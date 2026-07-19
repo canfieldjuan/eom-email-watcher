@@ -40,7 +40,13 @@ def _runtime(config_path: Path) -> tuple[object, Store, LocalModel]:
     secure_runtime_paths(config)
     store = Store(config.database_file)
     store.initialize()
-    model = LocalModel(config.model_base_url, config.model_name, config.model_timeout_seconds)
+    model = LocalModel(
+        config.model_base_url,
+        config.model_name,
+        config.model_timeout_seconds,
+        config.model_api_token_file,
+        config.model_require_auth,
+    )
     return config, store, model
 
 
@@ -56,6 +62,11 @@ def _doctor(config_path: Path) -> int:
         checks["database"] = {"ok": True, "initialized": store.state() is not None}
         checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
         checks["oauth_token"] = {"ok": config.gmail_token_file.exists()}
+        checks["model_api_token"] = {
+            "ok": bool(config.model_api_token_file and config.model_api_token_file.exists())
+            if config.model_require_auth
+            else True
+        }
         model_ok, detail = model.health()
         checks["local_model_server"] = {
             "ok": model_ok,

@@ -64,6 +64,8 @@ def config(tmp_path: Path) -> Config:
         database_file=tmp_path / "db.sqlite3",
         model_base_url="http://127.0.0.1:1234/v1",
         model_name="model",
+        model_api_token_file=tmp_path / "lm-token",
+        model_require_auth=True,
         model_timeout_seconds=60,
         notifications_enabled=False,
         senders=(Sender("trusted@example.com", "Trusted"),),

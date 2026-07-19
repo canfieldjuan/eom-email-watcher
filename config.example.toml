@@ -6,6 +6,8 @@ gmail_token_file = "~/.local/state/eom-email-watcher/token.json"
 database_file = "~/.local/state/eom-email-watcher/watcher.sqlite3"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "your-local-model-identifier"
+model_api_token_file = "~/.local/state/eom-email-watcher/lmstudio-api-token"
+model_require_auth = true
 model_timeout_seconds = 60
 notifications_enabled = true
 

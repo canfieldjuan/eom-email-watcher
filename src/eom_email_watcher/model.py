@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -80,17 +81,35 @@ def validate_analysis(raw: dict[str, object], received_at: str) -> Analysis:
 
 
 class LocalModel:
-    def __init__(self, base_url: str, model: str, timeout: float):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: float,
+        api_token_file: Path | None = None,
+        require_auth: bool = True,
+    ):
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        self.api_token_file = api_token_file
+        self.require_auth = require_auth
+
+    def _headers(self) -> dict[str, str]:
+        if self.api_token_file and self.api_token_file.exists():
+            token = self.api_token_file.read_text(encoding="utf-8").strip()
+            if token:
+                return {"Authorization": f"Bearer {token}"}
+        if self.require_auth:
+            raise ModelError("LM Studio API token is missing")
+        return {}
 
     def health(self) -> tuple[bool, str]:
         try:
-            response = httpx.get(f"{self.base_url}/models", timeout=5)
+            response = httpx.get(f"{self.base_url}/models", headers=self._headers(), timeout=5)
             response.raise_for_status()
             return True, f"HTTP {response.status_code}"
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ModelError) as exc:
             return False, type(exc).__name__
 
     def analyze(
@@ -117,6 +136,7 @@ class LocalModel:
         try:
             response = httpx.post(
                 f"{self.base_url}/chat/completions",
+                headers=self._headers(),
                 json={
                     "model": self.model,
                     "messages": [

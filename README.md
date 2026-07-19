@@ -51,6 +51,7 @@ The watcher rejects any non-local model URL. In LM Studio, use:
 - CORS disabled
 - sensitive-data and incoming-token logging disabled
 - just-in-time model loading enabled
+- **Require Authentication** enabled with a dedicated inference token
 
 Start the local service:
 
@@ -62,6 +63,17 @@ lms server status
 
 The configured model may load on the first matching email. LM Studio unload behavior is controlled
 by its JIT/TTL settings.
+
+In LM Studio 0.4+, open **Developer > Server Settings**, enable **Require Authentication**, create
+a token for this watcher, and paste only the token value into:
+
+```bash
+install -m 600 /dev/null ~/.local/state/eom-email-watcher/lmstudio-api-token
+# Edit the file and paste the token on one line; do not put it in config.toml.
+```
+
+The watcher refuses to send email text to LM Studio when authentication is required but this token
+file is missing. LM Studio's CLI can start the server but token creation is currently a GUI action.
 
 ## Gmail read-only OAuth setup
 

@@ -9,6 +9,7 @@ def write_config(path: Path, *, base_url: str = "http://127.0.0.1:1234/v1") -> N
     path.write_text(
         f'''model_base_url = "{base_url}"
 model_name = "local-model"
+model_api_token_file = "{path.parent / "lm-token"}"
 database_file = "{path.parent / "db.sqlite3"}"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
 gmail_token_file = "{path.parent / "token.json"}"

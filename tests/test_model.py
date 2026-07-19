@@ -1,6 +1,9 @@
 from datetime import UTC, datetime
+from pathlib import Path
 
-from eom_email_watcher.model import SYSTEM_PROMPT, validate_analysis
+import pytest
+
+from eom_email_watcher.model import SYSTEM_PROMPT, LocalModel, ModelError, validate_analysis
 
 
 def valid_result() -> dict[str, object]:
@@ -40,3 +43,16 @@ def test_prompt_treats_email_as_untrusted() -> None:
     assert "UNTRUSTED DATA" in SYSTEM_PROMPT
     assert "never call tools" in SYSTEM_PROMPT
     assert datetime.now(UTC).tzinfo is UTC
+
+
+def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-value\n", encoding="utf-8")
+    model = LocalModel("http://127.0.0.1:1234/v1", "model", 60, token_file, True)
+    assert model._headers() == {"Authorization": "Bearer secret-value"}
+
+
+def test_required_api_token_fails_closed(tmp_path: Path) -> None:
+    model = LocalModel("http://127.0.0.1:1234/v1", "model", 60, tmp_path / "missing", True)
+    with pytest.raises(ModelError, match="token is missing"):
+        model._headers()

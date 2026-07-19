@@ -32,6 +32,8 @@ class Config:
     database_file: Path
     model_base_url: str
     model_name: str
+    model_api_token_file: Path | None
+    model_require_auth: bool
     model_timeout_seconds: float
     notifications_enabled: bool
     senders: tuple[Sender, ...]
@@ -112,6 +114,11 @@ def load_config(path: Path | None = None) -> Config:
     model_name = data.get("model_name")
     if not isinstance(model_name, str) or not model_name.strip():
         raise ConfigError("model_name must be set")
+    require_auth = bool(data.get("model_require_auth", True))
+    raw_token_file = data.get("model_api_token_file")
+    token_file = _path(raw_token_file, "model_api_token_file") if raw_token_file else None
+    if require_auth and token_file is None:
+        raise ConfigError("model_api_token_file is required when model_require_auth is true")
 
     return Config(
         path=config_path,
@@ -132,6 +139,8 @@ def load_config(path: Path | None = None) -> Config:
         ),
         model_base_url=base_url,
         model_name=model_name.strip(),
+        model_api_token_file=token_file,
+        model_require_auth=require_auth,
         model_timeout_seconds=timeout,
         notifications_enabled=bool(data.get("notifications_enabled", True)),
         senders=tuple(senders),
