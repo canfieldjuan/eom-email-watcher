@@ -82,7 +82,10 @@ def _doctor(config_path: Path) -> int:
 
 def _setup(config_path: Path) -> int:
     config, store, model = _runtime(config_path)
-    gmail = GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
+    if config.gmail_token_file.exists():
+        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+    else:
+        gmail = GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
     watcher = Watcher(config, store, gmail, model)
     history_id = watcher.bootstrap()
     if config.notifications_enabled:

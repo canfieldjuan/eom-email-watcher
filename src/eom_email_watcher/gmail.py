@@ -119,7 +119,10 @@ class GmailGateway:
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     def profile_history_id(self) -> str:
-        result = self.service.users().getProfile(userId="me").execute()
+        try:
+            result = self.service.users().getProfile(userId="me").execute()
+        except HttpError as exc:
+            raise GmailError(f"Gmail profile request failed (HTTP {exc.resp.status})") from exc
         return str(result["historyId"])
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
