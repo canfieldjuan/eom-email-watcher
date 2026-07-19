@@ -1,0 +1,18 @@
+[Unit]
+Description=Effingham Office Maids trusted-sender email watcher
+After=network-online.target
+Wants=network-online.target
+Requires=eom-email-lmstudio.service
+After=eom-email-lmstudio.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher
+ExecStart="%h/Desktop/01 - Effingham Office Maids/eom-email-watcher/.venv/bin/eom-mail-watch" check
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/eom-email-watcher

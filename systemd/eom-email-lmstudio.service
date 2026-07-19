@@ -1,0 +1,8 @@
+[Unit]
+Description=Local-only LM Studio API for the EOM email watcher
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.lmstudio/bin/lms daemon up
+ExecStart=%h/.lmstudio/bin/lms server start --bind 127.0.0.1 -p 1234

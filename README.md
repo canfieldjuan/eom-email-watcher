@@ -1,0 +1,126 @@
+# EOM Email Watcher
+
+A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every five
+minutes, selects messages only from an exact sender allowlist, asks a local LM Studio model for
+a short structured summary, and sends a Linux desktop notification.
+
+Email content is never sent to a cloud model. The Gmail grant is read-only, attachment content is
+never downloaded, non-matching message metadata is not stored, and message bodies are discarded
+after each local inference request.
+
+## Behavior
+
+- Starts at the current Gmail `historyId`; setup does not backfill old mail.
+- Polls Gmail History for `messageAdded` events in `INBOX`.
+- Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
+- Fetches message bodies only after a sender matches.
+- Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
+- Records attachment filenames only. Attachment bytes are not fetched.
+- Stores message metadata and model summaries in SQLite for 180 days. Bodies are never stored.
+- Deduplicates by Gmail message ID.
+- Recovers an expired History cursor with an exact-sender search beginning five minutes before the
+  last successful check, then saves a fresh cursor.
+- If LM Studio is unavailable or times out, sends one metadata-only fallback notification and
+  retries the summary later with backoff.
+
+## Requirements
+
+- Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
+- LM Studio `llmster` with its API bound to `127.0.0.1`
+- `notify-send` (normally provided by `libnotify-bin`)
+- A Google Workspace or Gmail account and a Google Cloud Desktop OAuth client
+
+## Install
+
+```bash
+uv sync --locked --all-groups
+mkdir -p ~/.config/eom-email-watcher ~/.local/state/eom-email-watcher
+cp config.example.toml ~/.config/eom-email-watcher/config.toml
+chmod 700 ~/.config/eom-email-watcher ~/.local/state/eom-email-watcher
+chmod 600 ~/.config/eom-email-watcher/config.toml
+```
+
+Edit the private config with the real exact sender list and the LM Studio model identifier. Never
+commit that config; the repository example intentionally contains placeholders.
+
+### Secure LM Studio
+
+The watcher rejects any non-local model URL. In LM Studio, use:
+
+- network interface `127.0.0.1`
+- CORS disabled
+- sensitive-data and incoming-token logging disabled
+- just-in-time model loading enabled
+
+Start the local service:
+
+```bash
+lms daemon up
+lms server start --bind 127.0.0.1 -p 1234
+lms server status
+```
+
+The configured model may load on the first matching email. LM Studio unload behavior is controlled
+by its JIT/TTL settings.
+
+## Gmail read-only OAuth setup
+
+1. In Google Cloud Console, create or select a project.
+2. Enable the Gmail API.
+3. Configure the OAuth consent screen as Internal for the Workspace organization when available.
+4. Create an OAuth Client ID with application type **Desktop app**.
+5. Download the client JSON to:
+   `~/.local/state/eom-email-watcher/credentials.json`
+6. Lock it down and authorize:
+
+```bash
+chmod 600 ~/.local/state/eom-email-watcher/credentials.json
+uv run eom-mail-watch setup
+```
+
+The browser consent request asks only for
+`https://www.googleapis.com/auth/gmail.readonly`. The token is stored mode `0600`. Setup saves the
+current Gmail cursor, so only future arrivals are processed.
+
+## Commands
+
+```bash
+uv run eom-mail-watch doctor
+uv run eom-mail-watch check --dry-run
+uv run eom-mail-watch check
+uv run eom-mail-watch recent --limit 20
+```
+
+`--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.
+
+## Five-minute user timer
+
+After Gmail setup succeeds:
+
+```bash
+./scripts/install-user-services.sh
+systemctl --user start eom-email-watcher.timer
+systemctl --user status eom-email-watcher.timer
+journalctl --user -u eom-email-watcher.service --since today
+```
+
+The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
+not bodies, OAuth tokens, or model prompts.
+Its local LM Studio dependency starts llmster and the API on `127.0.0.1:1234` when needed.
+
+## Model output and safety
+
+The model must return a validated JSON object with category, priority, summary, action flag,
+suggested action, deadline text/date, and confidence. The prompt treats the entire email as
+untrusted data and denies instructions embedded in it. A model-proposed deadline before the
+message date is removed while its original deadline text remains available for human review.
+
+The local model has no Gmail tools and cannot send, delete, label, archive, or reply to mail. This
+project requests no Gmail write scope.
+
+## Development
+
+```bash
+uv run ruff check .
+uv run pytest --cov=eom_email_watcher --cov-report=term-missing
+```

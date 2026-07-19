@@ -1,0 +1,12 @@
+[Unit]
+Description=Check trusted Gmail senders every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=eom-email-watcher.service
+
+[Install]
+WantedBy=timers.target

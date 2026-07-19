@@ -1,0 +1,17 @@
+timezone = "America/Chicago"
+body_char_limit = 20000
+retention_days = 180
+gmail_credentials_file = "~/.local/state/eom-email-watcher/credentials.json"
+gmail_token_file = "~/.local/state/eom-email-watcher/token.json"
+database_file = "~/.local/state/eom-email-watcher/watcher.sqlite3"
+model_base_url = "http://127.0.0.1:1234/v1"
+model_name = "your-local-model-identifier"
+model_timeout_seconds = 60
+notifications_enabled = true
+
+[[senders]]
+email = "billing@example.com"
+name = "Example Billing"
+
+[[senders]]
+email = "contact@example.org"
