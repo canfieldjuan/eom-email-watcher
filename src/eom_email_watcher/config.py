@@ -29,6 +29,8 @@ class Config:
     retention_days: int
     gmail_credentials_file: Path
     gmail_token_file: Path
+    gmail_send_token_file: Path
+    monthly_hours_recipient: str | None
     database_file: Path
     model_base_url: str
     model_name: str
@@ -48,6 +50,8 @@ class Config:
 
 
 def _path(value: object, key: str) -> Path:
+    if isinstance(value, Path):
+        return value.expanduser()
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{key} must be a non-empty path")
     return Path(os.path.expandvars(value)).expanduser()
@@ -133,6 +137,15 @@ def load_config(path: Path | None = None) -> Config:
             data.get("gmail_token_file", DEFAULT_STATE / "token.json"),
             "gmail_token_file",
         ),
+        gmail_send_token_file=_path(
+            data.get("gmail_send_token_file", DEFAULT_STATE / "send-token.json"),
+            "gmail_send_token_file",
+        ),
+        monthly_hours_recipient=(
+            normalize_address(str(data["monthly_hours_recipient"]))
+            if data.get("monthly_hours_recipient")
+            else None
+        ),
         database_file=_path(
             data.get("database_file", DEFAULT_STATE / "watcher.sqlite3"),
             "database_file",
@@ -148,7 +161,12 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def secure_runtime_paths(config: Config) -> None:
-    for path in {config.path.parent, config.gmail_token_file.parent, config.database_file.parent}:
+    for path in {
+        config.path.parent,
+        config.gmail_token_file.parent,
+        config.gmail_send_token_file.parent,
+        config.database_file.parent,
+    }:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.chmod(0o700)
     if config.path.exists():

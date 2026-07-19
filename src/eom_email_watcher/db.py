@@ -70,6 +70,13 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_pending
                     ON messages(status, next_retry_at);
+                CREATE TABLE IF NOT EXISTS outbound_sends (
+                    dedupe_key TEXT PRIMARY KEY,
+                    recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    gmail_message_id TEXT NOT NULL,
+                    sent_at TEXT NOT NULL
+                );
                 """
             )
         self.path.chmod(0o600)
@@ -192,3 +199,34 @@ class Store:
                 "DELETE FROM messages WHERE discovered_at < ?", (cutoff.isoformat(),)
             )
         return cursor.rowcount
+
+    def outbound_was_sent(self, dedupe_key: str) -> bool:
+        with self.connection() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM outbound_sends WHERE dedupe_key = ?", (dedupe_key,)
+                ).fetchone()
+                is not None
+            )
+
+    def record_outbound(
+        self,
+        *,
+        dedupe_key: str,
+        recipient: str,
+        subject: str,
+        gmail_message_id: str,
+    ) -> None:
+        with self.connection() as db:
+            db.execute(
+                """INSERT INTO outbound_sends(
+                    dedupe_key, recipient, subject, gmail_message_id, sent_at
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    dedupe_key,
+                    recipient,
+                    subject,
+                    gmail_message_id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )

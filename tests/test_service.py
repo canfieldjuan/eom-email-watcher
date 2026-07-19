@@ -61,6 +61,8 @@ def config(tmp_path: Path) -> Config:
         retention_days=180,
         gmail_credentials_file=tmp_path / "credentials.json",
         gmail_token_file=tmp_path / "token.json",
+        gmail_send_token_file=tmp_path / "send-token.json",
+        monthly_hours_recipient="maria@example.com",
         database_file=tmp_path / "db.sqlite3",
         model_base_url="http://127.0.0.1:1234/v1",
         model_name="model",

@@ -130,6 +130,24 @@ message date is removed while its original deadline text remains available for h
 The local model has no Gmail tools and cannot send, delete, label, archive, or reply to mail. This
 project requests no Gmail write scope.
 
+## Monthly Firefly hours request
+
+The optional outbound job uses a separate OAuth token with only `gmail.send`. It does not widen the
+email watcher's read-only token. Configure `monthly_hours_recipient` privately, then authorize and
+install the timers:
+
+```bash
+uv run eom-mail-watch setup-send
+uv run eom-mail-watch send-hours --dry-run
+./scripts/install-user-services.sh
+systemctl --user start eom-monthly-hours.timer
+```
+
+The timer sends at 9:00 AM America/Chicago on the first of every month and automatically requests
+the previous month's Firefly hours. SQLite duplicate protection prevents more than one production
+send for a billing month. `--test-to address@example.com` sends a clearly marked test and does not
+consume the production duplicate key.
+
 ## Development
 
 ```bash

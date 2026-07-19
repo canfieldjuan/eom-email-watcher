@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -15,6 +16,7 @@ from .db import Store
 from .gmail import GmailError, GmailGateway
 from .model import LocalModel
 from .notifications import NotificationError, send_fallback
+from .outbound import GmailSender, SendError, previous_month_email
 from .service import Watcher
 
 
@@ -27,11 +29,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="Authorize Gmail and start from the current inbox state")
+    commands.add_parser("setup-send", help="Authorize the separate Gmail send-only token")
     check = commands.add_parser("check", help="Poll Gmail once")
     check.add_argument("--dry-run", action="store_true", help="Analyze without changing state")
     commands.add_parser("doctor", help="Check local configuration and dependencies")
     recent = commands.add_parser("recent", help="Show recent watched-message results")
     recent.add_argument("--limit", type=int, default=20)
+    send_hours = commands.add_parser("send-hours", help="Send the monthly Firefly hours request")
+    send_hours.add_argument("--test-to", help="Send a marked test without consuming monthly dedupe")
+    send_hours.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -62,6 +68,9 @@ def _doctor(config_path: Path) -> int:
         checks["database"] = {"ok": True, "initialized": store.state() is not None}
         checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
         checks["oauth_token"] = {"ok": config.gmail_token_file.exists()}
+        checks["send_oauth_token"] = {
+            "ok": config.gmail_send_token_file.exists() if config.monthly_hours_recipient else True
+        }
         checks["model_api_token"] = {
             "ok": bool(config.model_api_token_file and config.model_api_token_file.exists())
             if config.model_require_auth
@@ -105,6 +114,44 @@ def _check(config_path: Path, dry_run: bool) -> int:
     return 0
 
 
+def _setup_send(config_path: Path) -> int:
+    config, _store, _model = _runtime(config_path)
+    if config.gmail_send_token_file.exists():
+        GmailSender.from_token(config.gmail_send_token_file)
+    else:
+        GmailSender.authorize(config.gmail_credentials_file, config.gmail_send_token_file)
+    print("Gmail send-only authorization is ready.")
+    return 0
+
+
+def _send_hours(config_path: Path, *, test_to: str | None, dry_run: bool) -> int:
+    config, store, _model = _runtime(config_path)
+    recipient = test_to or config.monthly_hours_recipient
+    if not recipient or "@" not in recipient:
+        raise ConfigError("monthly_hours_recipient must be configured")
+    content = previous_month_email(datetime.now(config.zone).date())
+    dedupe_key = f"monthly-hours:{content.period_key}"
+    if not test_to and store.outbound_was_sent(dedupe_key):
+        print(json.dumps({"status": "already_sent", "period": content.period_key}))
+        return 0
+    subject = f"[TEST] {content.subject}" if test_to else content.subject
+    if dry_run:
+        print(json.dumps({"to": recipient, "subject": subject, "body": content.body}, indent=2))
+        return 0
+    message_id = GmailSender.from_token(config.gmail_send_token_file).send(
+        recipient, subject, content.body
+    )
+    if not test_to:
+        store.record_outbound(
+            dedupe_key=dedupe_key,
+            recipient=recipient,
+            subject=subject,
+            gmail_message_id=message_id,
+        )
+    print(json.dumps({"status": "sent", "to": recipient, "subject": subject}))
+    return 0
+
+
 def _recent(config_path: Path, limit: int) -> int:
     if not 1 <= limit <= 500:
         raise ConfigError("--limit must be between 1 and 500")
@@ -125,11 +172,15 @@ def main(argv: list[str] | None = None) -> None:
             code = _doctor(args.config)
         elif args.command == "setup":
             code = _setup(args.config)
+        elif args.command == "setup-send":
+            code = _setup_send(args.config)
         elif args.command == "check":
             code = _check(args.config, args.dry_run)
+        elif args.command == "send-hours":
+            code = _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
         else:
             code = _recent(args.config, args.limit)
-    except (ConfigError, GmailError, RuntimeError) as exc:
+    except (ConfigError, GmailError, SendError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

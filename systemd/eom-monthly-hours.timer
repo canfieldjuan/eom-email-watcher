@@ -1,0 +1,11 @@
+[Unit]
+Description=Send Firefly hours request on the first of each month at 9 AM Central
+
+[Timer]
+OnCalendar=*-*-01 09:00:00 America/Chicago
+Persistent=true
+AccuracySec=1min
+Unit=eom-monthly-hours.service
+
+[Install]
+WantedBy=timers.target
