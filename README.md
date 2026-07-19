@@ -1,6 +1,6 @@
 # EOM Email Watcher
 
-A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every five
+A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every eight
 minutes, selects messages only from an exact sender allowlist, asks a local LM Studio model for
 a short structured summary, and sends a Linux desktop notification.
 
@@ -105,7 +105,7 @@ uv run eom-mail-watch recent --limit 20
 
 `--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.
 
-## Five-minute user timer
+## Eight-hour user timer
 
 After Gmail setup succeeds:
 

@@ -1,10 +1,10 @@
 [Unit]
-Description=Check trusted Gmail senders every five minutes
+Description=Check trusted Gmail senders every eight hours
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
-RandomizedDelaySec=15s
+OnUnitActiveSec=8h
+RandomizedDelaySec=2min
 Persistent=true
 Unit=eom-email-watcher.service
 
