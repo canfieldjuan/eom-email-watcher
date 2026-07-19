@@ -112,7 +112,9 @@ class GmailGateway:
                 "Enable Gmail API and place the downloaded JSON at that path."
             )
         flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
-        credentials = flow.run_local_server(host="127.0.0.1", port=0, open_browser=True)
+        credentials = flow.run_local_server(
+            host="127.0.0.1", port=0, open_browser=True, prompt="consent"
+        )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         token_file.write_text(credentials.to_json(), encoding="utf-8")
         token_file.chmod(0o600)
