@@ -56,3 +56,30 @@ def test_required_api_token_fails_closed(tmp_path: Path) -> None:
     model = LocalModel("http://127.0.0.1:1234/v1", "model", 60, tmp_path / "missing", True)
     with pytest.raises(ModelError, match="token is missing"):
         model._headers()
+
+
+def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) -> None:
+    # Reasoning models (e.g. qwen3.5) leave content empty and put the JSON in
+    # the reasoning field; analyze() must still recover it.
+    token_file = tmp_path / "token"
+    token_file.write_text("k", encoding="utf-8")
+    model = LocalModel("http://127.0.0.1:1234/v1", "qwen3.5-4b", 60, token_file, True)
+
+    class FakeResp:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": "", "reasoning": (
+                '{"category":"invoice","priority":"normal","summary":"An invoice is due.",'
+                '"action_required":true,"suggested_action":"Pay it","deadline_text":null,'
+                '"deadline_iso":null,"confidence":0.9}')}}]}
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", lambda *a, **k: FakeResp())
+    result = model.analyze(
+        sender="ap@vendor.com", subject="Invoice", received_at="2026-07-18T12:00:00+00:00",
+        body="Please remit payment.", attachment_names=(),
+        current_local_time=datetime(2026, 7, 18, tzinfo=UTC),
+    )
+    assert result.category == "invoice"
+    assert result.action_required is True
