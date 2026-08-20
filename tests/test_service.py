@@ -3,7 +3,7 @@ from pathlib import Path
 
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
-from eom_email_watcher.gmail import MessageMetadata, StaleHistoryCursor
+from eom_email_watcher.gmail import MessageMetadata, MessageUnavailable, StaleHistoryCursor
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.service import Watcher
 
@@ -106,3 +106,48 @@ def test_dry_run_does_not_advance_cursor_or_store_messages(tmp_path: Path) -> No
     assert result["discovered"] == 1
     assert store.state()[0] == "100"
     assert store.recent(10) == []
+
+
+class VanishingMetadataGmail(FakeGmail):
+    """A message the history feed reported, but that 404s on metadata fetch
+    because it was deleted/expunged in the meantime."""
+
+    def history_message_ids(self, cursor: str):
+        return ["allowed", "vanished"], "200"
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        if message_id == "vanished":
+            raise MessageUnavailable(f"Gmail message {message_id} unavailable (HTTP 404)")
+        return super().metadata(message_id)
+
+
+class VanishingBodyGmail(FakeGmail):
+    """Metadata succeeds, but the body 404s (message deleted between the two calls)."""
+
+    def full_payload(self, message_id: str):
+        raise MessageUnavailable(f"Gmail message {message_id} unavailable (HTTP 404)")
+
+
+def test_metadata_404_skips_message_and_still_advances_cursor(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    # Must NOT raise, even though one message 404s on metadata fetch.
+    result = Watcher(cfg, store, VanishingMetadataGmail(), FakeModel()).check()
+    assert result["discovered"] == 1  # only the surviving message
+    assert result["summarized"] == 1
+    assert store.state()[0] == "200"  # cursor advances despite the vanished message
+
+
+def test_body_404_skips_pending_without_crashing(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    result = Watcher(cfg, store, VanishingBodyGmail(), FakeModel()).check()
+    assert result["discovered"] == 1  # discovered + stored
+    assert result["summarized"] == 0  # body gone -> skipped, not summarized, no crash
+    # Dropped from the pending queue (status 'skipped') so a re-run is a no-op.
+    assert store.recent(10)[0]["status"] == "skipped"
+    assert Watcher(cfg, store, VanishingBodyGmail(), FakeModel()).check()["summarized"] == 0

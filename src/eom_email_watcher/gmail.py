@@ -26,6 +26,12 @@ class StaleHistoryCursor(GmailError):
     """The saved Gmail history cursor has expired."""
 
 
+class MessageUnavailable(GmailError):
+    """A specific message could not be fetched -- e.g. it was deleted or
+    expunged after the history event that referenced it. Recoverable: the
+    caller should skip this one message, not fail the whole run."""
+
+
 @dataclass(frozen=True)
 class MessageMetadata:
     message_id: str
@@ -177,6 +183,10 @@ class GmailGateway:
                 .execute()
             )
         except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 404:
+                raise MessageUnavailable(
+                    f"Gmail message {message_id} unavailable (HTTP 404)"
+                ) from exc
             raise GmailError(f"Gmail metadata fetch failed (HTTP {exc.resp.status})") from exc
         return parse_metadata(message)
 
@@ -189,6 +199,10 @@ class GmailGateway:
                 .execute()
             )
         except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 404:
+                raise MessageUnavailable(
+                    f"Gmail message {message_id} unavailable (HTTP 404)"
+                ) from exc
             raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
         return message.get("payload") or {}
 

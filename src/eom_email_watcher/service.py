@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from .config import Config
 from .db import PendingMessage, Store
-from .gmail import GmailGateway, StaleHistoryCursor
+from .gmail import GmailGateway, MessageUnavailable, StaleHistoryCursor
 from .mime import extract_body
 from .model import LocalModel, ModelError
 from .notifications import NotificationError, send_analysis, send_fallback
@@ -45,7 +45,11 @@ class Watcher:
         for message_id in message_ids:
             if self.store.has_message(message_id):
                 continue
-            metadata = self.gmail.metadata(message_id)
+            try:
+                metadata = self.gmail.metadata(message_id)
+            except MessageUnavailable as exc:
+                logger.info("Skipping message %s (gone before fetch): %s", message_id, exc)
+                continue
             if "INBOX" not in metadata.labels or metadata.sender not in self.config.allowlist:
                 continue
             values = {
@@ -106,6 +110,15 @@ class Watcher:
                         message.message_id, analysis.model_dump(), notified=should_notify
                     )
                 summarized += 1
+            except MessageUnavailable as exc:
+                logger.info(
+                    "Skipping pending message %s (gone before fetch): %s",
+                    message.message_id,
+                    exc,
+                )
+                if not dry_run:
+                    self.store.mark_skipped(message.message_id)
+                continue
             except (ModelError, NotificationError) as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
                 if self.config.notifications_enabled and not message.fallback_notified_at:

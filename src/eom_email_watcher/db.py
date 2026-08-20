@@ -162,6 +162,14 @@ class Store:
                 (datetime.now(UTC).isoformat(), message_id),
             )
 
+    def mark_skipped(self, message_id: str) -> None:
+        with self.connection() as db:
+            db.execute(
+                """UPDATE messages SET status='skipped', next_retry_at=NULL,
+                last_error='message unavailable (skipped)' WHERE message_id = ?""",
+                (message_id,),
+            )
+
     def mark_summarized(self, message_id: str, result: dict[str, object], notified: bool) -> None:
         with self.connection() as db:
             db.execute(
