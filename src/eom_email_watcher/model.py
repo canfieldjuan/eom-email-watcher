@@ -38,9 +38,11 @@ deadline_text to that phrase and deadline_iso to its YYYY-MM-DD value. If no dea
 explicit, set both to null. deadline_iso must be YYYY-MM-DD and supported by the email text.
 Set action_required=true and give a specific suggested_action (e.g. "Pay invoice by the due
 date", "Reply to confirm the reschedule", "Call the customer") whenever a human must act. Set
-action_required=false with suggested_action=null only for automated confirmations or receipts
-that need nothing. Use category "automated_notice" for system confirmations or receipts that
-need no action, even if they mention an invoice; use "invoice" only for a bill requesting payment.
+action_required=false with suggested_action=null for any message that needs no human action at
+all -- automated confirmations, receipts, newsletters, status updates, or a plain FYI. Do not
+invent a suggested_action for a message that does not need one. Use category "automated_notice"
+for system confirmations or receipts that need no action, even if they mention an invoice; use
+"invoice" only for a bill requesting payment.
 
 Required keys: category, priority, summary, action_required, suggested_action,
 deadline_text, deadline_iso, confidence.
