@@ -109,6 +109,69 @@ def test_ntfy_failure_alone_does_not_raise_when_desktop_succeeds(
     )
 
 
+def test_desktop_timeout_falls_through_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A hung notify-send raises subprocess.TimeoutExpired, not NotificationError.
+    # It must not crash the whole run when another channel is configured.
+    import subprocess
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/notify-send")
+
+    def timing_out(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="notify-send", timeout=10)
+
+    monkeypatch.setattr("subprocess.run", timing_out)
+    ntfy_calls = []
+    monkeypatch.setattr(
+        "eom_email_watcher.notifications.httpx.post",
+        lambda *a, **k: ntfy_calls.append(1) or FakeResponse(),
+    )
+
+    send_analysis(
+        "Vendor", "Invoice", analysis(), ntfy_topic="eom-email-watch-0123456789ab"
+    )
+
+    assert ntfy_calls == [1]
+
+
+def test_desktop_oserror_falls_through_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> None:
+    # notify-send existing per shutil.which but failing to spawn (e.g. permission
+    # issue) raises OSError, not NotificationError.
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/notify-send")
+
+    def unspawnable(*a, **k):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("subprocess.run", unspawnable)
+    ntfy_calls = []
+    monkeypatch.setattr(
+        "eom_email_watcher.notifications.httpx.post",
+        lambda *a, **k: ntfy_calls.append(1) or FakeResponse(),
+    )
+
+    send_analysis(
+        "Vendor", "Invoice", analysis(), ntfy_topic="eom-email-watch-0123456789ab"
+    )
+
+    assert ntfy_calls == [1]
+
+
+def test_desktop_timeout_with_no_other_channel_raises_notification_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/notify-send")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="notify-send", timeout=10)
+        ),
+    )
+
+    with pytest.raises(NotificationError):
+        send_analysis("Vendor", "Invoice", analysis())
+
+
 def test_all_channels_failing_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: None)
 

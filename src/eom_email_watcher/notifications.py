@@ -32,13 +32,18 @@ def _send_desktop(title: str, body: str, urgency: str, dry_run: bool) -> None:
     executable = shutil.which("notify-send")
     if not executable:
         raise NotificationError("notify-send is not installed")
-    result = subprocess.run(
-        [executable, "--app-name=EOM Email Watcher", f"--urgency={urgency}", title, body],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            [executable, "--app-name=EOM Email Watcher", f"--urgency={urgency}", title, body],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A hung or unspawnable notify-send must not crash the whole run --
+        # the caller falls back to any other configured channel (e.g. ntfy).
+        raise NotificationError(f"notify-send failed: {type(exc).__name__}") from exc
     if result.returncode:
         raise NotificationError("notify-send returned an error")
 
