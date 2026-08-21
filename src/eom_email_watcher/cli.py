@@ -99,7 +99,13 @@ def _setup(config_path: Path) -> int:
     history_id = watcher.bootstrap()
     if config.notifications_enabled:
         try:
-            send_fallback("EOM Email Watcher", "Setup complete", dry_run=False)
+            send_fallback(
+                "EOM Email Watcher",
+                "Setup complete",
+                ntfy_topic=config.ntfy_topic,
+                ntfy_url=config.ntfy_url,
+                dry_run=False,
+            )
         except NotificationError as exc:
             print(f"Warning: notification test failed: {exc}", file=sys.stderr)
     print(f"Gmail authorized. Baseline history cursor saved ({history_id}); no old mail imported.")
