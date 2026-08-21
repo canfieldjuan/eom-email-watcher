@@ -70,6 +70,8 @@ def config(tmp_path: Path) -> Config:
         model_require_auth=True,
         model_timeout_seconds=60,
         notifications_enabled=False,
+        ntfy_topic=None,
+        ntfy_url="https://ntfy.sh",
         senders=(Sender("trusted@example.com", "Trusted"),),
     )
 

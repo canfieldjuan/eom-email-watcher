@@ -12,6 +12,13 @@ model_api_token_file = "~/.local/state/eom-email-watcher/lmstudio-api-token"
 model_require_auth = true
 model_timeout_seconds = 60
 notifications_enabled = true
+# Optional: push notifications to your phone via ntfy (https://ntfy.sh).
+# Install the ntfy app and subscribe to this exact topic. The topic name is
+# the sole secret protecting this channel (anyone who knows it can publish or
+# read) -- generate a long random one, e.g.: python3 -c "import secrets; print('eom-email-watch-' + secrets.token_hex(6))"
+# Leave unset to use desktop notifications only.
+# ntfy_topic = "eom-email-watch-xxxxxxxxxxxx"
+# ntfy_url = "https://ntfy.sh"
 
 [[senders]]
 email = "billing@example.com"
