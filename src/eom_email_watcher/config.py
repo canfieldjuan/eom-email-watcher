@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from email.utils import parseaddr
@@ -9,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
+NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 
 
 class ConfigError(ValueError):
@@ -38,6 +40,8 @@ class Config:
     model_require_auth: bool
     model_timeout_seconds: float
     notifications_enabled: bool
+    ntfy_topic: str | None
+    ntfy_url: str
     senders: tuple[Sender, ...]
 
     @property
@@ -124,6 +128,17 @@ def load_config(path: Path | None = None) -> Config:
     if require_auth and token_file is None:
         raise ConfigError("model_api_token_file is required when model_require_auth is true")
 
+    raw_ntfy_topic = data.get("ntfy_topic")
+    ntfy_topic = str(raw_ntfy_topic).strip() if raw_ntfy_topic else None
+    if ntfy_topic and not NTFY_TOPIC_RE.match(ntfy_topic):
+        raise ConfigError(
+            "ntfy_topic must be 20-64 characters of letters, digits, - or _ "
+            "(the topic is the sole secret protecting this channel -- keep it high-entropy)"
+        )
+    ntfy_url = str(data.get("ntfy_url", "https://ntfy.sh")).rstrip("/")
+    if not ntfy_url.startswith("https://"):
+        raise ConfigError("ntfy_url must use https://")
+
     return Config(
         path=config_path,
         timezone=timezone,
@@ -156,6 +171,8 @@ def load_config(path: Path | None = None) -> Config:
         model_require_auth=require_auth,
         model_timeout_seconds=timeout,
         notifications_enabled=bool(data.get("notifications_enabled", True)),
+        ntfy_topic=ntfy_topic,
+        ntfy_url=ntfy_url,
         senders=tuple(senders),
     )
 

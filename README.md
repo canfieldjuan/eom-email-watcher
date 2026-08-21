@@ -1,8 +1,9 @@
 # EOM Email Watcher
 
-A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every eight
-minutes, selects messages only from an exact sender allowlist, asks a local LM Studio model for
-a short structured summary, and sends a Linux desktop notification.
+A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every two
+hours, selects messages only from an exact sender allowlist, asks a local LM Studio model for
+a short structured summary, and sends a Linux desktop notification (and, optionally, a phone
+push via [ntfy](https://ntfy.sh)).
 
 Email content is never sent to a cloud model. The Gmail grant is read-only, attachment content is
 never downloaded, non-matching message metadata is not stored, and message bodies are discarded
@@ -29,6 +30,8 @@ after each local inference request.
 - LM Studio `llmster` with its API bound to `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
 - A Google Workspace or Gmail account and a Google Cloud Desktop OAuth client
+- Optional: an [ntfy](https://ntfy.sh) topic for phone push notifications alongside the desktop
+  one -- set `ntfy_topic`/`ntfy_url` in `config.toml` (see `config.example.toml`)
 
 ## Install
 
@@ -105,7 +108,7 @@ uv run eom-mail-watch recent --limit 20
 
 `--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.
 
-## Eight-hour user timer
+## Two-hour user timer
 
 After Gmail setup succeeds:
 

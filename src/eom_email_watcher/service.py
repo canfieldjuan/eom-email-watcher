@@ -104,7 +104,14 @@ class Watcher:
                     self.config.notifications_enabled and not message.fallback_notified_at
                 )
                 if should_notify:
-                    send_analysis(self._label(message), message.subject, analysis, dry_run=dry_run)
+                    send_analysis(
+                        self._label(message),
+                        message.subject,
+                        analysis,
+                        ntfy_topic=self.config.ntfy_topic,
+                        ntfy_url=self.config.ntfy_url,
+                        dry_run=dry_run,
+                    )
                 if not dry_run:
                     self.store.mark_summarized(
                         message.message_id, analysis.model_dump(), notified=should_notify
@@ -123,7 +130,13 @@ class Watcher:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
                 if self.config.notifications_enabled and not message.fallback_notified_at:
                     try:
-                        send_fallback(self._label(message), message.subject, dry_run=dry_run)
+                        send_fallback(
+                            self._label(message),
+                            message.subject,
+                            ntfy_topic=self.config.ntfy_topic,
+                            ntfy_url=self.config.ntfy_url,
+                            dry_run=dry_run,
+                        )
                         if not dry_run:
                             self.store.mark_fallback_notified(message.message_id)
                         fallback += 1
