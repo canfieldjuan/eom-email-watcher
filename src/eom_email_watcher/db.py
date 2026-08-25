@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+SCHEMA_VERSION = 1
+
 
 @dataclass(frozen=True)
 class PendingMessage:
@@ -20,6 +22,24 @@ class PendingMessage:
     fallback_notified_at: str | None
 
 
+@dataclass(frozen=True)
+class AnalyzedMessage:
+    message_id: str
+    sender: str
+    sender_name: str | None
+    subject: str
+    attempts: int
+    fallback_notified_at: str | None
+    category: str
+    priority: str
+    summary: str
+    action_required: int
+    suggested_action: str | None
+    deadline_text: str | None
+    deadline_iso: str | None
+    confidence: float
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -30,6 +50,10 @@ class Store:
         connection.row_factory = sqlite3.Row
         try:
             yield connection
+        except Exception:
+            connection.rollback()
+            raise
+        else:
             connection.commit()
         finally:
             connection.close()
@@ -37,9 +61,16 @@ class Store:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {version} is newer than supported "
+                    f"version {SCHEMA_VERSION}"
+                )
             db.executescript(
                 """
-                PRAGMA journal_mode=WAL;
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS mailbox_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     history_id TEXT NOT NULL,
@@ -54,6 +85,7 @@ class Store:
                     received_at TEXT NOT NULL,
                     discovered_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
+                    analysis_at TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_retry_at TEXT,
                     fallback_notified_at TEXT,
@@ -79,6 +111,12 @@ class Store:
                 );
                 """
             )
+            columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "analysis_at" not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN analysis_at TEXT")
+            db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
     def state(self) -> tuple[str, str] | None:
@@ -144,6 +182,21 @@ class Store:
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
 
+    def pending_delivery(
+        self, now: datetime | None = None, limit: int = 25
+    ) -> list[AnalyzedMessage]:
+        stamp = (now or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT message_id, sender, sender_name, subject, attempts,
+                fallback_notified_at, category, priority, summary, action_required,
+                suggested_action, deadline_text, deadline_iso, confidence FROM messages
+                WHERE status = 'analyzed' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY received_at LIMIT ?""",
+                (stamp, limit),
+            ).fetchall()
+        return [AnalyzedMessage(**dict(row)) for row in rows]
+
     def record_failure(self, message_id: str, error: str, attempts: int) -> None:
         delays = (5, 15, 60, 360, 1440)
         delay = delays[min(attempts, len(delays) - 1)]
@@ -170,13 +223,15 @@ class Store:
                 (message_id,),
             )
 
-    def mark_summarized(self, message_id: str, result: dict[str, object], notified: bool) -> None:
+    def mark_analyzed(self, message_id: str, result: dict[str, object]) -> None:
         with self.connection() as db:
             db.execute(
-                """UPDATE messages SET status='summarized', next_retry_at=NULL, last_error=NULL,
+                """UPDATE messages SET status='analyzed', analysis_at=?, attempts=0,
+                next_retry_at=NULL, last_error=NULL,
                 category=?, priority=?, summary=?, action_required=?, suggested_action=?,
-                deadline_text=?, deadline_iso=?, confidence=?, notified_at=? WHERE message_id=?""",
+                deadline_text=?, deadline_iso=?, confidence=? WHERE message_id=?""",
                 (
+                    datetime.now(UTC).isoformat(),
                     result["category"],
                     result["priority"],
                     result["summary"],
@@ -185,9 +240,16 @@ class Store:
                     result.get("deadline_text"),
                     result.get("deadline_iso"),
                     result["confidence"],
-                    datetime.now(UTC).isoformat() if notified else None,
                     message_id,
                 ),
+            )
+
+    def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
+        with self.connection() as db:
+            db.execute(
+                """UPDATE messages SET status='summarized', next_retry_at=NULL,
+                last_error=NULL, notified_at=? WHERE message_id=?""",
+                (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
 
     def recent(self, limit: int) -> list[dict[str, object]]:
