@@ -4,10 +4,10 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from .config import Config
-from .db import PendingMessage, Store
+from .db import AnalyzedMessage, PendingMessage, Store
 from .gmail import GmailGateway, MessageUnavailable, StaleHistoryCursor
 from .mime import extract_body
-from .model import LocalModel, ModelError
+from .model import Analysis, LocalModel, ModelError
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
@@ -80,14 +80,83 @@ class Watcher:
             "stale_cursor_recovered": recovered,
         }
 
-    def _label(self, message: PendingMessage) -> str:
+    def _label(self, message: PendingMessage | AnalyzedMessage) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
+
+    @staticmethod
+    def _stored_analysis(message: AnalyzedMessage) -> Analysis:
+        return Analysis(
+            category=message.category,
+            priority=message.priority,
+            summary=message.summary,
+            action_required=bool(message.action_required),
+            suggested_action=message.suggested_action,
+            deadline_text=message.deadline_text,
+            deadline_iso=message.deadline_iso,
+            confidence=message.confidence,
+        )
+
+    def _send_fallback(self, message: PendingMessage | AnalyzedMessage, dry_run: bool) -> int:
+        if not self.config.notifications_enabled or message.fallback_notified_at:
+            return 0
+        try:
+            send_fallback(
+                self._label(message),
+                message.subject,
+                ntfy_topic=self.config.ntfy_topic,
+                ntfy_url=self.config.ntfy_url,
+                dry_run=dry_run,
+            )
+            if not dry_run:
+                self.store.mark_fallback_notified(message.message_id)
+            return 1
+        except NotificationError as exc:
+            logger.warning("Fallback notification unavailable: %s", exc)
+            return 0
+
+    def _deliver_analysis(
+        self,
+        message: PendingMessage | AnalyzedMessage,
+        analysis: Analysis,
+        dry_run: bool,
+        attempts: int | None = None,
+    ) -> int:
+        if not self.config.notifications_enabled:
+            if not dry_run:
+                self.store.mark_delivery_complete(message.message_id, notified=False)
+            return 0
+        try:
+            send_analysis(
+                self._label(message),
+                message.subject,
+                analysis,
+                ntfy_topic=self.config.ntfy_topic,
+                ntfy_url=self.config.ntfy_url,
+                dry_run=dry_run,
+            )
+        except NotificationError as exc:
+            logger.warning("Message %s notification unavailable: %s", message.message_id, exc)
+            fallback = self._send_fallback(message, dry_run)
+            if not dry_run:
+                self.store.record_failure(
+                    message.message_id,
+                    str(exc),
+                    message.attempts if attempts is None else attempts,
+                )
+            return fallback
+        if not dry_run:
+            self.store.mark_delivery_complete(message.message_id, notified=True)
+        return 0
 
     def _process_pending(
         self, *, dry_run: bool, extra: list[PendingMessage] | None = None
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
+        for message in self.store.pending_delivery():
+            fallback += self._deliver_analysis(
+                message, self._stored_analysis(message), dry_run
+            )
         for message in [*self.store.pending(), *(extra or [])]:
             try:
                 payload = self.gmail.full_payload(message.message_id)
@@ -100,23 +169,10 @@ class Watcher:
                     attachment_names=attachments,
                     current_local_time=datetime.now(self.config.zone),
                 )
-                should_notify = (
-                    self.config.notifications_enabled and not message.fallback_notified_at
-                )
-                if should_notify:
-                    send_analysis(
-                        self._label(message),
-                        message.subject,
-                        analysis,
-                        ntfy_topic=self.config.ntfy_topic,
-                        ntfy_url=self.config.ntfy_url,
-                        dry_run=dry_run,
-                    )
                 if not dry_run:
-                    self.store.mark_summarized(
-                        message.message_id, analysis.model_dump(), notified=should_notify
-                    )
+                    self.store.mark_analyzed(message.message_id, analysis.model_dump())
                 summarized += 1
+                fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
             except MessageUnavailable as exc:
                 logger.info(
                     "Skipping pending message %s (gone before fetch): %s",
@@ -126,22 +182,9 @@ class Watcher:
                 if not dry_run:
                     self.store.mark_skipped(message.message_id)
                 continue
-            except (ModelError, NotificationError) as exc:
+            except ModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
-                if self.config.notifications_enabled and not message.fallback_notified_at:
-                    try:
-                        send_fallback(
-                            self._label(message),
-                            message.subject,
-                            ntfy_topic=self.config.ntfy_topic,
-                            ntfy_url=self.config.ntfy_url,
-                            dry_run=dry_run,
-                        )
-                        if not dry_run:
-                            self.store.mark_fallback_notified(message.message_id)
-                        fallback += 1
-                    except NotificationError as notify_exc:
-                        logger.warning("Fallback notification unavailable: %s", notify_exc)
+                fallback += self._send_fallback(message, dry_run)
                 if not dry_run:
                     self.store.record_failure(message.message_id, str(exc), message.attempts)
         return summarized, fallback

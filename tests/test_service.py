@@ -1,16 +1,20 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
 from eom_email_watcher.gmail import MessageMetadata, MessageUnavailable, StaleHistoryCursor
-from eom_email_watcher.model import Analysis
+from eom_email_watcher.model import Analysis, ModelError
+from eom_email_watcher.notifications import NotificationError
 from eom_email_watcher.service import Watcher
 
 
 class FakeGmail:
     def __init__(self, stale: bool = False):
         self.stale = stale
+        self.full_payload_calls = 0
 
     def profile_history_id(self) -> str:
         return "200"
@@ -36,11 +40,16 @@ class FakeGmail:
         )
 
     def full_payload(self, message_id: str):
+        self.full_payload_calls += 1
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
 
 class FakeModel:
+    def __init__(self):
+        self.calls = 0
+
     def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
         return Analysis(
             category="informational",
             priority="normal",
@@ -153,3 +162,101 @@ def test_body_404_skips_pending_without_crashing(tmp_path: Path) -> None:
     # Dropped from the pending queue (status 'skipped') so a re-run is a no-op.
     assert store.recent(10)[0]["status"] == "skipped"
     assert Watcher(cfg, store, VanishingBodyGmail(), FakeModel()).check()["summarized"] == 0
+
+
+def _make_retries_due(store: Store) -> None:
+    with store.connection() as db:
+        db.execute("UPDATE messages SET next_retry_at = NULL")
+
+
+def test_notification_retry_uses_persisted_analysis(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gmail = FakeGmail()
+    model = FakeModel()
+    analysis_attempts = 0
+
+    def flaky_analysis_notification(*args, **kwargs) -> None:
+        nonlocal analysis_attempts
+        analysis_attempts += 1
+        if analysis_attempts == 1:
+            raise NotificationError("all channels unavailable")
+
+    def unavailable_fallback(*args, **kwargs) -> None:
+        raise NotificationError("all channels unavailable")
+
+    monkeypatch.setattr(service_module, "send_analysis", flaky_analysis_notification)
+    monkeypatch.setattr(service_module, "send_fallback", unavailable_fallback)
+    watcher = Watcher(cfg, store, gmail, model)
+
+    first = watcher.check()
+    assert first["summarized"] == 1
+    assert store.recent(1)[0]["status"] == "analyzed"
+    assert gmail.full_payload_calls == 1
+    assert model.calls == 1
+
+    _make_retries_due(store)
+    second = watcher.check()
+    assert second["summarized"] == 0
+    assert store.recent(1)[0]["status"] == "summarized"
+    assert analysis_attempts == 2
+    assert gmail.full_payload_calls == 1
+    assert model.calls == 1
+
+
+class FailOnceModel(FakeModel):
+    def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
+        if self.calls == 1:
+            raise ModelError("local model unavailable")
+        return Analysis(
+            category="informational",
+            priority="normal",
+            summary="A short update.",
+            action_required=False,
+            suggested_action=None,
+            deadline_text=None,
+            deadline_iso=None,
+            confidence=0.9,
+        )
+
+
+def test_fallback_does_not_suppress_recovered_analysis(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FailOnceModel()
+    delivered: list[str] = []
+
+    monkeypatch.setattr(
+        service_module,
+        "send_fallback",
+        lambda *args, **kwargs: delivered.append("fallback"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "send_analysis",
+        lambda *args, **kwargs: delivered.append("analysis"),
+    )
+    watcher = Watcher(cfg, store, FakeGmail(), model)
+
+    first = watcher.check()
+    assert first["fallback_notified"] == 1
+    assert delivered == ["fallback"]
+
+    _make_retries_due(store)
+    second = watcher.check()
+    assert second["summarized"] == 1
+    assert delivered == ["fallback", "analysis"]
+    assert store.recent(1)[0]["status"] == "summarized"
+
+    watcher.check()
+    assert delivered == ["fallback", "analysis"]
+    assert model.calls == 2
