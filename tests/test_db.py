@@ -112,10 +112,50 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
         ).fetchone()
     assert "analysis_at" in columns
     assert row == ("pending", None)
+
+
+def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as db:
+        db.executescript(
+            """
+            PRAGMA user_version = 1;
+            CREATE TABLE outbound_sends (
+                dedupe_key TEXT PRIMARY KEY,
+                recipient TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                gmail_message_id TEXT NOT NULL,
+                sent_at TEXT NOT NULL
+            );
+            INSERT INTO outbound_sends(
+                dedupe_key, recipient, subject, gmail_message_id, sent_at
+            ) VALUES (
+                'monthly-hours:2026-07', 'maria@example.com', 'Subject',
+                'gmail-id', '2026-08-01T12:00:00+00:00'
+            );
+            """
+        )
+
+    Store(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        sent = db.execute(
+            "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
+            ("monthly-hours:2026-07",),
+        ).fetchone()
+        reservation_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbound_reservations'"
+        ).fetchone()
+    assert sent == ("gmail-id",)
+    assert reservation_table == (1,)
