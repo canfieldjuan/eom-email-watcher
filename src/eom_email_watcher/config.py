@@ -69,6 +69,8 @@ def normalize_address(value: str) -> str:
 
 def _validate_model_base_url(value: object) -> str:
     base_url = str(value).rstrip("/")
+    if any(character.isspace() or not character.isprintable() for character in base_url):
+        raise ConfigError("model_base_url must not contain whitespace or control characters")
     try:
         parsed = urlsplit(base_url)
         port = parsed.port

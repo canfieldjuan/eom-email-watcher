@@ -48,6 +48,9 @@ def test_remote_model_url_is_rejected(tmp_path: Path) -> None:
         "http://localhost/v1",
         "http://localhost:not-a-port/v1",
         "http://127.0.0.2:1234/v1",
+        " http://localhost:1234/v1",
+        "http://local\\thost:1234/v1",
+        "http://local\\nhost:1234/v1",
     ],
 )
 def test_deceptive_or_incomplete_local_model_url_is_rejected(
