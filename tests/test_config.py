@@ -39,6 +39,50 @@ def test_remote_model_url_is_rejected(tmp_path: Path) -> None:
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:1234@evil.example/v1",
+        "http://evil.example@localhost:1234/v1",
+        "https://localhost:1234/v1",
+        "http://localhost/v1",
+        "http://localhost:not-a-port/v1",
+        "http://127.0.0.2:1234/v1",
+        " http://localhost:1234/v1",
+        "http://local\\thost:1234/v1",
+        "http://local\\nhost:1234/v1",
+    ],
+)
+def test_deceptive_or_incomplete_local_model_url_is_rejected(
+    tmp_path: Path, base_url: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, base_url=base_url)
+    with pytest.raises(ConfigError, match="model_base_url"):
+        load_config(path)
+
+
+def test_localhost_model_url_with_explicit_port_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, base_url="http://localhost:1234/v1/")
+    assert load_config(path).model_base_url == "http://localhost:1234/v1"
+
+
+@pytest.mark.parametrize("port", [1, 65_535])
+def test_local_model_url_accepts_valid_port_boundaries(tmp_path: Path, port: int) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, base_url=f"http://127.0.0.1:{port}/v1")
+    assert load_config(path).model_base_url == f"http://127.0.0.1:{port}/v1"
+
+
+@pytest.mark.parametrize("port", [0, 65_536])
+def test_local_model_url_rejects_invalid_port_boundaries(tmp_path: Path, port: int) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, base_url=f"http://127.0.0.1:{port}/v1")
+    with pytest.raises(ConfigError, match="model_base_url"):
+        load_config(path)
+
+
 def test_duplicate_sender_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

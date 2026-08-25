@@ -6,6 +6,7 @@ import tomllib
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
@@ -66,6 +67,34 @@ def normalize_address(value: str) -> str:
     return address.strip().casefold()
 
 
+def _validate_model_base_url(value: object) -> str:
+    base_url = str(value).rstrip("/")
+    if any(character.isspace() or not character.isprintable() for character in base_url):
+        raise ConfigError("model_base_url must not contain whitespace or control characters")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(
+            "model_base_url must use http with an explicit port on localhost or "
+            "127.0.0.1; email bodies may not leave this machine"
+        ) from exc
+
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None
+        or not 1 <= port <= 65_535
+    ):
+        raise ConfigError(
+            "model_base_url must use http with an explicit port on localhost or "
+            "127.0.0.1; email bodies may not leave this machine"
+        )
+    return base_url
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = (path or DEFAULT_CONFIG).expanduser()
     try:
@@ -114,11 +143,9 @@ def load_config(path: Path | None = None) -> Config:
     if not 1 <= timeout <= 300:
         raise ConfigError("model_timeout_seconds must be between 1 and 300")
 
-    base_url = str(data.get("model_base_url", "http://127.0.0.1:1234/v1")).rstrip("/")
-    if not (base_url.startswith("http://127.0.0.1:") or base_url.startswith("http://localhost:")):
-        raise ConfigError(
-            "model_base_url must use localhost; email bodies may not leave this machine"
-        )
+    base_url = _validate_model_base_url(
+        data.get("model_base_url", "http://127.0.0.1:1234/v1")
+    )
     model_name = data.get("model_name")
     if not isinstance(model_name, str) or not model_name.strip():
         raise ConfigError("model_name must be set")
