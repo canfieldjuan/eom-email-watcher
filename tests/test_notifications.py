@@ -1,7 +1,12 @@
 import pytest
 
 from eom_email_watcher.model import Analysis
-from eom_email_watcher.notifications import NotificationError, send_analysis, send_fallback
+from eom_email_watcher.notifications import (
+    ChannelResult,
+    NotificationError,
+    send_analysis,
+    send_fallback,
+)
 
 
 def analysis(**overrides) -> Analysis:
@@ -49,10 +54,12 @@ def test_desktop_only_when_ntfy_not_configured(monkeypatch: pytest.MonkeyPatch) 
         lambda *a, **k: ntfy_calls.append((a, k)) or FakeResponse(),
     )
 
-    send_analysis("Vendor", "Invoice", analysis())
+    result = send_analysis("Vendor", "Invoice", analysis())
 
     assert len(calls) == 1
     assert not ntfy_calls
+    assert result.desktop == ChannelResult(attempted=True, delivered=True)
+    assert result.ntfy == ChannelResult(attempted=False, delivered=False)
 
 
 def test_both_channels_used_when_ntfy_configured(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -70,7 +77,7 @@ def test_both_channels_used_when_ntfy_configured(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr("eom_email_watcher.notifications.httpx.post", fake_post)
 
-    send_analysis(
+    result = send_analysis(
         "Vendor",
         "Invoice",
         analysis(priority="urgent"),
@@ -84,6 +91,9 @@ def test_both_channels_used_when_ntfy_configured(monkeypatch: pytest.MonkeyPatch
     assert payload["topic"] == "eom-email-watch-0123456789ab"
     assert payload["priority"] == 5
     assert payload["title"] == "Vendor: Invoice"
+    assert result.desktop.delivered
+    assert result.ntfy.delivered
+    assert result.failures == ()
 
 
 def test_ntfy_failure_alone_does_not_raise_when_desktop_succeeds(
@@ -104,9 +114,12 @@ def test_ntfy_failure_alone_does_not_raise_when_desktop_succeeds(
     monkeypatch.setattr("eom_email_watcher.notifications.httpx.post", failing_post)
 
     # Must not raise -- the desktop channel got through.
-    send_analysis(
+    result = send_analysis(
         "Vendor", "Invoice", analysis(), ntfy_topic="eom-email-watch-0123456789ab"
     )
+    assert result.desktop.delivered
+    assert not result.ntfy.delivered
+    assert result.ntfy.error == "ntfy delivery failed: ConnectError"
 
 
 def test_desktop_timeout_falls_through_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,11 +139,14 @@ def test_desktop_timeout_falls_through_to_ntfy(monkeypatch: pytest.MonkeyPatch) 
         lambda *a, **k: ntfy_calls.append(1) or FakeResponse(),
     )
 
-    send_analysis(
+    result = send_analysis(
         "Vendor", "Invoice", analysis(), ntfy_topic="eom-email-watch-0123456789ab"
     )
 
     assert ntfy_calls == [1]
+    assert not result.desktop.delivered
+    assert result.desktop.error == "notify-send failed: TimeoutExpired"
+    assert result.ntfy.delivered
 
 
 def test_desktop_oserror_falls_through_to_ntfy(monkeypatch: pytest.MonkeyPatch) -> None:

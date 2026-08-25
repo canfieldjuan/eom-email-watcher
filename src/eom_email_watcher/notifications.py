@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from dataclasses import dataclass
 
 import httpx
 
@@ -23,6 +24,28 @@ _NTFY_PRIORITY = {
 
 class NotificationError(RuntimeError):
     """No configured notification channel could deliver the message."""
+
+
+@dataclass(frozen=True)
+class ChannelResult:
+    attempted: bool
+    delivered: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    desktop: ChannelResult
+    ntfy: ChannelResult
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        results = (("desktop", self.desktop), ("ntfy", self.ntfy))
+        return tuple(
+            f"{name}: {result.error}"
+            for name, result in results
+            if result.attempted and not result.delivered and result.error
+        )
 
 
 def _send_desktop(title: str, body: str, urgency: str, dry_run: bool) -> None:
@@ -74,29 +97,30 @@ def _deliver(
     ntfy_url: str,
     ntfy_priority: int,
     dry_run: bool,
-) -> None:
+) -> DeliveryResult:
     # Each configured channel is independent: a down phone-push endpoint should
     # not silence the desktop popup, and vice versa. Only raise -- which the
     # caller treats as "nothing got through" and triggers a retry/fallback --
     # when every channel that was actually attempted failed.
-    errors: list[str] = []
-    attempted = 0
-
-    attempted += 1
+    desktop = ChannelResult(attempted=True, delivered=True)
     try:
         _send_desktop(title, body, urgency, dry_run)
     except NotificationError as exc:
-        errors.append(str(exc))
+        desktop = ChannelResult(attempted=True, delivered=False, error=str(exc))
 
+    ntfy = ChannelResult(attempted=False, delivered=False)
     if ntfy_topic:
-        attempted += 1
+        ntfy = ChannelResult(attempted=True, delivered=True)
         try:
             _send_ntfy(ntfy_topic, ntfy_url, title, body, ntfy_priority, dry_run)
         except NotificationError as exc:
-            errors.append(str(exc))
+            ntfy = ChannelResult(attempted=True, delivered=False, error=str(exc))
 
-    if errors and len(errors) == attempted:
-        raise NotificationError("; ".join(errors))
+    result = DeliveryResult(desktop=desktop, ntfy=ntfy)
+    attempted = (channel for channel in (desktop, ntfy) if channel.attempted)
+    if not any(channel.delivered for channel in attempted):
+        raise NotificationError("; ".join(result.failures))
+    return result
 
 
 def send_analysis(
@@ -107,14 +131,14 @@ def send_analysis(
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
     dry_run: bool = False,
-) -> None:
+) -> DeliveryResult:
     urgency = "critical" if analysis.priority == "urgent" else "normal"
     lines = [analysis.summary]
     if analysis.suggested_action:
         lines.append(f"Next: {analysis.suggested_action}")
     if analysis.deadline_iso:
         lines.append(f"Deadline: {analysis.deadline_iso}")
-    _deliver(
+    return _deliver(
         f"{sender_label}: {subject}",
         "\n".join(lines),
         urgency,
@@ -132,8 +156,8 @@ def send_fallback(
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
     dry_run: bool = False,
-) -> None:
-    _deliver(
+) -> DeliveryResult:
+    return _deliver(
         f"{sender_label}: {subject}",
         "A watched email arrived. Local summary unavailable; it will be retried.",
         "normal",
