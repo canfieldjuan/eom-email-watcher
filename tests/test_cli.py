@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from eom_email_watcher import cli
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
 
@@ -46,3 +48,51 @@ def test_setup_reports_partial_notification_failure(
     output = capsys.readouterr()
     assert "ntfy delivery failed: ConnectError" in output.err
     assert "Baseline history cursor saved (200)" in output.out
+
+
+def _check_config(tmp_path: Path) -> SimpleNamespace:
+    state = tmp_path / "state"
+    state.mkdir()
+    return SimpleNamespace(
+        database_file=state / "watcher.sqlite3",
+        gmail_credentials_file=tmp_path / "credentials.json",
+        gmail_token_file=tmp_path / "token.json",
+    )
+
+
+def test_second_production_check_stops_before_gmail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _check_config(tmp_path)
+    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr(
+        cli.GmailGateway,
+        "from_token",
+        lambda *args: pytest.fail("blocked check must not access Gmail"),
+    )
+
+    with cli._production_check_lock(config.database_file), pytest.raises(
+        RuntimeError, match="production check is already running"
+    ):
+        cli._check(tmp_path / "config.toml", dry_run=False)
+
+
+def test_dry_run_does_not_take_production_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _check_config(tmp_path)
+    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr(cli.GmailGateway, "from_token", lambda *args: object())
+
+    class FakeWatcher:
+        def __init__(self, *args):
+            pass
+
+        def check(self, *, dry_run: bool):
+            assert dry_run is True
+            return {"dry_run": True}
+
+    monkeypatch.setattr(cli, "Watcher", FakeWatcher)
+
+    with cli._production_check_lock(config.database_file):
+        assert cli._check(tmp_path / "config.toml", dry_run=True) == 0

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
 import shutil
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +57,24 @@ def _runtime(config_path: Path) -> tuple[object, Store, LocalModel]:
         config.model_require_auth,
     )
     return config, store, model
+
+
+@contextmanager
+def _production_check_lock(database_file: Path) -> Iterator[None]:
+    lock_path = database_file.with_name(f"{database_file.name}.check.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Another production check is already running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _doctor(config_path: Path) -> int:
@@ -120,8 +141,10 @@ def _setup(config_path: Path) -> int:
 
 def _check(config_path: Path, dry_run: bool) -> int:
     config, store, model = _runtime(config_path)
-    gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-    result = Watcher(config, store, gmail, model).check(dry_run=dry_run)
+    lock = nullcontext() if dry_run else _production_check_lock(config.database_file)
+    with lock:
+        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+        result = Watcher(config, store, gmail, model).check(dry_run=dry_run)
     print(json.dumps(result, indent=2))
     return 0
 
