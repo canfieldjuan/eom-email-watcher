@@ -41,6 +41,17 @@ def _parser() -> argparse.ArgumentParser:
     send_hours = commands.add_parser("send-hours", help="Send the monthly Firefly hours request")
     send_hours.add_argument("--test-to", help="Send a marked test without consuming monthly dedupe")
     send_hours.add_argument("--dry-run", action="store_true")
+    outbound_status = commands.add_parser(
+        "outbound-status", help="Inspect one outbound dedupe record without contacting Gmail"
+    )
+    outbound_status.add_argument("dedupe_key")
+    outbound_resolve = commands.add_parser(
+        "outbound-resolve", help="Resolve an outbound reservation after external verification"
+    )
+    outbound_resolve.add_argument("dedupe_key")
+    resolution = outbound_resolve.add_mutually_exclusive_group(required=True)
+    resolution.add_argument("--confirm-sent", metavar="GMAIL_MESSAGE_ID")
+    resolution.add_argument("--confirm-unsent", action="store_true")
     return parser
 
 
@@ -69,6 +80,24 @@ def _production_check_lock(database_file: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("Another production check is already running") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _outbound_operation_lock(database_file: Path) -> Iterator[None]:
+    lock_path = database_file.with_name(f"{database_file.name}.outbound.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("Another outbound operation is already running") from exc
         try:
             yield
         finally:
@@ -170,41 +199,81 @@ def _send_hours(config_path: Path, *, test_to: str | None, dry_run: bool) -> int
     if dry_run:
         print(json.dumps({"to": recipient, "subject": subject, "body": content.body}, indent=2))
         return 0
-    if not test_to:
-        status = store.outbound_status(dedupe_key)
-        if status == "sent":
-            print(json.dumps({"status": "already_sent", "period": content.period_key}))
-            return 0
-        if status:
+    lock = nullcontext() if test_to else _outbound_operation_lock(store.path)
+    with lock:
+        if not test_to:
+            status = store.outbound_status(dedupe_key)
+            if status == "sent":
+                print(json.dumps({"status": "already_sent", "period": content.period_key}))
+                return 0
+            if status:
+                raise SendError(
+                    f"Outbound send {dedupe_key} is {status} and requires manual reconciliation"
+                )
+        sender = GmailSender.from_token(config.gmail_send_token_file)
+        if not test_to and not store.reserve_outbound(
+            dedupe_key=dedupe_key, recipient=recipient, subject=subject
+        ):
+            status = store.outbound_status(dedupe_key)
+            if status == "sent":
+                print(json.dumps({"status": "already_sent", "period": content.period_key}))
+                return 0
             raise SendError(
-                f"Outbound send {dedupe_key} is {status} and requires manual reconciliation"
+                f"Outbound send {dedupe_key} is {status or 'blocked'} and requires "
+                "manual reconciliation"
             )
-    sender = GmailSender.from_token(config.gmail_send_token_file)
-    if not test_to and not store.reserve_outbound(
-        dedupe_key=dedupe_key, recipient=recipient, subject=subject
-    ):
-        status = store.outbound_status(dedupe_key)
-        if status == "sent":
-            print(json.dumps({"status": "already_sent", "period": content.period_key}))
-            return 0
-        raise SendError(
-            f"Outbound send {dedupe_key} is {status or 'blocked'} and requires "
-            "manual reconciliation"
-        )
-    try:
-        message_id = sender.send(recipient, subject, content.body)
-        if not test_to:
-            store.record_outbound(
-                dedupe_key=dedupe_key,
-                recipient=recipient,
-                subject=subject,
-                gmail_message_id=message_id,
-            )
-    except Exception as exc:
-        if not test_to:
-            store.mark_outbound_ambiguous(dedupe_key, type(exc).__name__)
-        raise
+        try:
+            message_id = sender.send(recipient, subject, content.body)
+            if not test_to:
+                store.record_outbound(
+                    dedupe_key=dedupe_key,
+                    recipient=recipient,
+                    subject=subject,
+                    gmail_message_id=message_id,
+                )
+        except Exception as exc:
+            if not test_to:
+                store.mark_outbound_ambiguous(dedupe_key, type(exc).__name__)
+            raise
     print(json.dumps({"status": "sent", "to": recipient, "subject": subject}))
+    return 0
+
+
+def _outbound_status(config_path: Path, dedupe_key: str) -> int:
+    _config, store, _model = _runtime(config_path)
+    details = store.outbound_details(dedupe_key)
+    print(json.dumps(details or {"dedupe_key": dedupe_key, "status": "not_found"}, indent=2))
+    return 0
+
+
+def _outbound_resolve(
+    config_path: Path,
+    dedupe_key: str,
+    *,
+    confirm_sent: str | None,
+    confirm_unsent: bool,
+) -> int:
+    if (confirm_sent is not None) == confirm_unsent:
+        raise RuntimeError("Exactly one outbound resolution confirmation is required")
+    _config, store, _model = _runtime(config_path)
+    with _outbound_operation_lock(store.path):
+        if confirm_sent is not None:
+            gmail_message_id = confirm_sent.strip()
+            store.reconcile_outbound_sent(dedupe_key, gmail_message_id)
+            result = {
+                "action": "confirmed_sent",
+                "dedupe_key": dedupe_key,
+                "gmail_message_id": gmail_message_id,
+                "status": "sent",
+            }
+        else:
+            store.release_outbound(dedupe_key)
+            result = {
+                "action": "confirmed_unsent",
+                "dedupe_key": dedupe_key,
+                "status": "released_for_future_retry",
+            }
+    print(json.dumps(result, indent=2))
     return 0
 
 
@@ -234,6 +303,15 @@ def main(argv: list[str] | None = None) -> None:
             code = _check(args.config, args.dry_run)
         elif args.command == "send-hours":
             code = _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
+        elif args.command == "outbound-status":
+            code = _outbound_status(args.config, args.dedupe_key)
+        elif args.command == "outbound-resolve":
+            code = _outbound_resolve(
+                args.config,
+                args.dedupe_key,
+                confirm_sent=args.confirm_sent,
+                confirm_unsent=args.confirm_unsent,
+            )
         else:
             code = _recent(args.config, args.limit)
     except (ConfigError, GmailError, SendError, RuntimeError) as exc:
