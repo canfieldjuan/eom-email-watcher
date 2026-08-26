@@ -39,6 +39,44 @@ def test_suggested_action_requires_action_even_when_model_says_false() -> None:
     assert result.action_required is True
 
 
+@pytest.mark.parametrize("suggested_action", [None, "", "   "])
+def test_required_action_without_usable_suggestion_is_rejected(
+    suggested_action: str | None,
+) -> None:
+    raw = valid_result()
+    raw["suggested_action"] = suggested_action
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="requires a suggested action"):
+        validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+
+def test_deadline_without_suggested_action_is_rejected() -> None:
+    raw = valid_result()
+    raw["action_required"] = False
+    raw["suggested_action"] = None
+
+    with pytest.raises(ModelError, match="requires a suggested action"):
+        validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+
+@pytest.mark.parametrize("suggested_action", [None, "", "   "])
+def test_no_action_with_empty_suggestion_is_normalized(
+    suggested_action: str | None,
+) -> None:
+    raw = valid_result()
+    raw["action_required"] = False
+    raw["suggested_action"] = suggested_action
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    result = validate_analysis(raw, "2026-07-18T12:00:00+00:00")
+
+    assert result.action_required is False
+    assert result.suggested_action is None
+
+
 def test_prompt_treats_email_as_untrusted() -> None:
     assert "UNTRUSTED DATA" in SYSTEM_PROMPT
     assert "never call tools" in SYSTEM_PROMPT
