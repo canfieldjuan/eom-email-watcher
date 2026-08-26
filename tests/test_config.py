@@ -109,6 +109,16 @@ def test_malformed_numeric_settings_raise_config_error(
         load_config(path)
 
 
+@pytest.mark.parametrize("timezone", ["", "/tmp/foo"])
+def test_invalid_timezone_keys_raise_config_error(
+    tmp_path: Path, timezone: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, extra=f'timezone = "{timezone}"')
+    with pytest.raises(ConfigError, match="Unknown timezone"):
+        load_config(path)
+
+
 def test_ntfy_defaults_to_disabled(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

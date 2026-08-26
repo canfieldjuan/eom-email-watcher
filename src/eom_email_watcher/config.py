@@ -125,7 +125,7 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError("timezone must be a string")
     try:
         ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as exc:
+    except (ValueError, ZoneInfoNotFoundError) as exc:
         raise ConfigError(f"Unknown timezone: {timezone}") from exc
 
     raw_senders = data.get("senders")

@@ -19,11 +19,12 @@ def write_config(
     ntfy_topic: str | None = None,
     notifications_enabled: bool = True,
     extra_settings: str = "",
+    timezone: str = "America/Chicago",
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
     path.write_text(
-        f'''timezone = "America/Chicago"
+        f'''timezone = "{timezone}"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
 gmail_token_file = "{path.parent / "token.json"}"
 gmail_send_token_file = "{path.parent / "send-token.json"}"
@@ -389,18 +390,32 @@ def test_gmail_error_response_redacts_configured_path(
     assert str(sensitive_path) in caplog.text
 
 
-def test_malformed_numeric_setting_returns_configuration_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("extra_settings", "timezone", "message"),
+    [
+        (
+            'retention_days = "seven"',
+            "America/Chicago",
+            "retention_days must be an integer",
+        ),
+        ("", "/tmp/foo", "Unknown timezone: /tmp/foo"),
+    ],
+)
+def test_malformed_setting_returns_configuration_error(
+    tmp_path: Path, extra_settings: str, timezone: str, message: str
+) -> None:
     config_path = tmp_path / "config.toml"
     write_config(
         config_path,
-        extra_settings='retention_days = "seven"',
+        extra_settings=extra_settings,
+        timezone=timezone,
     )
 
     response = engine_api._response(request(config_path, "settings.get"))
 
     assert response["error"] == {
         "code": "configuration_error",
-        "message": "retention_days must be an integer",
+        "message": message,
     }
 
 
