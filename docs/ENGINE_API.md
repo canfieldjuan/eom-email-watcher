@@ -1,0 +1,75 @@
+# Engine API v1
+
+`eom-mail-engine` is the machine-facing boundary for desktop hosts. It is a one-shot process:
+write one JSON request to stdin, read one JSON response from stdout, then inspect the exit status.
+Human diagnostics go to stderr.
+
+The first technical-user build may invoke the command from the installed Python environment. A
+future packaged sidecar must preserve this protocol.
+
+## Envelope
+
+Every request includes the protocol version, operation, engine config path, and an operation
+payload:
+
+```json
+{
+  "protocol": 1,
+  "operation": "inbox.recent",
+  "config_path": "/platform/app/config/config.toml",
+  "payload": {"limit": 20}
+}
+```
+
+Success and error responses are deterministic JSON objects:
+
+```json
+{"data":{"items":[]},"ok":true,"operation":"inbox.recent","protocol":1}
+```
+
+```json
+{
+  "error":{"code":"invalid_request","message":"limit must be an integer between 1 and 500"},
+  "ok":false,
+  "operation":"inbox.recent",
+  "protocol":1
+}
+```
+
+Exit status is `0` for success and `2` for a handled error. Requests are limited to 1 MB. Unknown
+payload fields are rejected. Responses never contain OAuth tokens, model token contents, the ntfy
+topic, or raw email bodies.
+
+## Operations
+
+| Operation | Payload | Result |
+|---|---|---|
+| `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
+| `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host |
+| `inbox.recent` | optional `limit` | Existing SQLite inbox rows; no raw bodies |
+| `watchlist.list` | `{}` | Normalized configured senders |
+| `settings.get` | `{}` | Safe public settings and token-presence boolean |
+| `notifications.pending` | optional `limit` | Durable native-notification intents |
+| `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
+
+Watchlist and settings mutation are intentionally not part of this version yet. The frontend must
+not edit TOML directly while those operations are absent.
+
+## Native notification handoff
+
+`watcher.check` persists analysis without invoking `notify-send`. The host then:
+
+1. calls `notifications.pending`;
+2. sends each intent through the native platform notification API;
+3. calls `notifications.ack` only after the platform accepts it.
+
+An analysis acknowledgement must echo `message_id`, `kind`, and `analysis_at` from the pending
+intent. A fallback acknowledgement uses `message_id` and `kind`. Stale identities are rejected so
+a delayed fallback acknowledgement cannot consume a newer analysis notification.
+
+Acknowledgement is idempotent. Delivery is at-least-once: if the host exits after platform
+acceptance but before acknowledgement, the durable intent remains and may be delivered again after
+restart. An unacknowledged intent is never treated as delivered.
+
+When notifications are disabled, analysis is completed without creating a host-delivery intent.
+The existing `eom-mail-watch check` command retains its Linux notification behavior.

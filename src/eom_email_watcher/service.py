@@ -26,7 +26,9 @@ class Watcher:
         self.store.set_state(history_id)
         return history_id
 
-    def check(self, *, dry_run: bool = False) -> dict[str, int | bool]:
+    def check(
+        self, *, dry_run: bool = False, deliver_notifications: bool = True
+    ) -> dict[str, int | bool]:
         state = self.store.state()
         if not state:
             raise RuntimeError("Watcher is not initialized. Run: eom-mail-watch setup")
@@ -70,7 +72,11 @@ class Watcher:
 
         if not dry_run:
             self.store.set_state(newest_cursor)
-        summarized, fallback = self._process_pending(dry_run=dry_run, extra=dry_run_messages)
+        summarized, fallback = self._process_pending(
+            dry_run=dry_run,
+            deliver_notifications=deliver_notifications,
+            extra=dry_run_messages,
+        )
         purged = 0 if dry_run else self.store.purge(self.config.retention_days)
         return {
             "discovered": added,
@@ -149,14 +155,21 @@ class Watcher:
         return 0
 
     def _process_pending(
-        self, *, dry_run: bool, extra: list[PendingMessage] | None = None
+        self,
+        *,
+        dry_run: bool,
+        deliver_notifications: bool,
+        extra: list[PendingMessage] | None = None,
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
         for message in self.store.pending_delivery():
-            fallback += self._deliver_analysis(
-                message, self._stored_analysis(message), dry_run
-            )
+            if deliver_notifications:
+                fallback += self._deliver_analysis(
+                    message, self._stored_analysis(message), dry_run
+                )
+            elif not self.config.notifications_enabled and not dry_run:
+                self.store.mark_delivery_complete(message.message_id, notified=False)
         for message in [*self.store.pending(), *(extra or [])]:
             try:
                 payload = self.gmail.full_payload(message.message_id)
@@ -172,7 +185,10 @@ class Watcher:
                 if not dry_run:
                     self.store.mark_analyzed(message.message_id, analysis.model_dump())
                 summarized += 1
-                fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
+                if deliver_notifications:
+                    fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
+                elif not self.config.notifications_enabled and not dry_run:
+                    self.store.mark_delivery_complete(message.message_id, notified=False)
             except MessageUnavailable as exc:
                 logger.info(
                     "Skipping pending message %s (gone before fetch): %s",
@@ -184,7 +200,8 @@ class Watcher:
                 continue
             except ModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
-                fallback += self._send_fallback(message, dry_run)
+                if deliver_notifications:
+                    fallback += self._send_fallback(message, dry_run)
                 if not dry_run:
                     self.store.record_failure(message.message_id, str(exc), message.attempts)
         return summarized, fallback
