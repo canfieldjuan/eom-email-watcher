@@ -83,8 +83,12 @@ def validate_analysis(raw: dict[str, object], received_at: str) -> Analysis:
                 analysis.deadline_iso = None
     if not analysis.deadline_text:
         analysis.deadline_iso = None
+    if analysis.suggested_action is not None and not analysis.suggested_action.strip():
+        analysis.suggested_action = None
     if analysis.suggested_action or analysis.deadline_text:
         analysis.action_required = True
+    if analysis.action_required and not analysis.suggested_action:
+        raise ModelError("Local model action_required=true requires a suggested action")
     return analysis
 
 
