@@ -151,6 +151,21 @@ the previous month's Firefly hours. SQLite duplicate protection prevents more th
 send for a billing month. `--test-to address@example.com` sends a clearly marked test and does not
 consume the production duplicate key.
 
+If a production send is left `reserved` or `ambiguous`, do not rerun it blindly. Inspect the exact
+dedupe key printed by the error, then independently check Gmail Sent before choosing a resolution:
+
+```bash
+uv run eom-mail-watch outbound-status monthly-hours:2026-07
+uv run eom-mail-watch outbound-resolve monthly-hours:2026-07 --confirm-sent GMAIL_MESSAGE_ID
+uv run eom-mail-watch outbound-resolve monthly-hours:2026-07 --confirm-unsent
+```
+
+These reconciliation commands never contact Gmail or send mail. `--confirm-sent` records the Gmail
+message ID and preserves the duplicate block. Use `--confirm-unsent` only after proving no message
+was accepted; it releases the reservation so a later timer or manual `send-hours` run may send.
+Production sends and mutating reconciliation refuse to overlap on this machine. Stop the monthly
+timer first if later eligibility would still be unsafe during reconciliation.
+
 ## Development
 
 ```bash

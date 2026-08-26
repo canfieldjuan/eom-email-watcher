@@ -290,6 +290,21 @@ class Store:
             ).fetchone()
         return str(row["status"]) if row else None
 
+    def outbound_details(self, dedupe_key: str) -> dict[str, object] | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT dedupe_key, recipient, subject, 'sent' AS status,
+                gmail_message_id, NULL AS reserved_at, sent_at AS updated_at,
+                NULL AS last_error FROM outbound_sends WHERE dedupe_key = ?
+                UNION ALL
+                SELECT dedupe_key, recipient, subject, status, NULL AS gmail_message_id,
+                reserved_at, updated_at, last_error FROM outbound_reservations
+                WHERE dedupe_key = ?
+                LIMIT 1""",
+                (dedupe_key, dedupe_key),
+            ).fetchone()
+        return dict(row) if row else None
+
     def outbound_was_sent(self, dedupe_key: str) -> bool:
         return self.outbound_status(dedupe_key) == "sent"
 
@@ -318,6 +333,56 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Outbound reservation is not in the reserved state")
+
+    def reconcile_outbound_sent(self, dedupe_key: str, gmail_message_id: str) -> None:
+        message_id = gmail_message_id.strip()
+        if not message_id:
+            raise RuntimeError("A non-empty Gmail message ID is required")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            completed = db.execute(
+                "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            if completed:
+                if completed["gmail_message_id"] == message_id:
+                    return
+                raise RuntimeError("Completed outbound send has a different Gmail message ID")
+            reservation = db.execute(
+                """SELECT recipient, subject FROM outbound_reservations
+                WHERE dedupe_key = ?""",
+                (dedupe_key,),
+            ).fetchone()
+            if not reservation:
+                raise RuntimeError("Outbound send has no unresolved reservation")
+            db.execute(
+                """INSERT INTO outbound_sends(
+                    dedupe_key, recipient, subject, gmail_message_id, sent_at
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    dedupe_key,
+                    reservation["recipient"],
+                    reservation["subject"],
+                    message_id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            db.execute(
+                "DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,)
+            )
+
+    def release_outbound(self, dedupe_key: str) -> None:
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM outbound_sends WHERE dedupe_key = ?", (dedupe_key,)
+            ).fetchone():
+                raise RuntimeError("Cannot release a completed outbound send")
+            cursor = db.execute(
+                "DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,)
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Outbound send has no unresolved reservation")
 
     def record_outbound(
         self,
