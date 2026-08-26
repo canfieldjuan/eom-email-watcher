@@ -92,6 +92,23 @@ def test_duplicate_sender_is_rejected(tmp_path: Path) -> None:
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("retention_days", '"seven"', "retention_days"),
+        ("body_char_limit", "{ value = 1000 }", "body_char_limit"),
+        ("model_timeout_seconds", '"soon"', "model_timeout_seconds"),
+    ],
+)
+def test_malformed_numeric_settings_raise_config_error(
+    tmp_path: Path, setting: str, value: str, message: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, extra=f"{setting} = {value}")
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
 def test_ntfy_defaults_to_disabled(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

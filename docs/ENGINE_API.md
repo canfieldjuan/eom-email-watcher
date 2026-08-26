@@ -56,6 +56,11 @@ only to stderr.
 Watchlist and settings mutation are intentionally not part of this version yet. The frontend must
 not edit TOML directly while those operations are absent.
 
+Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
+`production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A
+future Windows host must add an equivalent lock before enabling production checks; dry-run and
+read-only operations remain available meanwhile.
+
 ## Native notification handoff
 
 `watcher.check` persists analysis without invoking `notify-send`. The host then:

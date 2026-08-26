@@ -6,10 +6,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def operation_lock_supported() -> bool:
+    return os.name == "posix"
+
+
 @contextmanager
 def operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
     """Hold the existing Unix advisory lock behind a platform adapter boundary."""
-    if os.name != "posix":
+    if not operation_lock_supported():
         raise RuntimeError("Production operation locking is not available on this platform")
 
     import fcntl

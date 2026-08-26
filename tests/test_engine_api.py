@@ -18,6 +18,7 @@ def write_config(
     *,
     ntfy_topic: str | None = None,
     notifications_enabled: bool = True,
+    extra_settings: str = "",
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
@@ -32,6 +33,7 @@ model_name = "local-model"
 model_require_auth = false
 notifications_enabled = {notifications_setting}
 {ntfy_setting}
+{extra_settings}
 
 [[senders]]
 email = "z@example.com"
@@ -90,6 +92,7 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
         "host_delivery_ready": True,
         "ntfy_configured": False,
     }
+    assert health["data"]["production_check_supported"] is True
 
     runtime = load_runtime(config_path)
     runtime.store.add_message(
@@ -232,6 +235,35 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     assert loaded.store.recent(1) == []
 
 
+def test_unsupported_platform_is_reported_before_production_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    gmail_calls = 0
+
+    def gmail_from_token(*args):
+        nonlocal gmail_calls
+        gmail_calls += 1
+        return FakeGmail()
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda: False)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
+
+    health = engine_api._response(request(config_path, "health.get"))
+    checked = engine_api._response(request(config_path, "watcher.check"))
+
+    assert health["data"]["production_check_supported"] is False
+    assert health["data"]["notifications"]["host_delivery_ready"] is False
+    assert checked["error"]["code"] == "unsupported_platform"
+    assert gmail_calls == 0
+    assert loaded.store.state()[0] == "100"
+
+
 def test_disabled_notifications_hide_analysis_and_fallback_intents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -355,6 +387,21 @@ def test_gmail_error_response_redacts_configured_path(
     }
     assert str(sensitive_path) not in json.dumps(response)
     assert str(sensitive_path) in caplog.text
+
+
+def test_malformed_numeric_setting_returns_configuration_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        extra_settings='retention_days = "seven"',
+    )
+
+    response = engine_api._response(request(config_path, "settings.get"))
+
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": "retention_days must be an integer",
+    }
 
 
 def test_protocol_rejects_unknown_payload_fields(tmp_path: Path) -> None:

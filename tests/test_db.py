@@ -136,6 +136,26 @@ def test_fallback_ack_does_not_ack_later_analysis(tmp_path: Path) -> None:
     assert store.notification_intents()[0].kind == "analysis"
 
 
+def test_fallback_ack_requires_current_notification_intent(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Update",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+
+    with pytest.raises(RuntimeError, match="no longer current"):
+        store.acknowledge_notification(message_id="m1", kind="fallback")
+    assert store.recent(1)[0]["fallback_notified_at"] is None
+
+    store.record_failure("m1", "local model unavailable", 0)
+    assert store.acknowledge_notification(message_id="m1", kind="fallback") == "acknowledged"
+
+
 def test_notification_intent_count_is_not_limited_to_retrieval_page(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()

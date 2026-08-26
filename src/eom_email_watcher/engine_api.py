@@ -10,7 +10,7 @@ from pathlib import Path
 from .config import ConfigError, load_config
 from .db import NotificationIntent
 from .gmail import GmailError, GmailGateway
-from .locking import operation_lock
+from .locking import operation_lock, operation_lock_supported
 from .runtime import Runtime, load_runtime
 from .service import Watcher
 
@@ -72,6 +72,7 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     config = runtime.config
+    production_check_supported = operation_lock_supported()
     state = runtime.store.state()
     model_ok, model_detail = runtime.model.health()
     return {
@@ -94,9 +95,12 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         "notifications": {
             "delivery": "host",
             "enabled": config.notifications_enabled,
-            "host_delivery_ready": config.ntfy_topic is None,
+            "host_delivery_ready": (
+                config.ntfy_topic is None and production_check_supported
+            ),
             "ntfy_configured": config.ntfy_topic is not None,
         },
+        "production_check_supported": production_check_supported,
         "watchlist_count": len(config.senders),
     }
 
@@ -106,6 +110,11 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     dry_run = payload.get("dry_run", False)
     if not isinstance(dry_run, bool):
         raise ApiError("invalid_request", "dry_run must be a boolean")
+    if not dry_run and not operation_lock_supported():
+        raise ApiError(
+            "unsupported_platform",
+            "Production watcher checks require POSIX operation locking",
+        )
 
     runtime = _runtime(request)
     config = runtime.config

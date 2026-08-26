@@ -95,6 +95,20 @@ def _validate_model_base_url(value: object) -> str:
     return base_url
 
 
+def _integer_setting(data: dict[str, object], key: str, default: int) -> int:
+    try:
+        return int(data.get(key, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(f"{key} must be an integer") from exc
+
+
+def _float_setting(data: dict[str, object], key: str, default: float) -> float:
+    try:
+        return float(data.get(key, default))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ConfigError(f"{key} must be numeric") from exc
+
+
 def load_config(path: Path | None = None) -> Config:
     config_path = (path or DEFAULT_CONFIG).expanduser()
     try:
@@ -133,9 +147,9 @@ def load_config(path: Path | None = None) -> Config:
             raise ConfigError(f"senders entry {index} name must be a string")
         senders.append(Sender(email=email, name=name.strip() if name else None))
 
-    body_limit = int(data.get("body_char_limit", 20_000))
-    retention = int(data.get("retention_days", 180))
-    timeout = float(data.get("model_timeout_seconds", 60))
+    body_limit = _integer_setting(data, "body_char_limit", 20_000)
+    retention = _integer_setting(data, "retention_days", 180)
+    timeout = _float_setting(data, "model_timeout_seconds", 60)
     if not 1_000 <= body_limit <= 100_000:
         raise ConfigError("body_char_limit must be between 1000 and 100000")
     if not 1 <= retention <= 3650:

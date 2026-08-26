@@ -318,7 +318,7 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT status, analysis_at, fallback_notified_at, notified_at
+                """SELECT status, analysis_at, fallback_notified_at, notified_at, last_error
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -328,7 +328,7 @@ class Store:
             if kind == "fallback":
                 if row["fallback_notified_at"] is not None:
                     return "already_acknowledged"
-                if row["status"] != "pending":
+                if row["status"] != "pending" or row["last_error"] is None:
                     raise RuntimeError("Fallback notification intent is no longer current")
                 db.execute(
                     "UPDATE messages SET fallback_notified_at = ? WHERE message_id = ?",
