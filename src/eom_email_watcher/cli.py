@@ -166,23 +166,44 @@ def _send_hours(config_path: Path, *, test_to: str | None, dry_run: bool) -> int
         raise ConfigError("monthly_hours_recipient must be configured")
     content = previous_month_email(datetime.now(config.zone).date())
     dedupe_key = f"monthly-hours:{content.period_key}"
-    if not test_to and store.outbound_was_sent(dedupe_key):
-        print(json.dumps({"status": "already_sent", "period": content.period_key}))
-        return 0
     subject = f"[TEST] {content.subject}" if test_to else content.subject
     if dry_run:
         print(json.dumps({"to": recipient, "subject": subject, "body": content.body}, indent=2))
         return 0
-    message_id = GmailSender.from_token(config.gmail_send_token_file).send(
-        recipient, subject, content.body
-    )
     if not test_to:
-        store.record_outbound(
-            dedupe_key=dedupe_key,
-            recipient=recipient,
-            subject=subject,
-            gmail_message_id=message_id,
+        status = store.outbound_status(dedupe_key)
+        if status == "sent":
+            print(json.dumps({"status": "already_sent", "period": content.period_key}))
+            return 0
+        if status:
+            raise SendError(
+                f"Outbound send {dedupe_key} is {status} and requires manual reconciliation"
+            )
+    sender = GmailSender.from_token(config.gmail_send_token_file)
+    if not test_to and not store.reserve_outbound(
+        dedupe_key=dedupe_key, recipient=recipient, subject=subject
+    ):
+        status = store.outbound_status(dedupe_key)
+        if status == "sent":
+            print(json.dumps({"status": "already_sent", "period": content.period_key}))
+            return 0
+        raise SendError(
+            f"Outbound send {dedupe_key} is {status or 'blocked'} and requires "
+            "manual reconciliation"
         )
+    try:
+        message_id = sender.send(recipient, subject, content.body)
+        if not test_to:
+            store.record_outbound(
+                dedupe_key=dedupe_key,
+                recipient=recipient,
+                subject=subject,
+                gmail_message_id=message_id,
+            )
+    except Exception as exc:
+        if not test_to:
+            store.mark_outbound_ambiguous(dedupe_key, type(exc).__name__)
+        raise
     print(json.dumps({"status": "sent", "to": recipient, "subject": subject}))
     return 0
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,15 @@ class Store:
                     subject TEXT NOT NULL,
                     gmail_message_id TEXT NOT NULL,
                     sent_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS outbound_reservations (
+                    dedupe_key TEXT PRIMARY KEY,
+                    recipient TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('reserved', 'ambiguous')),
+                    reserved_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT
                 );
                 """
             )
@@ -270,14 +279,45 @@ class Store:
             )
         return cursor.rowcount
 
-    def outbound_was_sent(self, dedupe_key: str) -> bool:
+    def outbound_status(self, dedupe_key: str) -> str | None:
         with self.connection() as db:
-            return (
-                db.execute(
-                    "SELECT 1 FROM outbound_sends WHERE dedupe_key = ?", (dedupe_key,)
-                ).fetchone()
-                is not None
+            row = db.execute(
+                """SELECT 'sent' AS status FROM outbound_sends WHERE dedupe_key = ?
+                UNION ALL
+                SELECT status FROM outbound_reservations WHERE dedupe_key = ?
+                LIMIT 1""",
+                (dedupe_key, dedupe_key),
+            ).fetchone()
+        return str(row["status"]) if row else None
+
+    def outbound_was_sent(self, dedupe_key: str) -> bool:
+        return self.outbound_status(dedupe_key) == "sent"
+
+    def reserve_outbound(self, *, dedupe_key: str, recipient: str, subject: str) -> bool:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM outbound_sends WHERE dedupe_key = ?", (dedupe_key,)
+            ).fetchone():
+                return False
+            cursor = db.execute(
+                """INSERT OR IGNORE INTO outbound_reservations(
+                    dedupe_key, recipient, subject, status, reserved_at, updated_at
+                ) VALUES (?, ?, ?, 'reserved', ?, ?)""",
+                (dedupe_key, recipient, subject, stamp, stamp),
             )
+        return cursor.rowcount == 1
+
+    def mark_outbound_ambiguous(self, dedupe_key: str, error: str) -> None:
+        with self.connection() as db:
+            cursor = db.execute(
+                """UPDATE outbound_reservations SET status='ambiguous', updated_at=?,
+                last_error=? WHERE dedupe_key=? AND status='reserved'""",
+                (datetime.now(UTC).isoformat(), error[:500], dedupe_key),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Outbound reservation is not in the reserved state")
 
     def record_outbound(
         self,
@@ -288,6 +328,19 @@ class Store:
         gmail_message_id: str,
     ) -> None:
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            reservation = db.execute(
+                """SELECT recipient, subject, status FROM outbound_reservations
+                WHERE dedupe_key = ?""",
+                (dedupe_key,),
+            ).fetchone()
+            if (
+                not reservation
+                or reservation["status"] != "reserved"
+                or reservation["recipient"] != recipient
+                or reservation["subject"] != subject
+            ):
+                raise RuntimeError("Outbound send has no matching active reservation")
             db.execute(
                 """INSERT INTO outbound_sends(
                     dedupe_key, recipient, subject, gmail_message_id, sent_at
@@ -299,4 +352,7 @@ class Store:
                     gmail_message_id,
                     datetime.now(UTC).isoformat(),
                 ),
+            )
+            db.execute(
+                "DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,)
             )
