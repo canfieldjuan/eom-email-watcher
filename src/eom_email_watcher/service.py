@@ -77,7 +77,17 @@ class Watcher:
             deliver_notifications=deliver_notifications,
             extra=dry_run_messages,
         )
-        purged = 0 if dry_run else self.store.purge(self.config.retention_days)
+        preserve_notification_intents = (
+            not deliver_notifications and self.config.notifications_enabled
+        )
+        purged = (
+            0
+            if dry_run
+            else self.store.purge(
+                self.config.retention_days,
+                preserve_notification_intents=preserve_notification_intents,
+            )
+        )
         return {
             "discovered": added,
             "summarized": summarized,

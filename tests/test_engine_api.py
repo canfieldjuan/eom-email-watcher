@@ -12,7 +12,14 @@ from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime
 
 
-def write_config(path: Path) -> None:
+def write_config(
+    path: Path,
+    *,
+    ntfy_topic: str | None = None,
+    notifications_enabled: bool = True,
+) -> None:
+    ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
+    notifications_setting = str(notifications_enabled).lower()
     path.write_text(
         f'''timezone = "America/Chicago"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
@@ -22,7 +29,8 @@ database_file = "{path.parent / "watcher.sqlite3"}"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false
-notifications_enabled = true
+notifications_enabled = {notifications_setting}
+{ntfy_setting}
 
 [[senders]]
 email = "z@example.com"
@@ -30,6 +38,7 @@ name = "Zed"
 
 [[senders]]
 email = "A@Example.com"
+name = "Trusted A"
 ''',
         encoding="utf-8",
     )
@@ -60,7 +69,7 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
         "operation": "watchlist.list",
         "data": {
             "items": [
-                {"email": "a@example.com", "name": None},
+                {"email": "a@example.com", "name": "Trusted A"},
                 {"email": "z@example.com", "name": "Zed"},
             ]
         },
@@ -74,7 +83,12 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
 
     health = engine_api._response(request(config_path, "health.get"))
     assert health["data"]["local_model"]["ok"] is True
-    assert health["data"]["notifications"] == {"delivery": "host", "enabled": True}
+    assert health["data"]["notifications"] == {
+        "delivery": "host",
+        "enabled": True,
+        "host_delivery_ready": True,
+        "ntfy_configured": False,
+    }
 
     runtime = load_runtime(config_path)
     runtime.store.add_message(
@@ -98,7 +112,7 @@ class FakeGmail:
             message_id,
             None,
             "a@example.com",
-            None,
+            "Untrusted Header Name",
             "Action needed",
             "2026-07-18T14:00:00+00:00",
             frozenset({"INBOX"}),
@@ -109,6 +123,9 @@ class FakeGmail:
 
 
 class FakeModel:
+    def health(self) -> tuple[bool, str]:
+        return True, "HTTP 200"
+
     def analyze(self, **kwargs) -> Analysis:
         return Analysis(
             category="customer_request",
@@ -143,6 +160,7 @@ def test_check_defers_delivery_until_state_checked_ack(
     intent = pending["data"]["items"][0]
     assert intent["kind"] == "analysis"
     assert intent["body"] == "Please respond.\nNext: Reply."
+    assert intent["title"] == "Trusted A: Action needed"
 
     stale = engine_api._response(
         request(
@@ -180,6 +198,56 @@ def test_check_defers_delivery_until_state_checked_ack(
         )
     )
     assert duplicate["data"]["status"] == "already_acknowledged"
+
+
+def test_check_rejects_ntfy_before_gmail_or_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, ntfy_topic="configured-private-topic")
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+    assert health["data"]["notifications"] == {
+        "delivery": "host",
+        "enabled": True,
+        "host_delivery_ready": False,
+        "ntfy_configured": True,
+    }
+
+    checked = engine_api._response(request(config_path, "watcher.check"))
+
+    assert checked["ok"] is False
+    assert checked["error"]["code"] == "unsupported_configuration"
+    assert loaded.store.state()[0] == "100"
+    assert loaded.store.recent(1) == []
+
+
+def test_pending_notifications_excludes_fallback_when_disabled(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, notifications_enabled=False)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name="Untrusted Header Name",
+        subject="Action needed",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.record_failure("m1", "local model unavailable", 0)
+
+    pending = engine_api._response(request(config_path, "notifications.pending"))
+
+    assert pending["data"]["items"] == []
 
 
 def test_protocol_rejects_unknown_payload_fields(tmp_path: Path) -> None:

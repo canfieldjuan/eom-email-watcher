@@ -81,6 +81,8 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         "notifications": {
             "delivery": "host",
             "enabled": config.notifications_enabled,
+            "host_delivery_ready": config.ntfy_topic is None,
+            "ntfy_configured": config.ntfy_topic is not None,
         },
         "watchlist_count": len(config.senders),
     }
@@ -94,6 +96,11 @@ def _check(request: dict[str, object]) -> dict[str, object]:
 
     runtime = _runtime(request)
     config = runtime.config
+    if config.ntfy_topic:
+        raise ApiError(
+            "unsupported_configuration",
+            "Host-deferred checks cannot run while ntfy delivery is configured",
+        )
     lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
     def run() -> dict[str, int | bool]:
@@ -110,7 +117,11 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             result = run()
     return {
         **result,
-        "pending_notifications": len(runtime.store.notification_intents(limit=500)),
+        "pending_notifications": len(
+            runtime.store.notification_intents(
+                limit=500, include_fallback=config.notifications_enabled
+            )
+        ),
     }
 
 
@@ -152,8 +163,10 @@ def _settings(request: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _notification_payload(intent: NotificationIntent) -> dict[str, object]:
-    label = intent.sender_name or intent.sender
+def _notification_payload(
+    intent: NotificationIntent, sender_names: dict[str, str | None]
+) -> dict[str, object]:
+    label = sender_names.get(intent.sender) or intent.sender_name or intent.sender
     title = f"{label}: {intent.subject}"
     if intent.kind == "analysis":
         lines = [intent.summary]
@@ -179,8 +192,15 @@ def _notification_payload(intent: NotificationIntent) -> dict[str, object]:
 def _notifications_pending(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"limit"})
     limit = _bounded_limit(payload, default=25)
-    intents = _runtime(request).store.notification_intents(limit)
-    return {"items": [_notification_payload(intent) for intent in intents]}
+    runtime = _runtime(request)
+    config = runtime.config
+    intents = runtime.store.notification_intents(
+        limit, include_fallback=config.notifications_enabled
+    )
+    sender_names = {sender.email: sender.name for sender in config.senders}
+    return {
+        "items": [_notification_payload(intent, sender_names) for intent in intents]
+    }
 
 
 def _notifications_ack(request: dict[str, object]) -> dict[str, object]:

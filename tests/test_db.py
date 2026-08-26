@@ -136,6 +136,68 @@ def test_fallback_ack_does_not_ack_later_analysis(tmp_path: Path) -> None:
     assert store.notification_intents()[0].kind == "analysis"
 
 
+def test_notification_intents_can_exclude_fallbacks(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Update",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    store.record_failure("m1", "local model unavailable", 0)
+
+    assert store.notification_intents()[0].kind == "fallback"
+    assert store.notification_intents(include_fallback=False) == []
+
+
+def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for message_id in ("analysis", "fallback", "ordinary"):
+        store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject=message_id,
+            received_at="2026-07-18T14:00:00+00:00",
+        )
+    store.mark_analyzed(
+        "analysis",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "Summary.",
+            "action_required": False,
+            "suggested_action": None,
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    store.record_failure("fallback", "local model unavailable", 0)
+    old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    with store.connection() as db:
+        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+
+    assert store.purge(1, preserve_notification_intents=True) == 1
+    assert {row["message_id"] for row in store.recent(10)} == {"analysis", "fallback"}
+
+    analysis = next(
+        intent for intent in store.notification_intents() if intent.kind == "analysis"
+    )
+    store.acknowledge_notification(
+        message_id="analysis", kind="analysis", analysis_at=analysis.analysis_at
+    )
+    store.acknowledge_notification(message_id="fallback", kind="fallback")
+
+    assert store.purge(1, preserve_notification_intents=True) == 2
+    assert store.recent(10) == []
+
+
 def test_retry_is_not_immediately_due(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()

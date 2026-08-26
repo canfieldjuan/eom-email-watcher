@@ -276,7 +276,9 @@ class Store:
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
 
-    def notification_intents(self, limit: int = 25) -> list[NotificationIntent]:
+    def notification_intents(
+        self, limit: int = 25, *, include_fallback: bool = True
+    ) -> list[NotificationIntent]:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT message_id,
@@ -285,10 +287,10 @@ class Store:
                 suggested_action, deadline_iso, last_error
                 FROM messages
                 WHERE (status = 'analyzed' AND notified_at IS NULL)
-                   OR (status = 'pending' AND last_error IS NOT NULL
+                   OR (? AND status = 'pending' AND last_error IS NOT NULL
                        AND fallback_notified_at IS NULL)
                 ORDER BY received_at LIMIT ?""",
-                (limit,),
+                (include_fallback, limit),
             ).fetchall()
         return [NotificationIntent(**dict(row)) for row in rows]
 
@@ -351,12 +353,25 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def purge(self, retention_days: int) -> int:
+    def purge(
+        self, retention_days: int, *, preserve_notification_intents: bool = False
+    ) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         with self.connection() as db:
-            cursor = db.execute(
-                "DELETE FROM messages WHERE discovered_at < ?", (cutoff.isoformat(),)
-            )
+            if preserve_notification_intents:
+                cursor = db.execute(
+                    """DELETE FROM messages WHERE discovered_at < ?
+                    AND NOT (
+                        (status = 'analyzed' AND notified_at IS NULL)
+                        OR (status = 'pending' AND last_error IS NOT NULL
+                            AND fallback_notified_at IS NULL)
+                    )""",
+                    (cutoff.isoformat(),),
+                )
+            else:
+                cursor = db.execute(
+                    "DELETE FROM messages WHERE discovered_at < ?", (cutoff.isoformat(),)
+                )
         return cursor.rowcount
 
     def outbound_status(self, dedupe_key: str) -> str | None:

@@ -67,9 +67,17 @@ An analysis acknowledgement must echo `message_id`, `kind`, and `analysis_at` fr
 intent. A fallback acknowledgement uses `message_id` and `kind`. Stale identities are rejected so
 a delayed fallback acknowledgement cannot consume a newer analysis notification.
 
+Host-deferred checks fail with `unsupported_configuration` when an ntfy topic is configured. The
+existing CLI remains the canonical path for ntfy delivery; silently bypassing that configured
+channel would lose its delivery contract. `health.get` reports `host_delivery_ready` and whether
+ntfy is configured without exposing the topic.
+
 Acknowledgement is idempotent. Delivery is at-least-once: if the host exits after platform
 acceptance but before acknowledgement, the durable intent remains and may be delivered again after
 restart. An unacknowledged intent is never treated as delivered.
 
-When notifications are disabled, analysis is completed without creating a host-delivery intent.
-The existing `eom-mail-watch check` command retains its Linux notification behavior.
+When notifications are disabled, analysis is completed without creating a host-delivery intent,
+and model failures do not create fallback intents for the host. Retention never purges an
+unacknowledged host-delivery intent. Pending notification titles prefer the configured watchlist
+name over untrusted message-header display names. The existing `eom-mail-watch check` command
+retains its Linux notification behavior.

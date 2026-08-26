@@ -265,7 +265,7 @@ def test_fallback_does_not_suppress_recovered_analysis(
 def test_deferred_delivery_persists_analysis_without_linux_notification(
     tmp_path: Path, monkeypatch
 ) -> None:
-    cfg = replace(config(tmp_path), notifications_enabled=True)
+    cfg = replace(config(tmp_path), notifications_enabled=True, retention_days=1)
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
@@ -283,6 +283,15 @@ def test_deferred_delivery_persists_analysis_without_linux_notification(
 
     assert result["summarized"] == 1
     assert store.recent(1)[0]["status"] == "analyzed"
+    assert store.notification_intents()[0].kind == "analysis"
+
+    old = (datetime.now(UTC) - service_module.timedelta(days=2)).isoformat()
+    with store.connection() as db:
+        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+
+    watcher = Watcher(cfg, store, FakeGmail(), FakeModel())
+    watcher.check(deliver_notifications=False)
+
     assert store.notification_intents()[0].kind == "analysis"
 
 
@@ -326,3 +335,19 @@ def test_deferred_delivery_completes_without_intent_when_notifications_disabled(
 
     assert store.recent(1)[0]["status"] == "summarized"
     assert store.notification_intents() == []
+
+
+def test_deferred_model_failure_has_no_fallback_intent_when_notifications_disabled(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+
+    Watcher(cfg, store, FakeGmail(), FailOnceModel()).check(
+        deliver_notifications=False
+    )
+
+    assert store.recent(1)[0]["status"] == "pending"
+    assert store.notification_intents(include_fallback=False) == []
