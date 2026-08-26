@@ -292,6 +292,16 @@ class Store:
             ).fetchall()
         return [NotificationIntent(**dict(row)) for row in rows]
 
+    def notification_intent_count(self) -> int:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT COUNT(*) AS count FROM messages
+                WHERE (status = 'analyzed' AND notified_at IS NULL)
+                   OR (status = 'pending' AND last_error IS NOT NULL
+                       AND fallback_notified_at IS NULL)"""
+            ).fetchone()
+        return int(row["count"])
+
     def acknowledge_notification(
         self,
         *,

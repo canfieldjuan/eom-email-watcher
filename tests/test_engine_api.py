@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.gmail import MessageMetadata
+from eom_email_watcher.gmail import GmailError, MessageMetadata
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -279,6 +280,81 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
     assert pending["data"]["items"] == []
     assert checked["data"]["pending_notifications"] == 0
     assert {row["status"] for row in runtime.store.recent(10)} == {"pending", "analyzed"}
+
+
+def test_check_reports_complete_notification_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(runtime.store, "notification_intent_count", lambda: 501)
+
+    checked = engine_api._response(
+        request(config_path, "watcher.check", {"dry_run": True})
+    )
+
+    assert checked["data"]["pending_notifications"] == 501
+
+
+def test_protocol_rejects_unknown_top_level_fields_before_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    gmail_calls = 0
+
+    def gmail_from_token(*args):
+        nonlocal gmail_calls
+        gmail_calls += 1
+        return FakeGmail()
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
+
+    for field, value in (("dry_run", True), ("paylod", {"dry_run": True})):
+        invalid = request(config_path, "watcher.check")
+        invalid[field] = value
+        response = engine_api._response(invalid)
+        assert response["error"]["code"] == "invalid_request"
+        assert field in response["error"]["message"]
+
+    assert gmail_calls == 0
+    assert loaded.store.state()[0] == "100"
+
+
+def test_gmail_error_response_redacts_configured_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    sensitive_path = tmp_path / "private-token.json"
+
+    def fail_from_token(*args):
+        raise GmailError(f"Invalid OAuth token file: {sensitive_path}")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", fail_from_token)
+
+    with caplog.at_level(logging.WARNING, logger=engine_api.__name__):
+        response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["error"] == {
+        "code": "gmail_error",
+        "message": "Gmail operation failed; see stderr for details",
+    }
+    assert str(sensitive_path) not in json.dumps(response)
+    assert str(sensitive_path) in caplog.text
 
 
 def test_protocol_rejects_unknown_payload_fields(tmp_path: Path) -> None:

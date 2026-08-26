@@ -16,6 +16,7 @@ from .service import Watcher
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
+REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,12 @@ def _host_notification_intents(runtime: Runtime, limit: int) -> list[Notificatio
     if not runtime.config.notifications_enabled:
         return []
     return runtime.store.notification_intents(limit)
+
+
+def _host_notification_intent_count(runtime: Runtime) -> int:
+    if not runtime.config.notifications_enabled:
+        return 0
+    return runtime.store.notification_intent_count()
 
 
 def _health(request: dict[str, object]) -> dict[str, object]:
@@ -123,9 +130,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             result = run()
     return {
         **result,
-        "pending_notifications": len(
-            _host_notification_intents(runtime, limit=500)
-        ),
+        "pending_notifications": _host_notification_intent_count(runtime),
     }
 
 
@@ -245,6 +250,10 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
 def dispatch(request: object) -> dict[str, object]:
     if not isinstance(request, dict):
         raise ApiError("invalid_request", "request must be an object")
+    unknown = set(request) - REQUEST_FIELDS
+    if unknown:
+        fields = ", ".join(sorted(str(field) for field in unknown))
+        raise ApiError("invalid_request", f"Unsupported request fields: {fields}")
     protocol = request.get("protocol")
     if isinstance(protocol, bool) or protocol != PROTOCOL_VERSION:
         raise ApiError("unsupported_protocol", f"protocol must be {PROTOCOL_VERSION}")
@@ -280,8 +289,12 @@ def _response(request: object) -> dict[str, object]:
             "protocol": PROTOCOL_VERSION,
         }
     except GmailError as exc:
+        logger.warning("Gmail operation failed: %s", exc)
         return {
-            "error": {"code": "gmail_error", "message": str(exc)},
+            "error": {
+                "code": "gmail_error",
+                "message": "Gmail operation failed; see stderr for details",
+            },
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

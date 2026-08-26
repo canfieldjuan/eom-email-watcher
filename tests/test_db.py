@@ -136,6 +136,22 @@ def test_fallback_ack_does_not_ack_later_analysis(tmp_path: Path) -> None:
     assert store.notification_intents()[0].kind == "analysis"
 
 
+def test_notification_intent_count_is_not_limited_to_retrieval_page(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    stamp = datetime.now(UTC).isoformat()
+    with store.connection() as db:
+        db.executemany(
+            """INSERT INTO messages (
+                message_id, sender, subject, received_at, discovered_at, status, last_error
+            ) VALUES (?, 'a@b.com', 'Update', ?, ?, 'pending', 'model unavailable')""",
+            [(f"m{index}", stamp, stamp) for index in range(501)],
+        )
+
+    assert len(store.notification_intents(limit=500)) == 500
+    assert store.notification_intent_count() == 501
+
+
 def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()

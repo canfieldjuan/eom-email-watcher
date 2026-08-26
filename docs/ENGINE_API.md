@@ -37,15 +37,16 @@ Success and error responses are deterministic JSON objects:
 ```
 
 Exit status is `0` for success and `2` for a handled error. Requests are limited to 1 MB. Unknown
-payload fields are rejected. Responses never contain OAuth tokens, model token contents, the ntfy
-topic, or raw email bodies.
+top-level and payload fields are rejected. Responses never contain OAuth tokens, model token
+contents, token paths, the ntfy topic, or raw email bodies. Detailed Gmail diagnostics are written
+only to stderr.
 
 ## Operations
 
 | Operation | Payload | Result |
 |---|---|---|
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
-| `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host |
+| `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows; no raw bodies |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `settings.get` | `{}` | Safe public settings and token-presence boolean |
