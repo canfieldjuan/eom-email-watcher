@@ -231,7 +231,9 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     assert loaded.store.recent(1) == []
 
 
-def test_pending_notifications_excludes_fallback_when_disabled(tmp_path: Path) -> None:
+def test_disabled_notifications_hide_analysis_and_fallback_intents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, notifications_enabled=False)
     runtime = load_runtime(config_path)
@@ -244,10 +246,39 @@ def test_pending_notifications_excludes_fallback_when_disabled(tmp_path: Path) -
         received_at="2026-07-18T14:00:00+00:00",
     )
     runtime.store.record_failure("m1", "local model unavailable", 0)
+    runtime.store.add_message(
+        message_id="m2",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name="Untrusted Header Name",
+        subject="Analyzed action",
+        received_at="2026-07-18T15:00:00+00:00",
+    )
+    runtime.store.mark_analyzed(
+        "m2",
+        {
+            "category": "customer_request",
+            "priority": "high",
+            "summary": "Please respond.",
+            "action_required": True,
+            "suggested_action": "Reply.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    runtime.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
     pending = engine_api._response(request(config_path, "notifications.pending"))
+    checked = engine_api._response(
+        request(config_path, "watcher.check", {"dry_run": True})
+    )
 
     assert pending["data"]["items"] == []
+    assert checked["data"]["pending_notifications"] == 0
+    assert {row["status"] for row in runtime.store.recent(10)} == {"pending", "analyzed"}
 
 
 def test_protocol_rejects_unknown_payload_fields(tmp_path: Path) -> None:

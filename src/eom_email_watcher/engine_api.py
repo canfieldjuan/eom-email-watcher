@@ -55,6 +55,12 @@ def _runtime(request: dict[str, object]) -> Runtime:
     return load_runtime(_config_path(request))
 
 
+def _host_notification_intents(runtime: Runtime, limit: int) -> list[NotificationIntent]:
+    if not runtime.config.notifications_enabled:
+        return []
+    return runtime.store.notification_intents(limit)
+
+
 def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
@@ -118,9 +124,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     return {
         **result,
         "pending_notifications": len(
-            runtime.store.notification_intents(
-                limit=500, include_fallback=config.notifications_enabled
-            )
+            _host_notification_intents(runtime, limit=500)
         ),
     }
 
@@ -194,9 +198,7 @@ def _notifications_pending(request: dict[str, object]) -> dict[str, object]:
     limit = _bounded_limit(payload, default=25)
     runtime = _runtime(request)
     config = runtime.config
-    intents = runtime.store.notification_intents(
-        limit, include_fallback=config.notifications_enabled
-    )
+    intents = _host_notification_intents(runtime, limit)
     sender_names = {sender.email: sender.name for sender in config.senders}
     return {
         "items": [_notification_payload(intent, sender_names) for intent in intents]

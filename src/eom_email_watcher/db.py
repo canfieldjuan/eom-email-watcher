@@ -276,9 +276,7 @@ class Store:
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
 
-    def notification_intents(
-        self, limit: int = 25, *, include_fallback: bool = True
-    ) -> list[NotificationIntent]:
+    def notification_intents(self, limit: int = 25) -> list[NotificationIntent]:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT message_id,
@@ -287,10 +285,10 @@ class Store:
                 suggested_action, deadline_iso, last_error
                 FROM messages
                 WHERE (status = 'analyzed' AND notified_at IS NULL)
-                   OR (? AND status = 'pending' AND last_error IS NOT NULL
+                   OR (status = 'pending' AND last_error IS NOT NULL
                        AND fallback_notified_at IS NULL)
                 ORDER BY received_at LIMIT ?""",
-                (include_fallback, limit),
+                (limit,),
             ).fetchall()
         return [NotificationIntent(**dict(row)) for row in rows]
 

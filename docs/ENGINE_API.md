@@ -76,8 +76,8 @@ Acknowledgement is idempotent. Delivery is at-least-once: if the host exits afte
 acceptance but before acknowledgement, the durable intent remains and may be delivered again after
 restart. An unacknowledged intent is never treated as delivered.
 
-When notifications are disabled, analysis is completed without creating a host-delivery intent,
-and model failures do not create fallback intents for the host. Retention never purges an
-unacknowledged host-delivery intent. Pending notification titles prefer the configured watchlist
-name over untrusted message-header display names. The existing `eom-mail-watch check` command
-retains its Linux notification behavior.
+When notifications are disabled, the host receives no pending analysis or fallback intents,
+including intents queued before the setting changed. New analysis is completed without creating a
+host-delivery intent. Retention never purges an unacknowledged host-delivery intent. Pending
+notification titles prefer the configured watchlist name over untrusted message-header display
+names. The existing `eom-mail-watch check` command retains its Linux notification behavior.

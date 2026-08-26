@@ -335,19 +335,3 @@ def test_deferred_delivery_completes_without_intent_when_notifications_disabled(
 
     assert store.recent(1)[0]["status"] == "summarized"
     assert store.notification_intents() == []
-
-
-def test_deferred_model_failure_has_no_fallback_intent_when_notifications_disabled(
-    tmp_path: Path,
-) -> None:
-    cfg = config(tmp_path)
-    store = Store(cfg.database_file)
-    store.initialize()
-    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
-
-    Watcher(cfg, store, FakeGmail(), FailOnceModel()).check(
-        deliver_notifications=False
-    )
-
-    assert store.recent(1)[0]["status"] == "pending"
-    assert store.notification_intents(include_fallback=False) == []

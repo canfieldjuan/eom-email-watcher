@@ -136,23 +136,6 @@ def test_fallback_ack_does_not_ack_later_analysis(tmp_path: Path) -> None:
     assert store.notification_intents()[0].kind == "analysis"
 
 
-def test_notification_intents_can_exclude_fallbacks(tmp_path: Path) -> None:
-    store = Store(tmp_path / "db.sqlite3")
-    store.initialize()
-    store.add_message(
-        message_id="m1",
-        thread_id=None,
-        sender="a@b.com",
-        sender_name=None,
-        subject="Update",
-        received_at="2026-07-18T14:00:00+00:00",
-    )
-    store.record_failure("m1", "local model unavailable", 0)
-
-    assert store.notification_intents()[0].kind == "fallback"
-    assert store.notification_intents(include_fallback=False) == []
-
-
 def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
