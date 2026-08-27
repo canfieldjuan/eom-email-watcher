@@ -40,6 +40,21 @@ class AnalyzedMessage:
     confidence: float
 
 
+@dataclass(frozen=True)
+class NotificationIntent:
+    message_id: str
+    kind: str
+    sender: str
+    sender_name: str | None
+    subject: str
+    analysis_at: str | None
+    priority: str | None
+    summary: str | None
+    suggested_action: str | None
+    deadline_iso: str | None
+    last_error: str | None
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -261,22 +276,115 @@ class Store:
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
 
+    def notification_intents(self, limit: int = 25) -> list[NotificationIntent]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT message_id,
+                CASE WHEN status = 'analyzed' THEN 'analysis' ELSE 'fallback' END AS kind,
+                sender, sender_name, subject, analysis_at, priority, summary,
+                suggested_action, deadline_iso, last_error
+                FROM messages
+                WHERE (status = 'analyzed' AND notified_at IS NULL)
+                   OR (status = 'pending' AND last_error IS NOT NULL
+                       AND fallback_notified_at IS NULL)
+                ORDER BY received_at LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [NotificationIntent(**dict(row)) for row in rows]
+
+    def notification_intent_count(self) -> int:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT COUNT(*) AS count FROM messages
+                WHERE (status = 'analyzed' AND notified_at IS NULL)
+                   OR (status = 'pending' AND last_error IS NOT NULL
+                       AND fallback_notified_at IS NULL)"""
+            ).fetchone()
+        return int(row["count"])
+
+    def acknowledge_notification(
+        self,
+        *,
+        message_id: str,
+        kind: str,
+        analysis_at: str | None = None,
+    ) -> str:
+        if kind not in {"analysis", "fallback"}:
+            raise ValueError("Notification kind must be analysis or fallback")
+        if kind == "analysis" and not analysis_at:
+            raise ValueError("analysis_at is required for an analysis notification")
+
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT status, analysis_at, fallback_notified_at, notified_at, last_error
+                FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(message_id)
+
+            if kind == "fallback":
+                if row["fallback_notified_at"] is not None:
+                    return "already_acknowledged"
+                if row["status"] != "pending" or row["last_error"] is None:
+                    raise RuntimeError("Fallback notification intent is no longer current")
+                db.execute(
+                    "UPDATE messages SET fallback_notified_at = ? WHERE message_id = ?",
+                    (stamp, message_id),
+                )
+                return "acknowledged"
+
+            if row["analysis_at"] != analysis_at:
+                raise RuntimeError("Analysis notification intent is no longer current")
+            if row["status"] == "summarized" and row["notified_at"] is not None:
+                return "already_acknowledged"
+            if row["status"] != "analyzed":
+                raise RuntimeError("Analysis notification intent is no longer current")
+            db.execute(
+                """UPDATE messages SET status='summarized', next_retry_at=NULL,
+                last_error=NULL, notified_at=? WHERE message_id=?""",
+                (stamp, message_id),
+            )
+            return "acknowledged"
+
     def recent(self, limit: int) -> list[dict[str, object]]:
         with self.connection() as db:
             rows = db.execute(
-                """SELECT received_at, sender, sender_name, subject, status, priority, summary,
-                action_required, suggested_action, deadline_iso, confidence, last_error
+                """SELECT message_id, received_at, sender, sender_name, subject, status,
+                analysis_at, priority, summary, action_required, suggested_action,
+                deadline_text, deadline_iso, confidence, attempts, next_retry_at,
+                fallback_notified_at, notified_at, last_error
                 FROM messages ORDER BY received_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def purge(self, retention_days: int) -> int:
+    def purge(
+        self, retention_days: int, *, preserve_notification_intents: bool = False
+    ) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         with self.connection() as db:
-            cursor = db.execute(
-                "DELETE FROM messages WHERE discovered_at < ?", (cutoff.isoformat(),)
-            )
+            if preserve_notification_intents:
+                cursor = db.execute(
+                    """DELETE FROM messages WHERE discovered_at < ?
+                    AND (notified_at IS NULL OR notified_at < ?)
+                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)
+                    AND NOT (
+                        (status = 'analyzed' AND notified_at IS NULL)
+                        OR (status = 'pending' AND last_error IS NOT NULL
+                            AND fallback_notified_at IS NULL)
+                    )""",
+                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
+                )
+            else:
+                cursor = db.execute(
+                    """DELETE FROM messages WHERE discovered_at < ?
+                    AND (notified_at IS NULL OR notified_at < ?)
+                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)""",
+                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
+                )
         return cursor.rowcount
 
     def outbound_status(self, dedupe_key: str) -> str | None:

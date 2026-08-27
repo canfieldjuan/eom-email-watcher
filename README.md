@@ -108,6 +108,10 @@ uv run eom-mail-watch recent --limit 20
 
 `--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.
 
+Desktop hosts use the versioned one-shot JSON contract documented in
+[`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
+point.
+
 ## Two-hour user timer
 
 After Gmail setup succeeds:
