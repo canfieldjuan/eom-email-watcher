@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -57,6 +58,7 @@ def _check_config(tmp_path: Path) -> SimpleNamespace:
         database_file=state / "watcher.sqlite3",
         gmail_credentials_file=tmp_path / "credentials.json",
         gmail_token_file=tmp_path / "token.json",
+        senders=("trusted@example.com",),
     )
 
 
@@ -96,3 +98,44 @@ def test_dry_run_does_not_take_production_lock(
 
     with cli._production_check_lock(config.database_file):
         assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
+
+
+def test_zero_sender_check_stops_before_lock_and_gmail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        **{
+            **vars(_check_config(tmp_path)),
+            "senders": (),
+            "retention_days": 180,
+            "notifications_enabled": True,
+        }
+    )
+
+    class FakeStore:
+        def purge(self, retention_days: int, *, preserve_notification_intents: bool) -> int:
+            assert retention_days == 180
+            assert preserve_notification_intents is True
+            return 2
+
+    monkeypatch.setattr(cli, "_runtime", lambda path: (config, FakeStore(), object()))
+    monkeypatch.setattr(
+        cli,
+        "_production_check_lock",
+        lambda path: pytest.fail("inactive check must not take the production lock"),
+    )
+    monkeypatch.setattr(
+        cli.GmailGateway,
+        "from_token",
+        lambda *args: pytest.fail("inactive check must not access Gmail"),
+    )
+
+    assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "active": False,
+        "discovered": 0,
+        "fallback_notified": 0,
+        "purged": 2,
+        "stale_cursor_recovered": False,
+        "summarized": 0,
+    }

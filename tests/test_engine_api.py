@@ -237,6 +237,29 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
     }
 
 
+def test_zero_sender_check_still_rejects_incompatible_host_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        include_senders=False,
+        ntfy_topic="configured-private-topic",
+    )
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unsupported_configuration"
+
+
 class FakeGmail:
     def history_message_ids(self, cursor: str):
         return ["m1"], "200"

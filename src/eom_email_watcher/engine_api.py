@@ -130,6 +130,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
 
     runtime = _runtime(request)
     config = runtime.config
+    _require_host_delivery_compatible(runtime)
     if not config.senders:
         return {
             **Watcher.inactive_result(config, runtime.store, dry_run=dry_run),
@@ -141,7 +142,6 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "Production watcher checks require POSIX operation locking",
         )
 
-    _require_host_delivery_compatible(runtime)
     lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
     def run() -> dict[str, int | bool]:

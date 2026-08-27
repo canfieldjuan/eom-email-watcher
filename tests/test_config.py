@@ -219,6 +219,28 @@ def test_watchlist_atomic_replace_failure_preserves_original(
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
+def test_watchlist_mutation_preserves_symlinked_config_target(tmp_path: Path) -> None:
+    target = tmp_path / "managed" / "config.toml"
+    target.parent.mkdir()
+    write_config(target)
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    added = add_sender(link, "new@example.com", "New")
+
+    assert link.is_symlink()
+    assert added.email == "new@example.com"
+    assert load_config(target).allowlist == frozenset(
+        {"trusted@example.com", "new@example.com"}
+    )
+
+    removed = remove_sender(link, "new@example.com")
+
+    assert link.is_symlink()
+    assert removed == added
+    assert load_config(target).allowlist == frozenset({"trusted@example.com"})
+
+
 def test_removing_final_sender_leaves_valid_empty_watchlist(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

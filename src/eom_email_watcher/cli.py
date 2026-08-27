@@ -138,6 +138,9 @@ def _setup(config_path: Path) -> int:
 
 def _check(config_path: Path, dry_run: bool) -> int:
     config, store, model = _runtime(config_path)
+    if not config.senders:
+        print(json.dumps(Watcher.inactive_result(config, store, dry_run=dry_run), indent=2))
+        return 0
     lock = nullcontext() if dry_run else _production_check_lock(config.database_file)
     with lock:
         gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)

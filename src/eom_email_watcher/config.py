@@ -308,7 +308,7 @@ def _sender_table(sender: Sender, *, inline: bool):
 
 def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
     sender = _sender(email, name, invalid_message="email must be a valid email address")
-    config_path = path.expanduser()
+    config_path = path.expanduser().resolve()
     with FileLock(f"{config_path}.lock"):
         config = load_config(config_path)
         if sender.email in config.allowlist:
@@ -330,7 +330,7 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
 
 def remove_sender(path: Path, email: str) -> Sender:
     requested = _sender(email, None, invalid_message="email must be a valid email address")
-    config_path = path.expanduser()
+    config_path = path.expanduser().resolve()
     with FileLock(f"{config_path}.lock"):
         config = load_config(config_path)
         try:
