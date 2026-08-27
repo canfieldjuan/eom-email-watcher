@@ -25,6 +25,29 @@ pub struct WatchedSender {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxItem {
+    pub message_id: String,
+    pub received_at: String,
+    pub sender: String,
+    pub sender_name: Option<String>,
+    pub subject: String,
+    pub status: String,
+    pub analysis_at: Option<String>,
+    pub priority: Option<String>,
+    pub summary: Option<String>,
+    pub action_required: Option<i64>,
+    pub suggested_action: Option<String>,
+    pub deadline_text: Option<String>,
+    pub deadline_iso: Option<String>,
+    pub confidence: Option<f64>,
+    pub attempts: i64,
+    pub next_retry_at: Option<String>,
+    pub fallback_notified_at: Option<String>,
+    pub notified_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
@@ -56,6 +79,11 @@ struct SenderItems {
 #[derive(Deserialize)]
 struct SenderItem {
     item: WatchedSender,
+}
+
+#[derive(Deserialize)]
+struct InboxItems {
+    items: Vec<InboxItem>,
 }
 
 impl EngineError {
@@ -122,6 +150,11 @@ impl Engine {
 
     pub fn list(&self) -> Result<Vec<WatchedSender>, EngineError> {
         self.request::<SenderItems>("watchlist.list", json!({}))
+            .map(|data| data.items)
+    }
+
+    pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
+        self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
             .map(|data| data.items)
     }
 
@@ -286,18 +319,24 @@ mod tests {
     fn watchlist_round_trip_uses_real_engine_contract() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config_path = directory.path().join("config.toml");
+        let database_path = directory.path().join("watcher.sqlite3");
         fs::write(
             &config_path,
-            r#"model_base_url = "http://127.0.0.1:1234/v1"
+            format!(
+                r#"database_file = "{}"
+model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false
 notifications_enabled = true
 "#,
+                database_path.display()
+            ),
         )
         .expect("write config");
         let engine = real_engine(config_path);
 
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
+        assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
         let added = engine
             .add(
                 "Person <WATCHED@Example.com>".into(),
