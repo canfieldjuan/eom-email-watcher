@@ -369,16 +369,21 @@ class Store:
             if preserve_notification_intents:
                 cursor = db.execute(
                     """DELETE FROM messages WHERE discovered_at < ?
+                    AND (notified_at IS NULL OR notified_at < ?)
+                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)
                     AND NOT (
                         (status = 'analyzed' AND notified_at IS NULL)
                         OR (status = 'pending' AND last_error IS NOT NULL
                             AND fallback_notified_at IS NULL)
                     )""",
-                    (cutoff.isoformat(),),
+                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
                 )
             else:
                 cursor = db.execute(
-                    "DELETE FROM messages WHERE discovered_at < ?", (cutoff.isoformat(),)
+                    """DELETE FROM messages WHERE discovered_at < ?
+                    AND (notified_at IS NULL OR notified_at < ?)
+                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)""",
+                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
                 )
         return cursor.rowcount
 

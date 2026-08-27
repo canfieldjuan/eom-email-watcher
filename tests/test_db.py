@@ -213,6 +213,25 @@ def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path
     )
     store.acknowledge_notification(message_id="fallback", kind="fallback")
 
+    assert store.purge(1, preserve_notification_intents=True) == 0
+    assert (
+        store.acknowledge_notification(
+            message_id="analysis", kind="analysis", analysis_at=analysis.analysis_at
+        )
+        == "already_acknowledged"
+    )
+    assert (
+        store.acknowledge_notification(message_id="fallback", kind="fallback")
+        == "already_acknowledged"
+    )
+
+    with store.connection() as db:
+        db.execute(
+            """UPDATE messages SET notified_at = ?, fallback_notified_at = ?
+            WHERE message_id IN ('analysis', 'fallback')""",
+            (old, old),
+        )
+
     assert store.purge(1, preserve_notification_intents=True) == 2
     assert store.recent(10) == []
 

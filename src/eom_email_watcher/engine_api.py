@@ -68,6 +68,14 @@ def _host_notification_intent_count(runtime: Runtime) -> int:
     return runtime.store.notification_intent_count()
 
 
+def _require_host_delivery_compatible(runtime: Runtime) -> None:
+    if runtime.config.ntfy_topic:
+        raise ApiError(
+            "unsupported_configuration",
+            "Host delivery operations cannot run while ntfy delivery is configured",
+        )
+
+
 def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
@@ -118,11 +126,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
 
     runtime = _runtime(request)
     config = runtime.config
-    if config.ntfy_topic:
-        raise ApiError(
-            "unsupported_configuration",
-            "Host-deferred checks cannot run while ntfy delivery is configured",
-        )
+    _require_host_delivery_compatible(runtime)
     lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
     def run() -> dict[str, int | bool]:
@@ -212,6 +216,7 @@ def _notifications_pending(request: dict[str, object]) -> dict[str, object]:
     limit = _bounded_limit(payload, default=25)
     runtime = _runtime(request)
     config = runtime.config
+    _require_host_delivery_compatible(runtime)
     intents = _host_notification_intents(runtime, limit)
     sender_names = {sender.email: sender.name for sender in config.senders}
     return {
@@ -230,8 +235,10 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "kind must be analysis or fallback")
     if analysis_at is not None and not isinstance(analysis_at, str):
         raise ApiError("invalid_request", "analysis_at must be a string or null")
+    runtime = _runtime(request)
+    _require_host_delivery_compatible(runtime)
     try:
-        status = _runtime(request).store.acknowledge_notification(
+        status = runtime.store.acknowledge_notification(
             message_id=message_id,
             kind=kind,
             analysis_at=analysis_at,

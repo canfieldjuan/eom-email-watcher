@@ -213,6 +213,15 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     loaded = load_runtime(config_path)
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    loaded.store.add_message(
+        message_id="queued",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Queued notification",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    loaded.store.record_failure("queued", "local model unavailable", 0)
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
@@ -229,11 +238,21 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     }
 
     checked = engine_api._response(request(config_path, "watcher.check"))
+    pending = engine_api._response(request(config_path, "notifications.pending"))
+    acknowledged = engine_api._response(
+        request(
+            config_path,
+            "notifications.ack",
+            {"message_id": "queued", "kind": "fallback", "analysis_at": None},
+        )
+    )
 
     assert checked["ok"] is False
     assert checked["error"]["code"] == "unsupported_configuration"
+    assert pending["error"]["code"] == "unsupported_configuration"
+    assert acknowledged["error"]["code"] == "unsupported_configuration"
     assert loaded.store.state()[0] == "100"
-    assert loaded.store.recent(1) == []
+    assert loaded.store.notification_intents()[0].message_id == "queued"
 
 
 def test_unsupported_platform_is_reported_before_production_check(
