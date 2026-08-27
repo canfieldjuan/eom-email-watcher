@@ -172,6 +172,8 @@ def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: 
         "a.@example.com",
         "a@example..com",
         "a@-example.com",
+        "a@exam/ple.com",
+        "a@!",
     ],
 )
 def test_watchlist_rejects_invalid_addresses_without_changing_config(
@@ -185,6 +187,17 @@ def test_watchlist_rejects_invalid_addresses_without_changing_config(
         add_sender(path, email, None)
 
     assert path.read_bytes() == original
+
+
+def test_watchlist_domain_label_length_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+
+    accepted = add_sender(path, f"valid@{'a' * 63}.example", None)
+
+    assert accepted.email == f"valid@{'a' * 63}.example"
+    with pytest.raises(InvalidSenderError, match="valid email"):
+        add_sender(path, f"invalid@{'a' * 64}.example", None)
 
 
 def test_watchlist_atomic_replace_failure_preserves_original(

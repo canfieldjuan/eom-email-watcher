@@ -132,8 +132,8 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     config = runtime.config
     if not config.senders:
         return {
-            **Watcher.inactive_result(),
-            "pending_notifications": 0,
+            **Watcher.inactive_result(config, runtime.store, dry_run=dry_run),
+            "pending_notifications": _host_notification_intent_count(runtime),
         }
     if not dry_run and not operation_lock_supported():
         raise ApiError(

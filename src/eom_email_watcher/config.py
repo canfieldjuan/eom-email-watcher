@@ -17,6 +17,7 @@ from tomlkit.items import AoT, Array
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
+DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 class ConfigError(ValueError):
@@ -84,6 +85,16 @@ def normalize_address(value: str) -> str:
     return address.strip().casefold()
 
 
+def _valid_domain(domain: str) -> bool:
+    try:
+        ascii_domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return len(ascii_domain) <= 253 and all(
+        DOMAIN_LABEL_RE.fullmatch(label) for label in ascii_domain.split(".")
+    )
+
+
 def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
     email = normalize_address(email_value)
     local, separator, domain = email.rpartition("@")
@@ -95,9 +106,7 @@ def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -
         or local.startswith(".")
         or local.endswith(".")
         or ".." in local
-        or domain.startswith((".", "-"))
-        or domain.endswith((".", "-"))
-        or ".." in domain
+        or not _valid_domain(domain)
         or any(character.isspace() or not character.isprintable() for character in email)
     ):
         raise InvalidSenderError(invalid_message)
@@ -184,13 +193,16 @@ def load_config(path: Path | None = None) -> Config:
         name = raw.get("name")
         if name is not None and not isinstance(name, str):
             raise ConfigError(f"senders entry {index} name must be a string")
-        sender = _sender(
-            raw_email,
-            name,
-            invalid_message=f"senders entry {index} has an invalid email",
-        )
+        try:
+            sender = _sender(
+                raw_email,
+                name,
+                invalid_message=f"senders entry {index} has an invalid email",
+            )
+        except InvalidSenderError as exc:
+            raise ConfigError(str(exc)) from exc
         if sender.email in seen:
-            raise DuplicateSenderError(f"Duplicate sender: {sender.email}")
+            raise ConfigError(f"Duplicate sender: {sender.email}")
         seen.add(sender.email)
         senders.append(sender)
 

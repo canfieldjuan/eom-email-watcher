@@ -59,8 +59,9 @@ Watchlist mutation is serialized and uses same-directory atomic replacement thro
 frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an
 address that is not watched returns `not_found`, and malformed payload values return
 `invalid_request`. Configuration may contain zero senders for first-run onboarding. In that state,
-`watcher.check` returns `active: false` with zero work without accessing Gmail; adding the first
-sender activates later checks. Settings mutation remains intentionally absent.
+`watcher.check` returns `active: false` without accessing Gmail; local retention cleanup and exact
+pending-notification counting continue so removing the final sender cannot strand prior state.
+Adding the first sender activates later Gmail checks. Settings mutation remains intentionally absent.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

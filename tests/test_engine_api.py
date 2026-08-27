@@ -153,6 +153,7 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path:
         {"email": 42},
         {"email": "invalid"},
         {"email": "valid@example.com", "name": 42},
+        {"email": "valid@example.com", "name": "Bad\nName"},
         {"email": "valid@example.com", "extra": True},
     ],
 )
@@ -165,11 +166,53 @@ def test_watchlist_add_rejects_invalid_payloads(tmp_path: Path, payload: dict[st
     assert response["error"]["code"] == "invalid_request"
 
 
+@pytest.mark.parametrize(
+    "sender_config",
+    [
+        '[[senders]]\nemail = "invalid"\n',
+        (
+            '[[senders]]\nemail = "duplicate@example.com"\n'
+            '[[senders]]\nemail = "DUPLICATE@example.com"\n'
+        ),
+    ],
+)
+def test_watchlist_mutation_preserves_existing_configuration_errors(
+    tmp_path: Path, sender_config: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n{sender_config}",
+        encoding="utf-8",
+    )
+
+    added = engine_api._response(
+        request(config_path, "watchlist.add", {"email": "valid@example.com"})
+    )
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "valid@example.com"})
+    )
+
+    assert added["error"]["code"] == "configuration_error"
+    assert removed["error"]["code"] == "configuration_error"
+
+
 def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, include_senders=False)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="queued",
+        thread_id=None,
+        sender="former@example.com",
+        sender_name="Former",
+        subject="Queued before removal",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.mark_analyzed("queued", FakeModel().analyze().model_dump())
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -187,7 +230,7 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
         "active": False,
         "discovered": 0,
         "fallback_notified": 0,
-        "pending_notifications": 0,
+        "pending_notifications": 1,
         "purged": 0,
         "stale_cursor_recovered": False,
         "summarized": 0,

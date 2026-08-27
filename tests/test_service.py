@@ -100,9 +100,25 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
 
 
 def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path) -> None:
-    cfg = replace(config(tmp_path), senders=())
+    cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
+    for message_id in ("expired", "queued"):
+        store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="former@example.com",
+            sender_name="Former",
+            subject=message_id,
+            received_at="2020-01-01T00:00:00+00:00",
+        )
+    store.mark_skipped("expired")
+    store.mark_analyzed("queued", FakeModel().analyze().model_dump())
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ?",
+            ("2020-01-01T00:00:00+00:00",),
+        )
 
     class UnexpectedGmail:
         def __getattr__(self, name: str):
@@ -114,10 +130,11 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path
         "active": False,
         "discovered": 0,
         "fallback_notified": 0,
-        "purged": 0,
+        "purged": 1,
         "stale_cursor_recovered": False,
         "summarized": 0,
     }
+    assert [row["message_id"] for row in store.recent(10)] == ["queued"]
 
 
 def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
