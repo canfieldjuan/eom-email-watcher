@@ -150,4 +150,5 @@ form.addEventListener("submit", (event) => {
   })();
 });
 
-void loadSenders();
+setBusy(true);
+void loadSenders().finally(() => setBusy(false));
