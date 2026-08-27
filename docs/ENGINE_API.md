@@ -49,12 +49,19 @@ only to stderr.
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows; no raw bodies |
 | `watchlist.list` | `{}` | Normalized configured senders |
+| `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
+| `watchlist.remove` | `email` | Remove and return one normalized sender |
 | `settings.get` | `{}` | Safe public settings and token-presence boolean |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
 
-Watchlist and settings mutation are intentionally not part of this version yet. The frontend must
-not edit TOML directly while those operations are absent.
+Watchlist mutation is serialized and uses same-directory atomic replacement through the engine; the
+frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an
+address that is not watched returns `not_found`, and malformed payload values return
+`invalid_request`. Configuration may contain zero senders for first-run onboarding. In that state,
+`watcher.check` returns `active: false` without accessing Gmail; local retention cleanup and exact
+pending-notification counting continue so removing the final sender cannot strand prior state.
+Adding the first sender activates later Gmail checks. Settings mutation remains intentionally absent.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

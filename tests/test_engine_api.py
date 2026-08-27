@@ -20,9 +20,22 @@ def write_config(
     notifications_enabled: bool = True,
     extra_settings: str = "",
     timezone: str = "America/Chicago",
+    include_senders: bool = True,
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
+    senders = (
+        '''[[senders]]
+email = "z@example.com"
+name = "Zed"
+
+[[senders]]
+email = "A@Example.com"
+name = "Trusted A"
+'''
+        if include_senders
+        else ""
+    )
     path.write_text(
         f'''timezone = "{timezone}"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
@@ -35,14 +48,7 @@ model_require_auth = false
 notifications_enabled = {notifications_setting}
 {ntfy_setting}
 {extra_settings}
-
-[[senders]]
-email = "z@example.com"
-name = "Zed"
-
-[[senders]]
-email = "A@Example.com"
-name = "Trusted A"
+{senders}
 ''',
         encoding="utf-8",
     )
@@ -106,6 +112,152 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     )
     inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert inbox["data"]["items"][0]["message_id"] == "m1"
+
+
+def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+
+    added = engine_api._response(
+        request(
+            config_path,
+            "watchlist.add",
+            {"email": "New Person <NEW@Example.com>", "name": "  New Person  "},
+        )
+    )
+    duplicate = engine_api._response(
+        request(config_path, "watchlist.add", {"email": "new@example.com"})
+    )
+    missing = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "missing@example.com"})
+    )
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "NEW@example.com"})
+    )
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+
+    assert added["data"]["item"] == {
+        "email": "new@example.com",
+        "name": "New Person",
+    }
+    assert duplicate["error"]["code"] == "conflict"
+    assert missing["error"]["code"] == "not_found"
+    assert removed["data"]["item"] == added["data"]["item"]
+    assert listed["data"]["items"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"email": 42},
+        {"email": "invalid"},
+        {"email": "valid@example.com", "name": 42},
+        {"email": "valid@example.com", "name": "Bad\nName"},
+        {"email": "valid@example.com", "extra": True},
+    ],
+)
+def test_watchlist_add_rejects_invalid_payloads(tmp_path: Path, payload: dict[str, object]) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+
+    response = engine_api._response(request(config_path, "watchlist.add", payload))
+
+    assert response["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "sender_config",
+    [
+        '[[senders]]\nemail = "invalid"\n',
+        (
+            '[[senders]]\nemail = "duplicate@example.com"\n'
+            '[[senders]]\nemail = "DUPLICATE@example.com"\n'
+        ),
+    ],
+)
+def test_watchlist_mutation_preserves_existing_configuration_errors(
+    tmp_path: Path, sender_config: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    config_path.write_text(
+        f"{config_path.read_text(encoding='utf-8')}\n{sender_config}",
+        encoding="utf-8",
+    )
+
+    added = engine_api._response(
+        request(config_path, "watchlist.add", {"email": "valid@example.com"})
+    )
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "valid@example.com"})
+    )
+
+    assert added["error"]["code"] == "configuration_error"
+    assert removed["error"]["code"] == "configuration_error"
+
+
+def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="queued",
+        thread_id=None,
+        sender="former@example.com",
+        sender_name="Former",
+        subject="Queued before removal",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.mark_analyzed("queued", FakeModel().analyze().model_dump())
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "operation_lock_supported",
+        lambda: (_ for _ in ()).throw(AssertionError("No lock is needed while inactive")),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["data"] == {
+        "active": False,
+        "discovered": 0,
+        "fallback_notified": 0,
+        "pending_notifications": 1,
+        "purged": 0,
+        "stale_cursor_recovered": False,
+        "summarized": 0,
+    }
+
+
+def test_zero_sender_check_still_rejects_incompatible_host_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        include_senders=False,
+        ntfy_topic="configured-private-topic",
+    )
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "unsupported_configuration"
 
 
 class FakeGmail:

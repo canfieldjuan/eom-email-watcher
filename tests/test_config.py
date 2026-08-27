@@ -2,12 +2,33 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher.config import ConfigError, load_config, normalize_address
+from eom_email_watcher.config import (
+    ConfigError,
+    DuplicateSenderError,
+    InvalidSenderError,
+    SenderNotFoundError,
+    add_sender,
+    load_config,
+    normalize_address,
+    remove_sender,
+)
 
 
 def write_config(
-    path: Path, *, base_url: str = "http://127.0.0.1:1234/v1", extra: str = ""
+    path: Path,
+    *,
+    base_url: str = "http://127.0.0.1:1234/v1",
+    extra: str = "",
+    include_sender: bool = True,
 ) -> None:
+    sender = (
+        '''[[senders]]
+email = "Trusted@Example.com"
+name = "Trusted Person"
+'''
+        if include_sender
+        else ""
+    )
     path.write_text(
         f'''model_base_url = "{base_url}"
 model_name = "local-model"
@@ -16,9 +37,7 @@ database_file = "{path.parent / "db.sqlite3"}"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
 gmail_token_file = "{path.parent / "token.json"}"
 {extra}
-[[senders]]
-email = "Trusted@Example.com"
-name = "Trusted Person"
+{sender}
 ''',
         encoding="utf-8",
     )
@@ -90,6 +109,146 @@ def test_duplicate_sender_is_rejected(tmp_path: Path) -> None:
         stream.write('[[senders]]\nemail = "trusted@example.com"\n')
     with pytest.raises(ConfigError, match="Duplicate"):
         load_config(path)
+
+
+def test_config_allows_zero_senders_for_first_run(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+
+    config = load_config(path)
+
+    assert config.senders == ()
+    assert config.allowlist == frozenset()
+
+
+def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, extra="# operator comment\nretention_days = 90")
+
+    added = add_sender(path, "New Person <NEW@Example.com>", "  New Person  ")
+
+    assert added.email == "new@example.com"
+    assert added.name == "New Person"
+    text = path.read_text(encoding="utf-8")
+    assert "# operator comment" in text
+    assert "retention_days = 90" in text
+    assert "Trusted@Example.com" in text
+    assert load_config(path).allowlist == frozenset(
+        {"trusted@example.com", "new@example.com"}
+    )
+
+    removed = remove_sender(path, "NEW@example.com")
+
+    assert removed == added
+    assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+
+
+def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+
+    with pytest.raises(DuplicateSenderError, match="already watched"):
+        add_sender(path, "Person <TRUSTED@example.com>", None)
+    assert path.read_bytes() == original
+
+    with pytest.raises(SenderNotFoundError, match="not watched"):
+        remove_sender(path, "missing@example.com")
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "",
+        "not-an-address",
+        "@example.com",
+        "person@",
+        "a@@example.com",
+        "a b@example.com",
+        ".a@example.com",
+        "a.@example.com",
+        "a@example..com",
+        "a@-example.com",
+        "a@exam/ple.com",
+        "a@!",
+    ],
+)
+def test_watchlist_rejects_invalid_addresses_without_changing_config(
+    tmp_path: Path, email: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+
+    with pytest.raises(InvalidSenderError, match="valid email"):
+        add_sender(path, email, None)
+
+    assert path.read_bytes() == original
+
+
+def test_watchlist_domain_label_length_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+
+    accepted = add_sender(path, f"valid@{'a' * 63}.example", None)
+
+    assert accepted.email == f"valid@{'a' * 63}.example"
+    with pytest.raises(InvalidSenderError, match="valid email"):
+        add_sender(path, f"invalid@{'a' * 64}.example", None)
+
+
+def test_watchlist_atomic_replace_failure_preserves_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        add_sender(path, "new@example.com", "New")
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+
+
+def test_watchlist_mutation_preserves_symlinked_config_target(tmp_path: Path) -> None:
+    target = tmp_path / "managed" / "config.toml"
+    target.parent.mkdir()
+    write_config(target)
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    added = add_sender(link, "new@example.com", "New")
+
+    assert link.is_symlink()
+    assert added.email == "new@example.com"
+    assert load_config(target).allowlist == frozenset(
+        {"trusted@example.com", "new@example.com"}
+    )
+
+    removed = remove_sender(link, "new@example.com")
+
+    assert link.is_symlink()
+    assert removed == added
+    assert load_config(target).allowlist == frozenset({"trusted@example.com"})
+
+
+def test_removing_final_sender_leaves_valid_empty_watchlist(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+
+    removed = remove_sender(path, "trusted@example.com")
+
+    assert removed.email == "trusted@example.com"
+    assert load_config(path).senders == ()
 
 
 @pytest.mark.parametrize(

@@ -26,9 +26,32 @@ class Watcher:
         self.store.set_state(history_id)
         return history_id
 
+    @staticmethod
+    def inactive_result(
+        config: Config, store: Store, *, dry_run: bool
+    ) -> dict[str, int | bool]:
+        purged = (
+            0
+            if dry_run
+            else store.purge(
+                config.retention_days,
+                preserve_notification_intents=config.notifications_enabled,
+            )
+        )
+        return {
+            "active": False,
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": purged,
+            "stale_cursor_recovered": False,
+        }
+
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool]:
+        if not self.config.senders:
+            return self.inactive_result(self.config, self.store, dry_run=dry_run)
         state = self.store.state()
         if not state:
             raise RuntimeError("Watcher is not initialized. Run: eom-mail-watch setup")
@@ -87,6 +110,7 @@ class Watcher:
             )
         )
         return {
+            "active": True,
             "discovered": added,
             "summarized": summarized,
             "fallback_notified": fallback,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from email.utils import parseaddr
@@ -9,13 +10,30 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from filelock import FileLock
+from tomlkit import aot, dumps, inline_table, parse, table
+from tomlkit.items import AoT, Array
+
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
+DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 class ConfigError(ValueError):
     """Configuration is missing or unsafe."""
+
+
+class InvalidSenderError(ConfigError):
+    """A proposed watchlist sender is not valid."""
+
+
+class DuplicateSenderError(ConfigError):
+    """A proposed watchlist sender already exists."""
+
+
+class SenderNotFoundError(ConfigError):
+    """A requested watchlist sender does not exist."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,39 @@ def _path(value: object, key: str) -> Path:
 def normalize_address(value: str) -> str:
     _name, address = parseaddr(value)
     return address.strip().casefold()
+
+
+def _valid_domain(domain: str) -> bool:
+    try:
+        ascii_domain = domain.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return len(ascii_domain) <= 253 and all(
+        DOMAIN_LABEL_RE.fullmatch(label) for label in ascii_domain.split(".")
+    )
+
+
+def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
+    email = normalize_address(email_value)
+    local, separator, domain = email.rpartition("@")
+    if (
+        separator != "@"
+        or not local
+        or not domain
+        or "@" in local
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or not _valid_domain(domain)
+        or any(character.isspace() or not character.isprintable() for character in email)
+    ):
+        raise InvalidSenderError(invalid_message)
+    if name_value is not None and any(
+        character in "\r\n" or not character.isprintable() for character in name_value
+    ):
+        raise InvalidSenderError("sender name must not contain control characters")
+    name = name_value.strip() if name_value and name_value.strip() else None
+    return Sender(email=email, name=name)
 
 
 def _validate_model_base_url(value: object) -> str:
@@ -128,24 +179,32 @@ def load_config(path: Path | None = None) -> Config:
     except (ValueError, ZoneInfoNotFoundError) as exc:
         raise ConfigError(f"Unknown timezone: {timezone}") from exc
 
-    raw_senders = data.get("senders")
-    if not isinstance(raw_senders, list) or not raw_senders:
-        raise ConfigError("At least one [[senders]] entry is required")
+    raw_senders = data.get("senders", [])
+    if not isinstance(raw_senders, list):
+        raise ConfigError("senders must be a list of tables")
     senders: list[Sender] = []
     seen: set[str] = set()
     for index, raw in enumerate(raw_senders, start=1):
         if not isinstance(raw, dict):
             raise ConfigError(f"senders entry {index} must be a table")
-        email = normalize_address(str(raw.get("email", "")))
-        if not email or "@" not in email:
+        raw_email = raw.get("email", "")
+        if not isinstance(raw_email, str):
             raise ConfigError(f"senders entry {index} has an invalid email")
-        if email in seen:
-            raise ConfigError(f"Duplicate sender: {email}")
-        seen.add(email)
         name = raw.get("name")
         if name is not None and not isinstance(name, str):
             raise ConfigError(f"senders entry {index} name must be a string")
-        senders.append(Sender(email=email, name=name.strip() if name else None))
+        try:
+            sender = _sender(
+                raw_email,
+                name,
+                invalid_message=f"senders entry {index} has an invalid email",
+            )
+        except InvalidSenderError as exc:
+            raise ConfigError(str(exc)) from exc
+        if sender.email in seen:
+            raise ConfigError(f"Duplicate sender: {sender.email}")
+        seen.add(sender.email)
+        senders.append(sender)
 
     body_limit = _integer_setting(data, "body_char_limit", 20_000)
     retention = _integer_setting(data, "retention_days", 180)
@@ -216,6 +275,80 @@ def load_config(path: Path | None = None) -> Config:
         ntfy_url=ntfy_url,
         senders=tuple(senders),
     )
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _sender_table(sender: Sender, *, inline: bool):
+    item = inline_table() if inline else table()
+    item["email"] = sender.email
+    if sender.name:
+        item["name"] = sender.name
+    return item
+
+
+def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
+    sender = _sender(email, name, invalid_message="email must be a valid email address")
+    config_path = path.expanduser().resolve()
+    with FileLock(f"{config_path}.lock"):
+        config = load_config(config_path)
+        if sender.email in config.allowlist:
+            raise DuplicateSenderError(f"Sender is already watched: {sender.email}")
+        document = parse(config_path.read_text(encoding="utf-8"))
+        sender_items = document.get("senders")
+        if sender_items is None or isinstance(sender_items, Array) and not sender_items:
+            sender_items = aot()
+            document["senders"] = sender_items
+        if isinstance(sender_items, AoT):
+            sender_items.append(_sender_table(sender, inline=False))
+        elif isinstance(sender_items, Array):
+            sender_items.append(_sender_table(sender, inline=True))
+        else:
+            raise ConfigError("senders must be a list of tables")
+        _atomic_write(config_path, dumps(document))
+    return sender
+
+
+def remove_sender(path: Path, email: str) -> Sender:
+    requested = _sender(email, None, invalid_message="email must be a valid email address")
+    config_path = path.expanduser().resolve()
+    with FileLock(f"{config_path}.lock"):
+        config = load_config(config_path)
+        try:
+            index = next(
+                index
+                for index, sender in enumerate(config.senders)
+                if sender.email == requested.email
+            )
+        except StopIteration as exc:
+            raise SenderNotFoundError(f"Sender is not watched: {requested.email}") from exc
+        removed = config.senders[index]
+        document = parse(config_path.read_text(encoding="utf-8"))
+        sender_items = document.get("senders")
+        if not isinstance(sender_items, (AoT, Array)):
+            raise ConfigError("senders must be a list of tables")
+        del sender_items[index]
+        _atomic_write(config_path, dumps(document))
+    return removed
 
 
 def secure_runtime_paths(config: Config) -> None:
