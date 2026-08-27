@@ -5,6 +5,9 @@ __pycache__/
 .coverage
 htmlcov/
 dist/
+node_modules/
+target/
+desktop/src-tauri/gen/
 *.py[cod]
 *.sqlite3
 config.toml

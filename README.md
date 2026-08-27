@@ -112,6 +112,11 @@ Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
 point.
 
+The first Linux Tauri proof provides a GUI for listing, adding, and removing watched senders. It
+still requires this repository's Python/uv environment and an existing private config; see
+[`desktop/README.md`](desktop/README.md). It does not replace the systemd scheduler or notification
+delivery yet.
+
 ## Two-hour user timer
 
 After Gmail setup succeeds:
@@ -176,3 +181,6 @@ timer first if later eligibility would still be unsafe during reconciliation.
 uv run ruff check .
 uv run pytest --cov=eom_email_watcher --cov-report=term-missing
 ```
+
+Desktop checks are documented with the desktop proof because they require the Rust/Node/WebKit
+toolchain in addition to Python.
