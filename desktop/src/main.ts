@@ -45,6 +45,7 @@ const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const status = requiredElement<HTMLParagraphElement>("#status");
 let watchedSenders: WatchedSender[] = [];
+let operationInFlight = true;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -60,6 +61,21 @@ function setBusy(busy: boolean): void {
       control.disabled = busy;
     }
   }
+  for (const button of list.querySelectorAll<HTMLButtonElement>("button")) {
+    button.disabled = busy;
+  }
+}
+
+function beginOperation(): boolean {
+  if (operationInFlight) return false;
+  operationInFlight = true;
+  setBusy(true);
+  return true;
+}
+
+function finishOperation(): void {
+  operationInFlight = false;
+  setBusy(false);
 }
 
 function renderSenders(senders: WatchedSender[]): void {
@@ -92,27 +108,29 @@ function renderSenders(senders: WatchedSender[]): void {
     remove.className = "remove-button";
     remove.textContent = "Remove";
     remove.setAttribute("aria-label", `Remove ${sender.name || sender.email}`);
-    remove.addEventListener("click", () => void removeSender(sender.email, remove));
+    remove.addEventListener("click", () => void removeSender(sender.email));
 
     item.append(identity, remove);
     list.append(item);
   }
 }
 
-async function loadSenders(message = "Watchlist is up to date."): Promise<void> {
+async function loadSenders(message = "Watchlist is up to date."): Promise<boolean> {
   try {
     const senders = await invoke<WatchedSender[]>("watchlist_list");
     renderSenders(senders);
     status.textContent = message;
     status.dataset.kind = "success";
+    return true;
   } catch (error) {
     status.textContent = errorMessage(error);
     status.dataset.kind = "error";
+    return false;
   }
 }
 
-async function removeSender(email: string, button: HTMLButtonElement): Promise<void> {
-  button.disabled = true;
+async function removeSender(email: string): Promise<void> {
+  if (!beginOperation()) return;
   status.textContent = `Removing ${email}…`;
   try {
     const removed = await invoke<WatchedSender>("watchlist_remove", { email });
@@ -120,17 +138,19 @@ async function removeSender(email: string, button: HTMLButtonElement): Promise<v
     status.textContent = `${removed.email} is no longer watched.`;
     status.dataset.kind = "success";
   } catch (error) {
-    button.disabled = false;
     status.textContent = errorMessage(error);
     status.dataset.kind = "error";
+  } finally {
+    finishOperation();
   }
 }
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   void (async () => {
-    setBusy(true);
+    if (!beginOperation()) return;
     status.textContent = "Adding sender…";
+    let addedSuccessfully = false;
     try {
       const sender = await invoke<WatchedSender>("watchlist_add", {
         email: emailInput.value,
@@ -140,15 +160,18 @@ form.addEventListener("submit", (event) => {
       renderSenders([...watchedSenders, sender]);
       status.textContent = `${sender.email} is now watched.`;
       status.dataset.kind = "success";
-      emailInput.focus();
+      addedSuccessfully = true;
     } catch (error) {
       status.textContent = errorMessage(error);
       status.dataset.kind = "error";
     } finally {
-      setBusy(false);
+      finishOperation();
+      if (addedSuccessfully) emailInput.focus();
     }
   })();
 });
 
 setBusy(true);
-void loadSenders().finally(() => setBusy(false));
+void loadSenders().then((loaded) => {
+  if (loaded) finishOperation();
+});
