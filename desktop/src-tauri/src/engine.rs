@@ -8,6 +8,10 @@ use tauri::{AppHandle, Manager};
 
 const PROTOCOL_VERSION: u8 = 1;
 
+fn default_config_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".config/eom-email-watcher/config.toml")
+}
+
 #[derive(Clone)]
 pub struct Engine {
     program: OsString,
@@ -55,11 +59,21 @@ struct SenderItem {
 }
 
 impl EngineError {
-    fn host(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn host(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_owned(),
             message: message.into(),
         }
+    }
+
+    fn for_frontend(self) -> Self {
+        if self.code == "configuration_error" {
+            return Self::host(
+                "configuration_error",
+                "Watcher configuration is missing or invalid; inspect desktop logs",
+            );
+        }
+        self
     }
 }
 
@@ -67,11 +81,7 @@ impl Engine {
     pub fn for_app(app: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
         let config_path = std::env::var_os("EOM_EMAIL_WATCHER_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or(
-                app.path()
-                    .config_dir()?
-                    .join("eom-email-watcher/config.toml"),
-            );
+            .unwrap_or(default_config_path(&app.path().home_dir()?));
 
         if let Some(program) = std::env::var_os("EOM_EMAIL_ENGINE_BIN") {
             return Ok(Self {
@@ -180,6 +190,10 @@ impl Engine {
                 "Watcher engine did not return a result",
             )
         })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            eprintln!("watcher engine {operation} stderr: {}", stderr.trim());
+        }
         let envelope: EngineEnvelope<T> = serde_json::from_slice(&output.stdout).map_err(|_| {
             EngineError::host(
                 "engine_protocol_error",
@@ -195,12 +209,17 @@ impl Engine {
             ));
         }
         if !envelope.ok {
-            return Err(envelope.error.unwrap_or_else(|| {
+            let error = envelope.error.unwrap_or_else(|| {
                 EngineError::host(
                     "engine_protocol_error",
                     "Watcher engine omitted error details",
                 )
-            }));
+            });
+            eprintln!(
+                "watcher engine {operation} failed ({}): {}",
+                error.code, error.message
+            );
+            return Err(error.for_frontend());
         }
         if !output.status.success() {
             return Err(EngineError::host(
@@ -221,6 +240,30 @@ impl Engine {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn default_config_matches_python_watcher_location() {
+        assert_eq!(
+            default_config_path(Path::new("/home/watcher")),
+            PathBuf::from("/home/watcher/.config/eom-email-watcher/config.toml")
+        );
+    }
+
+    #[test]
+    fn configuration_errors_do_not_expose_paths_to_frontend() {
+        let error = EngineError {
+            code: "configuration_error".into(),
+            message: "Configuration not found: /home/private/config.toml".into(),
+        };
+
+        assert_eq!(
+            error.for_frontend(),
+            EngineError {
+                code: "configuration_error".into(),
+                message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
+            }
+        );
+    }
 
     fn real_engine(config_path: PathBuf) -> Engine {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))

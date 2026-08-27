@@ -4,25 +4,34 @@ use engine::{Engine, EngineError, WatchedSender};
 use tauri::{Manager, State};
 
 #[tauri::command]
-fn watchlist_list(engine: State<'_, Engine>) -> Result<Vec<WatchedSender>, EngineError> {
-    engine.list()
+async fn watchlist_list(engine: State<'_, Engine>) -> Result<Vec<WatchedSender>, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
-fn watchlist_add(
+async fn watchlist_add(
     engine: State<'_, Engine>,
     email: String,
     name: Option<String>,
 ) -> Result<WatchedSender, EngineError> {
-    engine.add(email, name)
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.add(email, name))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
-fn watchlist_remove(
+async fn watchlist_remove(
     engine: State<'_, Engine>,
     email: String,
 ) -> Result<WatchedSender, EngineError> {
-    engine.remove(email)
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.remove(email))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

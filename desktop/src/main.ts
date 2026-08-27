@@ -44,6 +44,7 @@ const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const status = requiredElement<HTMLParagraphElement>("#status");
+let watchedSenders: WatchedSender[] = [];
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -62,6 +63,7 @@ function setBusy(busy: boolean): void {
 }
 
 function renderSenders(senders: WatchedSender[]): void {
+  watchedSenders = senders;
   list.replaceChildren();
   if (senders.length === 0) {
     const empty = document.createElement("li");
@@ -113,8 +115,10 @@ async function removeSender(email: string, button: HTMLButtonElement): Promise<v
   button.disabled = true;
   status.textContent = `Removing ${email}…`;
   try {
-    await invoke<WatchedSender>("watchlist_remove", { email });
-    await loadSenders(`${email} is no longer watched.`);
+    const removed = await invoke<WatchedSender>("watchlist_remove", { email });
+    renderSenders(watchedSenders.filter((sender) => sender.email !== removed.email));
+    status.textContent = `${removed.email} is no longer watched.`;
+    status.dataset.kind = "success";
   } catch (error) {
     button.disabled = false;
     status.textContent = errorMessage(error);
@@ -133,7 +137,9 @@ form.addEventListener("submit", (event) => {
         name: nameInput.value.trim() || null,
       });
       form.reset();
-      await loadSenders(`${sender.email} is now watched.`);
+      renderSenders([...watchedSenders, sender]);
+      status.textContent = `${sender.email} is now watched.`;
+      status.dataset.kind = "success";
       emailInput.focus();
     } catch (error) {
       status.textContent = errorMessage(error);
