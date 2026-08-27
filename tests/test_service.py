@@ -92,10 +92,32 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     watcher = Watcher(cfg, store, FakeGmail(), FakeModel())
     result = watcher.check()
+    assert result["active"] is True
     assert result["discovered"] == 1
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+
+    class UnexpectedGmail:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"Gmail must not be called: {name}")
+
+    result = Watcher(cfg, store, UnexpectedGmail(), FakeModel()).check()
+
+    assert result == {
+        "active": False,
+        "discovered": 0,
+        "fallback_notified": 0,
+        "purged": 0,
+        "stale_cursor_recovered": False,
+        "summarized": 0,
+    }
 
 
 def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:

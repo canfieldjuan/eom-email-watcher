@@ -20,9 +20,22 @@ def write_config(
     notifications_enabled: bool = True,
     extra_settings: str = "",
     timezone: str = "America/Chicago",
+    include_senders: bool = True,
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
+    senders = (
+        '''[[senders]]
+email = "z@example.com"
+name = "Zed"
+
+[[senders]]
+email = "A@Example.com"
+name = "Trusted A"
+'''
+        if include_senders
+        else ""
+    )
     path.write_text(
         f'''timezone = "{timezone}"
 gmail_credentials_file = "{path.parent / "credentials.json"}"
@@ -35,14 +48,7 @@ model_require_auth = false
 notifications_enabled = {notifications_setting}
 {ntfy_setting}
 {extra_settings}
-
-[[senders]]
-email = "z@example.com"
-name = "Zed"
-
-[[senders]]
-email = "A@Example.com"
-name = "Trusted A"
+{senders}
 ''',
         encoding="utf-8",
     )
@@ -106,6 +112,86 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     )
     inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert inbox["data"]["items"][0]["message_id"] == "m1"
+
+
+def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+
+    added = engine_api._response(
+        request(
+            config_path,
+            "watchlist.add",
+            {"email": "New Person <NEW@Example.com>", "name": "  New Person  "},
+        )
+    )
+    duplicate = engine_api._response(
+        request(config_path, "watchlist.add", {"email": "new@example.com"})
+    )
+    missing = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "missing@example.com"})
+    )
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "NEW@example.com"})
+    )
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+
+    assert added["data"]["item"] == {
+        "email": "new@example.com",
+        "name": "New Person",
+    }
+    assert duplicate["error"]["code"] == "conflict"
+    assert missing["error"]["code"] == "not_found"
+    assert removed["data"]["item"] == added["data"]["item"]
+    assert listed["data"]["items"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"email": 42},
+        {"email": "invalid"},
+        {"email": "valid@example.com", "name": 42},
+        {"email": "valid@example.com", "extra": True},
+    ],
+)
+def test_watchlist_add_rejects_invalid_payloads(tmp_path: Path, payload: dict[str, object]) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+
+    response = engine_api._response(request(config_path, "watchlist.add", payload))
+
+    assert response["error"]["code"] == "invalid_request"
+
+
+def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "operation_lock_supported",
+        lambda: (_ for _ in ()).throw(AssertionError("No lock is needed while inactive")),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["data"] == {
+        "active": False,
+        "discovered": 0,
+        "fallback_notified": 0,
+        "pending_notifications": 0,
+        "purged": 0,
+        "stale_cursor_recovered": False,
+        "summarized": 0,
+    }
 
 
 class FakeGmail:

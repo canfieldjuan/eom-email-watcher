@@ -7,7 +7,16 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from .config import ConfigError, load_config
+from .config import (
+    ConfigError,
+    DuplicateSenderError,
+    InvalidSenderError,
+    Sender,
+    SenderNotFoundError,
+    add_sender,
+    load_config,
+    remove_sender,
+)
 from .db import NotificationIntent
 from .gmail import GmailError, GmailGateway
 from .locking import operation_lock, operation_lock_supported
@@ -118,14 +127,20 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     dry_run = payload.get("dry_run", False)
     if not isinstance(dry_run, bool):
         raise ApiError("invalid_request", "dry_run must be a boolean")
+
+    runtime = _runtime(request)
+    config = runtime.config
+    if not config.senders:
+        return {
+            **Watcher.inactive_result(),
+            "pending_notifications": 0,
+        }
     if not dry_run and not operation_lock_supported():
         raise ApiError(
             "unsupported_platform",
             "Production watcher checks require POSIX operation locking",
         )
 
-    runtime = _runtime(request)
-    config = runtime.config
     _require_host_delivery_compatible(runtime)
     lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
@@ -163,6 +178,41 @@ def _watchlist(request: dict[str, object]) -> dict[str, object]:
             for sender in sorted(config.senders, key=lambda item: item.email)
         ]
     }
+
+
+def _sender_data(sender: Sender) -> dict[str, str | None]:
+    return {"email": sender.email, "name": sender.name}
+
+
+def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"email", "name"})
+    email = payload.get("email")
+    name = payload.get("name")
+    if not isinstance(email, str) or not email.strip():
+        raise ApiError("invalid_request", "email must be a non-empty string")
+    if name is not None and not isinstance(name, str):
+        raise ApiError("invalid_request", "name must be a string or null")
+    try:
+        sender = add_sender(_config_path(request), email, name)
+    except InvalidSenderError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    except DuplicateSenderError as exc:
+        raise ApiError("conflict", str(exc)) from exc
+    return {"item": _sender_data(sender)}
+
+
+def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"email"})
+    email = payload.get("email")
+    if not isinstance(email, str) or not email.strip():
+        raise ApiError("invalid_request", "email must be a non-empty string")
+    try:
+        sender = remove_sender(_config_path(request), email)
+    except InvalidSenderError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    except SenderNotFoundError as exc:
+        raise ApiError("not_found", str(exc)) from exc
+    return {"item": _sender_data(sender)}
 
 
 def _settings(request: dict[str, object]) -> dict[str, object]:
@@ -259,7 +309,9 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "notifications.pending": _notifications_pending,
     "settings.get": _settings,
     "watcher.check": _check,
+    "watchlist.add": _watchlist_add,
     "watchlist.list": _watchlist,
+    "watchlist.remove": _watchlist_remove,
 }
 
 
