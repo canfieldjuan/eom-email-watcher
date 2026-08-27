@@ -452,3 +452,31 @@ def test_main_emits_one_json_error_for_invalid_input(monkeypatch, capsys) -> Non
         "operation": None,
         "protocol": 1,
     }
+
+
+@pytest.mark.parametrize("parse_error", [ValueError("integer too long"), RecursionError()])
+def test_main_converts_bounded_json_parse_failures_to_one_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    parse_error: Exception,
+) -> None:
+    decode = json.loads
+
+    def fail_parse(raw: bytes):
+        raise parse_error
+
+    monkeypatch.setattr(engine_api.json, "loads", fail_parse)
+    monkeypatch.setattr(engine_api.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}")))
+
+    with pytest.raises(SystemExit) as exit_info:
+        engine_api.main()
+
+    assert exit_info.value.code == 2
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert decode(output.out) == {
+        "error": {"code": "invalid_json", "message": "Request must be valid JSON"},
+        "ok": False,
+        "operation": None,
+        "protocol": 1,
+    }

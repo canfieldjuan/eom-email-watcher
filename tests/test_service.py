@@ -295,6 +295,60 @@ def test_deferred_delivery_persists_analysis_without_linux_notification(
     assert store.notification_intents()[0].kind == "analysis"
 
 
+def test_cli_delivery_failure_preserves_expired_notification_intent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True, retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.add_message(
+        message_id="old-analysis",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Action needed",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    store.mark_analyzed(
+        "old-analysis",
+        {
+            "category": "customer_request",
+            "priority": "high",
+            "summary": "Please respond.",
+            "action_required": True,
+            "suggested_action": "Reply.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    old = (datetime.now(UTC) - service_module.timedelta(days=2)).isoformat()
+    with store.connection() as db:
+        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    monkeypatch.setattr(
+        service_module,
+        "send_analysis",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            NotificationError("all channels unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "send_fallback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            NotificationError("all channels unavailable")
+        ),
+    )
+
+    Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=True)
+
+    assert store.notification_intents()[0].message_id == "old-analysis"
+
+
 def test_deferred_fallback_ack_preserves_eventual_analysis_intent(
     tmp_path: Path, monkeypatch
 ) -> None:

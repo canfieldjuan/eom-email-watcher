@@ -77,9 +77,7 @@ class Watcher:
             deliver_notifications=deliver_notifications,
             extra=dry_run_messages,
         )
-        preserve_notification_intents = (
-            not deliver_notifications and self.config.notifications_enabled
-        )
+        preserve_notification_intents = self.config.notifications_enabled
         purged = (
             0
             if dry_run

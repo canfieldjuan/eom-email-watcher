@@ -340,7 +340,7 @@ def main() -> None:
     else:
         try:
             request = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             request = None
             response = {
                 "error": {"code": "invalid_json", "message": "Request must be valid JSON"},
