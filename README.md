@@ -112,8 +112,9 @@ Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
 point.
 
-The first Linux Tauri proof provides a GUI for listing, adding, and removing watched senders. It
-still requires this repository's Python/uv environment and an existing private config; see
+The Linux Tauri proof provides a read-only Inbox plus a GUI for listing, adding, and removing
+watched senders. It still requires this repository's Python/uv environment and an existing private
+config; see
 [`desktop/README.md`](desktop/README.md). It does not replace the systemd scheduler or notification
 delivery yet.
 

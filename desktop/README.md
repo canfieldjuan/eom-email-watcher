@@ -1,7 +1,8 @@
-# Tauri watchlist proof
+# Tauri desktop proof
 
-This is the first Linux desktop slice. It exposes only the useful watchlist path: list, add, and
-remove exact watched senders through the existing versioned Python engine contract.
+The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger and
+the useful watchlist path: list, add, and remove exact watched senders through the existing
+versioned Python engine contract.
 
 It does **not** yet own polling, native notifications, tray/single-instance behavior, Gmail OAuth,
 settings mutation, or packaging. The existing systemd watcher remains the production path while

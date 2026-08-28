@@ -1,7 +1,17 @@
 mod engine;
 
-use engine::{Engine, EngineError, WatchedSender};
+use engine::{Engine, EngineError, InboxItem, WatchedSender};
 use tauri::{Manager, State};
+
+const INBOX_LIMIT: u16 = 50;
+
+#[tauri::command]
+async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.recent(INBOX_LIMIT))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
 
 #[tauri::command]
 async fn watchlist_list(engine: State<'_, Engine>) -> Result<Vec<WatchedSender>, EngineError> {
@@ -43,6 +53,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            inbox_recent,
             watchlist_list,
             watchlist_add,
             watchlist_remove
