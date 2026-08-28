@@ -12,7 +12,7 @@ from eom_email_watcher.benchmark import (
     BenchmarkEmailCase,
     BenchmarkExpected,
     ValidationCase,
-    _require_distinct_outputs,
+    _require_disjoint_input_outputs,
     _require_local_output,
     _write_json,
     build_blind_review,
@@ -209,18 +209,74 @@ def test_blind_review_hides_candidate_identity_and_keeps_source_local() -> None:
     )
 
 
-def test_corpus_requires_reserved_email_domains() -> None:
+@pytest.mark.parametrize(
+    "unsafe_address",
+    [
+        "person@customer.test",
+        '"john doe"@gmail.com',
+        "employee@[192.0.2.1]",
+        "malformed@localhost",
+    ],
+)
+def test_corpus_requires_reserved_email_domains(unsafe_address: str) -> None:
     data = _corpus().model_dump(mode="json")
-    data["email_cases"][0]["body"] = "Reply to person@customer.test immediately."
+    data["email_cases"][0]["body"] = f"Reply to {unsafe_address} immediately."
 
     with pytest.raises(ValueError, match="reserved example domains"):
         BenchmarkCorpus.model_validate(data)
+
+
+def test_corpus_accepts_quoted_address_on_reserved_domain() -> None:
+    data = _corpus().model_dump(mode="json")
+    data["email_cases"][0]["body"] = 'Reply to "john doe"@example.com immediately.'
+
+    BenchmarkCorpus.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"action_required": False},
+        {"deadline_text": None},
+        {"deadline_iso": "2026-9-5"},
+        {"deadline_iso": "2026-02-30"},
+    ],
+)
+def test_expected_deadline_contract_rejects_impossible_or_malformed_gold(
+    updates: dict[str, object],
+) -> None:
+    data = _corpus().email_cases[0].expected.model_dump(mode="json")
+    data.update(updates)
+
+    with pytest.raises(ValueError):
+        BenchmarkExpected.model_validate(data)
+
+
+def test_expected_deadline_contract_allows_past_deadline_without_iso() -> None:
+    data = _corpus().email_cases[0].expected.model_dump(mode="json")
+    data["deadline_iso"] = None
+
+    expected = BenchmarkExpected.model_validate(data)
+
+    assert expected.action_required is True
+    assert expected.deadline_text is not None
+    assert expected.deadline_iso is None
+
+
+def test_validation_case_rejects_unknown_expected_value_key_even_when_null() -> None:
+    data = _corpus().validation_cases[0].model_dump(mode="json")
+    data["expected_values"] = {"deadine_iso": None}
+
+    with pytest.raises(ValueError, match="Analysis fields"):
+        ValidationCase.model_validate(data)
 
 
 def test_content_bearing_output_requires_local_filename() -> None:
     _require_local_output(Path("benchmarks/local/review.local.json"))
     with pytest.raises(ValueError, match=r"\.local\.json"):
         _require_local_output(Path("benchmarks/results/review.json"))
+    with pytest.raises(ValueError, match="benchmarks/local"):
+        _require_local_output(Path("benchmarks/results/review.local.json"))
 
 
 def test_private_output_is_mode_600(tmp_path: Path) -> None:
@@ -246,17 +302,22 @@ def test_invalid_private_corpus_does_not_echo_content(
     assert "customer.test" not in captured.err
 
 
-def test_public_and_private_outputs_must_be_distinct(tmp_path: Path) -> None:
-    _require_distinct_outputs(
-        tmp_path / "public.json",
-        tmp_path / "review.local.json",
-        label="test output",
+def test_inputs_and_outputs_must_be_disjoint_with_mixed_paths(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.local.json"
+    other_input = tmp_path / "prior.local.json"
+    public = tmp_path / "public.json"
+    private = tmp_path / "private.local.json"
+
+    _require_disjoint_input_outputs(
+        [corpus, other_input], [public, private], label="benchmark"
     )
-    with pytest.raises(ValueError, match="distinct"):
-        _require_distinct_outputs(
-            tmp_path / "same.json",
-            tmp_path / "." / "same.json",
-            label="test output",
+    with pytest.raises(ValueError, match="input and output"):
+        _require_disjoint_input_outputs(
+            [corpus, other_input], [public, corpus], label="benchmark"
+        )
+    with pytest.raises(ValueError, match="output paths"):
+        _require_disjoint_input_outputs(
+            [corpus, other_input], [public, public], label="benchmark"
         )
 
 
@@ -272,11 +333,57 @@ def test_blind_review_requires_two_distinct_candidates() -> None:
         build_blind_review([private], seed="test-seed")
 
 
+def test_blind_review_rejects_candidates_without_shared_valid_runs() -> None:
+    _public_a, private_a = run_benchmark(
+        _corpus(),
+        _candidate("valid-model"),
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+
+    def fail(_case: BenchmarkEmailCase) -> Analysis:
+        raise ModelError("no schema-valid output")
+
+    _public_b, private_b = run_benchmark(
+        _corpus(),
+        _candidate("invalid-model"),
+        repetitions=1,
+        analyze=fail,
+        timer=iter([0.0, 0.1]).__next__,
+    )
+
+    with pytest.raises(ValueError, match="no shared schema-valid runs"):
+        build_blind_review([private_a, private_b], seed="test-seed")
+
+
+@pytest.mark.parametrize(
+    ("runtime", "cpu_only_method"),
+    [
+        ("lmstudio", "lms-load-gpu-off"),
+        ("ollama", "ollama-gpus-hidden"),
+        ("llama_cpp", "prism-llama-cpp-cpu-only"),
+    ],
+)
+def test_candidate_contract_accepts_only_matching_runtime_methods(
+    runtime: str, cpu_only_method: str
+) -> None:
+    data = _candidate().model_dump(mode="json")
+    data.update(runtime=runtime, cpu_only_method=cpu_only_method)
+
+    candidate = BenchmarkCandidate.model_validate(data)
+
+    assert candidate.runtime == runtime
+    assert candidate.cpu_only_method == cpu_only_method
+
+
 @pytest.mark.parametrize(
     "updates",
     [
         {"cpu_only": False},
         {"cpu_only_method": "ollama-gpus-hidden"},
+        {"runtime": "llama_cpp", "cpu_only_method": "lms-load-gpu-off"},
+        {"runtime": "ollama", "cpu_only_method": "prism-llama-cpp-cpu-only"},
         {"capabilities": ["vision_attachment_summary"]},
         {
             "capabilities": [
@@ -328,7 +435,7 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     )
     results = sorted((root / "benchmarks" / "results").glob("*.json"))
 
-    assert len(results) == 4
+    assert len(results) == 5
     for path in results:
         encoded = path.read_text(encoding="utf-8")
         result = json.loads(encoded)

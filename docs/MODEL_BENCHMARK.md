@@ -28,8 +28,9 @@ Every run has two outputs:
 - a mode-0600 local review file containing source text and model summaries. Put these files under
   `benchmarks/local/`, which Git ignores.
 
-The runner rejects a shared public/private output path and requires every content-bearing output
-filename to end in `.local.json`.
+The runner rejects collisions between every input and output path. It also requires every
+content-bearing output filename to end in `.local.json`; repository-local private outputs must
+resolve under the Git-ignored `benchmarks/local/` directory.
 
 The public result deliberately records only exception class names. Model response/error text is not
 copied into it. A private corpus may be supplied by path, but neither that corpus nor its local
@@ -58,6 +59,8 @@ The models observed locally when this procedure was written were:
 |---|---|---|
 | `qwen3.5-4b` | `Q4_K_M` | required baseline |
 | `qwen3.5-2b` | `Q4_K_M` | smaller general-purpose challenger |
+| `bonsai-4b` | `Q1_0` | end-to-end 1-bit challenger |
+| `ternary-bonsai-8b` | legacy `Q2_0` | ternary challenger requiring Prism llama.cpp |
 | `lfm2.5-vl-3b` | `Q8_0` | installed general/multimodal challenger |
 | `lfm2.5-vl-1.6b-extract` | `Q8_0` | optional extraction experiment only |
 
@@ -100,6 +103,64 @@ LM Studio's local CLI did not expose peak resident model memory in its loaded-mo
 machine used to author this procedure. The result therefore leaves `peak_resident_memory_mib` null
 rather than substituting model file size or guessing. Record a measured value only when the runtime
 or an external process monitor can attribute it to the candidate process.
+
+## Prism llama.cpp CPU-only procedure
+
+The locally observed `Ternary-Bonsai-8B-Q2_0.gguf` uses Prism's deprecated legacy group-128
+`Q2_0` encoding. Current mainline llama.cpp and the moving Prism `prism` branch do not load that
+artifact. Use the complete frozen `prism-v5` build pinned to the tested commit; do not mix its
+libraries with another llama.cpp build. Newer `Q2_0_g64` or `PQ2_0` artifacts require a different
+runtime line and are outside this result's provenance.
+
+Build an isolated CPU-only server:
+
+```bash
+git clone --branch prism-v5 --single-branch https://github.com/PrismML-Eng/llama.cpp.git
+git -C llama.cpp checkout b06f74a9ea9fa5eaf751f7d575bf766486b4ae62
+cmake -S llama.cpp -B llama.cpp/build \
+  -DGGML_CUDA=OFF \
+  -DGGML_HIP=OFF \
+  -DGGML_VULKAN=OFF \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build llama.cpp/build --target llama-server --config Release -j 4
+```
+
+Start one CPU-only prediction slot on loopback. Replace `MODEL_PATH` with the already-local GGUF;
+the benchmark process never downloads a model:
+
+```bash
+llama.cpp/build/bin/llama-server \
+  --model MODEL_PATH/Ternary-Bonsai-8B-Q2_0.gguf \
+  --alias bench-ternary-bonsai-8b \
+  --host 127.0.0.1 \
+  --port 11435 \
+  --ctx-size 8192 \
+  --parallel 1 \
+  --n-gpu-layers 0
+```
+
+Preserve the server's model-loaded duration as `--cold-start-seconds`, then use the same production
+client, schema, validator, corpus, and repetitions:
+
+```bash
+uv run eom-model-benchmark run \
+  --corpus benchmarks/email-analysis-v1.json \
+  --runtime llama_cpp \
+  --base-url http://127.0.0.1:11435/v1 \
+  --model bench-ternary-bonsai-8b \
+  --quantization Q2_0 \
+  --context-length 8192 \
+  --cold-start-seconds YOUR_MEASURED_LOAD_SECONDS \
+  --repetitions 3 \
+  --output benchmarks/results/llama-cpp-prism-ternary-bonsai-8b-q2.json \
+  --private-review-output benchmarks/local/llama-cpp-prism-ternary-bonsai-8b-q2.local.json
+```
+
+The public artifact records `prism-llama-cpp-cpu-only`; it must not be labeled as an LM Studio or
+Ollama run. Stop the temporary server after the result and keep all content-bearing output local.
 
 ## Ollama CPU-only procedure
 

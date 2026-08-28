@@ -11,7 +11,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -34,11 +34,23 @@ Category = Literal[
     "other",
 ]
 Priority = Literal["urgent", "high", "normal", "low"]
-RuntimeName = Literal["lmstudio", "ollama"]
-CpuOnlyMethod = Literal["lms-load-gpu-off", "ollama-gpus-hidden"]
+RuntimeName = Literal["lmstudio", "ollama", "llama_cpp"]
+CpuOnlyMethod = Literal[
+    "lms-load-gpu-off",
+    "ollama-gpus-hidden",
+    "prism-llama-cpp-cpu-only",
+]
 
-EMAIL_PATTERN = re.compile(r"(?i)\b[A-Z0-9._%+-]+@([A-Z0-9.-]+\.[A-Z]{2,})\b")
+CPU_ONLY_METHOD_BY_RUNTIME: dict[RuntimeName, CpuOnlyMethod] = {
+    "lmstudio": "lms-load-gpu-off",
+    "ollama": "ollama-gpus-hidden",
+    "llama_cpp": "prism-llama-cpp-cpu-only",
+}
+
+EMAIL_DOMAIN_PATTERN = re.compile(r"(?i)@(?P<domain>\[[^\]\r\n]+\]|[A-Z0-9.-]+\.[A-Z]{2,})")
 RESERVED_EMAIL_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PRIVATE_OUTPUT_ROOT = PROJECT_ROOT / "benchmarks" / "local"
 
 
 class BenchmarkExpected(BaseModel):
@@ -50,6 +62,23 @@ class BenchmarkExpected(BaseModel):
     deadline_text: str | None
     deadline_iso: str | None
     forbidden_output_substrings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_deadline_contract(self) -> BenchmarkExpected:
+        if (self.deadline_text is not None or self.deadline_iso is not None) and not (
+            self.action_required
+        ):
+            raise ValueError("an expected deadline requires action_required=true")
+        if self.deadline_iso is not None:
+            if self.deadline_text is None or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}", self.deadline_iso
+            ):
+                raise ValueError("expected deadline_iso requires deadline_text and YYYY-MM-DD")
+            try:
+                date.fromisoformat(self.deadline_iso)
+            except ValueError as exc:
+                raise ValueError("expected deadline_iso must be a calendar date") from exc
+        return self
 
 
 class BenchmarkEmailCase(BaseModel):
@@ -90,6 +119,13 @@ class ValidationCase(BaseModel):
             raise ValueError("validation timestamps must include a timezone offset")
         return value
 
+    @field_validator("expected_values")
+    @classmethod
+    def validate_expected_value_keys(cls, value: dict[str, object]) -> dict[str, object]:
+        if not set(value).issubset(Analysis.model_fields):
+            raise ValueError("expected_values keys must name Analysis fields")
+        return value
+
 
 class BenchmarkCorpus(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -108,12 +144,12 @@ class BenchmarkCorpus(BaseModel):
             raise ValueError("benchmark case ids must be unique")
 
         serialized = json.dumps(self.model_dump(mode="json"), ensure_ascii=False)
-        unsafe_domains = {
-            match.group(1).casefold()
-            for match in EMAIL_PATTERN.finditer(serialized)
-            if match.group(1).casefold() not in RESERVED_EMAIL_DOMAINS
-        }
-        if unsafe_domains:
+        matches = list(EMAIL_DOMAIN_PATTERN.finditer(serialized))
+        unsafe_domain = any(
+            match.group("domain").casefold() not in RESERVED_EMAIL_DOMAINS for match in matches
+        )
+        unmatched_at_sign = "@" in EMAIL_DOMAIN_PATTERN.sub("", serialized)
+        if unsafe_domain or unmatched_at_sign:
             raise ValueError("committed corpus email addresses must use reserved example domains")
         return self
 
@@ -132,9 +168,7 @@ class BenchmarkCandidate(BaseModel):
 
     @model_validator(mode="after")
     def validate_runtime_contract(self) -> BenchmarkCandidate:
-        required_method: CpuOnlyMethod = (
-            "lms-load-gpu-off" if self.runtime == "lmstudio" else "ollama-gpus-hidden"
-        )
+        required_method = CPU_ONLY_METHOD_BY_RUNTIME[self.runtime]
         if self.cpu_only_method != required_method:
             raise ValueError(f"{self.runtime} requires cpu_only_method={required_method}")
         if "structured_email_analysis" not in self.capabilities:
@@ -232,7 +266,8 @@ def _validation_boundary(cases: Iterable[ValidationCase]) -> dict[str, object]:
             actual_outcome = "valid"
             actual = analysis.model_dump(mode="json")
             values_match = all(
-                actual.get(key) == value for key, value in case.expected_values.items()
+                key in actual and actual[key] == value
+                for key, value in case.expected_values.items()
             )
         results.append(
             {
@@ -480,6 +515,8 @@ def build_blind_review(
         candidate_runs[alias] = usable
 
     shared_runs = set.intersection(*(set(runs) for runs in candidate_runs.values()))
+    if not shared_runs:
+        raise ValueError("blind review candidates have no shared schema-valid runs")
     items: list[dict[str, object]] = []
     for case_id, repetition in sorted(shared_runs):
         sources = [candidate_runs[alias][(case_id, repetition)]["source"] for alias in aliases]
@@ -522,11 +559,20 @@ def build_blind_review(
 def _require_local_output(path: Path) -> None:
     if not path.name.endswith(".local.json"):
         raise ValueError("content-bearing output filenames must end with .local.json")
+    resolved = path.resolve()
+    if resolved.is_relative_to(PROJECT_ROOT) and not resolved.is_relative_to(PRIVATE_OUTPUT_ROOT):
+        raise ValueError("repository-local private outputs must be under benchmarks/local")
 
 
-def _require_distinct_outputs(first: Path, second: Path, *, label: str) -> None:
-    if first.resolve() == second.resolve():
-        raise ValueError(f"{label} paths must be distinct")
+def _require_disjoint_input_outputs(
+    inputs: Iterable[Path], outputs: Iterable[Path], *, label: str
+) -> None:
+    resolved_inputs = {path.resolve() for path in inputs}
+    resolved_outputs = [path.resolve() for path in outputs]
+    if len(resolved_outputs) != len(set(resolved_outputs)):
+        raise ValueError(f"{label} output paths must be distinct")
+    if resolved_inputs.intersection(resolved_outputs):
+        raise ValueError(f"{label} input and output paths must be distinct")
 
 
 def _write_json(path: Path, value: object, *, private: bool) -> None:
@@ -548,7 +594,7 @@ def _write_json(path: Path, value: object, *, private: bool) -> None:
 
 
 def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
-    method = "lms-load-gpu-off" if args.runtime == "lmstudio" else "ollama-gpus-hidden"
+    method = CPU_ONLY_METHOD_BY_RUNTIME[args.runtime]
     capabilities = ["structured_email_analysis", *(args.capability or [])]
     return BenchmarkCandidate(
         runtime=args.runtime,
@@ -563,9 +609,9 @@ def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    _require_distinct_outputs(
-        args.output,
-        args.private_review_output,
+    _require_disjoint_input_outputs(
+        [args.corpus],
+        [args.output, args.private_review_output],
         label="public and private review output",
     )
     _require_local_output(args.private_review_output)
@@ -631,9 +677,9 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _blind_command(args: argparse.Namespace) -> int:
-    _require_distinct_outputs(
-        args.output,
-        args.key_output,
+    _require_disjoint_input_outputs(
+        args.input,
+        [args.output, args.key_output],
         label="blind review packet and key",
     )
     _require_local_output(args.output)
@@ -660,7 +706,7 @@ def _parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="Run one CPU-only candidate against a corpus")
     run.add_argument("--corpus", type=Path, required=True)
-    run.add_argument("--runtime", choices=("lmstudio", "ollama"), required=True)
+    run.add_argument("--runtime", choices=tuple(CPU_ONLY_METHOD_BY_RUNTIME), required=True)
     run.add_argument("--base-url", required=True)
     run.add_argument("--model", required=True)
     run.add_argument("--quantization", required=True)
