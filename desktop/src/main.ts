@@ -24,6 +24,44 @@ interface InboxItem {
   last_error: string | null;
 }
 
+interface HealthStatus {
+  database: {
+    ok: boolean;
+    initialized: boolean;
+  };
+  gmail: {
+    credentials_configured: boolean;
+    connected: boolean;
+  };
+  last_check: string | null;
+  local_model: {
+    authentication_required: boolean;
+    detail: string;
+    endpoint: string;
+    model: string;
+    ok: boolean;
+    token_configured: boolean;
+  };
+  notifications: {
+    delivery: string;
+    enabled: boolean;
+    host_delivery_ready: boolean;
+    ntfy_configured: boolean;
+  };
+  production_check_supported: boolean;
+  watchlist_count: number;
+}
+
+interface CheckResult {
+  active: boolean;
+  discovered: number;
+  summarized: number;
+  fallback_notified: number;
+  purged: number;
+  stale_cursor_recovered: boolean;
+  pending_notifications: number;
+}
+
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`Required element is missing: ${selector}`);
@@ -43,6 +81,7 @@ app.innerHTML = `
     <nav class="view-tabs" aria-label="Watcher views">
       <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
       <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
+      <button id="health-tab" type="button" aria-controls="health-view" aria-pressed="false">Health</button>
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
@@ -68,13 +107,55 @@ app.innerHTML = `
       <p id="watchlist-status" class="status" role="status" aria-live="polite">Loading watchlist…</p>
       <ul id="sender-list" class="sender-list" aria-label="Watched senders"></ul>
     </section>
+
+    <section id="health-view" class="view" aria-labelledby="health-tab" hidden>
+      <div class="view-heading">
+        <div>
+          <h2>Watcher health</h2>
+          <p class="view-lede">A live check of the local engine and its private connections.</p>
+        </div>
+        <button id="check-now" class="primary-action" type="button" disabled>Check now</button>
+      </div>
+
+      <p id="health-status" class="status" role="status" aria-live="polite">Loading health…</p>
+      <dl class="health-grid">
+        <div class="health-card">
+          <dt>Gmail</dt>
+          <dd id="gmail-health">Checking…</dd>
+          <dd id="gmail-detail" class="health-card-detail"></dd>
+        </div>
+        <div class="health-card">
+          <dt>Local AI</dt>
+          <dd id="model-health">Checking…</dd>
+          <dd id="model-detail" class="health-card-detail"></dd>
+        </div>
+        <div class="health-card">
+          <dt>Database</dt>
+          <dd id="database-health">Checking…</dd>
+          <dd id="database-detail" class="health-card-detail"></dd>
+        </div>
+        <div class="health-card">
+          <dt>Notifications</dt>
+          <dd id="notification-health">Checking…</dd>
+          <dd id="notification-detail" class="health-card-detail"></dd>
+        </div>
+      </dl>
+
+      <dl class="health-details">
+        <div><dt>Last successful check</dt><dd id="last-check">Not yet</dd></div>
+        <div><dt>Watched senders</dt><dd id="watchlist-count">0</dd></div>
+        <div><dt>Automatic polling</dt><dd>Not enabled in this desktop proof</dd></div>
+      </dl>
+    </section>
   </div>
 `;
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
 const watchlistTab = requiredElement<HTMLButtonElement>("#watchlist-tab");
+const healthTab = requiredElement<HTMLButtonElement>("#health-tab");
 const inboxView = requiredElement<HTMLElement>("#inbox-view");
 const watchlistView = requiredElement<HTMLElement>("#watchlist-view");
+const healthView = requiredElement<HTMLElement>("#health-view");
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const form = requiredElement<HTMLFormElement>("#sender-form");
@@ -82,8 +163,22 @@ const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const watchlistStatus = requiredElement<HTMLParagraphElement>("#watchlist-status");
+const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
+const checkNow = requiredElement<HTMLButtonElement>("#check-now");
+const gmailHealth = requiredElement<HTMLElement>("#gmail-health");
+const gmailDetail = requiredElement<HTMLElement>("#gmail-detail");
+const modelHealth = requiredElement<HTMLElement>("#model-health");
+const modelDetail = requiredElement<HTMLElement>("#model-detail");
+const databaseHealth = requiredElement<HTMLElement>("#database-health");
+const databaseDetail = requiredElement<HTMLElement>("#database-detail");
+const notificationHealth = requiredElement<HTMLElement>("#notification-health");
+const notificationDetail = requiredElement<HTMLElement>("#notification-detail");
+const lastCheck = requiredElement<HTMLElement>("#last-check");
+const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
 let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
+let checkInFlight = false;
+let checkSupported = false;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -93,12 +188,16 @@ function errorMessage(error: unknown): string {
   return "The watcher engine could not complete that request.";
 }
 
-function showView(view: "inbox" | "watchlist"): void {
+function showView(view: "inbox" | "watchlist" | "health"): void {
   const inboxSelected = view === "inbox";
+  const watchlistSelected = view === "watchlist";
+  const healthSelected = view === "health";
   inboxView.hidden = !inboxSelected;
-  watchlistView.hidden = inboxSelected;
+  watchlistView.hidden = !watchlistSelected;
+  healthView.hidden = !healthSelected;
   inboxTab.setAttribute("aria-pressed", String(inboxSelected));
-  watchlistTab.setAttribute("aria-pressed", String(!inboxSelected));
+  watchlistTab.setAttribute("aria-pressed", String(watchlistSelected));
+  healthTab.setAttribute("aria-pressed", String(healthSelected));
 }
 
 function receivedLabel(value: string): string {
@@ -207,6 +306,88 @@ async function loadInbox(): Promise<void> {
   } catch (error) {
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
+  }
+}
+
+function setHealthValue(element: HTMLElement, ready: boolean, text: string): void {
+  element.textContent = text;
+  element.dataset.ready = String(ready);
+}
+
+function renderHealth(health: HealthStatus): void {
+  const gmailReady = health.gmail.connected;
+  setHealthValue(gmailHealth, gmailReady, gmailReady ? "Configured" : "Needs attention");
+  gmailDetail.textContent = gmailReady
+    ? "A read-only watcher token is present."
+    : health.gmail.credentials_configured
+      ? "Finish Gmail authorization to start watching."
+      : "Gmail credentials have not been configured.";
+
+  setHealthValue(modelHealth, health.local_model.ok, health.local_model.ok ? "Ready" : "Unavailable");
+  modelDetail.textContent = `${health.local_model.model} · ${health.local_model.endpoint} · ${health.local_model.detail}`;
+
+  const databaseReady = health.database.ok && health.database.initialized;
+  setHealthValue(databaseHealth, databaseReady, databaseReady ? "Ready" : "Needs setup");
+  databaseDetail.textContent = health.database.initialized
+    ? "The local inbox ledger is initialized."
+    : "Run watcher setup to initialize the mailbox cursor.";
+
+  const notificationsReady =
+    !health.notifications.enabled || health.notifications.host_delivery_ready;
+  setHealthValue(
+    notificationHealth,
+    notificationsReady,
+    health.notifications.enabled ? (notificationsReady ? "Queue ready" : "Not ready") : "Disabled",
+  );
+  notificationDetail.textContent = health.notifications.ntfy_configured
+    ? "The desktop host cannot take delivery while ntfy is configured."
+    : health.notifications.enabled
+      ? "Native desktop delivery is not enabled yet; queued notifications remain durable."
+      : "Analysis will still appear in the local inbox.";
+
+  lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not yet";
+  watchlistCount.textContent = String(health.watchlist_count);
+  checkSupported = health.production_check_supported;
+  checkNow.disabled = checkInFlight || !checkSupported;
+}
+
+async function loadHealth(message = "Health is up to date."): Promise<boolean> {
+  try {
+    renderHealth(await invoke<HealthStatus>("health_get"));
+    healthStatus.textContent = message;
+    healthStatus.dataset.kind = "success";
+    return true;
+  } catch (error) {
+    healthStatus.textContent = errorMessage(error);
+    healthStatus.dataset.kind = "error";
+    return false;
+  }
+}
+
+function checkResultMessage(result: CheckResult): string {
+  if (!result.active) return "Add a watched sender before running a check.";
+  const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
+  if (result.pending_notifications > 0) {
+    return `${summary} ${result.pending_notifications} notification${result.pending_notifications === 1 ? " is" : "s are"} durably queued for delivery.`;
+  }
+  return summary;
+}
+
+async function runCheck(): Promise<void> {
+  if (checkInFlight) return;
+  checkInFlight = true;
+  checkNow.disabled = true;
+  healthStatus.textContent = "Checking watched mail…";
+  try {
+    const result = await invoke<CheckResult>("watcher_check");
+    const message = checkResultMessage(result);
+    await Promise.all([loadInbox(), loadHealth(message)]);
+  } catch (error) {
+    healthStatus.textContent = errorMessage(error);
+    healthStatus.dataset.kind = "error";
+  } finally {
+    checkInFlight = false;
+    checkNow.disabled = !checkSupported;
   }
 }
 
@@ -329,7 +510,10 @@ form.addEventListener("submit", (event) => {
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));
+healthTab.addEventListener("click", () => showView("health"));
+checkNow.addEventListener("click", () => void runCheck());
 void loadInbox();
+void loadHealth();
 void loadSenders().then((loaded) => {
   if (loaded) finishOperation();
 });
