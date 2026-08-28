@@ -49,6 +49,58 @@ pub struct InboxItem {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HealthStatus {
+    pub database: DatabaseHealth,
+    pub gmail: GmailHealth,
+    pub last_check: Option<String>,
+    pub local_model: LocalModelHealth,
+    pub notifications: NotificationHealth,
+    pub production_check_supported: bool,
+    pub watchlist_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatabaseHealth {
+    pub ok: bool,
+    pub initialized: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailHealth {
+    pub credentials_configured: bool,
+    pub connected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalModelHealth {
+    pub authentication_required: bool,
+    pub detail: String,
+    pub endpoint: String,
+    pub model: String,
+    pub ok: bool,
+    pub token_configured: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NotificationHealth {
+    pub delivery: String,
+    pub enabled: bool,
+    pub host_delivery_ready: bool,
+    pub ntfy_configured: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CheckResult {
+    pub active: bool,
+    pub discovered: u64,
+    pub summarized: u64,
+    pub fallback_notified: u64,
+    pub purged: u64,
+    pub stale_cursor_recovered: bool,
+    pub pending_notifications: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
     pub message: String,
@@ -156,6 +208,14 @@ impl Engine {
     pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
         self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub fn health(&self) -> Result<HealthStatus, EngineError> {
+        self.request("health.get", json!({}))
+    }
+
+    pub fn check(&self) -> Result<CheckResult, EngineError> {
+        self.request("watcher.check", json!({"dry_run": false}))
     }
 
     pub fn add(&self, email: String, name: Option<String>) -> Result<WatchedSender, EngineError> {
@@ -316,25 +376,57 @@ mod tests {
     }
 
     #[test]
-    fn watchlist_round_trip_uses_real_engine_contract() {
+    fn desktop_operations_use_real_engine_contract() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config_path = directory.path().join("config.toml");
         let database_path = directory.path().join("watcher.sqlite3");
+        let gmail_credentials_path = directory.path().join("gmail-credentials.json");
+        let gmail_token_path = directory.path().join("gmail-token.json");
         fs::write(
             &config_path,
             format!(
                 r#"database_file = "{}"
-model_base_url = "http://127.0.0.1:1234/v1"
+gmail_credentials_file = "{}"
+gmail_token_file = "{}"
+model_base_url = "http://127.0.0.1:9/v1"
 model_name = "local-model"
 model_require_auth = false
 notifications_enabled = true
 "#,
-                database_path.display()
+                database_path.display(),
+                gmail_credentials_path.display(),
+                gmail_token_path.display()
             ),
         )
         .expect("write config");
         let engine = real_engine(config_path);
 
+        let health = engine.health().expect("read engine health");
+        assert_eq!(
+            health.database,
+            DatabaseHealth {
+                ok: true,
+                initialized: false
+            }
+        );
+        assert!(!health.gmail.credentials_configured);
+        assert!(!health.gmail.connected);
+        assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
+        assert_eq!(health.local_model.model, "local-model");
+        assert_eq!(health.watchlist_count, 0);
+
+        assert_eq!(
+            engine.check().expect("inactive check without Gmail"),
+            CheckResult {
+                active: false,
+                discovered: 0,
+                summarized: 0,
+                fallback_notified: 0,
+                purged: 0,
+                stale_cursor_recovered: false,
+                pending_notifications: 0,
+            }
+        );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
         assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
         let added = engine

@@ -1,12 +1,14 @@
 # Tauri desktop proof
 
-The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger and
-the useful watchlist path: list, add, and remove exact watched senders through the existing
+The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger,
+the useful watchlist path, and a live Health view. Health can inspect Gmail, local AI, database,
+and notification readiness, then run one production-safe `Check now` through the existing
 versioned Python engine contract.
 
-It does **not** yet own polling, native notifications, tray/single-instance behavior, Gmail OAuth,
-settings mutation, or packaging. The existing systemd watcher remains the production path while
-those capabilities are proven in later slices.
+It does **not** yet own automatic polling, native notification delivery, tray/single-instance
+behavior, Gmail OAuth, settings mutation, or packaging. `Check now` preserves notification intents
+in the durable engine queue; it does not claim that the Tauri host delivered them. The existing
+systemd watcher remains the production path while those capabilities are proven in later slices.
 
 ## Development prerequisites
 
@@ -43,9 +45,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri build --no-bundle
 ```
 
-The Rust test performs a real add/list/remove round trip through `eom-mail-engine` using a temporary
-zero-sender config. The production build intentionally disables installer bundling; runtime and
-installer packaging belong to the distribution slice.
+The Rust test performs real health, inactive-check, and add/list/remove calls through
+`eom-mail-engine` using a temporary zero-sender config. The inactive check proves the host contract
+without contacting Gmail. The production build intentionally disables installer bundling; runtime
+and installer packaging belong to the distribution slice.
 
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.

@@ -1,6 +1,6 @@
 mod engine;
 
-use engine::{Engine, EngineError, InboxItem, WatchedSender};
+use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
 use tauri::{Manager, State};
 
 const INBOX_LIMIT: u16 = 50;
@@ -9,6 +9,22 @@ const INBOX_LIMIT: u16 = 50;
 async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.recent(INBOX_LIMIT))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn health_get(engine: State<'_, Engine>) -> Result<HealthStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.health())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn watcher_check(engine: State<'_, Engine>) -> Result<CheckResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.check())
         .await
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
@@ -53,7 +69,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            health_get,
             inbox_recent,
+            watcher_check,
             watchlist_list,
             watchlist_add,
             watchlist_remove

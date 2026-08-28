@@ -96,7 +96,8 @@ h1 {
 }
 
 .view-tabs button:focus-visible,
-.remove-button:focus-visible {
+.remove-button:focus-visible,
+.primary-action:focus-visible {
   outline: 3px solid rgb(46 107 76 / 25%);
   outline-offset: 2px;
 }
@@ -115,6 +116,27 @@ h2 {
 .view-lede {
   margin: 6px 0 18px;
   color: #657068;
+}
+
+.view-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.view-heading .view-lede {
+  margin-bottom: 0;
+}
+
+.primary-action {
+  flex: none;
+  padding: 11px 17px;
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  background: #245c40;
+  font-weight: 800;
 }
 
 .sender-form {
@@ -362,6 +384,92 @@ input:focus {
   text-align: center;
 }
 
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.health-card {
+  position: relative;
+  overflow: hidden;
+  min-height: 138px;
+  padding: 18px 20px 17px 24px;
+  border: 1px solid #d7ded8;
+  border-radius: 14px;
+  background: rgb(255 255 255 / 82%);
+  box-shadow: 0 12px 32px rgb(28 54 38 / 6%);
+}
+
+.health-card::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  background: #849189;
+  content: "";
+}
+
+.health-card dt {
+  color: #6a766e;
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.health-card dd {
+  margin: 8px 0 7px;
+  color: #17211b;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.35rem;
+  font-weight: 600;
+}
+
+.health-card dd[data-ready="true"] {
+  color: #245c40;
+}
+
+.health-card dd[data-ready="false"] {
+  color: #a2322f;
+}
+
+.health-card .health-card-detail {
+  display: block;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #657068;
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.health-details {
+  margin: 14px 0 0;
+  border-top: 1px solid #d7ded8;
+}
+
+.health-details div {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.75fr) 1.25fr;
+  gap: 18px;
+  padding: 13px 2px;
+  border-bottom: 1px solid #d7ded8;
+}
+
+.health-details dt {
+  color: #657068;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.health-details dd {
+  margin: 0;
+  color: #354239;
+  text-align: right;
+}
+
 @media (max-width: 680px) {
   .shell {
     width: min(100% - 28px, 760px);
@@ -374,6 +482,29 @@ input:focus {
 
   .sender-form button {
     width: 100%;
+  }
+
+  .view-heading {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .primary-action {
+    width: 100%;
+  }
+
+  .health-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .health-details div {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .health-details dd {
+    text-align: left;
   }
 
   .message-meta,
