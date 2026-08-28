@@ -315,7 +315,7 @@ function setHealthValue(element: HTMLElement, ready: boolean, text: string): voi
 }
 
 function renderHealth(health: HealthStatus): void {
-  const gmailReady = health.gmail.connected;
+  const gmailReady = health.gmail.connected && health.gmail.credentials_configured;
   setHealthValue(gmailHealth, gmailReady, gmailReady ? "Configured" : "Needs attention");
   gmailDetail.textContent = gmailReady
     ? "A read-only watcher token is present."
@@ -347,7 +347,8 @@ function renderHealth(health: HealthStatus): void {
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not yet";
   watchlistCount.textContent = String(health.watchlist_count);
-  checkSupported = health.production_check_supported;
+  checkSupported =
+    health.production_check_supported && health.notifications.host_delivery_ready;
   checkNow.disabled = checkInFlight || !checkSupported;
 }
 
@@ -365,12 +366,13 @@ async function loadHealth(message = "Health is up to date."): Promise<boolean> {
 }
 
 function checkResultMessage(result: CheckResult): string {
-  if (!result.active) return "Add a watched sender before running a check.";
+  const queued = result.pending_notifications;
+  const queueMessage = queued
+    ? ` ${queued} notification${queued === 1 ? " is" : "s are"} durably queued for delivery.`
+    : "";
+  if (!result.active) return `Add a watched sender before running a check.${queueMessage}`;
   const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
-  if (result.pending_notifications > 0) {
-    return `${summary} ${result.pending_notifications} notification${result.pending_notifications === 1 ? " is" : "s are"} durably queued for delivery.`;
-  }
-  return summary;
+  return `${summary}${queueMessage}`;
 }
 
 async function runCheck(): Promise<void> {
@@ -510,7 +512,10 @@ form.addEventListener("submit", (event) => {
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));
-healthTab.addEventListener("click", () => showView("health"));
+healthTab.addEventListener("click", () => {
+  showView("health");
+  void loadHealth();
+});
 checkNow.addEventListener("click", () => void runCheck());
 void loadInbox();
 void loadHealth();
