@@ -111,6 +111,11 @@ pub struct NotificationIntent {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EngineSettings {
+    pub poll_interval_minutes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
     pub message: String,
@@ -232,6 +237,10 @@ impl Engine {
 
     pub fn health(&self) -> Result<HealthStatus, EngineError> {
         self.request("health.get", json!({}))
+    }
+
+    pub fn settings(&self) -> Result<EngineSettings, EngineError> {
+        self.request("settings.get", json!({}))
     }
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
@@ -463,6 +472,12 @@ notifications_enabled = true
         assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);
+        assert_eq!(
+            engine.settings().expect("read engine settings"),
+            EngineSettings {
+                poll_interval_minutes: 120
+            }
+        );
 
         assert_eq!(
             engine.check().expect("inactive check without Gmail"),

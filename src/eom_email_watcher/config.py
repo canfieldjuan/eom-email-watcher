@@ -16,6 +16,7 @@ from tomlkit.items import AoT, Array
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
+DEFAULT_POLL_INTERVAL_MINUTES = 120
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
@@ -48,6 +49,7 @@ class Config:
     timezone: str
     body_char_limit: int
     retention_days: int
+    poll_interval_minutes: int
     gmail_credentials_file: Path
     gmail_token_file: Path
     gmail_send_token_file: Path
@@ -208,11 +210,16 @@ def load_config(path: Path | None = None) -> Config:
 
     body_limit = _integer_setting(data, "body_char_limit", 20_000)
     retention = _integer_setting(data, "retention_days", 180)
+    poll_interval = _integer_setting(
+        data, "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES
+    )
     timeout = _float_setting(data, "model_timeout_seconds", 60)
     if not 1_000 <= body_limit <= 100_000:
         raise ConfigError("body_char_limit must be between 1000 and 100000")
     if not 1 <= retention <= 3650:
         raise ConfigError("retention_days must be between 1 and 3650")
+    if not 1 <= poll_interval <= 1440:
+        raise ConfigError("poll_interval_minutes must be between 1 and 1440")
     if not 1 <= timeout <= 300:
         raise ConfigError("model_timeout_seconds must be between 1 and 300")
 
@@ -244,6 +251,7 @@ def load_config(path: Path | None = None) -> Config:
         timezone=timezone,
         body_char_limit=body_limit,
         retention_days=retention,
+        poll_interval_minutes=poll_interval,
         gmail_credentials_file=_path(
             data.get("gmail_credentials_file", DEFAULT_STATE / "credentials.json"),
             "gmail_credentials_file",

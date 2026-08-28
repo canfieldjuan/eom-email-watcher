@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 interface WatchedSender {
@@ -50,6 +51,10 @@ interface HealthStatus {
   };
   production_check_supported: boolean;
   watchlist_count: number;
+  polling: {
+    interval_minutes: number;
+    next_check_unix_ms: number;
+  };
 }
 
 interface CheckResult {
@@ -147,7 +152,8 @@ app.innerHTML = `
       <dl class="health-details">
         <div><dt>Mailbox cursor updated</dt><dd id="last-check">Not initialized</dd></div>
         <div><dt>Watched senders</dt><dd id="watchlist-count">0</dd></div>
-        <div><dt>Automatic polling</dt><dd>Not enabled in this desktop proof</dd></div>
+        <div><dt>Automatic polling</dt><dd id="polling-cadence">Loading…</dd></div>
+        <div><dt>Next check</dt><dd id="next-check">Loading…</dd></div>
       </dl>
     </section>
   </div>
@@ -178,6 +184,8 @@ const notificationHealth = requiredElement<HTMLElement>("#notification-health");
 const notificationDetail = requiredElement<HTMLElement>("#notification-detail");
 const lastCheck = requiredElement<HTMLElement>("#last-check");
 const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
+const pollingCadence = requiredElement<HTMLElement>("#polling-cadence");
+const nextCheck = requiredElement<HTMLElement>("#next-check");
 let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
@@ -211,6 +219,14 @@ function receivedLabel(value: string): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
+}
+
+function intervalLabel(minutes: number): string {
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `Every ${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `Every ${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
 function stateLabel(item: InboxItem): string {
@@ -331,6 +347,8 @@ function renderHealthUnknown(): void {
   }
   lastCheck.textContent = "Unknown";
   watchlistCount.textContent = "Unknown";
+  pollingCadence.textContent = "Unknown";
+  nextCheck.textContent = "Unknown";
 }
 
 function renderHealth(health: HealthStatus): void {
@@ -368,6 +386,8 @@ function renderHealth(health: HealthStatus): void {
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
   watchlistCount.textContent = String(health.watchlist_count);
+  pollingCadence.textContent = intervalLabel(health.polling.interval_minutes);
+  nextCheck.textContent = receivedLabel(new Date(health.polling.next_check_unix_ms).toISOString());
   const watcherPrerequisitesReady =
     health.watchlist_count === 0 || (gmailReady && databaseReady);
   checkSupported =
@@ -564,6 +584,15 @@ healthTab.addEventListener("click", () => {
   void loadHealth();
 });
 checkNow.addEventListener("click", () => void runCheck());
+void listen<{ ok: boolean }>("watcher://scheduled-check", (event) => {
+  void loadInbox();
+  if (!healthView.hidden) {
+    const message = event.payload.ok
+      ? "Automatic check complete."
+      : "Automatic check failed; it will retry on schedule.";
+    void loadHealth(message, event.payload.ok ? "success" : "error");
+  }
+});
 void loadInbox();
 void loadHealth();
 void loadSenders().then((loaded) => {

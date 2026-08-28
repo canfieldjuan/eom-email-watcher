@@ -1,12 +1,15 @@
 mod delivery;
 mod engine;
+mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
+use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 const INBOX_LIMIT: u16 = 50;
+const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
 
 #[derive(Serialize)]
 struct DesktopCheckResult {
@@ -15,6 +18,13 @@ struct DesktopCheckResult {
     delivered_notifications: u64,
     failed_notifications: u64,
     remaining_notifications: u64,
+}
+
+#[derive(Serialize)]
+struct DesktopHealthStatus {
+    #[serde(flatten)]
+    health: HealthStatus,
+    polling: PollingStatus,
 }
 
 #[tauri::command]
@@ -26,11 +36,19 @@ async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, Engin
 }
 
 #[tauri::command]
-async fn health_get(engine: State<'_, Engine>) -> Result<HealthStatus, EngineError> {
+async fn health_get(
+    engine: State<'_, Engine>,
+    scheduler: State<'_, PollScheduler>,
+) -> Result<DesktopHealthStatus, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.health())
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    let polling = scheduler.status();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine
+            .health()
+            .map(|health| DesktopHealthStatus { health, polling })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -91,27 +109,52 @@ async fn watchlist_remove(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
-            app.manage(engine.clone());
-            app.manage(delivery.clone());
-            let app = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || match delivery.deliver(&app, &engine) {
-                Ok(outcome) if outcome.failed > 0 => eprintln!(
-                    "{} watcher startup notifications remain queued after delivery errors",
-                    outcome.failed
-                ),
-                Ok(_) => {}
+            let poll_interval_minutes = match engine.settings() {
+                Ok(settings) => settings.poll_interval_minutes,
                 Err(error) => {
                     eprintln!(
-                        "watcher startup notification delivery failed ({}): {}",
-                        error.code, error.message
+                        "watcher polling settings unavailable ({}): {}; using {} minutes",
+                        error.code, error.message, DEFAULT_POLL_INTERVAL_MINUTES
                     );
+                    DEFAULT_POLL_INTERVAL_MINUTES
+                }
+            };
+            let scheduler = PollScheduler::new(poll_interval_minutes);
+            app.manage(engine.clone());
+            app.manage(delivery.clone());
+            app.manage(scheduler.clone());
+            let startup_app = app.handle().clone();
+            let startup_engine = engine.clone();
+            let startup_delivery = delivery.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                match startup_delivery.deliver(&startup_app, &startup_engine) {
+                    Ok(outcome) if outcome.failed > 0 => eprintln!(
+                        "{} watcher startup notifications remain queued after delivery errors",
+                        outcome.failed
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "watcher startup notification delivery failed ({}): {}",
+                            error.code, error.message
+                        );
+                    }
                 }
             });
+            scheduler.start(app.handle().clone(), engine, delivery)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

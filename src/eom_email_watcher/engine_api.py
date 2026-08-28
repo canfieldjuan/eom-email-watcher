@@ -230,6 +230,7 @@ def _settings(request: dict[str, object]) -> dict[str, object]:
             ),
         },
         "notifications_enabled": config.notifications_enabled,
+        "poll_interval_minutes": config.poll_interval_minutes,
         "retention_days": config.retention_days,
         "timezone": config.timezone,
     }
