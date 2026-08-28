@@ -328,7 +328,7 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     )
     results = sorted((root / "benchmarks" / "results").glob("*.json"))
 
-    assert len(results) == 3
+    assert len(results) == 4
     for path in results:
         encoded = path.read_text(encoding="utf-8")
         result = json.loads(encoded)

@@ -7,7 +7,6 @@ synthetic corpus, LM Studio measurements, Ollama compatibility probe, and attach
 boundary are complete. A final recommendation remains blocked by:
 
 - blinded human scoring of the generated summary packet;
-- one additional smaller general-purpose instruction candidate distinct from LFM2.5-VL-3B; and
 - attributable peak-resident-memory evidence for the LM Studio candidates.
 
 No runtime, model, or quantization default should be changed from this partial result.
@@ -29,30 +28,31 @@ claims and should not be generalized beyond this corpus without more evidence.
 
 ## LM Studio results
 
-| Metric | Qwen 3.5 4B Q4_K_M | LFM2.5-VL-3B Q8_0 | LFM2.5-VL-1.6B Extract Q8_0 |
-|---|---:|---:|---:|
-| Requests | 54 | 54 | 54 |
-| Schema-valid rate | 0.777778 | 0.407407 | 1.0 |
-| Category accuracy | 0.722222 | 0.222222 | 0.203704 |
-| Priority accuracy | 0.611111 | 0.074074 | 0.148148 |
-| High/urgent safety misses | 12 | 18 | 9 |
-| Action precision | 1.0 | 0.0 | 0.0 |
-| Action recall | 0.6 | 0.0 | 0.0 |
-| Action false negatives | 12 | 30 | 30 |
-| Suggested-action validity | 0.777778 | 0.407407 | 1.0 |
-| Exact deadline rate | 0.703704 | 0.407407 | 0.777778 |
-| Deadline hallucinations | 0 | 0 | 0 |
-| Prompt-injection failure rate | 0.5 | 0.5 | 1.0 |
-| Runtime cold load (seconds) | 2.58 | 3.93 | 2.57 |
-| First request (seconds) | 9.970967 | 7.938178 | 1.695244 |
-| Median request (seconds) | 5.851201 | 5.75835 | 1.484609 |
-| p95 request (seconds) | 10.011681 | 7.583735 | 1.943943 |
-| Peak resident memory | not measured | not measured | not measured |
-| Human summary review | pending | pending | pending |
+| Metric | Qwen 3.5 4B Q4_K_M | Qwen 3.5 2B Q4_K_M | LFM2.5-VL-3B Q8_0 | LFM2.5-VL-1.6B Extract Q8_0 |
+|---|---:|---:|---:|---:|
+| Requests | 54 | 54 | 54 | 54 |
+| Schema-valid rate | 0.777778 | 0.759259 | 0.407407 | 1.0 |
+| Category accuracy | 0.722222 | 0.537037 | 0.222222 | 0.203704 |
+| Priority accuracy | 0.611111 | 0.37037 | 0.074074 | 0.148148 |
+| High/urgent safety misses | 12 | 18 | 18 | 9 |
+| Action precision | 1.0 | 0.0 | 0.0 | 0.0 |
+| Action recall | 0.6 | 0.0 | 0.0 | 0.0 |
+| Action false negatives | 12 | 30 | 30 | 30 |
+| Suggested-action validity | 0.777778 | 0.759259 | 0.407407 | 1.0 |
+| Exact deadline rate | 0.703704 | 0.666667 | 0.407407 | 0.777778 |
+| Deadline hallucinations | 0 | 0 | 0 | 0 |
+| Prompt-injection failure rate | 0.5 | 0.666667 | 0.5 | 1.0 |
+| Runtime cold load (seconds) | 2.58 | 3.04 | 3.93 | 2.57 |
+| First request (seconds) | 9.970967 | 3.423189 | 7.938178 | 1.695244 |
+| Median request (seconds) | 5.851201 | 2.92073 | 5.75835 | 1.484609 |
+| p95 request (seconds) | 10.011681 | 4.877321 | 7.583735 | 1.943943 |
+| Peak resident memory | not measured | not measured | not measured | not measured |
+| Human summary review | pending | pending | pending | pending |
 
 Machine-readable artifacts:
 
 - [`lmstudio-qwen35-4b-q4km.json`](../benchmarks/results/lmstudio-qwen35-4b-q4km.json)
+- [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
 - [`lmstudio-lfm25-vl-1p6b-extract-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-1p6b-extract-q8.json)
 
@@ -71,6 +71,12 @@ candidate that satisfies it.
 
 LFM2.5-VL-3B is not equivalent enough to replace the 4B baseline. It had lower schema, category,
 priority, action, deadline, and high/urgent results under the fixed contract.
+
+Qwen 3.5 2B is the additional smaller general-purpose candidate required by issue #18. It loaded
+CPU-only from a 1.81 GiB Q4_K_M artifact, but it is not equivalent enough to replace the 4B
+baseline: action recall was 0.0, it missed 18 high/urgent classifications, and four of six
+adversarial repetitions failed the prompt-injection contract. Its lower request latency does not
+offset those safety and task-quality regressions.
 
 LFM2.5-VL-1.6B Extract is also not a replacement. Its 1.0 schema-valid rate only proves that it
 returned structurally admissible objects. Its action recall was 0.0, category accuracy was
@@ -101,7 +107,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 22 paired case/repetition items with three anonymous
+The local blind-review command produced 19 paired case/repetition items with four anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 
@@ -134,10 +140,8 @@ input shape are documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachme
 ## Next evidence required
 
 1. Complete the existing blinded human review without opening the alias key first.
-2. Install or otherwise make available one finite, smaller general instruction candidate, then run
-   the exact same corpus and settings. Do not substitute the Extract model for this requirement.
-3. Measure attributable peak resident memory for each candidate or document a runtime-supported
+2. Measure attributable peak resident memory for each candidate or document a runtime-supported
    equivalent.
-4. Repeat the Ollama compatibility probe with a practical already-local candidate.
-5. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
+3. Repeat the Ollama compatibility probe with a practical already-local candidate.
+4. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
    validation or changing the corpus after seeing model output.

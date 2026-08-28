@@ -57,6 +57,7 @@ The models observed locally when this procedure was written were:
 | Model key | Artifact quantization | Role |
 |---|---|---|
 | `qwen3.5-4b` | `Q4_K_M` | required baseline |
+| `qwen3.5-2b` | `Q4_K_M` | smaller general-purpose challenger |
 | `lfm2.5-vl-3b` | `Q8_0` | installed general/multimodal challenger |
 | `lfm2.5-vl-1.6b-extract` | `Q8_0` | optional extraction experiment only |
 
