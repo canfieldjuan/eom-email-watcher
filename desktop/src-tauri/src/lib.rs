@@ -1,9 +1,20 @@
+mod delivery;
 mod engine;
 
+use delivery::NotificationDelivery;
 use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
-use tauri::{Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Manager, State};
 
 const INBOX_LIMIT: u16 = 50;
+
+#[derive(Serialize)]
+struct DesktopCheckResult {
+    #[serde(flatten)]
+    check: CheckResult,
+    delivered_notifications: u64,
+    remaining_notifications: u64,
+}
 
 #[tauri::command]
 async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
@@ -22,11 +33,27 @@ async fn health_get(engine: State<'_, Engine>) -> Result<HealthStatus, EngineErr
 }
 
 #[tauri::command]
-async fn watcher_check(engine: State<'_, Engine>) -> Result<CheckResult, EngineError> {
+async fn watcher_check(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+) -> Result<DesktopCheckResult, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.check())
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let check = engine.check()?;
+        let delivered_notifications = delivery.deliver(&app, &engine)?;
+        let remaining_notifications = check
+            .pending_notifications
+            .saturating_sub(delivered_notifications);
+        Ok(DesktopCheckResult {
+            check,
+            delivered_notifications,
+            remaining_notifications,
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -63,9 +90,21 @@ async fn watchlist_remove(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
-            app.manage(engine);
+            let delivery = NotificationDelivery::default();
+            app.manage(engine.clone());
+            app.manage(delivery.clone());
+            let app = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = delivery.deliver(&app, &engine) {
+                    eprintln!(
+                        "watcher startup notification delivery failed ({}): {}",
+                        error.code, error.message
+                    );
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

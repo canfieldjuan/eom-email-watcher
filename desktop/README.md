@@ -3,12 +3,15 @@
 The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger,
 the useful watchlist path, and a live Health view. Health can inspect Gmail, local AI, database,
 and notification readiness, then run one production-safe `Check now` through the existing
-versioned Python engine contract.
+versioned Python engine contract. The host drains a bounded batch of durable notification intents
+through Tauri's native notification plugin on startup and after `Check now`.
 
-It does **not** yet own automatic polling, native notification delivery, tray/single-instance
-behavior, Gmail OAuth, settings mutation, or packaging. `Check now` preserves notification intents
-in the durable engine queue; it does not claim that the Tauri host delivered them. The existing
-systemd watcher remains the production path while those capabilities are proven in later slices.
+The host acknowledges an intent only after the platform notification API accepts it. Failed or
+interrupted delivery remains queued and may be retried after restart, with the existing at-least-once
+duplicate window between platform acceptance and durable acknowledgement. It does **not** yet own
+automatic polling, tray/single-instance behavior, Gmail OAuth, settings mutation, or packaging. The
+existing systemd watcher remains the production path while those capabilities are proven in later
+slices.
 
 ## Development prerequisites
 

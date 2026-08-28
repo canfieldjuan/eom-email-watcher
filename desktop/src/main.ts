@@ -60,6 +60,8 @@ interface CheckResult {
   purged: number;
   stale_cursor_recovered: boolean;
   pending_notifications: number;
+  delivered_notifications: number;
+  remaining_notifications: number;
 }
 
 function requiredElement<T extends Element>(selector: string): T {
@@ -399,13 +401,19 @@ async function loadHealth(
 }
 
 function checkResultMessage(result: CheckResult): string {
-  const queued = result.pending_notifications;
-  const queueMessage = queued
-    ? ` ${queued} notification${queued === 1 ? " is" : "s are"} durably queued for delivery.`
+  const delivered = result.delivered_notifications;
+  const deliveryMessage = delivered
+    ? ` ${delivered} notification${delivered === 1 ? " was" : "s were"} delivered.`
     : "";
-  if (!result.active) return `Add a watched sender before running a check.${queueMessage}`;
+  const remaining = result.remaining_notifications;
+  const queueMessage = remaining
+    ? ` ${remaining} notification${remaining === 1 ? " remains" : "s remain"} durably queued.`
+    : "";
+  if (!result.active) {
+    return `Add a watched sender before running a check.${deliveryMessage}${queueMessage}`;
+  }
   const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
-  return `${summary}${queueMessage}`;
+  return `${summary}${deliveryMessage}${queueMessage}`;
 }
 
 async function runCheck(): Promise<void> {
