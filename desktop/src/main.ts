@@ -315,6 +315,21 @@ function setHealthValue(element: HTMLElement, ready: boolean, text: string): voi
   element.dataset.ready = String(ready);
 }
 
+function renderHealthUnknown(): void {
+  const detail = "Health refresh failed; current status is unknown.";
+  for (const [value, description] of [
+    [gmailHealth, gmailDetail],
+    [modelHealth, modelDetail],
+    [databaseHealth, databaseDetail],
+    [notificationHealth, notificationDetail],
+  ]) {
+    setHealthValue(value, false, "Unknown");
+    description.textContent = detail;
+  }
+  lastCheck.textContent = "Unknown";
+  watchlistCount.textContent = "Unknown";
+}
+
 function renderHealth(health: HealthStatus): void {
   const gmailReady = health.gmail.connected && health.gmail.credentials_configured;
   setHealthValue(gmailHealth, gmailReady, gmailReady ? "Configured" : "Needs attention");
@@ -376,6 +391,7 @@ async function loadHealth(
     if (requestGeneration !== healthRequestGeneration) return false;
     checkSupported = false;
     checkNow.disabled = true;
+    renderHealthUnknown();
     healthStatus.textContent = errorMessage(error);
     healthStatus.dataset.kind = "error";
     return false;
