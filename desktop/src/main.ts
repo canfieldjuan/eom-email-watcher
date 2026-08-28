@@ -61,6 +61,7 @@ interface CheckResult {
   stale_cursor_recovered: boolean;
   pending_notifications: number;
   delivered_notifications: number;
+  failed_notifications: number;
   remaining_notifications: number;
 }
 
@@ -360,7 +361,9 @@ function renderHealth(health: HealthStatus): void {
   notificationDetail.textContent = health.notifications.ntfy_configured
     ? "The desktop host cannot take delivery while ntfy is configured."
     : health.notifications.enabled
-      ? "Native desktop delivery is not enabled yet; queued notifications remain durable."
+      ? notificationsReady
+        ? "Native desktop delivery is active; failed notifications remain durably queued."
+        : "Native desktop delivery is unavailable; queued notifications remain durable."
       : "Analysis will still appear in the local inbox.";
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
@@ -405,15 +408,19 @@ function checkResultMessage(result: CheckResult): string {
   const deliveryMessage = delivered
     ? ` ${delivered} notification${delivered === 1 ? " was" : "s were"} delivered.`
     : "";
+  const failed = result.failed_notifications;
+  const failureMessage = failed
+    ? ` ${failed} delivery attempt${failed === 1 ? " failed" : "s failed"}.`
+    : "";
   const remaining = result.remaining_notifications;
   const queueMessage = remaining
-    ? ` ${remaining} notification${remaining === 1 ? " remains" : "s remain"} durably queued.`
+    ? ` ${remaining} notification${remaining === 1 ? " remains" : "s remain"} queued.`
     : "";
   if (!result.active) {
-    return `Add a watched sender before running a check.${deliveryMessage}${queueMessage}`;
+    return `Add a watched sender before running a check.${deliveryMessage}${failureMessage}${queueMessage}`;
   }
   const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
-  return `${summary}${deliveryMessage}${queueMessage}`;
+  return `${summary}${deliveryMessage}${failureMessage}${queueMessage}`;
 }
 
 async function runCheck(): Promise<void> {

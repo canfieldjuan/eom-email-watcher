@@ -13,6 +13,7 @@ struct DesktopCheckResult {
     #[serde(flatten)]
     check: CheckResult,
     delivered_notifications: u64,
+    failed_notifications: u64,
     remaining_notifications: u64,
 }
 
@@ -41,14 +42,15 @@ async fn watcher_check(
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let check = engine.check()?;
-        let delivered_notifications = delivery.deliver(&app, &engine)?;
-        let remaining_notifications = check
+        let outcome = delivery.check_and_deliver(&app, &engine)?;
+        let remaining_notifications = outcome
+            .check
             .pending_notifications
-            .saturating_sub(delivered_notifications);
+            .saturating_sub(outcome.delivery.delivered);
         Ok(DesktopCheckResult {
-            check,
-            delivered_notifications,
+            check: outcome.check,
+            delivered_notifications: outcome.delivery.delivered,
+            failed_notifications: outcome.delivery.failed,
             remaining_notifications,
         })
     })
@@ -97,8 +99,13 @@ pub fn run() {
             app.manage(engine.clone());
             app.manage(delivery.clone());
             let app = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = delivery.deliver(&app, &engine) {
+            tauri::async_runtime::spawn_blocking(move || match delivery.deliver(&app, &engine) {
+                Ok(outcome) if outcome.failed > 0 => eprintln!(
+                    "{} watcher startup notifications remain queued after delivery errors",
+                    outcome.failed
+                ),
+                Ok(_) => {}
+                Err(error) => {
                     eprintln!(
                         "watcher startup notification delivery failed ({}): {}",
                         error.code, error.message

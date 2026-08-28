@@ -7,8 +7,9 @@ versioned Python engine contract. The host drains a bounded batch of durable not
 through Tauri's native notification plugin on startup and after `Check now`.
 
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
-interrupted delivery remains queued and may be retried after restart, with the existing at-least-once
-duplicate window between platform acceptance and durable acknowledgement. It does **not** yet own
+interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
+retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
+window remains between platform acceptance and durable acknowledgement. It does **not** yet own
 automatic polling, tray/single-instance behavior, Gmail OAuth, settings mutation, or packaging. The
 existing systemd watcher remains the production path while those capabilities are proven in later
 slices.
