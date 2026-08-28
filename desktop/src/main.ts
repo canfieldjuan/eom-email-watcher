@@ -33,7 +33,7 @@ function requiredElement<T extends Element>(selector: string): T {
 const app = requiredElement<HTMLElement>("#app");
 
 app.innerHTML = `
-  <main class="shell">
+  <div class="shell">
     <header class="intro">
       <p class="eyebrow">Local email watcher</p>
       <h1>Your signal inbox</h1>
@@ -41,8 +41,8 @@ app.innerHTML = `
     </header>
 
     <nav class="view-tabs" aria-label="Watcher views">
-      <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-selected="true">Inbox</button>
-      <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-selected="false">Watchlist</button>
+      <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
+      <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
@@ -68,7 +68,7 @@ app.innerHTML = `
       <p id="watchlist-status" class="status" role="status" aria-live="polite">Loading watchlist…</p>
       <ul id="sender-list" class="sender-list" aria-label="Watched senders"></ul>
     </section>
-  </main>
+  </div>
 `;
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
@@ -97,8 +97,8 @@ function showView(view: "inbox" | "watchlist"): void {
   const inboxSelected = view === "inbox";
   inboxView.hidden = !inboxSelected;
   watchlistView.hidden = inboxSelected;
-  inboxTab.setAttribute("aria-selected", String(inboxSelected));
-  watchlistTab.setAttribute("aria-selected", String(!inboxSelected));
+  inboxTab.setAttribute("aria-pressed", String(inboxSelected));
+  watchlistTab.setAttribute("aria-pressed", String(!inboxSelected));
 }
 
 function receivedLabel(value: string): string {
@@ -117,7 +117,7 @@ function stateLabel(item: InboxItem): string {
   if (item.status === "skipped") return "Message unavailable";
   if (item.last_error) {
     if (item.status === "analyzed") return "Notification retry queued";
-    return item.fallback_notified_at ? "Analysis retry queued" : "Fallback ready";
+    return "Analysis retry queued";
   }
   if (item.status === "analyzed") return "Ready to notify";
   return "Waiting for analysis";

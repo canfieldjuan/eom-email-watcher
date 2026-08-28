@@ -90,7 +90,7 @@ h1 {
   font-weight: 800;
 }
 
-.view-tabs button[aria-selected="true"] {
+.view-tabs button[aria-pressed="true"] {
   color: #fff;
   background: #245c40;
 }
