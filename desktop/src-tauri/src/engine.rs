@@ -100,6 +100,16 @@ pub struct CheckResult {
     pub pending_notifications: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NotificationIntent {
+    pub analysis_at: Option<String>,
+    pub body: String,
+    pub kind: String,
+    pub message_id: String,
+    pub priority: String,
+    pub title: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
@@ -136,6 +146,16 @@ struct SenderItem {
 #[derive(Deserialize)]
 struct InboxItems {
     items: Vec<InboxItem>,
+}
+
+#[derive(Deserialize)]
+struct NotificationItems {
+    items: Vec<NotificationIntent>,
+}
+
+#[derive(Deserialize)]
+struct NotificationAcknowledgement {
+    status: String,
 }
 
 impl EngineError {
@@ -216,6 +236,35 @@ impl Engine {
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
         self.request("watcher.check", json!({"dry_run": false}))
+    }
+
+    pub fn pending_notifications(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<NotificationIntent>, EngineError> {
+        self.request::<NotificationItems>("notifications.pending", json!({"limit": limit}))
+            .map(|data| data.items)
+    }
+
+    pub fn acknowledge_notification(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
+        let acknowledgement = self.request::<NotificationAcknowledgement>(
+            "notifications.ack",
+            json!({
+                "analysis_at": &intent.analysis_at,
+                "kind": &intent.kind,
+                "message_id": &intent.message_id,
+            }),
+        )?;
+        if matches!(
+            acknowledgement.status.as_str(),
+            "acknowledged" | "already_acknowledged"
+        ) {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid notification acknowledgement",
+        ))
     }
 
     pub fn add(&self, email: String, name: Option<String>) -> Result<WatchedSender, EngineError> {
@@ -429,6 +478,27 @@ notifications_enabled = true
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
         assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
+        assert_eq!(
+            engine
+                .pending_notifications(25)
+                .expect("list pending notifications"),
+            vec![]
+        );
+        let missing_notification = NotificationIntent {
+            analysis_at: Some("2026-08-28T12:00:00+00:00".into()),
+            body: "Missing notification".into(),
+            kind: "analysis".into(),
+            message_id: "missing-message".into(),
+            priority: "normal".into(),
+            title: "Missing notification".into(),
+        };
+        assert_eq!(
+            engine
+                .acknowledge_notification(&missing_notification)
+                .expect_err("missing notification must fail")
+                .code,
+            "not_found"
+        );
         let added = engine
             .add(
                 "Person <WATCHED@Example.com>".into(),
