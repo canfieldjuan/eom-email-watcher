@@ -142,7 +142,7 @@ app.innerHTML = `
       </dl>
 
       <dl class="health-details">
-        <div><dt>Last successful check</dt><dd id="last-check">Not yet</dd></div>
+        <div><dt>Mailbox cursor updated</dt><dd id="last-check">Not initialized</dd></div>
         <div><dt>Watched senders</dt><dd id="watchlist-count">0</dd></div>
         <div><dt>Automatic polling</dt><dd>Not enabled in this desktop proof</dd></div>
       </dl>
@@ -346,7 +346,7 @@ function renderHealth(health: HealthStatus): void {
       ? "Native desktop delivery is not enabled yet; queued notifications remain durable."
       : "Analysis will still appear in the local inbox.";
 
-  lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not yet";
+  lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
   watchlistCount.textContent = String(health.watchlist_count);
   const watcherPrerequisitesReady =
     health.watchlist_count === 0 || (gmailReady && databaseReady);
@@ -357,7 +357,10 @@ function renderHealth(health: HealthStatus): void {
   checkNow.disabled = checkInFlight || !checkSupported;
 }
 
-async function loadHealth(message = "Health is up to date."): Promise<boolean> {
+async function loadHealth(
+  message = "Health is up to date.",
+  kind: "success" | "error" = "success",
+): Promise<boolean> {
   const requestGeneration = ++healthRequestGeneration;
   checkSupported = false;
   checkNow.disabled = true;
@@ -367,7 +370,7 @@ async function loadHealth(message = "Health is up to date."): Promise<boolean> {
     if (requestGeneration !== healthRequestGeneration) return false;
     renderHealth(health);
     healthStatus.textContent = message;
-    healthStatus.dataset.kind = "success";
+    healthStatus.dataset.kind = kind;
     return true;
   } catch (error) {
     if (requestGeneration !== healthRequestGeneration) return false;
@@ -399,8 +402,7 @@ async function runCheck(): Promise<void> {
     const message = checkResultMessage(result);
     await Promise.all([loadInbox(), loadHealth(message)]);
   } catch (error) {
-    healthStatus.textContent = errorMessage(error);
-    healthStatus.dataset.kind = "error";
+    await Promise.all([loadInbox(), loadHealth(errorMessage(error), "error")]);
   } finally {
     checkInFlight = false;
     checkNow.disabled = !checkSupported;
