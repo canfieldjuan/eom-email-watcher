@@ -114,11 +114,12 @@ function stateLabel(item: InboxItem): string {
   if (item.status === "summarized") {
     return item.notified_at ? "Notification delivered" : "Analysis complete";
   }
-  if (item.status === "analyzed") return "Ready to notify";
   if (item.status === "skipped") return "Message unavailable";
   if (item.last_error) {
+    if (item.status === "analyzed") return "Notification retry queued";
     return item.fallback_notified_at ? "Analysis retry queued" : "Fallback ready";
   }
+  if (item.status === "analyzed") return "Ready to notify";
   return "Waiting for analysis";
 }
 
@@ -142,12 +143,20 @@ function renderInbox(items: InboxItem[]): void {
 
     const meta = document.createElement("div");
     meta.className = "message-meta";
+    const senderIdentity = document.createElement("div");
+    senderIdentity.className = "message-sender";
     const sender = document.createElement("strong");
     sender.textContent = item.sender_name || item.sender;
+    senderIdentity.append(sender);
+    if (item.sender_name) {
+      const senderAddress = document.createElement("span");
+      senderAddress.textContent = item.sender;
+      senderIdentity.append(senderAddress);
+    }
     const received = document.createElement("time");
     received.dateTime = item.received_at;
     received.textContent = receivedLabel(item.received_at);
-    meta.append(sender, received);
+    meta.append(senderIdentity, received);
 
     const subject = document.createElement("h3");
     subject.textContent = item.subject;
@@ -157,9 +166,12 @@ function renderInbox(items: InboxItem[]): void {
 
     const details = document.createElement("div");
     details.className = "message-details";
-    if (item.action_required === 1) {
+    if (item.action_required !== null) {
       const action = document.createElement("p");
-      action.textContent = item.suggested_action || "Review this message.";
+      action.textContent =
+        item.action_required === 1
+          ? item.suggested_action || "Review this message."
+          : "No action required.";
       action.dataset.label = "Action required";
       details.append(action);
     }

@@ -246,6 +246,20 @@ input:focus {
   letter-spacing: 0.02em;
 }
 
+.message-sender {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.message-sender span {
+  overflow: hidden;
+  color: #6a766e;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .inbox-card h3 {
   margin: 9px 0 7px;
   color: #17211b;
