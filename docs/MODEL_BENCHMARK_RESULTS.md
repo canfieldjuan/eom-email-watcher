@@ -53,6 +53,7 @@ Machine-readable artifacts:
 
 - [`lmstudio-qwen35-4b-q4km.json`](../benchmarks/results/lmstudio-qwen35-4b-q4km.json)
 - [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
+- [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
 - [`lmstudio-lfm25-vl-1p6b-extract-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-1p6b-extract-q8.json)
 
@@ -88,6 +89,44 @@ No measured smaller candidate is equivalent enough to replace Qwen 3.5 4B. The e
 setting may remain an operational status quo, but this benchmark does not promote it to a proven
 public default.
 
+## Bonsai quantization results
+
+| Metric | Bonsai 4B Q1_0 (LM Studio) | Ternary Bonsai 8B Q2_0 (Prism llama.cpp) |
+|---|---:|---:|
+| Requests | 54 | 54 |
+| Schema-valid rate | 1.0 | 0.388889 |
+| Category accuracy | 0.611111 | 0.277778 |
+| Priority accuracy | 0.388889 | 0.333333 |
+| High/urgent safety misses | 9 | 18 |
+| Action precision | 1.0 | 0.0 |
+| Action recall | 0.5 | 0.0 |
+| Action false negatives | 15 | 30 |
+| Suggested-action validity | 1.0 | 0.388889 |
+| Exact deadline rate | 0.833333 | 0.388889 |
+| Deadline hallucinations | 0 | 0 |
+| Prompt-injection failure rate | 1.0 | 0.5 |
+| Runtime cold load (seconds) | 2.35 | 6.34 |
+| First request (seconds) | 7.273486 | 195.661482 |
+| Median request (seconds) | 4.165237 | 145.770917 |
+| p95 request (seconds) | 7.272045 | 195.661482 |
+| Peak resident memory | not measured | 5252.144531 MiB |
+| Human summary review | pending | pending |
+
+Machine-readable 8B artifact:
+
+- [`llama-cpp-prism-ternary-bonsai-8b-q2.json`](../benchmarks/results/llama-cpp-prism-ternary-bonsai-8b-q2.json)
+
+The 4B Q1_0 candidate is structurally reliable but not equivalent enough to replace the Qwen 3.5
+4B baseline. Its category and priority accuracy and action recall are lower, and every adversarial
+repetition failed the complete prompt-injection contract despite its 1.0 schema-valid rate.
+
+The legacy group-128 Q2_0 artifact loaded only through the frozen Prism `prism-v5` CPU server. This
+proves runtime compatibility, but the candidate is not viable for this workload: fewer than half
+of responses passed the production schema, action recall was 0.0, and median latency exceeded two
+minutes. The final request overlapped the cached local desktop verification, so its individual
+latency and the reported tail are conservative rather than clean idle-machine measurements. The
+peak RSS is the Prism `llama-server` process high-water mark captured after all 54 requests.
+
 ## Ollama compatibility result
 
 The local Ollama CLI initially had no running server. A dedicated server was started on
@@ -107,7 +146,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 19 paired case/repetition items with four anonymous
+The local blind-review command produced 18 paired case/repetition items with six anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 
@@ -140,8 +179,8 @@ input shape are documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachme
 ## Next evidence required
 
 1. Complete the existing blinded human review without opening the alias key first.
-2. Measure attributable peak resident memory for each candidate or document a runtime-supported
-   equivalent.
+2. Measure attributable peak resident memory for the remaining LM Studio candidates or document a
+   runtime-supported equivalent.
 3. Repeat the Ollama compatibility probe with a practical already-local candidate.
 4. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
    validation or changing the corpus after seeing model output.
