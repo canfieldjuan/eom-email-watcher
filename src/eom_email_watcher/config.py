@@ -118,7 +118,7 @@ def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -
     return Sender(email=email, name=name)
 
 
-def _validate_model_base_url(value: object) -> str:
+def validate_model_base_url(value: object) -> str:
     base_url = str(value).rstrip("/")
     if any(character.isspace() or not character.isprintable() for character in base_url):
         raise ConfigError("model_base_url must not contain whitespace or control characters")
@@ -216,7 +216,7 @@ def load_config(path: Path | None = None) -> Config:
     if not 1 <= timeout <= 300:
         raise ConfigError("model_timeout_seconds must be between 1 and 300")
 
-    base_url = _validate_model_base_url(
+    base_url = validate_model_base_url(
         data.get("model_base_url", "http://127.0.0.1:1234/v1")
     )
     model_name = data.get("model_name")

@@ -182,5 +182,9 @@ uv run ruff check .
 uv run pytest --cov=eom_email_watcher --cov-report=term-missing
 ```
 
+The synthetic, local-only CPU model benchmark and its privacy boundary are documented in
+[`docs/MODEL_BENCHMARK.md`](docs/MODEL_BENCHMARK.md). Benchmarking is a developer/operator tool;
+it does not run during normal mail checks.
+
 Desktop checks are documented with the desktop proof because they require the Rust/Node/WebKit
 toolchain in addition to Python.

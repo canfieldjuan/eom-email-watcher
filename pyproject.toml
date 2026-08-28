@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 eom-mail-watch = "eom_email_watcher.cli:main"
 eom-mail-engine = "eom_email_watcher.engine_api:main"
+eom-model-benchmark = "eom_email_watcher.benchmark:main"
 
 [dependency-groups]
 dev = [

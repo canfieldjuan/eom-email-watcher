@@ -14,3 +14,4 @@ config.toml
 credentials.json
 token.json
 .env
+benchmarks/local/
