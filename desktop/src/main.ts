@@ -179,6 +179,7 @@ let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
+let healthRequestGeneration = 0;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -347,18 +348,31 @@ function renderHealth(health: HealthStatus): void {
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not yet";
   watchlistCount.textContent = String(health.watchlist_count);
+  const watcherPrerequisitesReady =
+    health.watchlist_count === 0 || (gmailReady && databaseReady);
   checkSupported =
-    health.production_check_supported && health.notifications.host_delivery_ready;
+    health.production_check_supported &&
+    health.notifications.host_delivery_ready &&
+    watcherPrerequisitesReady;
   checkNow.disabled = checkInFlight || !checkSupported;
 }
 
 async function loadHealth(message = "Health is up to date."): Promise<boolean> {
+  const requestGeneration = ++healthRequestGeneration;
+  checkSupported = false;
+  checkNow.disabled = true;
+  healthStatus.textContent = "Refreshing health…";
   try {
-    renderHealth(await invoke<HealthStatus>("health_get"));
+    const health = await invoke<HealthStatus>("health_get");
+    if (requestGeneration !== healthRequestGeneration) return false;
+    renderHealth(health);
     healthStatus.textContent = message;
     healthStatus.dataset.kind = "success";
     return true;
   } catch (error) {
+    if (requestGeneration !== healthRequestGeneration) return false;
+    checkSupported = false;
+    checkNow.disabled = true;
     healthStatus.textContent = errorMessage(error);
     healthStatus.dataset.kind = "error";
     return false;
