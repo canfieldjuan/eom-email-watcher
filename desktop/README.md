@@ -84,8 +84,11 @@ The Rust tests perform real health, inactive-check, add/list/remove, capability-
 summary-command contract calls through `eom-mail-engine` using isolated config. The inactive check
 proves the host contract without contacting Gmail. `scripts/connect-local-proof.py` is the explicit
 cross-process proof harness: it uses a real Document Summarizer provider process and real Email
-Watcher persistence with synthetic Gmail attachment bytes and a deterministic local fixture model.
-It does not claim a live Gmail OAuth or human UI-click test.
+Watcher persistence with synthetic Gmail attachment bytes. Its default mode starts a deterministic
+local fixture model. Supplying `--model-base-url` and `--model-name` instead exercises an existing
+exact-loopback OpenAI-compatible model; an authenticated endpoint may additionally use
+`--model-api-token-file`. Both configured-model fields are required together, and the provider
+retains final endpoint validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.
