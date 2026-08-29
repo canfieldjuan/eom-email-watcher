@@ -58,6 +58,8 @@ Machine-readable artifacts:
 - [`lmstudio-qwen38-27b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen38-27b-q4km-gpu.json)
 - [`lmstudio-gemma4-e4b-q4km-gpu.json`](../benchmarks/results/lmstudio-gemma4-e4b-q4km-gpu.json)
 - [`lmstudio-gemma4-12b-q4km-gpu.json`](../benchmarks/results/lmstudio-gemma4-12b-q4km-gpu.json)
+- [`lmstudio-gemma4-26b-a4b-q6k-gpu.json`](../benchmarks/results/lmstudio-gemma4-26b-a4b-q6k-gpu.json)
+- [`lmstudio-gemma4-31b-qat-q4-gpu.json`](../benchmarks/results/lmstudio-gemma4-31b-qat-q4-gpu.json)
 - [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
 - [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
@@ -157,7 +159,7 @@ RSS measurements.
 | p95 request (seconds) | 1.945832 | 2.160957 | 2.293834 |
 | Human summary review | pending | pending | pending |
 
-Gemma 4 E4B is the leading deterministic candidate: every response passed the production schema,
+Gemma 4 E4B is the leading compact deterministic candidate: every response passed the production schema,
 it had perfect action precision and recall, and it improved category, priority, and deadline
 accuracy over Qwen 3.5 9B. Its one measured safety regression was 9 high/urgent misses versus 8 for
 Qwen 9B, and its request latency was slightly higher. Gemma E4B loaded in 5.2 seconds with an LM
@@ -170,6 +172,43 @@ attributable peak process RSS measurements.
 
 Gemma E4B advances to blinded human review alongside Qwen 9B. This deterministic comparison alone
 does not change the production default.
+
+### Larger Gemma 4 full-GPU challengers
+
+| Metric | Gemma 4 E4B Q4_K_M | Gemma 4 26B-A4B Q6_K | Gemma 4 31B QAT Q4_0 |
+|---|---:|---:|---:|
+| Requests | 54 | 54 | 54 |
+| Schema-valid rate | 1.0 | 0.685185 | 1.0 |
+| Category accuracy | 0.851852 | 0.62963 | 0.944444 |
+| Priority accuracy | 0.740741 | 0.444444 | 0.944444 |
+| High/urgent safety misses | 9 | 13 | 0 |
+| Action precision | 1.0 | 1.0 | 1.0 |
+| Action recall | 1.0 | 0.733333 | 1.0 |
+| Action false negatives | 0 | 8 | 0 |
+| Suggested-action validity | 1.0 | 0.685185 | 1.0 |
+| Exact deadline rate | 0.777778 | 0.574074 | 0.833333 |
+| Deadline hallucinations | 0 | 0 | 0 |
+| Prompt-injection failure rate | 0.0 | 1.0 | 0.0 |
+| Runtime cold load (seconds) | 5.2 | 18.39 | 18.05 |
+| First request (seconds) | 2.226928 | 4.633377 | 5.164575 |
+| Median request (seconds) | 1.284546 | 1.525088 | 4.219328 |
+| p95 request (seconds) | 2.160957 | 5.859825 | 5.544154 |
+| Human summary review | pending | pending | pending |
+
+Gemma 4 31B QAT is the leading deterministic-quality candidate. It matched E4B on perfect schema
+and action results, raised category and priority accuracy to 0.944444, and recorded no high/urgent
+misses, deadline hallucinations, or prompt-injection failures. The cost is materially higher
+latency and operating footprint: a 4.219328-second median request and an LM Studio reported 17.56
+GiB loaded footprint, compared with E4B at 1.284546 seconds and 5.89 GiB.
+
+Gemma 4 26B-A4B does not advance. Despite the Q6_K artifact and full GPU offload, it regressed from
+E4B on every measured quality dimension, recorded 13 high/urgent misses, and failed all six
+prompt-injection repetitions. It loaded in 18.39 seconds with an LM Studio reported 22.20 GiB
+footprint. These load displays remain operating-profile observations rather than attributable peak
+process RSS measurements.
+
+Gemma 31B joins E4B and Qwen 9B in blinded human review. Deterministic quality favors 31B, while
+latency and GPU footprint favor E4B; no production default changes from these measurements alone.
 
 ### Smaller-candidate verdicts
 
@@ -249,7 +288,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 18 paired case/repetition items with eleven anonymous
+The local blind-review command produced 14 paired case/repetition items with thirteen anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 

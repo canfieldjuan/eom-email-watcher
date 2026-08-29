@@ -63,6 +63,8 @@ The models observed locally when this procedure was written were:
 | `qwen/qwen3.8-27b` | `Q4_K_M` | full-GPU general-purpose challenger |
 | `google/gemma-4-e4b` | `Q4_K_M` | full-GPU efficient Gemma challenger |
 | `google/gemma-4-12b` | `Q4_K_M` | full-GPU Gemma size challenger |
+| `google/gemma-4-26b-a4b` | `Q6_K` | full-GPU mixture-of-experts challenger |
+| `google/gemma-4-31b-qat` | `Q4_0` | full-GPU Gemma quality challenger |
 | `qwen3.5-2b` | `Q4_K_M` | smaller general-purpose challenger |
 | `bonsai-4b` | `Q1_0` | end-to-end 1-bit challenger |
 | `ternary-bonsai-8b` | legacy `Q2_0` | ternary challenger requiring Prism llama.cpp |
