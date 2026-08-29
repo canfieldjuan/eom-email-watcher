@@ -64,6 +64,10 @@ Machine-readable artifacts:
 - [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
 - [`lmstudio-lfm25-vl-1p6b-extract-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-1p6b-extract-q8.json)
+- [`lmstudio-mistral-moe-4x7b-q5ks-gpu.json`](../benchmarks/results/lmstudio-mistral-moe-4x7b-q5ks-gpu.json)
+- [`lmstudio-devstral-small2-q6k-gpu.json`](../benchmarks/results/lmstudio-devstral-small2-q6k-gpu.json)
+- [`lmstudio-codestral-22b-q8-gpu.json`](../benchmarks/results/lmstudio-codestral-22b-q8-gpu.json)
+- [`lmstudio-devstral-small-2507-q8-gpu.json`](../benchmarks/results/lmstudio-devstral-small-2507-q8-gpu.json)
 
 ### Qwen 3.5 4B baseline verdict
 
@@ -210,6 +214,35 @@ process RSS measurements.
 Gemma 31B joins E4B and Qwen 9B in blinded human review. Deterministic quality favors 31B, while
 latency and GPU footprint favor E4B; no production default changes from these measurements alone.
 
+### Mistral-family full-GPU challengers
+
+| Metric | Mistral MoE 4x7B Q5_K_S | Devstral Small 2 Q6_K | Codestral 22B Q8_0 | Devstral Small 2507 Q8_0 |
+|---|---:|---:|---:|---:|
+| Requests | 54 | 54 | 54 | 54 |
+| Schema-valid rate | 0.796296 | 0.851852 | 0.759259 | 0.833333 |
+| Category accuracy | 0.574074 | 0.740741 | 0.537037 | 0.722222 |
+| Priority accuracy | 0.333333 | 0.481481 | 0.407407 | 0.425926 |
+| High/urgent safety misses | 15 | 11 | 10 | 12 |
+| Action precision | 1.0 | 1.0 | 1.0 | 1.0 |
+| Action recall | 0.7 | 0.733333 | 0.766667 | 0.7 |
+| Action false negatives | 9 | 8 | 7 | 9 |
+| Suggested-action validity | 0.796296 | 0.851852 | 0.759259 | 0.833333 |
+| Exact deadline rate | 0.759259 | 0.740741 | 0.666667 | 0.740741 |
+| Deadline hallucinations | 0 | 0 | 0 | 0 |
+| Prompt-injection failure rate | 0.5 | 0.5 | 0.5 | 0.5 |
+| Runtime cold load (seconds) | 10.24 | 17.85 | 19.81 | 21.36 |
+| Median request (seconds) | 2.599391 | 3.32431 | 3.976596 | 3.732599 |
+| p95 request (seconds) | 4.028747 | 4.713165 | 5.970176 | 5.607941 |
+| Human summary review | pending | pending | pending | pending |
+
+None of the installed Mistral-family candidates advances. Every candidate failed three of the six
+prompt-injection repetitions and missed at least seven action-required cases. Devstral Small 2 had
+the strongest schema and category results in this group, while Codestral had the fewest action and
+high/urgent misses, but both remain behind the measured Gemma leaders on the safety and task-quality
+contract. The models loaded with explicit full GPU offload; LM Studio reported loaded footprints of
+15.53 GiB, 18.84 GiB, 22.02 GiB, and 23.33 GiB in table order. These load displays are operating
+profile observations rather than attributable peak process RSS measurements.
+
 ### Smaller-candidate verdicts
 
 LFM2.5-VL-3B is not equivalent enough to replace the 4B baseline. It had lower schema, category,
@@ -288,7 +321,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 14 paired case/repetition items with thirteen anonymous
+The local blind-review command produced 9 paired case/repetition items with seventeen anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 

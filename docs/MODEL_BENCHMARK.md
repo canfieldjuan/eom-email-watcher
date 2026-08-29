@@ -70,6 +70,10 @@ The models observed locally when this procedure was written were:
 | `ternary-bonsai-8b` | legacy `Q2_0` | ternary challenger requiring Prism llama.cpp |
 | `lfm2.5-vl-3b` | `Q8_0` | installed general/multimodal challenger |
 | `lfm2.5-vl-1.6b-extract` | `Q8_0` | optional extraction experiment only |
+| `mistral-moe-4x7b-dark-multiverse-uncensored-enhanced32-24b` | `Q5_K_S` | third-party Mistral-family mixture-of-experts challenger |
+| `mistralai/devstral-small-2-2512` | `Q6_K` | full-GPU official Devstral challenger |
+| `mistralai/codestral-22b-v0.1` | `Q8_0` | full-GPU official Codestral challenger |
+| `mistralai/devstral-small-2507` | `Q8_0` | full-GPU official Devstral challenger |
 
 The Extract model is not a valid general default unless it also passes the complete classification,
 priority, action, deadline, adversarial, and human-summary contract.
