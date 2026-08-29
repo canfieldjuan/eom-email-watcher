@@ -345,6 +345,37 @@ although its structure, action, latency, and high/urgent results are strong, it 
 prompt-injection repetitions. Historical LM Studio artifacts remain valid evidence but do not set
 the backend for future candidate runs. Local application runtime migration remains deferred.
 
+## Qwen3 30B-A3B summarization follow-up at 32K context
+
+The operator selected `qwen3-30b-a3b:latest` for continued local testing. This does not change the
+production watcher default. A disposable Ollama 0.24.0 server ran loopback-only with cloud access
+disabled and `OLLAMA_CONTEXT_LENGTH=32768`. Runtime logs reported all 49 model layers on the RTX
+3090, and `/api/ps` reported a 32,768-token context with the full loaded model resident in VRAM.
+
+The controlled document suite ran three repetitions at each size:
+
+| Tier / generated words | API prompt tokens | Requests | Schema-valid | Fact recall | Word-limit pass | Median latency (seconds) |
+|---|---:|---:|---:|---:|---:|---:|
+| Short / 650 | 863 | 3 | 1.0 | 1.0 | 1.0 | 0.908706 |
+| Short / 3,000 | 3,313 | 3 | 1.0 | 1.0 | 1.0 | 1.150351 |
+| Long / 9,000 | 9,921 | 3 | 1.0 | 0.714286 | 1.0 | 1.685545 |
+| Long / 18,000 | 19,655 | 3 | 1.0 | 0.833333 | 1.0 | 1.89384 |
+
+Across all 12 requests, schema validity and word-limit compliance were 1.0. Short-document fact
+recall was 1.0; long-document fact recall was 0.769231. The machine-readable public artifact is
+[`ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json`](../benchmarks/results/ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json).
+
+A fresh three-repetition pass over the private 20-email corpus at the same 32K runtime produced 60
+schema-valid responses. Category accuracy was 0.883333, priority accuracy was 0.95, action recall
+was 0.981481, exact deadline rate was 0.95, and three deadline hallucinations occurred. Its median
+latency was 1.052395 seconds. These differ from the earlier 8K-context pass, but the run does not
+isolate context size from normal temperature-0.1 output variance, so it is not evidence that a
+larger context caused the difference. The content-free result and content-bearing review artifact
+remain mode-`0600` under `benchmarks/local/`.
+
+Automated email classification scores do not settle summary quality. Human review of the real-email
+summaries remains pending.
+
 ## Human summary review
 
 The local blind-review command produced 9 paired case/repetition items with eighteen anonymous

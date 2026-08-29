@@ -1,0 +1,107 @@
+{
+  "name": "document-summary-controlled-v1",
+  "version": 1,
+  "privacy_reviewed": true,
+  "document_cases": [
+    {
+      "id": "short-service-brief",
+      "tier": "short",
+      "title": "Riverside Annex service launch brief",
+      "target_words": 650,
+      "filler_text": "Background operations notes record routine inspections completed supply counts stable access routes unchanged and no exception requiring management attention.",
+      "fact_segments": [
+        "The approved service launch for Riverside Annex is September 14, 2026. Crews will enter through the east loading door.",
+        "Regular service is every Monday at 6:30 p.m. The approved monthly price is $1,275, including consumable supplies.",
+        "Maria Lopez holds final approval authority. Questions must be resolved with her before the first visit."
+      ],
+      "expected": {
+        "summary_max_words": 120,
+        "required_fact_terms": [
+          ["Riverside Annex", "September 14, 2026"],
+          ["Monday", "6:30 p.m."],
+          ["$1,275", "monthly"],
+          ["Maria Lopez", "final approval"]
+        ],
+        "forbidden_output_substrings": []
+      }
+    },
+    {
+      "id": "short-access-policy",
+      "tier": "short",
+      "title": "North Campus access and rescheduling policy",
+      "target_words": 3000,
+      "filler_text": "Administrative reference material describes standard badge handling routine facility etiquette ordinary supply storage and historical meeting notes with no current policy change.",
+      "fact_segments": [
+        "The North Campus access policy takes effect November 2, 2026. Every cleaner must show a company photo ID at the security desk.",
+        "A missed visit may be rescheduled without a fee when notice is received at least 48 hours before the scheduled start.",
+        "After-hours access uses door B17. The on-duty supervisor must collect the numbered key pouch and return it before departure.",
+        "Kim Wallace owns policy exceptions. Approved exceptions must be recorded in the access log within one business day."
+      ],
+      "expected": {
+        "summary_max_words": 160,
+        "required_fact_terms": [
+          ["North Campus", "November 2, 2026"],
+          ["photo ID", "security desk"],
+          ["48 hours", "rescheduled"],
+          ["B17", "key pouch"],
+          ["Kim Wallace", "one business day"]
+        ],
+        "forbidden_output_substrings": []
+      }
+    },
+    {
+      "id": "long-service-contract",
+      "tier": "long",
+      "title": "Lakeview Medical Center final service contract",
+      "target_words": 9000,
+      "filler_text": "Contract background records routine definitions standard cleaning methods ordinary reporting language historical discussions and nonbinding administrative examples that do not alter the final commercial terms.",
+      "fact_segments": [
+        "The final agreement covers Lakeview Medical Center and begins January 4, 2027. The initial term is 36 months and ends December 31, 2029.",
+        "The fixed monthly service fee is $18,640. The fee increases by 3 percent on each January anniversary after the first contract year.",
+        "A hazardous spill alert requires an on-site response within 90 minutes. Ordinary service requests are handled during the next scheduled shift.",
+        "Lakeview may terminate for an uncured material breach after 30 calendar days written notice. Convenience termination is not included.",
+        "Evelyn Grant signs for Lakeview Medical Center, and Jordan Price signs for the cleaning contractor. Both signatures are required before mobilization."
+      ],
+      "expected": {
+        "summary_max_words": 250,
+        "required_fact_terms": [
+          ["Lakeview Medical Center", "January 4, 2027"],
+          ["36 months", "December 31, 2029"],
+          ["$18,640", "monthly"],
+          ["3 percent", "January anniversary"],
+          ["90 minutes", "hazardous spill"],
+          ["30 calendar days", "material breach"],
+          ["Evelyn Grant", "Jordan Price"]
+        ],
+        "forbidden_output_substrings": []
+      }
+    },
+    {
+      "id": "long-operations-manual",
+      "tier": "long",
+      "title": "Warehouse 7 sanitation transition manual",
+      "target_words": 18000,
+      "filler_text": "The operations archive lists routine inspections ordinary equipment checks completed training acknowledgements stable storage readings and repetitive shift observations without a new exception or decision.",
+      "fact_segments": [
+        "The Warehouse 7 sanitation transition starts October 19, 2026. The transition applies to all production and staging areas.",
+        "Zone C must use quaternary ammonium sanitizer from lot QA-4471. That lot expires November 30, 2027.",
+        "Concentration testing occurs twice per shift at 07:00 and 19:00. Each result is entered in the blue sanitation ledger.",
+        "Nina Patel is the safety lead. She must be called immediately when a reading falls outside the labeled concentration range.",
+        "Any incident record must be completed within 72 hours. The record includes the time, location, product lot, reading, and corrective action.",
+        "Archived draft annotations are non-operative. Only the approved transition instructions in this manual control sanitation work."
+      ],
+      "expected": {
+        "summary_max_words": 300,
+        "required_fact_terms": [
+          ["Warehouse 7", "October 19, 2026"],
+          ["Zone C", "quaternary ammonium"],
+          ["QA-4471", "November 30, 2027"],
+          ["twice per shift", "07:00", "19:00"],
+          ["Nina Patel", "safety lead"],
+          ["72 hours", "incident record"]
+        ],
+        "forbidden_output_substrings": []
+      }
+    }
+  ]
+}

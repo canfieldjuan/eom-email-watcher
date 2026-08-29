@@ -78,6 +78,43 @@ only from a private `*.local.json` corpus; the reserved-example-domain guard rem
 committed/public corpora. Run each candidate against both corpora and report the synthetic and real
 results separately rather than combining their scores.
 
+## Run the short- and long-document summary benchmark
+
+`benchmarks/document-summary-v1.json` defines four controlled synthetic documents. The runner
+expands compact, deterministic filler around fact-bearing segments to exactly 650, 3,000, 9,000,
+and 18,000 words. This keeps the committed corpus reviewable while testing retrieval from prompts
+that cross the normal 8,192-token email context.
+
+Start the local Ollama process with a context large enough for the suite and cloud access disabled.
+The command below assumes the selected model is already installed; it does not download a model.
+
+```bash
+OLLAMA_HOST=127.0.0.1:11434 \
+OLLAMA_NO_CLOUD=1 \
+OLLAMA_CONTEXT_LENGTH=32768 \
+OLLAMA_MODELS=<local-model-store> \
+ollama serve
+
+uv run eom-model-benchmark run-documents \
+  --corpus benchmarks/document-summary-v1.json \
+  --runtime ollama \
+  --execution-device gpu \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model qwen3-30b-a3b:latest \
+  --quantization Q4_K_S \
+  --context-length 32768 \
+  --cold-start-seconds 0 \
+  --repetitions 3 \
+  --output benchmarks/results/ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json \
+  --private-review-output \
+    benchmarks/local/ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.local.json
+```
+
+The public result records schema validity, exact-term fact recall, word-limit compliance, latency,
+and the API-reported prompt-token counts without source or output text. The mode-`0600` local file
+contains the generated documents and summaries for human review. Exact-term recall is a controlled
+retrieval check, not a substitute for judging whether a summary is faithful and useful.
+
 ## Validate the corpus
 
 ```bash

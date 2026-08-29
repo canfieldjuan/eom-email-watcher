@@ -33,7 +33,13 @@ from .config import (
 )
 from .gmail import GmailError, GmailGateway, MessageUnavailable
 from .mime import extract_body
-from .model import Analysis, LocalModel, ModelError, validate_analysis
+from .model import (
+    Analysis,
+    DocumentSummaryInference,
+    LocalModel,
+    ModelError,
+    validate_analysis,
+)
 
 Capability = Literal[
     "structured_email_analysis",
@@ -49,6 +55,7 @@ Category = Literal[
     "other",
 ]
 Priority = Literal["urgent", "high", "normal", "low"]
+DocumentTier = Literal["short", "long"]
 RuntimeName = Literal["lmstudio", "ollama", "llama_cpp"]
 CpuOnlyMethod = Literal[
     "lms-load-gpu-off",
@@ -180,6 +187,60 @@ class BenchmarkCorpus(BaseModel):
         return self
 
 
+class BenchmarkDocumentExpected(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary_max_words: int = Field(ge=25, le=1000)
+    required_fact_terms: list[list[str]] = Field(min_length=1)
+    forbidden_output_substrings: list[str] = Field(default_factory=list)
+
+    @field_validator("required_fact_terms")
+    @classmethod
+    def validate_fact_groups(cls, value: list[list[str]]) -> list[list[str]]:
+        if any(not group or any(not term.strip() for term in group) for group in value):
+            raise ValueError("required fact groups and terms must not be empty")
+        return value
+
+
+class BenchmarkDocumentCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
+    tier: DocumentTier
+    title: str = Field(min_length=1)
+    target_words: int = Field(ge=100)
+    filler_text: str = Field(min_length=1)
+    fact_segments: list[str] = Field(min_length=1)
+    expected: BenchmarkDocumentExpected
+
+    @model_validator(mode="after")
+    def validate_document_contract(self) -> BenchmarkDocumentCase:
+        document = expand_document(self)
+        normalized = document.casefold()
+        for group in self.expected.required_fact_terms:
+            if not all(term.casefold() in normalized for term in group):
+                raise ValueError("every required fact term must exist in the generated document")
+        return self
+
+
+class DocumentBenchmarkCorpus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: int = Field(ge=1)
+    privacy_reviewed: Literal[True]
+    document_cases: list[BenchmarkDocumentCase] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_ids_and_tiers(self) -> DocumentBenchmarkCorpus:
+        identifiers = [case.id for case in self.document_cases]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("document benchmark case ids must be unique")
+        if {case.tier for case in self.document_cases} != {"short", "long"}:
+            raise ValueError("document benchmark corpus must include short and long cases")
+        return self
+
+
 class BenchmarkCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -224,6 +285,40 @@ def load_corpus(path: Path) -> BenchmarkCorpus:
         path.read_text(encoding="utf-8"),
         context={"allow_private_content": allow_private_content},
     )
+
+
+def load_document_corpus(path: Path) -> DocumentBenchmarkCorpus:
+    if path.name.endswith(".local.json"):
+        _require_local_output(path)
+        if path.stat().st_mode & 0o077:
+            raise ValueError("private corpus files must not be accessible by group or other users")
+    return DocumentBenchmarkCorpus.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def expand_document(case: BenchmarkDocumentCase) -> str:
+    anchor_words = sum(len(segment.split()) for segment in case.fact_segments)
+    padding_words = case.target_words - anchor_words
+    if padding_words < 0:
+        raise ValueError("target_words must fit all fact segments")
+    filler_words = case.filler_text.split()
+    if not filler_words:
+        raise ValueError("filler_text must contain words")
+    gap_count = len(case.fact_segments) + 1
+    base, remainder = divmod(padding_words, gap_count)
+    parts: list[str] = []
+    filler_offset = 0
+    for index in range(gap_count):
+        length = base + (1 if index < remainder else 0)
+        parts.append(
+            " ".join(
+                filler_words[(filler_offset + offset) % len(filler_words)]
+                for offset in range(length)
+            )
+        )
+        filler_offset += length
+        if index < len(case.fact_segments):
+            parts.append(case.fact_segments[index])
+    return "\n\n".join(part for part in parts if part)
 
 
 def build_private_inbox_draft(
@@ -600,6 +695,215 @@ def run_benchmark(
     return public, private
 
 
+def _number_summary(values: list[int | float]) -> dict[str, int | float | None]:
+    if not values:
+        return {"minimum": None, "median": None, "maximum": None}
+    return {
+        "minimum": min(values),
+        "median": round(statistics.median(values), 6),
+        "maximum": max(values),
+    }
+
+
+def _document_score(
+    case: BenchmarkDocumentCase, inference: DocumentSummaryInference
+) -> dict[str, object]:
+    output = inference.output.summary.casefold()
+    fact_matches = [
+        all(term.casefold() in output for term in group)
+        for group in case.expected.required_fact_terms
+    ]
+    return {
+        "fact_matches": fact_matches,
+        "forbidden_output_failure": any(
+            marker.casefold() in output
+            for marker in case.expected.forbidden_output_substrings
+        ),
+        "summary_word_limit_passed": (
+            len(inference.output.summary.split()) <= case.expected.summary_max_words
+        ),
+    }
+
+
+def run_document_benchmark(
+    corpus: DocumentBenchmarkCorpus,
+    candidate: BenchmarkCandidate,
+    *,
+    repetitions: int,
+    summarize: Callable[[BenchmarkDocumentCase, str], DocumentSummaryInference],
+    timer: Callable[[], float] = time.perf_counter,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least 1")
+    if "text_attachment_summary" not in candidate.capabilities:
+        raise ValueError("document benchmark requires text_attachment_summary capability")
+
+    total_runs = len(corpus.document_cases) * repetitions
+    valid_runs = 0
+    fact_groups_total = 0
+    fact_groups_matched = 0
+    forbidden_failures = 0
+    word_limit_passes = 0
+    all_latencies: list[float] = []
+    all_prompt_tokens: list[int] = []
+    public_cases: list[dict[str, object]] = []
+    private_runs: list[dict[str, object]] = []
+    tier_totals: dict[str, Counter[str]] = {
+        tier: Counter() for tier in ("short", "long")
+    }
+    tier_latencies: dict[str, list[float]] = {tier: [] for tier in ("short", "long")}
+    tier_prompt_tokens: dict[str, list[int]] = {tier: [] for tier in ("short", "long")}
+
+    for case in corpus.document_cases:
+        document = expand_document(case)
+        case_fact_total = len(case.expected.required_fact_terms) * repetitions
+        fact_groups_total += case_fact_total
+        tier_totals[case.tier]["runs"] += repetitions
+        tier_totals[case.tier]["fact_groups_total"] += case_fact_total
+        case_valid = 0
+        case_fact_matches = 0
+        case_forbidden_failures = 0
+        case_word_limit_passes = 0
+        case_prompt_tokens: list[int] = []
+        case_latencies: list[float] = []
+        errors: Counter[str] = Counter()
+        error_codes: Counter[str] = Counter()
+
+        for repetition in range(1, repetitions + 1):
+            start = timer()
+            try:
+                inference = summarize(case, document)
+            except ModelError as exc:
+                latency = timer() - start
+                error_type = type(exc).__name__
+                errors[error_type] += 1
+                error_code = _safe_error_code(exc)
+                error_codes[error_code] += 1
+                private_runs.append(
+                    {
+                        "case_id": case.id,
+                        "repetition": repetition,
+                        "error_type": error_type,
+                        "error_code": error_code,
+                    }
+                )
+            else:
+                latency = timer() - start
+                valid_runs += 1
+                case_valid += 1
+                tier_totals[case.tier]["schema_valid"] += 1
+                scores = _document_score(case, inference)
+                matched = sum(bool(value) for value in scores["fact_matches"])
+                case_fact_matches += matched
+                fact_groups_matched += matched
+                tier_totals[case.tier]["fact_groups_matched"] += matched
+                if scores["forbidden_output_failure"]:
+                    case_forbidden_failures += 1
+                    forbidden_failures += 1
+                    tier_totals[case.tier]["forbidden_output_failures"] += 1
+                if scores["summary_word_limit_passed"]:
+                    case_word_limit_passes += 1
+                    word_limit_passes += 1
+                    tier_totals[case.tier]["summary_word_limit_passes"] += 1
+                if inference.prompt_tokens is not None:
+                    case_prompt_tokens.append(inference.prompt_tokens)
+                    all_prompt_tokens.append(inference.prompt_tokens)
+                    tier_prompt_tokens[case.tier].append(inference.prompt_tokens)
+                private_runs.append(
+                    {
+                        "case_id": case.id,
+                        "repetition": repetition,
+                        "input": {
+                            "title": case.title,
+                            "text": document,
+                            "summary_max_words": case.expected.summary_max_words,
+                        },
+                        "output": inference.output.model_dump(mode="json"),
+                        "usage": {
+                            "prompt_tokens": inference.prompt_tokens,
+                            "completion_tokens": inference.completion_tokens,
+                        },
+                    }
+                )
+            rounded_latency = round(latency, 6)
+            case_latencies.append(rounded_latency)
+            all_latencies.append(rounded_latency)
+            tier_latencies[case.tier].append(rounded_latency)
+
+        public_cases.append(
+            {
+                "id": case.id,
+                "tier": case.tier,
+                "generated_words": len(document.split()),
+                "runs": repetitions,
+                "schema_valid": case_valid,
+                "error_types": dict(sorted(errors.items())),
+                "error_codes": dict(sorted(error_codes.items())),
+                "fact_groups": case_fact_total,
+                "fact_groups_matched": case_fact_matches,
+                "fact_recall": _rate(case_fact_matches, case_fact_total),
+                "forbidden_output_failures": case_forbidden_failures,
+                "summary_word_limit_passes": case_word_limit_passes,
+                "prompt_tokens": _number_summary(case_prompt_tokens),
+                "latency_seconds": _number_summary(case_latencies),
+            }
+        )
+
+    tiers = {
+        tier: {
+            "runs": totals["runs"],
+            "schema_valid_rate": _rate(totals["schema_valid"], totals["runs"]),
+            "fact_recall": _rate(
+                totals["fact_groups_matched"], totals["fact_groups_total"]
+            ),
+            "forbidden_output_failures": totals["forbidden_output_failures"],
+            "summary_word_limit_pass_rate": _rate(
+                totals["summary_word_limit_passes"], totals["runs"]
+            ),
+            "prompt_tokens": _number_summary(tier_prompt_tokens[tier]),
+            "latency_seconds": _number_summary(tier_latencies[tier]),
+        }
+        for tier, totals in tier_totals.items()
+    }
+    public: dict[str, object] = {
+        "schema_version": 1,
+        "corpus": {
+            "name": corpus.name,
+            "version": corpus.version,
+            "sha256": _canonical_hash(corpus.model_dump(mode="json")),
+            "document_cases": len(corpus.document_cases),
+        },
+        "candidate": candidate.model_dump(mode="json"),
+        "transport": "openai-compatible-chat-completions",
+        "inference_settings": {
+            "temperature": 0.1,
+            "max_tokens": "min(2000, summary_max_words * 3 + 100)",
+            "response_format": "strict-json-schema",
+        },
+        "repetitions": repetitions,
+        "aggregate": {
+            "runs": total_runs,
+            "schema_valid_rate": _rate(valid_runs, total_runs),
+            "fact_recall": _rate(fact_groups_matched, fact_groups_total),
+            "forbidden_output_failures": forbidden_failures,
+            "summary_word_limit_pass_rate": _rate(word_limit_passes, total_runs),
+            "summary_human_review": "pending",
+        },
+        "prompt_tokens": _number_summary(all_prompt_tokens),
+        "latency_seconds": _number_summary(all_latencies),
+        "tiers": tiers,
+        "cases": public_cases,
+    }
+    private: dict[str, object] = {
+        "schema_version": 1,
+        "local_only": True,
+        "candidate": candidate.model_dump(mode="json"),
+        "corpus": corpus.model_dump(mode="json"),
+        "runs": private_runs,
+    }
+    return public, private
+
+
 def build_blind_review(
     private_results: Iterable[dict[str, object]], *, seed: str
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -792,6 +1096,55 @@ def _run_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_documents_command(args: argparse.Namespace) -> int:
+    _require_disjoint_input_outputs(
+        [args.corpus],
+        [args.output, args.private_review_output],
+        label="public and private document review output",
+    )
+    _require_local_output(args.private_review_output)
+    corpus = load_document_corpus(args.corpus)
+    candidate = _candidate_from_args(args)
+    model = LocalModel(
+        validate_model_base_url(args.base_url),
+        candidate.model,
+        args.timeout,
+        args.api_token_file,
+        args.require_auth,
+    )
+
+    def summarize(
+        case: BenchmarkDocumentCase, document: str
+    ) -> DocumentSummaryInference:
+        return model.summarize_document(
+            title=case.title,
+            text=document,
+            max_words=case.expected.summary_max_words,
+        )
+
+    public, private = run_document_benchmark(
+        corpus,
+        candidate,
+        repetitions=args.repetitions,
+        summarize=summarize,
+    )
+    _write_json(args.output, public, private=False)
+    _write_json(args.private_review_output, private, private=True)
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "private_review_output": str(args.private_review_output),
+                "runs": public["aggregate"]["runs"],
+                "schema_valid_rate": public["aggregate"]["schema_valid_rate"],
+                "fact_recall": public["aggregate"]["fact_recall"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _validate_command(args: argparse.Namespace) -> int:
     corpus = load_corpus(args.corpus)
     boundary = _validation_boundary(corpus.validation_cases)
@@ -954,6 +1307,31 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--private-review-output", type=Path, required=True)
     run.set_defaults(handler=_run_command)
+
+    run_documents = commands.add_parser(
+        "run-documents", help="Run one local candidate against short and long documents"
+    )
+    run_documents.add_argument("--corpus", type=Path, required=True)
+    run_documents.add_argument(
+        "--runtime", choices=tuple(CPU_ONLY_METHOD_BY_RUNTIME), required=True
+    )
+    run_documents.add_argument(
+        "--execution-device", choices=("cpu", "gpu"), default="cpu"
+    )
+    run_documents.add_argument("--base-url", required=True)
+    run_documents.add_argument("--model", required=True)
+    run_documents.add_argument("--quantization", required=True)
+    run_documents.add_argument("--context-length", type=int, required=True)
+    run_documents.add_argument("--cold-start-seconds", type=float, required=True)
+    run_documents.add_argument("--repetitions", type=int, default=1)
+    run_documents.add_argument("--timeout", type=float, default=600)
+    run_documents.add_argument("--api-token-file", type=Path)
+    run_documents.add_argument("--require-auth", action="store_true")
+    run_documents.add_argument("--output", type=Path, required=True)
+    run_documents.add_argument("--private-review-output", type=Path, required=True)
+    run_documents.set_defaults(
+        capability=["text_attachment_summary"], handler=_run_documents_command
+    )
 
     blind = commands.add_parser("blind", help="Create a blinded local summary-review packet")
     blind.add_argument("--input", type=Path, action="append", required=True)

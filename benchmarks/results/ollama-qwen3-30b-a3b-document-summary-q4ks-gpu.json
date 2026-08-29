@@ -1,0 +1,182 @@
+{
+  "aggregate": {
+    "fact_recall": 0.863636,
+    "forbidden_output_failures": 0,
+    "runs": 12,
+    "schema_valid_rate": 1.0,
+    "summary_human_review": "pending",
+    "summary_word_limit_pass_rate": 1.0
+  },
+  "candidate": {
+    "capabilities": [
+      "structured_email_analysis",
+      "text_attachment_summary"
+    ],
+    "cold_start_seconds": 0.0,
+    "context_length": 32768,
+    "cpu_only": false,
+    "cpu_only_method": null,
+    "gpu_offload_method": "ollama-cuda-visible-devices",
+    "model": "qwen3-30b-a3b:latest",
+    "quantization": "Q4_K_S",
+    "runtime": "ollama"
+  },
+  "cases": [
+    {
+      "error_codes": {},
+      "error_types": {},
+      "fact_groups": 12,
+      "fact_groups_matched": 12,
+      "fact_recall": 1.0,
+      "forbidden_output_failures": 0,
+      "generated_words": 650,
+      "id": "short-service-brief",
+      "latency_seconds": {
+        "maximum": 1.187947,
+        "median": 0.908706,
+        "minimum": 0.8919
+      },
+      "prompt_tokens": {
+        "maximum": 863,
+        "median": 863,
+        "minimum": 863
+      },
+      "runs": 3,
+      "schema_valid": 3,
+      "summary_word_limit_passes": 3,
+      "tier": "short"
+    },
+    {
+      "error_codes": {},
+      "error_types": {},
+      "fact_groups": 15,
+      "fact_groups_matched": 15,
+      "fact_recall": 1.0,
+      "forbidden_output_failures": 0,
+      "generated_words": 3000,
+      "id": "short-access-policy",
+      "latency_seconds": {
+        "maximum": 2.001323,
+        "median": 1.150351,
+        "minimum": 1.089239
+      },
+      "prompt_tokens": {
+        "maximum": 3313,
+        "median": 3313,
+        "minimum": 3313
+      },
+      "runs": 3,
+      "schema_valid": 3,
+      "summary_word_limit_passes": 3,
+      "tier": "short"
+    },
+    {
+      "error_codes": {},
+      "error_types": {},
+      "fact_groups": 21,
+      "fact_groups_matched": 15,
+      "fact_recall": 0.714286,
+      "forbidden_output_failures": 0,
+      "generated_words": 9000,
+      "id": "long-service-contract",
+      "latency_seconds": {
+        "maximum": 4.673981,
+        "median": 1.685545,
+        "minimum": 1.679609
+      },
+      "prompt_tokens": {
+        "maximum": 9921,
+        "median": 9921,
+        "minimum": 9921
+      },
+      "runs": 3,
+      "schema_valid": 3,
+      "summary_word_limit_passes": 3,
+      "tier": "long"
+    },
+    {
+      "error_codes": {},
+      "error_types": {},
+      "fact_groups": 18,
+      "fact_groups_matched": 15,
+      "fact_recall": 0.833333,
+      "forbidden_output_failures": 0,
+      "generated_words": 18000,
+      "id": "long-operations-manual",
+      "latency_seconds": {
+        "maximum": 8.958382,
+        "median": 1.89384,
+        "minimum": 1.889652
+      },
+      "prompt_tokens": {
+        "maximum": 19655,
+        "median": 19655,
+        "minimum": 19655
+      },
+      "runs": 3,
+      "schema_valid": 3,
+      "summary_word_limit_passes": 3,
+      "tier": "long"
+    }
+  ],
+  "corpus": {
+    "document_cases": 4,
+    "name": "document-summary-controlled-v1",
+    "sha256": "1b2c4dc8c90d212402cf107ac0e89e6205c20633831e80c8ff1d9a03974306fc",
+    "version": 1
+  },
+  "inference_settings": {
+    "max_tokens": "min(2000, summary_max_words * 3 + 100)",
+    "response_format": "strict-json-schema",
+    "temperature": 0.1
+  },
+  "latency_seconds": {
+    "maximum": 8.958382,
+    "median": 1.682577,
+    "minimum": 0.8919
+  },
+  "prompt_tokens": {
+    "maximum": 19655,
+    "median": 6617.0,
+    "minimum": 863
+  },
+  "repetitions": 3,
+  "schema_version": 1,
+  "tiers": {
+    "long": {
+      "fact_recall": 0.769231,
+      "forbidden_output_failures": 0,
+      "latency_seconds": {
+        "maximum": 8.958382,
+        "median": 1.891746,
+        "minimum": 1.679609
+      },
+      "prompt_tokens": {
+        "maximum": 19655,
+        "median": 14788.0,
+        "minimum": 9921
+      },
+      "runs": 6,
+      "schema_valid_rate": 1.0,
+      "summary_word_limit_pass_rate": 1.0
+    },
+    "short": {
+      "fact_recall": 1.0,
+      "forbidden_output_failures": 0,
+      "latency_seconds": {
+        "maximum": 2.001323,
+        "median": 1.119795,
+        "minimum": 0.8919
+      },
+      "prompt_tokens": {
+        "maximum": 3313,
+        "median": 2088.0,
+        "minimum": 863
+      },
+      "runs": 6,
+      "schema_valid_rate": 1.0,
+      "summary_word_limit_pass_rate": 1.0
+    }
+  },
+  "transport": "openai-compatible-chat-completions"
+}

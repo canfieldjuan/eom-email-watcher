@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher.model import SYSTEM_PROMPT, LocalModel, ModelError, validate_analysis
+from eom_email_watcher.model import (
+    DOCUMENT_SUMMARY_PROMPT,
+    SYSTEM_PROMPT,
+    LocalModel,
+    ModelError,
+    validate_analysis,
+)
 
 
 def valid_result() -> dict[str, object]:
@@ -121,3 +127,36 @@ def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) ->
     )
     assert result.category == "invoice"
     assert result.action_required is True
+
+
+def test_document_summary_uses_separate_prompt_schema_and_records_usage(monkeypatch) -> None:
+    model = LocalModel("http://127.0.0.1:11434/v1", "qwen3-30b-a3b", 60, None, False)
+    request_json: dict[str, object] = {}
+
+    class FakeResp:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": '{"summary":"Faithful summary."}'}}],
+                "usage": {"prompt_tokens": 1234, "completion_tokens": 12},
+            }
+
+    def fake_post(*args: object, **kwargs: object) -> FakeResp:
+        request_json.update(kwargs["json"])
+        return FakeResp()
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", fake_post)
+    result = model.summarize_document(
+        title="Local document",
+        text="PRIVATE_DOCUMENT_CANARY",
+        max_words=100,
+    )
+
+    assert result.output.summary == "Faithful summary."
+    assert result.prompt_tokens == 1234
+    assert result.completion_tokens == 12
+    assert request_json["messages"][0]["content"] == DOCUMENT_SUMMARY_PROMPT
+    assert request_json["response_format"]["json_schema"]["name"] == "document_summary"
+    assert "PRIVATE_DOCUMENT_CANARY" in request_json["messages"][1]["content"]

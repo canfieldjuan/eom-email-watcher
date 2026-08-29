@@ -11,8 +11,11 @@ from eom_email_watcher import benchmark as benchmark_module
 from eom_email_watcher.benchmark import (
     BenchmarkCandidate,
     BenchmarkCorpus,
+    BenchmarkDocumentCase,
+    BenchmarkDocumentExpected,
     BenchmarkEmailCase,
     BenchmarkExpected,
+    DocumentBenchmarkCorpus,
     ValidationCase,
     _candidate_from_args,
     _require_disjoint_input_outputs,
@@ -20,14 +23,21 @@ from eom_email_watcher.benchmark import (
     _write_json,
     build_blind_review,
     build_private_inbox_draft,
+    expand_document,
     finalize_private_inbox_draft,
     load_corpus,
     main,
     run_benchmark,
+    run_document_benchmark,
 )
 from eom_email_watcher.config import ConfigError, validate_model_base_url
 from eom_email_watcher.gmail import GmailError, MessageMetadata
-from eom_email_watcher.model import Analysis, ModelError
+from eom_email_watcher.model import (
+    Analysis,
+    DocumentSummary,
+    DocumentSummaryInference,
+    ModelError,
+)
 
 
 def _analysis(**overrides: object) -> Analysis:
@@ -102,6 +112,45 @@ def _candidate(model: str = "baseline-model") -> BenchmarkCandidate:
     )
 
 
+def _document_corpus() -> DocumentBenchmarkCorpus:
+    expected = BenchmarkDocumentExpected(
+        summary_max_words=80,
+        required_fact_terms=[["Riverside Annex", "September 14, 2026"], ["$1,275"]],
+        forbidden_output_substrings=["UNSUPPORTED_CANARY"],
+    )
+    return DocumentBenchmarkCorpus(
+        name="synthetic-document-test",
+        version=1,
+        privacy_reviewed=True,
+        document_cases=[
+            BenchmarkDocumentCase(
+                id="short-memo",
+                tier="short",
+                title="Service memo",
+                target_words=120,
+                filler_text="Routine background notes document completed inspections.",
+                fact_segments=[
+                    "Service at Riverside Annex begins September 14, 2026.",
+                    "The approved monthly amount is $1,275.",
+                ],
+                expected=expected,
+            ),
+            BenchmarkDocumentCase(
+                id="long-memo",
+                tier="long",
+                title="Long service memo",
+                target_words=240,
+                filler_text="Routine background notes document completed inspections.",
+                fact_segments=[
+                    "Service at Riverside Annex begins September 14, 2026.",
+                    "The approved monthly amount is $1,275.",
+                ],
+                expected=expected,
+            ),
+        ],
+    )
+
+
 def test_remote_benchmark_endpoint_uses_production_loopback_guard() -> None:
     assert validate_model_base_url("http://localhost:11434/v1/") == (
         "http://localhost:11434/v1"
@@ -137,6 +186,71 @@ def test_public_result_omits_email_and_free_form_model_text() -> None:
     encoded_private = json.dumps(private)
     assert "INJECTION_SOURCE_ONLY" in encoded_private
     assert "The customer asks for a schedule change." in encoded_private
+
+
+def test_document_benchmark_scores_facts_and_keeps_text_private() -> None:
+    candidate_data = _candidate().model_dump(mode="json")
+    candidate_data["capabilities"].append("text_attachment_summary")
+    candidate = BenchmarkCandidate.model_validate(candidate_data)
+    inference = DocumentSummaryInference(
+        output=DocumentSummary(
+            summary=(
+                "Service at Riverside Annex begins September 14, 2026, at an approved "
+                "monthly amount of $1,275."
+            )
+        ),
+        prompt_tokens=321,
+        completion_tokens=25,
+    )
+
+    public, private = run_document_benchmark(
+        _document_corpus(),
+        candidate,
+        repetitions=1,
+        summarize=lambda case, document: inference,
+        timer=iter([0.0, 0.4, 1.0, 1.8]).__next__,
+    )
+
+    encoded_public = json.dumps(public)
+    assert "Routine background notes" not in encoded_public
+    assert "Riverside Annex" not in encoded_public
+    assert public["aggregate"] == {
+        "runs": 2,
+        "schema_valid_rate": 1.0,
+        "fact_recall": 1.0,
+        "forbidden_output_failures": 0,
+        "summary_word_limit_pass_rate": 1.0,
+        "summary_human_review": "pending",
+    }
+    assert public["prompt_tokens"] == {"minimum": 321, "median": 321.0, "maximum": 321}
+    assert public["tiers"]["short"]["schema_valid_rate"] == 1.0
+    assert public["tiers"]["long"]["schema_valid_rate"] == 1.0
+    assert "Routine background notes" in json.dumps(private)
+    assert private["runs"][0]["usage"]["prompt_tokens"] == 321
+
+
+def test_document_expansion_hits_exact_word_target_and_validates_gold_terms() -> None:
+    corpus = _document_corpus()
+
+    assert [len(expand_document(case).split()) for case in corpus.document_cases] == [120, 240]
+    data = corpus.model_dump(mode="json")
+    data["document_cases"][0]["expected"]["required_fact_terms"] = [["missing fact"]]
+    with pytest.raises(ValueError, match="required fact term"):
+        DocumentBenchmarkCorpus.model_validate(data)
+
+
+def test_document_benchmark_requires_claimed_text_summary_capability() -> None:
+    with pytest.raises(ValueError, match="text_attachment_summary"):
+        run_document_benchmark(
+            _document_corpus(),
+            _candidate(),
+            repetitions=1,
+            summarize=lambda case, document: DocumentSummaryInference(
+                output=DocumentSummary(summary="Summary."),
+                prompt_tokens=None,
+                completion_tokens=None,
+            ),
+        )
 
 
 def test_scoring_exposes_high_false_negative_and_prompt_injection() -> None:
@@ -621,18 +735,44 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     corpus = BenchmarkCorpus.model_validate_json(
         (root / "benchmarks" / "email-analysis-v1.json").read_text(encoding="utf-8")
     )
-    results = sorted((root / "benchmarks" / "results").glob("*.json"))
+    results = [
+        (path, json.loads(path.read_text(encoding="utf-8")))
+        for path in sorted((root / "benchmarks" / "results").glob("*.json"))
+        if json.loads(path.read_text(encoding="utf-8"))["corpus"]["name"] == corpus.name
+    ]
 
     assert len(results) == 18
-    for path in results:
+    for path, result in results:
         encoded = path.read_text(encoding="utf-8")
-        result = json.loads(encoded)
         assert result["aggregate"]["runs"] == len(corpus.email_cases) * 3
         assert result["validation_boundary"]["failed"] == 0
         assert len(result["cases"]) == len(corpus.email_cases)
         assert all(case.body not in encoded for case in corpus.email_cases if case.body)
         assert all(case.subject not in encoded for case in corpus.email_cases)
         assert all(case.sender not in encoded for case in corpus.email_cases)
+
+
+def test_committed_document_result_matches_corpus_and_omits_free_text() -> None:
+    root = Path(__file__).parents[1]
+    corpus = DocumentBenchmarkCorpus.model_validate_json(
+        (root / "benchmarks" / "document-summary-v1.json").read_text(encoding="utf-8")
+    )
+    result_path = (
+        root
+        / "benchmarks"
+        / "results"
+        / "ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json"
+    )
+    encoded = result_path.read_text(encoding="utf-8")
+    result = json.loads(encoded)
+
+    assert result["aggregate"]["runs"] == len(corpus.document_cases) * 3
+    assert result["aggregate"]["schema_valid_rate"] == 1.0
+    assert len(result["cases"]) == len(corpus.document_cases)
+    for case in corpus.document_cases:
+        assert case.title not in encoded
+        assert case.filler_text not in encoded
+        assert all(segment not in encoded for segment in case.fact_segments)
 
 
 def test_validation_boundary_is_included_in_public_result() -> None:
