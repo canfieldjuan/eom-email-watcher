@@ -6,8 +6,10 @@ use delivery::NotificationDelivery;
 use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
+use std::path::Path;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 const INBOX_LIMIT: u16 = 50;
 const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
@@ -29,12 +31,56 @@ struct DesktopHealthStatus {
     polling: PollingStatus,
 }
 
+struct AttachmentExports {
+    directory: tempfile::TempDir,
+}
+
+impl AttachmentExports {
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+#[derive(Serialize)]
+struct OpenedAttachment {
+    filename: String,
+}
+
 #[tauri::command]
 async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.recent(INBOX_LIMIT))
         .await
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn attachment_open(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    exports: State<'_, AttachmentExports>,
+    message_id: String,
+    part_id: String,
+) -> Result<OpenedAttachment, EngineError> {
+    let engine = engine.inner().clone();
+    let destination = exports.path().to_path_buf();
+    let exported = tauri::async_runtime::spawn_blocking(move || {
+        engine.export_attachment(message_id, part_id, destination)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))??;
+    let open_path = exported.path.to_str().ok_or_else(|| {
+        EngineError::host(
+            "open_failed",
+            "Attachment path is not supported by this host",
+        )
+    })?;
+    app.opener()
+        .open_path(open_path, None::<&str>)
+        .map_err(|_| EngineError::host("open_failed", "Desktop could not open the attachment"))?;
+    Ok(OpenedAttachment {
+        filename: exported.filename,
+    })
 }
 
 #[tauri::command]
@@ -121,9 +167,15 @@ pub fn run() {
     }));
     builder
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
+            let exports = AttachmentExports {
+                directory: tempfile::Builder::new()
+                    .prefix("email-watcher-attachments-")
+                    .tempdir()?,
+            };
             let (poll_interval_minutes, polling_supported) =
                 match engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT) {
                     Ok(settings) => (
@@ -146,6 +198,7 @@ pub fn run() {
             let scheduler = PollScheduler::new(poll_interval_minutes, polling_supported);
             app.manage(engine.clone());
             app.manage(delivery.clone());
+            app.manage(exports);
             app.manage(scheduler.clone());
             let startup_app = app.handle().clone();
             let startup_engine = engine.clone();
@@ -169,6 +222,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            attachment_open,
             health_get,
             inbox_recent,
             watcher_check,

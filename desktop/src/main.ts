@@ -34,6 +34,10 @@ interface InboxItem {
   attachments: InboxAttachment[];
 }
 
+interface OpenedAttachment {
+  filename: string;
+}
+
 interface HealthStatus {
   database: {
     ok: boolean;
@@ -316,6 +320,8 @@ function renderInbox(items: InboxItem[]): void {
     attachments.className = "attachment-list";
     for (const attachment of item.attachments) {
       const row = document.createElement("li");
+      const attachmentDetails = document.createElement("div");
+      attachmentDetails.className = "attachment-details";
       const filename = document.createElement("strong");
       filename.textContent = attachment.filename;
       const metadata = document.createElement("span");
@@ -327,7 +333,29 @@ function renderInbox(items: InboxItem[]): void {
         notation: "compact",
       }).format(attachment.byte_size);
       metadata.textContent = `${type} · ${size}`;
-      row.append(filename, metadata);
+      attachmentDetails.append(filename, metadata);
+      const openButton = document.createElement("button");
+      openButton.type = "button";
+      openButton.textContent = "Open";
+      openButton.addEventListener("click", async () => {
+        openButton.disabled = true;
+        openButton.textContent = "Opening…";
+        try {
+          const opened = await invoke<OpenedAttachment>("attachment_open", {
+            messageId: item.message_id,
+            partId: attachment.part_id,
+          });
+          inboxStatus.textContent = `Opened ${opened.filename} in the default app.`;
+          inboxStatus.dataset.kind = "success";
+        } catch (error) {
+          inboxStatus.textContent = errorMessage(error);
+          inboxStatus.dataset.kind = "error";
+        } finally {
+          openButton.disabled = false;
+          openButton.textContent = "Open";
+        }
+      });
+      row.append(attachmentDetails, openButton);
       attachments.append(row);
     }
 

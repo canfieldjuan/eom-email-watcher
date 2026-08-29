@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,6 +9,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -16,6 +20,7 @@ from googleapiclient.errors import HttpError
 from .config import normalize_address
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
+TOKEN_LOCK_TIMEOUT_SECONDS = 30
 
 
 class GmailError(RuntimeError):
@@ -85,6 +90,29 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
     )
 
 
+def _decode_attachment_data(value: object) -> bytes:
+    if not isinstance(value, str):
+        raise GmailError("Gmail attachment response did not contain data")
+    try:
+        return base64.b64decode(
+            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise GmailError("Gmail attachment response contained invalid data") from exc
+
+
+def _find_part(payload: dict[str, Any], part_id: str) -> dict[str, Any] | None:
+    candidate = payload.get("partId")
+    if isinstance(candidate, str) and candidate.strip() == part_id:
+        return payload
+    for child in payload.get("parts") or []:
+        if isinstance(child, dict):
+            found = _find_part(child, part_id)
+            if found is not None:
+                return found
+    return None
+
+
 class GmailGateway:
     def __init__(self, service: Any):
         self.service = service
@@ -96,18 +124,25 @@ class GmailGateway:
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Download them from Google Cloud Console after enabling Gmail API."
             )
-        credentials: Credentials | None = None
-        if token_file.exists():
-            try:
-                credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-            except (ValueError, json.JSONDecodeError) as exc:
-                raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
-        if credentials and credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-            token_file.write_text(credentials.to_json(), encoding="utf-8")
-            token_file.chmod(0o600)
-        if not credentials or not credentials.valid:
-            raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+        token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                credentials: Credentials | None = None
+                if token_file.exists():
+                    try:
+                        credentials = Credentials.from_authorized_user_file(
+                            str(token_file), SCOPES
+                        )
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                if credentials and credentials.expired and credentials.refresh_token:
+                    credentials.refresh(Request())
+                    token_file.write_text(credentials.to_json(), encoding="utf-8")
+                    token_file.chmod(0o600)
+                if not credentials or not credentials.valid:
+                    raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+        except FileLockTimeout as exc:
+            raise GmailError("Gmail token is busy; retry the operation") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     @classmethod
@@ -122,8 +157,12 @@ class GmailGateway:
             host="127.0.0.1", port=0, open_browser=True, prompt="consent"
         )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        token_file.write_text(credentials.to_json(), encoding="utf-8")
-        token_file.chmod(0o600)
+        try:
+            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                token_file.write_text(credentials.to_json(), encoding="utf-8")
+                token_file.chmod(0o600)
+        except FileLockTimeout as exc:
+            raise GmailError("Gmail token is busy; retry setup") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     def profile_history_id(self) -> str:
@@ -205,6 +244,44 @@ class GmailGateway:
                 ) from exc
             raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
         return message.get("payload") or {}
+
+    def attachment_bytes(
+        self, message_id: str, part_id: str, attachment_id: str | None
+    ) -> bytes:
+        if attachment_id:
+            try:
+                response = (
+                    self.service.users()
+                    .messages()
+                    .attachments()
+                    .get(userId="me", messageId=message_id, id=attachment_id)
+                    .execute()
+                )
+            except HttpError as exc:
+                if getattr(exc.resp, "status", None) == 404:
+                    raise MessageUnavailable(
+                        f"Gmail message {message_id} attachment unavailable (HTTP 404)"
+                    ) from exc
+                raise GmailError(
+                    f"Gmail attachment fetch failed (HTTP {exc.resp.status})"
+                ) from exc
+            return _decode_attachment_data(response.get("data"))
+
+        part = _find_part(self.full_payload(message_id), part_id)
+        if part is None:
+            raise MessageUnavailable("Gmail attachment part is no longer available")
+        body = part.get("body") or {}
+        if not isinstance(body, dict):
+            raise GmailError("Gmail attachment part contained an invalid body")
+        inline_data = body.get("data")
+        if isinstance(inline_data, str):
+            return _decode_attachment_data(inline_data)
+        current_attachment_id = body.get("attachmentId")
+        if isinstance(current_attachment_id, str) and current_attachment_id.strip():
+            return self.attachment_bytes(
+                message_id, part_id, current_attachment_id.strip()
+            )
+        raise GmailError("Gmail attachment part did not contain retrievable data")
 
     def search_since(self, addresses: frozenset[str], since: datetime) -> list[str]:
         sender_terms = " ".join(f"from:{address}" for address in sorted(addresses))
