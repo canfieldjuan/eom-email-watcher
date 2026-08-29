@@ -84,6 +84,10 @@ def validate_analysis(raw: dict[str, object], received_at: str) -> Analysis:
         analysis = Analysis.model_validate(raw)
     except ValidationError as exc:
         raise ModelError("Local model response did not match the required schema") from exc
+    if "\x00" in analysis.summary or (
+        analysis.suggested_action is not None and "\x00" in analysis.suggested_action
+    ):
+        raise ModelError("Local model response contains unsupported control characters")
     if analysis.deadline_iso:
         try:
             deadline = datetime.strptime(analysis.deadline_iso, "%Y-%m-%d").date()

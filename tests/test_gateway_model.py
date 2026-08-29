@@ -465,6 +465,31 @@ def test_gateway_rejects_lone_unicode_surrogate_in_analysis(
         analyze(model)
 
 
+@pytest.mark.parametrize("field", ["summary", "suggested_action"])
+def test_gateway_rejects_nul_in_notification_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    result = json.loads(analysis_json())
+    result[field] = "unsafe\x00text"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": json.dumps(result)},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="unsupported control characters"):
+        analyze(model)
+
+
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
     token_file = tmp_path / "gateway-token"
     ca_file = tmp_path / "gateway-ca.pem"
