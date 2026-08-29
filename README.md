@@ -16,8 +16,10 @@ after each local inference request.
 - Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
 - Fetches message bodies only after a sender matches.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
-- Records attachment filenames only. Attachment bytes are not fetched.
-- Stores message metadata and model summaries in SQLite for 180 days. Bodies are never stored.
+- Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. Attachment
+  bytes are not fetched.
+- Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
+  are never stored.
 - Deduplicates by Gmail message ID.
 - Recovers an expired History cursor with an exact-sender search beginning five minutes before the
   last successful check, then saves a fresh cursor.

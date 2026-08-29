@@ -46,6 +46,15 @@ pub struct WatchedSender {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxAttachment {
+    pub part_id: String,
+    pub attachment_id: Option<String>,
+    pub filename: String,
+    pub media_type: String,
+    pub byte_size: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
     pub received_at: String,
@@ -66,6 +75,8 @@ pub struct InboxItem {
     pub fallback_notified_at: Option<String>,
     pub notified_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<InboxAttachment>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -489,6 +500,34 @@ mod tests {
                 message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
             }
         );
+    }
+
+    #[test]
+    fn protocol_v1_inbox_defaults_attachments_from_older_engines() {
+        let item: InboxItem = serde_json::from_value(json!({
+            "message_id": "message-1",
+            "received_at": "2026-08-29T12:00:00+00:00",
+            "sender": "sender@example.com",
+            "sender_name": null,
+            "subject": "Subject",
+            "status": "pending",
+            "analysis_at": null,
+            "priority": null,
+            "summary": null,
+            "action_required": null,
+            "suggested_action": null,
+            "deadline_text": null,
+            "deadline_iso": null,
+            "confidence": null,
+            "attempts": 0,
+            "next_retry_at": null,
+            "fallback_notified_at": null,
+            "notified_at": null,
+            "last_error": null
+        }))
+        .expect("protocol-v1 inbox row without attachments must remain valid");
+
+        assert!(item.attachments.is_empty());
     }
 
     #[cfg(unix)]

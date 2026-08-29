@@ -114,6 +114,7 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     )
     inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert inbox["data"]["items"][0]["message_id"] == "m1"
+    assert inbox["data"]["items"][0]["attachments"] == []
 
 
 def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path: Path) -> None:

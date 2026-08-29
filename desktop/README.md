@@ -9,6 +9,10 @@ single-instance process also polls automatically using `poll_interval_minutes` (
 default) and publishes the next scheduled check in Health. Polling remains disabled when production
 locking or host-owned notification delivery is unsupported by the current configuration.
 
+Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
+ledger. This slice inventories metadata only: attachment bytes are not downloaded, persisted, or
+sent to another application, and there is not yet an Open or Summarize action.
+
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
