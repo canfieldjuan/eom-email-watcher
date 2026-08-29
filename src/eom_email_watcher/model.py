@@ -346,9 +346,13 @@ class GatewayModel:
                 ),
                 None,
             )
-            if not task or task.get("status") not in {"available", "degraded", "unavailable"}:
+            status = task.get("status") if task else None
+            if not isinstance(status, str) or status not in {
+                "available",
+                "degraded",
+                "unavailable",
+            }:
                 return False, "unsupported_task"
-            status = str(task["status"])
             return status in {"available", "degraded"}, status
         except ModelError as exc:
             return False, str(exc)

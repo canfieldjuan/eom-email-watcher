@@ -210,6 +210,21 @@ def test_gateway_health_rejects_boolean_versions(
     assert model.health()[0] is False
 
 
+@pytest.mark.parametrize("status", [[], {}])
+def test_gateway_health_rejects_non_string_task_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: object
+) -> None:
+    payload = {
+        "protocol_version": 1,
+        "tasks": [{"id": "email.analyze", "version": 1, "status": status}],
+    }
+    model, _requested_ca_files = gateway_model(
+        tmp_path, monkeypatch, lambda request: httpx.Response(200, json=payload)
+    )
+
+    assert model.health() == (False, "unsupported_task")
+
+
 def test_gateway_health_uses_short_timeout_without_reducing_inference_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
