@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-08-29",
+  "runtime": {
+    "name": "llama.cpp",
+    "version": "0.3.0-dev",
+    "revision": "c1d0e7a004015f23bc0233470b747b596f29b264"
+  },
+  "request_contracts": {
+    "email_watcher_revision": "ea663e1af19fa510d5df0608cc6db9599048e0c4",
+    "document_summarizer_revision": "ca5933a2174f7b08af62a9a032fed261f0afdd02"
+  },
+  "model": {
+    "name": "qwen3.5-4b",
+    "quantization": "Q4_K_M",
+    "artifact_bytes": 2707513696,
+    "artifact_sha256": "25082a7dd3776cc3c741c6347d3bd04523f05796607b3fbc32fa3a25dfa1418c"
+  },
+  "server_profile": {
+    "device": "NVIDIA GeForce RTX 4060 Ti",
+    "context_tokens_total": 16384,
+    "context_tokens_per_slot": 4096,
+    "parallel_slots": 4,
+    "continuous_batching": true,
+    "reasoning": "off",
+    "endpoint": "http://127.0.0.1:18123/v1"
+  },
+  "default_reasoning_probe": {
+    "finish_reason": "length",
+    "content_chars": 0,
+    "reasoning_chars": 1807,
+    "mixed_requests": 8,
+    "passed": 0,
+    "failed": 8,
+    "error_types": {
+      "ModelError": 4,
+      "ProofError": 4
+    }
+  },
+  "reasoning_disabled_capacity_probe": {
+    "requests": {
+      "total": 8,
+      "concurrency": 4,
+      "email": 4,
+      "document": 4
+    },
+    "results": {
+      "passed": 8,
+      "failed": 0,
+      "passed_by_workload": {
+        "document": 4,
+        "email": 4
+      },
+      "error_types": {}
+    },
+    "latency_seconds": {
+      "median": 2.191081,
+      "p95": 2.939491,
+      "max": 2.939491,
+      "wall": 5.105018
+    }
+  },
+  "authenticated_probe": {
+    "unauthenticated_models_status": 401,
+    "requests": {
+      "total": 4,
+      "concurrency": 2,
+      "email": 2,
+      "document": 2
+    },
+    "results": {
+      "passed": 4,
+      "failed": 0,
+      "passed_by_workload": {
+        "document": 2,
+        "email": 2
+      },
+      "error_types": {}
+    },
+    "latency_seconds": {
+      "median": 1.860682,
+      "p95": 2.589566,
+      "max": 2.589566,
+      "wall": 3.721688
+    }
+  }
+}
