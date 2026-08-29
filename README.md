@@ -6,8 +6,9 @@ a short structured summary, and sends a Linux desktop notification (and, optiona
 push via [ntfy](https://ntfy.sh)).
 
 Email content is never sent to a cloud model. The Gmail grant is read-only, attachment content is
-downloaded only when the user opens that attachment, non-matching message metadata is not stored,
-and message bodies are discarded after each local inference request.
+downloaded only when the user explicitly opens it or requests an available local capability,
+non-matching message metadata is not stored, and message bodies are discarded after each local
+inference request.
 
 ## Behavior
 
@@ -18,6 +19,10 @@ and message bodies are discarded after each local inference request.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
 - Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. An explicit
   Open action fetches only that attachment into a mode-0600 process-owned temporary file.
+- Discovers the provider-neutral `document.summarize` capability at runtime. For a compatible PDF,
+  an explicit Summarize action fetches only that attachment and streams its bytes to the selected
+  authenticated exact-loopback provider. It does not transfer mailbox paths, sender, subject,
+  message ID, email body, or Gmail credentials.
 - Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
   are never stored.
 - Deduplicates by Gmail message ID.
@@ -114,10 +119,24 @@ Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
 point.
 
-The Linux Tauri proof provides a read-only Inbox, GUI watchlist management, live health status, and
-a safe one-shot `Check now` action. It still requires this repository's Python/uv environment and
-an existing private config; see [`desktop/README.md`](desktop/README.md). It does not replace the
-systemd scheduler or native notification delivery yet.
+The Linux Tauri application provides a read-only Inbox, GUI watchlist management, live health
+status, a safe one-shot `Check now` action, and contextual local capabilities for attachments. Its
+Debian package includes the Python engine as a Tauri sidecar, so the installed application does not
+depend on a source checkout or `uv`. It still requires an existing private config; see
+[`desktop/README.md`](desktop/README.md). It does not replace Gmail OAuth setup, the systemd
+scheduler, or the existing CLI's optional ntfy delivery.
+
+## Local Connect capability
+
+When exactly one running local provider advertises `document.summarize` version `1.0` for
+`application/pdf`, Inbox attachment cards show **Summarize**. The action disappears when no
+compatible provider is reachable. Email Watcher does not select by application identity and remains
+fully usable when Connect or the provider is absent. Completed summaries and failures are retained
+with the attachment in Email Watcher's private SQLite database.
+
+The v1 discovery, security, artifact, job, persistence, and failure boundaries are documented in
+[`docs/CONNECT_V1.md`](docs/CONNECT_V1.md). The language-neutral wire schemas live in the separate
+`connect-contracts` repository.
 
 ## Two-hour user timer
 

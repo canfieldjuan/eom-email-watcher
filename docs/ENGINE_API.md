@@ -4,8 +4,8 @@
 write one JSON request to stdin, read one JSON response from stdout, then inspect the exit status.
 Human diagnostics go to stderr.
 
-The first technical-user build may invoke the command from the installed Python environment. A
-future packaged sidecar must preserve this protocol.
+Source development may invoke the command from the installed Python environment. The Linux desktop
+package includes the same engine protocol as a Tauri sidecar.
 
 ## Envelope
 
@@ -49,6 +49,8 @@ only to stderr.
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
+| `connect.capabilities` | `{}` | Compatible capability declarations available now; provider identity and bearer token are not exposed |
+| `connect.attachment.summarize` | `message_id`, `part_id` | Explicitly fetch and hand off one inventoried PDF; return or reuse the durable terminal result |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
@@ -74,6 +76,25 @@ existing read-only Gmail authorization, rejects a byte-count mismatch, and creat
 mode-0600 file that uses at most a validated alphanumeric extension from the email filename. The
 response path is host-only; the Tauri command opens it natively and does not return it to frontend
 JavaScript.
+
+`connect.capabilities` performs live runtime discovery. Zero providers returns an empty list,
+exactly one compatible provider returns `document.summarize` version `1.0`, and multiple providers
+return an empty list with an `ambiguous_provider` diagnostic. Transport credentials and provider
+identity stay inside the engine.
+
+`connect.attachment.summarize` accepts only an existing PDF attachment identity. It rechecks live
+discovery and the provider's byte limit before fetching bytes through the existing read-only Gmail
+grant. The Connect request carries generated artifact/job IDs, media type, exact byte size, SHA-256,
+sanitized display name, and source-app attribution. It does not carry the Gmail message ID, sender,
+subject, body, path, OAuth data, or attachment ID. The provider receives the PDF as a multipart byte
+stream, never as a caller filesystem path.
+
+Email Watcher persists `requested -> accepted -> processing -> completed | failed` in schema v4.
+Expected-state updates and a partial unique index protect one active job per attachment/capability
+version. A completed result is reused on later calls; terminal failures never masquerade as a
+summary. Stored output size, digest, input provenance, and media type are revalidated before a
+summary is returned after reopen. Provider absence or Connect failure does not affect
+`inbox.recent`, watchlist, health, or normal watcher operations.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

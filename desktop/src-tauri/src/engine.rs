@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_shell::ShellExt;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -52,6 +53,59 @@ pub struct InboxAttachment {
     pub filename: String,
     pub media_type: String,
     pub byte_size: u64,
+    #[serde(default)]
+    pub capability_results: Vec<AttachmentCapabilityResult>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AttachmentCapabilityResult {
+    pub capability_id: String,
+    pub capability_version: String,
+    pub status: String,
+    pub updated_at: String,
+    pub summary: Option<ConnectSummary>,
+    pub error: Option<EngineError>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectSummary {
+    pub summary_version: String,
+    pub text: String,
+    pub warnings: Vec<ConnectWarning>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapability {
+    pub id: String,
+    pub version: String,
+    pub accepts: Vec<String>,
+    pub max_input_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectDiagnostic {
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilities {
+    pub items: Vec<ConnectCapability>,
+    pub diagnostic: Option<ConnectDiagnostic>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectSummaryResult {
+    pub job_id: String,
+    pub capability_id: String,
+    pub capability_version: String,
+    pub status: String,
+    pub summary: ConnectSummary,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -235,6 +289,17 @@ impl Engine {
             });
         }
 
+        let sidecar: Command = app.shell().sidecar("eom-mail-engine")?.into();
+        let packaged_program = sidecar.get_program().to_os_string();
+        if Path::new(&packaged_program).is_file() {
+            return Ok(Self {
+                program: packaged_program,
+                args: sidecar.get_args().map(OsString::from).collect(),
+                config_path,
+                request_timeout: None,
+            });
+        }
+
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -289,6 +354,21 @@ impl Engine {
                 "message_id": message_id,
                 "part_id": part_id,
             }),
+        )
+    }
+
+    pub fn connect_capabilities(&self) -> Result<ConnectCapabilities, EngineError> {
+        self.request("connect.capabilities", json!({}))
+    }
+
+    pub fn summarize_attachment(
+        &self,
+        message_id: String,
+        part_id: String,
+    ) -> Result<ConnectSummaryResult, EngineError> {
+        self.request(
+            "connect.attachment.summarize",
+            json!({"message_id": message_id, "part_id": part_id}),
         )
     }
 
@@ -396,7 +476,7 @@ impl Engine {
         let mut child = command.spawn().map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
-                "Watcher engine is unavailable; verify uv and the project environment",
+                "Watcher engine is unavailable; reinstall it or inspect desktop logs",
             )
         })?;
 

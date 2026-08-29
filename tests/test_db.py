@@ -1,3 +1,5 @@
+import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -310,7 +312,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
@@ -318,9 +320,13 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
         attachment_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attachments'"
         ).fetchone()
+        connect_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connect_attachment_jobs'"
+        ).fetchone()
     assert "analysis_at" in columns
     assert row == ("pending", None)
     assert attachment_table == (1,)
+    assert connect_table == (1,)
 
 
 def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
@@ -351,7 +357,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -442,3 +448,153 @@ def test_attachment_inventory_rejects_unknown_message_without_partial_rows(
 
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+
+
+def seed_pdf_attachment(store: Store) -> None:
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Document",
+        received_at="2026-08-29T12:00:00+00:00",
+    )
+    store.replace_attachments(
+        "m1",
+        (AttachmentDescriptor("2", "gmail-a", "invoice.pdf", "application/pdf", 20, 0),),
+    )
+
+
+def create_connect_job(store: Store, job_id: str) -> None:
+    store.create_connect_job(
+        job_id=job_id,
+        message_id="m1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        input_media_type="application/pdf",
+        input_byte_size=20,
+        input_sha256="a" * 64,
+    )
+
+
+def test_connect_job_state_result_and_integrity_survive_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_connect_job(store, job_id)
+    accepted = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    assert accepted.status == "accepted"
+
+    with pytest.raises(RuntimeError, match="expected-state"):
+        store.transition_connect_job(
+            job_id=job_id,
+            expected_state="requested",
+            next_state="processing",
+            provider_app_id="alternate-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+        )
+    assert store.connect_job(job_id).status == "accepted"  # type: ignore[union-attr]
+
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="processing",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    warnings = [{"code": "REVIEW", "message": "Human review required."}]
+    content = {
+        "summary_version": "1.0",
+        "text": "Exact $1,247.17 summary.",
+        "warnings": warnings,
+        "input_artifact": {
+            "artifact_id": "22222222-2222-4222-8222-222222222222",
+            "media_type": "application/pdf",
+            "byte_size": 20,
+            "sha256": "a" * 64,
+        },
+    }
+    encoded = json.dumps(content, separators=(",", ":"), ensure_ascii=False).encode()
+    completed = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="processing",
+        next_state="completed",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        result={
+            "output": {
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "media_type": "application/vnd.local-connect.document-summary+json",
+                "byte_size": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "summary_version": "1.0",
+                "text": "Exact $1,247.17 summary.",
+                "warnings": warnings,
+            }
+        },
+    )
+    assert completed.status == "completed"
+
+    reopened = Store(database)
+    reopened.initialize()
+    restored = reopened.connect_job(job_id)
+    assert restored == completed
+    attachment = reopened.recent(1)[0]["attachments"][0]
+    assert attachment["capability_results"] == [
+        {
+            "capability_id": "document.summarize",
+            "capability_version": "1.0",
+            "status": "completed",
+            "updated_at": completed.updated_at,
+            "summary": {
+                "summary_version": "1.0",
+                "text": "Exact $1,247.17 summary.",
+                "warnings": [{"code": "REVIEW", "message": "Human review required."}],
+            },
+        }
+    ]
+
+
+def test_connect_job_atomic_constraints_and_single_active_request(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    first_job = "33333333-3333-4333-8333-333333333333"
+    create_connect_job(store, first_job)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        create_connect_job(store, "44444444-4444-4444-8444-444444444444")
+    assert store.connect_job(first_job).status == "requested"  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="failed validation"):
+        store.transition_connect_job(
+            job_id=first_job,
+            expected_state="requested",
+            next_state="completed",
+            provider_app_id="alternate-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            result={
+                "output": {
+                    "artifact_id": None,
+                    "media_type": None,
+                    "byte_size": None,
+                    "sha256": None,
+                    "summary_version": None,
+                    "text": None,
+                    "warnings": [],
+                }
+            },
+        )
+    assert store.connect_job(first_job).status == "requested"  # type: ignore[union-attr]

@@ -3,7 +3,10 @@ mod engine;
 mod scheduler;
 
 use delivery::NotificationDelivery;
-use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
+use engine::{
+    CheckResult, ConnectCapabilities, ConnectSummaryResult, Engine, EngineError, HealthStatus,
+    InboxItem, WatchedSender,
+};
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
 use std::path::Path;
@@ -81,6 +84,28 @@ async fn attachment_open(
     Ok(OpenedAttachment {
         filename: exported.filename,
     })
+}
+
+#[tauri::command]
+async fn connect_capabilities(
+    engine: State<'_, Engine>,
+) -> Result<ConnectCapabilities, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.connect_capabilities())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn attachment_summarize(
+    engine: State<'_, Engine>,
+    message_id: String,
+    part_id: String,
+) -> Result<ConnectSummaryResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.summarize_attachment(message_id, part_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -168,6 +193,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
@@ -223,6 +249,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             attachment_open,
+            attachment_summarize,
+            connect_capabilities,
             health_get,
             inbox_recent,
             watcher_check,

@@ -8,6 +8,8 @@ dist/
 node_modules/
 target/
 desktop/src-tauri/gen/
+desktop/src-tauri/binaries/eom-mail-engine-*
+.sidecar-build/
 *.py[cod]
 *.sqlite3
 config.toml
