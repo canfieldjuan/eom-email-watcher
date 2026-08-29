@@ -64,13 +64,15 @@ def _json_object(text: str) -> dict[str, object]:
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
     try:
         value = json.loads(cleaned)
+    except RecursionError as exc:
+        raise ModelError("Local model returned invalid JSON") from exc
     except json.JSONDecodeError:
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start < 0 or end <= start:
             raise ModelError("Local model did not return JSON") from None
         try:
             value = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise ModelError("Local model returned invalid JSON") from exc
     if not isinstance(value, dict):
         raise ModelError("Local model response was not an object")

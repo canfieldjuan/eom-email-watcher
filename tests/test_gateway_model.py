@@ -383,6 +383,29 @@ def test_gateway_converts_deeply_nested_json_to_model_error(
         analyze(model)
 
 
+def test_gateway_converts_deeply_nested_output_content_to_model_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deeply_nested = "[" * 100_000 + "]" * 100_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": deeply_nested},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="returned invalid JSON"):
+        analyze(model)
+
+
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
     token_file = tmp_path / "gateway-token"
     ca_file = tmp_path / "gateway-ca.pem"
