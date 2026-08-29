@@ -263,7 +263,10 @@ class GatewayModel:
             character.isspace() or not character.isprintable() for character in token
         ):
             raise ModelError("Inference gateway credential is invalid")
-        return {"Authorization": f"Bearer {token}"}
+        return {
+            "Accept-Encoding": "identity",
+            "Authorization": f"Bearer {token}",
+        }
 
     def _client(self, timeout: float | None = None) -> httpx.Client:
         try:

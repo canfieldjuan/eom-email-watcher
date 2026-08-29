@@ -124,6 +124,7 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        assert request.headers["accept-encoding"] == "identity"
         assert request.headers["authorization"] == "Bearer app-credential"
         if request.url.path == "/v1/health":
             return httpx.Response(

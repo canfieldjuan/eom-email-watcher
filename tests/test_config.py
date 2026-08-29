@@ -164,6 +164,18 @@ def test_gateway_config_fails_closed_when_security_fields_are_invalid(
         load_config(path)
 
 
+def test_gateway_config_rejects_nul_in_trust_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(
+        path,
+        base_url="https://inference.office.internal",
+        extra='model_backend = "gateway"\nmodel_ca_file = "ca\\u0000.pem"',
+    )
+
+    with pytest.raises(ConfigError, match="model_ca_file"):
+        load_config(path)
+
+
 def test_duplicate_sender_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

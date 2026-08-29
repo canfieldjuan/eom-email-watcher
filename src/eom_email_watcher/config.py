@@ -82,7 +82,7 @@ class Config:
 def _path(value: object, key: str) -> Path:
     if isinstance(value, Path):
         return value.expanduser()
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ConfigError(f"{key} must be a non-empty path")
     return Path(os.path.expandvars(value)).expanduser()
 
