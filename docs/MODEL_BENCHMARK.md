@@ -15,6 +15,10 @@ The benchmark answers issue #18 in two stages:
 Do not recommend a model until both stages are complete. String similarity is not a substitute for
 the human summary review.
 
+New candidate testing uses the isolated Ollama procedure below. The LM Studio procedures remain
+only to reproduce the historical artifacts already committed by issue #18; they are not the backend
+for new benchmark runs.
+
 ## Privacy boundary
 
 `benchmarks/email-analysis-v1.json` is synthetic and uses only IANA-reserved example email
@@ -210,7 +214,57 @@ uv run eom-model-benchmark run \
 The public artifact records `prism-llama-cpp-cpu-only`; it must not be labeled as an LM Studio or
 Ollama run. Stop the temporary server after the result and keep all content-bearing output local.
 
-## Ollama CPU-only procedure
+## Ollama isolated procedures
+
+Do not enable or reuse a system service that listens beyond loopback. Ollama's local API does not
+require authentication, so every benchmark server must bind explicitly to `127.0.0.1`, disable
+cloud execution, admit only one model and one prediction slot, and use an already-local model.
+
+### Full-GPU procedure for new candidate testing
+
+Select the intended GPU by the stable UUID reported by `nvidia-smi -L`, then start a disposable
+server. This records the hardware-selection mechanism without coupling the benchmark to a device
+index whose ordering can change:
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU-YOUR-STABLE-UUID \
+OLLAMA_NO_CLOUD=1 \
+OLLAMA_HOST=127.0.0.1:11434 \
+OLLAMA_MAX_LOADED_MODELS=1 \
+OLLAMA_NUM_PARALLEL=1 \
+OLLAMA_CONTEXT_LENGTH=8192 \
+ollama serve
+```
+
+In a second terminal, verify the model is already local, preload it while measuring the cold load,
+and require `ollama ps` to report a GPU processor before running the complete corpus:
+
+```bash
+ollama list
+time ollama run YOUR_LOCAL_MODEL_ID ""
+ollama ps
+
+uv run eom-model-benchmark run \
+  --corpus benchmarks/email-analysis-v1.json \
+  --runtime ollama \
+  --execution-device gpu \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model YOUR_LOCAL_MODEL_ID \
+  --quantization YOUR_EXACT_QUANTIZATION \
+  --context-length 8192 \
+  --cold-start-seconds YOUR_MEASURED_LOAD_SECONDS \
+  --repetitions 3 \
+  --output benchmarks/results/ollama-candidate-gpu.json \
+  --private-review-output benchmarks/local/ollama-candidate-gpu.local.json
+
+ollama stop YOUR_LOCAL_MODEL_ID
+```
+
+The public artifact records `cpu_only=false` and
+`gpu_offload_method=ollama-cuda-visible-devices`. Stop the disposable server after the run. If
+`ollama ps` reports CPU or mixed placement, do not publish the artifact as a full-GPU result.
+
+### CPU-only compatibility procedure
 
 Run a dedicated loopback server with cloud access disabled and GPUs hidden from the process. Do not
 reuse an Ollama process whose device configuration is unknown.

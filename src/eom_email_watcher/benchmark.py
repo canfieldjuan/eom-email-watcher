@@ -40,12 +40,19 @@ CpuOnlyMethod = Literal[
     "ollama-gpus-hidden",
     "prism-llama-cpp-cpu-only",
 ]
-GpuOffloadMethod = Literal["lms-load-gpu-max"]
+GpuOffloadMethod = Literal[
+    "lms-load-gpu-max",
+    "ollama-cuda-visible-devices",
+]
 
 CPU_ONLY_METHOD_BY_RUNTIME: dict[RuntimeName, CpuOnlyMethod] = {
     "lmstudio": "lms-load-gpu-off",
     "ollama": "ollama-gpus-hidden",
     "llama_cpp": "prism-llama-cpp-cpu-only",
+}
+GPU_OFFLOAD_METHOD_BY_RUNTIME: dict[RuntimeName, GpuOffloadMethod] = {
+    "lmstudio": "lms-load-gpu-max",
+    "ollama": "ollama-cuda-visible-devices",
 }
 
 EMAIL_DOMAIN_PATTERN = re.compile(r"(?i)@(?P<domain>\[[^\]\r\n]+\]|[A-Z0-9.-]+\.[A-Z]{2,})")
@@ -174,12 +181,14 @@ class BenchmarkCandidate(BaseModel):
             required_method = CPU_ONLY_METHOD_BY_RUNTIME[self.runtime]
             if self.cpu_only_method != required_method or self.gpu_offload_method is not None:
                 raise ValueError(f"{self.runtime} CPU requires cpu_only_method={required_method}")
-        elif (
-            self.runtime != "lmstudio"
-            or self.cpu_only_method is not None
-            or self.gpu_offload_method != "lms-load-gpu-max"
-        ):
-            raise ValueError("GPU benchmarking requires LM Studio with gpu_offload_method=max")
+        else:
+            required_method = GPU_OFFLOAD_METHOD_BY_RUNTIME.get(self.runtime)
+            if required_method is None:
+                raise ValueError(f"{self.runtime} GPU benchmarking is unsupported")
+            if self.cpu_only_method is not None or self.gpu_offload_method != required_method:
+                raise ValueError(
+                    f"{self.runtime} GPU requires gpu_offload_method={required_method}"
+                )
         if "structured_email_analysis" not in self.capabilities:
             raise ValueError("benchmark candidates must provide structured_email_analysis")
         if len(self.capabilities) != len(set(self.capabilities)):
@@ -605,6 +614,7 @@ def _write_json(path: Path, value: object, *, private: bool) -> None:
 def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
     gpu = args.execution_device == "gpu"
     method = None if gpu else CPU_ONLY_METHOD_BY_RUNTIME[args.runtime]
+    gpu_method = GPU_OFFLOAD_METHOD_BY_RUNTIME.get(args.runtime) if gpu else None
     capabilities = ["structured_email_analysis", *(args.capability or [])]
     return BenchmarkCandidate(
         runtime=args.runtime,
@@ -614,7 +624,7 @@ def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
         cold_start_seconds=args.cold_start_seconds,
         cpu_only=not gpu,
         cpu_only_method=method,
-        gpu_offload_method="lms-load-gpu-max" if gpu else None,
+        gpu_offload_method=gpu_method,
         capabilities=list(dict.fromkeys(capabilities)),
     )
 

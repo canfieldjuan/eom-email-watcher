@@ -379,26 +379,45 @@ def test_candidate_contract_accepts_only_matching_runtime_methods(
     assert candidate.cpu_only_method == cpu_only_method
 
 
-def test_candidate_contract_accepts_lmstudio_full_gpu_profile() -> None:
+@pytest.mark.parametrize(
+    ("runtime", "gpu_offload_method"),
+    [
+        ("lmstudio", "lms-load-gpu-max"),
+        ("ollama", "ollama-cuda-visible-devices"),
+    ],
+)
+def test_candidate_contract_accepts_matching_runtime_full_gpu_profile(
+    runtime: str, gpu_offload_method: str
+) -> None:
     data = _candidate().model_dump(mode="json")
     data.update(
+        runtime=runtime,
         cpu_only=False,
         cpu_only_method=None,
-        gpu_offload_method="lms-load-gpu-max",
+        gpu_offload_method=gpu_offload_method,
     )
 
     candidate = BenchmarkCandidate.model_validate(data)
 
-    assert candidate.runtime == "lmstudio"
+    assert candidate.runtime == runtime
     assert candidate.cpu_only is False
     assert candidate.cpu_only_method is None
-    assert candidate.gpu_offload_method == "lms-load-gpu-max"
+    assert candidate.gpu_offload_method == gpu_offload_method
 
 
-def test_candidate_from_args_records_full_gpu_execution() -> None:
+@pytest.mark.parametrize(
+    ("runtime", "gpu_offload_method"),
+    [
+        ("lmstudio", "lms-load-gpu-max"),
+        ("ollama", "ollama-cuda-visible-devices"),
+    ],
+)
+def test_candidate_from_args_records_runtime_specific_full_gpu_execution(
+    runtime: str, gpu_offload_method: str
+) -> None:
     candidate = _candidate_from_args(
         Namespace(
-            runtime="lmstudio",
+            runtime=runtime,
             execution_device="gpu",
             model="bench-qwen35-9b-gpu",
             quantization="Q4_K_M",
@@ -410,7 +429,7 @@ def test_candidate_from_args_records_full_gpu_execution() -> None:
 
     assert candidate.cpu_only is False
     assert candidate.cpu_only_method is None
-    assert candidate.gpu_offload_method == "lms-load-gpu-max"
+    assert candidate.gpu_offload_method == gpu_offload_method
 
 
 @pytest.mark.parametrize(
@@ -425,6 +444,17 @@ def test_candidate_from_args_records_full_gpu_execution() -> None:
         },
         {
             "runtime": "ollama",
+            "cpu_only": False,
+            "cpu_only_method": None,
+            "gpu_offload_method": "lms-load-gpu-max",
+        },
+        {
+            "cpu_only": False,
+            "cpu_only_method": None,
+            "gpu_offload_method": "ollama-cuda-visible-devices",
+        },
+        {
+            "runtime": "llama_cpp",
             "cpu_only": False,
             "cpu_only_method": None,
             "gpu_offload_method": "lms-load-gpu-max",
@@ -483,7 +513,7 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     )
     results = sorted((root / "benchmarks" / "results").glob("*.json"))
 
-    assert len(results) == 17
+    assert len(results) == 18
     for path in results:
         encoded = path.read_text(encoding="utf-8")
         result = json.loads(encoded)

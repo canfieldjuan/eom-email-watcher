@@ -68,6 +68,7 @@ Machine-readable artifacts:
 - [`lmstudio-devstral-small2-q6k-gpu.json`](../benchmarks/results/lmstudio-devstral-small2-q6k-gpu.json)
 - [`lmstudio-codestral-22b-q8-gpu.json`](../benchmarks/results/lmstudio-codestral-22b-q8-gpu.json)
 - [`lmstudio-devstral-small-2507-q8-gpu.json`](../benchmarks/results/lmstudio-devstral-small-2507-q8-gpu.json)
+- [`ollama-qwen3-30b-a3b-q4ks-gpu.json`](../benchmarks/results/ollama-qwen3-30b-a3b-q4ks-gpu.json)
 
 ### Qwen 3.5 4B baseline verdict
 
@@ -302,9 +303,9 @@ minutes. The final request overlapped the cached local desktop verification, so 
 latency and the reported tail are conservative rather than clean idle-machine measurements. The
 peak RSS is the Prism `llama-server` process high-water mark captured after all 54 requests.
 
-## Ollama compatibility result
+## Ollama testing backend result
 
-The local Ollama CLI initially had no running server. A dedicated server was started on
+The initial CPU-only compatibility probe used a dedicated server on
 `127.0.0.1:11434` with cloud access disabled and GPUs hidden. Its logs confirmed CPU inference,
 0 of 49 layers offloaded, and a 17.2 GiB footprint for the only suitable already-local chat model,
 `qwen3-30b-a3b:latest` (`Q4_K_S`). The model runner loaded in 14.48 seconds.
@@ -314,14 +315,39 @@ OpenAI-compatible endpoint. The request did not return within the configured 600
 Ollama logged HTTP 500 after ten minutes and the client raised `ReadTimeout`. The temporary server
 was stopped cleanly.
 
-Therefore Ollama compatibility is **could not determine for a practical issue #18 candidate** on
-the current machine. The request reached the correct loopback CPU path, but the only suitable local
-model was too large/slow for the probe. No model was downloaded, no schema was relaxed, and the
-30B model is not included in the replacement ranking.
+The full-GPU follow-up used Ollama 0.24.0 in a disposable user process, still loopback-only and
+cloud-disabled, with `CUDA_VISIBLE_DEVICES` pinned to the RTX 3090 UUID. Ollama reported 49 of 49
+layers offloaded and `ollama ps` reported `100% GPU`, 8,192-token context, and an 18 GB loaded model;
+`nvidia-smi` attributed 18,210 MiB to the Ollama process. No model was downloaded or copied.
+
+| Metric | Qwen3 30B-A3B Q4_K_S (Ollama full GPU) |
+|---|---:|
+| Requests | 54 |
+| Schema-valid rate | 1.0 |
+| Category accuracy | 0.777778 |
+| Priority accuracy | 0.740741 |
+| High/urgent safety misses | 2 |
+| Action precision | 1.0 |
+| Action recall | 1.0 |
+| Action false negatives | 0 |
+| Suggested-action validity | 1.0 |
+| Exact deadline rate | 0.777778 |
+| Deadline hallucinations | 0 |
+| Prompt-injection failure rate | 0.5 |
+| Runtime cold load (seconds) | 41.49 |
+| First request (seconds) | 1.249684 |
+| Median request (seconds) | 0.711804 |
+| p95 request (seconds) | 1.105316 |
+| Human summary review | pending |
+
+Ollama is now the verified backend for new benchmark testing. The model itself does not advance:
+although its structure, action, latency, and high/urgent results are strong, it failed three of six
+prompt-injection repetitions. Historical LM Studio artifacts remain valid evidence but do not set
+the backend for future candidate runs. Local application runtime migration remains deferred.
 
 ## Human summary review
 
-The local blind-review command produced 9 paired case/repetition items with seventeen anonymous
+The local blind-review command produced 9 paired case/repetition items with eighteen anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 
@@ -356,8 +382,7 @@ input shape are documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachme
 1. Complete the existing blinded human review without opening the alias key first.
 2. Measure attributable peak resident memory for the remaining LM Studio candidates or document a
    runtime-supported equivalent.
-3. Repeat the Ollama compatibility probe with a practical already-local candidate.
-4. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
+3. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
    validation or changing the corpus after seeing model output.
-5. Confirm the full-GPU profile can remain available during watcher operation before changing the
+4. Confirm the full-GPU profile can remain available during watcher operation before changing the
    production model default.
