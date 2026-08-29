@@ -19,7 +19,7 @@ class ModelError(RuntimeError):
 
 
 MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
-MAX_GATEWAY_REQUEST_BYTES = 250_000
+MAX_GATEWAY_REQUEST_BYTES = 1_000_000
 MAX_GATEWAY_TOKEN_BYTES = 16_384
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 
@@ -280,14 +280,22 @@ class GatewayModel:
 
     @staticmethod
     def _bounded_json(response: httpx.Response) -> dict[str, object]:
-        content = bytearray()
-        for chunk in response.iter_bytes():
-            content.extend(chunk)
+        content_encoding = response.headers.get("content-encoding", "identity").strip().casefold()
+        if content_encoding not in {"", "identity"}:
+            raise ModelError("Inference gateway response content encoding is unsupported")
+        if response.is_stream_consumed:
+            content: bytes | bytearray = response.content
             if len(content) > MAX_GATEWAY_RESPONSE_BYTES:
                 raise ModelError("Inference gateway response exceeded the size limit")
+        else:
+            content = bytearray()
+            for chunk in response.iter_raw():
+                if len(chunk) > MAX_GATEWAY_RESPONSE_BYTES - len(content):
+                    raise ModelError("Inference gateway response exceeded the size limit")
+                content.extend(chunk)
         try:
             value = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise ModelError("Inference gateway returned invalid JSON") from exc
         if not isinstance(value, dict):
             raise ModelError("Inference gateway response was not an object")

@@ -326,10 +326,61 @@ def test_gateway_request_and_response_size_limits_fail_closed(
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
     with pytest.raises(ModelError, match="request exceeded"):
-        analyze(model, "x" * 300_000)
+        analyze(model, "x" * 1_000_000)
 
     with pytest.raises(ModelError, match="response exceeded"):
         analyze(model, "short")
+
+
+def test_gateway_request_accepts_maximum_configured_multibyte_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    assert analyze(model, "💩" * 100_000).priority == "high"
+
+
+def test_gateway_rejects_encoded_response_before_decompression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(b"compressed response is not admitted"),
+        ),
+    )
+
+    with pytest.raises(ModelError, match="content encoding is unsupported"):
+        analyze(model)
+
+
+def test_gateway_converts_deeply_nested_json_to_model_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deeply_nested = b"[" * 100_000 + b"]" * 100_000
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: httpx.Response(200, content=deeply_nested),
+    )
+
+    with pytest.raises(ModelError, match="returned invalid JSON"):
+        analyze(model)
 
 
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
