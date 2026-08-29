@@ -207,5 +207,9 @@ The synthetic, local-only CPU model benchmark and its privacy boundary are docum
 [`docs/MODEL_BENCHMARK.md`](docs/MODEL_BENCHMARK.md). Benchmarking is a developer/operator tool;
 it does not run during normal mail checks.
 
+The pinned mainline llama.cpp request-shape and bounded-concurrency proof is documented in
+[`docs/LLAMA_CPP_COMPATIBILITY.md`](docs/LLAMA_CPP_COMPATIBILITY.md). It records compatibility and
+the required reasoning setting; it does not switch the current production runtime.
+
 Desktop checks are documented with the desktop proof because they require the Rust/Node/WebKit
 toolchain in addition to Python.
