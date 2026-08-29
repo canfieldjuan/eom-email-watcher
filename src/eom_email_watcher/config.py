@@ -168,6 +168,8 @@ def validate_gateway_base_url(value: object) -> str:
         or parsed.hostname is None
         or parsed.username is not None
         or parsed.password is not None
+        or "?" in base_url
+        or "#" in base_url
         or parsed.query
         or parsed.fragment
         or parsed.path not in {"", "/"}

@@ -64,16 +64,16 @@ def _json_object(text: str) -> dict[str, object]:
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
     try:
         value = json.loads(cleaned)
-    except RecursionError as exc:
-        raise ModelError("Local model returned invalid JSON") from exc
     except json.JSONDecodeError:
         start, end = cleaned.find("{"), cleaned.rfind("}")
         if start < 0 or end <= start:
             raise ModelError("Local model did not return JSON") from None
         try:
             value = json.loads(cleaned[start : end + 1])
-        except (json.JSONDecodeError, RecursionError) as exc:
+        except (ValueError, RecursionError) as exc:
             raise ModelError("Local model returned invalid JSON") from exc
+    except (ValueError, RecursionError) as exc:
+        raise ModelError("Local model returned invalid JSON") from exc
     if not isinstance(value, dict):
         raise ModelError("Local model response was not an object")
     return value
@@ -267,8 +267,14 @@ class GatewayModel:
 
     def _client(self, timeout: float | None = None) -> httpx.Client:
         try:
-            if not self.ca_file.is_file():
-                raise ModelError("Inference gateway trust root is unavailable")
+            metadata = self.ca_file.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ModelError("Inference gateway trust root is invalid")
+            if os.name == "posix" and (
+                stat.S_IMODE(metadata.st_mode) & 0o022
+                or metadata.st_uid not in {0, os.geteuid()}
+            ):
+                raise ModelError("Inference gateway trust root is invalid")
             verify = ssl.create_default_context(cafile=str(self.ca_file))
         except OSError as exc:
             raise ModelError("Inference gateway trust root is unavailable") from exc
@@ -297,7 +303,7 @@ class GatewayModel:
                 content.extend(chunk)
         try:
             value = json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise ModelError("Inference gateway returned invalid JSON") from exc
         if not isinstance(value, dict):
             raise ModelError("Inference gateway response was not an object")

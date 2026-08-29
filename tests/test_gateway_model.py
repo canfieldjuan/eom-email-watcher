@@ -37,6 +37,7 @@ def gateway_model(
     token_file.chmod(0o600)
     ca_file = tmp_path / "gateway-ca.pem"
     ca_file.write_text("test trust root", encoding="utf-8")
+    ca_file.chmod(0o644)
     requested_ca_files: list[str] = []
     context = ssl.create_default_context()
 
@@ -406,6 +407,63 @@ def test_gateway_converts_deeply_nested_output_content_to_model_error(
         analyze(model)
 
 
+def test_gateway_converts_oversized_json_integers_to_model_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized_integer = "1" * 5_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/health":
+            return httpx.Response(
+                200,
+                content=(
+                    b'{"protocol_version":'
+                    + oversized_integer.encode()
+                    + b',"tasks":[]}'
+                ),
+            )
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": oversized_integer},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    assert model.health() == (False, "Inference gateway returned invalid JSON")
+    with pytest.raises(ModelError, match="returned invalid JSON"):
+        analyze(model)
+
+
+def test_gateway_rejects_lone_unicode_surrogate_in_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = json.loads(analysis_json())
+    result["summary"] = "\ud800"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": json.dumps(result)},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="required schema"):
+        analyze(model)
+
+
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
     token_file = tmp_path / "gateway-token"
     ca_file = tmp_path / "gateway-ca.pem"
@@ -428,3 +486,9 @@ def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -
     ok, detail = model.health()
     assert ok is False
     assert detail == "Inference gateway trust root is unavailable"
+
+    ca_file.write_text("untrusted replacement", encoding="utf-8")
+    ca_file.chmod(0o666)
+    ok, detail = model.health()
+    assert ok is False
+    assert detail == "Inference gateway trust root is invalid"

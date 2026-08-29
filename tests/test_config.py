@@ -128,6 +128,8 @@ def test_gateway_config_requires_https_trust_and_auth(tmp_path: Path) -> None:
         "https://inference.office.internal/v1",
         "https://inference.office.internal?target=elsewhere",
         "https://inference.office.internal#fragment",
+        "https://inference.office.internal?",
+        "https://inference.office.internal#",
         "https://💩.internal",
         " https://inference.office.internal",
     ],
