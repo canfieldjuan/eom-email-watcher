@@ -47,8 +47,9 @@ def extract_body(
         body = part.get("body") or {}
         if filename:
             attachment_names.append(filename)
-            part_id = str(part.get("partId", "")).strip()
-            if part_id and part_id not in attachments_by_part_id:
+            raw_part_id = part.get("partId")
+            part_id = raw_part_id.strip() if isinstance(raw_part_id, str) else None
+            if part_id is not None and part_id not in attachments_by_part_id:
                 raw_attachment_id = body.get("attachmentId")
                 attachment_id = (
                     raw_attachment_id.strip()

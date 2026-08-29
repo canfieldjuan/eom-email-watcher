@@ -46,6 +46,31 @@ def test_html_fallback_is_text_only_and_truncated() -> None:
     assert attachments == ()
 
 
+def test_explicit_empty_root_part_id_is_a_valid_attachment_identity() -> None:
+    body, attachment_names, attachments = extract_body(
+        {
+            "mimeType": "application/pdf",
+            "partId": "",
+            "filename": "root.pdf",
+            "body": {"attachmentId": "root-attachment", "size": 42},
+        },
+        20_000,
+    )
+
+    assert body == ""
+    assert attachment_names == ("root.pdf",)
+    assert attachments == (
+        AttachmentDescriptor(
+            part_id="",
+            attachment_id="root-attachment",
+            filename="root.pdf",
+            media_type="application/pdf",
+            byte_size=42,
+            position=0,
+        ),
+    )
+
+
 def test_nested_attachment_names_survive_when_descriptor_identity_is_missing() -> None:
     body, attachment_names, attachments = extract_body(
         {
@@ -56,6 +81,7 @@ def test_nested_attachment_names_survive_when_descriptor_identity_is_missing() -
                     "parts": [
                         {
                             "mimeType": "application/pdf",
+                            "partId": None,
                             "filename": "invoice.pdf",
                             "body": {"size": True},
                         },
