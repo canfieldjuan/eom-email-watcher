@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 const PROTOCOL_VERSION: u8 = 1;
@@ -239,8 +240,8 @@ impl Engine {
         self.request("health.get", json!({}))
     }
 
-    pub fn settings(&self) -> Result<EngineSettings, EngineError> {
-        self.request("settings.get", json!({}))
+    pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
+        self.request_with_timeout("settings.get", json!({}), timeout)
     }
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
@@ -291,6 +292,24 @@ impl Engine {
         operation: &str,
         payload: Value,
     ) -> Result<T, EngineError> {
+        self.request_inner(operation, payload, None)
+    }
+
+    fn request_with_timeout<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<T, EngineError> {
+        self.request_inner(operation, payload, Some(timeout))
+    }
+
+    fn request_inner<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        payload: Value,
+        timeout: Option<Duration>,
+    ) -> Result<T, EngineError> {
         let request = EngineRequest {
             protocol: PROTOCOL_VERSION,
             operation,
@@ -333,6 +352,34 @@ impl Engine {
             let _ = child.kill();
             let _ = child.wait();
             return Err(error);
+        }
+
+        if let Some(timeout) = timeout {
+            let started = Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if started.elapsed() < timeout => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(EngineError::host(
+                            "engine_timeout",
+                            "Watcher engine did not respond before the startup timeout",
+                        ));
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(EngineError::host(
+                            "engine_unavailable",
+                            "Watcher engine status could not be inspected",
+                        ));
+                    }
+                }
+            }
         }
 
         let output = child.wait_with_output().map_err(|_| {
@@ -416,6 +463,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_settings_request_terminates_a_stalled_engine() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![OsString::from("-c"), OsString::from("exec sleep 5")],
+            PathBuf::from("unused.toml"),
+        );
+        let started = Instant::now();
+
+        let error = engine
+            .settings_with_timeout(Duration::from_millis(20))
+            .expect_err("stalled settings request must time out");
+
+        assert_eq!(error.code, "engine_timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     fn real_engine(config_path: PathBuf) -> Engine {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -473,7 +538,9 @@ notifications_enabled = true
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);
         assert_eq!(
-            engine.settings().expect("read engine settings"),
+            engine
+                .settings_with_timeout(Duration::from_secs(5))
+                .expect("read engine settings"),
             EngineSettings {
                 poll_interval_minutes: 120
             }

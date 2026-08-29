@@ -584,13 +584,23 @@ healthTab.addEventListener("click", () => {
   void loadHealth();
 });
 checkNow.addEventListener("click", () => void runCheck());
-void listen<{ ok: boolean }>("watcher://scheduled-check", (event) => {
+void listen<{
+  status: "complete" | "delivery_failed" | "check_failed";
+  failed_notifications: number;
+}>("watcher://scheduled-check", (event) => {
   void loadInbox();
   if (!healthView.hidden) {
-    const message = event.payload.ok
-      ? "Automatic check complete."
-      : "Automatic check failed; it will retry on schedule.";
-    void loadHealth(message, event.payload.ok ? "success" : "error");
+    if (event.payload.status === "complete") {
+      void loadHealth("Automatic check complete.", "success");
+    } else if (event.payload.status === "delivery_failed") {
+      const count = event.payload.failed_notifications;
+      void loadHealth(
+        `Automatic check complete, but ${count} notification${count === 1 ? "" : "s"} remain queued.`,
+        "error",
+      );
+    } else {
+      void loadHealth("Automatic check failed; it will retry on schedule.", "error");
+    }
   }
 });
 void loadInbox();

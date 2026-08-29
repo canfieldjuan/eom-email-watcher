@@ -6,10 +6,12 @@ use delivery::NotificationDelivery;
 use engine::{CheckResult, Engine, EngineError, HealthStatus, InboxItem, WatchedSender};
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
+use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 
 const INBOX_LIMIT: u16 = 50;
 const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
+const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize)]
 struct DesktopCheckResult {
@@ -122,7 +124,8 @@ pub fn run() {
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
-            let poll_interval_minutes = match engine.settings() {
+            let poll_interval_minutes = match engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)
+            {
                 Ok(settings) => settings.poll_interval_minutes,
                 Err(error) => {
                     eprintln!(

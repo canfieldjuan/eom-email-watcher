@@ -12,9 +12,38 @@ use tauri::{AppHandle, Emitter};
 
 pub const SCHEDULED_CHECK_EVENT: &str = "watcher://scheduled-check";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ScheduledCheckStatus {
+    Complete,
+    DeliveryFailed,
+    CheckFailed,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ScheduledCheckEvent {
-    ok: bool,
+    status: ScheduledCheckStatus,
+    failed_notifications: u64,
+}
+
+impl ScheduledCheckEvent {
+    fn completed(failed_notifications: u64) -> Self {
+        Self {
+            status: if failed_notifications == 0 {
+                ScheduledCheckStatus::Complete
+            } else {
+                ScheduledCheckStatus::DeliveryFailed
+            },
+            failed_notifications,
+        }
+    }
+
+    fn check_failed() -> Self {
+        Self {
+            status: ScheduledCheckStatus::CheckFailed,
+            failed_notifications: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -68,7 +97,7 @@ impl PollScheduler {
             .name("email-watcher-poll".into())
             .spawn(move || loop {
                 thread::sleep(interval);
-                let ok = match delivery.check_and_deliver(&app, &engine) {
+                let event = match delivery.check_and_deliver(&app, &engine) {
                     Ok(outcome) => {
                         if outcome.delivery.failed > 0 {
                             eprintln!(
@@ -76,21 +105,21 @@ impl PollScheduler {
                                 outcome.delivery.failed
                             );
                         }
-                        true
+                        ScheduledCheckEvent::completed(outcome.delivery.failed)
                     }
                     Err(error) => {
                         eprintln!(
                             "scheduled watcher check failed ({}): {}",
                             error.code, error.message
                         );
-                        false
+                        ScheduledCheckEvent::check_failed()
                     }
                 };
                 scheduler.next_check_unix_ms.store(
                     next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
                     Ordering::Relaxed,
                 );
-                if app.emit(SCHEDULED_CHECK_EVENT, ScheduledCheckEvent { ok }).is_err() {
+                if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
                     eprintln!("scheduled watcher check could not refresh the desktop window");
                 }
             })
@@ -114,5 +143,30 @@ mod tests {
         let status = scheduler.status();
         assert_eq!(status.interval_minutes, 120);
         assert!(status.next_check_unix_ms > 0);
+    }
+
+    #[test]
+    fn scheduled_event_distinguishes_delivery_failure_from_complete_check() {
+        assert_eq!(
+            ScheduledCheckEvent::completed(2),
+            ScheduledCheckEvent {
+                status: ScheduledCheckStatus::DeliveryFailed,
+                failed_notifications: 2,
+            }
+        );
+        assert_eq!(
+            ScheduledCheckEvent::completed(0),
+            ScheduledCheckEvent {
+                status: ScheduledCheckStatus::Complete,
+                failed_notifications: 0,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduledCheckEvent::completed(2)).expect("serialize event"),
+            serde_json::json!({
+                "status": "delivery_failed",
+                "failed_notifications": 2,
+            })
+        );
     }
 }
