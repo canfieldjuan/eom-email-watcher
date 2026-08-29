@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher.db import Store
+from eom_email_watcher.mime import AttachmentDescriptor
 
 
 def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
@@ -43,6 +44,7 @@ def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
     recent = store.recent(1)[0]
     assert recent["message_id"] == "m1"
     assert recent["summary"] == "Invoice received."
+    assert recent["attachments"] == []
     assert "deadline_text" in recent
     assert recent["notified_at"] is not None
 
@@ -302,18 +304,23 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
             );
             """
         )
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 0
+        db.execute("PRAGMA user_version = 2")
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
 
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
         ).fetchone()
+        attachment_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attachments'"
+        ).fetchone()
     assert "analysis_at" in columns
     assert row == ("pending", None)
+    assert attachment_table == (1,)
 
 
 def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
@@ -344,7 +351,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -354,3 +361,79 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
         ).fetchone()
     assert sent == ("gmail-id",)
     assert reservation_table == (1,)
+
+
+def test_attachment_inventory_replaces_in_order_and_is_purged_with_message(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Documents",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    store.replace_attachments(
+        "m1",
+        (
+            AttachmentDescriptor(
+                "10", "gmail-b", "contract.pdf", "application/pdf", 20, 1
+            ),
+            AttachmentDescriptor(
+                "2", "gmail-a", "invoice.pdf", "application/pdf", 10, 0
+            ),
+        ),
+    )
+
+    assert store.recent(1)[0]["attachments"] == [
+        {
+            "part_id": "2",
+            "attachment_id": "gmail-a",
+            "filename": "invoice.pdf",
+            "media_type": "application/pdf",
+            "byte_size": 10,
+        },
+        {
+            "part_id": "10",
+            "attachment_id": "gmail-b",
+            "filename": "contract.pdf",
+            "media_type": "application/pdf",
+            "byte_size": 20,
+        },
+    ]
+
+    store.replace_attachments(
+        "m1",
+        (AttachmentDescriptor("4", None, "notes.txt", "text/plain", 5, 0),),
+    )
+    assert [item["part_id"] for item in store.recent(1)[0]["attachments"]] == ["4"]
+
+    old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    with store.connection() as db:
+        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+    assert store.purge(1) == 1
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+
+
+def test_attachment_inventory_rejects_unknown_message_without_partial_rows(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+
+    with pytest.raises(KeyError):
+        store.replace_attachments(
+            "missing",
+            (
+                AttachmentDescriptor(
+                    "1", None, "invoice.pdf", "application/pdf", 10, 0
+                ),
+            ),
+        )
+
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0

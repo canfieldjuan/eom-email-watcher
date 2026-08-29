@@ -205,13 +205,17 @@ class Watcher:
         for message in [*self.store.pending(), *(extra or [])]:
             try:
                 payload = self.gmail.full_payload(message.message_id)
-                body, attachments = extract_body(payload, self.config.body_char_limit)
+                body, attachment_names, attachments = extract_body(
+                    payload, self.config.body_char_limit
+                )
+                if not dry_run:
+                    self.store.replace_attachments(message.message_id, attachments)
                 analysis = self.model.analyze(
                     sender=message.sender,
                     subject=message.subject,
                     received_at=message.received_at,
                     body=body,
-                    attachment_names=attachments,
+                    attachment_names=attachment_names,
                     current_local_time=datetime.now(self.config.zone),
                 )
                 if not dry_run:

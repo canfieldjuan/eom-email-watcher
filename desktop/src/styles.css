@@ -320,6 +320,36 @@ input:focus {
   font-weight: 800;
 }
 
+.attachment-list {
+  display: grid;
+  gap: 7px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.attachment-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid #dce3dd;
+  border-radius: 9px;
+  color: #39463d;
+  background: #f8faf7;
+  font-size: 0.82rem;
+}
+
+.attachment-list strong {
+  overflow-wrap: anywhere;
+}
+
+.attachment-list span {
+  flex: 0 0 auto;
+  color: #6a766e;
+}
+
 .message-footer {
   margin-top: 15px;
   color: #6a766e;

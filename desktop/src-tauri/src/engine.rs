@@ -46,6 +46,15 @@ pub struct WatchedSender {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxAttachment {
+    pub part_id: String,
+    pub attachment_id: Option<String>,
+    pub filename: String,
+    pub media_type: String,
+    pub byte_size: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
     pub received_at: String,
@@ -66,6 +75,7 @@ pub struct InboxItem {
     pub fallback_notified_at: Option<String>,
     pub notified_at: Option<String>,
     pub last_error: Option<String>,
+    pub attachments: Vec<InboxAttachment>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]

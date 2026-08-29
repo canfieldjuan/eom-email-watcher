@@ -62,6 +62,34 @@ class FakeModel:
         )
 
 
+class AttachmentGmail(FakeGmail):
+    def full_payload(self, message_id: str):
+        self.full_payload_calls += 1
+        return {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}},
+                {
+                    "mimeType": "application/pdf",
+                    "partId": "2",
+                    "filename": "invoice.pdf",
+                    "body": {"attachmentId": "gmail-attachment", "size": 1234},
+                },
+            ],
+        }
+
+
+class FailingCaptureModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.attachment_names: tuple[str, ...] | None = None
+
+    def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
+        self.attachment_names = kwargs["attachment_names"]
+        raise ModelError("local model unavailable")
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         path=tmp_path / "config.toml",
@@ -98,6 +126,28 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+def test_attachment_inventory_is_durable_before_model_failure(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FailingCaptureModel()
+
+    result = Watcher(cfg, store, AttachmentGmail(), model).check()
+
+    assert result["summarized"] == 0
+    assert model.attachment_names == ("invoice.pdf",)
+    assert store.recent(1)[0]["attachments"] == [
+        {
+            "part_id": "2",
+            "attachment_id": "gmail-attachment",
+            "filename": "invoice.pdf",
+            "media_type": "application/pdf",
+            "byte_size": 1234,
+        }
+    ]
 
 
 def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path) -> None:

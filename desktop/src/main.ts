@@ -7,6 +7,14 @@ interface WatchedSender {
   name: string | null;
 }
 
+interface InboxAttachment {
+  part_id: string;
+  attachment_id: string | null;
+  filename: string;
+  media_type: string;
+  byte_size: number;
+}
+
 interface InboxItem {
   message_id: string;
   received_at: string;
@@ -23,6 +31,7 @@ interface InboxItem {
   fallback_notified_at: string | null;
   notified_at: string | null;
   last_error: string | null;
+  attachments: InboxAttachment[];
 }
 
 interface HealthStatus {
@@ -303,6 +312,25 @@ function renderInbox(items: InboxItem[]): void {
       details.append(deadline);
     }
 
+    const attachments = document.createElement("ul");
+    attachments.className = "attachment-list";
+    for (const attachment of item.attachments) {
+      const row = document.createElement("li");
+      const filename = document.createElement("strong");
+      filename.textContent = attachment.filename;
+      const metadata = document.createElement("span");
+      const type = attachment.media_type || "Unknown type";
+      const size = new Intl.NumberFormat(undefined, {
+        style: "unit",
+        unit: "byte",
+        unitDisplay: "narrow",
+        notation: "compact",
+      }).format(attachment.byte_size);
+      metadata.textContent = `${type} · ${size}`;
+      row.append(filename, metadata);
+      attachments.append(row);
+    }
+
     const footer = document.createElement("div");
     footer.className = "message-footer";
     const badge = document.createElement("span");
@@ -314,6 +342,7 @@ function renderInbox(items: InboxItem[]): void {
 
     card.append(meta, subject, summary);
     if (details.childElementCount) card.append(details);
+    if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
     inboxList.append(card);
   }
