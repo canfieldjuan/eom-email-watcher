@@ -21,6 +21,7 @@ class ModelError(RuntimeError):
 MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
 MAX_GATEWAY_REQUEST_BYTES = 250_000
 MAX_GATEWAY_TOKEN_BYTES = 16_384
+GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 
 
 class Analysis(BaseModel):
@@ -256,13 +257,13 @@ class GatewayModel:
             token = self.api_token_file.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeError) as exc:
             raise ModelError("Inference gateway credential is unavailable") from exc
-        if not token or any(
+        if not token or not token.isascii() or any(
             character.isspace() or not character.isprintable() for character in token
         ):
             raise ModelError("Inference gateway credential is invalid")
         return {"Authorization": f"Bearer {token}"}
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float | None = None) -> httpx.Client:
         try:
             if not self.ca_file.is_file():
                 raise ModelError("Inference gateway trust root is unavailable")
@@ -271,7 +272,7 @@ class GatewayModel:
             raise ModelError("Inference gateway trust root is unavailable") from exc
         return httpx.Client(
             verify=verify,
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
             trust_env=False,
             follow_redirects=False,
             transport=self.transport,
@@ -292,7 +293,14 @@ class GatewayModel:
             raise ModelError("Inference gateway response was not an object")
         return value
 
-    def _request(self, method: str, path: str, payload: dict[str, object] | None = None):
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        timeout: float | None = None,
+    ):
         headers = self._headers()
         content = None
         if payload is not None:
@@ -302,7 +310,7 @@ class GatewayModel:
             headers["Content-Type"] = "application/json"
         try:
             with (
-                self._client() as client,
+                self._client(timeout) as client,
                 client.stream(
                     method,
                     f"{self.base_url}{path}",
@@ -321,8 +329,12 @@ class GatewayModel:
 
     def health(self) -> tuple[bool, str]:
         try:
-            payload = self._request("GET", "/v1/health")
-            if payload.get("protocol_version") != 1 or not isinstance(payload.get("tasks"), list):
+            payload = self._request(
+                "GET", "/v1/health", timeout=GATEWAY_HEALTH_TIMEOUT_SECONDS
+            )
+            if not self._matches_version(payload.get("protocol_version"), 1) or not isinstance(
+                payload.get("tasks"), list
+            ):
                 raise ModelError("Inference gateway health response is incompatible")
             task = next(
                 (
@@ -330,7 +342,7 @@ class GatewayModel:
                     for item in payload["tasks"]
                     if isinstance(item, dict)
                     and item.get("id") == self.task_id
-                    and item.get("version") == self.task_version
+                    and self._matches_version(item.get("version"), self.task_version)
                 ),
                 None,
             )
@@ -340,6 +352,10 @@ class GatewayModel:
             return status in {"available", "degraded"}, status
         except ModelError as exc:
             return False, str(exc)
+
+    @staticmethod
+    def _matches_version(value: object, expected: int) -> bool:
+        return type(value) is int and value == expected
 
     def analyze(
         self,
@@ -384,7 +400,7 @@ class GatewayModel:
         response = self._request("POST", "/v1/inference", payload)
         output = response.get("output")
         if (
-            response.get("protocol_version") != 1
+            not self._matches_version(response.get("protocol_version"), 1)
             or response.get("request_id") != request_id
             or response.get("status") != "completed"
             or not isinstance(output, dict)

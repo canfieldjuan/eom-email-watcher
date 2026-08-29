@@ -190,6 +190,60 @@ def test_gateway_health_requires_authorized_email_task(
     assert model.health() == (False, "unsupported_task")
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"protocol_version": True, "tasks": []},
+        {
+            "protocol_version": 1,
+            "tasks": [{"id": "email.analyze", "version": True, "status": "available"}],
+        },
+    ],
+)
+def test_gateway_health_rejects_boolean_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path, monkeypatch, lambda request: httpx.Response(200, json=payload)
+    )
+
+    assert model.health()[0] is False
+
+
+def test_gateway_health_uses_short_timeout_without_reducing_inference_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"]["read"])
+        if request.url.path == "/v1/health":
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "tasks": [{"id": "email.analyze", "version": 1, "status": "available"}],
+                },
+            )
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    assert model.health()[0] is True
+    analyze(model)
+
+    assert timeouts == [5.0, 30]
+
+
 def test_gateway_redirect_is_not_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
@@ -216,6 +270,27 @@ def test_gateway_rejects_mismatched_response_envelope(
             json={
                 "protocol_version": 1,
                 "request_id": "different-request",
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="required envelope"):
+        analyze(model)
+
+
+def test_gateway_rejects_boolean_protocol_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": True,
+                "request_id": payload["request_id"],
                 "status": "completed",
                 "output": {"media_type": "application/json", "content": analysis_json()},
             },
@@ -256,6 +331,11 @@ def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -
         analyze(model, "short")
 
     token_file.chmod(0o600)
+    token_file.write_text("credential-💩", encoding="utf-8")
+    with pytest.raises(ModelError, match="credential is invalid"):
+        analyze(model, "short")
+
+    token_file.write_text("app-credential", encoding="utf-8")
     ok, detail = model.health()
     assert ok is False
     assert detail == "Inference gateway trust root is unavailable"

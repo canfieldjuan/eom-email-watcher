@@ -11,6 +11,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from filelock import FileLock
 from tomlkit import aot, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
@@ -159,7 +160,8 @@ def validate_gateway_base_url(value: object) -> str:
     try:
         parsed = urlsplit(base_url)
         port = parsed.port
-    except ValueError as exc:
+        httpx.URL(base_url)
+    except (ValueError, httpx.InvalidURL) as exc:
         raise ConfigError("gateway model_base_url must be an HTTPS origin") from exc
     if (
         parsed.scheme != "https"
