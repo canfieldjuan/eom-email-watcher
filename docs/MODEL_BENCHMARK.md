@@ -1,4 +1,4 @@
-# CPU-only local model benchmark
+# Local model benchmark
 
 This benchmark measures the production email-analysis prompt and schema against a finite,
 synthetic corpus. It never contacts Gmail, downloads attachments, or sends benchmark content to a
@@ -58,6 +58,7 @@ The models observed locally when this procedure was written were:
 | Model key | Artifact quantization | Role |
 |---|---|---|
 | `qwen3.5-4b` | `Q4_K_M` | required baseline |
+| `qwen3.5-9b` | `Q4_K_M` | full-GPU quality challenger |
 | `qwen3.5-2b` | `Q4_K_M` | smaller general-purpose challenger |
 | `bonsai-4b` | `Q1_0` | end-to-end 1-bit challenger |
 | `ternary-bonsai-8b` | legacy `Q2_0` | ternary challenger requiring Prism llama.cpp |
@@ -103,6 +104,43 @@ LM Studio's local CLI did not expose peak resident model memory in its loaded-mo
 machine used to author this procedure. The result therefore leaves `peak_resident_memory_mib` null
 rather than substituting model file size or guessing. Record a measured value only when the runtime
 or an external process monitor can attribute it to the candidate process.
+
+## LM Studio full-GPU comparison procedure
+
+GPU measurements use the same prompt, schema, validator, corpus, context, parallelism,
+temperature, and repetitions as CPU measurements. Load with explicit full offload; do not use LM
+Studio's automatic ratio because that would leave the execution profile ambiguous:
+
+```bash
+lms load qwen3.5-9b \
+  --gpu max \
+  --context-length 8192 \
+  --parallel 1 \
+  --identifier bench-qwen35-9b-gpu \
+  --yes
+
+uv run eom-model-benchmark run \
+  --corpus benchmarks/email-analysis-v1.json \
+  --runtime lmstudio \
+  --execution-device gpu \
+  --base-url http://127.0.0.1:1234/v1 \
+  --model bench-qwen35-9b-gpu \
+  --quantization Q4_K_M \
+  --context-length 8192 \
+  --cold-start-seconds YOUR_MEASURED_LOAD_SECONDS \
+  --repetitions 3 \
+  --require-auth \
+  --api-token-file ~/.local/state/eom-email-watcher/lmstudio-api-token \
+  --output benchmarks/results/lmstudio-qwen35-9b-q4km-gpu.json \
+  --private-review-output benchmarks/local/lmstudio-qwen35-9b-q4km-gpu.local.json
+
+lms unload bench-qwen35-9b-gpu
+```
+
+The public artifact records `cpu_only=false` and `gpu_offload_method=lms-load-gpu-max`. The runner
+rejects GPU metadata for Ollama or llama.cpp and rejects mixed CPU/GPU method declarations. Quality
+scores remain comparable because the evaluation contract is fixed; latency reflects the complete
+model-plus-device profile and must not be attributed to model size alone.
 
 ## Prism llama.cpp CPU-only procedure
 

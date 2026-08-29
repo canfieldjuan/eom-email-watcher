@@ -1,4 +1,4 @@
-# CPU-only local model benchmark: initial observed results
+# Local model benchmark: observed results
 
 ## Status
 
@@ -18,8 +18,9 @@ No runtime, model, or quantization default should be changed from this partial r
 - Transport: the production OpenAI-compatible `/chat/completions` path.
 - Inference: production prompt, strict JSON schema, validator, temperature `0.1`, maximum 500
   output tokens, 8,192-token context, and one parallel prediction.
-- Device: LM Studio `lms load --gpu off`; Ollama server with both GPU visibility variables set to
-  `-1` and cloud access disabled.
+- Device: CPU candidates use LM Studio `lms load --gpu off`; the 9B comparison uses explicit
+  `lms load --gpu max`; Ollama uses both GPU visibility variables set to `-1` with cloud access
+  disabled.
 - Privacy: public result artifacts contain case IDs and metrics, not source fields or free-form
   output. Private local review artifacts are Git-ignored and mode `600`.
 
@@ -52,6 +53,7 @@ claims and should not be generalized beyond this corpus without more evidence.
 Machine-readable artifacts:
 
 - [`lmstudio-qwen35-4b-q4km.json`](../benchmarks/results/lmstudio-qwen35-4b-q4km.json)
+- [`lmstudio-qwen35-9b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen35-9b-q4km-gpu.json)
 - [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
 - [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
@@ -67,6 +69,38 @@ Those schema failures produced the 12 high/urgent safety misses and action false
 This is not evidence to weaken `validate_analysis()`. The public product should retain the current
 validator and either improve the model/prompt behavior in a separately measured slice or select a
 candidate that satisfies it.
+
+### Qwen 3.5 9B full-GPU comparison
+
+| Metric | Qwen 3.5 4B Q4_K_M (CPU) | Qwen 3.5 9B Q4_K_M (full GPU) |
+|---|---:|---:|
+| Requests | 54 | 54 |
+| Schema-valid rate | 0.777778 | 0.814815 |
+| Category accuracy | 0.722222 | 0.685185 |
+| Priority accuracy | 0.611111 | 0.648148 |
+| High/urgent safety misses | 12 | 8 |
+| Action precision | 1.0 | 1.0 |
+| Action recall | 0.6 | 0.666667 |
+| Action false negatives | 12 | 10 |
+| Suggested-action validity | 0.777778 | 0.814815 |
+| Exact deadline rate | 0.703704 | 0.722222 |
+| Deadline hallucinations | 0 | 0 |
+| Prompt-injection failure rate | 0.5 | 0.0 |
+| Runtime cold load (seconds) | 2.58 | 6.74 |
+| First request (seconds) | 9.970967 | 2.066361 |
+| Median request (seconds) | 5.851201 | 1.152528 |
+| p95 request (seconds) | 10.011681 | 1.945832 |
+| Human summary review | pending | pending |
+
+The 9B full-GPU profile is the leading measured candidate. It matches or improves every recorded
+safety and action metric, schema validity, deadline accuracy, and request latency; category
+accuracy is the one measured regression. The model loaded with explicit full offload in 6.74
+seconds and LM Studio reported a 6.10 GiB loaded footprint. Latency is a device-profile result
+rather than a model-size comparison, so it does not predict 9B CPU performance.
+
+This is strong enough to advance 9B to blinded human review, but not to change the production
+default yet. The review must confirm summary faithfulness/usefulness, and sustained GPU availability
+must be treated as part of the operating requirement.
 
 ### Smaller-candidate verdicts
 
@@ -146,7 +180,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 18 paired case/repetition items with six anonymous
+The local blind-review command produced 18 paired case/repetition items with seven anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 
@@ -184,3 +218,5 @@ input shape are documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachme
 3. Repeat the Ollama compatibility probe with a practical already-local candidate.
 4. Revisit the 4B baseline's `action_without_suggestion` failures without weakening deterministic
    validation or changing the corpus after seeing model output.
+5. Confirm the full-GPU profile can remain available during watcher operation before changing the
+   production model default.

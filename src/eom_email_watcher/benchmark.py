@@ -40,6 +40,7 @@ CpuOnlyMethod = Literal[
     "ollama-gpus-hidden",
     "prism-llama-cpp-cpu-only",
 ]
+GpuOffloadMethod = Literal["lms-load-gpu-max"]
 
 CPU_ONLY_METHOD_BY_RUNTIME: dict[RuntimeName, CpuOnlyMethod] = {
     "lmstudio": "lms-load-gpu-off",
@@ -162,15 +163,23 @@ class BenchmarkCandidate(BaseModel):
     quantization: str = Field(min_length=1)
     context_length: int = Field(gt=0)
     cold_start_seconds: float = Field(ge=0)
-    cpu_only: Literal[True]
-    cpu_only_method: CpuOnlyMethod
+    cpu_only: bool
+    cpu_only_method: CpuOnlyMethod | None = None
+    gpu_offload_method: GpuOffloadMethod | None = None
     capabilities: list[Capability] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_runtime_contract(self) -> BenchmarkCandidate:
-        required_method = CPU_ONLY_METHOD_BY_RUNTIME[self.runtime]
-        if self.cpu_only_method != required_method:
-            raise ValueError(f"{self.runtime} requires cpu_only_method={required_method}")
+        if self.cpu_only:
+            required_method = CPU_ONLY_METHOD_BY_RUNTIME[self.runtime]
+            if self.cpu_only_method != required_method or self.gpu_offload_method is not None:
+                raise ValueError(f"{self.runtime} CPU requires cpu_only_method={required_method}")
+        elif (
+            self.runtime != "lmstudio"
+            or self.cpu_only_method is not None
+            or self.gpu_offload_method != "lms-load-gpu-max"
+        ):
+            raise ValueError("GPU benchmarking requires LM Studio with gpu_offload_method=max")
         if "structured_email_analysis" not in self.capabilities:
             raise ValueError("benchmark candidates must provide structured_email_analysis")
         if len(self.capabilities) != len(set(self.capabilities)):
@@ -594,7 +603,8 @@ def _write_json(path: Path, value: object, *, private: bool) -> None:
 
 
 def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
-    method = CPU_ONLY_METHOD_BY_RUNTIME[args.runtime]
+    gpu = args.execution_device == "gpu"
+    method = None if gpu else CPU_ONLY_METHOD_BY_RUNTIME[args.runtime]
     capabilities = ["structured_email_analysis", *(args.capability or [])]
     return BenchmarkCandidate(
         runtime=args.runtime,
@@ -602,8 +612,9 @@ def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
         quantization=args.quantization,
         context_length=args.context_length,
         cold_start_seconds=args.cold_start_seconds,
-        cpu_only=True,
+        cpu_only=not gpu,
         cpu_only_method=method,
+        gpu_offload_method="lms-load-gpu-max" if gpu else None,
         capabilities=list(dict.fromkeys(capabilities)),
     )
 
@@ -704,9 +715,10 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--corpus", type=Path, required=True)
     validate.set_defaults(handler=_validate_command)
 
-    run = commands.add_parser("run", help="Run one CPU-only candidate against a corpus")
+    run = commands.add_parser("run", help="Run one local candidate against a corpus")
     run.add_argument("--corpus", type=Path, required=True)
     run.add_argument("--runtime", choices=tuple(CPU_ONLY_METHOD_BY_RUNTIME), required=True)
+    run.add_argument("--execution-device", choices=("cpu", "gpu"), default="cpu")
     run.add_argument("--base-url", required=True)
     run.add_argument("--model", required=True)
     run.add_argument("--quantization", required=True)
