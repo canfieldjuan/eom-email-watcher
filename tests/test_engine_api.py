@@ -87,6 +87,8 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
 
     settings = engine_api._response(request(config_path, "settings.get"))
     assert settings["ok"] is True
+    assert settings["data"]["poll_interval_minutes"] == 120
+    assert settings["data"]["polling_supported"] is True
     encoded = json.dumps(settings)
     assert "model_api_token_file" not in encoded
     assert "send-token.json" not in encoded
@@ -382,12 +384,14 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     )
 
     health = engine_api._response(request(config_path, "health.get"))
+    settings = engine_api._response(request(config_path, "settings.get"))
     assert health["data"]["notifications"] == {
         "delivery": "host",
         "enabled": True,
         "host_delivery_ready": False,
         "ntfy_configured": True,
     }
+    assert settings["data"]["polling_supported"] is False
 
     checked = engine_api._response(request(config_path, "watcher.check"))
     pending = engine_api._response(request(config_path, "notifications.pending"))
@@ -427,10 +431,12 @@ def test_unsupported_platform_is_reported_before_production_check(
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
 
     health = engine_api._response(request(config_path, "health.get"))
+    settings = engine_api._response(request(config_path, "settings.get"))
     checked = engine_api._response(request(config_path, "watcher.check"))
 
     assert health["data"]["production_check_supported"] is False
     assert health["data"]["notifications"]["host_delivery_ready"] is False
+    assert settings["data"]["polling_supported"] is False
     assert checked["error"]["code"] == "unsupported_platform"
     assert gmail_calls == 0
     assert loaded.store.state()[0] == "100"

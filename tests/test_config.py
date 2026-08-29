@@ -257,6 +257,9 @@ def test_removing_final_sender_leaves_valid_empty_watchlist(tmp_path: Path) -> N
         ("retention_days", '"seven"', "retention_days"),
         ("body_char_limit", "{ value = 1000 }", "body_char_limit"),
         ("model_timeout_seconds", '"soon"', "model_timeout_seconds"),
+        ("poll_interval_minutes", '"often"', "poll_interval_minutes"),
+        ("poll_interval_minutes", "true", "poll_interval_minutes"),
+        ("poll_interval_minutes", "1.9", "poll_interval_minutes"),
     ],
 )
 def test_malformed_numeric_settings_raise_config_error(
@@ -266,6 +269,19 @@ def test_malformed_numeric_settings_raise_config_error(
     write_config(path, extra=f"{setting} = {value}")
     with pytest.raises(ConfigError, match=message):
         load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("minutes", "valid"), [(0, False), (1, True), (1440, True), (1441, False)]
+)
+def test_poll_interval_boundaries(tmp_path: Path, minutes: int, valid: bool) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, extra=f"poll_interval_minutes = {minutes}")
+    if valid:
+        assert load_config(path).poll_interval_minutes == minutes
+    else:
+        with pytest.raises(ConfigError, match="poll_interval_minutes"):
+            load_config(path)
 
 
 @pytest.mark.parametrize("timezone", ["", "/tmp/foo"])
