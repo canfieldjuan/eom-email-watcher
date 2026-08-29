@@ -47,7 +47,7 @@ only to stderr.
 |---|---|---|
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
-| `inbox.recent` | optional `limit` | Existing SQLite inbox rows; no raw bodies |
+| `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
@@ -62,6 +62,12 @@ address that is not watched returns `not_found`, and malformed payload values re
 `watcher.check` returns `active: false` without accessing Gmail; local retention cleanup and exact
 pending-notification counting continue so removing the final sender cannot strand prior state.
 Adding the first sender activates later Gmail checks. Settings mutation remains intentionally absent.
+
+Each inbox item carries an `attachments` array. An attachment contains the Gmail MIME `part_id`,
+optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine
+persists this inventory before local-model analysis, so a temporary inference failure does not lose
+the user's attachment list. Attachment bytes remain in Gmail and are not fetched or stored by this
+operation.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

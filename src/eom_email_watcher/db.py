@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+from .mime import AttachmentDescriptor
+
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,24 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_pending
                     ON messages(status, next_retry_at);
+                CREATE TABLE IF NOT EXISTS message_attachments (
+                    message_id TEXT NOT NULL,
+                    part_id TEXT NOT NULL,
+                    attachment_id TEXT,
+                    filename TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+                    position INTEGER NOT NULL CHECK (position >= 0),
+                    PRIMARY KEY (message_id, part_id),
+                    UNIQUE (message_id, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_attachments_message
+                    ON message_attachments(message_id, position);
+                CREATE TRIGGER IF NOT EXISTS messages_delete_attachments
+                AFTER DELETE ON messages
+                BEGIN
+                    DELETE FROM message_attachments WHERE message_id = OLD.message_id;
+                END;
                 CREATE TABLE IF NOT EXISTS outbound_sends (
                     dedupe_key TEXT PRIMARY KEY,
                     recipient TEXT NOT NULL,
@@ -193,6 +213,35 @@ class Store:
                 ),
             )
         return cursor.rowcount == 1
+
+    def replace_attachments(
+        self, message_id: str, attachments: Iterable[AttachmentDescriptor]
+    ) -> None:
+        items = tuple(attachments)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                "SELECT 1 FROM messages WHERE message_id = ?", (message_id,)
+            ).fetchone() is None:
+                raise KeyError(message_id)
+            db.execute("DELETE FROM message_attachments WHERE message_id = ?", (message_id,))
+            db.executemany(
+                """INSERT INTO message_attachments(
+                    message_id, part_id, attachment_id, filename, media_type, byte_size, position
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        message_id,
+                        item.part_id,
+                        item.attachment_id,
+                        item.filename,
+                        item.media_type,
+                        item.byte_size,
+                        item.position,
+                    )
+                    for item in items
+                ],
+            )
 
     def pending(self, now: datetime | None = None, limit: int = 25) -> list[PendingMessage]:
         stamp = (now or datetime.now(UTC)).isoformat()
@@ -359,7 +408,27 @@ class Store:
                 FROM messages ORDER BY received_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            items = [dict(row) for row in rows]
+            if not items:
+                return []
+            message_ids = [str(item["message_id"]) for item in items]
+            placeholders = ",".join("?" for _ in message_ids)
+            attachment_rows = db.execute(
+                f"""SELECT message_id, part_id, attachment_id, filename, media_type, byte_size
+                FROM message_attachments WHERE message_id IN ({placeholders})
+                ORDER BY message_id, position""",
+                message_ids,
+            ).fetchall()
+        attachments_by_message: dict[str, list[dict[str, object]]] = {
+            message_id: [] for message_id in message_ids
+        }
+        for row in attachment_rows:
+            attachment = dict(row)
+            message_id = str(attachment.pop("message_id"))
+            attachments_by_message[message_id].append(attachment)
+        for item in items:
+            item["attachments"] = attachments_by_message[str(item["message_id"])]
+        return items
 
     def purge(
         self, retention_days: int, *, preserve_notification_intents: bool = False
