@@ -51,7 +51,7 @@ only to stderr.
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
-| `settings.get` | `{}` | Safe public settings and token-presence boolean |
+| `settings.get` | `{}` | Safe public settings, polling interval/support, and token-presence boolean |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
 

@@ -68,6 +68,7 @@ def config(tmp_path: Path) -> Config:
         timezone="America/Chicago",
         body_char_limit=20_000,
         retention_days=180,
+        poll_interval_minutes=120,
         gmail_credentials_file=tmp_path / "credentials.json",
         gmail_token_file=tmp_path / "token.json",
         gmail_send_token_file=tmp_path / "send-token.json",
