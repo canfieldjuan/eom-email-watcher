@@ -9,6 +9,7 @@ import pytest
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.gmail import GmailError, MessageMetadata
+from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -147,6 +148,150 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path:
     assert missing["error"]["code"] == "not_found"
     assert removed["data"]["item"] == added["data"]["item"]
     assert listed["data"]["items"] == []
+
+
+def test_attachment_export_uses_stored_identity_and_safe_private_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Attachment",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        "m1",
+        (
+            AttachmentDescriptor(
+                "", "gmail-attachment", "../../private.PDF", "application/pdf", 4, 0
+            ),
+        ),
+    )
+    destination = tmp_path / "exports"
+    destination.mkdir()
+
+    class FakeAttachmentGmail:
+        def attachment_bytes(
+            self, message_id: str, part_id: str, attachment_id: str | None
+        ) -> bytes:
+            assert (message_id, part_id, attachment_id) == (
+                "m1",
+                "",
+                "gmail-attachment",
+            )
+            return b"%PDF"
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway, "from_token", lambda *args: FakeAttachmentGmail()
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {"message_id": "m1", "part_id": "", "destination_dir": str(destination)},
+        )
+    )
+
+    assert response["ok"] is True
+    exported = Path(response["data"]["path"])
+    assert exported.parent == destination.resolve()
+    assert exported.name.startswith("email-watcher-attachment-")
+    assert exported.name != "private.PDF"
+    assert exported.suffix == ".pdf"
+    assert exported.read_bytes() == b"%PDF"
+    assert exported.stat().st_mode & 0o777 == 0o600
+    assert response["data"] == {
+        "byte_size": 4,
+        "filename": "../../private.PDF",
+        "media_type": "application/pdf",
+        "path": str(exported),
+    }
+
+
+def test_attachment_export_fails_closed_before_gmail_or_file_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    destination = tmp_path / "exports"
+    destination.mkdir()
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
+    )
+
+    missing = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {"message_id": "missing", "part_id": "", "destination_dir": str(destination)},
+        )
+    )
+    relative = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {"message_id": "missing", "part_id": "", "destination_dir": "relative"},
+        )
+    )
+
+    assert missing["error"]["code"] == "not_found"
+    assert relative["error"]["code"] == "invalid_request"
+    assert list(destination.iterdir()) == []
+
+
+def test_attachment_export_rejects_a_byte_count_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Attachment",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        "m1",
+        (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 4, 0),),
+    )
+    destination = tmp_path / "exports"
+    destination.mkdir()
+
+    class TruncatedAttachmentGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return b"bad"
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: TruncatedAttachmentGmail(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {"message_id": "m1", "part_id": "2", "destination_dir": str(destination)},
+        )
+    )
+
+    assert response["error"]["code"] == "gmail_error"
+    assert list(destination.iterdir()) == []
 
 
 @pytest.mark.parametrize(

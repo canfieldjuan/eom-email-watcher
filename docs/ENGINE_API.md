@@ -48,6 +48,7 @@ only to stderr.
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
+| `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
@@ -67,7 +68,12 @@ Each inbox item carries an `attachments` array. An attachment contains the Gmail
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine
 persists this inventory before local-model analysis, so a temporary inference failure does not lose
 the user's attachment list. Attachment bytes remain in Gmail and are not fetched or stored by this
-operation.
+operation. The trusted desktop host may call `attachment.export` with its private absolute temporary
+directory. The engine resolves only an attachment already inventoried for that message, uses the
+existing read-only Gmail authorization, rejects a byte-count mismatch, and creates a random
+mode-0600 file that uses at most a validated alphanumeric extension from the email filename. The
+response path is host-only; the Tauri command opens it natively and does not return it to frontend
+JavaScript.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

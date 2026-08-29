@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,6 +30,7 @@ MAX_REQUEST_BYTES = 1_000_000
 REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
 
 logger = logging.getLogger(__name__)
+SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
 
 
 class ApiError(RuntimeError):
@@ -169,6 +172,74 @@ def _recent(request: dict[str, object]) -> dict[str, object]:
     return {"items": rows}
 
 
+def _attachment_destination(value: object) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError("invalid_request", "destination_dir must be a non-empty string")
+    destination = Path(value)
+    if not destination.is_absolute():
+        raise ApiError("invalid_request", "destination_dir must be an absolute path")
+    try:
+        resolved = destination.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ApiError("invalid_request", "destination_dir must be an existing directory") from exc
+    if not resolved.is_dir():
+        raise ApiError("invalid_request", "destination_dir must be an existing directory")
+    return resolved
+
+
+def _write_attachment(destination: Path, filename: str, content: bytes) -> Path:
+    suffix = Path(filename).suffix
+    if SAFE_ATTACHMENT_SUFFIX.fullmatch(suffix) is None:
+        suffix = ""
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix="email-watcher-attachment-", suffix=suffix.casefold(), dir=destination
+    )
+    path = Path(raw_path)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        path.chmod(0o600)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _attachment_export(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_id", "part_id", "destination_dir"})
+    message_id = payload.get("message_id")
+    part_id = payload.get("part_id")
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise ApiError("invalid_request", "message_id must be a non-empty string")
+    if not isinstance(part_id, str):
+        raise ApiError("invalid_request", "part_id must be a string")
+    destination = _attachment_destination(payload.get("destination_dir"))
+    runtime = _runtime(request)
+    try:
+        attachment = runtime.store.attachment(message_id, part_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Attachment was not found") from exc
+    gmail = GmailGateway.from_token(
+        runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
+    )
+    content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
+    if attachment.byte_size and len(content) != attachment.byte_size:
+        raise GmailError("Gmail attachment size did not match stored metadata")
+    try:
+        path = _write_attachment(destination, attachment.filename, content)
+    except OSError as exc:
+        logger.warning("Attachment export failed: %s", exc)
+        raise ApiError("export_failed", "Attachment could not be prepared") from exc
+    return {
+        "byte_size": len(content),
+        "filename": attachment.filename,
+        "media_type": attachment.media_type,
+        "path": str(path),
+    }
+
+
 def _watchlist(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     config = load_config(_config_path(request))
@@ -307,6 +378,7 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 
 
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
+    "attachment.export": _attachment_export,
     "health.get": _health,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,

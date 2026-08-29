@@ -54,6 +54,12 @@ pub struct InboxAttachment {
     pub byte_size: u64,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ExportedAttachment {
+    pub filename: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
@@ -268,6 +274,22 @@ impl Engine {
     pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
         self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub fn export_attachment(
+        &self,
+        message_id: String,
+        part_id: String,
+        destination_dir: PathBuf,
+    ) -> Result<ExportedAttachment, EngineError> {
+        self.request(
+            "attachment.export",
+            json!({
+                "destination_dir": destination_dir,
+                "message_id": message_id,
+                "part_id": part_id,
+            }),
+        )
     }
 
     pub fn health(&self) -> Result<HealthStatus, EngineError> {

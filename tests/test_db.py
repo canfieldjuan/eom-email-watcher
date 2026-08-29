@@ -404,6 +404,11 @@ def test_attachment_inventory_replaces_in_order_and_is_purged_with_message(
             "byte_size": 20,
         },
     ]
+    assert store.attachment("m1", "2") == AttachmentDescriptor(
+        "2", "gmail-a", "invoice.pdf", "application/pdf", 10, 0
+    )
+    with pytest.raises(KeyError):
+        store.attachment("m1", "missing")
 
     store.replace_attachments(
         "m1",
