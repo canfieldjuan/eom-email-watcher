@@ -18,7 +18,7 @@ No runtime, model, or quantization default should be changed from this partial r
 - Transport: the production OpenAI-compatible `/chat/completions` path.
 - Inference: production prompt, strict JSON schema, validator, temperature `0.1`, maximum 500
   output tokens, 8,192-token context, and one parallel prediction.
-- Device: CPU candidates use LM Studio `lms load --gpu off`; the 9B comparison uses explicit
+- Device: CPU candidates use LM Studio `lms load --gpu off`; GPU comparisons use explicit
   `lms load --gpu max`; Ollama uses both GPU visibility variables set to `-1` with cloud access
   disabled.
 - Privacy: public result artifacts contain case IDs and metrics, not source fields or free-form
@@ -54,6 +54,8 @@ Machine-readable artifacts:
 
 - [`lmstudio-qwen35-4b-q4km.json`](../benchmarks/results/lmstudio-qwen35-4b-q4km.json)
 - [`lmstudio-qwen35-9b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen35-9b-q4km-gpu.json)
+- [`lmstudio-jack-38-27b-coder-16gb-gpu.json`](../benchmarks/results/lmstudio-jack-38-27b-coder-16gb-gpu.json)
+- [`lmstudio-qwen38-27b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen38-27b-q4km-gpu.json)
 - [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
 - [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
@@ -101,6 +103,35 @@ rather than a model-size comparison, so it does not predict 9B CPU performance.
 This is strong enough to advance 9B to blinded human review, but not to change the production
 default yet. The review must confirm summary faithfulness/usefulness, and sustained GPU availability
 must be treated as part of the operating requirement.
+
+### 27B full-GPU challengers
+
+| Metric | Qwen 3.5 9B Q4_K_M | Jack 3.8 27B Coder 16 GB | Qwen 3.8 27B Q4_K_M |
+|---|---:|---:|---:|
+| Requests | 54 | 54 | 54 |
+| Schema-valid rate | 0.814815 | 0.555556 | 0.462963 |
+| Category accuracy | 0.685185 | 0.481481 | 0.37037 |
+| Priority accuracy | 0.648148 | 0.314815 | 0.462963 |
+| High/urgent safety misses | 8 | 16 | 18 |
+| Action precision | 1.0 | 1.0 | 1.0 |
+| Action recall | 0.666667 | 0.2 | 0.033333 |
+| Action false negatives | 10 | 24 | 29 |
+| Suggested-action validity | 0.814815 | 0.555556 | 0.462963 |
+| Exact deadline rate | 0.722222 | 0.518519 | 0.462963 |
+| Deadline hallucinations | 0 | 0 | 0 |
+| Prompt-injection failure rate | 0.0 | 0.5 | 0.5 |
+| Runtime cold load (seconds) | 6.74 | 13.76 | 16.57 |
+| First request (seconds) | 2.066361 | 6.768953 | 2.521705 |
+| Median request (seconds) | 1.152528 | 1.899621 | 1.727758 |
+| p95 request (seconds) | 1.945832 | 2.975452 | 2.502815 |
+| Human summary review | pending | pending | pending |
+
+Neither 27B challenger advances over Qwen 3.5 9B. Both loaded with explicit full GPU offload, but
+both repeatedly set `action_required=true` without a usable `suggested_action`; the unchanged
+production validator rejected those responses. Jack loaded in 13.76 seconds with an LM Studio
+reported footprint of 11.73 GiB. Qwen 3.8 27B loaded in 16.57 seconds with a reported footprint of
+16.52 GiB. These load displays are operating-profile observations, not attributable peak process
+RSS measurements.
 
 ### Smaller-candidate verdicts
 
@@ -180,7 +211,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 18 paired case/repetition items with seven anonymous
+The local blind-review command produced 18 paired case/repetition items with nine anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 

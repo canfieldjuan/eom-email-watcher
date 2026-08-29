@@ -59,6 +59,8 @@ The models observed locally when this procedure was written were:
 |---|---|---|
 | `qwen3.5-4b` | `Q4_K_M` | required baseline |
 | `qwen3.5-9b` | `Q4_K_M` | full-GPU quality challenger |
+| `jack-3.8-27b-coder-16gb-vram` | custom 16 GB VRAM artifact | full-GPU coder challenger |
+| `qwen/qwen3.8-27b` | `Q4_K_M` | full-GPU general-purpose challenger |
 | `qwen3.5-2b` | `Q4_K_M` | smaller general-purpose challenger |
 | `bonsai-4b` | `Q1_0` | end-to-end 1-bit challenger |
 | `ternary-bonsai-8b` | legacy `Q2_0` | ternary challenger requiring Prism llama.cpp |
