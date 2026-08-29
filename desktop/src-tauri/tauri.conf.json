@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.canfieldjuan.email-watcher",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "../scripts/build-desktop-sidecar.sh && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && ../scripts/build-desktop-sidecar.sh",
     "frontendDist": "../dist"
   },
   "app": {
@@ -24,7 +24,9 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["deb"],
+    "externalBin": ["binaries/eom-mail-engine"],
     "icon": ["icons/icon.png"]
   }
 }

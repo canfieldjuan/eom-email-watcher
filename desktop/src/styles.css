@@ -329,7 +329,8 @@ input:focus {
 }
 
 .attachment-list li {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -358,6 +359,39 @@ input:focus {
 .attachment-list button {
   flex: 0 0 auto;
   padding: 6px 10px;
+}
+
+.attachment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.attachment-summary,
+.attachment-summary-error {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid #dce3dd;
+}
+
+.attachment-summary {
+  display: grid;
+  gap: 5px;
+}
+
+.attachment-summary p {
+  margin: 0;
+  color: #39463d;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.attachment-summary .attachment-summary-warnings,
+.attachment-summary-error {
+  color: #765a2d;
+  font-size: 0.78rem;
 }
 
 .message-footer {

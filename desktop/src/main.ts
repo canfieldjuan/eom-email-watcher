@@ -13,6 +13,47 @@ interface InboxAttachment {
   filename: string;
   media_type: string;
   byte_size: number;
+  capability_results: AttachmentCapabilityResult[];
+}
+
+interface ConnectWarning {
+  code: string;
+  message: string;
+}
+
+interface ConnectSummary {
+  summary_version: string;
+  text: string;
+  warnings: ConnectWarning[];
+}
+
+interface AttachmentCapabilityResult {
+  capability_id: string;
+  capability_version: string;
+  status: "requested" | "accepted" | "processing" | "completed" | "failed";
+  updated_at: string;
+  summary: ConnectSummary | null;
+  error: { code: string; message: string } | null;
+}
+
+interface ConnectCapability {
+  id: string;
+  version: string;
+  accepts: string[];
+  max_input_bytes: number;
+}
+
+interface ConnectCapabilities {
+  items: ConnectCapability[];
+  diagnostic: { code: string } | null;
+}
+
+interface ConnectSummaryResult {
+  job_id: string;
+  capability_id: string;
+  capability_version: string;
+  status: "completed";
+  summary: ConnectSummary;
 }
 
 interface InboxItem {
@@ -205,6 +246,7 @@ let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
 let healthRequestGeneration = 0;
+let connectCapabilities: ConnectCapability[] = [];
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -254,6 +296,26 @@ function stateLabel(item: InboxItem): string {
   }
   if (item.status === "analyzed") return "Ready to notify";
   return "Waiting for analysis";
+}
+
+function summaryCapability(attachment: InboxAttachment): ConnectCapability | undefined {
+  return connectCapabilities.find(
+    (capability) =>
+      capability.id === "document.summarize" &&
+      capability.version === "1.0" &&
+      capability.accepts.includes(attachment.media_type.toLowerCase()) &&
+      attachment.byte_size > 0 &&
+      attachment.byte_size <= capability.max_input_bytes,
+  );
+}
+
+function attachmentSummary(
+  attachment: InboxAttachment,
+): AttachmentCapabilityResult | undefined {
+  return (attachment.capability_results ?? []).find(
+    (result) =>
+      result.capability_id === "document.summarize" && result.capability_version === "1.0",
+  );
 }
 
 function renderInbox(items: InboxItem[]): void {
@@ -355,7 +417,69 @@ function renderInbox(items: InboxItem[]): void {
           openButton.textContent = "Open";
         }
       });
-      row.append(attachmentDetails, openButton);
+      const actions = document.createElement("div");
+      actions.className = "attachment-actions";
+      actions.append(openButton);
+
+      const existingSummary = attachmentSummary(attachment);
+      const capability = summaryCapability(attachment);
+      if (capability && existingSummary?.status !== "completed") {
+        const summarizeButton = document.createElement("button");
+        summarizeButton.type = "button";
+        summarizeButton.textContent =
+          existingSummary?.status === "failed" ? "Retry summary" : "Summarize";
+        const active = ["requested", "accepted", "processing"].includes(
+          existingSummary?.status ?? "",
+        );
+        if (active) {
+          summarizeButton.disabled = true;
+          summarizeButton.textContent = "Summarizing…";
+        }
+        summarizeButton.addEventListener("click", async () => {
+          summarizeButton.disabled = true;
+          summarizeButton.textContent = "Summarizing…";
+          inboxStatus.textContent = `Summarizing ${attachment.filename} locally…`;
+          delete inboxStatus.dataset.kind;
+          try {
+            await invoke<ConnectSummaryResult>("attachment_summarize", {
+              messageId: item.message_id,
+              partId: attachment.part_id,
+            });
+            await loadInbox();
+            inboxStatus.textContent = `Summary ready for ${attachment.filename}.`;
+            inboxStatus.dataset.kind = "success";
+          } catch (error) {
+            await loadInbox();
+            inboxStatus.textContent = errorMessage(error);
+            inboxStatus.dataset.kind = "error";
+          }
+        });
+        actions.append(summarizeButton);
+      }
+      row.append(attachmentDetails, actions);
+      if (existingSummary?.status === "completed" && existingSummary.summary) {
+        const result = document.createElement("div");
+        result.className = "attachment-summary";
+        const label = document.createElement("strong");
+        label.textContent = "Document summary";
+        const text = document.createElement("p");
+        text.textContent = existingSummary.summary.text;
+        result.append(label, text);
+        if (existingSummary.summary.warnings.length) {
+          const warnings = document.createElement("p");
+          warnings.className = "attachment-summary-warnings";
+          warnings.textContent = existingSummary.summary.warnings
+            .map((warning) => warning.message)
+            .join(" ");
+          result.append(warnings);
+        }
+        row.append(result);
+      } else if (existingSummary?.status === "failed" && existingSummary.error) {
+        const failure = document.createElement("p");
+        failure.className = "attachment-summary-error";
+        failure.textContent = existingSummary.error.message;
+        row.append(failure);
+      }
       attachments.append(row);
     }
 
@@ -378,10 +502,25 @@ function renderInbox(items: InboxItem[]): void {
 
 async function loadInbox(): Promise<void> {
   try {
-    renderInbox(await invoke<InboxItem[]>("inbox_recent"));
-    inboxStatus.textContent = "Showing the most recent watched messages.";
+    const [inboxResult, capabilityResult] = await Promise.allSettled([
+      invoke<InboxItem[]>("inbox_recent"),
+      invoke<ConnectCapabilities>("connect_capabilities"),
+    ]);
+    if (inboxResult.status === "rejected") throw inboxResult.reason;
+    const items = inboxResult.value;
+    const capabilities =
+      capabilityResult.status === "fulfilled"
+        ? capabilityResult.value
+        : { items: [], diagnostic: null };
+    connectCapabilities = capabilities.items;
+    renderInbox(items);
+    inboxStatus.textContent =
+      capabilities.diagnostic?.code === "ambiguous_provider"
+        ? "Document summary actions are unavailable while multiple compatible providers are running."
+        : "Showing the most recent watched messages.";
     inboxStatus.dataset.kind = "success";
   } catch (error) {
+    connectCapabilities = [];
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
   }
@@ -668,6 +807,7 @@ void listen<{
     }
   }
 });
+window.addEventListener("focus", () => void loadInbox());
 void loadInbox();
 void loadHealth();
 void loadSenders().then((loaded) => {

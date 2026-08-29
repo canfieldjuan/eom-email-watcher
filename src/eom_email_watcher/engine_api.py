@@ -4,11 +4,13 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from . import connect
 from .config import (
     ConfigError,
     DuplicateSenderError,
@@ -19,7 +21,7 @@ from .config import (
     load_config,
     remove_sender,
 )
-from .db import NotificationIntent
+from .db import ConnectJob, NotificationIntent, Store
 from .gmail import GmailError, GmailGateway
 from .locking import operation_lock, operation_lock_supported
 from .runtime import Runtime, load_runtime
@@ -240,6 +242,225 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _connect_capabilities(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    return connect.discover_summary_capability().public_result()
+
+
+def _connect_result(job: ConnectJob) -> dict[str, object]:
+    if (
+        job.status != "completed"
+        or job.summary_version is None
+        or job.summary_text is None
+        or job.warnings_json is None
+    ):
+        raise RuntimeError("Completed Connect job is missing its durable result")
+    warnings = Store.completed_connect_warnings(job)
+    return {
+        "job_id": job.job_id,
+        "capability_id": job.capability_id,
+        "capability_version": job.capability_version,
+        "status": job.status,
+        "summary": {
+            "summary_version": job.summary_version,
+            "text": job.summary_text,
+            "warnings": warnings,
+        },
+    }
+
+
+def _tracked_job(job: ConnectJob, filename: str) -> connect.PreparedSummaryJob:
+    artifact = connect.ArtifactIdentity(
+        artifact_id=job.input_artifact_id,
+        media_type=job.input_media_type,
+        byte_size=job.input_byte_size,
+        sha256=job.input_sha256,
+    )
+    return connect.PreparedSummaryJob(
+        job_id=job.job_id,
+        artifact=artifact,
+        display_name=filename,
+        request={},
+    )
+
+
+def _apply_connect_update(store: Store, update: connect.JobUpdate) -> ConnectJob:
+    current = store.connect_job(update.job_id)
+    if current is None:
+        raise RuntimeError("Connect job disappeared before its status could persist")
+    if current.status == update.status:
+        return current
+    allowed = {
+        "requested": {"accepted", "processing", "completed", "failed"},
+        "accepted": {"processing", "completed", "failed"},
+        "processing": {"completed", "failed"},
+    }
+    if update.status not in allowed.get(current.status, set()):
+        raise connect.ConnectError(
+            "JOB_STATE_INVALID",
+            "The local capability provider returned an invalid job transition.",
+        )
+    return store.transition_connect_job(
+        job_id=update.job_id,
+        expected_state=current.status,
+        next_state=update.status,
+        provider_app_id=update.provider_app_id,
+        provider_instance_id=update.provider_instance_id,
+        result=update.result.store_dict() if update.result else None,
+        error=(
+            {
+                "code": update.error.code,
+                "message": str(update.error),
+                "retryable": update.error.retryable,
+            }
+            if update.error
+            else None
+        ),
+    )
+
+
+def _mark_connect_failed(
+    store: Store,
+    job_id: str,
+    provider: connect.ProviderCapability,
+    error: connect.ConnectError,
+) -> None:
+    current = store.connect_job(job_id)
+    if current is None or current.status not in {"requested", "accepted", "processing"}:
+        return
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state=current.status,
+        next_state="failed",
+        provider_app_id=provider.app_id,
+        provider_instance_id=provider.instance_id,
+        error={
+            "code": error.code,
+            "message": str(error),
+            "retryable": error.retryable,
+        },
+    )
+
+
+def _run_connect_job(
+    runtime: Runtime,
+    provider: connect.ProviderCapability,
+    job: connect.PreparedSummaryJob,
+    content: bytes | None,
+) -> dict[str, object]:
+    client = connect.ConnectClient(provider)
+    try:
+        initial = client.submit(job, content) if content is not None else client.get(job)
+        persisted = _apply_connect_update(runtime.store, initial)
+        final = client.wait_for_terminal(
+            job,
+            initial,
+            lambda update: _apply_connect_update(runtime.store, update),
+        )
+        if final.status == "failed":
+            if final.error is None:
+                raise RuntimeError("Failed Connect job omitted its error")
+            raise final.error
+        if final.status != "completed" or final.result is None:
+            raise RuntimeError("Connect job completed without a summary")
+        if persisted.status != "completed":
+            persisted = runtime.store.connect_job(job.job_id) or persisted
+        return _connect_result(persisted)
+    except connect.ConnectError as exc:
+        try:
+            _mark_connect_failed(runtime.store, job.job_id, provider, exc)
+        except Exception:
+            logger.exception("Connect failure could not be persisted")
+            raise RuntimeError("Connect failure could not be persisted safely") from exc
+        raise
+
+
+def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_id", "part_id"})
+    message_id = payload.get("message_id")
+    part_id = payload.get("part_id")
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise ApiError("invalid_request", "message_id must be a non-empty string")
+    if not isinstance(part_id, str):
+        raise ApiError("invalid_request", "part_id must be a string")
+
+    runtime = _runtime(request)
+    try:
+        attachment = runtime.store.attachment(message_id, part_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Attachment was not found") from exc
+    if not connect.capability_matches_attachment(attachment.media_type, attachment.byte_size):
+        raise ApiError("unsupported_attachment", "This attachment is not a supported PDF")
+
+    completed = runtime.store.completed_connect_job(
+        message_id=message_id,
+        part_id=part_id,
+        capability_id=connect.CAPABILITY_ID,
+        capability_version=connect.CAPABILITY_VERSION,
+    )
+    if completed is not None:
+        return _connect_result(completed)
+
+    discovery = connect.discover_summary_capability()
+    provider = discovery.provider
+    if provider is None:
+        code = discovery.diagnostic_code or "provider_unavailable"
+        message = (
+            "More than one compatible local capability provider is available."
+            if code == "ambiguous_provider"
+            else "No compatible local document summary capability is available."
+        )
+        raise ApiError(code, message)
+    if attachment.byte_size > provider.max_input_bytes:
+        raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
+
+    active = runtime.store.active_connect_job(
+        message_id=message_id,
+        part_id=part_id,
+        capability_id=connect.CAPABILITY_ID,
+        capability_version=connect.CAPABILITY_VERSION,
+    )
+    if active is not None:
+        tracked = _tracked_job(active, attachment.filename)
+        return _run_connect_job(runtime, provider, tracked, None)
+
+    gmail = GmailGateway.from_token(
+        runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
+    )
+    content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
+    if len(content) != attachment.byte_size:
+        raise GmailError("Gmail attachment size did not match stored metadata")
+    job = connect.prepare_summary_job(content, attachment.filename)
+    try:
+        runtime.store.create_connect_job(
+            job_id=job.job_id,
+            message_id=message_id,
+            part_id=part_id,
+            capability_id=connect.CAPABILITY_ID,
+            capability_version=connect.CAPABILITY_VERSION,
+            provider_app_id=provider.app_id,
+            provider_instance_id=provider.instance_id,
+            input_artifact_id=job.artifact.artifact_id,
+            input_media_type=job.artifact.media_type,
+            input_byte_size=job.artifact.byte_size,
+            input_sha256=job.artifact.sha256,
+        )
+    except sqlite3.IntegrityError as exc:
+        concurrent = runtime.store.active_connect_job(
+            message_id=message_id,
+            part_id=part_id,
+            capability_id=connect.CAPABILITY_ID,
+            capability_version=connect.CAPABILITY_VERSION,
+        )
+        if concurrent is not None:
+            raise ApiError(
+                "connect_job_in_progress",
+                "A summary job is already in progress for this attachment.",
+            ) from exc
+        raise
+    return _run_connect_job(runtime, provider, job, content)
+
+
 def _watchlist(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     config = load_config(_config_path(request))
@@ -379,6 +600,8 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "attachment.export": _attachment_export,
+    "connect.attachment.summarize": _connect_attachment_summarize,
+    "connect.capabilities": _connect_capabilities,
     "health.get": _health,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,
@@ -439,6 +662,14 @@ def _response(request: object) -> dict[str, object]:
                 "code": "gmail_error",
                 "message": "Gmail operation failed; see stderr for details",
             },
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except connect.ConnectError as exc:
+        logger.warning("Connect operation failed (%s): %s", exc.code, exc)
+        return {
+            "error": {"code": exc.code.casefold(), "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
