@@ -225,7 +225,7 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
     )
     content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
-    if attachment.byte_size and len(content) != attachment.byte_size:
+    if len(content) != attachment.byte_size:
         raise GmailError("Gmail attachment size did not match stored metadata")
     try:
         path = _write_attachment(destination, attachment.filename, content)

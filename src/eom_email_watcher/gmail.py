@@ -9,6 +9,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -18,6 +20,7 @@ from googleapiclient.errors import HttpError
 from .config import normalize_address
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
+TOKEN_LOCK_TIMEOUT_SECONDS = 30
 
 
 class GmailError(RuntimeError):
@@ -121,18 +124,25 @@ class GmailGateway:
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Download them from Google Cloud Console after enabling Gmail API."
             )
-        credentials: Credentials | None = None
-        if token_file.exists():
-            try:
-                credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-            except (ValueError, json.JSONDecodeError) as exc:
-                raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
-        if credentials and credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-            token_file.write_text(credentials.to_json(), encoding="utf-8")
-            token_file.chmod(0o600)
-        if not credentials or not credentials.valid:
-            raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+        token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                credentials: Credentials | None = None
+                if token_file.exists():
+                    try:
+                        credentials = Credentials.from_authorized_user_file(
+                            str(token_file), SCOPES
+                        )
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                if credentials and credentials.expired and credentials.refresh_token:
+                    credentials.refresh(Request())
+                    token_file.write_text(credentials.to_json(), encoding="utf-8")
+                    token_file.chmod(0o600)
+                if not credentials or not credentials.valid:
+                    raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+        except FileLockTimeout as exc:
+            raise GmailError("Gmail token is busy; retry the operation") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     @classmethod
@@ -147,8 +157,12 @@ class GmailGateway:
             host="127.0.0.1", port=0, open_browser=True, prompt="consent"
         )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        token_file.write_text(credentials.to_json(), encoding="utf-8")
-        token_file.chmod(0o600)
+        try:
+            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                token_file.write_text(credentials.to_json(), encoding="utf-8")
+                token_file.chmod(0o600)
+        except FileLockTimeout as exc:
+            raise GmailError("Gmail token is busy; retry setup") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     def profile_history_id(self) -> str:

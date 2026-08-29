@@ -266,7 +266,7 @@ def test_attachment_export_rejects_a_byte_count_mismatch(
     )
     runtime.store.replace_attachments(
         "m1",
-        (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 4, 0),),
+        (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 0, 0),),
     )
     destination = tmp_path / "exports"
     destination.mkdir()

@@ -1,7 +1,9 @@
 import base64
 
 import pytest
+from filelock import FileLock
 
+from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.gmail import GmailError, GmailGateway, parse_metadata
 
 
@@ -106,3 +108,18 @@ def test_attachment_bytes_accepts_an_empty_attachment() -> None:
     gateway = GmailGateway(FakeService(attachments))
 
     assert gateway.attachment_bytes("message-1", "2", "attachment-1") == b""
+
+
+def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module, "TOKEN_LOCK_TIMEOUT_SECONDS", 0)
+
+    with (
+        FileLock(f"{token_file}.lock"),
+        pytest.raises(GmailError, match="token is busy"),
+    ):
+        GmailGateway.from_token(credentials_file, token_file)
