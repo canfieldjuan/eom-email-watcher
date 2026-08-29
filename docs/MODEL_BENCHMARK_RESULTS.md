@@ -56,6 +56,8 @@ Machine-readable artifacts:
 - [`lmstudio-qwen35-9b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen35-9b-q4km-gpu.json)
 - [`lmstudio-jack-38-27b-coder-16gb-gpu.json`](../benchmarks/results/lmstudio-jack-38-27b-coder-16gb-gpu.json)
 - [`lmstudio-qwen38-27b-q4km-gpu.json`](../benchmarks/results/lmstudio-qwen38-27b-q4km-gpu.json)
+- [`lmstudio-gemma4-e4b-q4km-gpu.json`](../benchmarks/results/lmstudio-gemma4-e4b-q4km-gpu.json)
+- [`lmstudio-gemma4-12b-q4km-gpu.json`](../benchmarks/results/lmstudio-gemma4-12b-q4km-gpu.json)
 - [`lmstudio-qwen35-2b-q4km.json`](../benchmarks/results/lmstudio-qwen35-2b-q4km.json)
 - [`lmstudio-bonsai-4b-q1.json`](../benchmarks/results/lmstudio-bonsai-4b-q1.json)
 - [`lmstudio-lfm25-vl-3b-q8.json`](../benchmarks/results/lmstudio-lfm25-vl-3b-q8.json)
@@ -132,6 +134,42 @@ production validator rejected those responses. Jack loaded in 13.76 seconds with
 reported footprint of 11.73 GiB. Qwen 3.8 27B loaded in 16.57 seconds with a reported footprint of
 16.52 GiB. These load displays are operating-profile observations, not attributable peak process
 RSS measurements.
+
+### Gemma 4 full-GPU challengers
+
+| Metric | Qwen 3.5 9B Q4_K_M | Gemma 4 E4B Q4_K_M | Gemma 4 12B Q4_K_M |
+|---|---:|---:|---:|
+| Requests | 54 | 54 | 54 |
+| Schema-valid rate | 0.814815 | 1.0 | 0.444444 |
+| Category accuracy | 0.685185 | 0.851852 | 0.407407 |
+| Priority accuracy | 0.648148 | 0.740741 | 0.444444 |
+| High/urgent safety misses | 8 | 9 | 18 |
+| Action precision | 1.0 | 1.0 | 0.0 |
+| Action recall | 0.666667 | 1.0 | 0.0 |
+| Action false negatives | 10 | 0 | 30 |
+| Suggested-action validity | 0.814815 | 1.0 | 0.444444 |
+| Exact deadline rate | 0.722222 | 0.777778 | 0.444444 |
+| Deadline hallucinations | 0 | 0 | 0 |
+| Prompt-injection failure rate | 0.0 | 0.0 | 0.0 |
+| Runtime cold load (seconds) | 6.74 | 5.2 | 6.29 |
+| First request (seconds) | 2.066361 | 2.226928 | 2.293834 |
+| Median request (seconds) | 1.152528 | 1.284546 | 1.659811 |
+| p95 request (seconds) | 1.945832 | 2.160957 | 2.293834 |
+| Human summary review | pending | pending | pending |
+
+Gemma 4 E4B is the leading deterministic candidate: every response passed the production schema,
+it had perfect action precision and recall, and it improved category, priority, and deadline
+accuracy over Qwen 3.5 9B. Its one measured safety regression was 9 high/urgent misses versus 8 for
+Qwen 9B, and its request latency was slightly higher. Gemma E4B loaded in 5.2 seconds with an LM
+Studio reported footprint of 5.89 GiB.
+
+Gemma 4 12B does not advance. Its no-action cases were structurally valid, but action cases produced
+either `action_without_suggestion` or full schema mismatch. It loaded in 6.29 seconds with an LM
+Studio reported footprint of 7.04 GiB. The load displays are operating-profile observations, not
+attributable peak process RSS measurements.
+
+Gemma E4B advances to blinded human review alongside Qwen 9B. This deterministic comparison alone
+does not change the production default.
 
 ### Smaller-candidate verdicts
 
@@ -211,7 +249,7 @@ model was too large/slow for the probe. No model was downloaded, no schema was r
 
 ## Human summary review
 
-The local blind-review command produced 18 paired case/repetition items with nine anonymous
+The local blind-review command produced 18 paired case/repetition items with eleven anonymous
 summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
 mode `600`.
 
