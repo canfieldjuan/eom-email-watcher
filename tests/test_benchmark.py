@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from eom_email_watcher import benchmark as benchmark_module
 from eom_email_watcher.benchmark import (
     BenchmarkCandidate,
     BenchmarkCorpus,
@@ -18,10 +19,14 @@ from eom_email_watcher.benchmark import (
     _require_local_output,
     _write_json,
     build_blind_review,
+    build_private_inbox_draft,
+    finalize_private_inbox_draft,
+    load_corpus,
     main,
     run_benchmark,
 )
 from eom_email_watcher.config import ConfigError, validate_model_base_url
+from eom_email_watcher.gmail import GmailError, MessageMetadata
 from eom_email_watcher.model import Analysis, ModelError
 
 
@@ -233,6 +238,111 @@ def test_corpus_accepts_quoted_address_on_reserved_domain() -> None:
     data["email_cases"][0]["body"] = 'Reply to "john doe"@example.com immediately.'
 
     BenchmarkCorpus.model_validate(data)
+
+
+def test_private_local_corpus_accepts_real_addresses_without_weakening_public_guard(
+    tmp_path: Path,
+) -> None:
+    data = _corpus().model_dump(mode="json")
+    data["email_cases"][0]["sender"] = "customer@customer.test"
+    path = tmp_path / "real-inbox.reviewed.local.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    path.chmod(0o600)
+
+    corpus = load_corpus(path)
+
+    assert corpus.email_cases[0].sender == "customer@customer.test"
+    with pytest.raises(ValueError, match="reserved example domains"):
+        BenchmarkCorpus.model_validate(data)
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="group or other users"):
+        load_corpus(path)
+
+
+def test_private_inbox_draft_requires_human_label_review_before_finalizing() -> None:
+    class FakeGmail:
+        def recent_inbox_message_ids(self, addresses: frozenset[str], *, limit: int) -> list[str]:
+            assert addresses == frozenset({"customer@customer.test"})
+            assert limit == 1
+            return ["private-gmail-id"]
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            assert message_id == "private-gmail-id"
+            return MessageMetadata(
+                message_id=message_id,
+                thread_id="private-thread-id",
+                sender="customer@customer.test",
+                sender_name="Private Customer",
+                subject="Private subject",
+                received_at="2026-09-01T14:00:00+00:00",
+                labels=frozenset({"INBOX"}),
+            )
+
+        def full_payload(self, message_id: str) -> dict[str, object]:
+            assert message_id == "private-gmail-id"
+            return {
+                "mimeType": "text/plain",
+                "body": {"data": "UFJJVkFURV9CT0RZ"},
+            }
+
+    class FakeModel:
+        model = "local-draft-model"
+
+        def analyze(self, **kwargs: object) -> Analysis:
+            assert kwargs["body"] == "PRIVATE_BODY"
+            return _analysis()
+
+    draft = build_private_inbox_draft(
+        FakeGmail(),
+        FakeModel(),
+        _corpus(),
+        senders=frozenset({"customer@customer.test"}),
+        limit=1,
+        body_char_limit=20_000,
+        current_local_time=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+    )
+
+    assert draft["local_only"] is True
+    assert draft["labels_reviewed"] is False
+    assert draft["corpus"]["email_cases"][0]["sender"] == "customer@customer.test"
+    assert "private-gmail-id" not in json.dumps(draft)
+    with pytest.raises(ValueError, match="labels_reviewed"):
+        finalize_private_inbox_draft(draft)
+
+    draft["labels_reviewed"] = True
+    corpus = finalize_private_inbox_draft(draft)
+    assert corpus.email_cases[0].expected.category == "customer_request"
+    assert corpus.email_cases[0].body == "PRIVATE_BODY"
+
+
+def test_private_inbox_gmail_failure_does_not_echo_private_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_canary = "PRIVATE_EMAIL_BODY_CANARY"
+
+    def fail(_args: Namespace) -> int:
+        raise GmailError(private_canary)
+
+    monkeypatch.setattr(benchmark_module, "_prepare_inbox_command", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "prepare-inbox",
+                "--base-url",
+                "http://127.0.0.1:11434/v1",
+                "--model",
+                "local-model",
+                "--output",
+                str(tmp_path / "draft.local.json"),
+            ]
+        )
+
+    assert exit_info.value.code == 2
+    captured = capsys.readouterr()
+    assert private_canary not in captured.err
+    assert captured.err == "error: private local operation failed\n"
 
 
 @pytest.mark.parametrize(

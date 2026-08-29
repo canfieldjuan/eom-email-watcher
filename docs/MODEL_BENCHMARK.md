@@ -40,6 +40,44 @@ The public result deliberately records only exception class names. Model respons
 copied into it. A private corpus may be supplied by path, but neither that corpus nor its local
 review artifacts belong in Git, CI output, issue comments, or PR comments.
 
+## Build a private real-inbox corpus
+
+The committed synthetic corpus remains the stable regression control. For task-fidelity testing,
+create a second corpus from recent Inbox messages sent by the addresses in the configured watcher
+allowlist. This command uses the existing Gmail read-only token, fetches body text and attachment
+filenames through the production MIME path, and asks an explicitly selected loopback model for
+draft labels. It does not download attachment bytes or print source content.
+
+```bash
+uv run eom-model-benchmark prepare-inbox \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model <local-ollama-model> \
+  --limit 20 \
+  --output benchmarks/local/inbox-label-draft.local.json
+```
+
+The output is mode `0600`, Git-ignored, and contains real private email content. Draft labels are a
+review aid, not ground truth. Open the file locally, review every `expected` object against its
+source email, correct category, priority, action requirement, and deadline fields, then change the
+top-level `labels_reviewed` value to `true`. Do not paste the file or its contents into chat, issues,
+pull requests, CI logs, or cloud tools.
+
+Finalize the reviewed draft into the corpus consumed by the normal runner:
+
+```bash
+uv run eom-model-benchmark finalize-inbox \
+  --input benchmarks/local/inbox-label-draft.local.json \
+  --output benchmarks/local/inbox-gold.reviewed.local.json
+
+uv run eom-model-benchmark validate \
+  --corpus benchmarks/local/inbox-gold.reviewed.local.json
+```
+
+Both preparation and finalization refuse to overwrite existing files. Real addresses are accepted
+only from a private `*.local.json` corpus; the reserved-example-domain guard remains mandatory for
+committed/public corpora. Run each candidate against both corpora and report the synthetic and real
+results separately rather than combining their scores.
+
 ## Validate the corpus
 
 ```bash

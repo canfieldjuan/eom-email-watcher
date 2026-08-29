@@ -302,3 +302,44 @@ class GmailGateway:
             page_token = response.get("nextPageToken")
             if not page_token:
                 return list(dict.fromkeys(ids))
+
+    def recent_inbox_message_ids(
+        self, addresses: frozenset[str], *, limit: int
+    ) -> list[str]:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        if not addresses:
+            raise ValueError("at least one watched sender is required")
+        sender_terms = " ".join(f"from:{address}" for address in sorted(addresses))
+        query = f"in:inbox {{{sender_terms}}}"
+        ids: list[str] = []
+        seen: set[str] = set()
+        page_token: str | None = None
+        while len(ids) < limit:
+            try:
+                response = (
+                    self.service.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        q=query,
+                        pageToken=page_token,
+                        maxResults=min(500, limit - len(ids)),
+                    )
+                    .execute()
+                )
+            except HttpError as exc:
+                raise GmailError(
+                    f"Gmail private corpus search failed (HTTP {exc.resp.status})"
+                ) from exc
+            for item in response.get("messages") or []:
+                message_id = str(item.get("id", ""))
+                if message_id and message_id not in seen:
+                    seen.add(message_id)
+                    ids.append(message_id)
+                    if len(ids) == limit:
+                        return ids
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        return ids

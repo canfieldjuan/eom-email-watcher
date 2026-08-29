@@ -15,9 +15,24 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
-from .config import validate_model_base_url
+from .config import (
+    DEFAULT_CONFIG,
+    load_config,
+    secure_runtime_paths,
+    validate_model_base_url,
+)
+from .gmail import GmailError, GmailGateway, MessageUnavailable
+from .mime import extract_body
 from .model import Analysis, LocalModel, ModelError, validate_analysis
 
 Capability = Literal[
@@ -145,7 +160,7 @@ class BenchmarkCorpus(BaseModel):
     validation_cases: list[ValidationCase] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_privacy_and_ids(self) -> BenchmarkCorpus:
+    def validate_privacy_and_ids(self, info: ValidationInfo) -> BenchmarkCorpus:
         identifiers = [case.id for case in self.email_cases]
         identifiers.extend(case.id for case in self.validation_cases)
         if len(identifiers) != len(set(identifiers)):
@@ -157,7 +172,10 @@ class BenchmarkCorpus(BaseModel):
             match.group("domain").casefold() not in RESERVED_EMAIL_DOMAINS for match in matches
         )
         unmatched_at_sign = "@" in EMAIL_DOMAIN_PATTERN.sub("", serialized)
-        if unsafe_domain or unmatched_at_sign:
+        allow_private_content = bool(
+            info.context and info.context.get("allow_private_content") is True
+        )
+        if not allow_private_content and (unsafe_domain or unmatched_at_sign):
             raise ValueError("committed corpus email addresses must use reserved example domains")
         return self
 
@@ -197,7 +215,101 @@ class BenchmarkCandidate(BaseModel):
 
 
 def load_corpus(path: Path) -> BenchmarkCorpus:
-    return BenchmarkCorpus.model_validate_json(path.read_text(encoding="utf-8"))
+    allow_private_content = path.name.endswith(".local.json")
+    if allow_private_content:
+        _require_local_output(path)
+        if path.stat().st_mode & 0o077:
+            raise ValueError("private corpus files must not be accessible by group or other users")
+    return BenchmarkCorpus.model_validate_json(
+        path.read_text(encoding="utf-8"),
+        context={"allow_private_content": allow_private_content},
+    )
+
+
+def build_private_inbox_draft(
+    gmail: GmailGateway,
+    model: LocalModel,
+    base_corpus: BenchmarkCorpus,
+    *,
+    senders: frozenset[str],
+    limit: int,
+    body_char_limit: int,
+    current_local_time: datetime,
+) -> dict[str, object]:
+    if current_local_time.tzinfo is None:
+        raise ValueError("current_local_time must include a timezone offset")
+    message_ids = gmail.recent_inbox_message_ids(senders, limit=limit)
+    cases: list[dict[str, object]] = []
+    for message_id in message_ids:
+        try:
+            metadata = gmail.metadata(message_id)
+            body, attachment_names, _attachments = extract_body(
+                gmail.full_payload(message_id), body_char_limit
+            )
+        except MessageUnavailable:
+            continue
+        analysis = model.analyze(
+            sender=metadata.sender,
+            subject=metadata.subject,
+            received_at=metadata.received_at,
+            body=body,
+            attachment_names=attachment_names,
+            current_local_time=current_local_time,
+        )
+        cases.append(
+            {
+                "id": f"inbox-{len(cases) + 1:03d}",
+                "sender": metadata.sender,
+                "subject": metadata.subject,
+                "received_at": metadata.received_at,
+                "current_local_time": current_local_time.isoformat(),
+                "body": body,
+                "attachment_names": list(attachment_names),
+                "expected": {
+                    "category": analysis.category,
+                    "priority": analysis.priority,
+                    "action_required": analysis.action_required,
+                    "deadline_text": analysis.deadline_text,
+                    "deadline_iso": analysis.deadline_iso,
+                    "forbidden_output_substrings": [],
+                },
+            }
+        )
+    if not cases:
+        raise ValueError("no available inbox messages matched the configured watchlist")
+    return {
+        "schema_version": 1,
+        "local_only": True,
+        "labels_reviewed": False,
+        "draft_label_model": model.model,
+        "labeling_instructions": (
+            "Review every expected object against its source email, correct it, then set "
+            "labels_reviewed to true before finalizing. Draft model labels are not ground truth."
+        ),
+        "corpus": {
+            "name": "email-analysis-private-inbox",
+            "version": 1,
+            "privacy_reviewed": True,
+            "email_cases": cases,
+            "validation_cases": [
+                case.model_dump(mode="json") for case in base_corpus.validation_cases
+            ],
+        },
+    }
+
+
+def finalize_private_inbox_draft(draft: object) -> BenchmarkCorpus:
+    if not isinstance(draft, dict) or draft.get("local_only") is not True:
+        raise ValueError("private inbox draft must declare local_only=true")
+    if draft.get("labels_reviewed") is not True:
+        raise ValueError("private inbox draft requires labels_reviewed=true")
+    corpus = draft.get("corpus")
+    if not isinstance(corpus, dict):
+        raise ValueError("private inbox draft is missing its corpus")
+    return BenchmarkCorpus.model_validate(
+        corpus,
+        context={"allow_private_content": True},
+    )
 
 
 def _canonical_hash(value: object) -> str:
@@ -697,6 +809,74 @@ def _validate_command(args: argparse.Namespace) -> int:
     return 0 if boundary["failed"] == 0 else 1
 
 
+def _prepare_inbox_command(args: argparse.Namespace) -> int:
+    _require_disjoint_input_outputs(
+        [args.base_corpus], [args.output], label="private inbox corpus draft"
+    )
+    _require_local_output(args.output)
+    if args.output.exists():
+        raise ValueError("private inbox corpus preparation refuses to overwrite an existing file")
+    config = load_config(args.config)
+    secure_runtime_paths(config)
+    if not config.allowlist:
+        raise ValueError("private inbox corpus requires at least one configured watched sender")
+    gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+    model = LocalModel(
+        validate_model_base_url(args.base_url),
+        args.model,
+        args.timeout,
+        args.api_token_file,
+        args.require_auth,
+    )
+    draft = build_private_inbox_draft(
+        gmail,
+        model,
+        load_corpus(args.base_corpus),
+        senders=config.allowlist,
+        limit=args.limit,
+        body_char_limit=config.body_char_limit,
+        current_local_time=datetime.now(config.zone),
+    )
+    _write_json(args.output, draft, private=True)
+    corpus = draft["corpus"]
+    email_cases = corpus["email_cases"] if isinstance(corpus, dict) else []
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "email_cases": len(email_cases),
+                "labels_reviewed": False,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _finalize_inbox_command(args: argparse.Namespace) -> int:
+    _require_disjoint_input_outputs(
+        [args.input], [args.output], label="private inbox corpus finalization"
+    )
+    _require_local_output(args.input)
+    _require_local_output(args.output)
+    if args.output.exists():
+        raise ValueError("private inbox corpus finalization refuses to overwrite an existing file")
+    draft = json.loads(args.input.read_text(encoding="utf-8"))
+    corpus = finalize_private_inbox_draft(draft)
+    _write_json(args.output, corpus.model_dump(mode="json"), private=True)
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "email_cases": len(corpus.email_cases),
+                "labels_reviewed": True,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _blind_command(args: argparse.Namespace) -> int:
     _require_disjoint_input_outputs(
         args.input,
@@ -724,6 +904,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--corpus", type=Path, required=True)
     validate.set_defaults(handler=_validate_command)
+
+    prepare_inbox = commands.add_parser(
+        "prepare-inbox", help="Create a private real-inbox corpus labeling draft"
+    )
+    prepare_inbox.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    prepare_inbox.add_argument(
+        "--base-corpus", type=Path, default=PROJECT_ROOT / "benchmarks/email-analysis-v1.json"
+    )
+    prepare_inbox.add_argument("--base-url", required=True)
+    prepare_inbox.add_argument("--model", required=True)
+    prepare_inbox.add_argument("--limit", type=int, default=20)
+    prepare_inbox.add_argument("--timeout", type=float, default=300)
+    prepare_inbox.add_argument("--api-token-file", type=Path)
+    prepare_inbox.add_argument("--require-auth", action="store_true")
+    prepare_inbox.add_argument("--output", type=Path, required=True)
+    prepare_inbox.set_defaults(handler=_prepare_inbox_command)
+
+    finalize_inbox = commands.add_parser(
+        "finalize-inbox", help="Finalize a human-reviewed private inbox corpus"
+    )
+    finalize_inbox.add_argument("--input", type=Path, required=True)
+    finalize_inbox.add_argument("--output", type=Path, required=True)
+    finalize_inbox.set_defaults(handler=_finalize_inbox_command)
 
     run = commands.add_parser("run", help="Run one local candidate against a corpus")
     run.add_argument("--corpus", type=Path, required=True)
@@ -770,6 +973,9 @@ def main(argv: list[str] | None = None) -> None:
             f"error: benchmark input failed validation ({exc.error_count()} errors)",
             file=os.sys.stderr,
         )
+        code = 2
+    except (GmailError, ModelError):
+        print("error: private local operation failed", file=os.sys.stderr)
         code = 2
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=os.sys.stderr)

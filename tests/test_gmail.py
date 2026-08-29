@@ -123,3 +123,50 @@ def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
         pytest.raises(GmailError, match="token is busy"),
     ):
         GmailGateway.from_token(credentials_file, token_file)
+
+
+def test_recent_inbox_message_ids_is_watchlist_scoped_and_bounded() -> None:
+    class SearchMessages:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> FakeRequest:
+            self.calls.append(kwargs)
+            return FakeRequest(
+                {
+                    "messages": [{"id": "m1"}, {"id": "m2"}, {"id": "m3"}],
+                    "nextPageToken": "must-not-be-followed",
+                }
+            )
+
+    messages = SearchMessages()
+
+    class SearchUsers:
+        def messages(self) -> SearchMessages:
+            return messages
+
+    class SearchService:
+        def users(self) -> SearchUsers:
+            return SearchUsers()
+
+    gateway = GmailGateway(SearchService())
+
+    assert gateway.recent_inbox_message_ids(
+        frozenset({"z@example.com", "a@example.com"}), limit=2
+    ) == ["m1", "m2"]
+    assert messages.calls == [
+        {
+            "userId": "me",
+            "q": "in:inbox {from:a@example.com from:z@example.com}",
+            "pageToken": None,
+            "maxResults": 2,
+        }
+    ]
+
+
+@pytest.mark.parametrize("limit", [0, 501])
+def test_recent_inbox_message_ids_rejects_unsafe_limits(limit: int) -> None:
+    with pytest.raises(ValueError, match="between 1 and 500"):
+        GmailGateway(None).recent_inbox_message_ids(
+            frozenset({"a@example.com"}), limit=limit
+        )
