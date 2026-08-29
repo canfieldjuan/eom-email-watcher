@@ -105,3 +105,7 @@ replace the fixed quality benchmark and human review.
 
 Connect capability discovery remains independent of inference transport. Neither app discovers or
 selects models through Connect, and this proof adds no app-to-app runtime dependency.
+
+The proposed secure multi-user appliance boundary is documented separately in
+[`INFERENCE_GATEWAY_V0.md`](INFERENCE_GATEWAY_V0.md). It keeps worker/model selection behind
+administrator policy rather than making this llama.cpp proof an application dependency.
