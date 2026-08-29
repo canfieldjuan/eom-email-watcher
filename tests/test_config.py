@@ -102,6 +102,65 @@ def test_local_model_url_rejects_invalid_port_boundaries(tmp_path: Path, port: i
         load_config(path)
 
 
+def test_gateway_config_requires_https_trust_and_auth(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    ca_file = tmp_path / "gateway-ca.pem"
+    write_config(
+        path,
+        base_url="https://inference.office.internal:8443",
+        extra=f'model_backend = "gateway"\nmodel_ca_file = "{ca_file}"',
+    )
+
+    config = load_config(path)
+
+    assert config.model_backend == "gateway"
+    assert config.model_base_url == "https://inference.office.internal:8443"
+    assert config.model_name == "Managed by inference gateway"
+    assert config.model_ca_file == ca_file
+    assert config.model_require_auth is True
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://inference.office.internal:8080",
+        "https://user@inference.office.internal",
+        "https://inference.office.internal/v1",
+        "https://inference.office.internal?target=elsewhere",
+        "https://inference.office.internal#fragment",
+        " https://inference.office.internal",
+    ],
+)
+def test_gateway_config_rejects_unsafe_authorities(tmp_path: Path, base_url: str) -> None:
+    path = tmp_path / "config.toml"
+    write_config(
+        path,
+        base_url=base_url,
+        extra=f'model_backend = "gateway"\nmodel_ca_file = "{tmp_path / "ca.pem"}"',
+    )
+
+    with pytest.raises(ConfigError, match="model_base_url"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'model_backend = "gateway"',
+        'model_backend = "gateway"\nmodel_ca_file = "ca.pem"\nmodel_require_auth = false',
+        'model_backend = ["gateway"]',
+    ],
+)
+def test_gateway_config_fails_closed_when_security_fields_are_invalid(
+    tmp_path: Path, extra: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, base_url="https://inference.office.internal", extra=extra)
+
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_duplicate_sender_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)

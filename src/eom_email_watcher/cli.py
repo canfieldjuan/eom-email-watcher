@@ -16,7 +16,7 @@ from .config import DEFAULT_CONFIG, ConfigError
 from .db import Store
 from .gmail import GmailError, GmailGateway
 from .locking import operation_lock
-from .model import LocalModel
+from .model import ModelRuntime
 from .notifications import NotificationError, send_fallback
 from .outbound import GmailSender, SendError, previous_month_email
 from .runtime import load_runtime
@@ -55,7 +55,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _runtime(config_path: Path) -> tuple[object, Store, LocalModel]:
+def _runtime(config_path: Path) -> tuple[object, Store, ModelRuntime]:
     runtime = load_runtime(config_path)
     return runtime.config, runtime.store, runtime.model
 

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import ssl
+import stat
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -12,6 +16,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 class ModelError(RuntimeError):
     """Local model request or response failed."""
+
+
+MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
+MAX_GATEWAY_REQUEST_BYTES = 250_000
+MAX_GATEWAY_TOKEN_BYTES = 16_384
 
 
 class Analysis(BaseModel):
@@ -92,6 +101,43 @@ def validate_analysis(raw: dict[str, object], received_at: str) -> Analysis:
     return analysis
 
 
+class ModelRuntime(Protocol):
+    def health(self) -> tuple[bool, str]: ...
+
+    def analyze(
+        self,
+        *,
+        sender: str,
+        subject: str,
+        received_at: str,
+        body: str,
+        attachment_names: tuple[str, ...],
+        current_local_time: datetime,
+    ) -> Analysis: ...
+
+
+def _email_prompt(
+    *,
+    sender: str,
+    subject: str,
+    received_at: str,
+    body: str,
+    attachment_names: tuple[str, ...],
+    current_local_time: datetime,
+) -> str:
+    email_data = {
+        "sender": sender,
+        "subject": subject,
+        "received_at": received_at,
+        "attachment_filenames": list(attachment_names),
+        "body": body,
+    }
+    return (
+        f"Current local date and time: {current_local_time.isoformat()}\n"
+        "Analyze this untrusted email data:\n" + json.dumps(email_data, ensure_ascii=False)
+    )
+
+
 class LocalModel:
     def __init__(
         self,
@@ -134,16 +180,13 @@ class LocalModel:
         attachment_names: tuple[str, ...],
         current_local_time: datetime,
     ) -> Analysis:
-        email_data = {
-            "sender": sender,
-            "subject": subject,
-            "received_at": received_at,
-            "attachment_filenames": list(attachment_names),
-            "body": body,
-        }
-        prompt = (
-            f"Current local date and time: {current_local_time.isoformat()}\n"
-            "Analyze this untrusted email data:\n" + json.dumps(email_data, ensure_ascii=False)
+        prompt = _email_prompt(
+            sender=sender,
+            subject=subject,
+            received_at=received_at,
+            body=body,
+            attachment_names=attachment_names,
+            current_local_time=current_local_time,
         )
         try:
             response = httpx.post(
@@ -179,3 +222,174 @@ class LocalModel:
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
         return validate_analysis(_json_object(str(content)), received_at)
+
+
+class GatewayModel:
+    task_id = "email.analyze"
+    task_version = 1
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float,
+        api_token_file: Path,
+        ca_file: Path,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.api_token_file = api_token_file
+        self.ca_file = ca_file
+        self.transport = transport
+
+    def _headers(self) -> dict[str, str]:
+        try:
+            metadata = self.api_token_file.stat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not 0 < metadata.st_size <= MAX_GATEWAY_TOKEN_BYTES
+                or os.name == "posix"
+                and stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise ModelError("Inference gateway credential is invalid")
+            token = self.api_token_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise ModelError("Inference gateway credential is unavailable") from exc
+        if not token or any(
+            character.isspace() or not character.isprintable() for character in token
+        ):
+            raise ModelError("Inference gateway credential is invalid")
+        return {"Authorization": f"Bearer {token}"}
+
+    def _client(self) -> httpx.Client:
+        try:
+            if not self.ca_file.is_file():
+                raise ModelError("Inference gateway trust root is unavailable")
+            verify = ssl.create_default_context(cafile=str(self.ca_file))
+        except OSError as exc:
+            raise ModelError("Inference gateway trust root is unavailable") from exc
+        return httpx.Client(
+            verify=verify,
+            timeout=self.timeout,
+            trust_env=False,
+            follow_redirects=False,
+            transport=self.transport,
+        )
+
+    @staticmethod
+    def _bounded_json(response: httpx.Response) -> dict[str, object]:
+        content = bytearray()
+        for chunk in response.iter_bytes():
+            content.extend(chunk)
+            if len(content) > MAX_GATEWAY_RESPONSE_BYTES:
+                raise ModelError("Inference gateway response exceeded the size limit")
+        try:
+            value = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModelError("Inference gateway returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise ModelError("Inference gateway response was not an object")
+        return value
+
+    def _request(self, method: str, path: str, payload: dict[str, object] | None = None):
+        headers = self._headers()
+        content = None
+        if payload is not None:
+            content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+            if len(content) > MAX_GATEWAY_REQUEST_BYTES:
+                raise ModelError("Inference gateway request exceeded the size limit")
+            headers["Content-Type"] = "application/json"
+        try:
+            with (
+                self._client() as client,
+                client.stream(
+                    method,
+                    f"{self.base_url}{path}",
+                    headers=headers,
+                    content=content,
+                ) as response,
+            ):
+                response.raise_for_status()
+                return self._bounded_json(response)
+        except httpx.HTTPStatusError as exc:
+            raise ModelError(
+                f"Inference gateway rejected request: HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelError(f"Inference gateway request failed: {type(exc).__name__}") from exc
+
+    def health(self) -> tuple[bool, str]:
+        try:
+            payload = self._request("GET", "/v1/health")
+            if payload.get("protocol_version") != 1 or not isinstance(payload.get("tasks"), list):
+                raise ModelError("Inference gateway health response is incompatible")
+            task = next(
+                (
+                    item
+                    for item in payload["tasks"]
+                    if isinstance(item, dict)
+                    and item.get("id") == self.task_id
+                    and item.get("version") == self.task_version
+                ),
+                None,
+            )
+            if not task or task.get("status") not in {"available", "degraded", "unavailable"}:
+                return False, "unsupported_task"
+            status = str(task["status"])
+            return status in {"available", "degraded"}, status
+        except ModelError as exc:
+            return False, str(exc)
+
+    def analyze(
+        self,
+        *,
+        sender: str,
+        subject: str,
+        received_at: str,
+        body: str,
+        attachment_names: tuple[str, ...],
+        current_local_time: datetime,
+    ) -> Analysis:
+        request_id = str(uuid.uuid4())
+        payload = {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "task": {"id": self.task_id, "version": self.task_version},
+            "requirements": {
+                "input_modalities": ["text"],
+                "output_media_type": "application/json",
+                "structured_output": True,
+                "max_output_tokens": 500,
+            },
+            "generation": {
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": _email_prompt(
+                            sender=sender,
+                            subject=subject,
+                            received_at=received_at,
+                            body=body,
+                            attachment_names=attachment_names,
+                            current_local_time=current_local_time,
+                        ),
+                    },
+                ],
+                "temperature": 0.1,
+                "response_schema": Analysis.model_json_schema(),
+            },
+        }
+        response = self._request("POST", "/v1/inference", payload)
+        output = response.get("output")
+        if (
+            response.get("protocol_version") != 1
+            or response.get("request_id") != request_id
+            or response.get("status") != "completed"
+            or not isinstance(output, dict)
+            or output.get("media_type") != "application/json"
+            or not isinstance(output.get("content"), str)
+        ):
+            raise ModelError("Inference gateway response did not match the required envelope")
+        return validate_analysis(_json_object(output["content"]), received_at)

@@ -7,14 +7,14 @@ from .config import Config
 from .db import AnalyzedMessage, PendingMessage, Store
 from .gmail import GmailGateway, MessageUnavailable, StaleHistoryCursor
 from .mime import extract_body
-from .model import Analysis, LocalModel, ModelError
+from .model import Analysis, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
 
 
 class Watcher:
-    def __init__(self, config: Config, store: Store, gmail: GmailGateway, model: LocalModel):
+    def __init__(self, config: Config, store: Store, gmail: GmailGateway, model: ModelRuntime):
         self.config = config
         self.store = store
         self.gmail = gmail

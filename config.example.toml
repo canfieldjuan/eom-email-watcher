@@ -7,11 +7,18 @@ gmail_token_file = "~/.local/state/eom-email-watcher/token.json"
 gmail_send_token_file = "~/.local/state/eom-email-watcher/send-token.json"
 monthly_hours_recipient = "billing-contact@example.com"
 database_file = "~/.local/state/eom-email-watcher/watcher.sqlite3"
+model_backend = "loopback"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "your-local-model-identifier"
 model_api_token_file = "~/.local/state/eom-email-watcher/lmstudio-api-token"
 model_require_auth = true
 model_timeout_seconds = 60
+# To use an administrator-managed on-prem inference gateway instead, set:
+# model_backend = "gateway"
+# model_base_url = "https://inference.example.internal"
+# model_api_token_file = "~/.local/state/eom-email-watcher/gateway-credential"
+# model_ca_file = "~/.local/state/eom-email-watcher/gateway-ca.pem"
+# model_name is ignored in gateway mode; worker/model selection stays on the appliance.
 notifications_enabled = true
 # Optional: push notifications to your phone via ntfy (https://ntfy.sh).
 # Install the ntfy app and subscribe to this exact topic. The topic name is

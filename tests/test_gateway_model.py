@@ -1,0 +1,261 @@
+import json
+import ssl
+from datetime import UTC, datetime
+from pathlib import Path
+
+import httpx
+import pytest
+
+from eom_email_watcher import engine_api
+from eom_email_watcher import model as model_module
+from eom_email_watcher.model import GatewayModel, ModelError
+from eom_email_watcher.runtime import load_runtime
+
+
+def analysis_json() -> str:
+    return json.dumps(
+        {
+            "category": "scheduling",
+            "priority": "high",
+            "summary": "A schedule change is requested.",
+            "action_required": True,
+            "suggested_action": "Confirm the new time.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.91,
+        }
+    )
+
+
+def gateway_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handler,
+) -> tuple[GatewayModel, list[str]]:
+    token_file = tmp_path / "gateway-token"
+    token_file.write_text("app-credential\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    ca_file = tmp_path / "gateway-ca.pem"
+    ca_file.write_text("test trust root", encoding="utf-8")
+    requested_ca_files: list[str] = []
+    context = ssl.create_default_context()
+
+    def create_context(*, cafile: str):
+        requested_ca_files.append(cafile)
+        return context
+
+    monkeypatch.setattr(model_module.ssl, "create_default_context", create_context)
+    model = GatewayModel(
+        "https://inference.office.internal:8443",
+        30,
+        token_file,
+        ca_file,
+        transport=httpx.MockTransport(handler),
+    )
+    return model, requested_ca_files
+
+
+def write_gateway_config(tmp_path: Path) -> Path:
+    config_path = tmp_path / "config.toml"
+    (tmp_path / "gateway-token").write_text("app-credential\n", encoding="utf-8")
+    (tmp_path / "gateway-token").chmod(0o600)
+    (tmp_path / "gateway-ca.pem").write_text("test trust root", encoding="utf-8")
+    config_path.write_text(
+        f'''model_backend = "gateway"
+model_base_url = "https://inference.office.internal:8443"
+model_api_token_file = "{tmp_path / "gateway-token"}"
+model_ca_file = "{tmp_path / "gateway-ca.pem"}"
+database_file = "{tmp_path / "watcher.sqlite3"}"
+gmail_credentials_file = "{tmp_path / "credentials.json"}"
+gmail_token_file = "{tmp_path / "token.json"}"
+''',
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def analyze(model: GatewayModel, body: str = "Please move the appointment."):
+    return model.analyze(
+        sender="trusted@example.com",
+        subject="Schedule",
+        received_at="2026-08-29T12:00:00+00:00",
+        body=body,
+        attachment_names=(),
+        current_local_time=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+
+
+def test_engine_runtime_selects_gateway_without_exposing_secret_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_gateway_config(tmp_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(GatewayModel, "health", lambda self: (True, "available"))
+
+    response = engine_api._response(
+        {
+            "protocol": 1,
+            "operation": "health.get",
+            "config_path": str(config_path),
+            "payload": {},
+        }
+    )
+
+    assert isinstance(runtime.model, GatewayModel)
+    assert response["ok"] is True
+    assert response["data"]["local_model"] == {
+        "authentication_required": True,
+        "detail": "available",
+        "endpoint": "https://inference.office.internal:8443",
+        "model": "Managed by inference gateway",
+        "ok": True,
+        "token_configured": True,
+    }
+    encoded = json.dumps(response)
+    assert "gateway-token" not in encoded
+    assert "gateway-ca.pem" not in encoded
+
+
+def test_gateway_health_and_analysis_use_scoped_model_free_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["authorization"] == "Bearer app-credential"
+        if request.url.path == "/v1/health":
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "tasks": [{"id": "email.analyze", "version": 1, "status": "available"}],
+                },
+            )
+        payload = json.loads(request.content)
+        assert request.url.path == "/v1/inference"
+        assert payload["task"] == {"id": "email.analyze", "version": 1}
+        assert payload["requirements"]["input_modalities"] == ["text"]
+        assert "model" not in payload
+        assert "worker" not in payload
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    assert model.health() == (True, "available")
+    result = analyze(model)
+
+    assert result.priority == "high"
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert requested_ca_files == [
+        str(tmp_path / "gateway-ca.pem"),
+        str(tmp_path / "gateway-ca.pem"),
+    ]
+
+
+def test_gateway_client_disables_environment_proxy_and_redirects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path, monkeypatch, lambda request: httpx.Response(200, json={})
+    )
+
+    with model._client() as client:
+        assert client.follow_redirects is False
+        assert client._trust_env is False
+
+
+def test_gateway_health_requires_authorized_email_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "tasks": [{"id": "document.chunk.summarize", "version": 1, "status": "available"}],
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    assert model.health() == (False, "unsupported_task")
+
+
+def test_gateway_redirect_is_not_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(307, headers={"Location": "https://cloud.example/v1/health"})
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    ok, detail = model.health()
+
+    assert ok is False
+    assert "HTTP 307" in detail
+    assert calls == 1
+
+
+def test_gateway_rejects_mismatched_response_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": "different-request",
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="required envelope"):
+        analyze(model)
+
+
+def test_gateway_request_and_response_size_limits_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"{" + b"x" * 1_000_001)
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(ModelError, match="request exceeded"):
+        analyze(model, "x" * 300_000)
+
+    with pytest.raises(ModelError, match="response exceeded"):
+        analyze(model, "short")
+
+
+def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
+    token_file = tmp_path / "gateway-token"
+    ca_file = tmp_path / "gateway-ca.pem"
+    model = GatewayModel("https://inference.office.internal", 30, token_file, ca_file)
+
+    with pytest.raises(ModelError, match="credential is unavailable"):
+        analyze(model, "short")
+
+    token_file.write_text("app-credential", encoding="utf-8")
+    token_file.chmod(0o644)
+    with pytest.raises(ModelError, match="credential is invalid"):
+        analyze(model, "short")
+
+    token_file.chmod(0o600)
+    ok, detail = model.health()
+    assert ok is False
+    assert detail == "Inference gateway trust root is unavailable"
