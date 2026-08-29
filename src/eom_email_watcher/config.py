@@ -149,10 +149,10 @@ def validate_model_base_url(value: object) -> str:
 
 
 def _integer_setting(data: dict[str, object], key: str, default: int) -> int:
-    try:
-        return int(data.get(key, default))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ConfigError(f"{key} must be an integer") from exc
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{key} must be an integer")
+    return value
 
 
 def _float_setting(data: dict[str, object], key: str, default: float) -> float:

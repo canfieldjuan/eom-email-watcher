@@ -52,8 +52,9 @@ interface HealthStatus {
   production_check_supported: boolean;
   watchlist_count: number;
   polling: {
+    enabled: boolean;
     interval_minutes: number;
-    next_check_unix_ms: number;
+    next_check_unix_ms: number | null;
   };
 }
 
@@ -386,8 +387,15 @@ function renderHealth(health: HealthStatus): void {
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
   watchlistCount.textContent = String(health.watchlist_count);
-  pollingCadence.textContent = intervalLabel(health.polling.interval_minutes);
-  nextCheck.textContent = receivedLabel(new Date(health.polling.next_check_unix_ms).toISOString());
+  if (health.polling.enabled && health.polling.next_check_unix_ms !== null) {
+    pollingCadence.textContent = intervalLabel(health.polling.interval_minutes);
+    nextCheck.textContent = receivedLabel(
+      new Date(health.polling.next_check_unix_ms).toISOString(),
+    );
+  } else {
+    pollingCadence.textContent = "Disabled for current configuration";
+    nextCheck.textContent = "Not scheduled";
+  }
   const watcherPrerequisitesReady =
     health.watchlist_count === 0 || (gmailReady && databaseReady);
   checkSupported =

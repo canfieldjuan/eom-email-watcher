@@ -3,9 +3,12 @@ use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const PROTOCOL_VERSION: u8 = 1;
 
@@ -13,11 +16,27 @@ fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
 }
 
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(group_id) = i32::try_from(child.id()) {
+        // The child starts a dedicated process group, so this also terminates
+        // uv-launched Python descendants that would otherwise retain locks.
+        // SAFETY: the negative id targets only the process group created for
+        // this child; it is not derived from frontend or engine input.
+        unsafe {
+            libc::kill(-group_id, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[derive(Clone)]
 pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
+    request_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -114,6 +133,7 @@ pub struct NotificationIntent {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
     pub poll_interval_minutes: u64,
+    pub polling_supported: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -194,6 +214,7 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
+                request_timeout: None,
             });
         }
 
@@ -210,6 +231,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
+            request_timeout: None,
         })
     }
 
@@ -223,6 +245,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
+            request_timeout: None,
         }
     }
 
@@ -242,6 +265,12 @@ impl Engine {
 
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
         self.request_with_timeout("settings.get", json!({}), timeout)
+    }
+
+    pub fn with_request_timeout(&self, timeout: Duration) -> Self {
+        let mut engine = self.clone();
+        engine.request_timeout = Some(timeout);
+        engine
     }
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
@@ -292,7 +321,7 @@ impl Engine {
         operation: &str,
         payload: Value,
     ) -> Result<T, EngineError> {
-        self.request_inner(operation, payload, None)
+        self.request_inner(operation, payload, self.request_timeout)
     }
 
     fn request_with_timeout<T: DeserializeOwned>(
@@ -323,18 +352,20 @@ impl Engine {
             )
         })?;
 
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| {
-                EngineError::host(
-                    "engine_unavailable",
-                    "Watcher engine is unavailable; verify uv and the project environment",
-                )
-            })?;
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|_| {
+            EngineError::host(
+                "engine_unavailable",
+                "Watcher engine is unavailable; verify uv and the project environment",
+            )
+        })?;
 
         let write_result = child
             .stdin
@@ -349,8 +380,7 @@ impl Engine {
                 })
             });
         if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
             return Err(error);
         }
 
@@ -363,16 +393,14 @@ impl Engine {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_child(&mut child);
                         return Err(EngineError::host(
                             "engine_timeout",
-                            "Watcher engine did not respond before the startup timeout",
+                            "Watcher engine did not respond before its timeout",
                         ));
                     }
                     Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_child(&mut child);
                         return Err(EngineError::host(
                             "engine_unavailable",
                             "Watcher engine status could not be inspected",
@@ -481,6 +509,44 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_engine_terminates_a_stalled_scheduled_operation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("sleep 30 & echo $! > \"$1\"; wait"),
+                OsString::from("engine-timeout-probe"),
+                descendant_pid_file.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_millis(500));
+
+        assert_eq!(
+            engine
+                .check()
+                .expect_err("stalled check must time out")
+                .code,
+            "engine_timeout"
+        );
+        let descendant_pid: i32 = fs::read_to_string(descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        for _ in 0..100 {
+            if unsafe { libc::kill(descendant_pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out engine descendant {descendant_pid} is still running");
+    }
+
     fn real_engine(config_path: PathBuf) -> Engine {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -542,7 +608,8 @@ notifications_enabled = true
                 .settings_with_timeout(Duration::from_secs(5))
                 .expect("read engine settings"),
             EngineSettings {
-                poll_interval_minutes: 120
+                poll_interval_minutes: 120,
+                polling_supported: true,
             }
         );
 

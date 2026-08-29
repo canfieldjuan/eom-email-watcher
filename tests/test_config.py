@@ -258,6 +258,8 @@ def test_removing_final_sender_leaves_valid_empty_watchlist(tmp_path: Path) -> N
         ("body_char_limit", "{ value = 1000 }", "body_char_limit"),
         ("model_timeout_seconds", '"soon"', "model_timeout_seconds"),
         ("poll_interval_minutes", '"often"', "poll_interval_minutes"),
+        ("poll_interval_minutes", "true", "poll_interval_minutes"),
+        ("poll_interval_minutes", "1.9", "poll_interval_minutes"),
     ],
 )
 def test_malformed_numeric_settings_raise_config_error(

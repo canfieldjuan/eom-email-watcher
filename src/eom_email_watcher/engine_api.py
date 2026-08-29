@@ -231,6 +231,9 @@ def _settings(request: dict[str, object]) -> dict[str, object]:
         },
         "notifications_enabled": config.notifications_enabled,
         "poll_interval_minutes": config.poll_interval_minutes,
+        "polling_supported": (
+            config.ntfy_topic is None and operation_lock_supported()
+        ),
         "retention_days": config.retention_days,
         "timezone": config.timezone,
     }

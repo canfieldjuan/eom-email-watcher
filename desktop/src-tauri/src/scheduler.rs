@@ -11,6 +11,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 pub const SCHEDULED_CHECK_EVENT: &str = "watcher://scheduled-check";
+const MAX_SLEEP_SLICE: Duration = Duration::from_secs(30);
+const SCHEDULED_ENGINE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,12 +50,14 @@ impl ScheduledCheckEvent {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct PollingStatus {
+    pub enabled: bool,
     pub interval_minutes: u64,
-    pub next_check_unix_ms: u64,
+    pub next_check_unix_ms: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct PollScheduler {
+    enabled: bool,
     interval_minutes: u64,
     next_check_unix_ms: Arc<AtomicU64>,
 }
@@ -67,21 +71,48 @@ fn next_check_unix_ms(now: SystemTime, interval_minutes: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn sleep_slice(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
+    let remaining_ms = deadline_unix_ms.saturating_sub(now_unix_ms);
+    if remaining_ms == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(remaining_ms).min(MAX_SLEEP_SLICE))
+}
+
+fn wait_until(deadline_unix_ms: u64) {
+    loop {
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let Some(duration) = sleep_slice(deadline_unix_ms, now_unix_ms) else {
+            return;
+        };
+        thread::sleep(duration);
+    }
+}
+
 impl PollScheduler {
-    pub fn new(interval_minutes: u64) -> Self {
+    pub fn new(interval_minutes: u64, enabled: bool) -> Self {
         Self {
+            enabled,
             interval_minutes,
-            next_check_unix_ms: Arc::new(AtomicU64::new(next_check_unix_ms(
-                SystemTime::now(),
-                interval_minutes,
-            ))),
+            next_check_unix_ms: Arc::new(AtomicU64::new(if enabled {
+                next_check_unix_ms(SystemTime::now(), interval_minutes)
+            } else {
+                0
+            })),
         }
     }
 
     pub fn status(&self) -> PollingStatus {
+        let next_check_unix_ms = self.next_check_unix_ms.load(Ordering::Relaxed);
         PollingStatus {
+            enabled: self.enabled,
             interval_minutes: self.interval_minutes,
-            next_check_unix_ms: self.next_check_unix_ms.load(Ordering::Relaxed),
+            next_check_unix_ms: (next_check_unix_ms != 0).then_some(next_check_unix_ms),
         }
     }
 
@@ -91,12 +122,15 @@ impl PollScheduler {
         engine: Engine,
         delivery: NotificationDelivery,
     ) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         let scheduler = self.clone();
-        let interval = Duration::from_secs(self.interval_minutes.saturating_mul(60));
+        let engine = engine.with_request_timeout(SCHEDULED_ENGINE_TIMEOUT);
         thread::Builder::new()
             .name("email-watcher-poll".into())
             .spawn(move || loop {
-                thread::sleep(interval);
+                wait_until(scheduler.next_check_unix_ms.load(Ordering::Relaxed));
                 let event = match delivery.check_and_deliver(&app, &engine) {
                     Ok(outcome) => {
                         if outcome.delivery.failed > 0 {
@@ -139,10 +173,26 @@ mod tests {
 
     #[test]
     fn status_reports_interval_and_deadline() {
-        let scheduler = PollScheduler::new(120);
+        let scheduler = PollScheduler::new(120, true);
         let status = scheduler.status();
+        assert!(status.enabled);
         assert_eq!(status.interval_minutes, 120);
-        assert!(status.next_check_unix_ms > 0);
+        assert!(status.next_check_unix_ms.is_some());
+    }
+
+    #[test]
+    fn unsupported_polling_has_no_deadline() {
+        let status = PollScheduler::new(120, false).status();
+        assert!(!status.enabled);
+        assert_eq!(status.next_check_unix_ms, None);
+    }
+
+    #[test]
+    fn wall_clock_sleep_rechecks_resume_and_deadline_boundaries() {
+        assert_eq!(sleep_slice(120_000, 0), Some(MAX_SLEEP_SLICE));
+        assert_eq!(sleep_slice(120_000, 110_000), Some(Duration::from_secs(10)));
+        assert_eq!(sleep_slice(120_000, 120_000), None);
+        assert_eq!(sleep_slice(120_000, 130_000), None);
     }
 
     #[test]

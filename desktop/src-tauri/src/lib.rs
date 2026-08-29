@@ -124,18 +124,26 @@ pub fn run() {
         .setup(|app| {
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
-            let poll_interval_minutes = match engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)
-            {
-                Ok(settings) => settings.poll_interval_minutes,
-                Err(error) => {
-                    eprintln!(
-                        "watcher polling settings unavailable ({}): {}; using {} minutes",
-                        error.code, error.message, DEFAULT_POLL_INTERVAL_MINUTES
-                    );
-                    DEFAULT_POLL_INTERVAL_MINUTES
-                }
-            };
-            let scheduler = PollScheduler::new(poll_interval_minutes);
+            let (poll_interval_minutes, polling_supported) =
+                match engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT) {
+                    Ok(settings) => (
+                        settings.poll_interval_minutes,
+                        settings.polling_supported,
+                    ),
+                    Err(error) => {
+                        eprintln!(
+                            "watcher polling settings unavailable ({}): {}; polling disabled with {}-minute default",
+                            error.code, error.message, DEFAULT_POLL_INTERVAL_MINUTES
+                        );
+                        (DEFAULT_POLL_INTERVAL_MINUTES, false)
+                    }
+                };
+            if !polling_supported {
+                eprintln!(
+                    "watcher automatic polling is disabled for the current host configuration"
+                );
+            }
+            let scheduler = PollScheduler::new(poll_interval_minutes, polling_supported);
             app.manage(engine.clone());
             app.manage(delivery.clone());
             app.manage(scheduler.clone());
