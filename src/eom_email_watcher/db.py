@@ -243,6 +243,24 @@ class Store:
                 ],
             )
 
+    def attachment(self, message_id: str, part_id: str) -> AttachmentDescriptor:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT part_id, attachment_id, filename, media_type, byte_size, position
+                FROM message_attachments WHERE message_id = ? AND part_id = ?""",
+                (message_id, part_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError((message_id, part_id))
+        return AttachmentDescriptor(
+            part_id=str(row["part_id"]),
+            attachment_id=row["attachment_id"],
+            filename=str(row["filename"]),
+            media_type=str(row["media_type"]),
+            byte_size=int(row["byte_size"]),
+            position=int(row["position"]),
+        )
+
     def pending(self, now: datetime | None = None, limit: int = 25) -> list[PendingMessage]:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:

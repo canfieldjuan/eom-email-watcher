@@ -10,8 +10,10 @@ default) and publishes the next scheduled check in Health. Polling remains disab
 locking or host-owned notification delivery is unsupported by the current configuration.
 
 Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
-ledger. This slice inventories metadata only: attachment bytes are not downloaded, persisted, or
-sent to another application, and there is not yet an Open or Summarize action.
+ledger. Open fetches only the selected attachment through the read-only Gmail engine, writes it to a
+mode-0600 file in a process-owned temporary directory, and asks the operating system to open it with
+the default application. The host attempts to remove the temporary directory on an orderly app exit.
+Its path is not returned to frontend JavaScript. There is not yet a Summarize or Connect action.
 
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be

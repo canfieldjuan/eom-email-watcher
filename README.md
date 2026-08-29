@@ -6,8 +6,8 @@ a short structured summary, and sends a Linux desktop notification (and, optiona
 push via [ntfy](https://ntfy.sh)).
 
 Email content is never sent to a cloud model. The Gmail grant is read-only, attachment content is
-never downloaded, non-matching message metadata is not stored, and message bodies are discarded
-after each local inference request.
+downloaded only when the user opens that attachment, non-matching message metadata is not stored,
+and message bodies are discarded after each local inference request.
 
 ## Behavior
 
@@ -16,8 +16,8 @@ after each local inference request.
 - Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
 - Fetches message bodies only after a sender matches.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
-- Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. Attachment
-  bytes are not fetched.
+- Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. An explicit
+  Open action fetches only that attachment into a mode-0600 process-owned temporary file.
 - Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
   are never stored.
 - Deduplicates by Gmail message ID.
