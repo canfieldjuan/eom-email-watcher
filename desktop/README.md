@@ -31,12 +31,12 @@ The host acknowledges an intent only after the platform notification API accepts
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
 window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-tray/autostart behavior or Google OAuth client provisioning. When an OAuth desktop-client
-credentials file is already configured, Health can run the read-only Gmail browser authorization
-flow and initialize the current-mailbox baseline. The existing systemd watcher remains the
-production polling path while equivalent live behavior is evaluated; the production check lock
-continues to fail closed if both schedulers overlap. Scheduled engine processes have a 30-minute
-upper bound, and wall-clock deadline checks catch up after system resume.
+tray/autostart behavior or public Google OAuth verification. When an OAuth desktop-client identity
+is configured externally or injected into the release build, Health can run the read-only Gmail
+browser authorization flow and initialize the current-mailbox baseline. The existing systemd
+watcher remains the production polling path while equivalent live behavior is evaluated; the
+production check lock continues to fail closed if both schedulers overlap. Scheduled engine
+processes have a 30-minute upper bound, and wall-clock deadline checks catch up after system resume.
 
 ## Development prerequisites
 
@@ -44,7 +44,7 @@ upper bound, and wall-clock deadline checks catch up after system resume.
 - Node.js 26 and pnpm 11
 - current stable Rust with Cargo
 - Tauri's Linux WebKitGTK prerequisites
-- an existing watcher config at `~/.config/eom-email-watcher/config.toml`
+- a compatible local OpenAI-style model endpoint
 
 Install frontend dependencies and run the app:
 
@@ -76,6 +76,22 @@ pnpm tauri build --bundles deb
 The package contains both `eom-email-watcher-desktop` and `eom-mail-engine`. The bundled engine is a
 PyInstaller one-file executable built by `scripts/build-desktop-sidecar.sh`; installed runtime does
 not require the source checkout, Python, or `uv`.
+
+An approved Google Desktop OAuth client can be injected into the sidecar at release build time
+without committing it:
+
+```bash
+EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE=/secure/path/desktop-client.json \
+  pnpm tauri build --bundles deb
+```
+
+The build accepts only a downloaded Desktop-client JSON shape and rejects files containing access
+or refresh-token fields. A configured operator credential file remains authoritative; otherwise
+the packaged client identity is used. Account tokens are still created and stored only in the
+user's private local state. Atlas token-store files are not valid build inputs because they contain
+account grants rather than only the reusable Desktop client identity. A build without this variable
+remains suitable for development but requires the existing external credentials file before Gmail
+can connect.
 
 ## Verification
 
