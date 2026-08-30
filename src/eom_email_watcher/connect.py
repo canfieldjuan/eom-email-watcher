@@ -356,7 +356,7 @@ class DiscoveredCapability:
     confirmation_required: bool
 
     def accepts_artifact(self, media_type: str, byte_size: int) -> bool:
-        if byte_size <= 0 or byte_size > MAX_INPUT_BYTES:
+        if byte_size < 0 or byte_size > MAX_INPUT_BYTES:
             return False
         normalized_media_type = media_type.casefold()
         return any(

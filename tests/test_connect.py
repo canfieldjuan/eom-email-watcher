@@ -355,7 +355,10 @@ def test_generic_discovery_returns_every_capability_without_provider_secrets(
     ] == ["text.translate"]
     assert catalog.compatible("text/plain", connect.MAX_INPUT_BYTES + 1) == ()
     assert catalog.compatible("application/pdf", 1025) == ()
-    assert catalog.compatible("application/pdf", 0) == ()
+    assert [item.capability_id for item in catalog.compatible("application/pdf", 0)] == [
+        "document.summarize"
+    ]
+    assert catalog.compatible("application/pdf", -1) == ()
     public = catalog.public_result()
     assert public["diagnostic"] is None
     assert public["items"][1]["provider"] == {  # type: ignore[index]
