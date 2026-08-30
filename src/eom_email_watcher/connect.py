@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import os
 import stat
 import time
@@ -285,7 +286,7 @@ class _ErrorEnvelope(_WireModel):
 class _InputArtifactV2(_WireModel):
     artifact_id: UuidV4
     media_type: MediaType
-    byte_size: Annotated[StrictInt, Field(ge=1, le=1024 * 1024 * 1024)]
+    byte_size: Annotated[StrictInt, Field(ge=0, le=1024 * 1024 * 1024)]
     sha256: Sha256
     display_name: Annotated[StrictStr, Field(min_length=1, max_length=255)]
     source_app_id: Identifier
@@ -302,7 +303,7 @@ class _JobRequestV2(_WireModel):
 class _ArtifactProvenanceV2(_WireModel):
     artifact_id: UuidV4
     media_type: MediaType
-    byte_size: Annotated[StrictInt, Field(ge=1, le=1024 * 1024 * 1024)]
+    byte_size: Annotated[StrictInt, Field(ge=0, le=1024 * 1024 * 1024)]
     sha256: Sha256
 
 
@@ -442,7 +443,7 @@ class DiscoveredCapability:
     confirmation_required: bool
 
     def accepts_artifact(self, media_type: str, byte_size: int) -> bool:
-        if byte_size <= 0 or byte_size > MAX_INPUT_BYTES:
+        if byte_size < 0 or byte_size > MAX_INPUT_BYTES:
             return False
         normalized_media_type = media_type.casefold()
         return any(
@@ -1043,21 +1044,28 @@ def _validated_parameters(
     for name in sorted(supplied):
         value = supplied[name]
         value_type = declarations[name].value_type
+        integral_number = (
+            type(value) is int
+            and -9_007_199_254_740_991 <= value <= 9_007_199_254_740_991
+        ) or (
+            type(value) is float
+            and math.isfinite(value)
+            and value.is_integer()
+            and -9_007_199_254_740_991 <= value <= 9_007_199_254_740_991
+        )
         valid = (
             value_type == "string"
             and isinstance(value, str)
             and len(value) <= 1000
-        ) or (
-            value_type == "integer"
-            and type(value) is int
-            and -9_007_199_254_740_991 <= value <= 9_007_199_254_740_991
-        ) or (value_type == "boolean" and type(value) is bool)
+        ) or (value_type == "integer" and integral_number) or (
+            value_type == "boolean" and type(value) is bool
+        )
         if not valid:
             raise ConnectError(
                 "PARAMETERS_INVALID",
                 f"Capability parameter has the wrong type or size: {name}",
             )
-        validated[name] = value  # type: ignore[assignment]
+        validated[name] = int(value) if value_type == "integer" else value  # type: ignore[arg-type, assignment]
     return validated
 
 
@@ -1169,7 +1177,7 @@ def prepare_capability_job(
             "CONFIRMATION_REQUIRED",
             "This capability requires explicit confirmation before invocation.",
         )
-    if not content or len(content) > MAX_INPUT_BYTES:
+    if len(content) > MAX_INPUT_BYTES:
         raise ConnectError(
             "INPUT_ARTIFACT_INVALID",
             "The attachment size is unsupported.",

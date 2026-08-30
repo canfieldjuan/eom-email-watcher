@@ -357,7 +357,10 @@ def test_generic_discovery_returns_every_capability_without_provider_secrets(
     ] == ["text.translate"]
     assert catalog.compatible("text/plain", connect.MAX_INPUT_BYTES + 1) == ()
     assert catalog.compatible("application/pdf", 1025) == ()
-    assert catalog.compatible("application/pdf", 0) == ()
+    assert [item.capability_id for item in catalog.compatible("application/pdf", 0)] == [
+        "document.summarize"
+    ]
+    assert catalog.compatible("application/pdf", -1) == ()
     public = catalog.public_result()
     assert public["diagnostic"] is None
     assert public["items"][1]["provider"] == {  # type: ignore[index]
@@ -906,6 +909,39 @@ def test_v2_job_preparation_enforces_declaration_confirmation_and_stable_restore
     )
     assert restored.request_json == job.request_json
     assert restored.provider_instance_id == INSTANCE_A
+
+
+def test_v2_job_preparation_accepts_empty_artifacts_and_integral_numbers() -> None:
+    parameter = connect.CapabilityParameter(
+        name="page-limit",
+        value_type="integer",
+        required=True,
+        label="Page limit",
+        description="Maximum pages to process.",
+    )
+    capability = discovered_v2_capability(parameters=(parameter,))
+
+    job = connect.prepare_capability_job(
+        capability,
+        b"",
+        "application/pdf",
+        "empty.pdf",
+        parameters={"page-limit": 1.0},
+    )
+
+    request = json.loads(job.request_json)
+    assert request["inputs"][0]["byte_size"] == 0
+    assert request["inputs"][0]["sha256"] == hashlib.sha256(b"").hexdigest()
+    assert request["parameters"] == {"page-limit": 1}
+    with pytest.raises(connect.ConnectError) as fractional:
+        connect.prepare_capability_job(
+            capability,
+            b"",
+            "application/pdf",
+            "empty.pdf",
+            parameters={"page-limit": 1.5},
+        )
+    assert fractional.value.code == "PARAMETERS_INVALID"
 
 
 def test_v2_client_submits_and_polls_generic_outputs() -> None:
