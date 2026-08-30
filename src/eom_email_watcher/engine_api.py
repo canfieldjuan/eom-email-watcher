@@ -356,8 +356,12 @@ def _selection_object(
 
 
 def _selected_generic_capability(
-    payload: dict[str, object], media_type: str, byte_size: int
-) -> tuple[connect.DiscoveredCapability, dict[str, object], bool]:
+    payload: dict[str, object],
+) -> tuple[
+    connect.DiscoveredCapability,
+    dict[str, str | int | bool],
+    bool,
+]:
     provider = _selection_object(
         payload,
         "provider",
@@ -397,17 +401,7 @@ def _selected_generic_capability(
             "The selected local capability is unavailable.",
         )
     selected = matches[0]
-    if not selected.accepts_artifact(media_type, byte_size):
-        raise ApiError(
-            "unsupported_attachment",
-            "The attachment is not accepted by the selected capability.",
-        )
-    if (selected.external_effects or selected.confirmation_required) and not confirmed:
-        raise ApiError(
-            "confirmation_required",
-            "The selected capability requires explicit confirmation.",
-        )
-    return selected, parameters, confirmed
+    return selected, connect.validate_capability_parameters(selected, parameters), confirmed
 
 
 def _connect_result(job: ConnectJob) -> dict[str, object]:
@@ -485,6 +479,8 @@ def _tracked_generic_job(
 ) -> connect.PreparedCapabilityJob:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
+        or job.capability_id != capability.capability_id
+        or job.capability_version != capability.capability_version
         or job.provider_app_id != capability.app_id
         or job.provider_app_version != capability.app_version
         or job.provider_instance_id != capability.instance_id
@@ -497,38 +493,49 @@ def _tracked_generic_job(
 def _apply_connect_update(
     store: Store, update: connect.JobUpdate | connect.CapabilityJobUpdate
 ) -> ConnectJob:
-    current = store.connect_job(update.job_id)
-    if current is None:
-        raise RuntimeError("Connect job disappeared before its status could persist")
-    if current.status == update.status:
-        return current
     allowed = {
         "requested": {"accepted", "processing", "completed", "failed"},
         "accepted": {"processing", "completed", "failed"},
         "processing": {"completed", "failed"},
     }
-    if update.status not in allowed.get(current.status, set()):
-        raise connect.ConnectError(
-            "JOB_STATE_INVALID",
-            "The local capability provider returned an invalid job transition.",
-        )
-    return store.transition_connect_job(
-        job_id=update.job_id,
-        expected_state=current.status,
-        next_state=update.status,
-        provider_app_id=update.provider_app_id,
-        provider_instance_id=update.provider_instance_id,
-        result=update.result.store_dict() if update.result else None,
-        error=(
-            {
-                "code": update.error.code,
-                "message": str(update.error),
-                "retryable": update.error.retryable,
-            }
-            if update.error
-            else None
-        ),
-    )
+    active_rank = {"requested": 0, "accepted": 1, "processing": 2}
+    for _attempt in range(4):
+        current = store.connect_job(update.job_id)
+        if current is None:
+            raise RuntimeError("Connect job disappeared before its status could persist")
+        if current.status == update.status:
+            return current
+        if update.status in active_rank and (
+            current.status in {"completed", "failed"}
+            or active_rank.get(current.status, -1) > active_rank[update.status]
+        ):
+            return current
+        if update.status not in allowed.get(current.status, set()):
+            raise connect.ConnectError(
+                "JOB_STATE_INVALID",
+                "The local capability provider returned an invalid job transition.",
+            )
+        try:
+            return store.transition_connect_job(
+                job_id=update.job_id,
+                expected_state=current.status,
+                next_state=update.status,
+                provider_app_id=update.provider_app_id,
+                provider_instance_id=update.provider_instance_id,
+                result=update.result.store_dict() if update.result else None,
+                error=(
+                    {
+                        "code": update.error.code,
+                        "message": str(update.error),
+                        "retryable": update.error.retryable,
+                    }
+                    if update.error
+                    else None
+                ),
+            )
+        except RuntimeError:
+            continue
+    raise RuntimeError("Connect job status could not be persisted after concurrent updates")
 
 
 def _mark_connect_failed(
@@ -537,21 +544,27 @@ def _mark_connect_failed(
     provider: connect.ProviderCapability | connect.DiscoveredCapability,
     error: connect.ConnectError,
 ) -> None:
-    current = store.connect_job(job_id)
-    if current is None or current.status not in {"requested", "accepted", "processing"}:
-        return
-    store.transition_connect_job(
-        job_id=job_id,
-        expected_state=current.status,
-        next_state="failed",
-        provider_app_id=provider.app_id,
-        provider_instance_id=provider.instance_id,
-        error={
-            "code": error.code,
-            "message": str(error),
-            "retryable": error.retryable,
-        },
-    )
+    for _attempt in range(4):
+        current = store.connect_job(job_id)
+        if current is None or current.status not in {"requested", "accepted", "processing"}:
+            return
+        try:
+            store.transition_connect_job(
+                job_id=job_id,
+                expected_state=current.status,
+                next_state="failed",
+                provider_app_id=provider.app_id,
+                provider_instance_id=provider.instance_id,
+                error={
+                    "code": error.code,
+                    "message": str(error),
+                    "retryable": error.retryable,
+                },
+            )
+            return
+        except RuntimeError:
+            continue
+    raise RuntimeError("Connect failure could not be persisted after concurrent updates")
 
 
 def _run_connect_job(
@@ -669,7 +682,7 @@ def _resume_generic_connect_job(
     runtime: Runtime,
     capability: connect.DiscoveredCapability,
     active: ConnectJob,
-    content: bytes,
+    content: Callable[[], bytes],
 ) -> dict[str, object]:
     tracked = _tracked_generic_job(active, capability)
     reconciled = _query_generic_connect_job(runtime, capability, tracked)
@@ -683,6 +696,13 @@ def _resume_generic_connect_job(
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
     tracked = _tracked_generic_job(refreshed, capability)
+    if not capability.accepts_artifact(
+        tracked.artifact.media_type, tracked.artifact.byte_size
+    ):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment is no longer accepted by the selected capability.",
+        )
     try:
         runtime.store.reset_connect_job_for_resubmission(
             job_id=tracked.job_id,
@@ -700,7 +720,35 @@ def _resume_generic_connect_job(
             "connect_job_in_progress",
             "The local capability job changed while it was being reconciled.",
         ) from exc
-    return _run_generic_connect_job(runtime, capability, tracked, content)
+    return _run_generic_connect_job(runtime, capability, tracked, content())
+
+
+def _tracked_invocation_job(
+    job: ConnectJob,
+    capability: connect.DiscoveredCapability,
+    *,
+    message_id: str,
+    part_id: str,
+    parameters: dict[str, str | int | bool],
+) -> connect.PreparedCapabilityJob:
+    if job.message_id != message_id or job.part_id != part_id:
+        raise ApiError(
+            "request_id_conflict",
+            "The capability request identity belongs to another attachment.",
+        )
+    try:
+        tracked = _tracked_generic_job(job, capability)
+    except (RuntimeError, connect.ConnectError) as exc:
+        raise ApiError(
+            "request_id_conflict",
+            "The capability request identity belongs to another invocation.",
+        ) from exc
+    if dict(tracked.parameters) != parameters:
+        raise ApiError(
+            "request_id_conflict",
+            "The capability request identity belongs to different parameters.",
+        )
+    return tracked
 
 
 def _generic_job_lookup(
@@ -725,25 +773,73 @@ def _generic_job_lookup(
 def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(
         request,
-        {"message_id", "part_id", "provider", "capability", "parameters", "confirmed"},
+        {
+            "request_id",
+            "message_id",
+            "part_id",
+            "provider",
+            "capability",
+            "parameters",
+            "confirmed",
+        },
     )
+    request_id = connect.validate_job_id(payload.get("request_id"))
     message_id, part_id = _connect_attachment_ids(payload)
     runtime = _runtime(request)
     try:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    capability, parameters, confirmed = _selected_generic_capability(
-        payload,
-        attachment.media_type,
-        attachment.byte_size,
-    )
-    gmail = GmailGateway.from_token(
-        runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
-    )
-    content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
-    if len(content) != attachment.byte_size:
-        raise GmailError("Gmail attachment size did not match stored metadata")
+    capability, parameters, confirmed = _selected_generic_capability(payload)
+    cached_content: bytes | None = None
+
+    def attachment_content() -> bytes:
+        nonlocal cached_content
+        if cached_content is None:
+            gmail = GmailGateway.from_token(
+                runtime.config.gmail_credentials_file,
+                runtime.config.gmail_token_file,
+            )
+            cached_content = gmail.attachment_bytes(
+                message_id,
+                part_id,
+                attachment.attachment_id,
+            )
+            if len(cached_content) != attachment.byte_size:
+                raise GmailError("Gmail attachment size did not match stored metadata")
+        return cached_content
+
+    existing = runtime.store.connect_job(request_id)
+    if existing is not None:
+        _tracked_invocation_job(
+            existing,
+            capability,
+            message_id=message_id,
+            part_id=part_id,
+            parameters=parameters,
+        )
+        if existing.status == "completed":
+            return _generic_connect_result(existing)
+        if existing.status == "failed":
+            raise _stored_connect_failure(existing)
+        return _resume_generic_connect_job(
+            runtime,
+            capability,
+            existing,
+            attachment_content,
+        )
+
+    if not capability.accepts_artifact(attachment.media_type, attachment.byte_size):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment is not accepted by the selected capability.",
+        )
+    if (capability.external_effects or capability.confirmation_required) and not confirmed:
+        raise ApiError(
+            "confirmation_required",
+            "The selected capability requires explicit confirmation.",
+        )
+    content = attachment_content()
     candidate = connect.prepare_capability_job(
         capability,
         content,
@@ -751,14 +847,17 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         attachment.filename,
         parameters=parameters,
         confirmed=confirmed,
+        job_id=request_id,
     )
     lookup = _generic_job_lookup(message_id, part_id, capability, candidate)
-    completed = runtime.store.completed_connect_job(**lookup)
-    if completed is not None:
-        return _generic_connect_result(completed)
     active = runtime.store.active_connect_job(**lookup)
     if active is not None:
-        return _resume_generic_connect_job(runtime, capability, active, content)
+        return _resume_generic_connect_job(
+            runtime,
+            capability,
+            active,
+            attachment_content,
+        )
 
     try:
         runtime.store.create_connect_job(
@@ -779,13 +878,34 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             source_app_id=connect.SOURCE_APP_ID,
             request_json=candidate.request_json,
         )
-    except sqlite3.IntegrityError:
-        completed = runtime.store.completed_connect_job(**lookup)
-        if completed is not None:
-            return _generic_connect_result(completed)
+    except sqlite3.IntegrityError as exc:
+        exact = runtime.store.connect_job(request_id)
+        if exact is not None:
+            _tracked_invocation_job(
+                exact,
+                capability,
+                message_id=message_id,
+                part_id=part_id,
+                parameters=parameters,
+            )
+            if exact.status == "completed":
+                return _generic_connect_result(exact)
+            if exact.status == "failed":
+                raise _stored_connect_failure(exact) from exc
+            return _resume_generic_connect_job(
+                runtime,
+                capability,
+                exact,
+                attachment_content,
+            )
         active = runtime.store.active_connect_job(**lookup)
         if active is not None:
-            return _resume_generic_connect_job(runtime, capability, active, content)
+            return _resume_generic_connect_job(
+                runtime,
+                capability,
+                active,
+                attachment_content,
+            )
         raise
     return _run_generic_connect_job(runtime, capability, candidate, content)
 

@@ -12,6 +12,8 @@ INSTANCE_B = "22222222-2222-4222-8222-222222222222"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
 RACE_JOB_ID = "44444444-4444-4444-8444-444444444444"
 RACE_ARTIFACT_ID = "55555555-5555-4555-8555-555555555555"
+REQUEST_ID = "66666666-6666-4666-8666-666666666666"
+SECOND_REQUEST_ID = "77777777-7777-4777-8777-777777777777"
 TOKEN = "A" * 43
 PDF = b"%PDF-1.4\nreal attachment\nEOF"
 
@@ -109,8 +111,10 @@ def invocation_payload(
     *,
     parameters: dict[str, object] | None = None,
     confirmed: bool = False,
+    request_id: str = REQUEST_ID,
 ) -> dict[str, object]:
     return {
+        "request_id": request_id,
         "message_id": "message-1",
         "part_id": "2",
         "provider": {
@@ -216,6 +220,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         confirmation_required=True,
     )
     discovered_instances: list[str | None] = []
+    gmail_reads = 0
 
     def discover(**kwargs):
         discovered_instances.append(kwargs.get("provider_instance_id"))
@@ -236,6 +241,13 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     malformed = engine_api._response(
         api_request(config_path, "connect.attachment.invoke", missing_provider)
     )
+    missing_request_id = invocation_payload(
+        selected, parameters={"target-language": "es"}
+    )
+    missing_request_id.pop("request_id")
+    unidentified = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", missing_request_id)
+    )
     unconfirmed = engine_api._response(
         api_request(
             config_path,
@@ -245,12 +257,15 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     )
 
     assert malformed["error"]["code"] == "invalid_request"
+    assert unidentified["error"]["code"] == "job_request_invalid"
     assert unconfirmed["error"]["code"] == "confirmation_required"
 
     submitted: list[connect.PreparedCapabilityJob] = []
 
     class FakeGmail:
         def attachment_bytes(self, *args) -> bytes:
+            nonlocal gmail_reads
+            gmail_reads += 1
             return PDF
 
     class CompletingClient:
@@ -273,7 +288,29 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
-    response = engine_api._response(
+    request = api_request(
+        config_path,
+        "connect.attachment.invoke",
+        invocation_payload(
+            selected,
+            parameters={"target-language": "es"},
+            confirmed=True,
+        ),
+    )
+    response = engine_api._response(request)
+    repeated = engine_api._response(request)
+    conflict = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(
+                selected,
+                parameters={"target-language": "fr"},
+                confirmed=True,
+            ),
+        )
+    )
+    second_effect = engine_api._response(
         api_request(
             config_path,
             "connect.attachment.invoke",
@@ -281,11 +318,16 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
                 selected,
                 parameters={"target-language": "es"},
                 confirmed=True,
+                request_id=SECOND_REQUEST_ID,
             ),
         )
     )
 
     assert response["ok"] is True
+    assert repeated == response
+    assert conflict["error"]["code"] == "request_id_conflict"
+    assert second_effect["ok"] is True
+    assert second_effect["data"]["job_id"] == SECOND_REQUEST_ID
     assert response["data"]["provider"] == {
         "app_id": "second-provider",
         "version": "1.2.3",
@@ -302,8 +344,13 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         }
     ]
     assert "payload" not in str(response["data"])
-    assert discovered_instances == [INSTANCE_B, INSTANCE_B]
-    assert dict(submitted[0].parameters) == {"target-language": "es"}
+    assert discovered_instances == [INSTANCE_B] * 5
+    assert [job.job_id for job in submitted] == [REQUEST_ID, SECOND_REQUEST_ID]
+    assert [dict(job.parameters) for job in submitted] == [
+        {"target-language": "es"},
+        {"target-language": "es"},
+    ]
+    assert gmail_reads == 2
 
 
 def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
@@ -313,9 +360,12 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
     selected = capability()
     submissions: list[tuple[str, bytes]] = []
     queries: list[str] = []
+    gmail_reads = 0
 
     class FakeGmail:
         def attachment_bytes(self, *args) -> bytes:
+            nonlocal gmail_reads
+            gmail_reads += 1
             return PDF
 
     class RecoveringClient:
@@ -370,8 +420,82 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
         (durable.job_id, durable.request_json),
         (durable.job_id, durable.request_json),
     ]
+    assert gmail_reads == 2
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    gmail_reads = 0
+    submissions = 0
+    queries = 0
+    raced = False
+    real_transition = runtime.store.transition_connect_job
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            nonlocal gmail_reads
+            gmail_reads += 1
+            return PDF
+
+    class ReconcilingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+        def get(self, job):
+            nonlocal queries
+            queries += 1
+            return update(job, "completed", payload=b"Already completed")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    def racing_transition(**values):
+        nonlocal raced
+        if not raced and values["next_state"] == "completed":
+            raced = True
+            real_transition(**values)
+            raise RuntimeError("simulated competing poller won the transition")
+        return real_transition(**values)
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", ReconcilingClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(runtime.store, "transition_connect_job", racing_transition)
+    request = api_request(
+        config_path,
+        "connect.attachment.invoke",
+        invocation_payload(selected),
+    )
+
+    first = engine_api._response(request)
+    second = engine_api._response(request)
+
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["ok"] is True
+    assert second["data"]["job_id"] == REQUEST_ID
+    assert submissions == 1
+    assert queries == 1
+    assert gmail_reads == 1
+    assert raced is True
 
 
 def test_concurrent_identical_click_reuses_the_persisted_winner(

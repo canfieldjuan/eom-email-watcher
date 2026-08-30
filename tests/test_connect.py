@@ -17,6 +17,7 @@ INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
 OUTPUT_ID_B = "44444444-4444-4444-8444-444444444444"
+JOB_ID = "5aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def registration(
@@ -942,6 +943,28 @@ def test_v2_job_preparation_accepts_empty_artifacts_and_integral_numbers() -> No
             parameters={"page-limit": 1.5},
         )
     assert fractional.value.code == "PARAMETERS_INVALID"
+
+
+def test_v2_job_preparation_accepts_only_canonical_uuid4_request_identity() -> None:
+    capability = discovered_v2_capability()
+    job = connect.prepare_capability_job(
+        capability,
+        b"content",
+        "application/pdf",
+        "document.pdf",
+        job_id=JOB_ID,
+    )
+
+    assert job.job_id == JOB_ID
+    for invalid in (
+        "not-a-uuid",
+        "55555555-5555-1555-8555-555555555555",
+        JOB_ID.upper(),
+        42,
+    ):
+        with pytest.raises(connect.ConnectError) as raised:
+            connect.validate_job_id(invalid)
+        assert raised.value.code == "JOB_REQUEST_INVALID"
 
 
 def test_v2_client_submits_and_polls_generic_outputs() -> None:

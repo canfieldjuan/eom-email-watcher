@@ -15,7 +15,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from pydantic import (
@@ -1017,6 +1017,27 @@ def _safe_artifact_display_name(filename: str) -> str:
     return cleaned
 
 
+def validate_job_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The capability request identity must be a UUIDv4 string.",
+        )
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The capability request identity must be a UUIDv4 string.",
+        ) from exc
+    if parsed.version != 4 or str(parsed) != value:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The capability request identity must be a UUIDv4 string.",
+        )
+    return value
+
+
 def _validated_parameters(
     capability: DiscoveredCapability,
     values: dict[str, object] | None,
@@ -1067,6 +1088,13 @@ def _validated_parameters(
             )
         validated[name] = int(value) if value_type == "integer" else value  # type: ignore[arg-type, assignment]
     return validated
+
+
+def validate_capability_parameters(
+    capability: DiscoveredCapability,
+    values: dict[str, object] | None,
+) -> dict[str, str | int | bool]:
+    return _validated_parameters(capability, values)
 
 
 def _build_capability_job(
@@ -1194,11 +1222,6 @@ def restore_persisted_capability_job(
             "JOB_REQUEST_INVALID",
             "The durable capability job source is invalid.",
         )
-    if not capability.accepts_artifact(artifact.media_type, artifact.byte_size):
-        raise ConnectError(
-            "JOB_CAPABILITY_MISMATCH",
-            "The durable job input is no longer accepted by the selected capability.",
-        )
     parameters = _validated_parameters(capability, dict(request.parameters))
     return PreparedCapabilityJob(
         job_id=request.job_id,
@@ -1227,6 +1250,7 @@ def prepare_capability_job(
     *,
     parameters: dict[str, object] | None = None,
     confirmed: bool = False,
+    job_id: str | None = None,
 ) -> PreparedCapabilityJob:
     if capability.confirmation_required and not confirmed:
         raise ConnectError(
@@ -1240,7 +1264,7 @@ def prepare_capability_job(
         )
     return _build_capability_job(
         capability,
-        job_id=str(uuid4()),
+        job_id=validate_job_id(job_id) if job_id is not None else str(uuid4()),
         artifact_id=str(uuid4()),
         media_type=media_type,
         byte_size=len(content),
@@ -1509,24 +1533,33 @@ class ConnectV2Client:
     def _request_client(self) -> tuple[httpx.Client, bool]:
         return (self._client, False) if self._client is not None else (_client(), True)
 
-    def _validate_job(self, job: PreparedCapabilityJob) -> None:
+    def _validate_job(
+        self,
+        job: PreparedCapabilityJob,
+        *,
+        require_compatible_input: bool,
+    ) -> None:
         if (
             job.provider_app_id != self.capability.app_id
             or job.provider_app_version != self.capability.app_version
             or job.provider_instance_id != self.capability.instance_id
             or job.capability_id != self.capability.capability_id
             or job.capability_version != self.capability.capability_version
-            or not self.capability.accepts_artifact(
-                job.artifact.media_type, job.artifact.byte_size
-            )
         ):
             raise ConnectError(
                 "JOB_CAPABILITY_MISMATCH",
                 "The prepared job does not match the selected capability.",
             )
+        if require_compatible_input and not self.capability.accepts_artifact(
+            job.artifact.media_type, job.artifact.byte_size
+        ):
+            raise ConnectError(
+                "JOB_CAPABILITY_MISMATCH",
+                "The prepared job input is not accepted by the selected capability.",
+            )
 
     def submit(self, job: PreparedCapabilityJob, content: bytes) -> CapabilityJobUpdate:
-        self._validate_job(job)
+        self._validate_job(job, require_compatible_input=True)
         if len(content) != job.artifact.byte_size or hashlib.sha256(content).hexdigest() != (
             job.artifact.sha256
         ):
@@ -1568,7 +1601,7 @@ class ConnectV2Client:
                 active_client.close()
 
     def get(self, job: PreparedCapabilityJob) -> CapabilityJobUpdate:
-        self._validate_job(job)
+        self._validate_job(job, require_compatible_input=False)
         active_client, owned = self._request_client()
         try:
             with active_client.stream(
