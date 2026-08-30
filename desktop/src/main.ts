@@ -394,6 +394,10 @@ let healthRequestGeneration = 0;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
+const capabilityOutputPresentations = new Map<string, ConnectOutputPresentation>();
+const capabilityOutputPresentationsInFlight = new Set<string>();
+const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
+const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
 let settingsInFlight = false;
 let configurationReady = false;
@@ -495,6 +499,15 @@ function capabilityInvocationKey(
     capability.version,
     canonicalCapabilityParameters(parameters),
   ]);
+}
+
+function capabilityOutputKey(
+  messageId: string,
+  partId: string,
+  jobId: string,
+  artifactId: string,
+): string {
+  return JSON.stringify([messageId, partId, jobId, artifactId]);
 }
 
 function capabilityGroups(
@@ -657,20 +670,37 @@ function renderCapabilityResult(
       outputRow.append(detail);
       if (result.job_id) {
         const jobId = result.job_id;
+        const outputKey = capabilityOutputKey(
+          messageId,
+          partId,
+          jobId,
+          output.artifact_id,
+        );
         const controls = document.createElement("div");
         controls.className = "capability-output-actions";
         const preview = document.createElement("div");
         preview.className = "capability-output-preview";
+        capabilityOutputPreviews.set(outputKey, preview);
+        const cachedPresentation = capabilityOutputPresentations.get(outputKey);
+        if (cachedPresentation) renderOutputPresentation(preview, cachedPresentation);
         if (
           output.media_type === "application/vnd.local-connect.document-summary+json" ||
           output.media_type === "text/plain"
         ) {
           const view = document.createElement("button");
           view.type = "button";
-          view.textContent = "View";
+          const syncViewButton = (button: HTMLButtonElement): void => {
+            const loading = capabilityOutputPresentationsInFlight.has(outputKey);
+            button.disabled = loading;
+            button.textContent = loading ? "Loading…" : "View";
+          };
+          capabilityOutputViewButtons.set(outputKey, view);
+          syncViewButton(view);
           view.addEventListener("click", async () => {
-            view.disabled = true;
-            view.textContent = "Loading…";
+            if (capabilityOutputPresentationsInFlight.has(outputKey)) return;
+            capabilityOutputPresentationsInFlight.add(outputKey);
+            syncViewButton(view);
+            let presentationError: unknown;
             try {
               const outputView = await invoke<ConnectOutputView>("capability_output_present", {
                 messageId,
@@ -678,15 +708,27 @@ function renderCapabilityResult(
                 jobId,
                 artifactId: output.artifact_id,
               });
-              renderOutputPresentation(preview, outputView.presentation);
+              const currentPreview = capabilityOutputPreviews.get(outputKey);
+              if (currentPreview?.isConnected) {
+                capabilityOutputPresentations.set(outputKey, outputView.presentation);
+                renderOutputPresentation(currentPreview, outputView.presentation);
+              }
+            } catch (error) {
+              presentationError = error;
+            } finally {
+              capabilityOutputPresentationsInFlight.delete(outputKey);
+              const currentButton = capabilityOutputViewButtons.get(outputKey);
+              if (currentButton) syncViewButton(currentButton);
+            }
+            if (presentationError) {
+              inboxStatus.textContent = errorMessage(presentationError);
+              inboxStatus.dataset.kind = "error";
+            } else if (capabilityOutputPreviews.get(outputKey)?.isConnected) {
               inboxStatus.textContent = `Showing ${output.display_name}.`;
               inboxStatus.dataset.kind = "success";
-            } catch (error) {
-              inboxStatus.textContent = errorMessage(error);
-              inboxStatus.dataset.kind = "error";
-            } finally {
-              view.disabled = false;
-              view.textContent = "View";
+            } else {
+              inboxStatus.textContent = `${output.display_name} is no longer in the current inbox.`;
+              inboxStatus.dataset.kind = "warning";
             }
           });
           controls.append(view);
@@ -734,8 +776,11 @@ function renderCapabilityResult(
 }
 
 function renderInbox(items: InboxItem[]): void {
+  capabilityOutputPreviews.clear();
+  capabilityOutputViewButtons.clear();
   inboxList.replaceChildren();
   if (items.length === 0) {
+    capabilityOutputPresentations.clear();
     const empty = document.createElement("li");
     empty.className = "empty-state";
     empty.textContent = "No watched messages yet. Add a sender in Watchlist, then run the watcher.";
@@ -1033,6 +1078,9 @@ function renderInbox(items: InboxItem[]): void {
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
     inboxList.append(card);
+  }
+  for (const key of capabilityOutputPresentations.keys()) {
+    if (!capabilityOutputPreviews.has(key)) capabilityOutputPresentations.delete(key);
   }
 }
 
