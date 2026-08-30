@@ -1,18 +1,160 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+MAX_CONNECT_REQUEST_BYTES = 64 * 1024
+MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
+
+_CONNECT_JOBS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
+    job_id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    part_id TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL DEFAULT 1 CHECK (protocol_version IN (1, 2)),
+    capability_id TEXT NOT NULL,
+    capability_version TEXT NOT NULL,
+    provider_app_id TEXT,
+    provider_app_version TEXT,
+    provider_instance_id TEXT,
+    input_artifact_id TEXT NOT NULL,
+    input_media_type TEXT NOT NULL,
+    input_byte_size INTEGER NOT NULL CHECK (input_byte_size > 0),
+    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+    input_display_name TEXT,
+    source_app_id TEXT,
+    request_json BLOB CHECK (
+        request_json IS NULL OR (
+            typeof(request_json) = 'blob'
+            AND length(request_json) BETWEEN 1 AND 65536
+        )
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
+    ),
+    output_artifact_id TEXT,
+    output_media_type TEXT,
+    output_byte_size INTEGER CHECK (
+        output_byte_size IS NULL OR output_byte_size > 0
+    ),
+    output_sha256 TEXT CHECK (
+        output_sha256 IS NULL OR length(output_sha256) = 64
+    ),
+    summary_version TEXT,
+    summary_text TEXT,
+    warnings_json TEXT,
+    result_json BLOB CHECK (
+        result_json IS NULL OR (
+            typeof(result_json) = 'blob'
+            AND length(result_json) BETWEEN 1 AND 25165824
+        )
+    ),
+    error_code TEXT,
+    error_message TEXT,
+    error_retryable INTEGER CHECK (
+        error_retryable IS NULL OR error_retryable IN (0, 1)
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        protocol_version = 1 OR (
+            provider_app_id IS NOT NULL
+            AND provider_app_version IS NOT NULL
+            AND provider_instance_id IS NOT NULL
+            AND input_display_name IS NOT NULL
+            AND length(input_display_name) > 0
+            AND source_app_id IS NOT NULL
+            AND length(source_app_id) > 0
+            AND request_json IS NOT NULL
+        )
+    ),
+    CHECK (
+        (status = 'completed'
+            AND error_code IS NULL
+            AND error_message IS NULL
+            AND error_retryable IS NULL
+            AND (
+                (protocol_version = 1
+                    AND output_artifact_id IS NOT NULL
+                    AND output_media_type IS NOT NULL
+                    AND output_byte_size IS NOT NULL
+                    AND output_sha256 IS NOT NULL
+                    AND summary_version IS NOT NULL
+                    AND summary_text IS NOT NULL
+                    AND length(summary_text) > 0
+                    AND warnings_json IS NOT NULL
+                    AND result_json IS NULL)
+                OR (protocol_version = 2
+                    AND output_artifact_id IS NULL
+                    AND output_media_type IS NULL
+                    AND output_byte_size IS NULL
+                    AND output_sha256 IS NULL
+                    AND summary_version IS NULL
+                    AND summary_text IS NULL
+                    AND warnings_json IS NULL
+                    AND result_json IS NOT NULL)
+            ))
+        OR (status = 'failed'
+            AND error_code IS NOT NULL
+            AND error_message IS NOT NULL
+            AND error_retryable IS NOT NULL
+            AND output_artifact_id IS NULL
+            AND output_media_type IS NULL
+            AND output_byte_size IS NULL
+            AND output_sha256 IS NULL
+            AND summary_version IS NULL
+            AND summary_text IS NULL
+            AND warnings_json IS NULL
+            AND result_json IS NULL)
+        OR (status IN ('requested', 'accepted', 'processing')
+            AND output_artifact_id IS NULL
+            AND output_media_type IS NULL
+            AND output_byte_size IS NULL
+            AND output_sha256 IS NULL
+            AND summary_version IS NULL
+            AND summary_text IS NULL
+            AND warnings_json IS NULL
+            AND result_json IS NULL
+            AND error_code IS NULL
+            AND error_message IS NULL
+            AND error_retryable IS NULL)
+    )
+)
+"""
+
+_CONNECT_JOBS_LOOKUP_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_connect_attachment_jobs_lookup
+ON connect_attachment_jobs(
+    message_id, part_id, capability_id, capability_version, created_at
+)
+"""
+
+_CONNECT_JOBS_ACTIVE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_connect_attachment_jobs_active
+ON connect_attachment_jobs(message_id, part_id, capability_id, capability_version)
+WHERE status IN ('requested', 'accepted', 'processing')
+"""
+
+_CONNECT_JOBS_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS messages_delete_connect_attachment_jobs
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM connect_attachment_jobs WHERE message_id = OLD.message_id;
+END
+"""
 
 
 @dataclass(frozen=True)
@@ -75,14 +217,19 @@ class ConnectJob:
     job_id: str
     message_id: str
     part_id: str
+    protocol_version: int
     capability_id: str
     capability_version: str
     provider_app_id: str | None
+    provider_app_version: str | None
     provider_instance_id: str | None
     input_artifact_id: str
     input_media_type: str
     input_byte_size: int
     input_sha256: str
+    input_display_name: str | None
+    source_app_id: str | None
+    request_json: bytes | None = field(repr=False)
     status: str
     output_artifact_id: str | None
     output_media_type: str | None
@@ -91,11 +238,245 @@ class ConnectJob:
     summary_version: str | None
     summary_text: str | None
     warnings_json: str | None
+    result_json: bytes | None = field(repr=False)
     error_code: str | None
     error_message: str | None
     error_retryable: int | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class ConnectOutput:
+    artifact_id: str
+    media_type: str
+    display_name: str
+    byte_size: int
+    sha256: str
+    payload: bytes = field(repr=False)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "artifact_id": self.artifact_id,
+            "media_type": self.media_type,
+            "display_name": self.display_name,
+            "byte_size": self.byte_size,
+            "sha256": self.sha256,
+        }
+
+
+def _ensure_connect_jobs_schema(db: sqlite3.Connection) -> None:
+    table_exists = (
+        db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connect_attachment_jobs'"
+        ).fetchone()
+        is not None
+    )
+    legacy_table = False
+    if table_exists:
+        columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(connect_attachment_jobs)").fetchall()
+        }
+        legacy_table = "protocol_version" not in columns
+    if legacy_table:
+        db.execute("DROP TRIGGER IF EXISTS messages_delete_connect_attachment_jobs")
+        db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_lookup")
+        db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_active")
+        db.execute("ALTER TABLE connect_attachment_jobs RENAME TO connect_attachment_jobs_v5")
+
+    db.execute(_CONNECT_JOBS_TABLE_SQL)
+    db.execute(_CONNECT_JOBS_LOOKUP_INDEX_SQL)
+    db.execute(_CONNECT_JOBS_ACTIVE_INDEX_SQL)
+    db.execute(_CONNECT_JOBS_DELETE_TRIGGER_SQL)
+
+    if not legacy_table:
+        return
+    db.execute(
+        """INSERT INTO connect_attachment_jobs(
+            job_id, message_id, part_id, protocol_version,
+            capability_id, capability_version,
+            provider_app_id, provider_app_version, provider_instance_id,
+            input_artifact_id, input_media_type, input_byte_size, input_sha256,
+            input_display_name, source_app_id, request_json, status,
+            output_artifact_id, output_media_type, output_byte_size, output_sha256,
+            summary_version, summary_text, warnings_json, result_json,
+            error_code, error_message, error_retryable, created_at, updated_at
+        )
+        SELECT
+            job_id, message_id, part_id, 1,
+            capability_id, capability_version,
+            provider_app_id, NULL, provider_instance_id,
+            input_artifact_id, input_media_type, input_byte_size, input_sha256,
+            NULL, 'email-watcher', NULL, status,
+            output_artifact_id, output_media_type, output_byte_size, output_sha256,
+            summary_version, summary_text, warnings_json, NULL,
+            error_code, error_message, error_retryable, created_at, updated_at
+        FROM connect_attachment_jobs_v5
+        ORDER BY rowid"""
+    )
+    db.execute("DROP TABLE connect_attachment_jobs_v5")
+
+
+def _valid_uuid_v4(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return parsed.version == 4 and str(parsed) == value
+
+
+def _validate_v2_request_record(
+    request_json: bytes,
+    *,
+    job_id: str,
+    capability_id: str,
+    capability_version: str,
+    input_artifact_id: str,
+    input_media_type: str,
+    input_byte_size: int,
+    input_sha256: str,
+    input_display_name: str,
+    source_app_id: str,
+) -> None:
+    if not 0 < len(request_json) <= MAX_CONNECT_REQUEST_BYTES:
+        raise ValueError("Connect v2 request bytes are invalid")
+    try:
+        request = json.loads(request_json)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("Connect v2 request bytes are invalid") from exc
+    if not isinstance(request, dict) or set(request) != {
+        "protocol_version",
+        "job_id",
+        "capability",
+        "inputs",
+        "parameters",
+    }:
+        raise ValueError("Connect v2 request provenance is invalid")
+    capability = request.get("capability")
+    inputs = request.get("inputs")
+    parameters = request.get("parameters")
+    if (
+        request.get("protocol_version") != 2
+        or request.get("job_id") != job_id
+        or capability != {"id": capability_id, "version": capability_version}
+        or not isinstance(inputs, list)
+        or len(inputs) != 1
+        or inputs[0]
+        != {
+            "artifact_id": input_artifact_id,
+            "media_type": input_media_type,
+            "byte_size": input_byte_size,
+            "sha256": input_sha256,
+            "display_name": input_display_name,
+            "source_app_id": source_app_id,
+        }
+        or not isinstance(parameters, dict)
+        or len(parameters) > 16
+        or any(
+            not isinstance(name, str) or not name or type(value) not in {str, int, bool}
+            for name, value in parameters.items()
+        )
+    ):
+        raise ValueError("Connect v2 request provenance is invalid")
+
+
+def _validate_generic_result(value: object) -> tuple[ConnectOutput, ...]:
+    if not isinstance(value, dict) or set(value) != {"outputs"}:
+        raise ValueError("Completed Connect v2 result is invalid")
+    raw_outputs = value["outputs"]
+    if not isinstance(raw_outputs, list) or not 1 <= len(raw_outputs) <= 8:
+        raise ValueError("Completed Connect v2 result is invalid")
+
+    outputs: list[ConnectOutput] = []
+    artifact_ids: set[str] = set()
+    expected_keys = {
+        "artifact_id",
+        "media_type",
+        "display_name",
+        "byte_size",
+        "sha256",
+        "payload_base64",
+    }
+    for raw_output in raw_outputs:
+        if not isinstance(raw_output, dict) or set(raw_output) != expected_keys:
+            raise ValueError("Completed Connect v2 result is invalid")
+        artifact_id = raw_output["artifact_id"]
+        media_type = raw_output["media_type"]
+        display_name = raw_output["display_name"]
+        byte_size = raw_output["byte_size"]
+        sha256 = raw_output["sha256"]
+        payload_base64 = raw_output["payload_base64"]
+        if (
+            not _valid_uuid_v4(artifact_id)
+            or artifact_id in artifact_ids
+            or not isinstance(media_type, str)
+            or not 0 < len(media_type) <= 127
+            or media_type != media_type.casefold()
+            or not isinstance(display_name, str)
+            or not 0 < len(display_name) <= 255
+            or type(byte_size) is not int
+            or not 0 <= byte_size <= MAX_CONNECT_OUTPUT_BYTES
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or not isinstance(payload_base64, str)
+        ):
+            raise ValueError("Completed Connect v2 result is invalid")
+        try:
+            payload = base64.b64decode(payload_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Completed Connect v2 result is invalid") from exc
+        if (
+            base64.b64encode(payload).decode("ascii") != payload_base64
+            or len(payload) != byte_size
+            or hashlib.sha256(payload).hexdigest() != sha256
+        ):
+            raise ValueError("Completed Connect v2 result failed integrity validation")
+        artifact_ids.add(artifact_id)
+        outputs.append(
+            ConnectOutput(
+                artifact_id=artifact_id,
+                media_type=media_type,
+                display_name=display_name,
+                byte_size=byte_size,
+                sha256=sha256,
+                payload=payload,
+            )
+        )
+    return tuple(outputs)
+
+
+def _encode_generic_result(result: dict[str, object]) -> bytes:
+    outputs = _validate_generic_result(result)
+    encoded = json.dumps(
+        {
+            "outputs": [
+                {
+                    **output.metadata(),
+                    "payload_base64": base64.b64encode(output.payload).decode("ascii"),
+                }
+                for output in outputs
+            ]
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if len(encoded) > MAX_CONNECT_RESULT_BYTES:
+        raise ValueError("Completed Connect v2 result is too large")
+    return encoded
+
+
+def _decode_generic_result(result_json: bytes) -> tuple[ConnectOutput, ...]:
+    if not 0 < len(result_json) <= MAX_CONNECT_RESULT_BYTES:
+        raise RuntimeError("Completed Connect v2 result is invalid")
+    try:
+        value = json.loads(result_json)
+        return _validate_generic_result(value)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError("Completed Connect v2 result is invalid") from exc
 
 
 class Store:
@@ -179,94 +560,10 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_message_attachments_message
                     ON message_attachments(message_id, position);
-                CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    message_id TEXT NOT NULL,
-                    part_id TEXT NOT NULL,
-                    capability_id TEXT NOT NULL,
-                    capability_version TEXT NOT NULL,
-                    provider_app_id TEXT,
-                    provider_instance_id TEXT,
-                    input_artifact_id TEXT NOT NULL,
-                    input_media_type TEXT NOT NULL,
-                    input_byte_size INTEGER NOT NULL CHECK (input_byte_size > 0),
-                    input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
-                    status TEXT NOT NULL CHECK (
-                        status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
-                    ),
-                    output_artifact_id TEXT,
-                    output_media_type TEXT,
-                    output_byte_size INTEGER CHECK (
-                        output_byte_size IS NULL OR output_byte_size > 0
-                    ),
-                    output_sha256 TEXT CHECK (
-                        output_sha256 IS NULL OR length(output_sha256) = 64
-                    ),
-                    summary_version TEXT,
-                    summary_text TEXT,
-                    warnings_json TEXT,
-                    error_code TEXT,
-                    error_message TEXT,
-                    error_retryable INTEGER CHECK (
-                        error_retryable IS NULL OR error_retryable IN (0, 1)
-                    ),
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    CHECK (
-                        (status = 'completed'
-                            AND output_artifact_id IS NOT NULL
-                            AND output_media_type IS NOT NULL
-                            AND output_byte_size IS NOT NULL
-                            AND output_sha256 IS NOT NULL
-                            AND summary_version IS NOT NULL
-                            AND summary_text IS NOT NULL
-                            AND length(summary_text) > 0
-                            AND warnings_json IS NOT NULL
-                            AND error_code IS NULL
-                            AND error_message IS NULL
-                            AND error_retryable IS NULL)
-                        OR (status = 'failed'
-                            AND error_code IS NOT NULL
-                            AND error_message IS NOT NULL
-                            AND error_retryable IS NOT NULL
-                            AND output_artifact_id IS NULL
-                            AND output_media_type IS NULL
-                            AND output_byte_size IS NULL
-                            AND output_sha256 IS NULL
-                            AND summary_version IS NULL
-                            AND summary_text IS NULL
-                            AND warnings_json IS NULL)
-                        OR (status IN ('requested', 'accepted', 'processing')
-                            AND output_artifact_id IS NULL
-                            AND output_media_type IS NULL
-                            AND output_byte_size IS NULL
-                            AND output_sha256 IS NULL
-                            AND summary_version IS NULL
-                            AND summary_text IS NULL
-                            AND warnings_json IS NULL
-                            AND error_code IS NULL
-                            AND error_message IS NULL
-                            AND error_retryable IS NULL)
-                    )
-                );
-                CREATE INDEX IF NOT EXISTS idx_connect_attachment_jobs_lookup
-                    ON connect_attachment_jobs(
-                        message_id, part_id, capability_id, capability_version, created_at
-                    );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_connect_attachment_jobs_active
-                    ON connect_attachment_jobs(
-                        message_id, part_id, capability_id, capability_version
-                    )
-                    WHERE status IN ('requested', 'accepted', 'processing');
                 CREATE TRIGGER IF NOT EXISTS messages_delete_attachments
                 AFTER DELETE ON messages
                 BEGIN
                     DELETE FROM message_attachments WHERE message_id = OLD.message_id;
-                END;
-                CREATE TRIGGER IF NOT EXISTS messages_delete_connect_attachment_jobs
-                AFTER DELETE ON messages
-                BEGIN
-                    DELETE FROM connect_attachment_jobs WHERE message_id = OLD.message_id;
                 END;
                 CREATE TABLE IF NOT EXISTS outbound_sends (
                     dedupe_key TEXT PRIMARY KEY,
@@ -286,6 +583,7 @@ class Store:
                 );
                 """
             )
+            _ensure_connect_jobs_schema(db)
             columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()
             }
@@ -459,6 +757,12 @@ class Store:
             raise RuntimeError("Completed Connect job failed its integrity check")
         return warnings
 
+    @staticmethod
+    def completed_connect_outputs(job: ConnectJob) -> tuple[ConnectOutput, ...]:
+        if job.status != "completed" or job.protocol_version != 2 or job.result_json is None:
+            raise RuntimeError("Completed Connect v2 job is missing its durable result")
+        return _decode_generic_result(job.result_json)
+
     def active_connect_job(
         self,
         *,
@@ -466,15 +770,23 @@ class Store:
         part_id: str,
         capability_id: str,
         capability_version: str,
+        protocol_version: int = 1,
     ) -> ConnectJob | None:
         with self.connection() as db:
             row = db.execute(
                 """SELECT * FROM connect_attachment_jobs
                 WHERE message_id = ? AND part_id = ?
                   AND capability_id = ? AND capability_version = ?
+                  AND protocol_version = ?
                   AND status IN ('requested', 'accepted', 'processing')
                 ORDER BY created_at DESC, rowid DESC LIMIT 1""",
-                (message_id, part_id, capability_id, capability_version),
+                (
+                    message_id,
+                    part_id,
+                    capability_id,
+                    capability_version,
+                    protocol_version,
+                ),
             ).fetchone()
         return self._connect_job(row) if row else None
 
@@ -485,15 +797,23 @@ class Store:
         part_id: str,
         capability_id: str,
         capability_version: str,
+        protocol_version: int = 1,
     ) -> ConnectJob | None:
         with self.connection() as db:
             row = db.execute(
                 """SELECT * FROM connect_attachment_jobs
                 WHERE message_id = ? AND part_id = ?
                   AND capability_id = ? AND capability_version = ?
+                  AND protocol_version = ?
                   AND status = 'completed'
                 ORDER BY created_at DESC, rowid DESC LIMIT 1""",
-                (message_id, part_id, capability_id, capability_version),
+                (
+                    message_id,
+                    part_id,
+                    capability_id,
+                    capability_version,
+                    protocol_version,
+                ),
             ).fetchone()
         return self._connect_job(row) if row else None
 
@@ -511,35 +831,77 @@ class Store:
         input_media_type: str,
         input_byte_size: int,
         input_sha256: str,
+        protocol_version: int = 1,
+        provider_app_version: str | None = None,
+        input_display_name: str | None = None,
+        source_app_id: str | None = None,
+        request_json: bytes | None = None,
     ) -> ConnectJob:
+        if protocol_version not in {1, 2}:
+            raise ValueError("Connect protocol version is unsupported")
+        if protocol_version == 1:
+            if request_json is not None:
+                raise ValueError("Connect v1 jobs cannot store a v2 request")
+        else:
+            if (
+                not provider_app_version
+                or not input_display_name
+                or not source_app_id
+                or request_json is None
+            ):
+                raise ValueError("Connect v2 job provenance is incomplete")
+            _validate_v2_request_record(
+                request_json,
+                job_id=job_id,
+                capability_id=capability_id,
+                capability_version=capability_version,
+                input_artifact_id=input_artifact_id,
+                input_media_type=input_media_type,
+                input_byte_size=input_byte_size,
+                input_sha256=input_sha256,
+                input_display_name=input_display_name,
+                source_app_id=source_app_id,
+            )
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute(
-                """SELECT 1 FROM message_attachments
+            if (
+                db.execute(
+                    """SELECT 1 FROM message_attachments
                 WHERE message_id = ? AND part_id = ?""",
-                (message_id, part_id),
-            ).fetchone() is None:
+                    (message_id, part_id),
+                ).fetchone()
+                is None
+            ):
                 raise KeyError((message_id, part_id))
             db.execute(
                 """INSERT INTO connect_attachment_jobs(
-                    job_id, message_id, part_id, capability_id, capability_version,
-                    provider_app_id, provider_instance_id, input_artifact_id,
-                    input_media_type, input_byte_size, input_sha256, status,
+                    job_id, message_id, part_id, protocol_version,
+                    capability_id, capability_version,
+                    provider_app_id, provider_app_version, provider_instance_id,
+                    input_artifact_id, input_media_type, input_byte_size, input_sha256,
+                    input_display_name, source_app_id, request_json, status,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)""",
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?
+                )""",
                 (
                     job_id,
                     message_id,
                     part_id,
+                    protocol_version,
                     capability_id,
                     capability_version,
                     provider_app_id,
+                    provider_app_version,
                     provider_instance_id,
                     input_artifact_id,
                     input_media_type,
                     input_byte_size,
                     input_sha256,
+                    input_display_name,
+                    source_app_id,
+                    request_json,
                     stamp,
                     stamp,
                 ),
@@ -572,45 +934,11 @@ class Store:
         if next_state == "completed":
             if result is None or error is not None:
                 raise ValueError("Completed Connect jobs require only a result")
-            output = (
-                result.get("output") if isinstance(result.get("output"), dict) else None
-            )
-            if output is None:
-                raise ValueError("Completed Connect job result is invalid")
-            warnings = output.get("warnings")
-            if not isinstance(warnings, list):
-                raise ValueError("Completed Connect job warnings are invalid")
-            values = (
-                output.get("artifact_id"),
-                output.get("media_type"),
-                output.get("byte_size"),
-                output.get("sha256"),
-                output.get("summary_version"),
-                output.get("text"),
-                json.dumps(warnings, separators=(",", ":"), ensure_ascii=False),
-                None,
-                None,
-                None,
-            )
         elif next_state == "failed":
             if error is None or result is not None:
                 raise ValueError("Failed Connect jobs require only an error")
-            values = (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                error.get("code"),
-                error.get("message"),
-                int(bool(error.get("retryable"))),
-            )
-        else:
-            if result is not None or error is not None:
-                raise ValueError("Active Connect jobs cannot contain terminal data")
-            values = (None,) * 10
+        elif result is not None or error is not None:
+            raise ValueError("Active Connect jobs cannot contain terminal data")
 
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
@@ -620,6 +948,45 @@ class Store:
             ).fetchone()
             if current is None or current["status"] != expected_state:
                 raise RuntimeError("Connect job transition lost its expected-state race")
+            current_job = self._connect_job(current)
+            if current_job.protocol_version == 2 and (
+                current_job.provider_app_id != provider_app_id
+                or current_job.provider_instance_id != provider_instance_id
+            ):
+                raise ValueError("Connect v2 provider provenance cannot change")
+            if next_state == "completed" and current_job.protocol_version == 1:
+                assert result is not None
+                output = result.get("output") if isinstance(result.get("output"), dict) else None
+                if output is None:
+                    raise ValueError("Completed Connect job result is invalid")
+                warnings = output.get("warnings")
+                if not isinstance(warnings, list):
+                    raise ValueError("Completed Connect job warnings are invalid")
+                values = (
+                    output.get("artifact_id"),
+                    output.get("media_type"),
+                    output.get("byte_size"),
+                    output.get("sha256"),
+                    output.get("summary_version"),
+                    output.get("text"),
+                    json.dumps(warnings, separators=(",", ":"), ensure_ascii=False),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            elif next_state == "completed":
+                assert result is not None
+                values = (None,) * 7 + (_encode_generic_result(result), None, None, None)
+            elif next_state == "failed":
+                assert error is not None
+                values = (None,) * 8 + (
+                    error.get("code"),
+                    error.get("message"),
+                    int(bool(error.get("retryable"))),
+                )
+            else:
+                values = (None,) * 11
             if next_state == "completed":
                 candidate = ConnectJob(
                     **{
@@ -634,22 +1001,25 @@ class Store:
                         "summary_version": values[4],
                         "summary_text": values[5],
                         "warnings_json": values[6],
-                        "error_code": values[7],
-                        "error_message": values[8],
-                        "error_retryable": values[9],
+                        "result_json": values[7],
+                        "error_code": values[8],
+                        "error_message": values[9],
+                        "error_retryable": values[10],
                         "updated_at": stamp,
                     }
                 )
-                try:
-                    self.completed_connect_warnings(candidate)
-                except RuntimeError as exc:
-                    raise ValueError("Completed Connect job result failed validation") from exc
+                if candidate.protocol_version == 1:
+                    try:
+                        self.completed_connect_warnings(candidate)
+                    except RuntimeError as exc:
+                        raise ValueError("Completed Connect job result failed validation") from exc
             cursor = db.execute(
                 """UPDATE connect_attachment_jobs SET
                     provider_app_id = ?, provider_instance_id = ?, status = ?,
                     output_artifact_id = ?, output_media_type = ?, output_byte_size = ?,
                     output_sha256 = ?, summary_version = ?, summary_text = ?, warnings_json = ?,
-                    error_code = ?, error_message = ?, error_retryable = ?, updated_at = ?
+                    result_json = ?, error_code = ?, error_message = ?,
+                    error_retryable = ?, updated_at = ?
                 WHERE job_id = ? AND status = ?""",
                 (
                     provider_app_id,
@@ -689,6 +1059,7 @@ class Store:
                     output_artifact_id = NULL, output_media_type = NULL,
                     output_byte_size = NULL, output_sha256 = NULL,
                     summary_version = NULL, summary_text = NULL, warnings_json = NULL,
+                    result_json = NULL,
                     error_code = NULL, error_message = NULL, error_retryable = NULL,
                     updated_at = ?
                 WHERE job_id = ? AND status = ?
@@ -1028,13 +1399,25 @@ class Store:
                 "status": str(row["status"]),
                 "updated_at": str(row["updated_at"]),
             }
+            if int(row["protocol_version"]) == 2:
+                item["protocol_version"] = 2
+                item["provider"] = {
+                    "app_id": str(row["provider_app_id"]),
+                    "version": str(row["provider_app_version"]),
+                    "instance_id": str(row["provider_instance_id"]),
+                }
             if row["status"] == "completed":
                 completed = self._connect_job(row)
-                item["summary"] = {
-                    "summary_version": completed.summary_version,
-                    "text": completed.summary_text,
-                    "warnings": self.completed_connect_warnings(completed),
-                }
+                if completed.protocol_version == 1:
+                    item["summary"] = {
+                        "summary_version": completed.summary_version,
+                        "text": completed.summary_text,
+                        "warnings": self.completed_connect_warnings(completed),
+                    }
+                else:
+                    item["outputs"] = [
+                        output.metadata() for output in self.completed_connect_outputs(completed)
+                    ]
             elif row["status"] == "failed":
                 item["error"] = {
                     "code": str(row["error_code"]),

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import sqlite3
@@ -383,7 +384,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
@@ -428,7 +429,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -550,6 +551,301 @@ def create_connect_job(store: Store, job_id: str) -> None:
         input_byte_size=20,
         input_sha256="a" * 64,
     )
+
+
+def create_v2_connect_job(
+    store: Store,
+    job_id: str = "33333333-3333-4333-8333-333333333333",
+) -> bytes:
+    request = {
+        "protocol_version": 2,
+        "job_id": job_id,
+        "capability": {"id": "document.translate", "version": "1.0"},
+        "inputs": [
+            {
+                "artifact_id": "22222222-2222-4222-8222-222222222222",
+                "media_type": "application/pdf",
+                "byte_size": 20,
+                "sha256": "a" * 64,
+                "display_name": "invoice.pdf",
+                "source_app_id": "email-watcher",
+            }
+        ],
+        "parameters": {"target-language": "Spanish"},
+    }
+    request_json = json.dumps(request, separators=(",", ":")).encode()
+    store.create_connect_job(
+        job_id=job_id,
+        message_id="m1",
+        part_id="2",
+        protocol_version=2,
+        capability_id="document.translate",
+        capability_version="1.0",
+        provider_app_id="translation-provider",
+        provider_app_version="0.1.0",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        input_media_type="application/pdf",
+        input_byte_size=20,
+        input_sha256="a" * 64,
+        input_display_name="invoice.pdf",
+        source_app_id="email-watcher",
+        request_json=request_json,
+    )
+    return request_json
+
+
+def v2_result() -> tuple[dict[str, object], tuple[bytes, bytes]]:
+    translated = b"Translated invoice: $1,247.17"
+    empty = b""
+    outputs = (
+        {
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "media_type": "text/plain",
+            "display_name": "invoice-es.txt",
+            "byte_size": len(translated),
+            "sha256": hashlib.sha256(translated).hexdigest(),
+            "payload_base64": base64.b64encode(translated).decode(),
+        },
+        {
+            "artifact_id": "55555555-5555-4555-8555-555555555555",
+            "media_type": "text/plain",
+            "display_name": "empty.txt",
+            "byte_size": 0,
+            "sha256": hashlib.sha256(empty).hexdigest(),
+            "payload_base64": "",
+        },
+    )
+    return {"outputs": list(outputs)}, (translated, empty)
+
+
+def downgrade_connect_jobs_to_v5(database: Path) -> None:
+    legacy_columns = """
+        job_id, message_id, part_id, capability_id, capability_version,
+        provider_app_id, provider_instance_id, input_artifact_id,
+        input_media_type, input_byte_size, input_sha256, status,
+        output_artifact_id, output_media_type, output_byte_size, output_sha256,
+        summary_version, summary_text, warnings_json,
+        error_code, error_message, error_retryable, created_at, updated_at
+    """
+    with sqlite3.connect(database) as db:
+        db.execute("DROP TRIGGER messages_delete_connect_attachment_jobs")
+        db.execute("DROP INDEX idx_connect_attachment_jobs_lookup")
+        db.execute("DROP INDEX idx_connect_attachment_jobs_active")
+        db.execute("ALTER TABLE connect_attachment_jobs RENAME TO connect_attachment_jobs_v6")
+        db.execute(
+            f"CREATE TABLE connect_attachment_jobs AS "
+            f"SELECT {legacy_columns} FROM connect_attachment_jobs_v6"
+        )
+        db.execute("DROP TABLE connect_attachment_jobs_v6")
+        db.execute("PRAGMA user_version = 5")
+
+
+def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_connect_job(store, job_id)
+    failed = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="failed",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        error={"code": "PDF_MALFORMED", "message": "Invalid PDF", "retryable": False},
+    )
+    downgrade_connect_jobs_to_v5(database)
+
+    Store(database).initialize()
+
+    reopened = Store(database)
+    restored = reopened.connect_job(job_id)
+    assert restored is not None
+    assert restored.protocol_version == 1
+    assert restored.status == failed.status
+    assert restored.error_code == "PDF_MALFORMED"
+    assert restored.error_message == "Invalid PDF"
+    assert restored.error_retryable == 0
+    assert restored.source_app_id == "email-watcher"
+    assert restored.provider_app_version is None
+    assert restored.request_json is None
+    assert restored.result_json is None
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'connect_attachment_jobs_v5'"
+            ).fetchone()
+            is None
+        )
+        assert db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'messages_delete_connect_attachment_jobs'"
+        ).fetchone() == (1,)
+
+
+def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_connect_job(store, job_id)
+    downgrade_connect_jobs_to_v5(database)
+    with sqlite3.connect(database) as db:
+        db.execute(
+            "UPDATE connect_attachment_jobs SET input_sha256 = 'invalid' WHERE job_id = ?",
+            (job_id,),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        Store(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        columns = {
+            row[1] for row in db.execute("PRAGMA table_info(connect_attachment_jobs)")
+        }
+        assert "protocol_version" not in columns
+        assert db.execute("SELECT job_id FROM connect_attachment_jobs").fetchall() == [
+            (job_id,)
+        ]
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'connect_attachment_jobs_v5'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    request_json = create_v2_connect_job(store, job_id)
+    result, payloads = v2_result()
+    lookup = {
+        "message_id": "m1",
+        "part_id": "2",
+        "capability_id": "document.translate",
+        "capability_version": "1.0",
+    }
+    assert store.active_connect_job(**lookup) is None
+    assert store.active_connect_job(**lookup, protocol_version=2) is not None
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="processing",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    completed = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="processing",
+        next_state="completed",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        result=result,
+    )
+
+    reopened = Store(database)
+    reopened.initialize()
+    restored = reopened.connect_job(job_id)
+    assert restored == completed
+    assert restored is not None
+    assert restored.request_json == request_json
+    assert restored.provider_app_version == "0.1.0"
+    assert restored.input_display_name == "invoice.pdf"
+    assert restored.source_app_id == "email-watcher"
+    assert reopened.completed_connect_job(**lookup) is None
+    assert reopened.completed_connect_job(**lookup, protocol_version=2) == restored
+    outputs = reopened.completed_connect_outputs(restored)
+    assert tuple(output.payload for output in outputs) == payloads
+    assert [output.byte_size for output in outputs] == [len(payloads[0]), 0]
+
+    projected = reopened.recent(1)[0]["attachments"][0]["capability_results"][0]
+    assert projected == {
+        "capability_id": "document.translate",
+        "capability_version": "1.0",
+        "status": "completed",
+        "updated_at": completed.updated_at,
+        "protocol_version": 2,
+        "provider": {
+            "app_id": "translation-provider",
+            "version": "0.1.0",
+            "instance_id": "11111111-1111-4111-8111-111111111111",
+        },
+        "outputs": [output.metadata() for output in outputs],
+    }
+    assert "payload_base64" not in json.dumps(projected)
+
+
+def test_connect_v2_rejects_mismatched_request_and_corrupt_result(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    request_json = create_v2_connect_job(store, job_id)
+    request = json.loads(request_json)
+    request["job_id"] = "99999999-9999-4999-8999-999999999999"
+    mismatched = json.dumps(request, separators=(",", ":")).encode()
+    with pytest.raises(ValueError, match="provenance"):
+        store.create_connect_job(
+            job_id="66666666-6666-4666-8666-666666666666",
+            message_id="m1",
+            part_id="2",
+            protocol_version=2,
+            capability_id="document.translate",
+            capability_version="1.0",
+            provider_app_id="translation-provider",
+            provider_app_version="0.1.0",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            input_artifact_id="22222222-2222-4222-8222-222222222222",
+            input_media_type="application/pdf",
+            input_byte_size=20,
+            input_sha256="a" * 64,
+            input_display_name="invoice.pdf",
+            source_app_id="email-watcher",
+            request_json=mismatched,
+        )
+
+    result, _ = v2_result()
+    completed = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        result=result,
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE connect_attachment_jobs SET result_json = ? WHERE job_id = ?",
+            (b'{"outputs":[]}', job_id),
+        )
+    corrupted = store.connect_job(job_id)
+    assert corrupted is not None
+    assert corrupted.result_json != completed.result_json
+    with pytest.raises(RuntimeError, match="invalid"):
+        store.completed_connect_outputs(corrupted)
 
 
 def test_connect_job_state_result_and_integrity_survive_reopen(tmp_path: Path) -> None:
