@@ -398,6 +398,51 @@ def test_gateway_bounds_email_metadata_before_request_encoding(
     )
 
 
+def test_gateway_replaces_unencodable_surrogates_in_email_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["generation"]["messages"][1]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    result = model.analyze(
+        sender="sender\ud800@example.com",
+        subject="subject\ud800",
+        received_at="2026-08-29T12:00:00+00:00",
+        body="body\ud800",
+        attachment_names=("attachment\ud800.pdf",),
+        current_local_time=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+
+    assert result.priority == "high"
+    assert "\ud800" not in prompts[0]
+    assert prompts[0].count("?") == 4
+
+
+def test_gateway_translates_request_encoding_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path, monkeypatch, lambda request: httpx.Response(200, json={})
+    )
+
+    with pytest.raises(ModelError, match="request could not be encoded"):
+        model._request("POST", "/v1/inference", {"value": "\ud800"})
+
+
 def test_gateway_rejects_encoded_response_before_decompression(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

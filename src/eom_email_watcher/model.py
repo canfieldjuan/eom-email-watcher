@@ -151,6 +151,10 @@ def _email_prompt(
     )
 
 
+def _utf8_safe(value: str) -> str:
+    return value.encode("utf-8", errors="replace").decode("utf-8")
+
+
 class LocalModel:
     def __init__(
         self,
@@ -363,7 +367,12 @@ class GatewayModel:
         headers = self._headers()
         content = None
         if payload is not None:
-            content = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+            try:
+                content = json.dumps(
+                    payload, separators=(",", ":"), ensure_ascii=False
+                ).encode()
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise ModelError("Inference gateway request could not be encoded") from exc
             if len(content) > MAX_GATEWAY_REQUEST_BYTES:
                 raise ModelError("Inference gateway request exceeded the size limit")
             headers["Content-Type"] = "application/json"
@@ -447,12 +456,12 @@ class GatewayModel:
                     {
                         "role": "user",
                         "content": _email_prompt(
-                            sender=sender[:MAX_GATEWAY_SENDER_CHARS],
-                            subject=subject[:MAX_GATEWAY_SUBJECT_CHARS],
+                            sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
+                            subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
                             received_at=received_at,
-                            body=body[:MAX_GATEWAY_BODY_CHARS],
+                            body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
                             attachment_names=tuple(
-                                name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS]
+                                _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
                                 for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
                             ),
                             current_local_time=current_local_time,
