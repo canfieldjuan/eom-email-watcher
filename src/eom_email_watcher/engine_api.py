@@ -17,13 +17,16 @@ from . import connect
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
+    ConfigAlreadyExistsError,
     ConfigError,
     DuplicateSenderError,
+    InvalidConfigInitializationError,
     InvalidSenderError,
     InvalidSettingsUpdateError,
     Sender,
     SenderNotFoundError,
     add_sender,
+    initialize_config,
     load_config,
     remove_sender,
     update_settings,
@@ -584,6 +587,23 @@ def _settings_data(config: Config) -> dict[str, object]:
     }
 
 
+def _config_initialize(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"model_base_url", "model_name", "timezone"})
+    values: dict[str, str] = {}
+    for field in ("model_base_url", "model_name", "timezone"):
+        value = payload.get(field)
+        if not isinstance(value, str):
+            raise ApiError("invalid_request", f"{field} must be a string")
+        values[field] = value
+    try:
+        config = initialize_config(_config_path(request), **values)
+    except InvalidConfigInitializationError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    except ConfigAlreadyExistsError as exc:
+        raise ApiError("conflict", str(exc)) from exc
+    return {"created": True, "settings": _settings_data(config)}
+
+
 def _settings(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     return _settings_data(load_config(_config_path(request)))
@@ -671,6 +691,7 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "analysis.requeue": _analysis_requeue,
     "attachment.export": _attachment_export,
+    "config.initialize": _config_initialize,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
     "gmail.authorize": _gmail_authorize,

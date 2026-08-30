@@ -3,11 +3,14 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher.config import (
+    ConfigAlreadyExistsError,
     ConfigError,
     DuplicateSenderError,
+    InvalidConfigInitializationError,
     InvalidSenderError,
     SenderNotFoundError,
     add_sender,
+    initialize_config,
     load_config,
     normalize_address,
     remove_sender,
@@ -208,6 +211,95 @@ def test_config_allows_zero_senders_for_first_run(tmp_path: Path) -> None:
 
     assert config.senders == ()
     assert config.allowlist == frozenset()
+
+
+def test_first_run_initialization_creates_private_zero_sender_config(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested" / "config.toml"
+
+    config = initialize_config(
+        path,
+        timezone=" UTC ",
+        model_base_url="http://localhost:8080/v1/",
+        model_name=" local-model ",
+    )
+
+    assert config.path == path.resolve()
+    assert config.timezone == "UTC"
+    assert config.model_base_url == "http://localhost:8080/v1"
+    assert config.model_name == "local-model"
+    assert config.model_require_auth is False
+    assert config.notifications_enabled is True
+    assert config.senders == ()
+    assert path.stat().st_mode & 0o777 == 0o600
+    text = path.read_text(encoding="utf-8")
+    assert "gmail_send" not in text
+    assert "monthly_hours" not in text
+    assert list(path.parent.glob(".config.toml.*.tmp")) == []
+
+
+def test_first_run_initialization_never_replaces_existing_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    original = b"operator-owned config\n"
+    path.write_bytes(original)
+
+    with pytest.raises(ConfigAlreadyExistsError, match="already exists"):
+        initialize_config(
+            path,
+            timezone="UTC",
+            model_base_url="http://127.0.0.1:8080/v1",
+            model_name="local-model",
+        )
+
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("timezone", "model_base_url", "model_name"),
+    [
+        ("Unknown/Timezone", "http://127.0.0.1:8080/v1", "local-model"),
+        ("UTC", "https://models.example.com/v1", "local-model"),
+        ("UTC", "http://127.0.0.1:8080/v1", "   "),
+        ("UTC", "http://127.0.0.1:8080/v1", "bad\nmodel"),
+    ],
+)
+def test_first_run_initialization_rejects_invalid_input_without_creating_config(
+    tmp_path: Path, timezone: str, model_base_url: str, model_name: str
+) -> None:
+    path = tmp_path / "config.toml"
+
+    with pytest.raises(InvalidConfigInitializationError):
+        initialize_config(
+            path,
+            timezone=timezone,
+            model_base_url=model_base_url,
+            model_name=model_name,
+        )
+
+    assert not path.exists()
+
+
+def test_first_run_atomic_publication_failure_leaves_no_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+
+    def fail_link(source: Path, destination: Path) -> None:
+        raise OSError("link failed")
+
+    monkeypatch.setattr("eom_email_watcher.config.os.link", fail_link)
+
+    with pytest.raises(OSError, match="link failed"):
+        initialize_config(
+            path,
+            timezone="UTC",
+            model_base_url="http://127.0.0.1:8080/v1",
+            model_name="local-model",
+        )
+
+    assert not path.exists()
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
 def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
