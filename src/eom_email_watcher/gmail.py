@@ -152,15 +152,31 @@ class GmailGateway:
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Enable Gmail API and place the downloaded JSON at that path."
             )
-        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
-        credentials = flow.run_local_server(
-            host="127.0.0.1", port=0, open_browser=True, prompt="consent"
-        )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
-                token_file.write_text(credentials.to_json(), encoding="utf-8")
-                token_file.chmod(0o600)
+                if token_file.exists():
+                    try:
+                        credentials = Credentials.from_authorized_user_file(
+                            str(token_file), SCOPES
+                        )
+                    except (ValueError, json.JSONDecodeError) as exc:
+                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                    if credentials.expired and credentials.refresh_token:
+                        credentials.refresh(Request())
+                        token_file.write_text(credentials.to_json(), encoding="utf-8")
+                        token_file.chmod(0o600)
+                    if not credentials.valid:
+                        raise GmailError("Gmail is not authorized. Run setup again")
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        str(credentials_file), SCOPES
+                    )
+                    credentials = flow.run_local_server(
+                        host="127.0.0.1", port=0, open_browser=True, prompt="consent"
+                    )
+                    token_file.write_text(credentials.to_json(), encoding="utf-8")
+                    token_file.chmod(0o600)
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry setup") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))

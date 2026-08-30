@@ -131,6 +131,31 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    runtime = _runtime(request)
+    config = runtime.config
+    new_authorization = not config.gmail_token_file.exists()
+    if new_authorization:
+        gmail = GmailGateway.authorize(
+            config.gmail_credentials_file,
+            config.gmail_token_file,
+        )
+    else:
+        gmail = GmailGateway.from_token(
+            config.gmail_credentials_file,
+            config.gmail_token_file,
+        )
+
+    initialize_baseline = new_authorization or runtime.store.state() is None
+    if initialize_baseline:
+        runtime.store.set_state(gmail.profile_history_id())
+    return {
+        "baseline_initialized": initialize_baseline,
+        "connected": True,
+    }
+
+
 def _check(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"dry_run"})
     dry_run = payload.get("dry_run", False)
@@ -636,6 +661,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "attachment.export": _attachment_export,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
+    "gmail.authorize": _gmail_authorize,
     "health.get": _health,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,

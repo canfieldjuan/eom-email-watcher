@@ -1,4 +1,5 @@
 import base64
+from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock
@@ -123,3 +124,53 @@ def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
         pytest.raises(GmailError, match="token is busy"),
     ):
         GmailGateway.from_token(credentials_file, token_file)
+
+
+def test_authorize_serializes_the_entire_browser_flow(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module, "TOKEN_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("contended authorization must not open a browser")
+        ),
+    )
+
+    with (
+        FileLock(f"{token_file}.lock"),
+        pytest.raises(GmailError, match="token is busy"),
+    ):
+        GmailGateway.authorize(credentials_file, token_file)
+
+
+def test_authorize_reuses_a_token_found_after_lock_acquisition(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+    credentials = SimpleNamespace(valid=True, expired=False, refresh_token=None)
+    service = object()
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        lambda path, scopes: credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("an existing token must prevent a second browser flow")
+        ),
+    )
+    monkeypatch.setattr(gmail_module, "build", lambda *args, **kwargs: service)
+
+    gateway = GmailGateway.authorize(credentials_file, token_file)
+
+    assert gateway.service is service

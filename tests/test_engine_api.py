@@ -118,6 +118,93 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    class AuthorizedGmail:
+        def profile_history_id(self) -> str:
+            return "private-history-id"
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize",
+        lambda credentials_file, token_file: AuthorizedGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("new setup must authorize")),
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response == {
+        "data": {"baseline_initialized": True, "connected": True},
+        "ok": True,
+        "operation": "gmail.authorize",
+        "protocol": 1,
+    }
+    assert "private-history-id" not in json.dumps(response)
+    assert load_runtime(config_path).store.state()[0] == "private-history-id"
+
+
+def test_gmail_authorize_preserves_existing_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("preserved-history-id", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
+
+    class ExistingGmail:
+        def profile_history_id(self) -> str:
+            raise AssertionError("repeat setup must not reset the baseline")
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize",
+        lambda *args: (_ for _ in ()).throw(AssertionError("existing setup must reuse token")),
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": False, "connected": True}
+    assert load_runtime(config_path).store.state()[0] == "preserved-history-id"
+
+
+def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    token_file = tmp_path / "token.json"
+    token_file.write_text("existing token", encoding="utf-8")
+
+    class ExistingGmail:
+        def profile_history_id(self) -> str:
+            return "current-history-id"
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, configured_token_file: ExistingGmail(),
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    assert load_runtime(config_path).store.state()[0] == "current-history-id"
+
+
 def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, extra_settings="# preserve this\nextension_key = 7")
