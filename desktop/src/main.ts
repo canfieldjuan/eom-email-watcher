@@ -128,6 +128,13 @@ interface CheckResult {
   remaining_notifications: number;
 }
 
+interface WatcherSettings {
+  notifications_enabled: boolean;
+  poll_interval_minutes: number;
+  polling_supported: boolean;
+  retention_days: number;
+}
+
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`Required element is missing: ${selector}`);
@@ -148,6 +155,7 @@ app.innerHTML = `
       <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
       <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
       <button id="health-tab" type="button" aria-controls="health-view" aria-pressed="false">Health</button>
+      <button id="settings-tab" type="button" aria-controls="settings-view" aria-pressed="false">Settings</button>
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
@@ -214,15 +222,39 @@ app.innerHTML = `
         <div><dt>Next check</dt><dd id="next-check">Loading…</dd></div>
       </dl>
     </section>
+
+    <section id="settings-view" class="view" aria-labelledby="settings-tab" hidden>
+      <h2>Watcher settings</h2>
+      <p class="view-lede">Change the everyday controls that are safe to manage from this app.</p>
+      <form id="settings-form" class="settings-form">
+        <label>
+          <span>Polling cadence <small>minutes</small></span>
+          <input id="poll-interval" name="pollIntervalMinutes" type="number" min="1" max="1440" step="1" required />
+        </label>
+        <label>
+          <span>Message retention <small>days</small></span>
+          <input id="retention-days" name="retentionDays" type="number" min="1" max="3650" step="1" required />
+        </label>
+        <label class="settings-toggle">
+          <input id="notifications-enabled" name="notificationsEnabled" type="checkbox" />
+          <span>Deliver native notifications</span>
+        </label>
+        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention and notification changes apply on later watcher operations.</p>
+        <button type="submit">Save settings</button>
+      </form>
+      <p id="settings-status" class="status" role="status" aria-live="polite">Loading settings…</p>
+    </section>
   </div>
 `;
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
 const watchlistTab = requiredElement<HTMLButtonElement>("#watchlist-tab");
 const healthTab = requiredElement<HTMLButtonElement>("#health-tab");
+const settingsTab = requiredElement<HTMLButtonElement>("#settings-tab");
 const inboxView = requiredElement<HTMLElement>("#inbox-view");
 const watchlistView = requiredElement<HTMLElement>("#watchlist-view");
 const healthView = requiredElement<HTMLElement>("#health-view");
+const settingsView = requiredElement<HTMLElement>("#settings-view");
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const form = requiredElement<HTMLFormElement>("#sender-form");
@@ -244,12 +276,20 @@ const lastCheck = requiredElement<HTMLElement>("#last-check");
 const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
 const pollingCadence = requiredElement<HTMLElement>("#polling-cadence");
 const nextCheck = requiredElement<HTMLElement>("#next-check");
+const settingsForm = requiredElement<HTMLFormElement>("#settings-form");
+const pollIntervalInput = requiredElement<HTMLInputElement>("#poll-interval");
+const retentionDaysInput = requiredElement<HTMLInputElement>("#retention-days");
+const notificationsEnabledInput = requiredElement<HTMLInputElement>(
+  "#notifications-enabled",
+);
+const settingsStatus = requiredElement<HTMLParagraphElement>("#settings-status");
 let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
 let healthRequestGeneration = 0;
 let connectCapabilities: ConnectCapability[] = [];
+let settingsInFlight = false;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -259,16 +299,19 @@ function errorMessage(error: unknown): string {
   return "The watcher engine could not complete that request.";
 }
 
-function showView(view: "inbox" | "watchlist" | "health"): void {
+function showView(view: "inbox" | "watchlist" | "health" | "settings"): void {
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
   const healthSelected = view === "health";
+  const settingsSelected = view === "settings";
   inboxView.hidden = !inboxSelected;
   watchlistView.hidden = !watchlistSelected;
   healthView.hidden = !healthSelected;
+  settingsView.hidden = !settingsSelected;
   inboxTab.setAttribute("aria-pressed", String(inboxSelected));
   watchlistTab.setAttribute("aria-pressed", String(watchlistSelected));
   healthTab.setAttribute("aria-pressed", String(healthSelected));
+  settingsTab.setAttribute("aria-pressed", String(settingsSelected));
 }
 
 function receivedLabel(value: string): string {
@@ -704,6 +747,65 @@ async function runCheck(): Promise<void> {
   }
 }
 
+function renderSettings(settings: WatcherSettings): void {
+  pollIntervalInput.value = String(settings.poll_interval_minutes);
+  retentionDaysInput.value = String(settings.retention_days);
+  notificationsEnabledInput.checked = settings.notifications_enabled;
+}
+
+function setSettingsBusy(busy: boolean): void {
+  settingsInFlight = busy;
+  for (const control of settingsForm.elements) {
+    if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
+      control.disabled = busy;
+    }
+  }
+}
+
+async function loadSettings(): Promise<void> {
+  if (settingsInFlight) return;
+  setSettingsBusy(true);
+  settingsStatus.textContent = "Loading settings…";
+  delete settingsStatus.dataset.kind;
+  try {
+    const settings = await invoke<WatcherSettings>("settings_get");
+    renderSettings(settings);
+    settingsStatus.textContent = "Settings are up to date.";
+    settingsStatus.dataset.kind = "success";
+  } catch (error) {
+    settingsStatus.textContent = errorMessage(error);
+    settingsStatus.dataset.kind = "error";
+  } finally {
+    setSettingsBusy(false);
+  }
+}
+
+settingsForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void (async () => {
+    if (settingsInFlight) return;
+    setSettingsBusy(true);
+    settingsStatus.textContent = "Saving settings…";
+    delete settingsStatus.dataset.kind;
+    try {
+      const settings = await invoke<WatcherSettings>("settings_update", {
+        notificationsEnabled: notificationsEnabledInput.checked,
+        pollIntervalMinutes: Number(pollIntervalInput.value),
+        retentionDays: Number(retentionDaysInput.value),
+      });
+      renderSettings(settings);
+      settingsStatus.textContent =
+        "Settings saved. Restart the app to use the new polling cadence.";
+      settingsStatus.dataset.kind = "success";
+    } catch (error) {
+      settingsStatus.textContent = errorMessage(error);
+      settingsStatus.dataset.kind = "error";
+    } finally {
+      setSettingsBusy(false);
+    }
+  })();
+});
+
 function setBusy(busy: boolean): void {
   for (const control of form.elements) {
     if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
@@ -826,6 +928,10 @@ watchlistTab.addEventListener("click", () => showView("watchlist"));
 healthTab.addEventListener("click", () => {
   showView("health");
   void loadHealth();
+});
+settingsTab.addEventListener("click", () => {
+  showView("settings");
+  void loadSettings();
 });
 checkNow.addEventListener("click", () => void runCheck());
 void listen<{

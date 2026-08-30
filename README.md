@@ -120,10 +120,11 @@ Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
 point.
 
-The Linux Tauri application provides a read-only Inbox, GUI watchlist management, live health
-status, a safe one-shot `Check now` action, and contextual local capabilities for attachments. Its
-Debian package includes the Python engine as a Tauri sidecar, so the installed application does not
-depend on a source checkout or `uv`. It still requires an existing private config; see
+The Linux Tauri application provides a read-only Inbox, GUI watchlist management, safe polling,
+retention and notification settings, live health status, a safe one-shot `Check now` action, and
+contextual local capabilities for attachments. Its Debian package includes the Python engine as a
+Tauri sidecar, so the installed application does not depend on a source checkout or `uv`. It still
+requires an existing private config; see
 [`desktop/README.md`](desktop/README.md). It does not replace Gmail OAuth setup, the systemd
 scheduler, or the existing CLI's optional ntfy delivery.
 

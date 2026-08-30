@@ -9,6 +9,11 @@ single-instance process also polls automatically using `poll_interval_minutes` (
 default) and publishes the next scheduled check in Health. Polling remains disabled when production
 locking or host-owned notification delivery is unsupported by the current configuration.
 
+Settings can safely update polling cadence, message retention, and native-notification enablement
+through the engine contract without exposing TOML or secret-bearing fields to the frontend. A new
+polling cadence takes effect after the app restarts; retention and notification changes are read by
+later watcher operations. Model/gateway settings and credentials remain outside this UI.
+
 Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
 ledger. Open fetches only the selected attachment through the read-only Gmail engine, writes it to a
 mode-0600 file in a process-owned temporary directory, and asks the operating system to open it with
@@ -26,10 +31,10 @@ The host acknowledges an intent only after the platform notification API accepts
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
 window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-tray/autostart behavior, Gmail OAuth, or settings mutation. The existing systemd watcher remains the
-production polling path while equivalent live behavior is evaluated; the production check lock
-continues to fail closed if both schedulers overlap. Scheduled engine processes have a 30-minute
-upper bound, and wall-clock deadline checks catch up after system resume.
+tray/autostart behavior or Gmail OAuth. The existing systemd watcher remains the production polling
+path while equivalent live behavior is evaluated; the production check lock continues to fail
+closed if both schedulers overlap. Scheduled engine processes have a 30-minute upper bound, and
+wall-clock deadline checks catch up after system resume.
 
 ## Development prerequisites
 
