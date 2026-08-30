@@ -21,6 +21,12 @@ class ModelError(RuntimeError):
 MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
 MAX_GATEWAY_REQUEST_BYTES = 1_000_000
 MAX_GATEWAY_TOKEN_BYTES = 16_384
+MAX_GATEWAY_CA_BYTES = 1_000_000
+MAX_GATEWAY_SENDER_CHARS = 320
+MAX_GATEWAY_SUBJECT_CHARS = 4_096
+MAX_GATEWAY_BODY_CHARS = 100_000
+MAX_GATEWAY_ATTACHMENT_COUNT = 100
+MAX_GATEWAY_ATTACHMENT_NAME_CHARS = 512
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 
 
@@ -274,16 +280,23 @@ class GatewayModel:
 
     def _client(self, timeout: float | None = None) -> httpx.Client:
         try:
-            metadata = self.ca_file.stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ModelError("Inference gateway trust root is invalid")
-            if os.name == "posix" and (
-                stat.S_IMODE(metadata.st_mode) & 0o022
-                or metadata.st_uid not in {0, os.geteuid()}
-            ):
-                raise ModelError("Inference gateway trust root is invalid")
-            verify = ssl.create_default_context(cafile=str(self.ca_file))
-        except OSError as exc:
+            with self.ca_file.open("r", encoding="ascii") as stream:
+                metadata = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or not 0 < metadata.st_size <= MAX_GATEWAY_CA_BYTES
+                ):
+                    raise ModelError("Inference gateway trust root is invalid")
+                if os.name == "posix" and (
+                    stat.S_IMODE(metadata.st_mode) & 0o022
+                    or metadata.st_uid not in {0, os.geteuid()}
+                ):
+                    raise ModelError("Inference gateway trust root is invalid")
+                ca_data = stream.read(MAX_GATEWAY_CA_BYTES + 1)
+                if not ca_data or len(ca_data) > MAX_GATEWAY_CA_BYTES:
+                    raise ModelError("Inference gateway trust root is invalid")
+                verify = ssl.create_default_context(cadata=ca_data)
+        except (OSError, UnicodeError, ValueError) as exc:
             raise ModelError("Inference gateway trust root is unavailable") from exc
         return httpx.Client(
             verify=verify,
@@ -411,11 +424,14 @@ class GatewayModel:
                     {
                         "role": "user",
                         "content": _email_prompt(
-                            sender=sender,
-                            subject=subject,
+                            sender=sender[:MAX_GATEWAY_SENDER_CHARS],
+                            subject=subject[:MAX_GATEWAY_SUBJECT_CHARS],
                             received_at=received_at,
-                            body=body,
-                            attachment_names=attachment_names,
+                            body=body[:MAX_GATEWAY_BODY_CHARS],
+                            attachment_names=tuple(
+                                name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS]
+                                for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
+                            ),
                             current_local_time=current_local_time,
                         ),
                     },

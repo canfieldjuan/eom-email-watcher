@@ -41,8 +41,8 @@ def gateway_model(
     requested_ca_files: list[str] = []
     context = ssl.create_default_context()
 
-    def create_context(*, cafile: str):
-        requested_ca_files.append(cafile)
+    def create_context(*, cadata: str):
+        requested_ca_files.append(cadata)
         return context
 
     monkeypatch.setattr(model_module.ssl, "create_default_context", create_context)
@@ -158,8 +158,8 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
     assert result.priority == "high"
     assert [request.method for request in requests] == ["GET", "POST"]
     assert requested_ca_files == [
-        str(tmp_path / "gateway-ca.pem"),
-        str(tmp_path / "gateway-ca.pem"),
+        "test trust root",
+        "test trust root",
     ]
 
 
@@ -328,7 +328,7 @@ def test_gateway_request_and_response_size_limits_fail_closed(
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
     with pytest.raises(ModelError, match="request exceeded"):
-        analyze(model, "x" * 1_000_000)
+        model._request("POST", "/v1/inference", {"value": "x" * 1_000_000})
 
     with pytest.raises(ModelError, match="response exceeded"):
         analyze(model, "short")
@@ -352,6 +352,49 @@ def test_gateway_request_accepts_maximum_configured_multibyte_body(
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
     assert analyze(model, "💩" * 100_000).priority == "high"
+
+
+def test_gateway_bounds_email_metadata_before_request_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    result = model.analyze(
+        sender="💩" * 10_000,
+        subject="💩" * 100_000,
+        received_at="2026-08-29T12:00:00+00:00",
+        body="💩" * 200_000,
+        attachment_names=tuple("💩" * 10_000 for _ in range(1_000)),
+        current_local_time=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+
+    assert result.priority == "high"
+    assert len(requests[0].content) <= model_module.MAX_GATEWAY_REQUEST_BYTES
+    prompt = json.loads(requests[0].content)["generation"]["messages"][1]["content"]
+    email_data = json.loads(prompt.split("Analyze this untrusted email data:\n", 1)[1])
+    assert len(email_data["sender"]) == model_module.MAX_GATEWAY_SENDER_CHARS
+    assert len(email_data["subject"]) == model_module.MAX_GATEWAY_SUBJECT_CHARS
+    assert len(email_data["body"]) == model_module.MAX_GATEWAY_BODY_CHARS
+    assert len(email_data["attachment_filenames"]) == model_module.MAX_GATEWAY_ATTACHMENT_COUNT
+    assert all(
+        len(name) == model_module.MAX_GATEWAY_ATTACHMENT_NAME_CHARS
+        for name in email_data["attachment_filenames"]
+    )
 
 
 def test_gateway_rejects_encoded_response_before_decompression(
