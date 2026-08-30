@@ -355,11 +355,12 @@ def _selection_object(
     return value
 
 
-def _selected_generic_capability(
+def _generic_invocation_selection(
     payload: dict[str, object],
 ) -> tuple[
-    connect.DiscoveredCapability,
-    dict[str, str | int | bool],
+    dict[str, str],
+    dict[str, str],
+    dict[str, object],
     bool,
 ]:
     provider = _selection_object(
@@ -374,6 +375,20 @@ def _selected_generic_capability(
     confirmed = payload.get("confirmed", False)
     if not isinstance(confirmed, bool):
         raise ApiError("invalid_request", "confirmed must be a boolean")
+
+    return (
+        {name: str(provider[name]) for name in ("app_id", "version", "instance_id")},
+        {name: str(capability_ref[name]) for name in ("id", "version")},
+        parameters,
+        confirmed,
+    )
+
+
+def _discover_selected_generic_capability(
+    provider: dict[str, str],
+    capability_ref: dict[str, str],
+    parameters: dict[str, object],
+) -> tuple[connect.DiscoveredCapability, dict[str, str | int | bool]]:
 
     instance_id = str(provider["instance_id"])
     catalog = connect.discover_capabilities(provider_instance_id=instance_id)
@@ -401,7 +416,7 @@ def _selected_generic_capability(
             "The selected local capability is unavailable.",
         )
     selected = matches[0]
-    return selected, connect.validate_capability_parameters(selected, parameters), confirmed
+    return selected, connect.validate_capability_parameters(selected, parameters)
 
 
 def _connect_result(job: ConnectJob) -> dict[str, object]:
@@ -577,6 +592,10 @@ def _run_connect_job(
     try:
         initial = client.submit(job, content) if content is not None else client.get(job)
         persisted = _apply_connect_update(runtime.store, initial)
+        if persisted.status == "completed":
+            return _connect_result(persisted)
+        if persisted.status == "failed":
+            raise _stored_connect_failure(persisted)
         final = client.wait_for_terminal(
             job,
             initial,
@@ -629,6 +648,10 @@ def _run_generic_connect_job(
     try:
         initial = client.submit(job, content) if content is not None else client.get(job)
         persisted = _apply_connect_update(runtime.store, initial)
+        if persisted.status == "completed":
+            return _generic_connect_result(persisted)
+        if persisted.status == "failed":
+            raise _stored_connect_failure(persisted)
         final = client.wait_for_terminal(
             job,
             initial,
@@ -751,23 +774,38 @@ def _tracked_invocation_job(
     return tracked
 
 
-def _generic_job_lookup(
+def _validate_existing_invocation_identity(
+    job: ConnectJob,
+    *,
     message_id: str,
     part_id: str,
-    capability: connect.DiscoveredCapability,
-    job: connect.PreparedCapabilityJob,
-) -> dict[str, object]:
-    return {
-        "message_id": message_id,
-        "part_id": part_id,
-        "capability_id": capability.capability_id,
-        "capability_version": capability.capability_version,
-        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-        "provider_app_id": capability.app_id,
-        "provider_app_version": capability.app_version,
-        "provider_instance_id": capability.instance_id,
-        "request_json": job.request_json,
-    }
+    provider: dict[str, str],
+    capability: dict[str, str],
+    parameters: dict[str, object],
+) -> None:
+    if (
+        job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
+        or job.message_id != message_id
+        or job.part_id != part_id
+        or job.provider_app_id != provider["app_id"]
+        or job.provider_app_version != provider["version"]
+        or job.provider_instance_id != provider["instance_id"]
+        or job.capability_id != capability["id"]
+        or job.capability_version != capability["version"]
+    ):
+        raise ApiError(
+            "request_id_conflict",
+            "The capability request identity belongs to another invocation.",
+        )
+    try:
+        requested_parameters = Store.canonical_connect_parameters(parameters)
+    except ValueError as exc:
+        raise ApiError("invalid_request", "parameters contain unsupported values") from exc
+    if Store.connect_job_parameters(job) != requested_parameters:
+        raise ApiError(
+            "request_id_conflict",
+            "The capability request identity belongs to different parameters.",
+        )
 
 
 def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
@@ -790,7 +828,29 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    capability, parameters, confirmed = _selected_generic_capability(payload)
+    provider_ref, capability_ref, requested_parameters, confirmed = (
+        _generic_invocation_selection(payload)
+    )
+    existing = runtime.store.connect_job(request_id)
+    if existing is not None:
+        _validate_existing_invocation_identity(
+            existing,
+            message_id=message_id,
+            part_id=part_id,
+            provider=provider_ref,
+            capability=capability_ref,
+            parameters=requested_parameters,
+        )
+        if existing.status == "completed":
+            return _generic_connect_result(existing)
+        if existing.status == "failed":
+            raise _stored_connect_failure(existing)
+
+    capability, parameters = _discover_selected_generic_capability(
+        provider_ref,
+        capability_ref,
+        requested_parameters,
+    )
     cached_content: bytes | None = None
 
     def attachment_content() -> bytes:
@@ -809,7 +869,6 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
                 raise GmailError("Gmail attachment size did not match stored metadata")
         return cached_content
 
-    existing = runtime.store.connect_job(request_id)
     if existing is not None:
         _tracked_invocation_job(
             existing,
@@ -818,10 +877,6 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             part_id=part_id,
             parameters=parameters,
         )
-        if existing.status == "completed":
-            return _generic_connect_result(existing)
-        if existing.status == "failed":
-            raise _stored_connect_failure(existing)
         return _resume_generic_connect_job(
             runtime,
             capability,
@@ -849,16 +904,6 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         confirmed=confirmed,
         job_id=request_id,
     )
-    lookup = _generic_job_lookup(message_id, part_id, capability, candidate)
-    active = runtime.store.active_connect_job(**lookup)
-    if active is not None:
-        return _resume_generic_connect_job(
-            runtime,
-            capability,
-            active,
-            attachment_content,
-        )
-
     try:
         runtime.store.create_connect_job(
             job_id=candidate.job_id,
@@ -896,14 +941,6 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
                 runtime,
                 capability,
                 exact,
-                attachment_content,
-            )
-        active = runtime.store.active_connect_job(**lookup)
-        if active is not None:
-            return _resume_generic_connect_job(
-                runtime,
-                capability,
-                active,
                 attachment_content,
             )
         raise
