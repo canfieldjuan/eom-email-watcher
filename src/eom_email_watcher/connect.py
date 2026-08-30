@@ -169,6 +169,9 @@ class _CapabilityDeclarationV2(_WireModel):
 
     @model_validator(mode="after")
     def validate_unique_members(self) -> _CapabilityDeclarationV2:
+        accepted_media_types = [accepted.media_type for accepted in self.accepts]
+        if len(accepted_media_types) != len(set(accepted_media_types)):
+            raise ValueError("accepted media types must be unique")
         parameter_names = [parameter.name for parameter in self.parameters]
         if len(parameter_names) != len(set(parameter_names)):
             raise ValueError("capability parameter names must be unique")

@@ -451,7 +451,7 @@ def test_generic_discovery_rejects_unsafe_registration_before_http(
     assert catalog.diagnostic_code == "provider_unavailable"
 
 
-@pytest.mark.parametrize("duplicate", ["capability", "parameter"])
+@pytest.mark.parametrize("duplicate", ["capability", "accepted_media", "parameter"])
 def test_generic_discovery_rejects_ambiguous_manifest_members(
     tmp_path: Path, duplicate: str
 ) -> None:
@@ -471,7 +471,13 @@ def test_generic_discovery_rejects_ambiguous_manifest_members(
         produces="application/vnd.local-connect.document-summary+json",
     )
     capabilities = [declared, dict(declared)]
-    if duplicate == "parameter":
+    if duplicate == "accepted_media":
+        declared["accepts"] = [
+            {"media_type": "application/pdf", "max_bytes": 1024},
+            {"media_type": "application/pdf", "max_bytes": 2048},
+        ]
+        capabilities = [declared]
+    elif duplicate == "parameter":
         parameter = {
             "name": "mode",
             "value_type": "string",
