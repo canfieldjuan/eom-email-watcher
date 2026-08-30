@@ -6,10 +6,13 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from email.utils import parseaddr
+from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from filelock import FileLock
 from tomlkit import aot, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
@@ -19,6 +22,7 @@ DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 DEFAULT_POLL_INTERVAL_MINUTES = 120
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+GATEWAY_MODEL_LABEL = "Managed by inference gateway"
 
 
 class ConfigError(ValueError):
@@ -55,9 +59,11 @@ class Config:
     gmail_send_token_file: Path
     monthly_hours_recipient: str | None
     database_file: Path
+    model_backend: Literal["loopback", "gateway"]
     model_base_url: str
     model_name: str
     model_api_token_file: Path | None
+    model_ca_file: Path | None
     model_require_auth: bool
     model_timeout_seconds: float
     notifications_enabled: bool
@@ -77,7 +83,7 @@ class Config:
 def _path(value: object, key: str) -> Path:
     if isinstance(value, Path):
         return value.expanduser()
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ConfigError(f"{key} must be a non-empty path")
     return Path(os.path.expandvars(value)).expanduser()
 
@@ -95,6 +101,14 @@ def _valid_domain(domain: str) -> bool:
     return len(ascii_domain) <= 253 and all(
         DOMAIN_LABEL_RE.fullmatch(label) for label in ascii_domain.split(".")
     )
+
+
+def _valid_network_host(host: str) -> bool:
+    try:
+        ip_address(host)
+    except ValueError:
+        return _valid_domain(host)
+    return True
 
 
 def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
@@ -145,6 +159,34 @@ def validate_model_base_url(value: object) -> str:
             "model_base_url must use http with an explicit port on localhost or "
             "127.0.0.1; email bodies may not leave this machine"
         )
+    return base_url
+
+
+def validate_gateway_base_url(value: object) -> str:
+    base_url = str(value).rstrip("/")
+    if any(character.isspace() or not character.isprintable() for character in base_url):
+        raise ConfigError("model_base_url must not contain whitespace or control characters")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+        httpx.URL(base_url)
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise ConfigError("gateway model_base_url must be an HTTPS origin") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or not _valid_network_host(parsed.hostname)
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in base_url
+        or "#" in base_url
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or port is not None
+        and not 1 <= port <= 65_535
+    ):
+        raise ConfigError("gateway model_base_url must be an HTTPS origin")
     return base_url
 
 
@@ -223,17 +265,34 @@ def load_config(path: Path | None = None) -> Config:
     if not 1 <= timeout <= 300:
         raise ConfigError("model_timeout_seconds must be between 1 and 300")
 
-    base_url = validate_model_base_url(
-        data.get("model_base_url", "http://127.0.0.1:1234/v1")
+    backend = data.get("model_backend", "loopback")
+    if not isinstance(backend, str) or backend not in {"loopback", "gateway"}:
+        raise ConfigError("model_backend must be loopback or gateway")
+    raw_base_url = data.get("model_base_url", "http://127.0.0.1:1234/v1")
+    base_url = (
+        validate_gateway_base_url(raw_base_url)
+        if backend == "gateway"
+        else validate_model_base_url(raw_base_url)
     )
     model_name = data.get("model_name")
-    if not isinstance(model_name, str) or not model_name.strip():
-        raise ConfigError("model_name must be set")
-    require_auth = bool(data.get("model_require_auth", True))
+    if backend == "loopback":
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ConfigError("model_name must be set")
+        normalized_model_name = model_name.strip()
+    else:
+        normalized_model_name = GATEWAY_MODEL_LABEL
+    raw_require_auth = data.get("model_require_auth", True)
+    require_auth = bool(raw_require_auth)
+    if backend == "gateway" and raw_require_auth is not True:
+        raise ConfigError("gateway model_require_auth must be true")
     raw_token_file = data.get("model_api_token_file")
     token_file = _path(raw_token_file, "model_api_token_file") if raw_token_file else None
     if require_auth and token_file is None:
         raise ConfigError("model_api_token_file is required when model_require_auth is true")
+    raw_ca_file = data.get("model_ca_file")
+    ca_file = _path(raw_ca_file, "model_ca_file") if raw_ca_file else None
+    if backend == "gateway" and ca_file is None:
+        raise ConfigError("model_ca_file is required when model_backend is gateway")
 
     raw_ntfy_topic = data.get("ntfy_topic")
     ntfy_topic = str(raw_ntfy_topic).strip() if raw_ntfy_topic else None
@@ -273,9 +332,11 @@ def load_config(path: Path | None = None) -> Config:
             data.get("database_file", DEFAULT_STATE / "watcher.sqlite3"),
             "database_file",
         ),
+        model_backend=backend,
         model_base_url=base_url,
-        model_name=model_name.strip(),
+        model_name=normalized_model_name,
         model_api_token_file=token_file,
+        model_ca_file=ca_file,
         model_require_auth=require_auth,
         model_timeout_seconds=timeout,
         notifications_enabled=bool(data.get("notifications_enabled", True)),

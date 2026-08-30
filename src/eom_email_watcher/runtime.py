@@ -5,14 +5,14 @@ from pathlib import Path
 
 from .config import Config, load_config, secure_runtime_paths
 from .db import Store
-from .model import LocalModel
+from .model import GatewayModel, LocalModel, ModelRuntime
 
 
 @dataclass(frozen=True)
 class Runtime:
     config: Config
     store: Store
-    model: LocalModel
+    model: ModelRuntime
 
 
 def load_runtime(config_path: Path) -> Runtime:
@@ -20,11 +20,21 @@ def load_runtime(config_path: Path) -> Runtime:
     secure_runtime_paths(config)
     store = Store(config.database_file)
     store.initialize()
-    model = LocalModel(
-        config.model_base_url,
-        config.model_name,
-        config.model_timeout_seconds,
-        config.model_api_token_file,
-        config.model_require_auth,
-    )
+    if config.model_backend == "gateway":
+        assert config.model_api_token_file is not None
+        assert config.model_ca_file is not None
+        model: ModelRuntime = GatewayModel(
+            config.model_base_url,
+            config.model_timeout_seconds,
+            config.model_api_token_file,
+            config.model_ca_file,
+        )
+    else:
+        model = LocalModel(
+            config.model_base_url,
+            config.model_name,
+            config.model_timeout_seconds,
+            config.model_api_token_file,
+            config.model_require_auth,
+        )
     return Runtime(config=config, store=store, model=model)
