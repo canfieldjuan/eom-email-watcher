@@ -323,6 +323,7 @@ class GatewayModel:
                 if not ca_data or len(ca_data) > MAX_GATEWAY_CA_BYTES:
                     raise ModelError("Inference gateway trust root is invalid")
                 verify = ssl.create_default_context(cadata=ca_data)
+                verify.keylog_filename = None
         except (OSError, UnicodeError, ValueError) as exc:
             raise ModelError("Inference gateway trust root is unavailable") from exc
         return httpx.Client(

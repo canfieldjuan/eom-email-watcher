@@ -176,6 +176,36 @@ def test_gateway_client_disables_environment_proxy_and_redirects(
         assert client._trust_env is False
 
 
+def test_gateway_client_disables_inherited_tls_key_logging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "gateway-token"
+    token_file.write_text("app-credential", encoding="utf-8")
+    token_file.chmod(0o600)
+    ca_file = tmp_path / "gateway-ca.pem"
+    ca_file.write_text("test trust root", encoding="ascii")
+    ca_file.chmod(0o644)
+    context = ssl.create_default_context()
+    context.keylog_filename = str(tmp_path / "tls-keys.log")
+    monkeypatch.setattr(
+        model_module.ssl,
+        "create_default_context",
+        lambda *, cadata: context,
+    )
+    model = GatewayModel(
+        "https://inference.office.internal:8443",
+        30,
+        token_file,
+        ca_file,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})),
+    )
+
+    with model._client():
+        pass
+
+    assert context.keylog_filename is None
+
+
 def test_gateway_health_requires_authorized_email_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
