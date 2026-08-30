@@ -4,8 +4,8 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CheckResult, ConnectCapabilities, ConnectSummaryResult, Engine, EngineError, EngineSettings,
-    GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
+    CheckResult, ConfigInitialization, ConnectCapabilities, ConnectSummaryResult, Engine,
+    EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -47,6 +47,33 @@ impl AttachmentExports {
 #[derive(Serialize)]
 struct OpenedAttachment {
     filename: String,
+}
+
+#[derive(Serialize)]
+struct ConfigStatus {
+    present: bool,
+}
+
+#[tauri::command]
+fn config_status(engine: State<'_, Engine>) -> Result<ConfigStatus, EngineError> {
+    engine
+        .config_present()
+        .map(|present| ConfigStatus { present })
+}
+
+#[tauri::command]
+async fn config_initialize(
+    engine: State<'_, Engine>,
+    timezone: String,
+    model_base_url: String,
+    model_name: String,
+) -> Result<ConfigInitialization, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.initialize_config(timezone, model_base_url, model_name)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -293,6 +320,8 @@ pub fn run() {
             analysis_requeue,
             attachment_open,
             attachment_summarize,
+            config_initialize,
+            config_status,
             connect_capabilities,
             gmail_authorize,
             health_get,

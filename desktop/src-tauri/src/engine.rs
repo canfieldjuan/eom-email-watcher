@@ -221,6 +221,12 @@ pub struct EngineSettings {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfigInitialization {
+    pub created: bool,
+    pub settings: EngineSettings,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
     pub message: String,
@@ -424,6 +430,33 @@ impl Engine {
 
     pub fn settings(&self) -> Result<EngineSettings, EngineError> {
         self.request("settings.get", json!({}))
+    }
+
+    pub fn config_present(&self) -> Result<bool, EngineError> {
+        match std::fs::symlink_metadata(&self.config_path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(EngineError::host(
+                "host_error",
+                "Desktop could not inspect watcher configuration",
+            )),
+        }
+    }
+
+    pub fn initialize_config(
+        &self,
+        timezone: String,
+        model_base_url: String,
+        model_name: String,
+    ) -> Result<ConfigInitialization, EngineError> {
+        self.request(
+            "config.initialize",
+            json!({
+                "model_base_url": model_base_url,
+                "model_name": model_name,
+                "timezone": timezone,
+            }),
+        )
     }
 
     pub fn update_settings(
@@ -671,6 +704,31 @@ mod tests {
     }
 
     #[test]
+    fn config_presence_distinguishes_missing_from_existing_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let engine = Engine::with_command("unused", Vec::new(), config_path.clone());
+
+        assert!(!engine.config_present().expect("inspect missing config"));
+        fs::write(&config_path, "invalid but present").expect("write config marker");
+        assert!(engine.config_present().expect("inspect present config"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_config_symlink_is_present_and_never_treated_as_first_run() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        symlink(directory.path().join("missing-target"), &config_path)
+            .expect("create broken config symlink");
+        let engine = Engine::with_command("unused", Vec::new(), config_path);
+
+        assert!(engine.config_present().expect("inspect broken symlink"));
+    }
+
+    #[test]
     fn protocol_v1_inbox_defaults_attachments_from_older_engines() {
         let item: InboxItem = serde_json::from_value(json!({
             "message_id": "message-1",
@@ -858,6 +916,45 @@ esac"#,
             ],
             config_path,
         )
+    }
+
+    #[test]
+    fn real_engine_initializes_missing_config_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("nested/config.toml");
+        let engine = real_engine(config_path);
+
+        assert!(!engine.config_present().expect("inspect missing config"));
+        assert_eq!(
+            engine
+                .initialize_config(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                )
+                .expect("initialize first-run config"),
+            ConfigInitialization {
+                created: true,
+                settings: EngineSettings {
+                    notifications_enabled: true,
+                    poll_interval_minutes: 120,
+                    polling_supported: true,
+                    retention_days: 180,
+                },
+            }
+        );
+        assert!(engine.config_present().expect("inspect created config"));
+        assert_eq!(
+            engine
+                .initialize_config(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                )
+                .expect_err("existing config must not be replaced")
+                .code,
+            "conflict"
+        );
     }
 
     #[test]

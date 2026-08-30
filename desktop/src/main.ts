@@ -140,6 +140,15 @@ interface WatcherSettings {
   retention_days: number;
 }
 
+interface ConfigStatus {
+  present: boolean;
+}
+
+interface ConfigInitialization {
+  created: boolean;
+  settings: WatcherSettings;
+}
+
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`Required element is missing: ${selector}`);
@@ -234,7 +243,23 @@ app.innerHTML = `
     <section id="settings-view" class="view" aria-labelledby="settings-tab" hidden>
       <h2>Watcher settings</h2>
       <p class="view-lede">Change the everyday controls that are safe to manage from this app.</p>
-      <form id="settings-form" class="settings-form">
+      <form id="config-initialize-form" class="settings-form" hidden>
+        <label>
+          <span>Time zone</span>
+          <input id="initial-timezone" name="timezone" autocomplete="off" required />
+        </label>
+        <label>
+          <span>Local AI endpoint</span>
+          <input id="initial-model-endpoint" name="modelBaseUrl" type="url" placeholder="http://127.0.0.1:8080/v1" autocomplete="url" required />
+        </label>
+        <label>
+          <span>Model identifier</span>
+          <input id="initial-model-name" name="modelName" autocomplete="off" required />
+        </label>
+        <p class="settings-note">The AI endpoint must be an HTTP service on this computer. Gmail connection comes next.</p>
+        <button type="submit">Create watcher configuration</button>
+      </form>
+      <form id="settings-form" class="settings-form" hidden>
         <label>
           <span>Polling cadence <small>minutes</small></span>
           <input id="poll-interval" name="pollIntervalMinutes" type="number" min="1" max="1440" step="1" required />
@@ -285,6 +310,12 @@ const lastCheck = requiredElement<HTMLElement>("#last-check");
 const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
 const pollingCadence = requiredElement<HTMLElement>("#polling-cadence");
 const nextCheck = requiredElement<HTMLElement>("#next-check");
+const configInitializeForm = requiredElement<HTMLFormElement>("#config-initialize-form");
+const initialTimezoneInput = requiredElement<HTMLInputElement>("#initial-timezone");
+const initialModelEndpointInput = requiredElement<HTMLInputElement>(
+  "#initial-model-endpoint",
+);
+const initialModelNameInput = requiredElement<HTMLInputElement>("#initial-model-name");
 const settingsForm = requiredElement<HTMLFormElement>("#settings-form");
 const pollIntervalInput = requiredElement<HTMLInputElement>("#poll-interval");
 const retentionDaysInput = requiredElement<HTMLInputElement>("#retention-days");
@@ -302,6 +333,8 @@ let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
 let connectCapabilities: ConnectCapability[] = [];
 let settingsInFlight = false;
+let configurationReady = false;
+let configInitializationInFlight = false;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -800,6 +833,84 @@ function renderSettings(settings: WatcherSettings): void {
   notificationsEnabledInput.checked = settings.notifications_enabled;
 }
 
+function setConfigInitializationBusy(busy: boolean): void {
+  configInitializationInFlight = busy;
+  for (const control of configInitializeForm.elements) {
+    if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
+      control.disabled = busy;
+    }
+  }
+}
+
+function setConfiguredNavigation(enabled: boolean): void {
+  inboxTab.disabled = !enabled;
+  watchlistTab.disabled = !enabled;
+  healthTab.disabled = !enabled;
+}
+
+function startConfiguredDesktop(): void {
+  configurationReady = true;
+  setConfiguredNavigation(true);
+  configInitializeForm.hidden = true;
+  settingsForm.hidden = false;
+  void loadInbox();
+  void loadHealth();
+  void loadSenders().then((loaded) => {
+    if (loaded) finishOperation();
+  });
+}
+
+async function initializeDesktop(): Promise<void> {
+  setConfiguredNavigation(false);
+  settingsForm.hidden = true;
+  configInitializeForm.hidden = true;
+  try {
+    const status = await invoke<ConfigStatus>("config_status");
+    if (status.present) {
+      startConfiguredDesktop();
+      return;
+    }
+    initialTimezoneInput.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    showView("settings");
+    configInitializeForm.hidden = false;
+    settingsStatus.textContent = "Set the local essentials to create this watcher's configuration.";
+    delete settingsStatus.dataset.kind;
+    initialModelEndpointInput.focus();
+  } catch (error) {
+    showView("settings");
+    settingsStatus.textContent = errorMessage(error);
+    settingsStatus.dataset.kind = "error";
+  }
+}
+
+configInitializeForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void (async () => {
+    if (configInitializationInFlight) return;
+    setConfigInitializationBusy(true);
+    settingsStatus.textContent = "Creating watcher configuration…";
+    delete settingsStatus.dataset.kind;
+    try {
+      const result = await invoke<ConfigInitialization>("config_initialize", {
+        modelBaseUrl: initialModelEndpointInput.value,
+        modelName: initialModelNameInput.value,
+        timezone: initialTimezoneInput.value,
+      });
+      if (!result.created) throw new Error("Watcher configuration was not created.");
+      renderSettings(result.settings);
+      startConfiguredDesktop();
+      settingsStatus.textContent =
+        "Configuration created. Restart the app once to enable automatic polling.";
+      settingsStatus.dataset.kind = "success";
+    } catch (error) {
+      settingsStatus.textContent = errorMessage(error);
+      settingsStatus.dataset.kind = "error";
+    } finally {
+      setConfigInitializationBusy(false);
+    }
+  })();
+});
+
 function setSettingsBusy(busy: boolean): void {
   settingsInFlight = busy;
   for (const control of settingsForm.elements) {
@@ -978,7 +1089,7 @@ healthTab.addEventListener("click", () => {
 });
 settingsTab.addEventListener("click", () => {
   showView("settings");
-  void loadSettings();
+  if (configurationReady) void loadSettings();
 });
 checkNow.addEventListener("click", () => void runCheck());
 gmailAuthorize.addEventListener("click", () => void authorizeGmail());
@@ -1001,9 +1112,7 @@ void listen<{
     }
   }
 });
-window.addEventListener("focus", () => void loadInbox());
-void loadInbox();
-void loadHealth();
-void loadSenders().then((loaded) => {
-  if (loaded) finishOperation();
+window.addEventListener("focus", () => {
+  if (configurationReady) void loadInbox();
 });
+void initializeDesktop();
