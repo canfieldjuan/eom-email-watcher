@@ -10,8 +10,6 @@ from eom_email_watcher.runtime import load_runtime
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
-RACE_JOB_ID = "44444444-4444-4444-8444-444444444444"
-RACE_ARTIFACT_ID = "55555555-5555-4555-8555-555555555555"
 REQUEST_ID = "66666666-6666-4666-8666-666666666666"
 SECOND_REQUEST_ID = "77777777-7777-4777-8777-777777777777"
 TOKEN = "A" * 43
@@ -298,6 +296,13 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         ),
     )
     response = engine_api._response(request)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal request identity must resolve without provider discovery")
+        ),
+    )
     repeated = engine_api._response(request)
     conflict = engine_api._response(
         api_request(
@@ -310,6 +315,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
             ),
         )
     )
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
     second_effect = engine_api._response(
         api_request(
             config_path,
@@ -344,7 +350,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         }
     ]
     assert "payload" not in str(response["data"])
-    assert discovered_instances == [INSTANCE_B] * 5
+    assert discovered_instances == [INSTANCE_B] * 3
     assert [job.job_id for job in submitted] == [REQUEST_ID, SECOND_REQUEST_ID]
     assert [dict(job.parameters) for job in submitted] == [
         {"target-language": "es"},
@@ -425,6 +431,60 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
 
 
+def test_distinct_confirmed_request_ids_remain_distinct_while_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability(external_effects=True, confirmation_required=True)
+    submissions: list[str] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class AmbiguousClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            assert content == PDF
+            submissions.append(job.job_id)
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", AmbiguousClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    for request_id in (REQUEST_ID, SECOND_REQUEST_ID):
+        response = engine_api._response(
+            api_request(
+                config_path,
+                "connect.attachment.invoke",
+                invocation_payload(selected, confirmed=True, request_id=request_id),
+            )
+        )
+        assert response["error"]["code"] == "provider_unavailable"
+
+    assert submissions == [REQUEST_ID, SECOND_REQUEST_ID]
+    with runtime.store.connection() as db:
+        rows = db.execute(
+            "SELECT job_id, status FROM connect_attachment_jobs ORDER BY job_id"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (REQUEST_ID, "requested"),
+        (SECOND_REQUEST_ID, "requested"),
+    ]
+
+
 def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -498,7 +558,84 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     assert raced is True
 
 
-def test_concurrent_identical_click_reuses_the_persisted_winner(
+def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submitted: list[connect.PreparedCapabilityJob] = []
+    wait_calls = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class RacingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            assert content == PDF
+            submitted.append(job)
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+        def get(self, job):
+            return update(job, "accepted")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            nonlocal wait_calls
+            wait_calls += 1
+            raise AssertionError("a durable terminal row must stop provider polling")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", RacingClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    request = api_request(
+        config_path,
+        "connect.attachment.invoke",
+        invocation_payload(selected),
+    )
+    first = engine_api._response(request)
+    real_transition = runtime.store.transition_connect_job
+    raced = False
+
+    def racing_transition(**values):
+        nonlocal raced
+        if not raced and values["next_state"] == "accepted":
+            raced = True
+            terminal = update(submitted[0], "completed", payload=b"Already complete")
+            assert terminal.result is not None
+            real_transition(
+                job_id=submitted[0].job_id,
+                expected_state="requested",
+                next_state="completed",
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+                result=terminal.result.store_dict(),
+            )
+            raise RuntimeError("simulated competing poller completed the job")
+        return real_transition(**values)
+
+    monkeypatch.setattr(runtime.store, "transition_connect_job", racing_transition)
+    second = engine_api._response(request)
+
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["ok"] is True
+    assert second["data"]["job_id"] == REQUEST_ID
+    assert raced is True
+    assert wait_calls == 0
+
+
+def test_concurrent_same_request_id_reuses_the_persisted_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
@@ -525,23 +662,7 @@ def test_concurrent_identical_click_reuses_the_persisted_winner(
             return initial
 
     def race_create(**values):
-        winner = connect.restore_capability_job(
-            selected,
-            job_id=RACE_JOB_ID,
-            artifact_id=RACE_ARTIFACT_ID,
-            media_type="application/pdf",
-            byte_size=len(PDF),
-            sha256=hashlib.sha256(PDF).hexdigest(),
-            filename="invoice.pdf",
-        )
-        real_create(
-            **{
-                **values,
-                "job_id": winner.job_id,
-                "input_artifact_id": winner.artifact.artifact_id,
-                "request_json": winner.request_json,
-            }
-        )
+        real_create(**values)
         real_create(**values)
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
@@ -563,7 +684,7 @@ def test_concurrent_identical_click_reuses_the_persisted_winner(
     )
 
     assert response["ok"] is True
-    assert response["data"]["job_id"] == RACE_JOB_ID
-    assert queried == [RACE_JOB_ID]
+    assert response["data"]["job_id"] == REQUEST_ID
+    assert queried == [REQUEST_ID]
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
