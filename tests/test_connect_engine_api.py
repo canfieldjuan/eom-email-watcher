@@ -265,7 +265,7 @@ def test_provider_failure_is_durable_and_never_masquerades_as_success(
     ) is None
 
 
-def test_provider_crash_after_acceptance_is_persisted_as_failure(
+def test_provider_crash_after_acceptance_remains_active_for_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
@@ -314,10 +314,147 @@ def test_provider_crash_after_acceptance_is_persisted_as_failure(
         capability_id="document.summarize",
         capability_version="1.0",
     )
-    assert active is None
+    assert active is not None
+    assert active.status == "accepted"
     persisted = runtime.store.recent(1)[0]["attachments"][0]["capability_results"][0]
-    assert persisted["status"] == "failed"
-    assert persisted["error"]["retryable"] is True
+    assert persisted["status"] == "accepted"
+    assert "error" not in persisted
+
+
+def test_lost_submit_ack_reuses_identity_and_resubmits_only_after_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    pdf = b"%PDF-1.4\nreal attachment\nEOF"
+    submitted: list[connect.PreparedSummaryJob] = []
+    queried: list[str] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return pdf
+
+    class RecoveringClient:
+        def __init__(self, selected):
+            pass
+
+        def submit(self, job, content):
+            assert content == pdf
+            submitted.append(job)
+            if len(submitted) == 1:
+                raise connect.ConnectError(
+                    "PROVIDER_UNAVAILABLE",
+                    "The provider response was lost.",
+                    retryable=True,
+                )
+            return update(job, "completed", result=summary(job))
+
+        def get(self, job):
+            queried.append(job.job_id)
+            raise connect.ConnectError(
+                "JOB_NOT_FOUND",
+                "The provider did not accept this job.",
+            )
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda: connect.CapabilityDiscovery(provider()),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectClient", RecoveringClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    first = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+    active = runtime.store.active_connect_job(
+        message_id="message-1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+    )
+
+    assert first["error"]["code"] == "provider_unavailable"
+    assert active is not None
+    assert active.status == "requested"
+
+    second = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+
+    assert second["ok"] is True
+    assert queried == [active.job_id]
+    assert [job.job_id for job in submitted] == [active.job_id, active.job_id]
+    assert submitted[0].artifact == submitted[1].artifact
+    assert submitted[0].request == submitted[1].request
+
+
+def test_active_job_is_not_handed_to_a_different_provider_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    original = provider()
+    runtime.store.create_connect_job(
+        job_id="33333333-3333-4333-8333-333333333333",
+        message_id="message-1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id=original.app_id,
+        provider_instance_id=original.instance_id,
+        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        input_media_type="application/pdf",
+        input_byte_size=28,
+        input_sha256="a" * 64,
+    )
+    replacement = connect.ProviderCapability(
+        base_url=original.base_url,
+        token=original.token,
+        app_id=original.app_id,
+        instance_id="99999999-9999-4999-8999-999999999999",
+        max_input_bytes=original.max_input_bytes,
+    )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda: connect.CapabilityDiscovery(replacement),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectClient",
+        lambda provider: (_ for _ in ()).throw(
+            AssertionError("replacement provider must not receive the active job")
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+
+    assert response["error"] == {
+        "code": "provider_unavailable",
+        "message": "The provider for the active local capability job is unavailable.",
+    }
+    assert runtime.store.connect_job("33333333-3333-4333-8333-333333333333").status == (
+        "requested"
+    )
 
 
 def test_simultaneous_submit_returns_structured_in_progress_error(

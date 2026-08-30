@@ -328,17 +328,13 @@ def _connect_result(job: ConnectJob) -> dict[str, object]:
 
 
 def _tracked_job(job: ConnectJob, filename: str) -> connect.PreparedSummaryJob:
-    artifact = connect.ArtifactIdentity(
+    return connect.restore_summary_job(
+        job_id=job.job_id,
         artifact_id=job.input_artifact_id,
         media_type=job.input_media_type,
         byte_size=job.input_byte_size,
         sha256=job.input_sha256,
-    )
-    return connect.PreparedSummaryJob(
-        job_id=job.job_id,
-        artifact=artifact,
-        display_name=filename,
-        request={},
+        filename=filename,
     )
 
 
@@ -425,11 +421,12 @@ def _run_connect_job(
             persisted = runtime.store.connect_job(job.job_id) or persisted
         return _connect_result(persisted)
     except connect.ConnectError as exc:
-        try:
-            _mark_connect_failed(runtime.store, job.job_id, provider, exc)
-        except Exception:
-            logger.exception("Connect failure could not be persisted")
-            raise RuntimeError("Connect failure could not be persisted safely") from exc
+        if not exc.retryable and exc.code != "JOB_NOT_FOUND":
+            try:
+                _mark_connect_failed(runtime.store, job.job_id, provider, exc)
+            except Exception:
+                logger.exception("Connect failure could not be persisted")
+                raise RuntimeError("Connect failure could not be persisted safely") from exc
         raise
 
 
@@ -479,8 +476,23 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         capability_version=connect.CAPABILITY_VERSION,
     )
     if active is not None:
+        if (
+            active.provider_app_id != provider.app_id
+            or active.provider_instance_id != provider.instance_id
+        ):
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
         tracked = _tracked_job(active, attachment.filename)
-        return _run_connect_job(runtime, provider, tracked, None)
+        try:
+            return _run_connect_job(runtime, provider, tracked, None)
+        except connect.ConnectError as exc:
+            if exc.code != "JOB_NOT_FOUND":
+                raise
+        job = tracked
+    else:
+        job = None
 
     gmail = GmailGateway.from_token(
         runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
@@ -488,34 +500,35 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
     if len(content) != attachment.byte_size:
         raise GmailError("Gmail attachment size did not match stored metadata")
-    job = connect.prepare_summary_job(content, attachment.filename)
-    try:
-        runtime.store.create_connect_job(
-            job_id=job.job_id,
-            message_id=message_id,
-            part_id=part_id,
-            capability_id=connect.CAPABILITY_ID,
-            capability_version=connect.CAPABILITY_VERSION,
-            provider_app_id=provider.app_id,
-            provider_instance_id=provider.instance_id,
-            input_artifact_id=job.artifact.artifact_id,
-            input_media_type=job.artifact.media_type,
-            input_byte_size=job.artifact.byte_size,
-            input_sha256=job.artifact.sha256,
-        )
-    except sqlite3.IntegrityError as exc:
-        concurrent = runtime.store.active_connect_job(
-            message_id=message_id,
-            part_id=part_id,
-            capability_id=connect.CAPABILITY_ID,
-            capability_version=connect.CAPABILITY_VERSION,
-        )
-        if concurrent is not None:
-            raise ApiError(
-                "connect_job_in_progress",
-                "A summary job is already in progress for this attachment.",
-            ) from exc
-        raise
+    if job is None:
+        job = connect.prepare_summary_job(content, attachment.filename)
+        try:
+            runtime.store.create_connect_job(
+                job_id=job.job_id,
+                message_id=message_id,
+                part_id=part_id,
+                capability_id=connect.CAPABILITY_ID,
+                capability_version=connect.CAPABILITY_VERSION,
+                provider_app_id=provider.app_id,
+                provider_instance_id=provider.instance_id,
+                input_artifact_id=job.artifact.artifact_id,
+                input_media_type=job.artifact.media_type,
+                input_byte_size=job.artifact.byte_size,
+                input_sha256=job.artifact.sha256,
+            )
+        except sqlite3.IntegrityError as exc:
+            concurrent = runtime.store.active_connect_job(
+                message_id=message_id,
+                part_id=part_id,
+                capability_id=connect.CAPABILITY_ID,
+                capability_version=connect.CAPABILITY_VERSION,
+            )
+            if concurrent is not None:
+                raise ApiError(
+                    "connect_job_in_progress",
+                    "A summary job is already in progress for this attachment.",
+                ) from exc
+            raise
     return _run_connect_job(runtime, provider, job, content)
 
 
