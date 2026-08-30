@@ -8,7 +8,7 @@ import stat
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TextIO
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -256,21 +256,44 @@ class GatewayModel:
         self.ca_file = ca_file
         self.transport = transport
 
+    @staticmethod
+    def _open_readonly(path: Path) -> TextIO:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            return os.fdopen(descriptor, "r", encoding="ascii")
+        except Exception:
+            os.close(descriptor)
+            raise
+
     def _headers(self) -> dict[str, str]:
         try:
-            metadata = self.api_token_file.stat()
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or not 0 < metadata.st_size <= MAX_GATEWAY_TOKEN_BYTES
-                or os.name == "posix"
-                and stat.S_IMODE(metadata.st_mode) & 0o077
-            ):
-                raise ModelError("Inference gateway credential is invalid")
-            token = self.api_token_file.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeError) as exc:
+            with self._open_readonly(self.api_token_file) as stream:
+                metadata = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or not 0 < metadata.st_size <= MAX_GATEWAY_TOKEN_BYTES
+                    or os.name == "posix"
+                    and (
+                        stat.S_IMODE(metadata.st_mode) & 0o077
+                        or metadata.st_uid not in {0, os.geteuid()}
+                    )
+                ):
+                    raise ModelError("Inference gateway credential is invalid")
+                token = stream.read(MAX_GATEWAY_TOKEN_BYTES + 1).strip()
+        except OSError as exc:
             raise ModelError("Inference gateway credential is unavailable") from exc
-        if not token or not token.isascii() or any(
+        except UnicodeError as exc:
+            raise ModelError("Inference gateway credential is invalid") from exc
+        if (
+            not token
+            or len(token) > MAX_GATEWAY_TOKEN_BYTES
+            or not token.isascii()
+            or any(
             character.isspace() or not character.isprintable() for character in token
+            )
         ):
             raise ModelError("Inference gateway credential is invalid")
         return {
@@ -280,7 +303,7 @@ class GatewayModel:
 
     def _client(self, timeout: float | None = None) -> httpx.Client:
         try:
-            with self.ca_file.open("r", encoding="ascii") as stream:
+            with self._open_readonly(self.ca_file) as stream:
                 metadata = os.fstat(stream.fileno())
                 if (
                     not stat.S_ISREG(metadata.st_mode)

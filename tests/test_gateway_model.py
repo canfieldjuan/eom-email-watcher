@@ -1,4 +1,5 @@
 import json
+import os
 import ssl
 from datetime import UTC, datetime
 from pathlib import Path
@@ -561,3 +562,18 @@ def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -
     ok, detail = model.health()
     assert ok is False
     assert detail == "Inference gateway trust root is invalid"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO probe is POSIX-specific")
+def test_gateway_rejects_fifo_credential_without_blocking(tmp_path: Path) -> None:
+    token_file = tmp_path / "gateway-token"
+    os.mkfifo(token_file, mode=0o600)
+    model = GatewayModel(
+        "https://inference.office.internal",
+        30,
+        token_file,
+        tmp_path / "gateway-ca.pem",
+    )
+
+    with pytest.raises(ModelError, match="credential is invalid"):
+        model._headers()
