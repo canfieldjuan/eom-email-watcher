@@ -58,6 +58,17 @@ async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, Engin
 }
 
 #[tauri::command]
+async fn analysis_requeue(
+    engine: State<'_, Engine>,
+    message_id: String,
+) -> Result<(), EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.requeue_analysis(message_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn attachment_open(
     app: AppHandle,
     engine: State<'_, Engine>,
@@ -248,6 +259,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            analysis_requeue,
             attachment_open,
             attachment_summarize,
             connect_capabilities,

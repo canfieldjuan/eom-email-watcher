@@ -174,6 +174,20 @@ def _recent(request: dict[str, object]) -> dict[str, object]:
     return {"items": rows}
 
 
+def _analysis_requeue(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_id"})
+    message_id = payload.get("message_id")
+    if not isinstance(message_id, str) or not message_id.strip():
+        raise ApiError("invalid_request", "message_id must be a non-empty string")
+    try:
+        status = _runtime(request).store.requeue_analysis(message_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Message was not found") from exc
+    except RuntimeError as exc:
+        raise ApiError("conflict", str(exc)) from exc
+    return {"status": status}
+
+
 def _attachment_destination(value: object) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ApiError("invalid_request", "destination_dir must be a non-empty string")
@@ -599,6 +613,7 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 
 
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
+    "analysis.requeue": _analysis_requeue,
     "attachment.export": _attachment_export,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,

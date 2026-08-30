@@ -48,6 +48,7 @@ only to stderr.
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
+| `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
 | `connect.capabilities` | `{}` | Compatible capability declarations available now; provider identity and bearer token are not exposed |
 | `connect.attachment.summarize` | `message_id`, `part_id` | Explicitly fetch and hand off one inventoried PDF; return or reuse the durable terminal result |
@@ -76,6 +77,13 @@ existing read-only Gmail authorization, rejects a byte-count mismatch, and creat
 mode-0600 file that uses at most a validated alphanumeric extension from the email filename. The
 response path is host-only; the Tauri command opens it natively and does not return it to frontend
 JavaScript.
+
+Inbox rows also expose `analysis_retryable`, `analysis_error_code`, and
+`analysis_retry_after_seconds`. A retryable gateway failure remains scheduled in the durable
+message ledger using the server delay when present. A permanent failure remains visible but is not
+automatically selected by later checks. `analysis.requeue` accepts only such a permanently paused
+row, clears its prior request identity and retry directives, and makes it eligible for a fresh
+attempt. It does not acknowledge or discard a pending fallback notification.
 
 `connect.capabilities` performs live runtime discovery. Zero providers returns an empty list,
 exactly one compatible provider returns `document.summarize` version `1.0`, and multiple providers

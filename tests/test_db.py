@@ -256,6 +256,77 @@ def test_retry_is_not_immediately_due(tmp_path: Path) -> None:
     assert len(store.pending(now=datetime.now(UTC) + timedelta(minutes=6))) == 1
 
 
+def test_analysis_request_and_server_retry_delay_survive_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "db.sqlite3"
+    store = Store(database)
+    store.initialize()
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+    )
+    now = datetime(2026, 8, 29, 13, 0, tzinfo=UTC)
+
+    first = store.reserve_analysis_request("m1", 20_000, now)
+    reopened = Store(database)
+    reopened.initialize()
+    second = reopened.reserve_analysis_request(
+        "m1", 99_999, now + timedelta(hours=1)
+    )
+
+    assert second == first
+    reopened.record_analysis_failure(
+        "m1",
+        "Inference gateway error: capacity_limited",
+        0,
+        retryable=True,
+        error_code="capacity_limited",
+        retry_after_seconds=90,
+        now=now,
+    )
+    assert reopened.pending(now=now + timedelta(seconds=89)) == []
+    due = reopened.pending(now=now + timedelta(seconds=90))[0]
+    assert due.analysis_request_id == first.request_id
+    recent = reopened.recent(1)[0]
+    assert recent["analysis_retryable"] == 1
+    assert recent["analysis_error_code"] == "capacity_limited"
+    assert recent["analysis_retry_after_seconds"] == 90
+
+
+def test_permanent_analysis_failure_requires_explicit_requeue(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+    )
+    first = store.reserve_analysis_request("m1", 20_000)
+    store.record_analysis_failure(
+        "m1",
+        "Inference gateway error: forbidden",
+        0,
+        retryable=False,
+        error_code="forbidden",
+    )
+
+    assert store.pending(now=datetime.now(UTC) + timedelta(days=365)) == []
+    assert store.notification_intents()[0].kind == "fallback"
+    assert store.requeue_analysis("m1") == "requeued"
+    assert store.notification_intents()[0].kind == "fallback"
+    assert store.pending()[0].analysis_request_id is None
+    with pytest.raises(RuntimeError, match="permanently paused"):
+        store.requeue_analysis("m1")
+    second = store.reserve_analysis_request("m1", 20_000)
+    assert second.request_id != first.request_id
+
+
 def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     database.parent.mkdir(parents=True)
@@ -312,7 +383,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
@@ -357,7 +428,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),

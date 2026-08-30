@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -11,7 +12,14 @@ from pathlib import Path
 
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+
+@dataclass(frozen=True)
+class AnalysisRequest:
+    request_id: str
+    context_at: str
+    body_char_limit: int
 
 
 @dataclass(frozen=True)
@@ -24,6 +32,9 @@ class PendingMessage:
     received_at: str
     attempts: int
     fallback_notified_at: str | None
+    analysis_request_id: str | None
+    analysis_context_at: str | None
+    analysis_body_char_limit: int | None
 
 
 @dataclass(frozen=True)
@@ -135,6 +146,12 @@ class Store:
                     analysis_at TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_retry_at TEXT,
+                    analysis_request_id TEXT,
+                    analysis_context_at TEXT,
+                    analysis_body_char_limit INTEGER,
+                    analysis_retryable INTEGER,
+                    analysis_error_code TEXT,
+                    analysis_retry_after_seconds INTEGER,
                     fallback_notified_at TEXT,
                     notified_at TEXT,
                     category TEXT,
@@ -274,6 +291,17 @@ class Store:
             }
             if "analysis_at" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN analysis_at TEXT")
+            migrations = {
+                "analysis_request_id": "TEXT",
+                "analysis_context_at": "TEXT",
+                "analysis_body_char_limit": "INTEGER",
+                "analysis_retryable": "INTEGER",
+                "analysis_error_code": "TEXT",
+                "analysis_retry_after_seconds": "INTEGER",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -647,12 +675,51 @@ class Store:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT message_id, thread_id, sender, sender_name, subject, received_at,
-                attempts, fallback_notified_at FROM messages
-                WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                attempts, fallback_notified_at, analysis_request_id, analysis_context_at,
+                analysis_body_char_limit FROM messages
+                WHERE status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
+                AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY received_at LIMIT ?""",
                 (stamp, limit),
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
+
+    def reserve_analysis_request(
+        self,
+        message_id: str,
+        body_char_limit: int,
+        now: datetime | None = None,
+    ) -> AnalysisRequest:
+        if body_char_limit < 1:
+            raise ValueError("body_char_limit must be positive")
+        request_id = str(uuid.uuid4())
+        context_at = (now or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT status, analysis_request_id, analysis_context_at,
+                analysis_body_char_limit FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(message_id)
+            if row["status"] != "pending":
+                raise RuntimeError("Analysis request can only be reserved for a pending message")
+            values = (
+                row["analysis_request_id"],
+                row["analysis_context_at"],
+                row["analysis_body_char_limit"],
+            )
+            if all(value is None for value in values):
+                db.execute(
+                    """UPDATE messages SET analysis_request_id = ?, analysis_context_at = ?,
+                    analysis_body_char_limit = ? WHERE message_id = ? AND status = 'pending'""",
+                    (request_id, context_at, body_char_limit, message_id),
+                )
+                return AnalysisRequest(request_id, context_at, body_char_limit)
+            if any(value is None for value in values):
+                raise RuntimeError("Pending message has incomplete analysis request state")
+            return AnalysisRequest(str(values[0]), str(values[1]), int(values[2]))
 
     def pending_delivery(
         self, now: datetime | None = None, limit: int = 25
@@ -680,6 +747,68 @@ class Store:
                 (retry.isoformat(), error[:500], message_id),
             )
 
+    def record_analysis_failure(
+        self,
+        message_id: str,
+        error: str,
+        attempts: int,
+        *,
+        retryable: bool,
+        error_code: str | None = None,
+        retry_after_seconds: int | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        if retry_after_seconds is not None and retry_after_seconds < 1:
+            raise ValueError("retry_after_seconds must be positive")
+        current = now or datetime.now(UTC)
+        if retryable:
+            if retry_after_seconds is None:
+                delays = (5, 15, 60, 360, 1440)
+                next_retry = current + timedelta(minutes=delays[min(attempts, len(delays) - 1)])
+            else:
+                next_retry = current + timedelta(seconds=retry_after_seconds)
+        else:
+            next_retry = None
+        with self.connection() as db:
+            cursor = db.execute(
+                """UPDATE messages SET attempts = attempts + 1, next_retry_at = ?,
+                last_error = ?, analysis_retryable = ?, analysis_error_code = ?,
+                analysis_retry_after_seconds = ?
+                WHERE message_id = ? AND status = 'pending'""",
+                (
+                    next_retry.isoformat() if next_retry else None,
+                    error[:500],
+                    int(retryable),
+                    error_code,
+                    retry_after_seconds,
+                    message_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Analysis failure target is no longer pending")
+
+    def requeue_analysis(self, message_id: str) -> str:
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT status, analysis_retryable
+                FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(message_id)
+            if row["status"] != "pending" or row["analysis_retryable"] != 0:
+                raise RuntimeError("Message does not have a permanently paused analysis")
+            db.execute(
+                """UPDATE messages SET attempts = 0, next_retry_at = NULL,
+                analysis_request_id = NULL, analysis_context_at = NULL,
+                analysis_body_char_limit = NULL, analysis_retryable = NULL,
+                analysis_error_code = NULL, analysis_retry_after_seconds = NULL
+                WHERE message_id = ?""",
+                (message_id,),
+            )
+        return "requeued"
+
     def mark_fallback_notified(self, message_id: str) -> None:
         with self.connection() as db:
             db.execute(
@@ -691,7 +820,10 @@ class Store:
         with self.connection() as db:
             db.execute(
                 """UPDATE messages SET status='skipped', next_retry_at=NULL,
-                last_error='message unavailable (skipped)' WHERE message_id = ?""",
+                last_error='message unavailable (skipped)', analysis_request_id=NULL,
+                analysis_context_at=NULL, analysis_body_char_limit=NULL,
+                analysis_retryable=NULL, analysis_error_code=NULL,
+                analysis_retry_after_seconds=NULL WHERE message_id = ?""",
                 (message_id,),
             )
 
@@ -699,7 +831,10 @@ class Store:
         with self.connection() as db:
             db.execute(
                 """UPDATE messages SET status='analyzed', analysis_at=?, attempts=0,
-                next_retry_at=NULL, last_error=NULL,
+                next_retry_at=NULL, last_error=NULL, analysis_request_id=NULL,
+                analysis_context_at=NULL, analysis_body_char_limit=NULL,
+                analysis_retryable=NULL, analysis_error_code=NULL,
+                analysis_retry_after_seconds=NULL,
                 category=?, priority=?, summary=?, action_required=?, suggested_action=?,
                 deadline_text=?, deadline_iso=?, confidence=? WHERE message_id=?""",
                 (
@@ -803,11 +938,15 @@ class Store:
                 """SELECT message_id, received_at, sender, sender_name, subject, status,
                 analysis_at, priority, summary, action_required, suggested_action,
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
-                fallback_notified_at, notified_at, last_error
+                fallback_notified_at, notified_at, last_error, analysis_retryable,
+                analysis_error_code, analysis_retry_after_seconds
                 FROM messages ORDER BY received_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
             items = [dict(row) for row in rows]
+            for item in items:
+                if item["analysis_retryable"] is not None:
+                    item["analysis_retryable"] = bool(item["analysis_retryable"])
             if not items:
                 return []
             message_ids = [str(item["message_id"]) for item in items]

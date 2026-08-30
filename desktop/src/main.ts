@@ -72,6 +72,9 @@ interface InboxItem {
   fallback_notified_at: string | null;
   notified_at: string | null;
   last_error: string | null;
+  analysis_retryable: boolean | null;
+  analysis_error_code: string | null;
+  analysis_retry_after_seconds: number | null;
   attachments: InboxAttachment[];
 }
 
@@ -292,6 +295,7 @@ function stateLabel(item: InboxItem): string {
   if (item.status === "skipped") return "Message unavailable";
   if (item.last_error) {
     if (item.status === "analyzed") return "Notification retry queued";
+    if (item.analysis_retryable === false) return "Analysis paused";
     return "Analysis retry queued";
   }
   if (item.status === "analyzed") return "Ready to notify";
@@ -491,6 +495,29 @@ function renderInbox(items: InboxItem[]): void {
     const state = document.createElement("span");
     state.textContent = stateLabel(item);
     footer.append(badge, state);
+    if (item.status === "pending" && item.analysis_retryable === false) {
+      const retryButton = document.createElement("button");
+      retryButton.type = "button";
+      retryButton.textContent = "Retry analysis";
+      retryButton.addEventListener("click", async () => {
+        retryButton.disabled = true;
+        retryButton.textContent = "Retrying…";
+        delete inboxStatus.dataset.kind;
+        inboxStatus.textContent = `Requeueing analysis for ${item.subject}…`;
+        try {
+          await invoke("analysis_requeue", { messageId: item.message_id });
+          await loadInbox();
+          inboxStatus.textContent = `Analysis requeued for ${item.subject}.`;
+          inboxStatus.dataset.kind = "success";
+        } catch (error) {
+          retryButton.disabled = false;
+          retryButton.textContent = "Retry analysis";
+          inboxStatus.textContent = errorMessage(error);
+          inboxStatus.dataset.kind = "error";
+        }
+      });
+      footer.append(retryButton);
+    }
 
     card.append(meta, subject, summary);
     if (details.childElementCount) card.append(details);

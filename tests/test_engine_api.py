@@ -118,6 +118,52 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Subject",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.reserve_analysis_request("m1", 20_000)
+    runtime.store.record_analysis_failure(
+        "m1",
+        "Inference gateway error: forbidden",
+        0,
+        retryable=False,
+        error_code="forbidden",
+    )
+
+    inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
+    assert inbox["data"]["items"][0]["analysis_retryable"] is False
+    assert inbox["data"]["items"][0]["analysis_error_code"] == "forbidden"
+
+    requeued = engine_api._response(
+        request(config_path, "analysis.requeue", {"message_id": "m1"})
+    )
+    assert requeued["data"] == {"status": "requeued"}
+    assert runtime.store.pending()[0].analysis_request_id is None
+    refreshed = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
+    assert refreshed["data"]["items"][0]["analysis_retryable"] is None
+
+    duplicate = engine_api._response(
+        request(config_path, "analysis.requeue", {"message_id": "m1"})
+    )
+    assert duplicate["error"]["code"] == "conflict"
+
+    missing = engine_api._response(
+        request(config_path, "analysis.requeue", {"message_id": "missing"})
+    )
+    assert missing["error"]["code"] == "not_found"
+
+
 def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, include_senders=False)
