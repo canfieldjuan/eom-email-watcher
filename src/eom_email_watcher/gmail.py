@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -23,6 +24,7 @@ from .config import normalize_address
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
 GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
+BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 
 
 class GmailError(RuntimeError):
@@ -41,6 +43,22 @@ class MessageUnavailable(GmailError):
     """A specific message could not be fetched -- e.g. it was deleted or
     expunged after the history event that referenced it. Recoverable: the
     caller should skip this one message, not fail the whole run."""
+
+
+def resolve_gmail_credentials_file(configured_file: Path) -> Path:
+    """Prefer an explicit operator file, then a packaged desktop client."""
+    if configured_file.is_file():
+        return configured_file
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if isinstance(bundle_root, str):
+        bundled_file = Path(bundle_root) / BUNDLED_GOOGLE_OAUTH_CLIENT
+        if bundled_file.is_file():
+            return bundled_file
+    return configured_file
+
+
+def gmail_credentials_configured(configured_file: Path) -> bool:
+    return resolve_gmail_credentials_file(configured_file).is_file()
 
 
 @dataclass(frozen=True)
@@ -125,7 +143,8 @@ class GmailGateway:
 
     @classmethod
     def from_token(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
-        if not credentials_file.exists():
+        resolved_credentials_file = resolve_gmail_credentials_file(credentials_file)
+        if not resolved_credentials_file.is_file():
             raise GmailError(
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Download them from Google Cloud Console after enabling Gmail API."
@@ -166,7 +185,8 @@ class GmailGateway:
         *,
         force_reauthorize: bool = False,
     ) -> tuple[GmailGateway, bool]:
-        if not credentials_file.exists():
+        resolved_credentials_file = resolve_gmail_credentials_file(credentials_file)
+        if not resolved_credentials_file.is_file():
             raise GmailError(
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Enable Gmail API and place the downloaded JSON at that path."
@@ -193,7 +213,7 @@ class GmailGateway:
                 authorization_changed = not credentials or not credentials.valid
                 if authorization_changed:
                     flow = InstalledAppFlow.from_client_secrets_file(
-                        str(credentials_file), SCOPES
+                        str(resolved_credentials_file), SCOPES
                     )
                     try:
                         credentials = flow.run_local_server(

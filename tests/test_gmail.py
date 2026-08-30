@@ -11,6 +11,7 @@ from eom_email_watcher.gmail import (
     GmailError,
     GmailGateway,
     parse_metadata,
+    resolve_gmail_credentials_file,
 )
 
 
@@ -79,6 +80,75 @@ class FakeService:
 
 def encoded(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def test_explicit_gmail_credentials_override_bundled_client(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_file = tmp_path / "configured.json"
+    configured_file.write_text("{}", encoding="utf-8")
+    bundle_root = tmp_path / "bundle"
+    bundled_file = bundle_root / gmail_module.BUNDLED_GOOGLE_OAUTH_CLIENT
+    bundled_file.parent.mkdir(parents=True)
+    bundled_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+    assert resolve_gmail_credentials_file(configured_file) == configured_file
+
+
+def test_missing_explicit_gmail_credentials_use_bundled_client(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_file = tmp_path / "missing.json"
+    bundle_root = tmp_path / "bundle"
+    bundled_file = bundle_root / gmail_module.BUNDLED_GOOGLE_OAUTH_CLIENT
+    bundled_file.parent.mkdir(parents=True)
+    bundled_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module.sys, "_MEIPASS", str(bundle_root), raising=False)
+
+    assert resolve_gmail_credentials_file(configured_file) == bundled_file
+
+
+def test_missing_explicit_and_bundled_credentials_preserve_configured_path(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_file = tmp_path / "missing.json"
+    monkeypatch.delattr(gmail_module.sys, "_MEIPASS", raising=False)
+
+    assert resolve_gmail_credentials_file(configured_file) == configured_file
+
+
+def test_authorize_uses_bundled_client_without_copying_it_to_local_state(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_file = tmp_path / "missing.json"
+    token_file = tmp_path / "token.json"
+    bundle_root = tmp_path / "bundle"
+    bundled_file = bundle_root / gmail_module.BUNDLED_GOOGLE_OAUTH_CLIENT
+    bundled_file.parent.mkdir(parents=True)
+    bundled_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module.sys, "_MEIPASS", str(bundle_root), raising=False)
+    credentials = SimpleNamespace(valid=True, to_json=lambda: "local account token")
+    flow = SimpleNamespace(run_local_server=lambda **kwargs: credentials)
+    opened_client_files: list[str] = []
+
+    def open_client_file(path: str, scopes: tuple[str, ...]):
+        opened_client_files.append(path)
+        assert scopes == gmail_module.SCOPES
+        return flow
+
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        open_client_file,
+    )
+    monkeypatch.setattr(gmail_module, "build", lambda *args, **kwargs: object())
+
+    GmailGateway.authorize(configured_file, token_file)
+
+    assert opened_client_files == [str(bundled_file)]
+    assert not configured_file.exists()
+    assert token_file.read_text(encoding="utf-8") == "local account token"
 
 
 def test_attachment_bytes_uses_gmail_attachment_identity() -> None:

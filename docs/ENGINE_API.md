@@ -65,11 +65,14 @@ only to stderr.
 `gmail.authorize` uses only the existing `gmail.readonly` authorization and never returns OAuth
 credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
 at the current mailbox state. Reusing an existing valid token preserves an existing history cursor;
-if watcher state is missing, the operation initializes it from the current mailbox state. The
-configured desktop OAuth credentials file remains a prerequisite. Token access serializes the
-entire browser authorization flow and rechecks token state under that lock, so an overlapping setup
-reuses the completed token instead of opening another browser flow or racing token replacement. The
-engine also serializes authorization through mailbox-baseline persistence, so overlapping first-run
+if watcher state is missing, the operation initializes it from the current mailbox state. The OAuth
+client identity may come from an explicit configured Desktop-client credentials file or, when that
+file is absent, from a release-packaged client identity. Development builds without a packaged
+identity still require the configured file. Account tokens are never read from the packaged
+identity and remain in the user's private local state. Token access serializes the entire browser
+authorization flow and rechecks token state under that lock, so an overlapping setup reuses the
+completed token instead of opening another browser flow or racing token replacement. The engine
+also serializes authorization through mailbox-baseline persistence, so overlapping first-run
 requests cannot advance the initial history cursor twice. An unusable stored token causes this
 explicit authorization operation to run the browser flow and replace the token only after that flow
 succeeds. A locally valid token is also probed against Gmail; an HTTP 401 triggers the same explicit
