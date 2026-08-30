@@ -67,8 +67,11 @@ at the current mailbox state. Reusing an existing valid token preserves an exist
 if watcher state is missing, the operation initializes it from the current mailbox state. The
 configured desktop OAuth credentials file remains a prerequisite. Token access serializes the
 entire browser authorization flow and rechecks token state under that lock, so an overlapping setup
-reuses the completed token instead of opening another browser flow or racing token replacement.
-This operation does not expose or request the separate EOM `gmail.send` capability.
+reuses the completed token instead of opening another browser flow or racing token replacement. The
+engine also serializes authorization through mailbox-baseline persistence, so overlapping first-run
+requests cannot advance the initial history cursor twice. An unusable stored token causes this
+explicit authorization operation to run the browser flow and replace the token only after that flow
+succeeds. This operation does not expose or request the separate EOM `gmail.send` capability.
 
 Watchlist mutation is serialized and uses same-directory atomic replacement through the engine; the
 frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an

@@ -130,13 +130,8 @@ def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
-        "authorize",
-        lambda credentials_file, token_file: AuthorizedGmail(),
-    )
-    monkeypatch.setattr(
-        engine_api.GmailGateway,
-        "from_token",
-        lambda *args: (_ for _ in ()).throw(AssertionError("new setup must authorize")),
+        "authorize_with_status",
+        lambda credentials_file, token_file: (AuthorizedGmail(), True),
     )
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
@@ -166,13 +161,8 @@ def test_gmail_authorize_preserves_existing_baseline(
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
-        "from_token",
-        lambda credentials_file, token_file: ExistingGmail(),
-    )
-    monkeypatch.setattr(
-        engine_api.GmailGateway,
-        "authorize",
-        lambda *args: (_ for _ in ()).throw(AssertionError("existing setup must reuse token")),
+        "authorize_with_status",
+        lambda credentials_file, token_file: (ExistingGmail(), False),
     )
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
@@ -195,14 +185,68 @@ def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
-        "from_token",
-        lambda credentials_file, configured_token_file: ExistingGmail(),
+        "authorize_with_status",
+        lambda credentials_file, configured_token_file: (ExistingGmail(), False),
     )
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
 
     assert response["data"] == {"baseline_initialized": True, "connected": True}
     assert load_runtime(config_path).store.state()[0] == "current-history-id"
+
+
+def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    lock_held = False
+
+    class AuthorizationLock:
+        def __init__(self, path: str, timeout: int):
+            assert path.endswith("watcher.sqlite3.gmail-authorize.lock")
+            assert timeout == engine_api.GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS
+
+        def __enter__(self):
+            nonlocal lock_held
+            lock_held = True
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            nonlocal lock_held
+            lock_held = False
+
+    class AuthorizedGmail:
+        def profile_history_id(self) -> str:
+            assert lock_held
+            return "serialized-history-id"
+
+    original_state = runtime.store.state
+    original_set_state = runtime.store.set_state
+
+    def state():
+        assert lock_held
+        return original_state()
+
+    def set_state(history_id: str):
+        assert lock_held
+        original_set_state(history_id)
+
+    monkeypatch.setattr(engine_api, "FileLock", AuthorizationLock)
+    monkeypatch.setattr(engine_api, "_runtime", lambda request: runtime)
+    monkeypatch.setattr(runtime.store, "state", state)
+    monkeypatch.setattr(runtime.store, "set_state", set_state)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        lambda credentials_file, token_file: (AuthorizedGmail(), True),
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    assert lock_held is False
+    assert original_state()[0] == "serialized-history-id"
 
 
 def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -> None:

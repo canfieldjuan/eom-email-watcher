@@ -174,3 +174,62 @@ def test_authorize_reuses_a_token_found_after_lock_acquisition(
     gateway = GmailGateway.authorize(credentials_file, token_file)
 
     assert gateway.service is service
+
+
+@pytest.mark.parametrize("stored_token", ["malformed", "unusable", "revoked"])
+def test_authorize_replaces_an_unusable_existing_token(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, stored_token: str
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("unusable token", encoding="utf-8")
+
+    if stored_token == "malformed":
+        stored_credentials = None
+
+        def load_credentials(path, scopes):
+            raise ValueError("malformed token")
+
+    elif stored_token == "unusable":
+        stored_credentials = SimpleNamespace(valid=False, expired=False, refresh_token=None)
+
+        def load_credentials(path, scopes):
+            return stored_credentials
+
+    else:
+        def rejected_refresh(request):
+            raise gmail_module.RefreshError("revoked token")
+
+        stored_credentials = SimpleNamespace(
+            valid=False,
+            expired=True,
+            refresh_token="refresh-token",
+            refresh=rejected_refresh,
+        )
+
+        def load_credentials(path, scopes):
+            return stored_credentials
+
+    replacement = SimpleNamespace(valid=True, to_json=lambda: "replacement token")
+    flow = SimpleNamespace(run_local_server=lambda **kwargs: replacement)
+    service = object()
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        load_credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: flow,
+    )
+    monkeypatch.setattr(gmail_module, "build", lambda *args, **kwargs: service)
+
+    gateway, authorization_changed = GmailGateway.authorize_with_status(
+        credentials_file, token_file
+    )
+
+    assert gateway.service is service
+    assert authorization_changed is True
+    assert token_file.read_text(encoding="utf-8") == "replacement token"

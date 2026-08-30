@@ -11,6 +11,7 @@ from typing import Any
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -147,6 +148,15 @@ class GmailGateway:
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
+        gateway, _authorization_changed = cls.authorize_with_status(
+            credentials_file, token_file
+        )
+        return gateway
+
+    @classmethod
+    def authorize_with_status(
+        cls, credentials_file: Path, token_file: Path
+    ) -> tuple[GmailGateway, bool]:
         if not credentials_file.exists():
             raise GmailError(
                 f"OAuth desktop credentials not found: {credentials_file}. "
@@ -155,20 +165,24 @@ class GmailGateway:
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                credentials: Credentials | None = None
                 if token_file.exists():
                     try:
                         credentials = Credentials.from_authorized_user_file(
                             str(token_file), SCOPES
                         )
-                    except (ValueError, json.JSONDecodeError) as exc:
-                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
-                    if credentials.expired and credentials.refresh_token:
-                        credentials.refresh(Request())
-                        token_file.write_text(credentials.to_json(), encoding="utf-8")
-                        token_file.chmod(0o600)
-                    if not credentials.valid:
-                        raise GmailError("Gmail is not authorized. Run setup again")
-                else:
+                    except (ValueError, json.JSONDecodeError):
+                        credentials = None
+                    if credentials and credentials.expired and credentials.refresh_token:
+                        try:
+                            credentials.refresh(Request())
+                        except RefreshError:
+                            credentials = None
+                        else:
+                            token_file.write_text(credentials.to_json(), encoding="utf-8")
+                            token_file.chmod(0o600)
+                authorization_changed = not credentials or not credentials.valid
+                if authorization_changed:
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(credentials_file), SCOPES
                     )
@@ -179,7 +193,10 @@ class GmailGateway:
                     token_file.chmod(0o600)
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry setup") from exc
-        return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
+        return (
+            cls(build("gmail", "v1", credentials=credentials, cache_discovery=False)),
+            authorization_changed,
+        )
 
     def profile_history_id(self) -> str:
         try:
