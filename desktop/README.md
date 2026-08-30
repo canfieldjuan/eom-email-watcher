@@ -31,10 +31,12 @@ The host acknowledges an intent only after the platform notification API accepts
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
 window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-tray/autostart behavior or Gmail OAuth. The existing systemd watcher remains the production polling
-path while equivalent live behavior is evaluated; the production check lock continues to fail
-closed if both schedulers overlap. Scheduled engine processes have a 30-minute upper bound, and
-wall-clock deadline checks catch up after system resume.
+tray/autostart behavior or Google OAuth client provisioning. When an OAuth desktop-client
+credentials file is already configured, Health can run the read-only Gmail browser authorization
+flow and initialize the current-mailbox baseline. The existing systemd watcher remains the
+production polling path while equivalent live behavior is evaluated; the production check lock
+continues to fail closed if both schedulers overlap. Scheduled engine processes have a 30-minute
+upper bound, and wall-clock deadline checks catch up after system resume.
 
 ## Development prerequisites
 

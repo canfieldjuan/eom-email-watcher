@@ -14,7 +14,7 @@ from filelock import Timeout as FileLockTimeout
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, WSGITimeoutError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -22,6 +22,7 @@ from .config import normalize_address
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
+GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
 
 
 class GmailError(RuntimeError):
@@ -194,13 +195,19 @@ class GmailGateway:
                     flow = InstalledAppFlow.from_client_secrets_file(
                         str(credentials_file), SCOPES
                     )
-                    credentials = flow.run_local_server(
-                        host="127.0.0.1",
-                        port=0,
-                        authorization_prompt_message=None,
-                        open_browser=True,
-                        prompt="consent",
-                    )
+                    try:
+                        credentials = flow.run_local_server(
+                            host="127.0.0.1",
+                            port=0,
+                            authorization_prompt_message=None,
+                            open_browser=True,
+                            prompt="consent",
+                            timeout_seconds=GMAIL_AUTHORIZATION_TIMEOUT_SECONDS,
+                        )
+                    except WSGITimeoutError as exc:
+                        raise GmailError(
+                            "Gmail authorization timed out; retry setup"
+                        ) from exc
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
         except FileLockTimeout as exc:
