@@ -1,11 +1,12 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.mime import AttachmentDescriptor
-from eom_email_watcher.runtime import load_runtime
+from eom_email_watcher.runtime import Runtime, load_runtime
 
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
@@ -82,6 +83,7 @@ def capability(
     instance_id: str = INSTANCE_A,
     capability_id: str = "document.translate",
     media_type: str = "application/pdf",
+    produces: tuple[str, ...] = ("text/plain",),
     parameters: tuple[connect.CapabilityParameter, ...] = (),
     external_effects: bool = False,
     confirmation_required: bool = False,
@@ -99,7 +101,7 @@ def capability(
         action_label="Translate",
         action_description="Translate this attachment locally.",
         accepts=(connect.AcceptedArtifactType(media_type, 1024),),
-        produces=("text/plain",),
+        produces=produces,
         parameters=parameters,
         external_effects=external_effects,
         confirmation_required=confirmation_required,
@@ -162,6 +164,39 @@ def update(
     )
 
 
+def persist_completed_outputs(
+    runtime: Runtime,
+    job: connect.PreparedCapabilityJob,
+    outputs: tuple[connect.CapabilityOutput, ...],
+) -> None:
+    runtime.store.create_connect_job(
+        job_id=job.job_id,
+        message_id="message-1",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job.job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=job.provider_app_id,
+        provider_instance_id=job.provider_instance_id,
+        result=connect.CapabilityResult(outputs).store_dict(),
+    )
+
+
 def test_attachment_capabilities_are_contextual_and_do_not_expose_transport_secrets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -192,6 +227,160 @@ def test_attachment_capabilities_are_contextual_and_do_not_expose_transport_secr
     assert response["data"]["items"][0]["capability"]["id"] == "document.translate"
     assert TOKEN not in str(response)
     assert "127.0.0.1" not in str(response)
+
+
+def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability(
+        capability_id="document.summarize",
+        produces=(connect.OUTPUT_MEDIA_TYPE, "text/plain", "application/x-msdownload"),
+    )
+    job = connect.restore_capability_job(
+        selected,
+        job_id=REQUEST_ID,
+        artifact_id=RACE_ARTIFACT_ID,
+        media_type="application/pdf",
+        byte_size=len(PDF),
+        sha256=hashlib.sha256(PDF).hexdigest(),
+        filename="invoice.pdf",
+    )
+    summary_payload = json.dumps(
+        {
+            "summary_version": "1.0",
+            "text": "Invoice due Friday.",
+            "warnings": [],
+            "input_artifact": job.artifact.public_dict(),
+        },
+        separators=(",", ":"),
+    ).encode()
+    text_payload = b"Factura vence el viernes."
+    invalid_text_payload = b"\xff"
+    opaque_payload = b"dangerous-content-must-not-reach-the-dom"
+    summary_output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type=connect.OUTPUT_MEDIA_TYPE,
+        display_name="summary.json",
+        byte_size=len(summary_payload),
+        sha256=hashlib.sha256(summary_payload).hexdigest(),
+        payload=summary_payload,
+    )
+    text_output = connect.CapabilityOutput(
+        artifact_id="88888888-8888-4888-8888-888888888888",
+        media_type="text/plain",
+        display_name="translation.txt",
+        byte_size=len(text_payload),
+        sha256=hashlib.sha256(text_payload).hexdigest(),
+        payload=text_payload,
+    )
+    opaque_output = connect.CapabilityOutput(
+        artifact_id="99999999-9999-4999-8999-999999999999",
+        media_type="application/x-msdownload",
+        display_name="../../run-me.exe",
+        byte_size=len(opaque_payload),
+        sha256=hashlib.sha256(opaque_payload).hexdigest(),
+        payload=opaque_payload,
+    )
+    invalid_text_output = connect.CapabilityOutput(
+        artifact_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        media_type="text/plain",
+        display_name="invalid.txt",
+        byte_size=len(invalid_text_payload),
+        sha256=hashlib.sha256(invalid_text_payload).hexdigest(),
+        payload=invalid_text_payload,
+    )
+    persist_completed_outputs(
+        runtime,
+        job,
+        (summary_output, text_output, opaque_output, invalid_text_output),
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+
+    def present(artifact_id: str) -> dict[str, object]:
+        return engine_api._response(
+            api_request(
+                config_path,
+                "connect.output.present",
+                {
+                    "message_id": "message-1",
+                    "part_id": "2",
+                    "job_id": job.job_id,
+                    "artifact_id": artifact_id,
+                },
+            )
+        )
+
+    summary = present(summary_output.artifact_id)
+    text = present(text_output.artifact_id)
+    opaque = present(opaque_output.artifact_id)
+    invalid_text = present(invalid_text_output.artifact_id)
+
+    assert summary["data"]["presentation"] == {
+        "kind": "document_summary",
+        "summary": {
+            "summary_version": "1.0",
+            "text": "Invoice due Friday.",
+            "warnings": [],
+        },
+    }
+    assert text["data"]["presentation"] == {
+        "kind": "text",
+        "text": "Factura vence el viernes.",
+    }
+    assert opaque["data"]["presentation"] == {"kind": "opaque"}
+    assert "dangerous-content-must-not-reach-the-dom" not in str(opaque)
+    assert invalid_text["error"]["code"] == "output_invalid"
+    assert present("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")["error"]["code"] == "not_found"
+
+    destination = tmp_path / "exports"
+    destination.mkdir()
+    exported = engine_api._response(
+        api_request(
+            config_path,
+            "connect.output.export",
+            {
+                "message_id": "message-1",
+                "part_id": "2",
+                "job_id": job.job_id,
+                "artifact_id": opaque_output.artifact_id,
+                "destination_dir": str(destination),
+            },
+        )
+    )
+    exported_path = Path(exported["data"]["path"])
+    assert exported_path.parent == destination.resolve()
+    assert exported_path.name.startswith("email-watcher-output-")
+    assert exported_path.suffix == ".bin"
+    assert exported_path.read_bytes() == opaque_payload
+    assert exported_path.stat().st_mode & 0o777 == 0o600
+    assert "run-me.exe" not in exported_path.name
+    assert "dangerous-content-must-not-reach-the-dom" not in str(exported)
+
+    missing = engine_api._response(
+        api_request(
+            config_path,
+            "connect.output.present",
+            {
+                "message_id": "another-message",
+                "part_id": "2",
+                "job_id": job.job_id,
+                "artifact_id": opaque_output.artifact_id,
+            },
+        )
+    )
+    assert missing["error"]["code"] == "not_found"
+
+    with pytest.raises(connect.ConnectError, match="input artifact"):
+        connect.decode_document_summary_output(
+            summary_output,
+            connect.ArtifactIdentity(
+                artifact_id=job.artifact.artifact_id,
+                media_type=job.artifact.media_type,
+                byte_size=job.artifact.byte_size,
+                sha256="0" * 64,
+            ),
+        )
 
 
 def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persists_first(

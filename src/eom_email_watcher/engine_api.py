@@ -31,7 +31,7 @@ from .config import (
     remove_sender,
     update_settings,
 )
-from .db import ConnectJob, NotificationIntent, Store
+from .db import ConnectJob, ConnectOutput, NotificationIntent, Store
 from .gmail import (
     GmailAuthorizationRejected,
     GmailError,
@@ -45,6 +45,7 @@ from .service import Watcher
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
 GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS = 30
+MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
 
 logger = logging.getLogger(__name__)
@@ -254,12 +255,11 @@ def _attachment_destination(value: object) -> Path:
     return resolved
 
 
-def _write_attachment(destination: Path, filename: str, content: bytes) -> Path:
-    suffix = Path(filename).suffix
-    if SAFE_ATTACHMENT_SUFFIX.fullmatch(suffix) is None:
-        suffix = ""
+def _write_private_file(destination: Path, prefix: str, suffix: str, content: bytes) -> Path:
     descriptor, raw_path = tempfile.mkstemp(
-        prefix="email-watcher-attachment-", suffix=suffix.casefold(), dir=destination
+        prefix=prefix,
+        suffix=suffix,
+        dir=destination,
     )
     path = Path(raw_path)
     try:
@@ -272,6 +272,22 @@ def _write_attachment(destination: Path, filename: str, content: bytes) -> Path:
         path.unlink(missing_ok=True)
         raise
     return path
+
+
+def _write_attachment(destination: Path, filename: str, content: bytes) -> Path:
+    suffix = Path(filename).suffix
+    if SAFE_ATTACHMENT_SUFFIX.fullmatch(suffix) is None:
+        suffix = ""
+    return _write_private_file(
+        destination,
+        "email-watcher-attachment-",
+        suffix.casefold(),
+        content,
+    )
+
+
+def _write_capability_output(destination: Path, content: bytes) -> Path:
+    return _write_private_file(destination, "email-watcher-output-", ".bin", content)
 
 
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
@@ -471,6 +487,99 @@ def _generic_connect_result(job: ConnectJob) -> dict[str, object]:
             "source_app_id": job.source_app_id,
         },
         "outputs": [output.metadata() for output in outputs],
+    }
+
+
+def _selected_connect_output(
+    payload: dict[str, object], runtime: Runtime
+) -> tuple[ConnectJob, ConnectOutput]:
+    message_id, part_id = _connect_attachment_ids(payload)
+    job_id = payload.get("job_id")
+    artifact_id = payload.get("artifact_id")
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise ApiError("invalid_request", "job_id must be a non-empty string")
+    if not isinstance(artifact_id, str) or not artifact_id.strip():
+        raise ApiError("invalid_request", "artifact_id must be a non-empty string")
+    job = runtime.store.connect_job(job_id)
+    if (
+        job is None
+        or job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
+        or job.message_id != message_id
+        or job.part_id != part_id
+    ):
+        raise ApiError("not_found", "Capability output was not found")
+    if job.status != "completed":
+        raise ApiError("conflict", "Capability output is not complete")
+    try:
+        outputs = runtime.store.completed_connect_outputs(job)
+    except RuntimeError as exc:
+        logger.warning("Stored capability output failed validation: %s", exc)
+        raise ApiError("output_invalid", "Stored capability output is invalid") from exc
+    output = next((item for item in outputs if item.artifact_id == artifact_id), None)
+    if output is None:
+        raise ApiError("not_found", "Capability output was not found")
+    return job, output
+
+
+def _connect_output_present(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_id", "part_id", "job_id", "artifact_id"})
+    job, output = _selected_connect_output(payload, _runtime(request))
+    if output.media_type == connect.OUTPUT_MEDIA_TYPE:
+        summary = connect.decode_document_summary_output(
+            connect.CapabilityOutput(
+                artifact_id=output.artifact_id,
+                media_type=output.media_type,
+                display_name=output.display_name,
+                byte_size=output.byte_size,
+                sha256=output.sha256,
+                payload=output.payload,
+            ),
+            connect.ArtifactIdentity(
+                artifact_id=job.input_artifact_id,
+                media_type=job.input_media_type,
+                byte_size=job.input_byte_size,
+                sha256=job.input_sha256,
+            ),
+        )
+        presentation: dict[str, object] = {
+            "kind": "document_summary",
+            "summary": {
+                "summary_version": summary.summary_version,
+                "text": summary.text,
+                "warnings": [dict(warning) for warning in summary.warnings],
+            },
+        }
+    elif output.media_type == "text/plain" and output.byte_size <= MAX_NATIVE_TEXT_OUTPUT_BYTES:
+        try:
+            text = output.payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ApiError("output_invalid", "Text capability output is not valid UTF-8") from exc
+        presentation = {"kind": "text", "text": text}
+    else:
+        presentation = {"kind": "opaque"}
+    return {
+        "job_id": job.job_id,
+        "output": output.metadata(),
+        "presentation": presentation,
+    }
+
+
+def _connect_output_export(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {"message_id", "part_id", "job_id", "artifact_id", "destination_dir"},
+    )
+    job, output = _selected_connect_output(payload, _runtime(request))
+    destination = _attachment_destination(payload.get("destination_dir"))
+    try:
+        path = _write_capability_output(destination, output.payload)
+    except OSError as exc:
+        logger.warning("Capability output export failed: %s", exc)
+        raise ApiError("export_failed", "Capability output could not be prepared") from exc
+    return {
+        "job_id": job.job_id,
+        "output": output.metadata(),
+        "path": str(path),
     }
 
 
@@ -1233,6 +1342,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.attachment.invoke": _connect_attachment_invoke,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
+    "connect.output.export": _connect_output_export,
+    "connect.output.present": _connect_output_present,
     "gmail.authorize": _gmail_authorize,
     "health.get": _health,
     "inbox.recent": _recent,

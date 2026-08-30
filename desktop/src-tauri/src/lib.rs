@@ -5,8 +5,8 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
-    ConnectInvocationResult, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
-    GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
+    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
+    EngineSettings, GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -49,6 +49,12 @@ impl AttachmentExports {
 
 #[derive(Serialize)]
 struct OpenedAttachment {
+    filename: String,
+}
+
+#[derive(Serialize)]
+struct RevealedCapabilityOutput {
+    display_name: String,
     filename: String,
 }
 
@@ -160,6 +166,74 @@ async fn attachment_capability_invoke(
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn capability_output_present(
+    engine: State<'_, Engine>,
+    message_id: String,
+    part_id: String,
+    job_id: String,
+    artifact_id: String,
+) -> Result<ConnectOutputView, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.present_capability_output(message_id, part_id, job_id, artifact_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn capability_output_export(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    exports: State<'_, AttachmentExports>,
+    message_id: String,
+    part_id: String,
+    job_id: String,
+    artifact_id: String,
+) -> Result<RevealedCapabilityOutput, EngineError> {
+    let engine = engine.inner().clone();
+    let destination = std::fs::canonicalize(exports.path()).map_err(|_| {
+        EngineError::host("export_failed", "Desktop export directory is unavailable")
+    })?;
+    let engine_destination = destination.clone();
+    let exported = tauri::async_runtime::spawn_blocking(move || {
+        engine.export_capability_output(
+            message_id,
+            part_id,
+            job_id,
+            artifact_id,
+            engine_destination,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))??;
+    if exported.path.parent() != Some(destination.as_path()) {
+        return Err(EngineError::host(
+            "export_failed",
+            "Watcher engine returned an invalid export path",
+        ));
+    }
+    let filename = exported
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| EngineError::host("export_failed", "Export filename is unsupported"))?;
+    let open_path = destination.to_str().ok_or_else(|| {
+        EngineError::host(
+            "open_failed",
+            "Export directory path is not supported by this host",
+        )
+    })?;
+    app.opener()
+        .open_path(open_path, None::<&str>)
+        .map_err(|_| EngineError::host("open_failed", "Desktop could not reveal the export"))?;
+    Ok(RevealedCapabilityOutput {
+        display_name: exported.output.display_name,
+        filename: filename.to_owned(),
+    })
 }
 
 #[tauri::command]
@@ -337,6 +411,8 @@ pub fn run() {
             attachment_capabilities,
             attachment_capability_invoke,
             attachment_open,
+            capability_output_export,
+            capability_output_present,
             config_initialize,
             config_status,
             gmail_authorize,

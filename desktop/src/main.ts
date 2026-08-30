@@ -100,6 +100,22 @@ interface ConnectInvocationResult {
   outputs: ConnectOutputMetadata[];
 }
 
+type ConnectOutputPresentation =
+  | { kind: "document_summary"; summary: ConnectSummary }
+  | { kind: "text"; text: string }
+  | { kind: "opaque" };
+
+interface ConnectOutputView {
+  job_id: string;
+  output: ConnectOutputMetadata;
+  presentation: ConnectOutputPresentation;
+}
+
+interface RevealedCapabilityOutput {
+  display_name: string;
+  filename: string;
+}
+
 interface InboxItem {
   message_id: string;
   received_at: string;
@@ -565,9 +581,44 @@ function collectCapabilityParameters(
   return values;
 }
 
+function renderOutputPresentation(
+  container: HTMLDivElement,
+  presentation: ConnectOutputPresentation,
+): void {
+  container.replaceChildren();
+  if (presentation.kind === "document_summary") {
+    const label = document.createElement("strong");
+    label.textContent = "Document summary";
+    const text = document.createElement("p");
+    text.textContent = presentation.summary.text;
+    container.append(label, text);
+    if (presentation.summary.warnings.length) {
+      const warnings = document.createElement("p");
+      warnings.className = "attachment-summary-warnings";
+      warnings.textContent = presentation.summary.warnings
+        .map((warning) => warning.message)
+        .join(" ");
+      container.append(warnings);
+    }
+    return;
+  }
+  if (presentation.kind === "text") {
+    const text = document.createElement("pre");
+    text.className = "capability-output-text";
+    text.textContent = presentation.text;
+    container.append(text);
+    return;
+  }
+  const unavailable = document.createElement("p");
+  unavailable.textContent = "This output type has no native preview. Use the safe export.";
+  container.append(unavailable);
+}
+
 function renderCapabilityResult(
   row: HTMLLIElement,
   result: AttachmentCapabilityResult,
+  messageId: string,
+  partId: string,
 ): void {
   if (result.summary) {
     const summary = document.createElement("div");
@@ -599,9 +650,77 @@ function renderCapabilityResult(
   presentation.append(label);
   if (result.status === "completed") {
     for (const output of result.outputs ?? []) {
+      const outputRow = document.createElement("div");
+      outputRow.className = "capability-output";
       const detail = document.createElement("p");
       detail.textContent = `${output.display_name} · ${output.media_type} · ${output.byte_size.toLocaleString()} bytes`;
-      presentation.append(detail);
+      outputRow.append(detail);
+      if (result.job_id) {
+        const jobId = result.job_id;
+        const controls = document.createElement("div");
+        controls.className = "capability-output-actions";
+        const preview = document.createElement("div");
+        preview.className = "capability-output-preview";
+        if (
+          output.media_type === "application/vnd.local-connect.document-summary+json" ||
+          output.media_type === "text/plain"
+        ) {
+          const view = document.createElement("button");
+          view.type = "button";
+          view.textContent = "View";
+          view.addEventListener("click", async () => {
+            view.disabled = true;
+            view.textContent = "Loading…";
+            try {
+              const outputView = await invoke<ConnectOutputView>("capability_output_present", {
+                messageId,
+                partId,
+                jobId,
+                artifactId: output.artifact_id,
+              });
+              renderOutputPresentation(preview, outputView.presentation);
+              inboxStatus.textContent = `Showing ${output.display_name}.`;
+              inboxStatus.dataset.kind = "success";
+            } catch (error) {
+              inboxStatus.textContent = errorMessage(error);
+              inboxStatus.dataset.kind = "error";
+            } finally {
+              view.disabled = false;
+              view.textContent = "View";
+            }
+          });
+          controls.append(view);
+        }
+        const exportButton = document.createElement("button");
+        exportButton.type = "button";
+        exportButton.textContent = "Safe export";
+        exportButton.addEventListener("click", async () => {
+          exportButton.disabled = true;
+          exportButton.textContent = "Exporting…";
+          try {
+            const exported = await invoke<RevealedCapabilityOutput>(
+              "capability_output_export",
+              {
+                messageId,
+                partId,
+                jobId,
+                artifactId: output.artifact_id,
+              },
+            );
+            inboxStatus.textContent = `Prepared ${exported.display_name} as ${exported.filename} and opened its export folder.`;
+            inboxStatus.dataset.kind = "success";
+          } catch (error) {
+            inboxStatus.textContent = errorMessage(error);
+            inboxStatus.dataset.kind = "error";
+          } finally {
+            exportButton.disabled = false;
+            exportButton.textContent = "Safe export";
+          }
+        });
+        controls.append(exportButton);
+        outputRow.append(controls, preview);
+      }
+      presentation.append(outputRow);
     }
   } else {
     const detail = document.createElement("p");
@@ -867,7 +986,7 @@ function renderInbox(items: InboxItem[]): void {
       }
       row.append(attachmentDetails, actions);
       for (const result of attachment.capability_results ?? []) {
-        renderCapabilityResult(row, result);
+        renderCapabilityResult(row, result, item.message_id, attachment.part_id);
       }
       attachments.append(row);
     }
