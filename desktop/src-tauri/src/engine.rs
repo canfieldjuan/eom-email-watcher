@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -12,7 +13,6 @@ use tauri_plugin_shell::ShellExt;
 use std::os::unix::process::CommandExt;
 
 const PROTOCOL_VERSION: u8 = 1;
-const GMAIL_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -38,6 +38,7 @@ pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
+    gmail_check_gate: Arc<Mutex<()>>,
     request_timeout: Option<Duration>,
 }
 
@@ -302,6 +303,7 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
+                gmail_check_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
             });
         }
@@ -313,6 +315,7 @@ impl Engine {
                 program: packaged_program,
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
+                gmail_check_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
             });
         }
@@ -330,6 +333,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
+            gmail_check_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         })
     }
@@ -344,6 +348,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
+            gmail_check_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         }
     }
@@ -406,7 +411,11 @@ impl Engine {
     }
 
     pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
-        self.request_with_timeout("gmail.authorize", json!({}), GMAIL_AUTHORIZATION_TIMEOUT)
+        let _guard = self
+            .gmail_check_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Gmail operation coordinator stopped"))?;
+        self.request("gmail.authorize", json!({}))
     }
 
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
@@ -440,6 +449,10 @@ impl Engine {
     }
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
+        let _guard = self
+            .gmail_check_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Gmail operation coordinator stopped"))?;
         self.request("watcher.check", json!({"dry_run": false}))
     }
 
@@ -759,6 +772,75 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed-out engine descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gmail_authorization_serializes_watcher_checks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let authorization_started = directory.path().join("authorization-started");
+        let check_started = directory.path().join("check-started");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *gmail.authorize*)
+    : > "$1"
+    sleep 0.2
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.authorize","data":{"baseline_initialized":true,"connected":true}}'
+    ;;
+  *)
+    : > "$2"
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'
+    ;;
+esac"#,
+                ),
+                OsString::from("engine-gmail-gate-probe"),
+                authorization_started.as_os_str().to_owned(),
+                check_started.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let authorization_engine = engine.clone();
+        let authorization = std::thread::spawn(move || authorization_engine.authorize_gmail());
+        for _ in 0..100 {
+            if authorization_started.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            authorization_started.exists(),
+            "authorization probe did not start"
+        );
+
+        let check_engine = engine.clone();
+        let check = std::thread::spawn(move || check_engine.check());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !check_started.exists(),
+            "watcher check started before authorization completed"
+        );
+
+        assert!(
+            authorization
+                .join()
+                .expect("authorization thread")
+                .expect("authorization result")
+                .connected
+        );
+        assert!(
+            check
+                .join()
+                .expect("check thread")
+                .expect("check result")
+                .active
+        );
+        assert!(check_started.exists());
     }
 
     fn real_engine(config_path: PathBuf) -> Engine {

@@ -246,6 +246,37 @@ def test_authorize_replaces_an_unusable_existing_token(
     assert authorization_changed is True
     assert token_file.read_text(encoding="utf-8") == "replacement token"
     assert browser_calls[0]["authorization_prompt_message"] is None
+    assert (
+        browser_calls[0]["timeout_seconds"]
+        == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
+    )
+
+
+def test_authorization_timeout_does_not_persist_a_token(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+
+    def run_local_server(**kwargs):
+        assert (
+            kwargs["timeout_seconds"]
+            == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
+        )
+        raise gmail_module.WSGITimeoutError("browser flow timed out")
+
+    flow = SimpleNamespace(run_local_server=run_local_server)
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: flow,
+    )
+
+    with pytest.raises(GmailError, match="authorization timed out"):
+        GmailGateway.authorize_with_status(credentials_file, token_file)
+
+    assert not token_file.exists()
 
 
 def test_profile_history_id_classifies_http_401_as_rejected_authorization() -> None:
