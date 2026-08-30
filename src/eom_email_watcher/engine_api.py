@@ -17,6 +17,7 @@ from .config import (
     ConfigError,
     DuplicateSenderError,
     InvalidSenderError,
+    InvalidSettingsUpdateError,
     Sender,
     SenderNotFoundError,
     add_sender,
@@ -558,7 +559,7 @@ def _settings_update(request: dict[str, object]) -> dict[str, object]:
     )
     try:
         config = update_settings(_config_path(request), payload)
-    except ConfigError as exc:
+    except InvalidSettingsUpdateError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
     return _settings_data(config)
 

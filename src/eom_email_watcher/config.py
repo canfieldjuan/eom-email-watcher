@@ -45,6 +45,10 @@ class SenderNotFoundError(ConfigError):
     """A requested watchlist sender does not exist."""
 
 
+class InvalidSettingsUpdateError(ConfigError):
+    """A proposed desktop settings update is not valid."""
+
+
 @dataclass(frozen=True)
 class Sender:
     email: str
@@ -426,29 +430,31 @@ def remove_sender(path: Path, email: str) -> Sender:
 
 def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
     if not updates:
-        raise ConfigError("At least one setting must be provided")
+        raise InvalidSettingsUpdateError("At least one setting must be provided")
     unknown = set(updates) - MUTABLE_DESKTOP_SETTINGS
     if unknown:
         fields = ", ".join(sorted(str(field) for field in unknown))
-        raise ConfigError(f"Unsupported settings: {fields}")
+        raise InvalidSettingsUpdateError(f"Unsupported settings: {fields}")
 
     poll_interval = updates.get("poll_interval_minutes")
     if "poll_interval_minutes" in updates:
         if type(poll_interval) is not int:
-            raise ConfigError("poll_interval_minutes must be an integer")
+            raise InvalidSettingsUpdateError("poll_interval_minutes must be an integer")
         if not 1 <= poll_interval <= 1440:
-            raise ConfigError("poll_interval_minutes must be between 1 and 1440")
+            raise InvalidSettingsUpdateError(
+                "poll_interval_minutes must be between 1 and 1440"
+            )
 
     retention = updates.get("retention_days")
     if "retention_days" in updates:
         if type(retention) is not int:
-            raise ConfigError("retention_days must be an integer")
+            raise InvalidSettingsUpdateError("retention_days must be an integer")
         if not 1 <= retention <= 3650:
-            raise ConfigError("retention_days must be between 1 and 3650")
+            raise InvalidSettingsUpdateError("retention_days must be between 1 and 3650")
 
     notifications = updates.get("notifications_enabled")
     if "notifications_enabled" in updates and type(notifications) is not bool:
-        raise ConfigError("notifications_enabled must be a boolean")
+        raise InvalidSettingsUpdateError("notifications_enabled must be a boolean")
 
     config_path = path.expanduser().resolve()
     with FileLock(f"{config_path}.lock"):

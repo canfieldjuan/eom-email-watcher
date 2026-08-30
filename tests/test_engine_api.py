@@ -168,6 +168,51 @@ def test_settings_update_rejects_invalid_payload_without_mutation(
     assert config_path.read_bytes() == original
 
 
+@pytest.mark.parametrize(
+    ("extra_settings", "timezone", "message"),
+    [
+        (
+            'retention_days = "seven"',
+            "America/Chicago",
+            "retention_days must be an integer",
+        ),
+        ("", "/tmp/foo", "Unknown timezone: /tmp/foo"),
+    ],
+)
+def test_settings_update_preserves_existing_configuration_errors(
+    tmp_path: Path, extra_settings: str, timezone: str, message: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings=extra_settings, timezone=timezone)
+    original = config_path.read_bytes()
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "settings.update",
+            {"poll_interval_minutes": 45},
+        )
+    )
+
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": message,
+    }
+    assert config_path.read_bytes() == original
+
+
+def test_settings_update_preserves_missing_configuration_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "missing.toml"
+
+    response = engine_api._response(
+        request(config_path, "settings.update", {"poll_interval_minutes": 45})
+    )
+
+    assert response["error"]["code"] == "configuration_error"
+    assert "Configuration not found" in response["error"]["message"]
+    assert not config_path.exists()
+
+
 def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     tmp_path: Path,
 ) -> None:
