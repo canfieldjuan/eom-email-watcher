@@ -132,6 +132,9 @@ pub struct InboxItem {
     pub confidence: Option<f64>,
     pub attempts: i64,
     pub next_retry_at: Option<String>,
+    pub analysis_retryable: Option<bool>,
+    pub analysis_error_code: Option<String>,
+    pub analysis_retry_after_seconds: Option<u64>,
     pub fallback_notified_at: Option<String>,
     pub notified_at: Option<String>,
     pub last_error: Option<String>,
@@ -255,6 +258,11 @@ struct NotificationAcknowledgement {
     status: String,
 }
 
+#[derive(Deserialize)]
+struct AnalysisRequeue {
+    status: String,
+}
+
 impl EngineError {
     pub(crate) fn host(code: &str, message: impl Into<String>) -> Self {
         Self {
@@ -339,6 +347,18 @@ impl Engine {
     pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
         self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
+        let response =
+            self.request::<AnalysisRequeue>("analysis.requeue", json!({"message_id": message_id}))?;
+        if response.status == "requeued" {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid analysis requeue result",
+        ))
     }
 
     pub fn export_attachment(
@@ -623,6 +643,9 @@ mod tests {
             "confidence": null,
             "attempts": 0,
             "next_retry_at": null,
+            "analysis_retryable": null,
+            "analysis_error_code": null,
+            "analysis_retry_after_seconds": null,
             "fallback_notified_at": null,
             "notified_at": null,
             "last_error": null
@@ -768,6 +791,13 @@ notifications_enabled = true
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
         assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
+        assert_eq!(
+            engine
+                .requeue_analysis("missing-message".into())
+                .expect_err("missing analysis must not be requeued")
+                .code,
+            "not_found"
+        );
         assert_eq!(
             engine
                 .pending_notifications(25)

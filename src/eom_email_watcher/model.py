@@ -18,6 +18,20 @@ class ModelError(RuntimeError):
     """Local model request or response failed."""
 
 
+class GatewayModelError(ModelError):
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool,
+        retry_after_seconds: int | None = None,
+    ):
+        super().__init__(f"Inference gateway error: {code}")
+        self.code = code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+
+
 MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
 MAX_GATEWAY_REQUEST_BYTES = 1_000_000
 MAX_GATEWAY_TOKEN_BYTES = 16_384
@@ -27,7 +41,9 @@ MAX_GATEWAY_SUBJECT_CHARS = 4_096
 MAX_GATEWAY_BODY_CHARS = 100_000
 MAX_GATEWAY_ATTACHMENT_COUNT = 100
 MAX_GATEWAY_ATTACHMENT_NAME_CHARS = 512
+MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
+GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class Analysis(BaseModel):
@@ -126,6 +142,7 @@ class ModelRuntime(Protocol):
         body: str,
         attachment_names: tuple[str, ...],
         current_local_time: datetime,
+        request_id: str | None = None,
     ) -> Analysis: ...
 
 
@@ -196,6 +213,7 @@ class LocalModel:
         body: str,
         attachment_names: tuple[str, ...],
         current_local_time: datetime,
+        request_id: str | None = None,
     ) -> Analysis:
         prompt = _email_prompt(
             sender=sender,
@@ -366,6 +384,11 @@ class GatewayModel:
         timeout: float | None = None,
     ):
         headers = self._headers()
+        expected_request_id = (
+            payload.get("request_id")
+            if payload is not None and isinstance(payload.get("request_id"), str)
+            else None
+        )
         content = None
         if payload is not None:
             try:
@@ -387,14 +410,70 @@ class GatewayModel:
                     content=content,
                 ) as response,
             ):
-                response.raise_for_status()
+                if expected_request_id is not None:
+                    try:
+                        response_payload = self._bounded_json(response)
+                    except ModelError as exc:
+                        if response.status_code >= 400:
+                            raise GatewayModelError(
+                                "invalid_error_envelope",
+                                retryable=response.status_code >= 500,
+                            ) from exc
+                        raise
+                    if (
+                        response.status_code >= 400
+                        or response_payload.get("status") == "failed"
+                    ):
+                        raise self._gateway_error(response_payload, expected_request_id)
+                    if response.status_code >= 300:
+                        raise ModelError(
+                            f"Inference gateway rejected request: HTTP {response.status_code}"
+                        )
+                    return response_payload
+                if response.status_code >= 300:
+                    raise ModelError(
+                        f"Inference gateway rejected request: HTTP {response.status_code}"
+                    )
                 return self._bounded_json(response)
-        except httpx.HTTPStatusError as exc:
-            raise ModelError(
-                f"Inference gateway rejected request: HTTP {exc.response.status_code}"
-            ) from exc
         except httpx.HTTPError as exc:
+            if expected_request_id is not None:
+                raise GatewayModelError("transport_error", retryable=True) from exc
             raise ModelError(f"Inference gateway request failed: {type(exc).__name__}") from exc
+
+    @staticmethod
+    def _gateway_error(
+        payload: dict[str, object], expected_request_id: str
+    ) -> GatewayModelError:
+        error = payload.get("error")
+        if (
+            type(payload.get("protocol_version")) is not int
+            or payload.get("protocol_version") != 1
+            or payload.get("request_id") != expected_request_id
+            or payload.get("status") != "failed"
+            or not isinstance(error, dict)
+        ):
+            return GatewayModelError("invalid_error_envelope", retryable=False)
+        code = error.get("code")
+        retryable = error.get("retryable")
+        retry_after = error.get("retry_after_seconds")
+        if (
+            not isinstance(code, str)
+            or GATEWAY_ERROR_CODE_RE.fullmatch(code) is None
+            or type(retryable) is not bool
+            or retry_after is not None
+            and (
+                type(retry_after) is not int
+                or not 1 <= retry_after <= MAX_GATEWAY_RETRY_AFTER_SECONDS
+            )
+            or retryable is False
+            and retry_after is not None
+        ):
+            return GatewayModelError("invalid_error_envelope", retryable=False)
+        return GatewayModelError(
+            code,
+            retryable=retryable,
+            retry_after_seconds=retry_after,
+        )
 
     def health(self) -> tuple[bool, str]:
         try:
@@ -439,8 +518,9 @@ class GatewayModel:
         body: str,
         attachment_names: tuple[str, ...],
         current_local_time: datetime,
+        request_id: str | None = None,
     ) -> Analysis:
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         payload = {
             "protocol_version": 1,
             "request_id": request_id,

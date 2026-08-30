@@ -6,7 +6,7 @@ from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
 from eom_email_watcher.gmail import MessageMetadata, MessageUnavailable, StaleHistoryCursor
-from eom_email_watcher.model import Analysis, ModelError
+from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
 from eom_email_watcher.notifications import NotificationError
 from eom_email_watcher.service import Watcher
 
@@ -315,6 +315,75 @@ class FailOnceModel(FakeModel):
             deadline_iso=None,
             confidence=0.9,
         )
+
+
+class GatewayRetryModel(FakeModel):
+    def __init__(self, *, retryable: bool):
+        super().__init__()
+        self.retryable = retryable
+        self.requests: list[tuple[str | None, datetime]] = []
+
+    def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
+        self.requests.append((kwargs["request_id"], kwargs["current_local_time"]))
+        if self.calls == 1 or not self.retryable:
+            raise GatewayModelError(
+                "worker_unavailable" if self.retryable else "forbidden",
+                retryable=self.retryable,
+                retry_after_seconds=30 if self.retryable else None,
+            )
+        return Analysis(
+            category="informational",
+            priority="normal",
+            summary="A short update.",
+            action_required=False,
+            suggested_action=None,
+            deadline_text=None,
+            deadline_iso=None,
+            confidence=0.9,
+        )
+
+
+def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = GatewayRetryModel(retryable=True)
+    watcher = Watcher(cfg, store, FakeGmail(), model)
+
+    assert watcher.check()["summarized"] == 0
+    first = store.recent(1)[0]
+    assert first["analysis_retryable"] == 1
+    assert first["analysis_retry_after_seconds"] == 30
+
+    _make_retries_due(store)
+    retry_watcher = Watcher(
+        replace(cfg, timezone="America/New_York"), store, FakeGmail(), model
+    )
+    assert retry_watcher.check()["summarized"] == 1
+    assert model.requests[0] == model.requests[1]
+    assert store.recent(1)[0]["status"] == "summarized"
+
+
+def test_gateway_permanent_failure_waits_for_explicit_requeue(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = GatewayRetryModel(retryable=False)
+    watcher = Watcher(cfg, store, FakeGmail(), model)
+
+    assert watcher.check()["summarized"] == 0
+    first_request_id = model.requests[0][0]
+    assert store.recent(1)[0]["analysis_retryable"] == 0
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 1
+
+    store.requeue_analysis("allowed")
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 2
+    assert model.requests[1][0] != first_request_id
 
 
 def test_fallback_does_not_suppress_recovered_analysis(

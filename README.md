@@ -111,6 +111,7 @@ uv run eom-mail-watch doctor
 uv run eom-mail-watch check --dry-run
 uv run eom-mail-watch check
 uv run eom-mail-watch recent --limit 20
+uv run eom-mail-watch requeue-analysis MESSAGE_ID
 ```
 
 `--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.

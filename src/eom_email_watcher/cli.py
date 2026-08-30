@@ -38,6 +38,10 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="Check local configuration and dependencies")
     recent = commands.add_parser("recent", help="Show recent watched-message results")
     recent.add_argument("--limit", type=int, default=20)
+    requeue_analysis = commands.add_parser(
+        "requeue-analysis", help="Retry one permanently paused message analysis"
+    )
+    requeue_analysis.add_argument("message_id")
     send_hours = commands.add_parser("send-hours", help="Send the monthly Firefly hours request")
     send_hours.add_argument("--test-to", help="Send a marked test without consuming monthly dedupe")
     send_hours.add_argument("--dry-run", action="store_true")
@@ -256,6 +260,16 @@ def _recent(config_path: Path, limit: int) -> int:
     return 0
 
 
+def _requeue_analysis(config_path: Path, message_id: str) -> int:
+    _config, store, _model = _runtime(config_path)
+    try:
+        status = store.requeue_analysis(message_id)
+    except KeyError as exc:
+        raise RuntimeError("Message was not found") from exc
+    print(json.dumps({"message_id": message_id, "status": status}, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     logging.basicConfig(
@@ -283,6 +297,8 @@ def main(argv: list[str] | None = None) -> None:
                 confirm_sent=args.confirm_sent,
                 confirm_unsent=args.confirm_unsent,
             )
+        elif args.command == "requeue-analysis":
+            code = _requeue_analysis(args.config, args.message_id)
         else:
             code = _recent(args.config, args.limit)
     except (ConfigError, GmailError, SendError, RuntimeError) as exc:

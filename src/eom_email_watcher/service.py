@@ -7,7 +7,7 @@ from .config import Config
 from .db import AnalyzedMessage, PendingMessage, Store
 from .gmail import GmailGateway, MessageUnavailable, StaleHistoryCursor
 from .mime import extract_body
-from .model import Analysis, ModelError, ModelRuntime
+from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,14 @@ class Watcher:
             }
             if dry_run:
                 dry_run_messages.append(
-                    PendingMessage(**values, attempts=0, fallback_notified_at=None)
+                    PendingMessage(
+                        **values,
+                        attempts=0,
+                        fallback_notified_at=None,
+                        analysis_request_id=None,
+                        analysis_context_at=None,
+                        analysis_body_char_limit=None,
+                    )
                 )
                 added += 1
             elif self.store.add_message(**values):
@@ -204,9 +211,21 @@ class Watcher:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
         for message in [*self.store.pending(), *(extra or [])]:
             try:
+                if dry_run:
+                    request_id = None
+                    body_char_limit = self.config.body_char_limit
+                    current_local_time = datetime.now(self.config.zone)
+                else:
+                    request = self.store.reserve_analysis_request(
+                        message.message_id,
+                        self.config.body_char_limit,
+                    )
+                    request_id = request.request_id
+                    body_char_limit = request.body_char_limit
+                    current_local_time = datetime.fromisoformat(request.context_at)
                 payload = self.gmail.full_payload(message.message_id)
                 body, attachment_names, attachments = extract_body(
-                    payload, self.config.body_char_limit
+                    payload, body_char_limit
                 )
                 if not dry_run:
                     self.store.replace_attachments(message.message_id, attachments)
@@ -216,7 +235,8 @@ class Watcher:
                     received_at=message.received_at,
                     body=body,
                     attachment_names=attachment_names,
-                    current_local_time=datetime.now(self.config.zone),
+                    current_local_time=current_local_time,
+                    request_id=request_id,
                 )
                 if not dry_run:
                     self.store.mark_analyzed(message.message_id, analysis.model_dump())
@@ -234,10 +254,28 @@ class Watcher:
                 if not dry_run:
                     self.store.mark_skipped(message.message_id)
                 continue
+            except GatewayModelError as exc:
+                logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
+                if deliver_notifications:
+                    fallback += self._send_fallback(message, dry_run)
+                if not dry_run:
+                    self.store.record_analysis_failure(
+                        message.message_id,
+                        str(exc),
+                        message.attempts,
+                        retryable=exc.retryable,
+                        error_code=exc.code,
+                        retry_after_seconds=exc.retry_after_seconds,
+                    )
             except ModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
                 if deliver_notifications:
                     fallback += self._send_fallback(message, dry_run)
                 if not dry_run:
-                    self.store.record_failure(message.message_id, str(exc), message.attempts)
+                    self.store.record_analysis_failure(
+                        message.message_id,
+                        str(exc),
+                        message.attempts,
+                        retryable=True,
+                    )
         return summarized, fallback

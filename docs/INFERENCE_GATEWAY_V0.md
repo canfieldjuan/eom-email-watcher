@@ -198,6 +198,26 @@ branch business behavior on a worker or model name.
 The gateway returns a stable bounded error envelope with `code`, `retryable`, and optional
 `retry_after_seconds`; it never returns worker stack traces or prompt fragments.
 
+```json
+{
+  "protocol_version": 1,
+  "request_id": "018f...uuid",
+  "status": "failed",
+  "error": {
+    "code": "capacity_limited",
+    "retryable": true,
+    "retry_after_seconds": 90
+  }
+}
+```
+
+The client rejects malformed envelopes, mismatched request IDs, non-boolean `retryable` values,
+retry delays outside 1 through 86400 seconds, and retry delays on permanent failures. For Email
+Watcher, one analysis attempt keeps the same request ID, context timestamp, and body-size limit
+across process restarts. The request is reconstructed from Gmail's immutable message payload rather
+than persisting the raw body. An explicit requeue after configuration or contract repair creates a
+new request identity.
+
 Minimum classes:
 
 | Class | Meaning | Client behavior |

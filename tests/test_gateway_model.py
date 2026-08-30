@@ -9,7 +9,7 @@ import pytest
 
 from eom_email_watcher import engine_api
 from eom_email_watcher import model as model_module
-from eom_email_watcher.model import GatewayModel, ModelError
+from eom_email_watcher.model import GatewayModel, GatewayModelError, ModelError
 from eom_email_watcher.runtime import load_runtime
 
 
@@ -327,6 +327,85 @@ def test_gateway_rejects_mismatched_response_envelope(
 
     with pytest.raises(ModelError, match="required envelope"):
         analyze(model)
+
+
+@pytest.mark.parametrize("http_status", [200, 429])
+def test_gateway_exposes_validated_retry_directives_for_any_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            http_status,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "failed",
+                "error": {
+                    "code": "capacity_limited",
+                    "retryable": True,
+                    "retry_after_seconds": 90,
+                },
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(GatewayModelError) as captured:
+        analyze(model)
+
+    assert str(captured.value) == "Inference gateway error: capacity_limited"
+    assert captured.value.code == "capacity_limited"
+    assert captured.value.retryable is True
+    assert captured.value.retry_after_seconds == 90
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"code": "forbidden", "retryable": False, "retry_after_seconds": 30},
+        {"code": "capacity_limited", "retryable": 1, "retry_after_seconds": 30},
+        {"code": "capacity_limited", "retryable": True, "retry_after_seconds": 0},
+    ],
+)
+def test_gateway_rejects_invalid_error_directives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: dict[str, object]
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            400,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "failed",
+                "error": error,
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(GatewayModelError) as captured:
+        analyze(model)
+
+    assert captured.value.code == "invalid_error_envelope"
+    assert captured.value.retryable is False
+    assert captured.value.retry_after_seconds is None
+
+
+def test_gateway_transport_failure_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    with pytest.raises(GatewayModelError) as captured:
+        analyze(model)
+
+    assert captured.value.code == "transport_error"
+    assert captured.value.retryable is True
 
 
 def test_gateway_rejects_boolean_protocol_version(
