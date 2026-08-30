@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
 import stat
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +39,8 @@ MAX_INPUT_BYTES = 100 * 1024 * 1024
 MAX_REGISTRATION_BYTES = 16 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 2 * 1024 * 1024 + 64 * 1024
+MAX_GENERIC_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_GENERIC_STATUS_BYTES = 24 * 1024 * 1024
 DEFAULT_JOB_TIMEOUT_SECONDS = 30 * 60
 
 UUID_V4_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -53,6 +57,12 @@ Identifier = Annotated[StrictStr, Field(pattern=IDENTIFIER_PATTERN, max_length=1
 MediaType = Annotated[StrictStr, Field(pattern=MEDIA_TYPE_PATTERN, max_length=127)]
 CapabilityVersion = Annotated[StrictStr, Field(pattern=VERSION_PATTERN)]
 Sha256 = Annotated[StrictStr, Field(pattern=SHA256_PATTERN)]
+ParameterString = Annotated[StrictStr, Field(max_length=1000)]
+ParameterInteger = Annotated[
+    StrictInt,
+    Field(ge=-9_007_199_254_740_991, le=9_007_199_254_740_991),
+]
+ParameterValue = ParameterString | ParameterInteger | StrictBool
 
 
 class ConnectError(RuntimeError):
@@ -272,6 +282,82 @@ class _ErrorEnvelope(_WireModel):
     error: _JobError
 
 
+class _InputArtifactV2(_WireModel):
+    artifact_id: UuidV4
+    media_type: MediaType
+    byte_size: Annotated[StrictInt, Field(ge=1, le=1024 * 1024 * 1024)]
+    sha256: Sha256
+    display_name: Annotated[StrictStr, Field(min_length=1, max_length=255)]
+    source_app_id: Identifier
+
+
+class _JobRequestV2(_WireModel):
+    protocol_version: Literal[2]
+    job_id: UuidV4
+    capability: _CapabilityRef
+    inputs: Annotated[list[_InputArtifactV2], Field(min_length=1, max_length=1)]
+    parameters: Annotated[dict[Identifier, ParameterValue], Field(max_length=16)]
+
+
+class _ArtifactProvenanceV2(_WireModel):
+    artifact_id: UuidV4
+    media_type: MediaType
+    byte_size: Annotated[StrictInt, Field(ge=1, le=1024 * 1024 * 1024)]
+    sha256: Sha256
+
+
+class _GenericOutputV2(_WireModel):
+    artifact_id: UuidV4
+    media_type: MediaType
+    display_name: Annotated[StrictStr, Field(min_length=1, max_length=255)]
+    byte_size: Annotated[StrictInt, Field(ge=0, le=MAX_GENERIC_OUTPUT_BYTES)]
+    sha256: Sha256
+    payload_base64: Annotated[StrictStr, Field(max_length=2_796_204)]
+
+
+class _JobResultV2(_WireModel):
+    outputs: Annotated[list[_GenericOutputV2], Field(min_length=1, max_length=8)]
+
+
+class _JobStatusV2(_WireModel):
+    protocol_version: Literal[2]
+    job_id: UuidV4
+    capability: _CapabilityRef
+    provider: _ProviderRef
+    status: Literal["accepted", "processing", "completed", "failed"]
+    created_at: StrictStr
+    updated_at: StrictStr
+    input_artifacts: Annotated[
+        list[_ArtifactProvenanceV2], Field(min_length=1, max_length=1)
+    ]
+    result: _JobResultV2 | None = None
+    error: _JobError | None = None
+
+    _created_timestamp = field_validator("created_at")(_validate_timestamp)
+    _updated_timestamp = field_validator("updated_at")(_validate_timestamp)
+
+    @model_validator(mode="after")
+    def validate_terminal_shape(self) -> _JobStatusV2:
+        if self.status == "completed" and (self.result is None or self.error is not None):
+            raise ValueError("completed jobs require only a result")
+        if self.status == "failed" and (self.error is None or self.result is not None):
+            raise ValueError("failed jobs require only an error")
+        if self.status in {"accepted", "processing"} and (
+            self.result is not None or self.error is not None
+        ):
+            raise ValueError("active jobs cannot contain terminal data")
+        if self.result is not None:
+            artifact_ids = [output.artifact_id for output in self.result.outputs]
+            if len(artifact_ids) != len(set(artifact_ids)):
+                raise ValueError("output artifact identifiers must be unique")
+        return self
+
+
+class _ErrorEnvelopeV2(_WireModel):
+    protocol_version: Literal[2]
+    error: _JobError
+
+
 @dataclass(frozen=True)
 class ProviderCapability:
     base_url: str
@@ -430,6 +516,58 @@ class ArtifactIdentity:
 
 
 @dataclass(frozen=True)
+class PreparedCapabilityJob:
+    job_id: str
+    provider_app_id: str
+    provider_app_version: str
+    provider_instance_id: str
+    capability_id: str
+    capability_version: str
+    artifact: ArtifactIdentity
+    display_name: str
+    parameters: tuple[tuple[str, str | int | bool], ...]
+    request_json: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class CapabilityOutput:
+    artifact_id: str
+    media_type: str
+    display_name: str
+    byte_size: int
+    sha256: str
+    payload: bytes = field(repr=False)
+
+    def store_dict(self) -> dict[str, object]:
+        return {
+            "artifact_id": self.artifact_id,
+            "media_type": self.media_type,
+            "display_name": self.display_name,
+            "byte_size": self.byte_size,
+            "sha256": self.sha256,
+            "payload_base64": base64.b64encode(self.payload).decode("ascii"),
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityResult:
+    outputs: tuple[CapabilityOutput, ...]
+
+    def store_dict(self) -> dict[str, object]:
+        return {"outputs": [output.store_dict() for output in self.outputs]}
+
+
+@dataclass(frozen=True)
+class CapabilityJobUpdate:
+    job_id: str
+    status: str
+    provider_app_id: str
+    provider_instance_id: str
+    result: CapabilityResult | None
+    error: ConnectError | None
+
+
+@dataclass(frozen=True)
 class PreparedSummaryJob:
     job_id: str
     artifact: ArtifactIdentity
@@ -584,6 +722,23 @@ def _http_error(response: httpx.Response) -> ConnectError:
     try:
         value = _response_json(response, 64 * 1024)
         envelope = _ErrorEnvelope.model_validate(value)
+    except (ConnectError, ValueError, TypeError):
+        return ConnectError(
+            "PROVIDER_REQUEST_FAILED",
+            "The local capability provider rejected the request.",
+            retryable=response.status_code >= 500,
+        )
+    return ConnectError(
+        envelope.error.code,
+        envelope.error.message,
+        retryable=envelope.error.retryable,
+    )
+
+
+def _http_error_v2(response: httpx.Response) -> ConnectError:
+    try:
+        value = _response_json(response, 64 * 1024)
+        envelope = _ErrorEnvelopeV2.model_validate(value)
     except (ConnectError, ValueError, TypeError):
         return ConnectError(
             "PROVIDER_REQUEST_FAILED",
@@ -851,6 +1006,186 @@ def _safe_display_name(filename: str) -> str:
     return f"{stem}.pdf"
 
 
+def _safe_artifact_display_name(filename: str) -> str:
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(character for character in basename if character.isprintable()).strip()
+    if not cleaned:
+        cleaned = "attachment"
+    while len(cleaned.encode("utf-8")) > 255:
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+def _validated_parameters(
+    capability: DiscoveredCapability,
+    values: dict[str, object] | None,
+) -> dict[str, str | int | bool]:
+    supplied = values or {}
+    declarations = {parameter.name: parameter for parameter in capability.parameters}
+    missing = sorted(
+        name
+        for name, parameter in declarations.items()
+        if parameter.required and name not in supplied
+    )
+    if missing:
+        raise ConnectError(
+            "PARAMETERS_INVALID",
+            f"Required capability parameter is missing: {missing[0]}",
+        )
+    undeclared = sorted(set(supplied) - set(declarations))
+    if undeclared:
+        raise ConnectError(
+            "PARAMETERS_INVALID",
+            f"Capability parameter is not declared: {undeclared[0]}",
+        )
+
+    validated: dict[str, str | int | bool] = {}
+    for name in sorted(supplied):
+        value = supplied[name]
+        value_type = declarations[name].value_type
+        valid = (
+            value_type == "string"
+            and isinstance(value, str)
+            and len(value) <= 1000
+        ) or (
+            value_type == "integer"
+            and type(value) is int
+            and -9_007_199_254_740_991 <= value <= 9_007_199_254_740_991
+        ) or (value_type == "boolean" and type(value) is bool)
+        if not valid:
+            raise ConnectError(
+                "PARAMETERS_INVALID",
+                f"Capability parameter has the wrong type or size: {name}",
+            )
+        validated[name] = value  # type: ignore[assignment]
+    return validated
+
+
+def _build_capability_job(
+    capability: DiscoveredCapability,
+    *,
+    job_id: str,
+    artifact_id: str,
+    media_type: str,
+    byte_size: int,
+    sha256: str,
+    filename: str,
+    parameters: dict[str, object] | None,
+) -> PreparedCapabilityJob:
+    if capability.protocol_version != GENERIC_PROTOCOL_VERSION:
+        raise ConnectError(
+            "PROTOCOL_VERSION_UNSUPPORTED",
+            "The selected capability does not use the generic Connect protocol.",
+        )
+    if not capability.accepts_artifact(media_type, byte_size):
+        raise ConnectError(
+            "INPUT_ARTIFACT_INVALID",
+            "The attachment type or size is not accepted by this capability.",
+        )
+    artifact = ArtifactIdentity(
+        artifact_id=artifact_id,
+        media_type=media_type.casefold(),
+        byte_size=byte_size,
+        sha256=sha256,
+    )
+    display_name = _safe_artifact_display_name(filename)
+    validated_parameters = _validated_parameters(capability, parameters)
+    try:
+        request = _JobRequestV2.model_validate(
+            {
+                "protocol_version": GENERIC_PROTOCOL_VERSION,
+                "job_id": job_id,
+                "capability": {
+                    "id": capability.capability_id,
+                    "version": capability.capability_version,
+                },
+                "inputs": [
+                    {
+                        **artifact.public_dict(),
+                        "display_name": display_name,
+                        "source_app_id": SOURCE_APP_ID,
+                    }
+                ],
+                "parameters": validated_parameters,
+            }
+        ).model_dump()
+    except (ValueError, TypeError) as exc:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The capability job request is invalid.",
+        ) from exc
+    return PreparedCapabilityJob(
+        job_id=job_id,
+        provider_app_id=capability.app_id,
+        provider_app_version=capability.app_version,
+        provider_instance_id=capability.instance_id,
+        capability_id=capability.capability_id,
+        capability_version=capability.capability_version,
+        artifact=artifact,
+        display_name=display_name,
+        parameters=tuple(validated_parameters.items()),
+        request_json=json.dumps(
+            request,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8"),
+    )
+
+
+def restore_capability_job(
+    capability: DiscoveredCapability,
+    *,
+    job_id: str,
+    artifact_id: str,
+    media_type: str,
+    byte_size: int,
+    sha256: str,
+    filename: str,
+    parameters: dict[str, object] | None = None,
+) -> PreparedCapabilityJob:
+    return _build_capability_job(
+        capability,
+        job_id=job_id,
+        artifact_id=artifact_id,
+        media_type=media_type,
+        byte_size=byte_size,
+        sha256=sha256,
+        filename=filename,
+        parameters=parameters,
+    )
+
+
+def prepare_capability_job(
+    capability: DiscoveredCapability,
+    content: bytes,
+    media_type: str,
+    filename: str,
+    *,
+    parameters: dict[str, object] | None = None,
+    confirmed: bool = False,
+) -> PreparedCapabilityJob:
+    if capability.confirmation_required and not confirmed:
+        raise ConnectError(
+            "CONFIRMATION_REQUIRED",
+            "This capability requires explicit confirmation before invocation.",
+        )
+    if not content or len(content) > MAX_INPUT_BYTES:
+        raise ConnectError(
+            "INPUT_ARTIFACT_INVALID",
+            "The attachment size is unsupported.",
+        )
+    return _build_capability_job(
+        capability,
+        job_id=str(uuid4()),
+        artifact_id=str(uuid4()),
+        media_type=media_type,
+        byte_size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        filename=filename,
+        parameters=parameters,
+    )
+
+
 def _summary_request(
     job_id: str, artifact: ArtifactIdentity, display_name: str
 ) -> dict[str, object]:
@@ -1078,6 +1413,216 @@ class ConnectClient:
                 retryable=status.error.retryable,
             )
         return JobUpdate(
+            job_id=status.job_id,
+            status=status.status,
+            provider_app_id=status.provider.app_id,
+            provider_instance_id=status.provider.instance_id,
+            result=result,
+            error=error,
+        )
+
+
+class ConnectV2Client:
+    def __init__(
+        self,
+        capability: DiscoveredCapability,
+        *,
+        client: httpx.Client | None = None,
+        poll_interval_seconds: float = 0.25,
+        job_timeout_seconds: float = DEFAULT_JOB_TIMEOUT_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        if capability.protocol_version != GENERIC_PROTOCOL_VERSION:
+            raise ValueError("ConnectV2Client requires a v2 capability")
+        self.capability = capability
+        self._client = client
+        self._poll_interval_seconds = poll_interval_seconds
+        self._job_timeout_seconds = job_timeout_seconds
+        self._sleep = sleep
+        self._monotonic = monotonic
+
+    def _request_client(self) -> tuple[httpx.Client, bool]:
+        return (self._client, False) if self._client is not None else (_client(), True)
+
+    def _validate_job(self, job: PreparedCapabilityJob) -> None:
+        if (
+            job.provider_app_id != self.capability.app_id
+            or job.provider_app_version != self.capability.app_version
+            or job.provider_instance_id != self.capability.instance_id
+            or job.capability_id != self.capability.capability_id
+            or job.capability_version != self.capability.capability_version
+            or not self.capability.accepts_artifact(
+                job.artifact.media_type, job.artifact.byte_size
+            )
+        ):
+            raise ConnectError(
+                "JOB_CAPABILITY_MISMATCH",
+                "The prepared job does not match the selected capability.",
+            )
+
+    def submit(self, job: PreparedCapabilityJob, content: bytes) -> CapabilityJobUpdate:
+        self._validate_job(job)
+        if len(content) != job.artifact.byte_size or hashlib.sha256(content).hexdigest() != (
+            job.artifact.sha256
+        ):
+            raise ConnectError(
+                "INPUT_ARTIFACT_CHANGED",
+                "The attachment changed before handoff.",
+            )
+        active_client, owned = self._request_client()
+        try:
+            with active_client.stream(
+                "POST",
+                f"{self.capability.base_url}v2/jobs",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.capability.token}",
+                },
+                files=[
+                    (
+                        "request",
+                        ("request.json", job.request_json, "application/json"),
+                    ),
+                    (
+                        "artifact",
+                        (job.display_name, BytesIO(content), job.artifact.media_type),
+                    ),
+                ],
+            ) as response:
+                if response.status_code not in {200, 202}:
+                    raise _http_error_v2(response)
+                return self._job_update(response, job)
+        except httpx.HTTPError as exc:
+            raise ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The local capability provider became unavailable.",
+                retryable=True,
+            ) from exc
+        finally:
+            if owned:
+                active_client.close()
+
+    def get(self, job: PreparedCapabilityJob) -> CapabilityJobUpdate:
+        self._validate_job(job)
+        active_client, owned = self._request_client()
+        try:
+            with active_client.stream(
+                "GET",
+                f"{self.capability.base_url}v2/jobs/{job.job_id}",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.capability.token}",
+                },
+            ) as response:
+                if response.status_code != 200:
+                    raise _http_error_v2(response)
+                return self._job_update(response, job)
+        except httpx.HTTPError as exc:
+            raise ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The local capability provider became unavailable.",
+                retryable=True,
+            ) from exc
+        finally:
+            if owned:
+                active_client.close()
+
+    def wait_for_terminal(
+        self,
+        job: PreparedCapabilityJob,
+        initial: CapabilityJobUpdate,
+        on_update: Callable[[CapabilityJobUpdate], None],
+    ) -> CapabilityJobUpdate:
+        current = initial
+        started = self._monotonic()
+        while current.status not in {"completed", "failed"}:
+            if self._monotonic() - started >= self._job_timeout_seconds:
+                raise ConnectError(
+                    "JOB_TIMEOUT",
+                    "The local capability job did not finish before its timeout.",
+                    retryable=True,
+                )
+            self._sleep(self._poll_interval_seconds)
+            update = self.get(job)
+            allowed = {
+                "accepted": {"accepted", "processing", "completed", "failed"},
+                "processing": {"processing", "completed", "failed"},
+            }
+            if update.status not in allowed.get(current.status, set()):
+                raise ConnectError(
+                    "JOB_STATE_INVALID",
+                    "The local capability provider returned an invalid job transition.",
+                )
+            if update.status != current.status:
+                on_update(update)
+            current = update
+        return current
+
+    def _job_update(
+        self, response: httpx.Response, job: PreparedCapabilityJob
+    ) -> CapabilityJobUpdate:
+        try:
+            status = _JobStatusV2.model_validate(
+                _response_json(response, MAX_GENERIC_STATUS_BYTES)
+            )
+        except (ValueError, TypeError) as exc:
+            raise ConnectError("RESPONSE_INVALID", "Connect job status was invalid.") from exc
+        expected = job.artifact
+        if (
+            status.job_id != job.job_id
+            or status.capability.id != job.capability_id
+            or status.capability.version != job.capability_version
+            or status.provider.app_id != self.capability.app_id
+            or status.provider.instance_id != self.capability.instance_id
+            or status.input_artifacts[0].model_dump() != expected.public_dict()
+        ):
+            raise ConnectError("RESPONSE_MISMATCH", "Connect job status did not match its request.")
+
+        result: CapabilityResult | None = None
+        error: ConnectError | None = None
+        if status.result is not None:
+            outputs: list[CapabilityOutput] = []
+            for output in status.result.outputs:
+                if output.media_type not in self.capability.produces:
+                    raise ConnectError(
+                        "RESPONSE_MISMATCH",
+                        "Connect output type was not declared by the capability.",
+                    )
+                try:
+                    payload = base64.b64decode(output.payload_base64, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise ConnectError(
+                        "OUTPUT_INTEGRITY_INVALID",
+                        "Connect output encoding was invalid.",
+                    ) from exc
+                if (
+                    base64.b64encode(payload).decode("ascii") != output.payload_base64
+                    or len(payload) != output.byte_size
+                    or hashlib.sha256(payload).hexdigest() != output.sha256
+                ):
+                    raise ConnectError(
+                        "OUTPUT_INTEGRITY_INVALID",
+                        "Connect output integrity check failed.",
+                    )
+                outputs.append(
+                    CapabilityOutput(
+                        artifact_id=output.artifact_id,
+                        media_type=output.media_type,
+                        display_name=output.display_name,
+                        byte_size=output.byte_size,
+                        sha256=output.sha256,
+                        payload=payload,
+                    )
+                )
+            result = CapabilityResult(tuple(outputs))
+        if status.error is not None:
+            error = ConnectError(
+                status.error.code,
+                status.error.message,
+                retryable=status.error.retryable,
+            )
+        return CapabilityJobUpdate(
             job_id=status.job_id,
             status=status.status,
             provider_app_id=status.provider.app_id,

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ TOKEN = "A" * 43
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
+OUTPUT_ID_B = "44444444-4444-4444-8444-444444444444"
 
 
 def registration(
@@ -635,6 +637,79 @@ def completed_result(job: connect.PreparedSummaryJob) -> dict[str, object]:
     }
 
 
+def discovered_v2_capability(
+    *,
+    capability_id: str = "document.translate",
+    produces: tuple[str, ...] = ("text/plain",),
+    parameters: tuple[connect.CapabilityParameter, ...] = (),
+    confirmation_required: bool = False,
+) -> connect.DiscoveredCapability:
+    return connect.DiscoveredCapability(
+        protocol_version=2,
+        base_url="http://127.0.0.1:32123/",
+        token=TOKEN,
+        app_id="generic-provider",
+        app_name="Generic Provider",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id=capability_id,
+        capability_version="1.0",
+        action_label="Translate",
+        action_description="Translate this attachment locally.",
+        accepts=(connect.AcceptedArtifactType("application/pdf", 1024),),
+        produces=produces,
+        parameters=parameters,
+        external_effects=confirmation_required,
+        confirmation_required=confirmation_required,
+    )
+
+
+def generic_job_status(
+    job: connect.PreparedCapabilityJob,
+    status: str,
+    *,
+    result: dict[str, object] | None = None,
+    error: dict[str, object] | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "protocol_version": 2,
+        "job_id": job.job_id,
+        "capability": {
+            "id": job.capability_id,
+            "version": job.capability_version,
+        },
+        "provider": {
+            "app_id": job.provider_app_id,
+            "instance_id": job.provider_instance_id,
+        },
+        "status": status,
+        "created_at": "2026-08-30T12:00:00+00:00",
+        "updated_at": "2026-08-30T12:00:01+00:00",
+        "input_artifacts": [job.artifact.public_dict()],
+    }
+    if result is not None:
+        value["result"] = result
+    if error is not None:
+        value["error"] = error
+    return value
+
+
+def generic_output(
+    payload: bytes,
+    *,
+    artifact_id: str = OUTPUT_ID,
+    media_type: str = "text/plain",
+) -> dict[str, object]:
+    return {
+        "artifact_id": artifact_id,
+        "media_type": media_type,
+        "display_name": "translation.txt",
+        "byte_size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "payload_base64": base64.b64encode(payload).decode("ascii"),
+    }
+
+
 def test_job_handoff_has_no_path_or_mailbox_metadata_and_polls_to_completion() -> None:
     content = b"%PDF-1.4\nlocal fixture\n%%EOF"
     job = connect.prepare_summary_job(content, "../../private.pdf")
@@ -745,3 +820,244 @@ def test_job_rejects_status_from_a_different_provider_instance() -> None:
             client.submit(job, content)
 
     assert raised.value.code == "RESPONSE_MISMATCH"
+
+
+def test_v2_job_preparation_enforces_declaration_confirmation_and_stable_restore() -> None:
+    parameter = connect.CapabilityParameter(
+        name="target-language",
+        value_type="string",
+        required=True,
+        label="Target language",
+        description="Language to produce.",
+    )
+    capability = discovered_v2_capability(
+        parameters=(parameter,), confirmation_required=True
+    )
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+
+    with pytest.raises(connect.ConnectError) as confirmation:
+        connect.prepare_capability_job(
+            capability,
+            content,
+            "application/pdf",
+            "../../private.pdf",
+            parameters={"target-language": "Spanish"},
+        )
+    assert confirmation.value.code == "CONFIRMATION_REQUIRED"
+
+    for parameters in (
+        {},
+        {"target-language": True},
+        {"target-language": "Spanish", "format": "short"},
+    ):
+        with pytest.raises(connect.ConnectError) as invalid:
+            connect.prepare_capability_job(
+                capability,
+                content,
+                "application/pdf",
+                "../../private.pdf",
+                parameters=parameters,
+                confirmed=True,
+            )
+        assert invalid.value.code == "PARAMETERS_INVALID"
+
+    with pytest.raises(connect.ConnectError) as media:
+        connect.prepare_capability_job(
+            capability,
+            content,
+            "text/plain",
+            "private.txt",
+            parameters={"target-language": "Spanish"},
+            confirmed=True,
+        )
+    assert media.value.code == "INPUT_ARTIFACT_INVALID"
+
+    job = connect.prepare_capability_job(
+        capability,
+        content,
+        "application/pdf",
+        "../../private.pdf",
+        parameters={"target-language": "Spanish"},
+        confirmed=True,
+    )
+    request = json.loads(job.request_json)
+    assert request["protocol_version"] == 2
+    assert request["parameters"] == {"target-language": "Spanish"}
+    assert request["inputs"][0]["display_name"] == "private.pdf"
+    assert set(request["inputs"][0]) == {
+        "artifact_id",
+        "media_type",
+        "byte_size",
+        "sha256",
+        "display_name",
+        "source_app_id",
+    }
+    assert TOKEN.encode() not in job.request_json
+    assert b"127.0.0.1" not in job.request_json
+    restored = connect.restore_capability_job(
+        capability,
+        job_id=job.job_id,
+        artifact_id=job.artifact.artifact_id,
+        media_type=job.artifact.media_type,
+        byte_size=job.artifact.byte_size,
+        sha256=job.artifact.sha256,
+        filename=job.display_name,
+        parameters=dict(job.parameters),
+    )
+    assert restored.request_json == job.request_json
+    assert restored.provider_instance_id == INSTANCE_A
+
+
+def test_v2_client_submits_and_polls_generic_outputs() -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    capability = discovered_v2_capability()
+    job = connect.prepare_capability_job(
+        capability, content, "application/pdf", "invoice.pdf"
+    )
+    observed_requests: list[dict[str, object]] = []
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        assert request.headers["authorization"] == f"Bearer {TOKEN}"
+        assert "origin" not in request.headers
+        if request.method == "POST":
+            assert request.url == "http://127.0.0.1:32123/v2/jobs"
+            parts = multipart_parts(request)
+            observed_requests.append(json.loads(parts["request"]))
+            assert parts["artifact"] == content
+            return httpx.Response(202, json=generic_job_status(job, "accepted"))
+        polls += 1
+        assert request.url == f"http://127.0.0.1:32123/v2/jobs/{job.job_id}"
+        if polls == 1:
+            return httpx.Response(200, json=generic_job_status(job, "processing"))
+        return httpx.Response(
+            200,
+            json=generic_job_status(
+                job,
+                "completed",
+                result={
+                    "outputs": [
+                        generic_output(b"Invoice due Friday."),
+                        generic_output(b"", artifact_id=OUTPUT_ID_B),
+                    ]
+                },
+            ),
+        )
+
+    updates: list[str] = []
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(
+            capability,
+            client=http_client,
+            poll_interval_seconds=0,
+            sleep=lambda _seconds: None,
+        )
+        initial = client.submit(job, content)
+        final = client.wait_for_terminal(
+            job, initial, lambda update: updates.append(update.status)
+        )
+
+    assert observed_requests == [json.loads(job.request_json)]
+    assert updates == ["processing", "completed"]
+    assert final.result is not None
+    assert [output.payload for output in final.result.outputs] == [
+        b"Invoice due Friday.",
+        b"",
+    ]
+    assert final.result.store_dict()["outputs"][1]["payload_base64"] == ""  # type: ignore[index]
+
+
+def test_v2_client_reuses_prepared_identity_after_lost_acknowledgement() -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    capability = discovered_v2_capability()
+    job = connect.prepare_capability_job(
+        capability, content, "application/pdf", "invoice.pdf"
+    )
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(multipart_parts(request)["request"]))
+        if len(requests) == 1:
+            raise httpx.ReadError("acknowledgement lost", request=request)
+        return httpx.Response(202, json=generic_job_status(job, "accepted"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(capability, client=http_client)
+        with pytest.raises(connect.ConnectError) as lost:
+            client.submit(job, content)
+        retried = client.submit(job, content)
+
+    assert lost.value.code == "PROVIDER_UNAVAILABLE"
+    assert lost.value.retryable is True
+    assert retried.job_id == job.job_id
+    assert requests == [json.loads(job.request_json), json.loads(job.request_json)]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        ("noncanonical", "OUTPUT_INTEGRITY_INVALID"),
+        ("digest", "OUTPUT_INTEGRITY_INVALID"),
+        ("duplicate", "RESPONSE_INVALID"),
+        ("undeclared_media", "RESPONSE_MISMATCH"),
+    ],
+)
+def test_v2_client_rejects_invalid_generic_outputs(mode: str, expected_code: str) -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    capability = discovered_v2_capability()
+    job = connect.prepare_capability_job(
+        capability, content, "application/pdf", "invoice.pdf"
+    )
+    output = generic_output(b"f")
+    outputs = [output]
+    if mode == "noncanonical":
+        output["payload_base64"] = "Zh=="
+    elif mode == "digest":
+        output["sha256"] = "0" * 64
+    elif mode == "duplicate":
+        outputs.append(generic_output(b"other", artifact_id=OUTPUT_ID))
+    elif mode == "undeclared_media":
+        output["media_type"] = "application/octet-stream"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=generic_job_status(job, "completed", result={"outputs": outputs}),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(capability, client=http_client)
+        with pytest.raises(connect.ConnectError) as raised:
+            client.submit(job, content)
+
+    assert raised.value.code == expected_code
+
+
+def test_v2_client_preserves_provider_error_contract() -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    capability = discovered_v2_capability()
+    job = connect.prepare_capability_job(
+        capability, content, "application/pdf", "invoice.pdf"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "protocol_version": 2,
+                "error": {
+                    "code": "JOB_ID_CONFLICT",
+                    "message": "The job identity is already in use.",
+                    "retryable": False,
+                },
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(capability, client=http_client)
+        with pytest.raises(connect.ConnectError) as raised:
+            client.submit(job, content)
+
+    assert raised.value.code == "JOB_ID_CONFLICT"
+    assert raised.value.retryable is False
