@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
+
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.db import SCHEMA_VERSION
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -287,6 +289,7 @@ def main() -> None:
     restarted: subprocess.Popen[bytes] | None = None
     recovered: subprocess.Popen[bytes] | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    original_connect_client_factory = connect._client
     try:
         with tempfile.TemporaryDirectory(prefix="connect-proof-") as temporary:
             root = Path(temporary)
@@ -433,6 +436,20 @@ def main() -> None:
 
             interrupted_invocation = {**invocation, "request_id": str(uuid4())}
             interrupted_result: dict[str, object] = {}
+            interrupted_provider_submissions = 0
+
+            def instrumented_connect_client() -> httpx.Client:
+                client = original_connect_client_factory()
+
+                def record_request(request: httpx.Request) -> None:
+                    nonlocal interrupted_provider_submissions
+                    if request.method == "POST" and request.url.path == "/v2/jobs":
+                        interrupted_provider_submissions += 1
+
+                client.event_hooks["request"].append(record_request)
+                return client
+
+            connect._client = instrumented_connect_client
 
             def invoke_interrupted_job() -> None:
                 try:
@@ -590,6 +607,7 @@ def main() -> None:
                     and interrupted_row[3] == "PROVIDER_RESTARTED"
                     and interrupted_row[4] == 1
                 ),
+                "interrupted_provider_submitted_once": interrupted_provider_submissions == 1,
                 "interrupted_reconciliation_skipped_gmail": gmail_reconciliation_reads == 0,
                 "email_database_healthy": quick_check == "ok",
                 "email_database_current": schema_version == SCHEMA_VERSION,
@@ -646,6 +664,7 @@ def main() -> None:
                 "email_database_schema_version": schema_version,
                 "job_status": response["data"]["status"],
                 "interrupted_initial_error_code": interrupted_error_code,
+                "interrupted_provider_submissions": interrupted_provider_submissions,
                 "interrupted_reconciled_error_code": reconciled_error_code,
                 "model_id": model_name,
                 "model_mode": model_mode,
@@ -663,6 +682,7 @@ def main() -> None:
             print(json.dumps(result, separators=(",", ":"), sort_keys=True))
             require_proof_checks(proof_checks)
     finally:
+        connect._client = original_connect_client_factory
         if provider is not None:
             stop_provider(provider)
         if restarted is not None:
