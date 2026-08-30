@@ -3,9 +3,15 @@ from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock
+from googleapiclient.errors import HttpError
 
 from eom_email_watcher import gmail as gmail_module
-from eom_email_watcher.gmail import GmailError, GmailGateway, parse_metadata
+from eom_email_watcher.gmail import (
+    GmailAuthorizationRejected,
+    GmailError,
+    GmailGateway,
+    parse_metadata,
+)
 
 
 def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
@@ -212,7 +218,13 @@ def test_authorize_replaces_an_unusable_existing_token(
             return stored_credentials
 
     replacement = SimpleNamespace(valid=True, to_json=lambda: "replacement token")
-    flow = SimpleNamespace(run_local_server=lambda **kwargs: replacement)
+    browser_calls: list[dict[str, object]] = []
+
+    def run_local_server(**kwargs):
+        browser_calls.append(kwargs)
+        return replacement
+
+    flow = SimpleNamespace(run_local_server=run_local_server)
     service = object()
     monkeypatch.setattr(
         gmail_module.Credentials,
@@ -233,3 +245,19 @@ def test_authorize_replaces_an_unusable_existing_token(
     assert gateway.service is service
     assert authorization_changed is True
     assert token_file.read_text(encoding="utf-8") == "replacement token"
+    assert browser_calls[0]["authorization_prompt_message"] is None
+
+
+def test_profile_history_id_classifies_http_401_as_rejected_authorization() -> None:
+    response = SimpleNamespace(status=401, reason="Unauthorized")
+    error = HttpError(response, b"{}")
+
+    def reject():
+        raise error
+
+    request = SimpleNamespace(execute=reject)
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    with pytest.raises(GmailAuthorizationRejected, match="rejected"):
+        gateway.profile_history_id()

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.gmail import GmailError, MessageMetadata
+from eom_email_watcher.gmail import GmailAuthorizationRejected, GmailError, MessageMetadata
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime
@@ -157,7 +157,7 @@ def test_gmail_authorize_preserves_existing_baseline(
 
     class ExistingGmail:
         def profile_history_id(self) -> str:
-            raise AssertionError("repeat setup must not reset the baseline")
+            return "current-probe-history-id"
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
@@ -169,6 +169,44 @@ def test_gmail_authorize_preserves_existing_baseline(
 
     assert response["data"] == {"baseline_initialized": False, "connected": True}
     assert load_runtime(config_path).store.state()[0] == "preserved-history-id"
+
+
+def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("old-history-id", datetime(2026, 7, 18, tzinfo=UTC))
+    authorization_calls: list[bool] = []
+
+    class RejectedGmail:
+        def profile_history_id(self) -> str:
+            raise GmailAuthorizationRejected("rejected")
+
+    class ReauthorizedGmail:
+        def profile_history_id(self) -> str:
+            return "new-history-id"
+
+    def authorize_with_status(
+        credentials_file, token_file, *, force_reauthorize: bool = False
+    ):
+        authorization_calls.append(force_reauthorize)
+        if force_reauthorize:
+            return ReauthorizedGmail(), True
+        return RejectedGmail(), False
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    assert authorization_calls == [False, True]
+    assert load_runtime(config_path).store.state()[0] == "new-history-id"
 
 
 def test_gmail_authorize_initializes_missing_baseline_with_existing_token(

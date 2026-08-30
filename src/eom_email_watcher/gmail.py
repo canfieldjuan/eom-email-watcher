@@ -28,6 +28,10 @@ class GmailError(RuntimeError):
     """Gmail operation failed."""
 
 
+class GmailAuthorizationRejected(GmailError):
+    """Gmail rejected credentials that appeared usable locally."""
+
+
 class StaleHistoryCursor(GmailError):
     """The saved Gmail history cursor has expired."""
 
@@ -155,7 +159,11 @@ class GmailGateway:
 
     @classmethod
     def authorize_with_status(
-        cls, credentials_file: Path, token_file: Path
+        cls,
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool = False,
     ) -> tuple[GmailGateway, bool]:
         if not credentials_file.exists():
             raise GmailError(
@@ -166,7 +174,7 @@ class GmailGateway:
         try:
             with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
                 credentials: Credentials | None = None
-                if token_file.exists():
+                if token_file.exists() and not force_reauthorize:
                     try:
                         credentials = Credentials.from_authorized_user_file(
                             str(token_file), SCOPES
@@ -187,7 +195,11 @@ class GmailGateway:
                         str(credentials_file), SCOPES
                     )
                     credentials = flow.run_local_server(
-                        host="127.0.0.1", port=0, open_browser=True, prompt="consent"
+                        host="127.0.0.1",
+                        port=0,
+                        authorization_prompt_message=None,
+                        open_browser=True,
+                        prompt="consent",
                     )
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
@@ -202,6 +214,10 @@ class GmailGateway:
         try:
             result = self.service.users().getProfile(userId="me").execute()
         except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 401:
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
             raise GmailError(f"Gmail profile request failed (HTTP {exc.resp.status})") from exc
         return str(result["historyId"])
 

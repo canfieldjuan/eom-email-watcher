@@ -71,7 +71,10 @@ reuses the completed token instead of opening another browser flow or racing tok
 engine also serializes authorization through mailbox-baseline persistence, so overlapping first-run
 requests cannot advance the initial history cursor twice. An unusable stored token causes this
 explicit authorization operation to run the browser flow and replace the token only after that flow
-succeeds. This operation does not expose or request the separate EOM `gmail.send` capability.
+succeeds. A locally valid token is also probed against Gmail; an HTTP 401 triggers the same explicit
+reauthorization path, while other Gmail errors remain failures. The browser helper's authorization
+prompt is suppressed because stdout is reserved exclusively for the JSON engine envelope. This
+operation does not expose or request the separate EOM `gmail.send` capability.
 
 Watchlist mutation is serialized and uses same-directory atomic replacement through the engine; the
 frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an
