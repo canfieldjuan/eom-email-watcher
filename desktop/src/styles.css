@@ -20,7 +20,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -29,7 +30,8 @@ button {
 }
 
 button:disabled,
-input:disabled {
+input:disabled,
+select:disabled {
   cursor: wait;
   opacity: 0.62;
 }
@@ -406,6 +408,15 @@ input:focus {
 .attachment-list button {
   flex: 0 0 auto;
   padding: 6px 10px;
+}
+
+.capability-provider {
+  max-width: 190px;
+  padding: 6px 8px;
+  border: 1px solid #c8d1ca;
+  border-radius: 8px;
+  color: #27352c;
+  background: #fff;
 }
 
 .attachment-actions {

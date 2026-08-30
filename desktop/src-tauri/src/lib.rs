@@ -4,11 +4,14 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CheckResult, ConfigInitialization, ConnectCapabilities, ConnectSummaryResult, Engine,
-    EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
+    CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
+    ConnectInvocationResult, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
+    GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
@@ -125,25 +128,38 @@ async fn attachment_open(
 }
 
 #[tauri::command]
-async fn connect_capabilities(
-    engine: State<'_, Engine>,
-) -> Result<ConnectCapabilities, EngineError> {
-    let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.connect_capabilities())
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
-}
-
-#[tauri::command]
-async fn attachment_summarize(
+async fn attachment_capabilities(
     engine: State<'_, Engine>,
     message_id: String,
     part_id: String,
-) -> Result<ConnectSummaryResult, EngineError> {
+) -> Result<ConnectCapabilities, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.summarize_attachment(message_id, part_id))
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.attachment_capabilities(message_id, part_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn attachment_capability_invoke(
+    engine: State<'_, Engine>,
+    request_id: String,
+    message_id: String,
+    part_id: String,
+    provider: ConnectProviderIdentity,
+    capability: ConnectCapabilityRef,
+    parameters: BTreeMap<String, Value>,
+    confirmed: bool,
+) -> Result<ConnectInvocationResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.invoke_attachment_capability(
+            request_id, message_id, part_id, provider, capability, parameters, confirmed,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -318,11 +334,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             analysis_requeue,
+            attachment_capabilities,
+            attachment_capability_invoke,
             attachment_open,
-            attachment_summarize,
             config_initialize,
             config_status,
-            connect_capabilities,
             gmail_authorize,
             health_get,
             inbox_recent,

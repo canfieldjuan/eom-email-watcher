@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,11 +62,21 @@ pub struct InboxAttachment {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AttachmentCapabilityResult {
+    #[serde(default)]
+    pub job_id: Option<String>,
     pub capability_id: String,
     pub capability_version: String,
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
+    #[serde(default)]
+    pub provider: Option<ConnectProviderIdentity>,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, Value>,
     pub status: String,
     pub updated_at: String,
     pub summary: Option<ConnectSummary>,
+    #[serde(default)]
+    pub outputs: Vec<ConnectOutputMetadata>,
     pub error: Option<EngineError>,
 }
 
@@ -83,11 +94,78 @@ pub struct ConnectWarning {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ConnectCapability {
+pub struct ConnectProviderIdentity {
+    pub app_id: String,
+    pub version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectProvider {
+    pub app_id: String,
+    pub name: String,
+    pub version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilityRef {
     pub id: String,
     pub version: String,
-    pub accepts: Vec<String>,
-    pub max_input_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectAction {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectAcceptedArtifact {
+    pub media_type: String,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectParameter {
+    pub name: String,
+    pub value_type: String,
+    pub required: bool,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectEffects {
+    pub external: bool,
+    pub confirmation_required: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilityDeclaration {
+    pub id: String,
+    pub version: String,
+    pub action: ConnectAction,
+    pub accepts: Vec<ConnectAcceptedArtifact>,
+    pub produces: Vec<String>,
+    pub parameters: Vec<ConnectParameter>,
+    pub effects: ConnectEffects,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapability {
+    pub protocol_version: u32,
+    pub provider: ConnectProvider,
+    pub capability: ConnectCapabilityDeclaration,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectOutputMetadata {
+    pub artifact_id: String,
+    pub media_type: String,
+    pub display_name: String,
+    pub byte_size: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -102,12 +180,13 @@ pub struct ConnectCapabilities {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ConnectSummaryResult {
+pub struct ConnectInvocationResult {
+    pub protocol_version: u32,
     pub job_id: String,
-    pub capability_id: String,
-    pub capability_version: String,
+    pub provider: ConnectProviderIdentity,
+    pub capability: ConnectCapabilityRef,
     pub status: String,
-    pub summary: ConnectSummary,
+    pub outputs: Vec<ConnectOutputMetadata>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -397,18 +476,38 @@ impl Engine {
         )
     }
 
-    pub fn connect_capabilities(&self) -> Result<ConnectCapabilities, EngineError> {
-        self.request("connect.capabilities", json!({}))
-    }
-
-    pub fn summarize_attachment(
+    pub fn attachment_capabilities(
         &self,
         message_id: String,
         part_id: String,
-    ) -> Result<ConnectSummaryResult, EngineError> {
+    ) -> Result<ConnectCapabilities, EngineError> {
         self.request(
-            "connect.attachment.summarize",
+            "connect.attachment.capabilities",
             json!({"message_id": message_id, "part_id": part_id}),
+        )
+    }
+
+    pub fn invoke_attachment_capability(
+        &self,
+        request_id: String,
+        message_id: String,
+        part_id: String,
+        provider: ConnectProviderIdentity,
+        capability: ConnectCapabilityRef,
+        parameters: BTreeMap<String, Value>,
+        confirmed: bool,
+    ) -> Result<ConnectInvocationResult, EngineError> {
+        self.request(
+            "connect.attachment.invoke",
+            json!({
+                "request_id": request_id,
+                "message_id": message_id,
+                "part_id": part_id,
+                "provider": provider,
+                "capability": capability,
+                "parameters": parameters,
+                "confirmed": confirmed,
+            }),
         )
     }
 
@@ -760,6 +859,65 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v2_capabilities_and_durable_results_are_typed() {
+        let capabilities: ConnectCapabilities = serde_json::from_value(json!({
+            "items": [{
+                "protocol_version": 2,
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "name": "Document Summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111"
+                },
+                "capability": {
+                    "id": "document.summarize",
+                    "version": "1.0",
+                    "action": {
+                        "label": "Summarize",
+                        "description": "Create a local summary."
+                    },
+                    "accepts": [{"media_type": "application/pdf", "max_bytes": 1024}],
+                    "produces": ["application/vnd.local-connect.document-summary+json"],
+                    "parameters": [],
+                    "effects": {"external": false, "confirmation_required": false}
+                }
+            }],
+            "diagnostic": null
+        }))
+        .expect("deserialize generic capability catalog");
+        assert_eq!(capabilities.items[0].protocol_version, 2);
+        assert_eq!(capabilities.items[0].provider.name, "Document Summarizer");
+
+        let result: AttachmentCapabilityResult = serde_json::from_value(json!({
+            "job_id": "22222222-2222-4222-8222-222222222222",
+            "protocol_version": 2,
+            "capability_id": "document.summarize",
+            "capability_version": "1.0",
+            "provider": {
+                "app_id": "document-summarizer",
+                "version": "0.1.0",
+                "instance_id": "11111111-1111-4111-8111-111111111111"
+            },
+            "parameters": {},
+            "status": "completed",
+            "updated_at": "2026-08-30T12:00:00+00:00",
+            "outputs": [{
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "media_type": "application/vnd.local-connect.document-summary+json",
+                "display_name": "summary.json",
+                "byte_size": 25,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }))
+        .expect("deserialize durable generic result");
+        assert_eq!(
+            result.job_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(result.outputs[0].display_name, "summary.json");
+    }
+
+    #[test]
     fn protocol_v1_gmail_authorization_result_is_typed() {
         let result: GmailAuthorization = serde_json::from_value(json!({
             "baseline_initialized": true,
@@ -1056,6 +1214,35 @@ notifications_enabled = true
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
         assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
+        assert_eq!(
+            engine
+                .attachment_capabilities("missing-message".into(), "2".into())
+                .expect_err("missing attachment must not discover capabilities")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .invoke_attachment_capability(
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "missing-message".into(),
+                    "2".into(),
+                    ConnectProviderIdentity {
+                        app_id: "document-summarizer".into(),
+                        version: "0.1.0".into(),
+                        instance_id: "11111111-1111-4111-8111-111111111111".into(),
+                    },
+                    ConnectCapabilityRef {
+                        id: "document.summarize".into(),
+                        version: "1.0".into(),
+                    },
+                    BTreeMap::new(),
+                    false,
+                )
+                .expect_err("missing attachment must not invoke a capability")
+                .code,
+            "not_found"
+        );
         assert_eq!(
             engine
                 .requeue_analysis("missing-message".into())
