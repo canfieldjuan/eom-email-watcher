@@ -82,6 +82,11 @@ interface OpenedAttachment {
   filename: string;
 }
 
+interface GmailAuthorization {
+  baseline_initialized: boolean;
+  connected: boolean;
+}
+
 interface HealthStatus {
   database: {
     ok: boolean;
@@ -197,6 +202,9 @@ app.innerHTML = `
           <dt>Gmail</dt>
           <dd id="gmail-health">Checking…</dd>
           <dd id="gmail-detail" class="health-card-detail"></dd>
+          <dd class="health-card-action">
+            <button id="gmail-authorize" class="gmail-action" type="button" disabled>Connect Gmail</button>
+          </dd>
         </div>
         <div class="health-card">
           <dt>Local AI</dt>
@@ -266,6 +274,7 @@ const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
 const checkNow = requiredElement<HTMLButtonElement>("#check-now");
 const gmailHealth = requiredElement<HTMLElement>("#gmail-health");
 const gmailDetail = requiredElement<HTMLElement>("#gmail-detail");
+const gmailAuthorize = requiredElement<HTMLButtonElement>("#gmail-authorize");
 const modelHealth = requiredElement<HTMLElement>("#model-health");
 const modelDetail = requiredElement<HTMLElement>("#model-detail");
 const databaseHealth = requiredElement<HTMLElement>("#database-health");
@@ -287,6 +296,9 @@ let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
+let gmailAuthorizationInFlight = false;
+let gmailConnected = false;
+let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
 let connectCapabilities: ConnectCapability[] = [];
 let settingsInFlight = false;
@@ -614,6 +626,15 @@ function setHealthValue(element: HTMLElement, ready: boolean, text: string): voi
   element.dataset.ready = String(ready);
 }
 
+function syncGmailAuthorizationAction(): void {
+  gmailAuthorize.textContent = gmailAuthorizationInFlight
+    ? "Connecting…"
+    : gmailConnected
+      ? "Reconnect Gmail"
+      : "Connect Gmail";
+  gmailAuthorize.disabled = gmailAuthorizationInFlight || !gmailCredentialsConfigured;
+}
+
 function renderHealthUnknown(): void {
   const detail = "Health refresh failed; current status is unknown.";
   for (const [value, description] of [
@@ -629,9 +650,15 @@ function renderHealthUnknown(): void {
   watchlistCount.textContent = "Unknown";
   pollingCadence.textContent = "Unknown";
   nextCheck.textContent = "Unknown";
+  gmailConnected = false;
+  gmailCredentialsConfigured = false;
+  syncGmailAuthorizationAction();
 }
 
 function renderHealth(health: HealthStatus): void {
+  gmailConnected = health.gmail.connected;
+  gmailCredentialsConfigured = health.gmail.credentials_configured;
+  syncGmailAuthorizationAction();
   const gmailReady = health.gmail.connected && health.gmail.credentials_configured;
   setHealthValue(gmailHealth, gmailReady, gmailReady ? "Configured" : "Needs attention");
   gmailDetail.textContent = gmailReady
@@ -682,6 +709,26 @@ function renderHealth(health: HealthStatus): void {
     health.notifications.host_delivery_ready &&
     watcherPrerequisitesReady;
   checkNow.disabled = checkInFlight || !checkSupported;
+}
+
+async function authorizeGmail(): Promise<void> {
+  if (gmailAuthorizationInFlight || !gmailCredentialsConfigured) return;
+  gmailAuthorizationInFlight = true;
+  syncGmailAuthorizationAction();
+  healthStatus.textContent = "Complete Gmail authorization in your browser…";
+  delete healthStatus.dataset.kind;
+  try {
+    const result = await invoke<GmailAuthorization>("gmail_authorize");
+    const message = result.baseline_initialized
+      ? "Gmail connected. Watching begins from the current mailbox state."
+      : "Gmail connection verified. The existing mailbox position was preserved.";
+    await loadHealth(message);
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    gmailAuthorizationInFlight = false;
+    syncGmailAuthorizationAction();
+  }
 }
 
 async function loadHealth(
@@ -934,6 +981,7 @@ settingsTab.addEventListener("click", () => {
   void loadSettings();
 });
 checkNow.addEventListener("click", () => void runCheck());
+gmailAuthorize.addEventListener("click", () => void authorizeGmail());
 void listen<{
   status: "complete" | "delivery_failed" | "check_failed";
   failed_notifications: number;

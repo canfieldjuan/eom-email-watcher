@@ -125,8 +125,10 @@ retention and notification settings, live health status, a safe one-shot `Check 
 contextual local capabilities for attachments. Its Debian package includes the Python engine as a
 Tauri sidecar, so the installed application does not depend on a source checkout or `uv`. It still
 requires an existing private config; see
-[`desktop/README.md`](desktop/README.md). It does not replace Gmail OAuth setup, the systemd
-scheduler, or the existing CLI's optional ntfy delivery.
+[`desktop/README.md`](desktop/README.md). Its Health view can run the existing read-only browser
+authorization when a desktop OAuth credentials file is already configured; it does not provision
+that Google credential. It does not replace the systemd scheduler or the existing CLI's optional
+ntfy delivery.
 
 ## Local Connect capability
 

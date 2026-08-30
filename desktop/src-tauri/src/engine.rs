@@ -12,6 +12,7 @@ use tauri_plugin_shell::ShellExt;
 use std::os::unix::process::CommandExt;
 
 const PROTOCOL_VERSION: u8 = 1;
+const GMAIL_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -162,6 +163,12 @@ pub struct DatabaseHealth {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GmailHealth {
     pub credentials_configured: bool,
+    pub connected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailAuthorization {
+    pub baseline_initialized: bool,
     pub connected: bool,
 }
 
@@ -396,6 +403,10 @@ impl Engine {
 
     pub fn health(&self) -> Result<HealthStatus, EngineError> {
         self.request("health.get", json!({}))
+    }
+
+    pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
+        self.request_with_timeout("gmail.authorize", json!({}), GMAIL_AUTHORIZATION_TIMEOUT)
     }
 
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
@@ -677,6 +688,23 @@ mod tests {
         assert!(item.attachments.is_empty());
     }
 
+    #[test]
+    fn protocol_v1_gmail_authorization_result_is_typed() {
+        let result: GmailAuthorization = serde_json::from_value(json!({
+            "baseline_initialized": true,
+            "connected": true
+        }))
+        .expect("deserialize Gmail authorization result");
+
+        assert_eq!(
+            result,
+            GmailAuthorization {
+                baseline_initialized: true,
+                connected: true,
+            }
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_settings_request_terminates_a_stalled_engine() {
@@ -786,6 +814,13 @@ notifications_enabled = true
         );
         assert!(!health.gmail.credentials_configured);
         assert!(!health.gmail.connected);
+        assert_eq!(
+            engine
+                .authorize_gmail()
+                .expect_err("missing credentials must prevent Gmail authorization")
+                .code,
+            "gmail_error"
+        );
         assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);

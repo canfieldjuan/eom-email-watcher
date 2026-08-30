@@ -5,7 +5,7 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     CheckResult, ConnectCapabilities, ConnectSummaryResult, Engine, EngineError, EngineSettings,
-    HealthStatus, InboxItem, WatchedSender,
+    GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -133,6 +133,14 @@ async fn health_get(
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -286,6 +294,7 @@ pub fn run() {
             attachment_open,
             attachment_summarize,
             connect_capabilities,
+            gmail_authorize,
             health_get,
             inbox_recent,
             settings_get,
