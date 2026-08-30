@@ -150,8 +150,9 @@ journalctl --user -u eom-email-watcher.service --since today
 ```
 
 The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
-not bodies, OAuth tokens, or model prompts.
-Its local LM Studio dependency starts llmster and the API on `127.0.0.1:1234` when needed.
+not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
+loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
+watcher when LM Studio is absent or fails.
 
 ## Model output and safety
 
