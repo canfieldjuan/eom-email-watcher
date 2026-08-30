@@ -14,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from eom_email_watcher import connect, engine_api
+from eom_email_watcher.db import SCHEMA_VERSION
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
@@ -47,9 +48,7 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             schema_name = request["response_format"]["json_schema"]["name"]
             user_prompt = next(
-                message["content"]
-                for message in request["messages"]
-                if message["role"] == "user"
+                message["content"] for message in request["messages"] if message["role"] == "user"
             )
             prompt = json.loads(user_prompt)
             text = self._structured_output(schema_name, prompt)
@@ -214,6 +213,12 @@ def positive_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return seconds
+
+
+def require_proof_checks(checks: dict[str, bool]) -> None:
+    failed_checks = sorted(name for name, passed in checks.items() if not passed)
+    if failed_checks:
+        raise RuntimeError(f"Connect proof failed checks: {', '.join(failed_checks)}")
 
 
 def main() -> None:
@@ -412,64 +417,104 @@ def main() -> None:
                 raise RuntimeError("Connect proof result was not durable")
             durable_request = json.loads(job_row[12])
             replayed_data = replayed.get("data") if replayed["ok"] else None
-            restarted_items = after_restart["items"]
-            print(
-                json.dumps(
-                    {
-                        "after_restart_capabilities": len(restarted_items),
-                        "after_stop_capabilities": len(after_stop["items"]),
-                        "before_provider_capabilities": len(before["items"]),
-                        "capability_id": selected["capability"]["id"],
-                        "capability_version": selected["capability"]["version"],
-                        "during_provider_capabilities": len(during["items"]),
-                        "email_database_quick_check": quick_check,
-                        "email_database_schema_version": schema_version,
-                        "inbox_healthy_without_connect": (
-                            inbox_without_connect["ok"]
-                            and inbox_without_connect["data"]["items"][0]["message_id"]
-                            == "fixture-message"
-                        ),
-                        "input_sha256_matches": job_row[9] == hashlib.sha256(pdf).hexdigest(),
-                        "job_status": response["data"]["status"],
-                        "model_id": model_name,
-                        "model_mode": model_mode,
-                        "persisted_capability_matches": (
-                            job_row[2] == selected["capability"]["id"]
-                            and job_row[3] == selected["capability"]["version"]
-                        ),
-                        "persisted_job_status": job_row[11],
-                        "persisted_protocol_version": job_row[1],
-                        "persisted_provider_matches": (
-                            job_row[4] == selected["provider"]["app_id"]
-                            and job_row[5] == selected["provider"]["version"]
-                            and job_row[6] == selected["provider"]["instance_id"]
-                        ),
-                        "persisted_result_present": job_row[13] is not None,
-                        "proof_input": "synthetic Gmail attachment bytes",
-                        "provider_instance_rotated": (
-                            len(restarted_items) == 1
-                            and restarted_items[0]["provider"]["instance_id"]
-                            != selected["provider"]["instance_id"]
-                        ),
-                        "replayed_completed_job_without_provider": (
-                            replayed_data is not None
-                            and replayed_data["job_id"] == request_id
-                            and replayed_data["outputs"] == outputs
-                        ),
-                        "request_excludes_gmail_identity": (
-                            durable_request["job_id"] == request_id
-                            and "fixture-message" not in job_row[12].decode()
-                            and "fixture-attachment" not in job_row[12].decode()
-                            and "fixture@example.invalid" not in job_row[12].decode()
-                            and "Fixture document" not in job_row[12].decode()
-                        ),
-                        "source_app_id": job_row[10],
-                        "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
+            restarted_matches = [
+                item
+                for item in after_restart["items"]
+                if item["provider"]["app_id"] == selected["provider"]["app_id"]
+                and item["capability"]["id"] == selected["capability"]["id"]
+                and item["capability"]["version"] == selected["capability"]["version"]
+            ]
+            request_inputs = durable_request.get("inputs")
+            serialized_request = json.dumps(durable_request, separators=(",", ":"))
+            request_has_safe_shape = (
+                set(durable_request)
+                == {"protocol_version", "job_id", "capability", "inputs", "parameters"}
+                and isinstance(request_inputs, list)
+                and len(request_inputs) == 1
+                and isinstance(request_inputs[0], dict)
+                and set(request_inputs[0])
+                == {
+                    "artifact_id",
+                    "media_type",
+                    "byte_size",
+                    "sha256",
+                    "display_name",
+                    "source_app_id",
+                }
             )
+            proof_checks = {
+                "before_provider_absent": not before["items"],
+                "provider_available": bool(during["items"]),
+                "provider_removed": not after_stop["items"],
+                "provider_restored": len(restarted_matches) == 1,
+                "email_database_healthy": quick_check == "ok",
+                "email_database_current": schema_version == SCHEMA_VERSION,
+                "inbox_healthy_without_connect": (
+                    inbox_without_connect["ok"]
+                    and inbox_without_connect["data"]["items"][0]["message_id"] == "fixture-message"
+                ),
+                "input_sha256_matches": job_row[9] == hashlib.sha256(pdf).hexdigest(),
+                "job_completed": response["data"]["status"] == "completed",
+                "persisted_capability_matches": (
+                    job_row[2] == selected["capability"]["id"]
+                    and job_row[3] == selected["capability"]["version"]
+                ),
+                "persisted_job_completed": job_row[11] == "completed",
+                "persisted_protocol_matches": job_row[1] == connect.GENERIC_PROTOCOL_VERSION,
+                "persisted_provider_matches": (
+                    job_row[4] == selected["provider"]["app_id"]
+                    and job_row[5] == selected["provider"]["version"]
+                    and job_row[6] == selected["provider"]["instance_id"]
+                ),
+                "persisted_result_present": job_row[13] is not None,
+                "provider_instance_rotated": (
+                    len(restarted_matches) == 1
+                    and restarted_matches[0]["provider"]["instance_id"]
+                    != selected["provider"]["instance_id"]
+                ),
+                "replayed_completed_job_without_provider": (
+                    replayed_data is not None
+                    and replayed_data["job_id"] == request_id
+                    and replayed_data["outputs"] == outputs
+                ),
+                "request_excludes_gmail_identity": (
+                    request_has_safe_shape
+                    and durable_request["job_id"] == request_id
+                    and all(
+                        private_value not in serialized_request
+                        for private_value in (
+                            "fixture-message",
+                            "fixture-attachment",
+                            "fixture@example.invalid",
+                            "Fixture Sender",
+                            "Fixture document",
+                        )
+                    )
+                ),
+                "source_app_matches": job_row[10] == connect.SOURCE_APP_ID,
+            }
+            result = {
+                "after_restart_capabilities": len(after_restart["items"]),
+                "after_stop_capabilities": len(after_stop["items"]),
+                "before_provider_capabilities": len(before["items"]),
+                "capability_id": selected["capability"]["id"],
+                "capability_version": selected["capability"]["version"],
+                "during_provider_capabilities": len(during["items"]),
+                "email_database_quick_check": quick_check,
+                "email_database_schema_version": schema_version,
+                "job_status": response["data"]["status"],
+                "model_id": model_name,
+                "model_mode": model_mode,
+                "persisted_job_status": job_row[11],
+                "persisted_protocol_version": job_row[1],
+                "proof_input": "synthetic Gmail attachment bytes",
+                "proof_passed": all(proof_checks.values()),
+                "source_app_id": job_row[10],
+                "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
+                **proof_checks,
+            }
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+            require_proof_checks(proof_checks)
     finally:
         if provider is not None:
             stop_provider(provider)
