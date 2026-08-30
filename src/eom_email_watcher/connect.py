@@ -1163,6 +1163,62 @@ def restore_capability_job(
     )
 
 
+def restore_persisted_capability_job(
+    capability: DiscoveredCapability,
+    request_json: bytes,
+) -> PreparedCapabilityJob:
+    """Restore the exact durable v2 request for reconciliation or resubmission."""
+    if capability.protocol_version != GENERIC_PROTOCOL_VERSION:
+        raise ConnectError(
+            "PROTOCOL_VERSION_UNSUPPORTED",
+            "The selected capability does not use the generic Connect protocol.",
+        )
+    try:
+        request = _JobRequestV2.model_validate_json(request_json)
+    except (ValueError, TypeError) as exc:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job request is invalid.",
+        ) from exc
+    if (
+        request.capability.id != capability.capability_id
+        or request.capability.version != capability.capability_version
+    ):
+        raise ConnectError(
+            "JOB_CAPABILITY_MISMATCH",
+            "The durable job does not match the selected capability.",
+        )
+    artifact = request.inputs[0]
+    if artifact.source_app_id != SOURCE_APP_ID:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job source is invalid.",
+        )
+    if not capability.accepts_artifact(artifact.media_type, artifact.byte_size):
+        raise ConnectError(
+            "JOB_CAPABILITY_MISMATCH",
+            "The durable job input is no longer accepted by the selected capability.",
+        )
+    parameters = _validated_parameters(capability, dict(request.parameters))
+    return PreparedCapabilityJob(
+        job_id=request.job_id,
+        provider_app_id=capability.app_id,
+        provider_app_version=capability.app_version,
+        provider_instance_id=capability.instance_id,
+        capability_id=request.capability.id,
+        capability_version=request.capability.version,
+        artifact=ArtifactIdentity(
+            artifact_id=artifact.artifact_id,
+            media_type=artifact.media_type,
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+        ),
+        display_name=artifact.display_name,
+        parameters=tuple(parameters.items()),
+        request_json=request_json,
+    )
+
+
 def prepare_capability_job(
     capability: DiscoveredCapability,
     content: bytes,
@@ -1592,6 +1648,11 @@ class ConnectV2Client:
         if status.result is not None:
             outputs: list[CapabilityOutput] = []
             for output in status.result.outputs:
+                if output.artifact_id == expected.artifact_id:
+                    raise ConnectError(
+                        "RESPONSE_MISMATCH",
+                        "Connect output identity cannot alias its input.",
+                    )
                 if output.media_type not in self.capability.produces:
                     raise ConnectError(
                         "RESPONSE_MISMATCH",

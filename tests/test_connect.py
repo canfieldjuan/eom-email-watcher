@@ -1036,6 +1036,7 @@ def test_v2_client_reuses_prepared_identity_after_lost_acknowledgement() -> None
         ("noncanonical", "OUTPUT_INTEGRITY_INVALID"),
         ("digest", "OUTPUT_INTEGRITY_INVALID"),
         ("duplicate", "RESPONSE_INVALID"),
+        ("aliases_input", "RESPONSE_MISMATCH"),
         ("undeclared_media", "RESPONSE_MISMATCH"),
     ],
 )
@@ -1053,6 +1054,8 @@ def test_v2_client_rejects_invalid_generic_outputs(mode: str, expected_code: str
         output["sha256"] = "0" * 64
     elif mode == "duplicate":
         outputs.append(generic_output(b"other", artifact_id=OUTPUT_ID))
+    elif mode == "aliases_input":
+        output["artifact_id"] = job.artifact.artifact_id
     elif mode == "undeclared_media":
         output["media_type"] = "application/octet-stream"
 
