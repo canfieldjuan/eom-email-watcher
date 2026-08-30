@@ -45,6 +45,7 @@ only to stderr.
 
 | Operation | Payload | Result |
 |---|---|---|
+| `config.initialize` | `timezone`, loopback `model_base_url`, `model_name` | Create a private zero-sender first-run config and return safe settings |
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `gmail.authorize` | `{}` | Run the configured read-only Gmail OAuth flow and initialize a new mailbox baseline when required |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
@@ -75,6 +76,15 @@ succeeds. A locally valid token is also probed against Gmail; an HTTP 401 trigge
 reauthorization path, while other Gmail errors remain failures. The browser helper's authorization
 prompt is suppressed because stdout is reserved exclusively for the JSON engine envelope. This
 operation does not expose or request the separate EOM `gmail.send` capability.
+
+`config.initialize` is the only operation that may run before the configuration file exists. It
+requires an explicit IANA timezone, exact-loopback HTTP model endpoint, and nonblank printable model
+identifier. It creates a mode-0600 configuration with zero senders, desktop notifications enabled,
+the existing polling/retention defaults, and unauthenticated loopback inference. Publication is
+atomic and create-only: an existing file returns `conflict` without being parsed, replaced, or
+modified. The operation never accepts or returns OAuth credentials, model tokens, token paths,
+gateway trust material, ntfy configuration, or EOM outbound settings. Authenticated inference,
+gateway pairing, and the frontend onboarding form remain separate contracts.
 
 Watchlist mutation is serialized and uses same-directory atomic replacement through the engine; the
 frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an

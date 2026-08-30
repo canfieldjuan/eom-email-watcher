@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from filelock import FileLock
-from tomlkit import aot, dumps, inline_table, parse, table
+from tomlkit import aot, document, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
@@ -47,6 +47,14 @@ class SenderNotFoundError(ConfigError):
 
 class InvalidSettingsUpdateError(ConfigError):
     """A proposed desktop settings update is not valid."""
+
+
+class InvalidConfigInitializationError(ConfigError):
+    """A proposed first-run desktop configuration is not valid."""
+
+
+class ConfigAlreadyExistsError(ConfigError):
+    """First-run initialization cannot replace an existing configuration."""
 
 
 @dataclass(frozen=True)
@@ -373,6 +381,72 @@ def _atomic_write(path: Path, content: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _atomic_create(path: Path, content: str) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ConfigAlreadyExistsError("Configuration already exists") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def initialize_config(
+    path: Path,
+    *,
+    timezone: str,
+    model_base_url: str,
+    model_name: str,
+) -> Config:
+    normalized_timezone = timezone.strip()
+    if not normalized_timezone:
+        raise InvalidConfigInitializationError("timezone must be a non-empty string")
+    try:
+        ZoneInfo(normalized_timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise InvalidConfigInitializationError(f"Unknown timezone: {normalized_timezone}") from exc
+
+    try:
+        normalized_base_url = validate_model_base_url(model_base_url)
+    except ConfigError as exc:
+        raise InvalidConfigInitializationError(str(exc)) from exc
+    normalized_model_name = model_name.strip()
+    if not normalized_model_name or any(
+        not character.isprintable() for character in normalized_model_name
+    ):
+        raise InvalidConfigInitializationError("model_name must be a non-empty printable string")
+
+    config_path = path.expanduser().resolve()
+    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    initial = document()
+    initial["timezone"] = normalized_timezone
+    initial["poll_interval_minutes"] = DEFAULT_POLL_INTERVAL_MINUTES
+    initial["retention_days"] = 180
+    initial["model_backend"] = "loopback"
+    initial["model_base_url"] = normalized_base_url
+    initial["model_name"] = normalized_model_name
+    initial["model_require_auth"] = False
+    initial["notifications_enabled"] = True
+    with FileLock(f"{config_path}.lock"):
+        _atomic_create(config_path, dumps(initial))
+    return load_config(config_path)
 
 
 def _sender_table(sender: Sender, *, inline: bool):

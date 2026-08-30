@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.config import load_config
 from eom_email_watcher.gmail import GmailAuthorizationRejected, GmailError, MessageMetadata
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.model import Analysis
@@ -116,6 +117,94 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert inbox["data"]["items"][0]["message_id"] == "m1"
     assert inbox["data"]["items"][0]["attachments"] == []
+
+
+def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
+    config_path = tmp_path / "new" / "config.toml"
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:8080/v1",
+                "model_name": "local-model",
+                "timezone": "UTC",
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["created"] is True
+    assert response["data"]["settings"]["timezone"] == "UTC"
+    assert response["data"]["settings"]["local_model"] == {
+        "authentication_required": False,
+        "endpoint": "http://127.0.0.1:8080/v1",
+        "model": "local-model",
+        "timeout_seconds": 60.0,
+        "token_configured": False,
+    }
+    assert load_config(config_path).senders == ()
+    encoded = json.dumps(response)
+    assert "token.json" not in encoded
+    assert "send-token.json" not in encoded
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"model_base_url": "http://127.0.0.1:8080/v1", "model_name": "model"},
+        {
+            "model_base_url": "http://127.0.0.1:8080/v1",
+            "model_name": "model",
+            "timezone": "UTC",
+            "unknown": True,
+        },
+        {
+            "model_base_url": "https://models.example.com/v1",
+            "model_name": "model",
+            "timezone": "UTC",
+        },
+    ],
+)
+def test_config_initialize_rejects_invalid_payload_without_creating_file(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    config_path = tmp_path / "config.toml"
+
+    response = engine_api._response(request(config_path, "config.initialize", payload))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_request"
+    assert not config_path.exists()
+
+
+def test_config_initialize_reports_conflict_without_reading_or_replacing(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    original = b"operator-owned config\n"
+    config_path.write_bytes(original)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:8080/v1",
+                "model_name": "local-model",
+                "timezone": "UTC",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"] == {
+        "code": "conflict",
+        "message": "Configuration already exists",
+    }
+    assert config_path.read_bytes() == original
 
 
 def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
