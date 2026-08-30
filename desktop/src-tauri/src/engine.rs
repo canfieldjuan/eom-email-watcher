@@ -206,8 +206,10 @@ pub struct NotificationIntent {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
+    pub notifications_enabled: bool,
     pub poll_interval_minutes: u64,
     pub polling_supported: bool,
+    pub retention_days: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -398,6 +400,26 @@ impl Engine {
 
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
         self.request_with_timeout("settings.get", json!({}), timeout)
+    }
+
+    pub fn settings(&self) -> Result<EngineSettings, EngineError> {
+        self.request("settings.get", json!({}))
+    }
+
+    pub fn update_settings(
+        &self,
+        poll_interval_minutes: u64,
+        retention_days: u64,
+        notifications_enabled: bool,
+    ) -> Result<EngineSettings, EngineError> {
+        self.request(
+            "settings.update",
+            json!({
+                "notifications_enabled": notifications_enabled,
+                "poll_interval_minutes": poll_interval_minutes,
+                "retention_days": retention_days,
+            }),
+        )
     }
 
     pub fn with_request_timeout(&self, timeout: Duration) -> Self {
@@ -772,8 +794,37 @@ notifications_enabled = true
                 .settings_with_timeout(Duration::from_secs(5))
                 .expect("read engine settings"),
             EngineSettings {
+                notifications_enabled: true,
                 poll_interval_minutes: 120,
                 polling_supported: true,
+                retention_days: 180,
+            }
+        );
+        assert_eq!(
+            engine
+                .update_settings(0, 180, true)
+                .expect_err("invalid polling cadence must fail")
+                .code,
+            "invalid_request"
+        );
+        assert_eq!(
+            engine
+                .update_settings(45, 365, false)
+                .expect("update safe desktop settings"),
+            EngineSettings {
+                notifications_enabled: false,
+                poll_interval_minutes: 45,
+                polling_supported: true,
+                retention_days: 365,
+            }
+        );
+        assert_eq!(
+            engine.settings().expect("read updated desktop settings"),
+            EngineSettings {
+                notifications_enabled: false,
+                poll_interval_minutes: 45,
+                polling_supported: true,
+                retention_days: 365,
             }
         );
 

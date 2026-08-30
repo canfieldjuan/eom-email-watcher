@@ -4,8 +4,8 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CheckResult, ConnectCapabilities, ConnectSummaryResult, Engine, EngineError, HealthStatus,
-    InboxItem, WatchedSender,
+    CheckResult, ConnectCapabilities, ConnectSummaryResult, Engine, EngineError, EngineSettings,
+    HealthStatus, InboxItem, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -130,6 +130,29 @@ async fn health_get(
         engine
             .health()
             .map(|health| DesktopHealthStatus { health, polling })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.settings())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn settings_update(
+    engine: State<'_, Engine>,
+    poll_interval_minutes: u64,
+    retention_days: u64,
+    notifications_enabled: bool,
+) -> Result<EngineSettings, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.update_settings(poll_interval_minutes, retention_days, notifications_enabled)
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -265,6 +288,8 @@ pub fn run() {
             connect_capabilities,
             health_get,
             inbox_recent,
+            settings_get,
+            settings_update,
             watcher_check,
             watchlist_list,
             watchlist_add,
