@@ -457,13 +457,17 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
         raise InvalidSettingsUpdateError("notifications_enabled must be a boolean")
 
     config_path = path.expanduser().resolve()
-    with FileLock(f"{config_path}.lock"):
+    try:
+        with FileLock(f"{config_path}.lock"):
+            load_config(config_path)
+            document = parse(config_path.read_text(encoding="utf-8"))
+            for key, value in updates.items():
+                document[key] = value
+            _atomic_write(config_path, dumps(document))
+            return load_config(config_path)
+    except FileNotFoundError:
         load_config(config_path)
-        document = parse(config_path.read_text(encoding="utf-8"))
-        for key, value in updates.items():
-            document[key] = value
-        _atomic_write(config_path, dumps(document))
-        return load_config(config_path)
+        raise
 
 
 def secure_runtime_paths(config: Config) -> None:

@@ -201,8 +201,15 @@ def test_settings_update_preserves_existing_configuration_errors(
     assert config_path.read_bytes() == original
 
 
-def test_settings_update_preserves_missing_configuration_error(tmp_path: Path) -> None:
-    config_path = tmp_path / "missing.toml"
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_settings_update_preserves_missing_configuration_error(
+    tmp_path: Path, missing_parent: bool
+) -> None:
+    config_path = (
+        tmp_path / "absent" / "missing.toml"
+        if missing_parent
+        else tmp_path / "missing.toml"
+    )
 
     response = engine_api._response(
         request(config_path, "settings.update", {"poll_interval_minutes": 45})
