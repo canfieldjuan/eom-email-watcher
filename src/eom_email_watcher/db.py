@@ -670,6 +670,46 @@ class Store:
             raise RuntimeError("Connect job was not readable after transition")
         return self._connect_job(row)
 
+    def reset_connect_job_for_resubmission(
+        self,
+        *,
+        job_id: str,
+        expected_state: str,
+        provider_app_id: str,
+        provider_instance_id: str,
+    ) -> ConnectJob:
+        if expected_state not in {"requested", "accepted", "processing"}:
+            raise ValueError("Only active Connect jobs can be reset for resubmission")
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE connect_attachment_jobs SET
+                    status = 'requested',
+                    output_artifact_id = NULL, output_media_type = NULL,
+                    output_byte_size = NULL, output_sha256 = NULL,
+                    summary_version = NULL, summary_text = NULL, warnings_json = NULL,
+                    error_code = NULL, error_message = NULL, error_retryable = NULL,
+                    updated_at = ?
+                WHERE job_id = ? AND status = ?
+                  AND provider_app_id = ? AND provider_instance_id = ?""",
+                (
+                    stamp,
+                    job_id,
+                    expected_state,
+                    provider_app_id,
+                    provider_instance_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Connect job resubmission lost its expected-state race")
+            row = db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Connect job was not readable after resubmission reset")
+        return self._connect_job(row)
+
     def pending(self, now: datetime | None = None, limit: int = 25) -> list[PendingMessage]:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:

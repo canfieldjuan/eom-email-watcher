@@ -669,3 +669,43 @@ def test_connect_job_atomic_constraints_and_single_active_request(tmp_path: Path
             },
         )
     assert store.connect_job(first_job).status == "requested"  # type: ignore[union-attr]
+
+
+def test_connect_job_resubmission_reset_is_atomic_and_provider_scoped(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_connect_job(store, job_id)
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="processing",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    with pytest.raises(RuntimeError, match="expected-state"):
+        store.reset_connect_job_for_resubmission(
+            job_id=job_id,
+            expected_state="processing",
+            provider_app_id="alternate-provider",
+            provider_instance_id="99999999-9999-4999-8999-999999999999",
+        )
+    assert store.connect_job(job_id).status == "processing"  # type: ignore[union-attr]
+
+    reset = store.reset_connect_job_for_resubmission(
+        job_id=job_id,
+        expected_state="processing",
+        provider_app_id="alternate-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    assert reset.status == "requested"
+
+    with pytest.raises(RuntimeError, match="expected-state"):
+        store.reset_connect_job_for_resubmission(
+            job_id=job_id,
+            expected_state="processing",
+            provider_app_id="alternate-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+        )

@@ -413,7 +413,10 @@ def _client() -> httpx.Client:
 
 
 def discover_summary_capability(
-    runtime_dir: Path | None = None, *, client: httpx.Client | None = None
+    runtime_dir: Path | None = None,
+    *,
+    client: httpx.Client | None = None,
+    provider_instance_id: str | None = None,
 ) -> CapabilityDiscovery:
     root_value = runtime_dir or (
         Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
@@ -485,6 +488,12 @@ def discover_summary_capability(
         if owned_client:
             active_client.close()
 
+    if provider_instance_id is not None:
+        provider = providers.get(provider_instance_id)
+        return CapabilityDiscovery(
+            provider,
+            None if provider is not None else "provider_unavailable",
+        )
     if len(providers) > 1:
         return CapabilityDiscovery(None, "ambiguous_provider")
     if not providers:

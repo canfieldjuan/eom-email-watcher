@@ -463,9 +463,26 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     if completed is not None:
         return _connect_result(completed)
 
-    discovery = connect.discover_summary_capability()
+    active = runtime.store.active_connect_job(
+        message_id=message_id,
+        part_id=part_id,
+        capability_id=connect.CAPABILITY_ID,
+        capability_version=connect.CAPABILITY_VERSION,
+    )
+    discovery = (
+        connect.discover_summary_capability(
+            provider_instance_id=active.provider_instance_id
+        )
+        if active is not None
+        else connect.discover_summary_capability()
+    )
     provider = discovery.provider
     if provider is None:
+        if active is not None:
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
         code = discovery.diagnostic_code or "provider_unavailable"
         message = (
             "More than one compatible local capability provider is available."
@@ -476,12 +493,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     if attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
 
-    active = runtime.store.active_connect_job(
-        message_id=message_id,
-        part_id=part_id,
-        capability_id=connect.CAPABILITY_ID,
-        capability_version=connect.CAPABILITY_VERSION,
-    )
+    resubmit_expected_state: str | None = None
     if active is not None:
         if (
             active.provider_app_id != provider.app_id
@@ -497,6 +509,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         except connect.ConnectError as exc:
             if exc.code != "JOB_NOT_FOUND":
                 raise
+        resubmit_expected_state = active.status
         job = tracked
     else:
         job = None
@@ -536,6 +549,22 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
                     "A summary job is already in progress for this attachment.",
                 ) from exc
             raise
+    elif resubmit_expected_state is not None:
+        try:
+            runtime.store.reset_connect_job_for_resubmission(
+                job_id=job.job_id,
+                expected_state=resubmit_expected_state,
+                provider_app_id=provider.app_id,
+                provider_instance_id=provider.instance_id,
+            )
+        except RuntimeError as exc:
+            concurrent = runtime.store.connect_job(job.job_id)
+            if concurrent is not None and concurrent.status == "completed":
+                return _connect_result(concurrent)
+            raise ApiError(
+                "connect_job_in_progress",
+                "The local capability job changed while it was being reconciled.",
+            ) from exc
     return _run_connect_job(runtime, provider, job, content)
 
 

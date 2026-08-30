@@ -528,18 +528,17 @@ function renderInbox(items: InboxItem[]): void {
 
       const existingSummary = attachmentSummary(attachment);
       const capability = summaryCapability(attachment);
-      if (capability && existingSummary?.status !== "completed") {
+      const activeSummary = ["requested", "accepted", "processing"].includes(
+        existingSummary?.status ?? "",
+      );
+      if ((capability || activeSummary) && existingSummary?.status !== "completed") {
         const summarizeButton = document.createElement("button");
         summarizeButton.type = "button";
-        summarizeButton.textContent =
-          existingSummary?.status === "failed" ? "Retry summary" : "Summarize";
-        const active = ["requested", "accepted", "processing"].includes(
-          existingSummary?.status ?? "",
-        );
-        if (active) {
-          summarizeButton.disabled = true;
-          summarizeButton.textContent = "Summarizing…";
-        }
+        summarizeButton.textContent = activeSummary
+          ? "Resume summary"
+          : existingSummary?.status === "failed"
+            ? "Retry summary"
+            : "Summarize";
         summarizeButton.addEventListener("click", async () => {
           summarizeButton.disabled = true;
           summarizeButton.textContent = "Summarizing…";

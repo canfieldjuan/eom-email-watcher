@@ -145,7 +145,7 @@ def test_attachment_summary_persists_terminal_result_and_reuses_it(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_summary_capability",
-        lambda: connect.CapabilityDiscovery(provider()),
+        lambda **kwargs: connect.CapabilityDiscovery(provider()),
     )
     monkeypatch.setattr(engine_api.connect, "ConnectClient", FakeClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -225,7 +225,7 @@ def test_provider_failure_is_durable_and_never_masquerades_as_success(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_summary_capability",
-        lambda: connect.CapabilityDiscovery(provider()),
+        lambda **kwargs: connect.CapabilityDiscovery(provider()),
     )
     monkeypatch.setattr(engine_api.connect, "ConnectClient", FailingClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -362,7 +362,7 @@ def test_lost_submit_ack_reuses_identity_and_resubmits_only_after_not_found(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_summary_capability",
-        lambda: connect.CapabilityDiscovery(provider()),
+        lambda **kwargs: connect.CapabilityDiscovery(provider()),
     )
     monkeypatch.setattr(engine_api.connect, "ConnectClient", RecoveringClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -430,7 +430,7 @@ def test_active_job_is_not_handed_to_a_different_provider_instance(
     monkeypatch.setattr(
         engine_api.connect,
         "discover_summary_capability",
-        lambda: connect.CapabilityDiscovery(replacement),
+        lambda **kwargs: connect.CapabilityDiscovery(replacement),
     )
     monkeypatch.setattr(
         engine_api.connect,
@@ -455,6 +455,78 @@ def test_active_job_is_not_handed_to_a_different_provider_instance(
     assert runtime.store.connect_job("33333333-3333-4333-8333-333333333333").status == (
         "requested"
     )
+
+
+def test_processing_job_resubmits_as_requested_after_authenticated_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = provider()
+    job_id = "33333333-3333-4333-8333-333333333333"
+    runtime.store.create_connect_job(
+        job_id=job_id,
+        message_id="message-1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        input_media_type="application/pdf",
+        input_byte_size=28,
+        input_sha256=hashlib.sha256(b"%PDF-1.4\nreal attachment\nEOF").hexdigest(),
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="processing",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    discovered_instances: list[str | None] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return b"%PDF-1.4\nreal attachment\nEOF"
+
+    class RecoveringClient:
+        def __init__(self, provider_value):
+            assert provider_value == selected
+
+        def get(self, job):
+            raise connect.ConnectError("JOB_NOT_FOUND", "The job was not accepted.")
+
+        def submit(self, job, content):
+            assert runtime.store.connect_job(job_id).status == "requested"
+            return update(job, "accepted")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            assert initial.status == "accepted"
+            completed = update(job, "completed", result=summary(job))
+            on_update(completed)
+            return completed
+
+    def discover(**kwargs):
+        discovered_instances.append(kwargs.get("provider_instance_id"))
+        return connect.CapabilityDiscovery(selected)
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.connect, "discover_summary_capability", discover)
+    monkeypatch.setattr(engine_api.connect, "ConnectClient", RecoveringClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["job_id"] == job_id
+    assert discovered_instances == [selected.instance_id]
+    assert runtime.store.connect_job(job_id).status == "completed"
 
 
 def test_simultaneous_submit_returns_structured_in_progress_error(
