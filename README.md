@@ -132,15 +132,17 @@ state. The app does not replace the systemd scheduler or the existing CLI's opti
 
 ## Local Connect capability
 
-When exactly one running local provider advertises `document.summarize` version `1.0` for
-`application/pdf`, Inbox attachment cards show **Summarize**. The action disappears when no
-compatible provider is reachable. Email Watcher does not select by application identity and remains
-fully usable when Connect or the provider is absent. Completed summaries and failures are retained
-with the attachment in Email Watcher's private SQLite database.
+Inbox attachment cards show every compatible capability advertised by live Local Connect v2
+providers. One provider produces a normal action; multiple providers produce an explicit native
+picker. The host revalidates the exact provider, capability version, parameters, size, and effect
+confirmation before handoff. Actions disappear when their providers stop, while Gmail monitoring
+and the rest of the desktop remain usable. Jobs, results, errors, and complete provider/input/output
+provenance remain in Email Watcher's private SQLite database under a stable caller request ID.
 
-The v1 discovery, security, artifact, job, persistence, and failure boundaries are documented in
-[`docs/CONNECT_V1.md`](docs/CONNECT_V1.md). The language-neutral wire schemas live in the separate
-`connect-contracts` repository.
+The current machine contract, including generic discovery, invocation, durable reconciliation, and
+safe output presentation/export, is documented in [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The
+legacy v1 summary-only boundary remains documented in [`docs/CONNECT_V1.md`](docs/CONNECT_V1.md).
+Language-neutral wire schemas and fixtures live in the separate `connect-contracts` repository.
 
 ## Two-hour user timer
 

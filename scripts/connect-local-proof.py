@@ -11,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import uuid4
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -44,16 +45,72 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
-        except (ValueError, json.JSONDecodeError):
+            schema_name = request["response_format"]["json_schema"]["name"]
+            user_prompt = next(
+                message["content"]
+                for message in request["messages"]
+                if message["role"] == "user"
+            )
+            prompt = json.loads(user_prompt)
+            text = self._structured_output(schema_name, prompt)
+        except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             self.send_error(400)
             return
-        max_tokens = request.get("max_tokens")
-        text = (
-            "The structured report records Q1 revenue of $1,247,392.17 and a change of -4.75%."
-            if max_tokens == 512
-            else "Q1 revenue was $1,247,392.17, with a -4.75% change."
-        )
         self._json({"choices": [{"message": {"content": text}}]})
+
+    @staticmethod
+    def _structured_output(schema_name: str, prompt: dict[str, object]) -> str:
+        if schema_name == "document_chunk_evidence_v1":
+            evidence = []
+            for block in prompt["source_blocks"]:
+                exact_quote = next(
+                    line.strip() for line in block["text"].splitlines() if line.strip()
+                )[:200]
+                evidence.append(
+                    {
+                        "block_id": block["block_id"],
+                        "claim_text": exact_quote,
+                        "exact_quote": exact_quote,
+                    }
+                )
+            return json.dumps({"evidence": evidence}, separators=(",", ":"))
+        if schema_name == "document_summary_claims_v1":
+            return json.dumps(
+                {
+                    "claims": [
+                        {
+                            "text": evidence["claim_text"],
+                            "evidence_ids": [evidence["evidence_id"]],
+                        }
+                        for evidence in prompt["evidence"]
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        if schema_name == "document_candidate_claims_v1":
+            candidate = prompt["candidates"][0]
+            return json.dumps(
+                {
+                    "claims": [
+                        {
+                            "text": candidate["text"],
+                            "candidate_ids": [candidate["candidate_id"]],
+                        }
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        if schema_name == "document_claim_verdicts_v1":
+            return json.dumps(
+                {
+                    "verdicts": [
+                        {"claim_id": claim["claim_id"], "verdict": "supported"}
+                        for claim in prompt["claims"]
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        raise ValueError("unsupported fixture response schema")
 
 
 class FixtureGmail:
@@ -100,8 +157,14 @@ def wait_for_capability(available: bool, timeout_seconds: float = 15) -> dict[st
     deadline = time.monotonic() + timeout_seconds
     latest: dict[str, object] = {"items": [], "diagnostic": None}
     while time.monotonic() < deadline:
-        latest = connect.discover_summary_capability().public_result()
-        if bool(latest["items"]) is available:
+        latest = connect.discover_capabilities().public_result()
+        summary_items = [
+            item
+            for item in latest["items"]
+            if item["capability"]["id"] == connect.CAPABILITY_ID
+            and item["capability"]["version"] == connect.CAPABILITY_VERSION
+        ]
+        if bool(summary_items) is available:
             return latest
         time.sleep(0.1)
     raise RuntimeError(f"Capability availability did not become {available}: {latest}")
@@ -117,9 +180,18 @@ def start_provider(binary: Path, environment: dict[str, str]) -> subprocess.Pope
     )
     try:
         wait_for_capability(True)
-    except BaseException:
+    except BaseException as error:
+        return_code = process.poll()
         stop_provider(process)
-        raise
+        detail = (
+            f"provider exited with status {return_code}"
+            if return_code is not None
+            else "provider stayed running without publishing a usable v2 registration"
+        )
+        raise RuntimeError(
+            f"Document Summarizer did not advertise Local Connect v2 ({detail}); "
+            "build the provider from its current main branch before running this proof"
+        ) from error
     return process
 
 
@@ -240,24 +312,88 @@ def main() -> None:
                     ),
                 ),
             )
+            capabilities = engine_api._response(
+                request(
+                    config_path,
+                    "connect.attachment.capabilities",
+                    {"message_id": "fixture-message", "part_id": "2"},
+                )
+            )
+            if not capabilities["ok"]:
+                raise RuntimeError(f"Connect capability discovery failed: {capabilities}")
+            matches = [
+                item
+                for item in capabilities["data"]["items"]
+                if item["capability"]["id"] == connect.CAPABILITY_ID
+                and item["capability"]["version"] == connect.CAPABILITY_VERSION
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Expected one compatible document summary capability: {capabilities}"
+                )
+            selected = matches[0]
+            request_id = str(uuid4())
+            invocation = {
+                "request_id": request_id,
+                "message_id": "fixture-message",
+                "part_id": "2",
+                "provider": {
+                    "app_id": selected["provider"]["app_id"],
+                    "version": selected["provider"]["version"],
+                    "instance_id": selected["provider"]["instance_id"],
+                },
+                "capability": {
+                    "id": selected["capability"]["id"],
+                    "version": selected["capability"]["version"],
+                },
+                "parameters": {},
+                "confirmed": False,
+            }
             original_from_token = engine_api.GmailGateway.__dict__["from_token"]
             engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
             try:
                 response = engine_api._response(
                     request(
                         config_path,
-                        "connect.attachment.summarize",
-                        {"message_id": "fixture-message", "part_id": "2"},
+                        "connect.attachment.invoke",
+                        invocation,
                     )
                 )
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
             if not response["ok"]:
                 raise RuntimeError(f"Connect proof job failed: {response}")
+            outputs = response["data"]["outputs"]
+            if len(outputs) != 1:
+                raise RuntimeError(f"Expected one Connect output: {response}")
+            presentation = engine_api._response(
+                request(
+                    config_path,
+                    "connect.output.present",
+                    {
+                        "message_id": "fixture-message",
+                        "part_id": "2",
+                        "job_id": request_id,
+                        "artifact_id": outputs[0]["artifact_id"],
+                    },
+                )
+            )
+            if not presentation["ok"]:
+                raise RuntimeError(f"Connect output presentation failed: {presentation}")
+            rendered = presentation["data"]["presentation"]
+            if rendered["kind"] != "document_summary":
+                raise RuntimeError(f"Unexpected Connect output presentation: {presentation}")
+            summary_text = rendered["summary"]["text"]
 
             stop_provider(provider)
             provider = None
             after_stop = wait_for_capability(False)
+            replayed = engine_api._response(
+                request(config_path, "connect.attachment.invoke", invocation)
+            )
+            inbox_without_connect = engine_api._response(
+                request(config_path, "inbox.recent", {"limit": 1})
+            )
             restarted = start_provider(provider_binary, environment)
             after_restart = wait_for_capability(True)
 
@@ -265,28 +401,69 @@ def main() -> None:
                 quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
                 schema_version = database.execute("PRAGMA user_version").fetchone()[0]
                 job_row = database.execute(
-                    """SELECT status, summary_text, input_sha256
-                    FROM connect_attachment_jobs ORDER BY created_at DESC LIMIT 1"""
+                    """SELECT job_id, protocol_version, capability_id, capability_version,
+                    provider_app_id, provider_app_version, provider_instance_id,
+                    input_media_type, input_byte_size, input_sha256, source_app_id,
+                    status, request_json, result_json
+                    FROM connect_attachment_jobs WHERE job_id = ?""",
+                    (request_id,),
                 ).fetchone()
             if job_row is None:
                 raise RuntimeError("Connect proof result was not durable")
-            summary_text = str(response["data"]["summary"]["text"])
+            durable_request = json.loads(job_row[12])
+            replayed_data = replayed.get("data") if replayed["ok"] else None
+            restarted_items = after_restart["items"]
             print(
                 json.dumps(
                     {
-                        "after_restart_capabilities": len(after_restart["items"]),
+                        "after_restart_capabilities": len(restarted_items),
                         "after_stop_capabilities": len(after_stop["items"]),
                         "before_provider_capabilities": len(before["items"]),
+                        "capability_id": selected["capability"]["id"],
+                        "capability_version": selected["capability"]["version"],
                         "during_provider_capabilities": len(during["items"]),
                         "email_database_quick_check": quick_check,
                         "email_database_schema_version": schema_version,
-                        "input_sha256_matches": job_row[2] == hashlib.sha256(pdf).hexdigest(),
+                        "inbox_healthy_without_connect": (
+                            inbox_without_connect["ok"]
+                            and inbox_without_connect["data"]["items"][0]["message_id"]
+                            == "fixture-message"
+                        ),
+                        "input_sha256_matches": job_row[9] == hashlib.sha256(pdf).hexdigest(),
                         "job_status": response["data"]["status"],
                         "model_id": model_name,
                         "model_mode": model_mode,
-                        "persisted_job_status": job_row[0],
-                        "persisted_summary_matches": job_row[1] == summary_text,
+                        "persisted_capability_matches": (
+                            job_row[2] == selected["capability"]["id"]
+                            and job_row[3] == selected["capability"]["version"]
+                        ),
+                        "persisted_job_status": job_row[11],
+                        "persisted_protocol_version": job_row[1],
+                        "persisted_provider_matches": (
+                            job_row[4] == selected["provider"]["app_id"]
+                            and job_row[5] == selected["provider"]["version"]
+                            and job_row[6] == selected["provider"]["instance_id"]
+                        ),
+                        "persisted_result_present": job_row[13] is not None,
                         "proof_input": "synthetic Gmail attachment bytes",
+                        "provider_instance_rotated": (
+                            len(restarted_items) == 1
+                            and restarted_items[0]["provider"]["instance_id"]
+                            != selected["provider"]["instance_id"]
+                        ),
+                        "replayed_completed_job_without_provider": (
+                            replayed_data is not None
+                            and replayed_data["job_id"] == request_id
+                            and replayed_data["outputs"] == outputs
+                        ),
+                        "request_excludes_gmail_identity": (
+                            durable_request["job_id"] == request_id
+                            and "fixture-message" not in job_row[12].decode()
+                            and "fixture-attachment" not in job_row[12].decode()
+                            and "fixture@example.invalid" not in job_row[12].decode()
+                            and "Fixture document" not in job_row[12].decode()
+                        ),
+                        "source_app_id": job_row[10],
                         "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
                     },
                     separators=(",", ":"),

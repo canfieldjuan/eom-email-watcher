@@ -108,7 +108,20 @@ summary-command contract calls through `eom-mail-engine` using isolated config. 
 proves the host contract without contacting Gmail. `scripts/connect-local-proof.py` is the explicit
 cross-process proof harness: it uses a real Document Summarizer provider process and real Email
 Watcher persistence with synthetic Gmail attachment bytes. Its default mode starts a deterministic
-local fixture model. Supplying `--model-base-url` and `--model-name` instead exercises an existing
+local fixture model that satisfies the provider's current structured evidence, synthesis, and
+verification schemas:
+
+```bash
+.venv/bin/python scripts/connect-local-proof.py \
+  --provider-binary /path/to/document-summarizer \
+  --pdf /path/to/structured-report.pdf
+```
+
+The proof uses attachment-scoped v2 discovery and explicit provider/capability selection, persists a
+stable request identity and generic output, stops the provider, replays the completed job while it is
+offline, verifies the Inbox remains healthy, then restarts the provider and observes a fresh live
+instance. Its single JSON result contains booleans/counts and a summary digest rather than document
+text or credentials. Supplying `--model-base-url` and `--model-name` instead exercises an existing
 exact-loopback OpenAI-compatible model; an authenticated endpoint may additionally use
 `--model-api-token-file`. Both configured-model fields are required together, and the provider
 retains final endpoint validation. Neither mode claims a live Gmail OAuth or human UI-click test.
