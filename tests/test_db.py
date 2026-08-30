@@ -900,6 +900,18 @@ def test_connect_v2_active_identity_scopes_protocol_provider_and_parameters(
     assert store.connect_job("44444444-4444-4444-8444-444444444444") is not None
     assert store.connect_job("77777777-7777-4777-8777-777777777777") is not None
 
+    projected = store.recent(1)[0]["attachments"][0]["capability_results"]
+    v2_results = [result for result in projected if result.get("protocol_version") == 2]
+    assert {result["job_id"] for result in v2_results} == {
+        "55555555-5555-4555-8555-555555555555",
+        "66666666-6666-4666-8666-666666666666",
+        "77777777-7777-4777-8777-777777777777",
+    }
+    assert {json.dumps(result["parameters"], sort_keys=True) for result in v2_results} == {
+        '{"target-language": "French"}',
+        '{"target-language": "Spanish"}',
+    }
+
 
 def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
@@ -940,18 +952,6 @@ def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path)
         assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 2
     assert "protocol_version = 1" in index_sql
-
-    projected = store.recent(1)[0]["attachments"][0]["capability_results"]
-    v2_results = [result for result in projected if result.get("protocol_version") == 2]
-    assert {result["job_id"] for result in v2_results} == {
-        "44444444-4444-4444-8444-444444444444",
-        "55555555-5555-4555-8555-555555555555",
-        "66666666-6666-4666-8666-666666666666",
-    }
-    assert {json.dumps(result["parameters"], sort_keys=True) for result in v2_results} == {
-        '{"target-language": "French"}',
-        '{"target-language": "Spanish"}',
-    }
 
 
 def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(
