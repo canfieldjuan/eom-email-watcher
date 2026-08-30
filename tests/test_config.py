@@ -130,6 +130,8 @@ def test_gateway_config_requires_https_trust_and_auth(tmp_path: Path) -> None:
         "https://inference.office.internal#fragment",
         "https://inference.office.internal?",
         "https://inference.office.internal#",
+        "https://a..b",
+        f"https://{'a' * 64}.internal",
         "https://💩.internal",
         " https://inference.office.internal",
     ],
@@ -144,6 +146,18 @@ def test_gateway_config_rejects_unsafe_authorities(tmp_path: Path, base_url: str
 
     with pytest.raises(ConfigError, match="model_base_url"):
         load_config(path)
+
+
+def test_gateway_config_accepts_maximum_dns_label(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    base_url = f"https://{'a' * 63}.internal"
+    write_config(
+        path,
+        base_url=base_url,
+        extra=f'model_backend = "gateway"\nmodel_ca_file = "{tmp_path / "ca.pem"}"',
+    )
+
+    assert load_config(path).model_base_url == base_url
 
 
 @pytest.mark.parametrize(

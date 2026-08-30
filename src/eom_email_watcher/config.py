@@ -6,6 +6,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass
 from email.utils import parseaddr
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -102,6 +103,14 @@ def _valid_domain(domain: str) -> bool:
     )
 
 
+def _valid_network_host(host: str) -> bool:
+    try:
+        ip_address(host)
+    except ValueError:
+        return _valid_domain(host)
+    return True
+
+
 def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
     email = normalize_address(email_value)
     local, separator, domain = email.rpartition("@")
@@ -166,6 +175,7 @@ def validate_gateway_base_url(value: object) -> str:
     if (
         parsed.scheme != "https"
         or parsed.hostname is None
+        or not _valid_network_host(parsed.hostname)
         or parsed.username is not None
         or parsed.password is not None
         or "?" in base_url
