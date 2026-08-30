@@ -147,6 +147,10 @@ Schema v7 persists v2 request identity, provider/capability versions, input prov
 state, outputs, errors, and timestamps. Repeated calls with the same active identity reconcile the
 same job. A lost submission acknowledgement remains nonterminal: the next call queries that
 identity, and only authenticated `JOB_NOT_FOUND` evidence permits resubmission with the same ID.
+V2 provider identity follows the provider-owned durable state namespace rather than one process;
+runtime PID, endpoint, and bearer token may rotate. A restarted provider can therefore expose the
+authoritative terminal state for a previously accepted job under the same selected identity, and the
+consumer persists that state without reopening Gmail or creating another request.
 Completed and failed requests replay from durable state before live discovery, so a provider outage
 cannot erase an already authoritative result. Distinct caller request IDs remain distinct work.
 
