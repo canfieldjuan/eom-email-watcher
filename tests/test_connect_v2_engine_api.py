@@ -11,6 +11,7 @@ from eom_email_watcher.runtime import Runtime, load_runtime
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
+INPUT_ARTIFACT_ID = "55555555-5555-4555-8555-555555555555"
 REQUEST_ID = "66666666-6666-4666-8666-666666666666"
 SECOND_REQUEST_ID = "77777777-7777-4777-8777-777777777777"
 TOKEN = "A" * 43
@@ -238,7 +239,7 @@ def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     job = connect.restore_capability_job(
         selected,
         job_id=REQUEST_ID,
-        artifact_id=RACE_ARTIFACT_ID,
+        artifact_id=INPUT_ARTIFACT_ID,
         media_type="application/pdf",
         byte_size=len(PDF),
         sha256=hashlib.sha256(PDF).hexdigest(),
