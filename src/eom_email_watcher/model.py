@@ -410,15 +410,26 @@ class GatewayModel:
                     content=content,
                 ) as response,
             ):
-                if response.status_code >= 400 and expected_request_id is not None:
+                if expected_request_id is not None:
                     try:
-                        error_payload = self._bounded_json(response)
+                        response_payload = self._bounded_json(response)
                     except ModelError as exc:
-                        raise GatewayModelError(
-                            "invalid_error_envelope",
-                            retryable=response.status_code >= 500,
-                        ) from exc
-                    raise self._gateway_error(error_payload, expected_request_id)
+                        if response.status_code >= 400:
+                            raise GatewayModelError(
+                                "invalid_error_envelope",
+                                retryable=response.status_code >= 500,
+                            ) from exc
+                        raise
+                    if (
+                        response.status_code >= 400
+                        or response_payload.get("status") == "failed"
+                    ):
+                        raise self._gateway_error(response_payload, expected_request_id)
+                    if response.status_code >= 300:
+                        raise ModelError(
+                            f"Inference gateway rejected request: HTTP {response.status_code}"
+                        )
+                    return response_payload
                 if response.status_code >= 300:
                     raise ModelError(
                         f"Inference gateway rejected request: HTTP {response.status_code}"

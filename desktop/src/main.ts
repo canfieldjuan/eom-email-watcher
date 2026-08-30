@@ -295,7 +295,20 @@ function stateLabel(item: InboxItem): string {
   if (item.status === "skipped") return "Message unavailable";
   if (item.last_error) {
     if (item.status === "analyzed") return "Notification retry queued";
-    if (item.analysis_retryable === false) return "Analysis paused";
+    if (item.analysis_retryable === false) {
+      const reasons: Record<string, string> = {
+        unauthenticated: "inference sign-in required",
+        forbidden: "inference permission required",
+        unsupported_task: "email analysis unavailable",
+        invalid_request: "inference configuration needs repair",
+        invalid_error_envelope: "inference service response incompatible",
+        invalid_worker_output: "inference service output invalid",
+      };
+      const reason = item.analysis_error_code
+        ? reasons[item.analysis_error_code] ?? `inference error: ${item.analysis_error_code}`
+        : "inference configuration needs repair";
+      return `Analysis paused · ${reason}`;
+    }
     return "Analysis retry queued";
   }
   if (item.status === "analyzed") return "Ready to notify";

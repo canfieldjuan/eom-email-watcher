@@ -329,13 +329,14 @@ def test_gateway_rejects_mismatched_response_envelope(
         analyze(model)
 
 
-def test_gateway_exposes_validated_retry_directives(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("http_status", [200, 429])
+def test_gateway_exposes_validated_retry_directives_for_any_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         return httpx.Response(
-            429,
+            http_status,
             json={
                 "protocol_version": 1,
                 "request_id": payload["request_id"],

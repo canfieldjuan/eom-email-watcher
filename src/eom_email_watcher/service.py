@@ -222,9 +222,7 @@ class Watcher:
                     )
                     request_id = request.request_id
                     body_char_limit = request.body_char_limit
-                    current_local_time = datetime.fromisoformat(
-                        request.context_at
-                    ).astimezone(self.config.zone)
+                    current_local_time = datetime.fromisoformat(request.context_at)
                 payload = self.gmail.full_payload(message.message_id)
                 body, attachment_names, attachments = extract_body(
                     payload, body_char_limit

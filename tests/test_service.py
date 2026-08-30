@@ -358,7 +358,10 @@ def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
     assert first["analysis_retry_after_seconds"] == 30
 
     _make_retries_due(store)
-    assert watcher.check()["summarized"] == 1
+    retry_watcher = Watcher(
+        replace(cfg, timezone="America/New_York"), store, FakeGmail(), model
+    )
+    assert retry_watcher.check()["summarized"] == 1
     assert model.requests[0] == model.requests[1]
     assert store.recent(1)[0]["status"] == "summarized"
 

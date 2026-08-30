@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import cli
+from eom_email_watcher.db import Store
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
 
 
@@ -139,3 +140,43 @@ def test_zero_sender_check_stops_before_lock_and_gmail(
         "stale_cursor_recovered": False,
         "summarized": 0,
     }
+
+
+def test_requeue_analysis_command_releases_only_permanent_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    store = Store(tmp_path / "watcher.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="message-1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Subject",
+        received_at="2026-08-29T12:00:00+00:00",
+    )
+    store.reserve_analysis_request("message-1", 20_000)
+    store.record_analysis_failure(
+        "message-1",
+        "Inference gateway error: forbidden",
+        0,
+        retryable=False,
+        error_code="forbidden",
+    )
+    monkeypatch.setattr(cli, "_runtime", lambda path: (object(), store, object()))
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--config", str(tmp_path / "config.toml"), "requeue-analysis", "message-1"])
+
+    assert exited.value.code == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "message_id": "message-1",
+        "status": "requeued",
+    }
+    assert store.pending()[0].message_id == "message-1"
+
+    with pytest.raises(SystemExit) as missing:
+        cli.main(["requeue-analysis", "missing-message"])
+
+    assert missing.value.code == 2
+    assert capsys.readouterr().err.strip() == "error: Message was not found"
