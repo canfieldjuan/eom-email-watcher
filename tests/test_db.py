@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher.db import Store
+from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, Store
 from eom_email_watcher.mime import AttachmentDescriptor
 
 
@@ -556,38 +556,52 @@ def create_connect_job(store: Store, job_id: str) -> None:
 def create_v2_connect_job(
     store: Store,
     job_id: str = "33333333-3333-4333-8333-333333333333",
+    *,
+    capability_id: str = "document.translate",
+    provider_app_id: str = "translation-provider",
+    provider_app_version: str = "0.1.0",
+    provider_instance_id: str = "11111111-1111-4111-8111-111111111111",
+    artifact_id: str = "22222222-2222-4222-8222-222222222222",
+    input_byte_size: int = 20,
+    input_sha256: str = "a" * 64,
+    parameters: dict[str, object] | None = None,
 ) -> bytes:
+    parameter_values = {"target-language": "Spanish"} if parameters is None else parameters
     request = {
         "protocol_version": 2,
         "job_id": job_id,
-        "capability": {"id": "document.translate", "version": "1.0"},
+        "capability": {"id": capability_id, "version": "1.0"},
         "inputs": [
             {
-                "artifact_id": "22222222-2222-4222-8222-222222222222",
+                "artifact_id": artifact_id,
                 "media_type": "application/pdf",
-                "byte_size": 20,
-                "sha256": "a" * 64,
+                "byte_size": input_byte_size,
+                "sha256": input_sha256,
                 "display_name": "invoice.pdf",
                 "source_app_id": "email-watcher",
             }
         ],
-        "parameters": {"target-language": "Spanish"},
+        "parameters": parameter_values,
     }
-    request_json = json.dumps(request, separators=(",", ":")).encode()
+    request_json = json.dumps(
+        request,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
     store.create_connect_job(
         job_id=job_id,
         message_id="m1",
         part_id="2",
         protocol_version=2,
-        capability_id="document.translate",
+        capability_id=capability_id,
         capability_version="1.0",
-        provider_app_id="translation-provider",
-        provider_app_version="0.1.0",
-        provider_instance_id="11111111-1111-4111-8111-111111111111",
-        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        provider_app_id=provider_app_id,
+        provider_app_version=provider_app_version,
+        provider_instance_id=provider_instance_id,
+        input_artifact_id=artifact_id,
         input_media_type="application/pdf",
-        input_byte_size=20,
-        input_sha256="a" * 64,
+        input_byte_size=input_byte_size,
+        input_sha256=input_sha256,
         input_display_name="invoice.pdf",
         source_app_id="email-watcher",
         request_json=request_json,
@@ -672,8 +686,10 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     assert restored.error_retryable == 0
     assert restored.source_app_id == "email-watcher"
     assert restored.provider_app_version is None
+    assert restored.invocation_fingerprint == "v1"
     assert restored.request_json is None
     assert restored.result_json is None
+    assert restored.result_metadata_json is None
     with sqlite3.connect(database) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 6
         assert (
@@ -740,8 +756,16 @@ def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -
         "capability_id": "document.translate",
         "capability_version": "1.0",
     }
+    v2_lookup = {
+        **lookup,
+        "protocol_version": 2,
+        "provider_app_id": "translation-provider",
+        "provider_app_version": "0.1.0",
+        "provider_instance_id": "11111111-1111-4111-8111-111111111111",
+        "request_json": request_json,
+    }
     assert store.active_connect_job(**lookup) is None
-    assert store.active_connect_job(**lookup, protocol_version=2) is not None
+    assert store.active_connect_job(**v2_lookup) is not None
     store.transition_connect_job(
         job_id=job_id,
         expected_state="requested",
@@ -775,7 +799,7 @@ def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -
     assert restored.input_display_name == "invoice.pdf"
     assert restored.source_app_id == "email-watcher"
     assert reopened.completed_connect_job(**lookup) is None
-    assert reopened.completed_connect_job(**lookup, protocol_version=2) == restored
+    assert reopened.completed_connect_job(**v2_lookup) == restored
     outputs = reopened.completed_connect_outputs(restored)
     assert tuple(output.payload for output in outputs) == payloads
     assert [output.byte_size for output in outputs] == [len(payloads[0]), 0]
@@ -795,6 +819,112 @@ def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -
         "outputs": [output.metadata() for output in outputs],
     }
     assert "payload_base64" not in json.dumps(projected)
+
+
+def test_connect_v2_active_identity_scopes_protocol_provider_and_parameters(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    create_connect_job(store, "33333333-3333-4333-8333-333333333333")
+    spanish_request = create_v2_connect_job(
+        store,
+        "44444444-4444-4444-8444-444444444444",
+        capability_id="document.summarize",
+        parameters={"target-language": "Spanish"},
+    )
+    french_request = create_v2_connect_job(
+        store,
+        "55555555-5555-4555-8555-555555555555",
+        capability_id="document.summarize",
+        parameters={"target-language": "French"},
+    )
+    other_provider_request = create_v2_connect_job(
+        store,
+        "66666666-6666-4666-8666-666666666666",
+        capability_id="document.summarize",
+        provider_app_id="other-provider",
+        provider_instance_id="99999999-9999-4999-8999-999999999999",
+        parameters={"target-language": "Spanish"},
+    )
+
+    base_lookup = {
+        "message_id": "m1",
+        "part_id": "2",
+        "capability_id": "document.summarize",
+        "capability_version": "1.0",
+    }
+    assert store.active_connect_job(**base_lookup).job_id == (  # type: ignore[union-attr]
+        "33333333-3333-4333-8333-333333333333"
+    )
+    for request_json, provider_app_id, provider_instance_id, expected_job_id in (
+        (
+            spanish_request,
+            "translation-provider",
+            "11111111-1111-4111-8111-111111111111",
+            "44444444-4444-4444-8444-444444444444",
+        ),
+        (
+            french_request,
+            "translation-provider",
+            "11111111-1111-4111-8111-111111111111",
+            "55555555-5555-4555-8555-555555555555",
+        ),
+        (
+            other_provider_request,
+            "other-provider",
+            "99999999-9999-4999-8999-999999999999",
+            "66666666-6666-4666-8666-666666666666",
+        ),
+    ):
+        restored = store.active_connect_job(
+            **base_lookup,
+            protocol_version=2,
+            provider_app_id=provider_app_id,
+            provider_app_version="0.1.0",
+            provider_instance_id=provider_instance_id,
+            request_json=request_json,
+        )
+        assert restored is not None
+        assert restored.job_id == expected_job_id
+
+    with pytest.raises(sqlite3.IntegrityError):
+        create_v2_connect_job(
+            store,
+            "77777777-7777-4777-8777-777777777777",
+            capability_id="document.summarize",
+            parameters={"target-language": "Spanish"},
+        )
+
+
+def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    parameters = {
+        (f"p{index:02d}-" + "x" * 96): "😀" * 1000 for index in range(16)
+    }
+    large_request = create_v2_connect_job(
+        store,
+        "33333333-3333-4333-8333-333333333333",
+        parameters=parameters,
+    )
+    assert 64 * 1024 < len(large_request) <= MAX_CONNECT_REQUEST_BYTES
+
+    empty_request = create_v2_connect_job(
+        store,
+        "44444444-4444-4444-8444-444444444444",
+        input_byte_size=0,
+        input_sha256=hashlib.sha256(b"").hexdigest(),
+        parameters={},
+    )
+    empty = store.connect_job("44444444-4444-4444-8444-444444444444")
+    assert empty is not None
+    assert empty.input_byte_size == 0
+    assert empty.request_json == empty_request
 
 
 def test_connect_v2_rejects_mismatched_request_and_corrupt_result(tmp_path: Path) -> None:
@@ -844,6 +974,10 @@ def test_connect_v2_rejects_mismatched_request_and_corrupt_result(tmp_path: Path
     corrupted = store.connect_job(job_id)
     assert corrupted is not None
     assert corrupted.result_json != completed.result_json
+    projected = store.recent(1)[0]["attachments"][0]["capability_results"][0]
+    assert projected["outputs"] == [
+        output.metadata() for output in store.completed_connect_outputs(completed)
+    ]
     with pytest.raises(RuntimeError, match="invalid"):
         store.completed_connect_outputs(corrupted)
 

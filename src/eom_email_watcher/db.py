@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator
@@ -15,9 +16,10 @@ from pathlib import Path
 from .mime import AttachmentDescriptor
 
 SCHEMA_VERSION = 6
-MAX_CONNECT_REQUEST_BYTES = 64 * 1024
+MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
+MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 
 _CONNECT_JOBS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
@@ -30,16 +32,23 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
     provider_app_id TEXT,
     provider_app_version TEXT,
     provider_instance_id TEXT,
+    invocation_fingerprint TEXT NOT NULL CHECK (
+        (protocol_version = 1 AND invocation_fingerprint = 'v1')
+        OR (protocol_version = 2 AND length(invocation_fingerprint) = 64)
+    ),
     input_artifact_id TEXT NOT NULL,
     input_media_type TEXT NOT NULL,
-    input_byte_size INTEGER NOT NULL CHECK (input_byte_size > 0),
+    input_byte_size INTEGER NOT NULL CHECK (
+        (protocol_version = 1 AND input_byte_size > 0)
+        OR (protocol_version = 2 AND input_byte_size >= 0)
+    ),
     input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
     input_display_name TEXT,
     source_app_id TEXT,
     request_json BLOB CHECK (
         request_json IS NULL OR (
             typeof(request_json) = 'blob'
-            AND length(request_json) BETWEEN 1 AND 65536
+            AND length(request_json) BETWEEN 1 AND 131072
         )
     ),
     status TEXT NOT NULL CHECK (
@@ -60,6 +69,12 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
         result_json IS NULL OR (
             typeof(result_json) = 'blob'
             AND length(result_json) BETWEEN 1 AND 25165824
+        )
+    ),
+    result_metadata_json BLOB CHECK (
+        result_metadata_json IS NULL OR (
+            typeof(result_metadata_json) = 'blob'
+            AND length(result_metadata_json) BETWEEN 1 AND 65536
         )
     ),
     error_code TEXT,
@@ -96,7 +111,8 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
                     AND summary_text IS NOT NULL
                     AND length(summary_text) > 0
                     AND warnings_json IS NOT NULL
-                    AND result_json IS NULL)
+                    AND result_json IS NULL
+                    AND result_metadata_json IS NULL)
                 OR (protocol_version = 2
                     AND output_artifact_id IS NULL
                     AND output_media_type IS NULL
@@ -105,7 +121,8 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
                     AND summary_version IS NULL
                     AND summary_text IS NULL
                     AND warnings_json IS NULL
-                    AND result_json IS NOT NULL)
+                    AND result_json IS NOT NULL
+                    AND result_metadata_json IS NOT NULL)
             ))
         OR (status = 'failed'
             AND error_code IS NOT NULL
@@ -118,7 +135,8 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
             AND summary_version IS NULL
             AND summary_text IS NULL
             AND warnings_json IS NULL
-            AND result_json IS NULL)
+            AND result_json IS NULL
+            AND result_metadata_json IS NULL)
         OR (status IN ('requested', 'accepted', 'processing')
             AND output_artifact_id IS NULL
             AND output_media_type IS NULL
@@ -128,6 +146,7 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
             AND summary_text IS NULL
             AND warnings_json IS NULL
             AND result_json IS NULL
+            AND result_metadata_json IS NULL
             AND error_code IS NULL
             AND error_message IS NULL
             AND error_retryable IS NULL)
@@ -138,13 +157,17 @@ CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
 _CONNECT_JOBS_LOOKUP_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_connect_attachment_jobs_lookup
 ON connect_attachment_jobs(
-    message_id, part_id, capability_id, capability_version, created_at
+    message_id, part_id, protocol_version, capability_id, capability_version,
+    invocation_fingerprint, created_at
 )
 """
 
 _CONNECT_JOBS_ACTIVE_INDEX_SQL = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_connect_attachment_jobs_active
-ON connect_attachment_jobs(message_id, part_id, capability_id, capability_version)
+ON connect_attachment_jobs(
+    message_id, part_id, protocol_version, capability_id, capability_version,
+    invocation_fingerprint
+)
 WHERE status IN ('requested', 'accepted', 'processing')
 """
 
@@ -223,6 +246,7 @@ class ConnectJob:
     provider_app_id: str | None
     provider_app_version: str | None
     provider_instance_id: str | None
+    invocation_fingerprint: str
     input_artifact_id: str
     input_media_type: str
     input_byte_size: int
@@ -239,6 +263,7 @@ class ConnectJob:
     summary_text: str | None
     warnings_json: str | None
     result_json: bytes | None = field(repr=False)
+    result_metadata_json: bytes | None = field(repr=False)
     error_code: str | None
     error_message: str | None
     error_retryable: int | None
@@ -297,20 +322,23 @@ def _ensure_connect_jobs_schema(db: sqlite3.Connection) -> None:
             job_id, message_id, part_id, protocol_version,
             capability_id, capability_version,
             provider_app_id, provider_app_version, provider_instance_id,
+            invocation_fingerprint,
             input_artifact_id, input_media_type, input_byte_size, input_sha256,
             input_display_name, source_app_id, request_json, status,
             output_artifact_id, output_media_type, output_byte_size, output_sha256,
             summary_version, summary_text, warnings_json, result_json,
+            result_metadata_json,
             error_code, error_message, error_retryable, created_at, updated_at
         )
         SELECT
             job_id, message_id, part_id, 1,
             capability_id, capability_version,
             provider_app_id, NULL, provider_instance_id,
+            'v1',
             input_artifact_id, input_media_type, input_byte_size, input_sha256,
             NULL, 'email-watcher', NULL, status,
             output_artifact_id, output_media_type, output_byte_size, output_sha256,
-            summary_version, summary_text, warnings_json, NULL,
+            summary_version, summary_text, warnings_json, NULL, NULL,
             error_code, error_message, error_retryable, created_at, updated_at
         FROM connect_attachment_jobs_v5
         ORDER BY rowid"""
@@ -328,19 +356,7 @@ def _valid_uuid_v4(value: object) -> bool:
     return parsed.version == 4 and str(parsed) == value
 
 
-def _validate_v2_request_record(
-    request_json: bytes,
-    *,
-    job_id: str,
-    capability_id: str,
-    capability_version: str,
-    input_artifact_id: str,
-    input_media_type: str,
-    input_byte_size: int,
-    input_sha256: str,
-    input_display_name: str,
-    source_app_id: str,
-) -> None:
+def _decode_v2_request(request_json: bytes) -> dict[str, object]:
     if not 0 < len(request_json) <= MAX_CONNECT_REQUEST_BYTES:
         raise ValueError("Connect v2 request bytes are invalid")
     try:
@@ -355,13 +371,101 @@ def _validate_v2_request_record(
         "parameters",
     }:
         raise ValueError("Connect v2 request provenance is invalid")
+    return request
+
+
+def _canonical_v2_parameters(value: object) -> dict[str, str | int | bool]:
+    if not isinstance(value, dict) or len(value) > 16:
+        raise ValueError("Connect v2 request provenance is invalid")
+    normalized: dict[str, str | int | bool] = {}
+    for name, raw in value.items():
+        if not isinstance(name, str) or not 0 < len(name) <= 100:
+            raise ValueError("Connect v2 request provenance is invalid")
+        if (
+            isinstance(raw, str)
+            and len(raw) <= 1000
+            or type(raw) is bool
+            or type(raw) is int
+            and -9_007_199_254_740_991 <= raw <= 9_007_199_254_740_991
+        ):
+            normalized[name] = raw
+        elif (
+            type(raw) is float
+            and math.isfinite(raw)
+            and raw.is_integer()
+            and -9_007_199_254_740_991 <= raw <= 9_007_199_254_740_991
+        ):
+            normalized[name] = int(raw)
+        else:
+            raise ValueError("Connect v2 request provenance is invalid")
+    return normalized
+
+
+def _v2_invocation_fingerprint(
+    request: dict[str, object],
+    *,
+    capability_id: str,
+    capability_version: str,
+    provider_app_id: str,
+    provider_app_version: str,
+    provider_instance_id: str,
+) -> str:
     capability = request.get("capability")
     inputs = request.get("inputs")
-    parameters = request.get("parameters")
     if (
         request.get("protocol_version") != 2
-        or request.get("job_id") != job_id
         or capability != {"id": capability_id, "version": capability_version}
+        or not isinstance(inputs, list)
+        or len(inputs) != 1
+        or not isinstance(inputs[0], dict)
+        or set(inputs[0])
+        != {"artifact_id", "media_type", "byte_size", "sha256", "display_name", "source_app_id"}
+    ):
+        raise ValueError("Connect v2 request provenance is invalid")
+    input_artifact = inputs[0]
+    identity = {
+        "protocol_version": 2,
+        "provider": {
+            "app_id": provider_app_id,
+            "version": provider_app_version,
+            "instance_id": provider_instance_id,
+        },
+        "capability": capability,
+        "input": {
+            key: input_artifact[key]
+            for key in ("media_type", "byte_size", "sha256", "display_name", "source_app_id")
+        },
+        "parameters": _canonical_v2_parameters(request.get("parameters")),
+    }
+    encoded = json.dumps(
+        identity,
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_v2_request_record(
+    request_json: bytes,
+    *,
+    job_id: str,
+    capability_id: str,
+    capability_version: str,
+    provider_app_id: str,
+    provider_app_version: str,
+    provider_instance_id: str,
+    input_artifact_id: str,
+    input_media_type: str,
+    input_byte_size: int,
+    input_sha256: str,
+    input_display_name: str,
+    source_app_id: str,
+) -> str:
+    request = _decode_v2_request(request_json)
+    inputs = request.get("inputs")
+    if (
+        request.get("job_id") != job_id
         or not isinstance(inputs, list)
         or len(inputs) != 1
         or inputs[0]
@@ -373,14 +477,55 @@ def _validate_v2_request_record(
             "display_name": input_display_name,
             "source_app_id": source_app_id,
         }
-        or not isinstance(parameters, dict)
-        or len(parameters) > 16
-        or any(
-            not isinstance(name, str) or not name or type(value) not in {str, int, bool}
-            for name, value in parameters.items()
-        )
     ):
         raise ValueError("Connect v2 request provenance is invalid")
+    return _v2_invocation_fingerprint(
+        request,
+        capability_id=capability_id,
+        capability_version=capability_version,
+        provider_app_id=provider_app_id,
+        provider_app_version=provider_app_version,
+        provider_instance_id=provider_instance_id,
+    )
+
+
+def _lookup_invocation_fingerprint(
+    *,
+    protocol_version: int,
+    capability_id: str,
+    capability_version: str,
+    provider_app_id: str | None,
+    provider_app_version: str | None,
+    provider_instance_id: str | None,
+    request_json: bytes | None,
+) -> str:
+    if protocol_version == 1:
+        if any(
+            value is not None
+            for value in (
+                provider_app_version,
+                request_json,
+            )
+        ):
+            raise ValueError("Connect v1 lookup cannot use v2 request identity")
+        return "v1"
+    if protocol_version != 2:
+        raise ValueError("Connect protocol version is unsupported")
+    if (
+        not provider_app_id
+        or not provider_app_version
+        or not provider_instance_id
+        or request_json is None
+    ):
+        raise ValueError("Connect v2 lookup identity is incomplete")
+    return _v2_invocation_fingerprint(
+        _decode_v2_request(request_json),
+        capability_id=capability_id,
+        capability_version=capability_version,
+        provider_app_id=provider_app_id,
+        provider_app_version=provider_app_version,
+        provider_instance_id=provider_instance_id,
+    )
 
 
 def _validate_generic_result(value: object) -> tuple[ConnectOutput, ...]:
@@ -449,8 +594,9 @@ def _validate_generic_result(value: object) -> tuple[ConnectOutput, ...]:
     return tuple(outputs)
 
 
-def _encode_generic_result(result: dict[str, object]) -> bytes:
+def _encode_generic_result(result: dict[str, object]) -> tuple[bytes, bytes]:
     outputs = _validate_generic_result(result)
+    metadata = {"outputs": [output.metadata() for output in outputs]}
     encoded = json.dumps(
         {
             "outputs": [
@@ -466,7 +612,14 @@ def _encode_generic_result(result: dict[str, object]) -> bytes:
     ).encode("utf-8")
     if len(encoded) > MAX_CONNECT_RESULT_BYTES:
         raise ValueError("Completed Connect v2 result is too large")
-    return encoded
+    encoded_metadata = json.dumps(
+        metadata,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if len(encoded_metadata) > MAX_CONNECT_RESULT_METADATA_BYTES:
+        raise ValueError("Completed Connect v2 result metadata is too large")
+    return encoded, encoded_metadata
 
 
 def _decode_generic_result(result_json: bytes) -> tuple[ConnectOutput, ...]:
@@ -477,6 +630,52 @@ def _decode_generic_result(result_json: bytes) -> tuple[ConnectOutput, ...]:
         return _validate_generic_result(value)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
         raise RuntimeError("Completed Connect v2 result is invalid") from exc
+
+
+def _decode_generic_result_metadata(result_metadata_json: bytes) -> list[dict[str, object]]:
+    if not 0 < len(result_metadata_json) <= MAX_CONNECT_RESULT_METADATA_BYTES:
+        raise RuntimeError("Completed Connect v2 result metadata is invalid")
+    try:
+        value = json.loads(result_metadata_json)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Completed Connect v2 result metadata is invalid") from exc
+    if not isinstance(value, dict) or set(value) != {"outputs"}:
+        raise RuntimeError("Completed Connect v2 result metadata is invalid")
+    outputs = value["outputs"]
+    if not isinstance(outputs, list) or not 1 <= len(outputs) <= 8:
+        raise RuntimeError("Completed Connect v2 result metadata is invalid")
+    artifact_ids: set[str] = set()
+    for output in outputs:
+        if not isinstance(output, dict) or set(output) != {
+            "artifact_id",
+            "media_type",
+            "display_name",
+            "byte_size",
+            "sha256",
+        }:
+            raise RuntimeError("Completed Connect v2 result metadata is invalid")
+        artifact_id = output["artifact_id"]
+        media_type = output["media_type"]
+        display_name = output["display_name"]
+        byte_size = output["byte_size"]
+        sha256 = output["sha256"]
+        if (
+            not _valid_uuid_v4(artifact_id)
+            or artifact_id in artifact_ids
+            or not isinstance(media_type, str)
+            or not 0 < len(media_type) <= 127
+            or media_type != media_type.casefold()
+            or not isinstance(display_name, str)
+            or not 0 < len(display_name) <= 255
+            or type(byte_size) is not int
+            or not 0 <= byte_size <= MAX_CONNECT_OUTPUT_BYTES
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise RuntimeError("Completed Connect v2 result metadata is invalid")
+        artifact_ids.add(artifact_id)
+    return outputs
 
 
 class Store:
@@ -771,13 +970,27 @@ class Store:
         capability_id: str,
         capability_version: str,
         protocol_version: int = 1,
+        provider_app_id: str | None = None,
+        provider_app_version: str | None = None,
+        provider_instance_id: str | None = None,
+        request_json: bytes | None = None,
     ) -> ConnectJob | None:
+        invocation_fingerprint = _lookup_invocation_fingerprint(
+            protocol_version=protocol_version,
+            capability_id=capability_id,
+            capability_version=capability_version,
+            provider_app_id=provider_app_id,
+            provider_app_version=provider_app_version,
+            provider_instance_id=provider_instance_id,
+            request_json=request_json,
+        )
         with self.connection() as db:
             row = db.execute(
                 """SELECT * FROM connect_attachment_jobs
                 WHERE message_id = ? AND part_id = ?
                   AND capability_id = ? AND capability_version = ?
                   AND protocol_version = ?
+                  AND invocation_fingerprint = ?
                   AND status IN ('requested', 'accepted', 'processing')
                 ORDER BY created_at DESC, rowid DESC LIMIT 1""",
                 (
@@ -786,6 +999,7 @@ class Store:
                     capability_id,
                     capability_version,
                     protocol_version,
+                    invocation_fingerprint,
                 ),
             ).fetchone()
         return self._connect_job(row) if row else None
@@ -798,13 +1012,27 @@ class Store:
         capability_id: str,
         capability_version: str,
         protocol_version: int = 1,
+        provider_app_id: str | None = None,
+        provider_app_version: str | None = None,
+        provider_instance_id: str | None = None,
+        request_json: bytes | None = None,
     ) -> ConnectJob | None:
+        invocation_fingerprint = _lookup_invocation_fingerprint(
+            protocol_version=protocol_version,
+            capability_id=capability_id,
+            capability_version=capability_version,
+            provider_app_id=provider_app_id,
+            provider_app_version=provider_app_version,
+            provider_instance_id=provider_instance_id,
+            request_json=request_json,
+        )
         with self.connection() as db:
             row = db.execute(
                 """SELECT * FROM connect_attachment_jobs
                 WHERE message_id = ? AND part_id = ?
                   AND capability_id = ? AND capability_version = ?
                   AND protocol_version = ?
+                  AND invocation_fingerprint = ?
                   AND status = 'completed'
                 ORDER BY created_at DESC, rowid DESC LIMIT 1""",
                 (
@@ -813,6 +1041,7 @@ class Store:
                     capability_id,
                     capability_version,
                     protocol_version,
+                    invocation_fingerprint,
                 ),
             ).fetchone()
         return self._connect_job(row) if row else None
@@ -842,6 +1071,7 @@ class Store:
         if protocol_version == 1:
             if request_json is not None:
                 raise ValueError("Connect v1 jobs cannot store a v2 request")
+            invocation_fingerprint = "v1"
         else:
             if (
                 not provider_app_version
@@ -850,11 +1080,14 @@ class Store:
                 or request_json is None
             ):
                 raise ValueError("Connect v2 job provenance is incomplete")
-            _validate_v2_request_record(
+            invocation_fingerprint = _validate_v2_request_record(
                 request_json,
                 job_id=job_id,
                 capability_id=capability_id,
                 capability_version=capability_version,
+                provider_app_id=provider_app_id,
+                provider_app_version=provider_app_version,
+                provider_instance_id=provider_instance_id,
                 input_artifact_id=input_artifact_id,
                 input_media_type=input_media_type,
                 input_byte_size=input_byte_size,
@@ -879,11 +1112,12 @@ class Store:
                     job_id, message_id, part_id, protocol_version,
                     capability_id, capability_version,
                     provider_app_id, provider_app_version, provider_instance_id,
+                    invocation_fingerprint,
                     input_artifact_id, input_media_type, input_byte_size, input_sha256,
                     input_display_name, source_app_id, request_json, status,
                     created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?
                 )""",
                 (
                     job_id,
@@ -895,6 +1129,7 @@ class Store:
                     provider_app_id,
                     provider_app_version,
                     provider_instance_id,
+                    invocation_fingerprint,
                     input_artifact_id,
                     input_media_type,
                     input_byte_size,
@@ -974,19 +1209,27 @@ class Store:
                     None,
                     None,
                     None,
+                    None,
                 )
             elif next_state == "completed":
                 assert result is not None
-                values = (None,) * 7 + (_encode_generic_result(result), None, None, None)
+                result_json, result_metadata_json = _encode_generic_result(result)
+                values = (None,) * 7 + (
+                    result_json,
+                    result_metadata_json,
+                    None,
+                    None,
+                    None,
+                )
             elif next_state == "failed":
                 assert error is not None
-                values = (None,) * 8 + (
+                values = (None,) * 9 + (
                     error.get("code"),
                     error.get("message"),
                     int(bool(error.get("retryable"))),
                 )
             else:
-                values = (None,) * 11
+                values = (None,) * 12
             if next_state == "completed":
                 candidate = ConnectJob(
                     **{
@@ -1002,9 +1245,10 @@ class Store:
                         "summary_text": values[5],
                         "warnings_json": values[6],
                         "result_json": values[7],
-                        "error_code": values[8],
-                        "error_message": values[9],
-                        "error_retryable": values[10],
+                        "result_metadata_json": values[8],
+                        "error_code": values[9],
+                        "error_message": values[10],
+                        "error_retryable": values[11],
                         "updated_at": stamp,
                     }
                 )
@@ -1018,7 +1262,7 @@ class Store:
                     provider_app_id = ?, provider_instance_id = ?, status = ?,
                     output_artifact_id = ?, output_media_type = ?, output_byte_size = ?,
                     output_sha256 = ?, summary_version = ?, summary_text = ?, warnings_json = ?,
-                    result_json = ?, error_code = ?, error_message = ?,
+                    result_json = ?, result_metadata_json = ?, error_code = ?, error_message = ?,
                     error_retryable = ?, updated_at = ?
                 WHERE job_id = ? AND status = ?""",
                 (
@@ -1059,7 +1303,7 @@ class Store:
                     output_artifact_id = NULL, output_media_type = NULL,
                     output_byte_size = NULL, output_sha256 = NULL,
                     summary_version = NULL, summary_text = NULL, warnings_json = NULL,
-                    result_json = NULL,
+                    result_json = NULL, result_metadata_json = NULL,
                     error_code = NULL, error_message = NULL, error_retryable = NULL,
                     updated_at = ?
                 WHERE job_id = ? AND status = ?
@@ -1369,9 +1613,38 @@ class Store:
                 message_ids,
             ).fetchall()
             connect_rows = db.execute(
-                f"""SELECT * FROM connect_attachment_jobs
-                WHERE message_id IN ({placeholders})
-                ORDER BY created_at DESC, rowid DESC""",
+                f"""SELECT
+                    job_id, message_id, part_id, protocol_version,
+                    capability_id, capability_version,
+                    provider_app_id, provider_app_version, provider_instance_id,
+                    invocation_fingerprint,
+                    input_artifact_id, input_media_type, input_byte_size, input_sha256,
+                    input_display_name, source_app_id,
+                    NULL AS request_json, status,
+                    output_artifact_id, output_media_type, output_byte_size, output_sha256,
+                    summary_version, summary_text, warnings_json,
+                    NULL AS result_json, result_metadata_json,
+                    error_code, error_message, error_retryable, created_at, updated_at
+                FROM (
+                    SELECT
+                        job_id, message_id, part_id, protocol_version,
+                        capability_id, capability_version,
+                        provider_app_id, provider_app_version, provider_instance_id,
+                        invocation_fingerprint,
+                        input_artifact_id, input_media_type, input_byte_size, input_sha256,
+                        input_display_name, source_app_id, status,
+                        output_artifact_id, output_media_type, output_byte_size, output_sha256,
+                        summary_version, summary_text, warnings_json, result_metadata_json,
+                        error_code, error_message, error_retryable, created_at, updated_at,
+                        ROW_NUMBER() OVER (
+                        PARTITION BY message_id, part_id, capability_id, capability_version
+                        ORDER BY created_at DESC, rowid DESC
+                        ) AS recency
+                    FROM connect_attachment_jobs
+                    WHERE message_id IN ({placeholders})
+                )
+                WHERE recency = 1
+                ORDER BY created_at DESC""",
                 message_ids,
             ).fetchall()
         attachments_by_message: dict[str, list[dict[str, object]]] = {
@@ -1382,7 +1655,6 @@ class Store:
             message_id = str(attachment.pop("message_id"))
             attachments_by_message[message_id].append(attachment)
         connect_by_attachment: dict[tuple[str, str], list[dict[str, object]]] = {}
-        seen_connect: set[tuple[str, str, str, str]] = set()
         for row in connect_rows:
             key = (
                 str(row["message_id"]),
@@ -1390,9 +1662,6 @@ class Store:
                 str(row["capability_id"]),
                 str(row["capability_version"]),
             )
-            if key in seen_connect:
-                continue
-            seen_connect.add(key)
             item: dict[str, object] = {
                 "capability_id": key[2],
                 "capability_version": key[3],
@@ -1415,9 +1684,12 @@ class Store:
                         "warnings": self.completed_connect_warnings(completed),
                     }
                 else:
-                    item["outputs"] = [
-                        output.metadata() for output in self.completed_connect_outputs(completed)
-                    ]
+                    metadata_json = row["result_metadata_json"]
+                    if not isinstance(metadata_json, bytes):
+                        raise RuntimeError(
+                            "Completed Connect v2 job is missing its durable result metadata"
+                        )
+                    item["outputs"] = _decode_generic_result_metadata(metadata_json)
             elif row["status"] == "failed":
                 item["error"] = {
                     "code": str(row["error_code"]),
