@@ -18,6 +18,8 @@ from eom_email_watcher.db import SCHEMA_VERSION
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
+FIXTURE_PART_ID = "fixture-mime-part"
+
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
     model_id = "connect-proof-model"
@@ -119,7 +121,7 @@ class FixtureGmail:
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if (message_id, part_id, attachment_id) != (
             "fixture-message",
-            "2",
+            FIXTURE_PART_ID,
             "fixture-attachment",
         ):
             raise AssertionError("Unexpected fixture attachment identity")
@@ -308,7 +310,7 @@ def main() -> None:
                 "fixture-message",
                 (
                     AttachmentDescriptor(
-                        "2",
+                        FIXTURE_PART_ID,
                         "fixture-attachment",
                         pdf_path.name,
                         "application/pdf",
@@ -321,7 +323,7 @@ def main() -> None:
                 request(
                     config_path,
                     "connect.attachment.capabilities",
-                    {"message_id": "fixture-message", "part_id": "2"},
+                    {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
                 )
             )
             if not capabilities["ok"]:
@@ -341,7 +343,7 @@ def main() -> None:
             invocation = {
                 "request_id": request_id,
                 "message_id": "fixture-message",
-                "part_id": "2",
+                "part_id": FIXTURE_PART_ID,
                 "provider": {
                     "app_id": selected["provider"]["app_id"],
                     "version": selected["provider"]["version"],
@@ -377,7 +379,7 @@ def main() -> None:
                     "connect.output.present",
                     {
                         "message_id": "fixture-message",
-                        "part_id": "2",
+                        "part_id": FIXTURE_PART_ID,
                         "job_id": request_id,
                         "artifact_id": outputs[0]["artifact_id"],
                     },
@@ -484,6 +486,7 @@ def main() -> None:
                         private_value not in serialized_request
                         for private_value in (
                             "fixture-message",
+                            FIXTURE_PART_ID,
                             "fixture-attachment",
                             "fixture@example.invalid",
                             "Fixture Sender",
