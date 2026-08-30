@@ -950,8 +950,10 @@ function renderInbox(items: InboxItem[]): void {
           invokeButton.textContent = `Running ${capability.capability.action.label}…`;
           inboxStatus.textContent = `Running ${capability.capability.action.label} for ${attachment.filename}…`;
           delete inboxStatus.dataset.kind;
+          let result: ConnectInvocationResult | undefined;
+          let invocationError: unknown;
           try {
-            const result = await invoke<ConnectInvocationResult>(
+            result = await invoke<ConnectInvocationResult>(
               "attachment_capability_invoke",
               {
                 requestId,
@@ -971,15 +973,18 @@ function renderInbox(items: InboxItem[]): void {
               },
             );
             attachmentRequestIds.delete(key);
-            await loadInbox();
-            inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
-            inboxStatus.dataset.kind = "success";
           } catch (error) {
-            await loadInbox();
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
+            invocationError = error;
           } finally {
             attachmentInvocationsInFlight.delete(key);
+          }
+          await loadInbox();
+          if (result) {
+            inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
+            inboxStatus.dataset.kind = "success";
+          } else {
+            inboxStatus.textContent = errorMessage(invocationError);
+            inboxStatus.dataset.kind = "error";
           }
         });
         actions.append(invokeButton);
@@ -1077,6 +1082,7 @@ async function loadInbox(): Promise<void> {
   try {
     items = await invoke<InboxItem[]>("inbox_recent");
   } catch (error) {
+    if (generation !== inboxRequestGeneration) return;
     attachmentCapabilities.clear();
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
