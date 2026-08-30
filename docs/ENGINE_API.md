@@ -56,6 +56,7 @@ only to stderr.
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
 | `settings.get` | `{}` | Safe public settings, polling interval/support, and token-presence boolean |
+| `settings.update` | one or more safe setting fields | Persist and return safe desktop settings |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
 
@@ -65,7 +66,15 @@ address that is not watched returns `not_found`, and malformed payload values re
 `invalid_request`. Configuration may contain zero senders for first-run onboarding. In that state,
 `watcher.check` returns `active: false` without accessing Gmail; local retention cleanup and exact
 pending-notification counting continue so removing the final sender cannot strand prior state.
-Adding the first sender activates later Gmail checks. Settings mutation remains intentionally absent.
+Adding the first sender activates later Gmail checks.
+
+`settings.update` accepts only `poll_interval_minutes` (1 through 1440), `retention_days` (1 through
+3650), and an exact boolean `notifications_enabled`. Mutation uses the same serialized,
+same-directory atomic replacement as watchlist updates and preserves all unrelated TOML fields and
+comments. Empty payloads, unknown fields, wrong types, and out-of-range values return
+`invalid_request` without changing the file. Model endpoint, model identifier, credentials, token
+paths, Gmail settings, timezone, and EOM outbound configuration are not mutable through this
+operation.
 
 Each inbox item carries an `attachments` array. An attachment contains the Gmail MIME `part_id`,
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine

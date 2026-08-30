@@ -118,6 +118,56 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="# preserve this\nextension_key = 7")
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "settings.update",
+            {
+                "poll_interval_minutes": 45,
+                "retention_days": 365,
+                "notifications_enabled": False,
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["poll_interval_minutes"] == 45
+    assert response["data"]["retention_days"] == 365
+    assert response["data"]["notifications_enabled"] is False
+    assert "# preserve this" in config_path.read_text(encoding="utf-8")
+    assert "extension_key = 7" in config_path.read_text(encoding="utf-8")
+    encoded = json.dumps(response)
+    assert "token.json" not in encoded
+    assert "send-token.json" not in encoded
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"unknown": True},
+        {"poll_interval_minutes": False},
+        {"retention_days": 3651},
+        {"notifications_enabled": "false"},
+    ],
+)
+def test_settings_update_rejects_invalid_payload_without_mutation(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    original = config_path.read_bytes()
+
+    response = engine_api._response(request(config_path, "settings.update", payload))
+
+    assert response["error"]["code"] == "invalid_request"
+    assert config_path.read_bytes() == original
+
+
 def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     tmp_path: Path,
 ) -> None:
