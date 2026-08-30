@@ -457,7 +457,7 @@ def test_active_job_is_not_handed_to_a_different_provider_instance(
     )
 
 
-def test_processing_job_resubmits_as_requested_after_authenticated_not_found(
+def test_poll_not_found_reloads_processing_state_before_same_identity_resubmission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
@@ -476,14 +476,8 @@ def test_processing_job_resubmits_as_requested_after_authenticated_not_found(
         input_byte_size=28,
         input_sha256=hashlib.sha256(b"%PDF-1.4\nreal attachment\nEOF").hexdigest(),
     )
-    runtime.store.transition_connect_job(
-        job_id=job_id,
-        expected_state="requested",
-        next_state="processing",
-        provider_app_id=selected.app_id,
-        provider_instance_id=selected.instance_id,
-    )
     discovered_instances: list[str | None] = []
+    submitted: list[str] = []
 
     class FakeGmail:
         def attachment_bytes(self, *args) -> bytes:
@@ -494,14 +488,20 @@ def test_processing_job_resubmits_as_requested_after_authenticated_not_found(
             assert provider_value == selected
 
         def get(self, job):
-            raise connect.ConnectError("JOB_NOT_FOUND", "The job was not accepted.")
+            return update(job, "accepted")
 
         def submit(self, job, content):
             assert runtime.store.connect_job(job_id).status == "requested"
+            submitted.append(job.job_id)
             return update(job, "accepted")
 
         def wait_for_terminal(self, job, initial, on_update):
             assert initial.status == "accepted"
+            if not submitted:
+                on_update(update(job, "processing"))
+                raise connect.ConnectError(
+                    "JOB_NOT_FOUND", "The provider lost the accepted job."
+                )
             completed = update(job, "completed", result=summary(job))
             on_update(completed)
             return completed
@@ -526,7 +526,136 @@ def test_processing_job_resubmits_as_requested_after_authenticated_not_found(
     assert response["ok"] is True
     assert response["data"]["job_id"] == job_id
     assert discovered_instances == [selected.instance_id]
+    assert submitted == [job_id]
     assert runtime.store.connect_job(job_id).status == "completed"
+
+
+def test_terminal_job_not_found_failure_is_not_treated_as_resubmission_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = provider()
+    job_id = "33333333-3333-4333-8333-333333333333"
+    runtime.store.create_connect_job(
+        job_id=job_id,
+        message_id="message-1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        input_artifact_id="22222222-2222-4222-8222-222222222222",
+        input_media_type="application/pdf",
+        input_byte_size=28,
+        input_sha256="a" * 64,
+    )
+
+    class TerminalClient:
+        def __init__(self, provider_value):
+            assert provider_value == selected
+
+        def get(self, job):
+            return update(
+                job,
+                "failed",
+                error=connect.ConnectError("JOB_NOT_FOUND", "Document was rejected."),
+            )
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda **kwargs: connect.CapabilityDiscovery(selected),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectClient", TerminalClient)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("terminal failure must not refetch Gmail")
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+
+    assert response["error"] == {
+        "code": "job_not_found",
+        "message": "Document was rejected.",
+    }
+    assert runtime.store.connect_job(job_id).status == "failed"
+
+
+def test_active_job_is_queried_before_a_lower_current_input_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = connect.ProviderCapability(
+        base_url=provider().base_url,
+        token=provider().token,
+        app_id=provider().app_id,
+        instance_id=provider().instance_id,
+        max_input_bytes=1,
+    )
+    job_id = "33333333-3333-4333-8333-333333333333"
+    artifact_id = "22222222-2222-4222-8222-222222222222"
+    runtime.store.create_connect_job(
+        job_id=job_id,
+        message_id="message-1",
+        part_id="2",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        input_artifact_id=artifact_id,
+        input_media_type="application/pdf",
+        input_byte_size=28,
+        input_sha256="a" * 64,
+    )
+
+    class CompletedClient:
+        def __init__(self, provider_value):
+            assert provider_value == selected
+
+        def get(self, job):
+            return update(job, "completed", result=summary(job))
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda **kwargs: connect.CapabilityDiscovery(selected),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectClient", CompletedClient)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("accepted job must be queried before any new upload")
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "2"},
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["job_id"] == job_id
 
 
 def test_simultaneous_submit_returns_structured_in_progress_error(

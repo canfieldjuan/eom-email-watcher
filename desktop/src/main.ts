@@ -332,6 +332,7 @@ let gmailConnected = false;
 let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
 let connectCapabilities: ConnectCapability[] = [];
+const attachmentSummariesInFlight = new Set<string>();
 let settingsInFlight = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
@@ -528,6 +529,10 @@ function renderInbox(items: InboxItem[]): void {
 
       const existingSummary = attachmentSummary(attachment);
       const capability = summaryCapability(attachment);
+      const summaryInvocationKey = JSON.stringify([item.message_id, attachment.part_id]);
+      const summaryInvocationInFlight = attachmentSummariesInFlight.has(
+        summaryInvocationKey,
+      );
       const activeSummary = ["requested", "accepted", "processing"].includes(
         existingSummary?.status ?? "",
       );
@@ -539,7 +544,12 @@ function renderInbox(items: InboxItem[]): void {
           : existingSummary?.status === "failed"
             ? "Retry summary"
             : "Summarize";
+        if (summaryInvocationInFlight) {
+          summarizeButton.disabled = true;
+          summarizeButton.textContent = "Summarizing…";
+        }
         summarizeButton.addEventListener("click", async () => {
+          attachmentSummariesInFlight.add(summaryInvocationKey);
           summarizeButton.disabled = true;
           summarizeButton.textContent = "Summarizing…";
           inboxStatus.textContent = `Summarizing ${attachment.filename} locally…`;
@@ -549,13 +559,17 @@ function renderInbox(items: InboxItem[]): void {
               messageId: item.message_id,
               partId: attachment.part_id,
             });
+            attachmentSummariesInFlight.delete(summaryInvocationKey);
             await loadInbox();
             inboxStatus.textContent = `Summary ready for ${attachment.filename}.`;
             inboxStatus.dataset.kind = "success";
           } catch (error) {
+            attachmentSummariesInFlight.delete(summaryInvocationKey);
             await loadInbox();
             inboxStatus.textContent = errorMessage(error);
             inboxStatus.dataset.kind = "error";
+          } finally {
+            attachmentSummariesInFlight.delete(summaryInvocationKey);
           }
         });
         actions.append(summarizeButton);

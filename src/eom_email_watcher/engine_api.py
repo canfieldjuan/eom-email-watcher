@@ -437,6 +437,24 @@ def _run_connect_job(
         raise
 
 
+def _query_connect_job(
+    runtime: Runtime,
+    provider: connect.ProviderCapability,
+    job: connect.PreparedSummaryJob,
+) -> dict[str, object] | None:
+    try:
+        return _run_connect_job(runtime, provider, job, None)
+    except connect.ConnectError as exc:
+        current = runtime.store.connect_job(job.job_id)
+        if (
+            exc.code == "JOB_NOT_FOUND"
+            and current is not None
+            and current.status in {"requested", "accepted", "processing"}
+        ):
+            return None
+        raise
+
+
 def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id", "part_id"})
     message_id = payload.get("message_id")
@@ -490,9 +508,6 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
             else "No compatible local document summary capability is available."
         )
         raise ApiError(code, message)
-    if attachment.byte_size > provider.max_input_bytes:
-        raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-
     resubmit_expected_state: str | None = None
     if active is not None:
         if (
@@ -504,16 +519,34 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
                 "The provider for the active local capability job is unavailable.",
             )
         tracked = _tracked_job(active, attachment.filename)
-        try:
-            return _run_connect_job(runtime, provider, tracked, None)
-        except connect.ConnectError as exc:
-            if exc.code != "JOB_NOT_FOUND":
-                raise
-        resubmit_expected_state = active.status
-        job = tracked
+        reconciled = _query_connect_job(runtime, provider, tracked)
+        if reconciled is not None:
+            return reconciled
+        refreshed = runtime.store.connect_job(active.job_id)
+        if refreshed is None:
+            raise RuntimeError("Connect job disappeared during reconciliation")
+        if refreshed.status == "completed":
+            return _connect_result(refreshed)
+        if refreshed.status == "failed":
+            raise ApiError(
+                (refreshed.error_code or "connect_job_failed").lower(),
+                refreshed.error_message or "The local capability job failed.",
+            )
+        if (
+            refreshed.provider_app_id != provider.app_id
+            or refreshed.provider_instance_id != provider.instance_id
+        ):
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
+        resubmit_expected_state = refreshed.status
+        job = _tracked_job(refreshed, attachment.filename)
     else:
         job = None
 
+    if attachment.byte_size > provider.max_input_bytes:
+        raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
     gmail = GmailGateway.from_token(
         runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
     )
