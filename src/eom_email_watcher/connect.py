@@ -413,7 +413,10 @@ def _client() -> httpx.Client:
 
 
 def discover_summary_capability(
-    runtime_dir: Path | None = None, *, client: httpx.Client | None = None
+    runtime_dir: Path | None = None,
+    *,
+    client: httpx.Client | None = None,
+    provider_instance_id: str | None = None,
 ) -> CapabilityDiscovery:
     root_value = runtime_dir or (
         Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
@@ -485,6 +488,12 @@ def discover_summary_capability(
         if owned_client:
             active_client.close()
 
+    if provider_instance_id is not None:
+        provider = providers.get(provider_instance_id)
+        return CapabilityDiscovery(
+            provider,
+            None if provider is not None else "provider_unavailable",
+        )
     if len(providers) > 1:
         return CapabilityDiscovery(None, "ambiguous_provider")
     if not providers:
@@ -507,18 +516,10 @@ def _safe_display_name(filename: str) -> str:
     return f"{stem}.pdf"
 
 
-def prepare_summary_job(content: bytes, filename: str) -> PreparedSummaryJob:
-    if not content or len(content) > MAX_INPUT_BYTES:
-        raise ConnectError("INPUT_ARTIFACT_INVALID", "The PDF attachment size is unsupported.")
-    job_id = str(uuid4())
-    artifact = ArtifactIdentity(
-        artifact_id=str(uuid4()),
-        media_type=INPUT_MEDIA_TYPE,
-        byte_size=len(content),
-        sha256=hashlib.sha256(content).hexdigest(),
-    )
-    display_name = _safe_display_name(filename)
-    request: dict[str, object] = {
+def _summary_request(
+    job_id: str, artifact: ArtifactIdentity, display_name: str
+) -> dict[str, object]:
+    return {
         "protocol_version": PROTOCOL_VERSION,
         "job_id": job_id,
         "capability": {"id": CAPABILITY_ID, "version": CAPABILITY_VERSION},
@@ -530,7 +531,43 @@ def prepare_summary_job(content: bytes, filename: str) -> PreparedSummaryJob:
             }
         ],
     }
-    return PreparedSummaryJob(job_id, artifact, display_name, request)
+
+
+def restore_summary_job(
+    *,
+    job_id: str,
+    artifact_id: str,
+    media_type: str,
+    byte_size: int,
+    sha256: str,
+    filename: str,
+) -> PreparedSummaryJob:
+    artifact = ArtifactIdentity(
+        artifact_id=artifact_id,
+        media_type=media_type,
+        byte_size=byte_size,
+        sha256=sha256,
+    )
+    display_name = _safe_display_name(filename)
+    return PreparedSummaryJob(
+        job_id,
+        artifact,
+        display_name,
+        _summary_request(job_id, artifact, display_name),
+    )
+
+
+def prepare_summary_job(content: bytes, filename: str) -> PreparedSummaryJob:
+    if not content or len(content) > MAX_INPUT_BYTES:
+        raise ConnectError("INPUT_ARTIFACT_INVALID", "The PDF attachment size is unsupported.")
+    return restore_summary_job(
+        job_id=str(uuid4()),
+        artifact_id=str(uuid4()),
+        media_type=INPUT_MEDIA_TYPE,
+        byte_size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        filename=filename,
+    )
 
 
 class ConnectClient:

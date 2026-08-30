@@ -75,8 +75,12 @@ provenance checks run when a stored result is loaded after database reopen.
 SQLite schema v4 stores jobs separately from email analysis. A partial unique index permits one
 active job for an attachment and capability version; expected-state updates reject stale or
 regressive transitions. Artifact/result fields and status shape are committed atomically. A
-completed result is idempotently reused. A provider crash, timeout, malformed result, integrity
-failure, or domain rejection becomes a durable failure and cannot produce a completed summary.
+completed result is idempotently reused. Authoritative provider failures, malformed results,
+integrity failures, and domain rejections become durable failures and cannot produce a completed
+summary. A retryable transport failure or timeout preserves the active job for explicit
+reconciliation. The next request queries the same provider instance and job identity; only an
+authenticated `JOB_NOT_FOUND` response permits resubmission, using that same identity and artifact
+provenance. A different provider instance cannot inherit the ambiguous job.
 
 ## UI boundary
 

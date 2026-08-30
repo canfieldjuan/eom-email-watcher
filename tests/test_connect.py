@@ -197,12 +197,26 @@ def test_discovery_ignores_stale_provider_and_reports_multiple_live_providers(
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
         discovery = connect.discover_summary_capability(tmp_path, client=client)
+        selected = connect.discover_summary_capability(
+            tmp_path,
+            client=client,
+            provider_instance_id=INSTANCE_A,
+        )
+        missing = connect.discover_summary_capability(
+            tmp_path,
+            client=client,
+            provider_instance_id="55555555-5555-4555-8555-555555555555",
+        )
 
     assert discovery.provider is None
     assert discovery.public_result() == {
         "items": [],
         "diagnostic": {"code": "ambiguous_provider"},
     }
+    assert selected.provider is not None
+    assert selected.provider.instance_id == INSTANCE_A
+    assert missing.provider is None
+    assert missing.diagnostic_code == "provider_unavailable"
 
 
 def test_discovery_does_not_follow_provider_redirects(tmp_path: Path) -> None:

@@ -335,17 +335,13 @@ def _connect_result(job: ConnectJob) -> dict[str, object]:
 
 
 def _tracked_job(job: ConnectJob, filename: str) -> connect.PreparedSummaryJob:
-    artifact = connect.ArtifactIdentity(
+    return connect.restore_summary_job(
+        job_id=job.job_id,
         artifact_id=job.input_artifact_id,
         media_type=job.input_media_type,
         byte_size=job.input_byte_size,
         sha256=job.input_sha256,
-    )
-    return connect.PreparedSummaryJob(
-        job_id=job.job_id,
-        artifact=artifact,
-        display_name=filename,
-        request={},
+        filename=filename,
     )
 
 
@@ -432,11 +428,30 @@ def _run_connect_job(
             persisted = runtime.store.connect_job(job.job_id) or persisted
         return _connect_result(persisted)
     except connect.ConnectError as exc:
-        try:
-            _mark_connect_failed(runtime.store, job.job_id, provider, exc)
-        except Exception:
-            logger.exception("Connect failure could not be persisted")
-            raise RuntimeError("Connect failure could not be persisted safely") from exc
+        if not exc.retryable and exc.code != "JOB_NOT_FOUND":
+            try:
+                _mark_connect_failed(runtime.store, job.job_id, provider, exc)
+            except Exception:
+                logger.exception("Connect failure could not be persisted")
+                raise RuntimeError("Connect failure could not be persisted safely") from exc
+        raise
+
+
+def _query_connect_job(
+    runtime: Runtime,
+    provider: connect.ProviderCapability,
+    job: connect.PreparedSummaryJob,
+) -> dict[str, object] | None:
+    try:
+        return _run_connect_job(runtime, provider, job, None)
+    except connect.ConnectError as exc:
+        current = runtime.store.connect_job(job.job_id)
+        if (
+            exc.code == "JOB_NOT_FOUND"
+            and current is not None
+            and current.status in {"requested", "accepted", "processing"}
+        ):
+            return None
         raise
 
 
@@ -466,9 +481,26 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     if completed is not None:
         return _connect_result(completed)
 
-    discovery = connect.discover_summary_capability()
+    active = runtime.store.active_connect_job(
+        message_id=message_id,
+        part_id=part_id,
+        capability_id=connect.CAPABILITY_ID,
+        capability_version=connect.CAPABILITY_VERSION,
+    )
+    discovery = (
+        connect.discover_summary_capability(
+            provider_instance_id=active.provider_instance_id
+        )
+        if active is not None
+        else connect.discover_summary_capability()
+    )
     provider = discovery.provider
     if provider is None:
+        if active is not None:
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
         code = discovery.diagnostic_code or "provider_unavailable"
         message = (
             "More than one compatible local capability provider is available."
@@ -476,53 +508,96 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
             else "No compatible local document summary capability is available."
         )
         raise ApiError(code, message)
+    resubmit_expected_state: str | None = None
+    if active is not None:
+        if (
+            active.provider_app_id != provider.app_id
+            or active.provider_instance_id != provider.instance_id
+        ):
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
+        tracked = _tracked_job(active, attachment.filename)
+        reconciled = _query_connect_job(runtime, provider, tracked)
+        if reconciled is not None:
+            return reconciled
+        refreshed = runtime.store.connect_job(active.job_id)
+        if refreshed is None:
+            raise RuntimeError("Connect job disappeared during reconciliation")
+        if refreshed.status == "completed":
+            return _connect_result(refreshed)
+        if refreshed.status == "failed":
+            raise ApiError(
+                (refreshed.error_code or "connect_job_failed").lower(),
+                refreshed.error_message or "The local capability job failed.",
+            )
+        if (
+            refreshed.provider_app_id != provider.app_id
+            or refreshed.provider_instance_id != provider.instance_id
+        ):
+            raise ApiError(
+                "provider_unavailable",
+                "The provider for the active local capability job is unavailable.",
+            )
+        resubmit_expected_state = refreshed.status
+        job = _tracked_job(refreshed, attachment.filename)
+    else:
+        job = None
+
     if attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-
-    active = runtime.store.active_connect_job(
-        message_id=message_id,
-        part_id=part_id,
-        capability_id=connect.CAPABILITY_ID,
-        capability_version=connect.CAPABILITY_VERSION,
-    )
-    if active is not None:
-        tracked = _tracked_job(active, attachment.filename)
-        return _run_connect_job(runtime, provider, tracked, None)
-
     gmail = GmailGateway.from_token(
         runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
     )
     content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
     if len(content) != attachment.byte_size:
         raise GmailError("Gmail attachment size did not match stored metadata")
-    job = connect.prepare_summary_job(content, attachment.filename)
-    try:
-        runtime.store.create_connect_job(
-            job_id=job.job_id,
-            message_id=message_id,
-            part_id=part_id,
-            capability_id=connect.CAPABILITY_ID,
-            capability_version=connect.CAPABILITY_VERSION,
-            provider_app_id=provider.app_id,
-            provider_instance_id=provider.instance_id,
-            input_artifact_id=job.artifact.artifact_id,
-            input_media_type=job.artifact.media_type,
-            input_byte_size=job.artifact.byte_size,
-            input_sha256=job.artifact.sha256,
-        )
-    except sqlite3.IntegrityError as exc:
-        concurrent = runtime.store.active_connect_job(
-            message_id=message_id,
-            part_id=part_id,
-            capability_id=connect.CAPABILITY_ID,
-            capability_version=connect.CAPABILITY_VERSION,
-        )
-        if concurrent is not None:
+    if job is None:
+        job = connect.prepare_summary_job(content, attachment.filename)
+        try:
+            runtime.store.create_connect_job(
+                job_id=job.job_id,
+                message_id=message_id,
+                part_id=part_id,
+                capability_id=connect.CAPABILITY_ID,
+                capability_version=connect.CAPABILITY_VERSION,
+                provider_app_id=provider.app_id,
+                provider_instance_id=provider.instance_id,
+                input_artifact_id=job.artifact.artifact_id,
+                input_media_type=job.artifact.media_type,
+                input_byte_size=job.artifact.byte_size,
+                input_sha256=job.artifact.sha256,
+            )
+        except sqlite3.IntegrityError as exc:
+            concurrent = runtime.store.active_connect_job(
+                message_id=message_id,
+                part_id=part_id,
+                capability_id=connect.CAPABILITY_ID,
+                capability_version=connect.CAPABILITY_VERSION,
+            )
+            if concurrent is not None:
+                raise ApiError(
+                    "connect_job_in_progress",
+                    "A summary job is already in progress for this attachment.",
+                ) from exc
+            raise
+    elif resubmit_expected_state is not None:
+        try:
+            runtime.store.reset_connect_job_for_resubmission(
+                job_id=job.job_id,
+                expected_state=resubmit_expected_state,
+                provider_app_id=provider.app_id,
+                provider_instance_id=provider.instance_id,
+            )
+        except RuntimeError as exc:
+            concurrent = runtime.store.connect_job(job.job_id)
+            if concurrent is not None and concurrent.status == "completed":
+                return _connect_result(concurrent)
             raise ApiError(
                 "connect_job_in_progress",
-                "A summary job is already in progress for this attachment.",
+                "The local capability job changed while it was being reconciled.",
             ) from exc
-        raise
     return _run_connect_job(runtime, provider, job, content)
 
 
