@@ -46,6 +46,7 @@ only to stderr.
 | Operation | Payload | Result |
 |---|---|---|
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
+| `gmail.authorize` | `{}` | Run the configured read-only Gmail OAuth flow and initialize a new mailbox baseline when required |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
@@ -59,6 +60,21 @@ only to stderr.
 | `settings.update` | one or more safe setting fields | Persist and return safe desktop settings |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
+
+`gmail.authorize` uses only the existing `gmail.readonly` authorization and never returns OAuth
+credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
+at the current mailbox state. Reusing an existing valid token preserves an existing history cursor;
+if watcher state is missing, the operation initializes it from the current mailbox state. The
+configured desktop OAuth credentials file remains a prerequisite. Token access serializes the
+entire browser authorization flow and rechecks token state under that lock, so an overlapping setup
+reuses the completed token instead of opening another browser flow or racing token replacement. The
+engine also serializes authorization through mailbox-baseline persistence, so overlapping first-run
+requests cannot advance the initial history cursor twice. An unusable stored token causes this
+explicit authorization operation to run the browser flow and replace the token only after that flow
+succeeds. A locally valid token is also probed against Gmail; an HTTP 401 triggers the same explicit
+reauthorization path, while other Gmail errors remain failures. The browser helper's authorization
+prompt is suppressed because stdout is reserved exclusively for the JSON engine envelope. This
+operation does not expose or request the separate EOM `gmail.send` capability.
 
 Watchlist mutation is serialized and uses same-directory atomic replacement through the engine; the
 frontend never parses or edits TOML. Adding a normalized duplicate returns `conflict`, removing an

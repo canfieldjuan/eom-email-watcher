@@ -11,6 +11,7 @@ from typing import Any
 
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -25,6 +26,10 @@ TOKEN_LOCK_TIMEOUT_SECONDS = 30
 
 class GmailError(RuntimeError):
     """Gmail operation failed."""
+
+
+class GmailAuthorizationRejected(GmailError):
+    """Gmail rejected credentials that appeared usable locally."""
 
 
 class StaleHistoryCursor(GmailError):
@@ -147,28 +152,72 @@ class GmailGateway:
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
+        gateway, _authorization_changed = cls.authorize_with_status(
+            credentials_file, token_file
+        )
+        return gateway
+
+    @classmethod
+    def authorize_with_status(
+        cls,
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool = False,
+    ) -> tuple[GmailGateway, bool]:
         if not credentials_file.exists():
             raise GmailError(
                 f"OAuth desktop credentials not found: {credentials_file}. "
                 "Enable Gmail API and place the downloaded JSON at that path."
             )
-        flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
-        credentials = flow.run_local_server(
-            host="127.0.0.1", port=0, open_browser=True, prompt="consent"
-        )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
-                token_file.write_text(credentials.to_json(), encoding="utf-8")
-                token_file.chmod(0o600)
+                credentials: Credentials | None = None
+                if token_file.exists() and not force_reauthorize:
+                    try:
+                        credentials = Credentials.from_authorized_user_file(
+                            str(token_file), SCOPES
+                        )
+                    except (ValueError, json.JSONDecodeError):
+                        credentials = None
+                    if credentials and credentials.expired and credentials.refresh_token:
+                        try:
+                            credentials.refresh(Request())
+                        except RefreshError:
+                            credentials = None
+                        else:
+                            token_file.write_text(credentials.to_json(), encoding="utf-8")
+                            token_file.chmod(0o600)
+                authorization_changed = not credentials or not credentials.valid
+                if authorization_changed:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        str(credentials_file), SCOPES
+                    )
+                    credentials = flow.run_local_server(
+                        host="127.0.0.1",
+                        port=0,
+                        authorization_prompt_message=None,
+                        open_browser=True,
+                        prompt="consent",
+                    )
+                    token_file.write_text(credentials.to_json(), encoding="utf-8")
+                    token_file.chmod(0o600)
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry setup") from exc
-        return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
+        return (
+            cls(build("gmail", "v1", credentials=credentials, cache_discovery=False)),
+            authorization_changed,
+        )
 
     def profile_history_id(self) -> str:
         try:
             result = self.service.users().getProfile(userId="me").execute()
         except HttpError as exc:
+            if getattr(exc.resp, "status", None) == 401:
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
             raise GmailError(f"Gmail profile request failed (HTTP {exc.resp.status})") from exc
         return str(result["historyId"])
 

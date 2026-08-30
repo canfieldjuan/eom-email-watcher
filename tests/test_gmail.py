@@ -1,10 +1,17 @@
 import base64
+from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock
+from googleapiclient.errors import HttpError
 
 from eom_email_watcher import gmail as gmail_module
-from eom_email_watcher.gmail import GmailError, GmailGateway, parse_metadata
+from eom_email_watcher.gmail import (
+    GmailAuthorizationRejected,
+    GmailError,
+    GmailGateway,
+    parse_metadata,
+)
 
 
 def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
@@ -123,3 +130,134 @@ def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
         pytest.raises(GmailError, match="token is busy"),
     ):
         GmailGateway.from_token(credentials_file, token_file)
+
+
+def test_authorize_serializes_the_entire_browser_flow(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(gmail_module, "TOKEN_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("contended authorization must not open a browser")
+        ),
+    )
+
+    with (
+        FileLock(f"{token_file}.lock"),
+        pytest.raises(GmailError, match="token is busy"),
+    ):
+        GmailGateway.authorize(credentials_file, token_file)
+
+
+def test_authorize_reuses_a_token_found_after_lock_acquisition(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+    credentials = SimpleNamespace(valid=True, expired=False, refresh_token=None)
+    service = object()
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        lambda path, scopes: credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("an existing token must prevent a second browser flow")
+        ),
+    )
+    monkeypatch.setattr(gmail_module, "build", lambda *args, **kwargs: service)
+
+    gateway = GmailGateway.authorize(credentials_file, token_file)
+
+    assert gateway.service is service
+
+
+@pytest.mark.parametrize("stored_token", ["malformed", "unusable", "revoked"])
+def test_authorize_replaces_an_unusable_existing_token(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, stored_token: str
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("unusable token", encoding="utf-8")
+
+    if stored_token == "malformed":
+        stored_credentials = None
+
+        def load_credentials(path, scopes):
+            raise ValueError("malformed token")
+
+    elif stored_token == "unusable":
+        stored_credentials = SimpleNamespace(valid=False, expired=False, refresh_token=None)
+
+        def load_credentials(path, scopes):
+            return stored_credentials
+
+    else:
+        def rejected_refresh(request):
+            raise gmail_module.RefreshError("revoked token")
+
+        stored_credentials = SimpleNamespace(
+            valid=False,
+            expired=True,
+            refresh_token="refresh-token",
+            refresh=rejected_refresh,
+        )
+
+        def load_credentials(path, scopes):
+            return stored_credentials
+
+    replacement = SimpleNamespace(valid=True, to_json=lambda: "replacement token")
+    browser_calls: list[dict[str, object]] = []
+
+    def run_local_server(**kwargs):
+        browser_calls.append(kwargs)
+        return replacement
+
+    flow = SimpleNamespace(run_local_server=run_local_server)
+    service = object()
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        load_credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module.InstalledAppFlow,
+        "from_client_secrets_file",
+        lambda *args: flow,
+    )
+    monkeypatch.setattr(gmail_module, "build", lambda *args, **kwargs: service)
+
+    gateway, authorization_changed = GmailGateway.authorize_with_status(
+        credentials_file, token_file
+    )
+
+    assert gateway.service is service
+    assert authorization_changed is True
+    assert token_file.read_text(encoding="utf-8") == "replacement token"
+    assert browser_calls[0]["authorization_prompt_message"] is None
+
+
+def test_profile_history_id_classifies_http_401_as_rejected_authorization() -> None:
+    response = SimpleNamespace(status=401, reason="Unauthorized")
+    error = HttpError(response, b"{}")
+
+    def reject():
+        raise error
+
+    request = SimpleNamespace(execute=reject)
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    with pytest.raises(GmailAuthorizationRejected, match="rejected"):
+        gateway.profile_history_id()

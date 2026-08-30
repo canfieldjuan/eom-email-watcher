@@ -10,6 +10,9 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
+
 from . import connect
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
@@ -26,13 +29,14 @@ from .config import (
     update_settings,
 )
 from .db import ConnectJob, NotificationIntent, Store
-from .gmail import GmailError, GmailGateway
+from .gmail import GmailAuthorizationRejected, GmailError, GmailGateway
 from .locking import operation_lock, operation_lock_supported
 from .runtime import Runtime, load_runtime
 from .service import Watcher
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
+GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS = 30
 REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
 
 logger = logging.getLogger(__name__)
@@ -128,6 +132,39 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         },
         "production_check_supported": production_check_supported,
         "watchlist_count": len(config.senders),
+    }
+
+
+def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    runtime = _runtime(request)
+    config = runtime.config
+    lock_path = config.database_file.with_name(
+        f"{config.database_file.name}.gmail-authorize.lock"
+    )
+    try:
+        with FileLock(str(lock_path), timeout=GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS):
+            gmail, authorization_changed = GmailGateway.authorize_with_status(
+                config.gmail_credentials_file,
+                config.gmail_token_file,
+            )
+            try:
+                current_history_id = gmail.profile_history_id()
+            except GmailAuthorizationRejected:
+                gmail, authorization_changed = GmailGateway.authorize_with_status(
+                    config.gmail_credentials_file,
+                    config.gmail_token_file,
+                    force_reauthorize=True,
+                )
+                current_history_id = gmail.profile_history_id()
+            initialize_baseline = authorization_changed or runtime.store.state() is None
+            if initialize_baseline:
+                runtime.store.set_state(current_history_id)
+    except FileLockTimeout as exc:
+        raise GmailError("Gmail authorization is busy; retry the operation") from exc
+    return {
+        "baseline_initialized": initialize_baseline,
+        "connected": True,
     }
 
 
@@ -636,6 +673,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "attachment.export": _attachment_export,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
+    "gmail.authorize": _gmail_authorize,
     "health.get": _health,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,
