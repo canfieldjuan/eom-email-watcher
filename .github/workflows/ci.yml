@@ -63,6 +63,7 @@ jobs:
           workspaces: desktop/src-tauri -> target
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      - run: ../scripts/build-desktop-sidecar.sh
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
