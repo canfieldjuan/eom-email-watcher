@@ -365,6 +365,9 @@ def test_generic_discovery_returns_every_capability_without_provider_secrets(
         "instance_id": INSTANCE_A,
         "available": True,
     }
+    assert public["items"][1]["capability"]["accepts"] == [  # type: ignore[index]
+        {"media_type": "text/plain", "max_bytes": connect.MAX_INPUT_BYTES}
+    ]
     assert public["items"][1]["capability"]["parameters"][0] == {  # type: ignore[index]
         "name": "target-language",
         "value_type": "string",

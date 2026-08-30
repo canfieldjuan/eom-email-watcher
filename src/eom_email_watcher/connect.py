@@ -713,7 +713,10 @@ def _generic_capabilities(
             action_label=capability.action.label,
             action_description=capability.action.description,
             accepts=tuple(
-                AcceptedArtifactType(accepted.media_type, accepted.max_bytes)
+                AcceptedArtifactType(
+                    accepted.media_type,
+                    min(accepted.max_bytes, MAX_INPUT_BYTES),
+                )
                 for accepted in capability.accepts
             ),
             produces=tuple(capability.produces),
