@@ -32,7 +32,12 @@ from .config import (
     update_settings,
 )
 from .db import ConnectJob, NotificationIntent, Store
-from .gmail import GmailAuthorizationRejected, GmailError, GmailGateway
+from .gmail import (
+    GmailAuthorizationRejected,
+    GmailError,
+    GmailGateway,
+    gmail_credentials_configured,
+)
 from .locking import operation_lock, operation_lock_supported
 from .runtime import Runtime, load_runtime
 from .service import Watcher
@@ -111,7 +116,9 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     return {
         "database": {"ok": True, "initialized": state is not None},
         "gmail": {
-            "credentials_configured": config.gmail_credentials_file.exists(),
+            "credentials_configured": gmail_credentials_configured(
+                config.gmail_credentials_file
+            ),
             "connected": config.gmail_token_file.exists(),
         },
         "last_check": state[1] if state else None,

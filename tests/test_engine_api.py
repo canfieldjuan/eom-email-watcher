@@ -119,6 +119,25 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_health_recognizes_bundled_desktop_oauth_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    bundle_root = tmp_path / "bundle"
+    bundled_file = bundle_root / "eom_email_watcher_data/google-oauth-client.json"
+    bundled_file.parent.mkdir(parents=True)
+    bundled_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("eom_email_watcher.gmail.sys._MEIPASS", str(bundle_root), raising=False)
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert health["data"]["gmail"]["credentials_configured"] is True
+
+
 def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
     config_path = tmp_path / "new" / "config.toml"
 
