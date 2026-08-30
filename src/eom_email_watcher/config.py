@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from email.utils import parseaddr
 from ipaddress import ip_address
@@ -23,6 +24,9 @@ DEFAULT_POLL_INTERVAL_MINUTES = 120
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
+MUTABLE_DESKTOP_SETTINGS = frozenset(
+    {"notifications_enabled", "poll_interval_minutes", "retention_days"}
+)
 
 
 class ConfigError(ValueError):
@@ -39,6 +43,10 @@ class DuplicateSenderError(ConfigError):
 
 class SenderNotFoundError(ConfigError):
     """A requested watchlist sender does not exist."""
+
+
+class InvalidSettingsUpdateError(ConfigError):
+    """A proposed desktop settings update is not valid."""
 
 
 @dataclass(frozen=True)
@@ -418,6 +426,48 @@ def remove_sender(path: Path, email: str) -> Sender:
         del sender_items[index]
         _atomic_write(config_path, dumps(document))
     return removed
+
+
+def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
+    if not updates:
+        raise InvalidSettingsUpdateError("At least one setting must be provided")
+    unknown = set(updates) - MUTABLE_DESKTOP_SETTINGS
+    if unknown:
+        fields = ", ".join(sorted(str(field) for field in unknown))
+        raise InvalidSettingsUpdateError(f"Unsupported settings: {fields}")
+
+    poll_interval = updates.get("poll_interval_minutes")
+    if "poll_interval_minutes" in updates:
+        if type(poll_interval) is not int:
+            raise InvalidSettingsUpdateError("poll_interval_minutes must be an integer")
+        if not 1 <= poll_interval <= 1440:
+            raise InvalidSettingsUpdateError(
+                "poll_interval_minutes must be between 1 and 1440"
+            )
+
+    retention = updates.get("retention_days")
+    if "retention_days" in updates:
+        if type(retention) is not int:
+            raise InvalidSettingsUpdateError("retention_days must be an integer")
+        if not 1 <= retention <= 3650:
+            raise InvalidSettingsUpdateError("retention_days must be between 1 and 3650")
+
+    notifications = updates.get("notifications_enabled")
+    if "notifications_enabled" in updates and type(notifications) is not bool:
+        raise InvalidSettingsUpdateError("notifications_enabled must be a boolean")
+
+    config_path = path.expanduser().resolve()
+    try:
+        with FileLock(f"{config_path}.lock"):
+            load_config(config_path)
+            document = parse(config_path.read_text(encoding="utf-8"))
+            for key, value in updates.items():
+                document[key] = value
+            _atomic_write(config_path, dumps(document))
+            return load_config(config_path)
+    except FileNotFoundError:
+        load_config(config_path)
+        raise
 
 
 def secure_runtime_paths(config: Config) -> None:

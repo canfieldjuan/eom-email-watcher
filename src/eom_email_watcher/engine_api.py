@@ -12,14 +12,18 @@ from pathlib import Path
 
 from . import connect
 from .config import (
+    MUTABLE_DESKTOP_SETTINGS,
+    Config,
     ConfigError,
     DuplicateSenderError,
     InvalidSenderError,
+    InvalidSettingsUpdateError,
     Sender,
     SenderNotFoundError,
     add_sender,
     load_config,
     remove_sender,
+    update_settings,
 )
 from .db import ConnectJob, NotificationIntent, Store
 from .gmail import GmailError, GmailGateway
@@ -521,9 +525,7 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     return {"item": _sender_data(sender)}
 
 
-def _settings(request: dict[str, object]) -> dict[str, object]:
-    _payload(request)
-    config = load_config(_config_path(request))
+def _settings_data(config: Config) -> dict[str, object]:
     return {
         "body_char_limit": config.body_char_limit,
         "local_model": {
@@ -543,6 +545,23 @@ def _settings(request: dict[str, object]) -> dict[str, object]:
         "retention_days": config.retention_days,
         "timezone": config.timezone,
     }
+
+
+def _settings(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    return _settings_data(load_config(_config_path(request)))
+
+
+def _settings_update(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        set(MUTABLE_DESKTOP_SETTINGS),
+    )
+    try:
+        config = update_settings(_config_path(request), payload)
+    except InvalidSettingsUpdateError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+    return _settings_data(config)
 
 
 def _notification_payload(
@@ -622,6 +641,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "notifications.ack": _notifications_ack,
     "notifications.pending": _notifications_pending,
     "settings.get": _settings,
+    "settings.update": _settings_update,
     "watcher.check": _check,
     "watchlist.add": _watchlist_add,
     "watchlist.list": _watchlist,

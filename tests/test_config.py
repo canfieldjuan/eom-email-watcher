@@ -11,6 +11,7 @@ from eom_email_watcher.config import (
     load_config,
     normalize_address,
     remove_sender,
+    update_settings,
 )
 
 
@@ -302,6 +303,109 @@ def test_watchlist_atomic_replace_failure_preserves_original(
 
     with pytest.raises(OSError, match="replace failed"):
         add_sender(path, "new@example.com", "New")
+
+    assert path.read_bytes() == original
+    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+
+
+def test_settings_update_preserves_unrelated_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(
+        path,
+        extra='''# operator comment
+poll_interval_minutes = 30
+retention_days = 90
+notifications_enabled = false
+extension_key = "preserve-me"''',
+    )
+
+    updated = update_settings(
+        path,
+        {
+            "poll_interval_minutes": 60,
+            "retention_days": 180,
+            "notifications_enabled": True,
+        },
+    )
+
+    assert updated.poll_interval_minutes == 60
+    assert updated.retention_days == 180
+    assert updated.notifications_enabled is True
+    text = path.read_text(encoding="utf-8")
+    assert "# operator comment" in text
+    assert 'extension_key = "preserve-me"' in text
+    assert 'model_name = "local-model"' in text
+    assert 'email = "Trusted@Example.com"' in text
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"poll_interval_minutes": 1},
+        {"poll_interval_minutes": 1440},
+        {"retention_days": 1},
+        {"retention_days": 3650},
+        {"notifications_enabled": False},
+    ],
+)
+def test_settings_update_accepts_boundary_values(
+    tmp_path: Path, updates: dict[str, object]
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+
+    updated = update_settings(path, updates)
+
+    for key, expected in updates.items():
+        assert getattr(updated, key) == expected
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({}, "At least one"),
+        ({"unknown": 1}, "Unsupported settings"),
+        ({"poll_interval_minutes": True}, "must be an integer"),
+        ({"poll_interval_minutes": 0}, "between 1 and 1440"),
+        ({"poll_interval_minutes": 1441}, "between 1 and 1440"),
+        ({"retention_days": False}, "must be an integer"),
+        ({"retention_days": 0}, "between 1 and 3650"),
+        ({"retention_days": 3651}, "between 1 and 3650"),
+        ({"notifications_enabled": 1}, "must be a boolean"),
+        ({"notifications_enabled": "false"}, "must be a boolean"),
+        (
+            {"poll_interval_minutes": 30, "retention_days": 3651},
+            "between 1 and 3650",
+        ),
+    ],
+)
+def test_settings_update_rejects_invalid_values_without_changing_config(
+    tmp_path: Path, updates: dict[str, object], message: str
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+
+    with pytest.raises(ConfigError, match=message):
+        update_settings(path, updates)
+
+    assert path.read_bytes() == original
+
+
+def test_settings_update_atomic_replace_failure_preserves_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        update_settings(path, {"poll_interval_minutes": 60})
 
     assert path.read_bytes() == original
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []

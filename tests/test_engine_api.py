@@ -118,6 +118,108 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="# preserve this\nextension_key = 7")
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "settings.update",
+            {
+                "poll_interval_minutes": 45,
+                "retention_days": 365,
+                "notifications_enabled": False,
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["poll_interval_minutes"] == 45
+    assert response["data"]["retention_days"] == 365
+    assert response["data"]["notifications_enabled"] is False
+    assert "# preserve this" in config_path.read_text(encoding="utf-8")
+    assert "extension_key = 7" in config_path.read_text(encoding="utf-8")
+    encoded = json.dumps(response)
+    assert "token.json" not in encoded
+    assert "send-token.json" not in encoded
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"unknown": True},
+        {"poll_interval_minutes": False},
+        {"retention_days": 3651},
+        {"notifications_enabled": "false"},
+    ],
+)
+def test_settings_update_rejects_invalid_payload_without_mutation(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    original = config_path.read_bytes()
+
+    response = engine_api._response(request(config_path, "settings.update", payload))
+
+    assert response["error"]["code"] == "invalid_request"
+    assert config_path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("extra_settings", "timezone", "message"),
+    [
+        (
+            'retention_days = "seven"',
+            "America/Chicago",
+            "retention_days must be an integer",
+        ),
+        ("", "/tmp/foo", "Unknown timezone: /tmp/foo"),
+    ],
+)
+def test_settings_update_preserves_existing_configuration_errors(
+    tmp_path: Path, extra_settings: str, timezone: str, message: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings=extra_settings, timezone=timezone)
+    original = config_path.read_bytes()
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "settings.update",
+            {"poll_interval_minutes": 45},
+        )
+    )
+
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": message,
+    }
+    assert config_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_settings_update_preserves_missing_configuration_error(
+    tmp_path: Path, missing_parent: bool
+) -> None:
+    config_path = (
+        tmp_path / "absent" / "missing.toml"
+        if missing_parent
+        else tmp_path / "missing.toml"
+    )
+
+    response = engine_api._response(
+        request(config_path, "settings.update", {"poll_interval_minutes": 45})
+    )
+
+    assert response["error"]["code"] == "configuration_error"
+    assert "Configuration not found" in response["error"]["message"]
+    assert not config_path.exists()
+
+
 def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     tmp_path: Path,
 ) -> None:
