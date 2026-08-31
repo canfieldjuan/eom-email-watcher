@@ -158,6 +158,7 @@ def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> No
     assert response["data"]["settings"]["timezone"] == "UTC"
     assert response["data"]["settings"]["local_model"] == {
         "authentication_required": False,
+        "editable": True,
         "endpoint": "http://127.0.0.1:8080/v1",
         "model": "local-model",
         "timeout_seconds": 60.0,
@@ -404,6 +405,8 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
             config_path,
             "settings.update",
             {
+                "model_base_url": "http://localhost:8080/v1/",
+                "model_name": " replacement-model ",
                 "poll_interval_minutes": 45,
                 "retention_days": 365,
                 "notifications_enabled": False,
@@ -415,11 +418,58 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
     assert response["data"]["poll_interval_minutes"] == 45
     assert response["data"]["retention_days"] == 365
     assert response["data"]["notifications_enabled"] is False
+    assert response["data"]["local_model"] == {
+        "authentication_required": False,
+        "editable": True,
+        "endpoint": "http://localhost:8080/v1",
+        "model": "replacement-model",
+        "timeout_seconds": 60.0,
+        "token_configured": False,
+    }
     assert "# preserve this" in config_path.read_text(encoding="utf-8")
     assert "extension_key = 7" in config_path.read_text(encoding="utf-8")
     encoded = json.dumps(response)
     assert "token.json" not in encoded
     assert "send-token.json" not in encoded
+
+
+def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        extra_settings=(
+            'model_backend = "gateway"\n'
+            f'model_api_token_file = "{tmp_path / "model-token"}"\n'
+            f'model_ca_file = "{tmp_path / "gateway-ca.pem"}"'
+        ),
+    )
+    gateway_config = (
+        config_path.read_text(encoding="utf-8")
+        .replace(
+            'model_base_url = "http://127.0.0.1:1234/v1"',
+            'model_base_url = "https://inference.office.internal:8443"',
+        )
+        .replace("model_require_auth = false", "model_require_auth = true")
+    )
+    config_path.write_text(gateway_config, encoding="utf-8")
+    original = config_path.read_bytes()
+
+    settings = engine_api._response(request(config_path, "settings.get"))
+    changed = engine_api._response(
+        request(
+            config_path,
+            "settings.update",
+            {"model_name": "operator-selected-model"},
+        )
+    )
+
+    assert settings["data"]["local_model"]["editable"] is False
+    assert settings["data"]["local_model"]["model"] == "Managed by inference gateway"
+    assert changed["error"]["code"] == "invalid_request"
+    assert "managed" in changed["error"]["message"]
+    assert config_path.read_bytes() == original
 
 
 @pytest.mark.parametrize(
@@ -430,6 +480,8 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
         {"poll_interval_minutes": False},
         {"retention_days": 3651},
         {"notifications_enabled": "false"},
+        {"model_base_url": "https://models.example.com/v1"},
+        {"model_name": "   "},
     ],
 )
 def test_settings_update_rejects_invalid_payload_without_mutation(

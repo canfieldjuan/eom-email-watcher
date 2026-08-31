@@ -25,7 +25,13 @@ NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
 MUTABLE_DESKTOP_SETTINGS = frozenset(
-    {"notifications_enabled", "poll_interval_minutes", "retention_days"}
+    {
+        "model_base_url",
+        "model_name",
+        "notifications_enabled",
+        "poll_interval_minutes",
+        "retention_days",
+    }
 )
 
 
@@ -530,12 +536,42 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
     if "notifications_enabled" in updates and type(notifications) is not bool:
         raise InvalidSettingsUpdateError("notifications_enabled must be a boolean")
 
+    normalized_updates = dict(updates)
+    model_base_url = updates.get("model_base_url")
+    if "model_base_url" in updates:
+        if not isinstance(model_base_url, str):
+            raise InvalidSettingsUpdateError("model_base_url must be a string")
+        try:
+            normalized_updates["model_base_url"] = validate_model_base_url(model_base_url)
+        except ConfigError as exc:
+            raise InvalidSettingsUpdateError(str(exc)) from exc
+
+    model_name = updates.get("model_name")
+    if "model_name" in updates:
+        if not isinstance(model_name, str):
+            raise InvalidSettingsUpdateError("model_name must be a string")
+        normalized_model_name = model_name.strip()
+        if not normalized_model_name or any(
+            not character.isprintable() for character in normalized_model_name
+        ):
+            raise InvalidSettingsUpdateError(
+                "model_name must be a non-empty printable string"
+            )
+        normalized_updates["model_name"] = normalized_model_name
+
     config_path = path.expanduser().resolve()
     try:
         with FileLock(f"{config_path}.lock"):
-            load_config(config_path)
+            config = load_config(config_path)
+            if (
+                {"model_base_url", "model_name"} & updates.keys()
+                and config.model_backend != "loopback"
+            ):
+                raise InvalidSettingsUpdateError(
+                    "Model endpoint and identifier are managed by the inference gateway"
+                )
             document = parse(config_path.read_text(encoding="utf-8"))
-            for key, value in updates.items():
+            for key, value in normalized_updates.items():
                 document[key] = value
             _atomic_write(config_path, dumps(document))
             return load_config(config_path)

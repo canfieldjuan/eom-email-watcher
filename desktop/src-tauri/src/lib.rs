@@ -276,10 +276,18 @@ async fn settings_update(
     poll_interval_minutes: u64,
     retention_days: u64,
     notifications_enabled: bool,
+    model_base_url: Option<String>,
+    model_name: Option<String>,
 ) -> Result<EngineSettings, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        engine.update_settings(poll_interval_minutes, retention_days, notifications_enabled)
+        engine.update_settings(
+            poll_interval_minutes,
+            retention_days,
+            notifications_enabled,
+            model_base_url,
+            model_name,
+        )
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?

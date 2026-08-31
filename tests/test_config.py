@@ -8,6 +8,7 @@ from eom_email_watcher.config import (
     DuplicateSenderError,
     InvalidConfigInitializationError,
     InvalidSenderError,
+    InvalidSettingsUpdateError,
     SenderNotFoundError,
     add_sender,
     initialize_config,
@@ -414,6 +415,8 @@ extension_key = "preserve-me"''',
     updated = update_settings(
         path,
         {
+            "model_base_url": "http://localhost:8080/v1/",
+            "model_name": " replacement-model ",
             "poll_interval_minutes": 60,
             "retention_days": 180,
             "notifications_enabled": True,
@@ -423,10 +426,12 @@ extension_key = "preserve-me"''',
     assert updated.poll_interval_minutes == 60
     assert updated.retention_days == 180
     assert updated.notifications_enabled is True
+    assert updated.model_base_url == "http://localhost:8080/v1"
+    assert updated.model_name == "replacement-model"
     text = path.read_text(encoding="utf-8")
     assert "# operator comment" in text
     assert 'extension_key = "preserve-me"' in text
-    assert 'model_name = "local-model"' in text
+    assert 'model_name = "replacement-model"' in text
     assert 'email = "Trusted@Example.com"' in text
 
 
@@ -438,6 +443,8 @@ extension_key = "preserve-me"''',
         {"retention_days": 1},
         {"retention_days": 3650},
         {"notifications_enabled": False},
+        {"model_base_url": "http://localhost:65535/v1"},
+        {"model_name": "another-model"},
     ],
 )
 def test_settings_update_accepts_boundary_values(
@@ -465,6 +472,11 @@ def test_settings_update_accepts_boundary_values(
         ({"retention_days": 3651}, "between 1 and 3650"),
         ({"notifications_enabled": 1}, "must be a boolean"),
         ({"notifications_enabled": "false"}, "must be a boolean"),
+        ({"model_base_url": 1234}, "must be a string"),
+        ({"model_base_url": "https://models.example.com/v1"}, "localhost"),
+        ({"model_name": 1234}, "must be a string"),
+        ({"model_name": "   "}, "non-empty printable"),
+        ({"model_name": "bad\nmodel"}, "non-empty printable"),
         (
             {"poll_interval_minutes": 30, "retention_days": 3651},
             "between 1 and 3650",
@@ -482,6 +494,33 @@ def test_settings_update_rejects_invalid_values_without_changing_config(
         update_settings(path, updates)
 
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("model_update", ["model_base_url", "model_name"])
+def test_settings_update_keeps_gateway_model_configuration_read_only(
+    tmp_path: Path, model_update: str
+) -> None:
+    path = tmp_path / "config.toml"
+    ca_file = tmp_path / "gateway-ca.pem"
+    write_config(
+        path,
+        base_url="https://inference.office.internal:8443",
+        extra=f'model_backend = "gateway"\nmodel_ca_file = "{ca_file}"',
+    )
+    original = path.read_bytes()
+    value = (
+        "http://127.0.0.1:8080/v1"
+        if model_update == "model_base_url"
+        else "replacement-model"
+    )
+
+    with pytest.raises(InvalidSettingsUpdateError, match="managed"):
+        update_settings(path, {model_update: value})
+
+    assert path.read_bytes() == original
+    updated = update_settings(path, {"poll_interval_minutes": 45})
+    assert updated.poll_interval_minutes == 45
+    assert updated.model_backend == "gateway"
 
 
 def test_settings_update_atomic_replace_failure_preserves_original(
