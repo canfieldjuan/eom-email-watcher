@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
+import itertools
 import json
 import os
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 FEATURE_ID = "connect.capability_exchange"
 ENTITLEMENT_FILE_NAME = "entitlement-v1.json"
+ENTITLEMENT_LOCK_FILE_NAME = ".entitlement-v1.lock"
 BUNDLED_KEYRING = Path("eom_email_watcher_data/connect-entitlement-keyring.json")
 MAX_ENTITLEMENT_BYTES = 16 * 1024
 MAX_KEYRING_BYTES = 64 * 1024
@@ -30,6 +35,7 @@ KEY_ID_PATTERN = r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
 FEATURE_PATTERN = r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
 UUID_V4_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 UTC_TIMESTAMP_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
+_TEMP_SEQUENCE = itertools.count()
 
 KeyId = Annotated[StrictStr, Field(pattern=KEY_ID_PATTERN, max_length=100)]
 FeatureId = Annotated[StrictStr, Field(pattern=FEATURE_PATTERN, max_length=100)]
@@ -49,6 +55,46 @@ class EntitlementDecision(StrEnum):
     @property
     def is_active(self) -> bool:
         return self is EntitlementDecision.ACTIVE
+
+
+@dataclass(frozen=True)
+class EntitlementStatus:
+    state: EntitlementDecision
+    active: bool
+
+    @classmethod
+    def from_decision(cls, state: EntitlementDecision) -> EntitlementStatus:
+        return cls(state=state, active=state.is_active)
+
+    def public_dict(self) -> dict[str, object]:
+        return {"state": self.state.value, "active": self.active}
+
+
+class EntitlementInstallError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+AUTHORITY_UNAVAILABLE = "CONNECT_ENTITLEMENT_AUTHORITY_UNAVAILABLE"
+SOURCE_INVALID = "CONNECT_ENTITLEMENT_SOURCE_INVALID"
+NOT_ACTIVE = "CONNECT_ENTITLEMENT_NOT_ACTIVE"
+STORAGE_UNAVAILABLE = "CONNECT_ENTITLEMENT_STORAGE_UNAVAILABLE"
+ACTIVATION_BUSY = "CONNECT_ENTITLEMENT_ACTIVATION_BUSY"
+INSTALL_FAILED = "CONNECT_ENTITLEMENT_INSTALL_FAILED"
+
+_INSTALL_ERROR_MESSAGES = {
+    AUTHORITY_UNAVAILABLE: "this build has no trusted Connect entitlement authority",
+    SOURCE_INVALID: "the selected Connect entitlement is not a safe, valid license file",
+    NOT_ACTIVE: "the selected Connect entitlement is not currently active",
+    STORAGE_UNAVAILABLE: "the private Connect entitlement directory is unavailable or unsafe",
+    ACTIVATION_BUSY: "another Connect entitlement activation is already in progress",
+    INSTALL_FAILED: "the Connect entitlement could not be installed safely",
+}
+
+
+def _install_error(code: str) -> EntitlementInstallError:
+    return EntitlementInstallError(code, _INSTALL_ERROR_MESSAGES[code])
 
 
 class _StrictModel(BaseModel):
@@ -86,7 +132,7 @@ class _Claims(_StrictModel):
 class EntitlementGate:
     path: Path | None
     keys: MappingProxyType[str, bytes] | None
-    now: datetime
+    now: datetime | None
 
     @classmethod
     def from_installation(cls) -> EntitlementGate:
@@ -96,7 +142,7 @@ class EntitlementGate:
                 os.environ.get("HOME"),
             ),
             keys=_load_bundled_keyring(),
-            now=datetime.now(UTC),
+            now=None,
         )
 
     @classmethod
@@ -116,11 +162,52 @@ class EntitlementGate:
         content = _read_private_entitlement(self.path)
         if content is None:
             return EntitlementDecision.MISSING
-        return _evaluate_entitlement(content, self.keys, self.now)
+        return _evaluate_entitlement(content, self.keys, self._current_time())
+
+    def status(self) -> EntitlementStatus:
+        return EntitlementStatus.from_decision(self.decision())
+
+    def install(self, source: Path) -> EntitlementStatus:
+        if not self.keys:
+            raise _install_error(AUTHORITY_UNAVAILABLE)
+        if self.path is None:
+            raise _install_error(STORAGE_UNAVAILABLE)
+        if (
+            os.name != "posix"
+            or not hasattr(os, "geteuid")
+            or not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_CLOEXEC")
+            or not hasattr(os, "O_DIRECTORY")
+        ):
+            raise _install_error(STORAGE_UNAVAILABLE)
+
+        candidate = _read_candidate_entitlement(source)
+        _require_active_candidate(candidate, self.keys, self._current_time())
+        parent = self.path.parent
+        _ensure_private_directory(parent)
+        with _activation_lock(parent):
+            _validate_existing_destination(self.path)
+            _require_active_candidate(candidate, self.keys, self._current_time())
+            _install_candidate(self.path, candidate)
+            status = self.status()
+            if not status.active:
+                raise _install_error(INSTALL_FAILED)
+            return status
+
+    def _current_time(self) -> datetime:
+        return self.now if self.now is not None else datetime.now(UTC)
 
 
 def connect_entitlement_decision() -> EntitlementDecision:
     return EntitlementGate.from_installation().decision()
+
+
+def connect_entitlement_status() -> EntitlementStatus:
+    return EntitlementGate.from_installation().status()
+
+
+def install_connect_entitlement(source: Path) -> EntitlementStatus:
+    return EntitlementGate.from_installation().install(source)
 
 
 def _entitlement_path(xdg_config_home: str | None, home: str | None) -> Path | None:
@@ -241,6 +328,25 @@ def _evaluate_entitlement(
     return EntitlementDecision.ACTIVE
 
 
+def _require_active_candidate(
+    content: bytes,
+    keys: MappingProxyType[str, bytes],
+    now: datetime,
+) -> None:
+    decision = _evaluate_entitlement(content, keys, now)
+    if decision is EntitlementDecision.ACTIVE:
+        return
+    if decision in {
+        EntitlementDecision.NOT_YET_VALID,
+        EntitlementDecision.EXPIRED,
+        EntitlementDecision.FEATURE_MISSING,
+    }:
+        raise _install_error(NOT_ACTIVE)
+    if decision is EntitlementDecision.AUTHORITY_UNAVAILABLE:
+        raise _install_error(AUTHORITY_UNAVAILABLE)
+    raise _install_error(SOURCE_INVALID)
+
+
 def _read_private_entitlement(path: Path) -> bytes | None:
     if os.name != "posix" or not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
         return None
@@ -277,4 +383,258 @@ def _read_private_entitlement(path: Path) -> bytes | None:
     except OSError:
         return None
     finally:
-        os.close(descriptor)
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _read_candidate_entitlement(path: Path) -> bytes:
+    try:
+        candidate = path.lstat()
+        if (
+            not stat.S_ISREG(candidate.st_mode)
+            or not 0 < candidate.st_size <= MAX_ENTITLEMENT_BYTES
+        ):
+            raise _install_error(SOURCE_INVALID)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except EntitlementInstallError:
+        raise
+    except OSError as exc:
+        raise _install_error(SOURCE_INVALID) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not 0 < opened.st_size <= MAX_ENTITLEMENT_BYTES
+            or (opened.st_dev, opened.st_ino) != (candidate.st_dev, candidate.st_ino)
+        ):
+            raise _install_error(SOURCE_INVALID)
+        content = bytearray()
+        while len(content) <= MAX_ENTITLEMENT_BYTES:
+            chunk = os.read(descriptor, min(8192, MAX_ENTITLEMENT_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if not 0 < len(content) <= MAX_ENTITLEMENT_BYTES:
+            raise _install_error(SOURCE_INVALID)
+        return bytes(content)
+    except EntitlementInstallError:
+        raise
+    except OSError as exc:
+        raise _install_error(SOURCE_INVALID) from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _ensure_private_directory(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        missing: list[Path] = []
+        cursor = path
+        while True:
+            try:
+                cursor.lstat()
+                break
+            except FileNotFoundError:
+                missing.append(cursor)
+                parent = cursor.parent
+                if parent == cursor:
+                    raise _install_error(STORAGE_UNAVAILABLE) from None
+                cursor = parent
+            except OSError as exc:
+                raise _install_error(STORAGE_UNAVAILABLE) from exc
+
+        for directory in reversed(missing):
+            created = False
+            try:
+                directory.mkdir(mode=0o700)
+                created = True
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise _install_error(STORAGE_UNAVAILABLE) from exc
+            if created:
+                try:
+                    directory.chmod(0o700)
+                except OSError as exc:
+                    raise _install_error(STORAGE_UNAVAILABLE) from exc
+            try:
+                metadata = directory.lstat()
+            except OSError as exc:
+                raise _install_error(STORAGE_UNAVAILABLE) from exc
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o077
+            ):
+                raise _install_error(STORAGE_UNAVAILABLE) from None
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise _install_error(STORAGE_UNAVAILABLE)
+
+
+def _validate_existing_destination(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise _install_error(STORAGE_UNAVAILABLE)
+
+
+@contextmanager
+def _activation_lock(parent: Path) -> Iterator[None]:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+
+    path = parent / ENTITLEMENT_LOCK_FILE_NAME
+    expected: os.stat_result | None
+    try:
+        expected = path.lstat()
+    except FileNotFoundError:
+        expected = None
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    if expected is not None and (
+        not stat.S_ISREG(expected.st_mode)
+        or expected.st_uid != os.geteuid()
+        or expected.st_mode & 0o077
+    ):
+        raise _install_error(STORAGE_UNAVAILABLE)
+
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (
+                expected is not None
+                and (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            )
+        ):
+            raise _install_error(STORAGE_UNAVAILABLE)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise _install_error(ACTIVATION_BUSY) from exc
+            raise _install_error(STORAGE_UNAVAILABLE) from exc
+        yield
+    except EntitlementInstallError:
+        raise
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _create_temporary_entitlement(parent: Path) -> tuple[int, Path]:
+    for _ in range(64):
+        path = parent / (
+            f".{ENTITLEMENT_FILE_NAME}.tmp.{os.getpid()}.{next(_TEMP_SEQUENCE)}"
+        )
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise _install_error(INSTALL_FAILED) from exc
+        try:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise _install_error(INSTALL_FAILED)
+            return descriptor, path
+        except (EntitlementInstallError, OSError) as exc:
+            with suppress(OSError):
+                os.close(descriptor)
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+            if isinstance(exc, EntitlementInstallError):
+                raise
+            raise _install_error(INSTALL_FAILED) from exc
+    raise _install_error(INSTALL_FAILED)
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("entitlement write made no progress")
+        view = view[written:]
+
+
+def _sync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _install_candidate(destination: Path, content: bytes) -> None:
+    descriptor, temporary = _create_temporary_entitlement(destination.parent)
+    replaced = False
+    try:
+        try:
+            _write_all(descriptor, content)
+            os.fsync(descriptor)
+            os.replace(temporary, destination)
+            replaced = True
+        except OSError as exc:
+            raise _install_error(INSTALL_FAILED) from exc
+        _sync_directory(destination.parent)
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+        if not replaced:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)

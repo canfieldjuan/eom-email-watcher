@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import connect, engine_api
+from eom_email_watcher import connect, engine_api, entitlement
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
@@ -43,6 +43,100 @@ def api_request(config_path: Path, operation: str, payload: dict[str, object] | 
         "config_path": str(config_path),
         "payload": payload or {},
     }
+
+
+def test_entitlement_status_is_claim_free_and_does_not_load_watcher_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        entitlement,
+        "connect_entitlement_status",
+        lambda: entitlement.EntitlementStatus.from_decision(
+            entitlement.EntitlementDecision.EXPIRED
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(tmp_path / "missing-config.toml", "connect.entitlement.status")
+    )
+
+    assert response == {
+        "data": {"state": "expired", "active": False},
+        "ok": True,
+        "operation": "connect.entitlement.status",
+        "protocol": 1,
+    }
+
+
+def test_entitlement_install_forwards_only_an_absolute_source_and_preserves_error_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "license.json"
+    source.write_text("{}", encoding="utf-8")
+    captured: list[Path] = []
+
+    def install(path: Path) -> entitlement.EntitlementStatus:
+        captured.append(path)
+        return entitlement.EntitlementStatus.from_decision(
+            entitlement.EntitlementDecision.ACTIVE
+        )
+
+    monkeypatch.setattr(entitlement, "install_connect_entitlement", install)
+    response = engine_api._response(
+        api_request(
+            tmp_path / "missing-config.toml",
+            "connect.entitlement.install",
+            {"source_path": str(source)},
+        )
+    )
+    assert response["data"] == {"state": "active", "active": True}
+    assert captured == [source]
+
+    relative = engine_api._response(
+        api_request(
+            tmp_path / "missing-config.toml",
+            "connect.entitlement.install",
+            {"source_path": "relative-license.json"},
+        )
+    )
+    assert relative["error"]["code"] == entitlement.SOURCE_INVALID
+    assert captured == [source]
+
+    def busy(_path: Path) -> entitlement.EntitlementStatus:
+        raise entitlement.EntitlementInstallError(
+            entitlement.ACTIVATION_BUSY,
+            "another Connect entitlement activation is already in progress",
+        )
+
+    monkeypatch.setattr(entitlement, "install_connect_entitlement", busy)
+    failed = engine_api._response(
+        api_request(
+            tmp_path / "missing-config.toml",
+            "connect.entitlement.install",
+            {"source_path": str(source)},
+        )
+    )
+    assert failed["error"] == {
+        "code": "CONNECT_ENTITLEMENT_ACTIVATION_BUSY",
+        "message": "another Connect entitlement activation is already in progress",
+    }
+
+
+def test_entitlement_install_rejects_unknown_destination_fields(tmp_path: Path) -> None:
+    response = engine_api._response(
+        api_request(
+            tmp_path / "missing-config.toml",
+            "connect.entitlement.install",
+            {
+                "source_path": str(tmp_path / "license.json"),
+                "destination_path": str(tmp_path / "attacker-selected.json"),
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "invalid_request"
 
 
 def seeded_runtime(tmp_path: Path):

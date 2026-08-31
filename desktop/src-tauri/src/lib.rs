@@ -5,14 +5,15 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
-    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
-    EngineSettings, GmailAuthorization, HealthStatus, InboxItem, WatchedSender,
+    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxItem,
+    WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -317,6 +318,29 @@ async fn health_get(
 }
 
 #[tauri::command]
+async fn connect_entitlement_status(
+    engine: State<'_, Engine>,
+) -> Result<ConnectEntitlementStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.connect_entitlement_status())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn connect_entitlement_install(
+    engine: State<'_, Engine>,
+    source_path: String,
+) -> Result<ConnectEntitlementStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.install_connect_entitlement(PathBuf::from(source_path))
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
@@ -430,6 +454,7 @@ pub fn run() {
         }
     });
     builder
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -495,6 +520,8 @@ pub fn run() {
             attachment_open,
             capability_output_export,
             capability_output_present,
+            connect_entitlement_install,
+            connect_entitlement_status,
             config_initialize,
             config_status,
             gmail_authorize,

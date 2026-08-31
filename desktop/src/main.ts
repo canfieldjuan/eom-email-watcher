@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 interface WatchedSender {
@@ -145,6 +146,20 @@ interface OpenedAttachment {
 interface GmailAuthorization {
   baseline_initialized: boolean;
   connected: boolean;
+}
+
+type ConnectEntitlementState =
+  | "active"
+  | "authority_unavailable"
+  | "missing"
+  | "invalid"
+  | "not_yet_valid"
+  | "expired"
+  | "feature_missing";
+
+interface ConnectEntitlementStatus {
+  state: ConnectEntitlementState;
+  active: boolean;
 }
 
 interface HealthStatus {
@@ -295,6 +310,14 @@ app.innerHTML = `
           <dd id="notification-health">Checking…</dd>
           <dd id="notification-detail" class="health-card-detail"></dd>
         </div>
+        <div class="health-card connect-health-card">
+          <dt>Connect</dt>
+          <dd id="connect-health">Checking…</dd>
+          <dd id="connect-detail" class="health-card-detail">Looking for your license…</dd>
+          <dd class="health-card-action">
+            <button id="connect-activate" class="connect-action" type="button" hidden>Activate</button>
+          </dd>
+        </div>
       </dl>
 
       <dl class="health-details">
@@ -380,6 +403,9 @@ const databaseHealth = requiredElement<HTMLElement>("#database-health");
 const databaseDetail = requiredElement<HTMLElement>("#database-detail");
 const notificationHealth = requiredElement<HTMLElement>("#notification-health");
 const notificationDetail = requiredElement<HTMLElement>("#notification-detail");
+const connectHealth = requiredElement<HTMLElement>("#connect-health");
+const connectDetail = requiredElement<HTMLElement>("#connect-detail");
+const connectActivate = requiredElement<HTMLButtonElement>("#connect-activate");
 const lastCheck = requiredElement<HTMLElement>("#last-check");
 const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
 const pollingCadence = requiredElement<HTMLElement>("#polling-cadence");
@@ -408,6 +434,8 @@ let gmailAuthorizationInFlight = false;
 let gmailConnected = false;
 let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
+let connectInstalling = false;
+let connectStatusRefreshInFlight = false;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
@@ -1194,6 +1222,100 @@ function syncGmailAuthorizationAction(): void {
   gmailAuthorize.disabled = gmailAuthorizationInFlight || !gmailCredentialsConfigured;
 }
 
+function renderConnectStatus(status: ConnectEntitlementStatus): void {
+  connectActivate.disabled = connectInstalling;
+  connectActivate.hidden = status.state === "authority_unavailable";
+  connectActivate.textContent = status.active ? "Replace license" : "Activate";
+
+  const content: Record<ConnectEntitlementState, [string, string]> = {
+    active: ["Active", "Compatible installed apps can add actions to email attachments."],
+    authority_unavailable: [
+      "Unavailable in this build",
+      "Install an official Connect-enabled build to activate a license.",
+    ],
+    missing: ["Not activated", "Install your Connect license to enable app-to-app capabilities."],
+    invalid: ["License invalid", "Choose a valid signed Connect license to restore capabilities."],
+    not_yet_valid: [
+      "Not active yet",
+      "This license cannot be used before its signed start time.",
+    ],
+    expired: ["License expired", "Install a current signed license to restore capabilities."],
+    feature_missing: [
+      "Access not included",
+      "This license does not include app-to-app capability exchange.",
+    ],
+  };
+  const [title, detail] = content[status.state];
+  setHealthValue(connectHealth, status.active, title);
+  connectDetail.textContent = detail;
+}
+
+async function refreshConnectStatus(): Promise<void> {
+  if (connectInstalling || connectStatusRefreshInFlight) return;
+  connectStatusRefreshInFlight = true;
+  setHealthValue(connectHealth, false, "Checking…");
+  connectDetail.textContent = "Looking for your license…";
+  connectActivate.hidden = true;
+  try {
+    const status = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
+    if (!connectInstalling) renderConnectStatus(status);
+  } catch (error) {
+    if (!connectInstalling) {
+      setHealthValue(connectHealth, false, "Unknown");
+      connectDetail.textContent = errorMessage(error);
+    }
+  } finally {
+    connectStatusRefreshInFlight = false;
+  }
+}
+
+async function selectAndInstallConnectEntitlement(): Promise<void> {
+  if (connectInstalling) return;
+  let selected: string | null;
+  try {
+    selected = await open({
+      multiple: false,
+      filters: [{ name: "Connect license", extensions: ["json"] }],
+    });
+  } catch (error) {
+    setHealthValue(connectHealth, false, "Selection failed");
+    connectDetail.textContent = errorMessage(error);
+    return;
+  }
+  if (selected === null) return;
+
+  connectInstalling = true;
+  connectActivate.disabled = true;
+  setHealthValue(connectHealth, false, "Activating…");
+  connectDetail.textContent = "Verifying and installing your signed license…";
+  try {
+    renderConnectStatus(
+      await invoke<ConnectEntitlementStatus>("connect_entitlement_install", {
+        sourcePath: selected,
+      }),
+    );
+  } catch (error) {
+    const failure = errorMessage(error);
+    try {
+      const current = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
+      renderConnectStatus(current);
+      setHealthValue(
+        connectHealth,
+        current.active,
+        current.active ? "Active — replacement failed" : "Activation failed",
+      );
+      connectDetail.textContent = failure;
+    } catch {
+      setHealthValue(connectHealth, false, "Activation failed");
+      connectDetail.textContent = failure;
+      connectActivate.hidden = false;
+    }
+  } finally {
+    connectInstalling = false;
+    connectActivate.disabled = false;
+  }
+}
+
 function renderHealthUnknown(): void {
   const detail = "Health refresh failed; current status is unknown.";
   for (const [value, description] of [
@@ -1631,7 +1753,7 @@ inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));
 healthTab.addEventListener("click", () => {
   showView("health");
-  void loadHealth();
+  void Promise.all([loadHealth(), refreshConnectStatus()]);
 });
 settingsTab.addEventListener("click", () => {
   showView("settings");
@@ -1639,6 +1761,7 @@ settingsTab.addEventListener("click", () => {
 });
 checkNow.addEventListener("click", () => void runCheck());
 gmailAuthorize.addEventListener("click", () => void authorizeGmail());
+connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
 void listen<{
   status: "complete" | "delivery_failed" | "check_failed";
   failed_notifications: number;
@@ -1660,5 +1783,13 @@ void listen<{
 });
 window.addEventListener("focus", () => {
   if (configurationReady) void loadInbox();
+  void refreshConnectStatus();
 });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void refreshConnectStatus();
+});
+window.setInterval(() => {
+  if (document.visibilityState === "visible") void refreshConnectStatus();
+}, 30_000);
+void refreshConnectStatus();
 void initializeDesktop();

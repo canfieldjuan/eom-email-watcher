@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import stat
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from eom_email_watcher import entitlement
 
-CONTRACTS_REVISION = "3851b4c55901ef18470c63b92a99a8348e2f1459"
+CONTRACTS_REVISION = "c5405935bd1354cf6a4c8539425a53dfd7f52949"
 
 
 def encoded(value: bytes) -> str:
@@ -191,6 +193,298 @@ def test_empty_xdg_config_home_uses_home_fallback() -> None:
     assert entitlement._entitlement_path("", "/home/test-user") == Path(
         "/home/test-user/.config/local-connect/entitlement-v1.json"
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_active_install_is_exact_private_and_visible_after_reopen(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    license_bytes = signed_license(key, claims())
+    source = tmp_path / "purchased-license.json"
+    source.write_bytes(license_bytes)
+    source_before = source.read_bytes()
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    assert gate.status().public_dict() == {"state": "missing", "active": False}
+    assert gate.install(source).public_dict() == {"state": "active", "active": True}
+    assert source.read_bytes() == source_before
+    assert destination.read_bytes() == license_bytes
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    lock = destination.parent / entitlement.ENTITLEMENT_LOCK_FILE_NAME
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+    reopened = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    assert reopened.status().public_dict() == {"state": "active", "active": True}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_invalid_and_inactive_sources_preserve_existing_entitlement(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(
+        key,
+        claims(expires_at="2028-01-01T00:00:00Z"),
+    )
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    candidates = [
+        (b"{}", entitlement.SOURCE_INVALID),
+        (
+            signed_license(
+                key,
+                claims(
+                    not_before="2025-01-01T00:00:00Z",
+                    expires_at="2026-01-01T00:00:00Z",
+                ),
+            ),
+            entitlement.NOT_ACTIVE,
+        ),
+        (
+            signed_license(
+                key,
+                claims(
+                    not_before="2026-09-01T00:00:00Z",
+                    expires_at="2027-01-01T00:00:00Z",
+                ),
+            ),
+            entitlement.NOT_ACTIVE,
+        ),
+        (
+            signed_license(
+                key,
+                claims(features=["document.local_processing"]),
+            ),
+            entitlement.NOT_ACTIVE,
+        ),
+    ]
+    for index, (candidate, code) in enumerate(candidates):
+        source = tmp_path / f"candidate-{index}.json"
+        source.write_bytes(candidate)
+        with pytest.raises(entitlement.EntitlementInstallError) as failure:
+            gate.install(source)
+        assert failure.value.code == code
+        assert destination.read_bytes() == existing
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_source_destination_and_authority_boundaries_fail_closed(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    license_bytes = signed_license(key, claims())
+    source = tmp_path / "candidate.json"
+    source.write_bytes(license_bytes)
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    for unsafe in [tmp_path / "missing.json", tmp_path / "empty.json"]:
+        if unsafe.name == "empty.json":
+            unsafe.write_bytes(b"")
+        with pytest.raises(entitlement.EntitlementInstallError) as failure:
+            gate.install(unsafe)
+        assert failure.value.code == entitlement.SOURCE_INVALID
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"x" * (entitlement.MAX_ENTITLEMENT_BYTES + 1))
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(oversized)
+    assert failure.value.code == entitlement.SOURCE_INVALID
+
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(source)
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(linked)
+    assert failure.value.code == entitlement.SOURCE_INVALID
+
+    destination.parent.mkdir(parents=True, mode=0o700)
+    destination.write_bytes(b"existing")
+    destination.chmod(0o640)
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+    assert failure.value.code == entitlement.STORAGE_UNAVAILABLE
+    assert destination.read_bytes() == b"existing"
+
+    no_authority = entitlement.EntitlementGate(
+        path=destination,
+        keys=None,
+        now=datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        no_authority.install(source)
+    assert failure.value.code == entitlement.AUTHORITY_UNAVAILABLE
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_commit_time_revalidation_preserves_existing_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(key, claims(expires_at="2028-01-01T00:00:00Z"))
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    source = tmp_path / "replacement.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    times = iter(
+        [
+            datetime(2026, 8, 31, tzinfo=UTC),
+            datetime(2027, 1, 1, tzinfo=UTC),
+        ]
+    )
+    monkeypatch.setattr(
+        entitlement.EntitlementGate,
+        "_current_time",
+        lambda _gate: next(times),
+    )
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+    assert failure.value.code == entitlement.NOT_ACTIVE
+    assert destination.read_bytes() == existing
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_held_lock_blocks_installer_and_child_process(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    entitlement._ensure_private_directory(destination.parent)
+
+    with entitlement._activation_lock(destination.parent):
+        with pytest.raises(entitlement.EntitlementInstallError) as failure:
+            gate.install(source)
+        assert failure.value.code == entitlement.ACTIVATION_BUSY
+        assert not destination.exists()
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; from pathlib import Path; "
+                    "from eom_email_watcher import entitlement as e; "
+                    "\ntry:\n"
+                    "    with e._activation_lock(Path(sys.argv[1])):\n"
+                    "        raise SystemExit(4)\n"
+                    "except e.EntitlementInstallError as exc:\n"
+                    "    raise SystemExit(0 if exc.code == e.ACTIVATION_BUSY else 3)\n"
+                ),
+                str(destination.parent),
+            ],
+            check=False,
+        )
+        assert child.returncode == 0
+
+    assert gate.install(source).active is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_write_and_temp_preparation_failures_roll_back_and_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(key, claims(expires_at="2028-01-01T00:00:00Z"))
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    source = tmp_path / "replacement.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    monkeypatch.setattr(entitlement.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError()))
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert destination.read_bytes() == existing
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+    monkeypatch.undo()
+    original_fchmod = entitlement.os.fchmod
+    calls = 0
+
+    def fail_temp_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected temp permission failure")
+        original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(entitlement.os, "fchmod", fail_temp_fchmod)
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert destination.read_bytes() == existing
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_installer_sets_exact_modes_under_restrictive_umask(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    previous = os.umask(0o777)
+    try:
+        assert gate.install(source).active is True
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert (
+        stat.S_IMODE((destination.parent / entitlement.ENTITLEMENT_LOCK_FILE_NAME).stat().st_mode)
+        == 0o600
+    )
+
+
+def test_public_status_and_install_failure_codes_are_stable_and_claim_free() -> None:
+    status = entitlement.EntitlementStatus.from_decision(
+        entitlement.EntitlementDecision.EXPIRED
+    )
+    assert status.public_dict() == {"state": "expired", "active": False}
+    assert set(status.public_dict()) == {"state", "active"}
+    assert set(entitlement._INSTALL_ERROR_MESSAGES) == {
+        "CONNECT_ENTITLEMENT_AUTHORITY_UNAVAILABLE",
+        "CONNECT_ENTITLEMENT_SOURCE_INVALID",
+        "CONNECT_ENTITLEMENT_NOT_ACTIVE",
+        "CONNECT_ENTITLEMENT_STORAGE_UNAVAILABLE",
+        "CONNECT_ENTITLEMENT_ACTIVATION_BUSY",
+        "CONNECT_ENTITLEMENT_INSTALL_FAILED",
+    }
 
 
 def git_fixture(repository: Path, relative_path: str) -> bytes:

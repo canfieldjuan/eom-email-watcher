@@ -12,6 +12,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
   "tomlkit>=0.13,<1",
+  "tzdata>=2025.2,<2027",
 ]
 
 [project.scripts]

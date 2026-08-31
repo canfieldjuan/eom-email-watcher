@@ -17,14 +17,24 @@ OAUTH_CLIENT_SOURCE="${EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE:-}"
 OAUTH_STAGE_DIRECTORY=""
 ENTITLEMENT_KEYRING_SOURCE="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
 ENTITLEMENT_STAGE_DIRECTORY=""
+SIDECAR_SMOKE_DIRECTORY=""
 PYINSTALLER_EXTRA_ARGS=()
 
 cleanup() {
   if [[ -n "$OAUTH_STAGE_DIRECTORY" ]]; then
-    rm -rf -- "$OAUTH_STAGE_DIRECTORY"
+    rm -f -- "$OAUTH_STAGE_DIRECTORY/google-oauth-client.json"
+    rmdir -- "$OAUTH_STAGE_DIRECTORY" 2>/dev/null || true
   fi
   if [[ -n "$ENTITLEMENT_STAGE_DIRECTORY" ]]; then
-    rm -rf -- "$ENTITLEMENT_STAGE_DIRECTORY"
+    rm -f -- "$ENTITLEMENT_STAGE_DIRECTORY/connect-entitlement-keyring.json"
+    rmdir -- "$ENTITLEMENT_STAGE_DIRECTORY" 2>/dev/null || true
+  fi
+  if [[ -n "$SIDECAR_SMOKE_DIRECTORY" ]]; then
+    rm -f -- \
+      "$SIDECAR_SMOKE_DIRECTORY/config.toml" \
+      "$SIDECAR_SMOKE_DIRECTORY/config.toml.lock" \
+      "$SIDECAR_SMOKE_DIRECTORY/response.json"
+    rmdir -- "$SIDECAR_SMOKE_DIRECTORY" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -111,8 +121,51 @@ PYINSTALLER_CONFIG_DIR="$BUILD_DIRECTORY/cache" uv run pyinstaller \
   --distpath "$BUILD_DIRECTORY/dist" \
   --workpath "$BUILD_DIRECTORY/work" \
   --specpath "$BUILD_DIRECTORY/spec" \
+  --collect-all tzdata \
   "${PYINSTALLER_EXTRA_ARGS[@]}" \
   packaging/engine_entry.py
 
 install -m 0755 -- "$BUILD_DIRECTORY/dist/eom-mail-engine" "$OUTPUT_PATH"
+
+SIDECAR_SMOKE_DIRECTORY="$(mktemp -d "$BUILD_DIRECTORY/sidecar-smoke.XXXXXX")"
+SMOKE_CONFIG_PATH="$SIDECAR_SMOKE_DIRECTORY/config.toml"
+SMOKE_RESPONSE_PATH="$SIDECAR_SMOKE_DIRECTORY/response.json"
+uv run --project "$PROJECT_DIRECTORY" python - "$SMOKE_CONFIG_PATH" <<'PY' | \
+  HOME="$SIDECAR_SMOKE_DIRECTORY" \
+  XDG_CONFIG_HOME="$SIDECAR_SMOKE_DIRECTORY" \
+  "$OUTPUT_PATH" > "$SMOKE_RESPONSE_PATH"
+import json
+import sys
+
+print(
+    json.dumps(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "config_path": sys.argv[1],
+            "payload": {
+                "model_base_url": "http://127.0.0.1:11434/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+uv run --project "$PROJECT_DIRECTORY" python - "$SMOKE_RESPONSE_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit("Desktop sidecar smoke response is invalid") from exc
+
+settings = response.get("data", {}).get("settings", {})
+if response.get("ok") is not True or settings.get("timezone") != "America/Chicago":
+    raise SystemExit(f"Desktop sidecar timezone smoke failed: {response}")
+PY
+
 echo "$OUTPUT_PATH"

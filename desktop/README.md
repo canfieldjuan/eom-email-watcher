@@ -33,6 +33,17 @@ fetches only the selected Gmail attachment, persists job state and the verified 
 sends mail metadata or credentials to the provider. Inbox loading succeeds even when Connect
 discovery fails.
 
+Health includes a separate Connect card with claim-free active/missing/invalid/future/expired/
+feature-missing status. **Activate** selects an acquired JSON license; the picker is only the
+consent surface. The Python engine enforces the compiled issuer authority, bounded non-symlink
+source read, fixed shared destination, owner-private directory and files, cross-app non-blocking
+lock, exact-byte synced temporary write, atomic replacement, directory sync, and final
+re-evaluation. It does not read watcher configuration, Gmail credentials, or private mailbox state
+for these app-local operations. A failed replacement re-reads authoritative status so an existing
+active license is not presented as unavailable. The card also refreshes on focus, visibility
+restoration, and a bounded timer because another installed Connect app may change the shared
+entitlement.
+
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
@@ -81,7 +92,10 @@ pnpm tauri build --bundles deb
 
 The package contains both `eom-email-watcher-desktop` and `eom-mail-engine`. The bundled engine is a
 PyInstaller one-file executable built by `scripts/build-desktop-sidecar.sh`; installed runtime does
-not require the source checkout, Python, or `uv`.
+not require the source checkout, Python, or `uv`. The sidecar carries its own IANA timezone data so
+its behavior does not depend on the build interpreter's filesystem paths. Every sidecar build runs
+an isolated first-use configuration smoke with `America/Chicago` and fails before packaging if the
+frozen engine cannot resolve that timezone.
 
 An approved Google Desktop OAuth client can be injected into the sidecar at release build time
 without committing it:
@@ -109,7 +123,8 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 The key ring contains public verification keys only. Private signing keys must never be supplied
 to the build or committed. A build without this variable remains a healthy standalone Email
 Watcher but Connect capability discovery and invocation fail closed. This variable is consumed by
-the release build script; there is no runtime environment override for issuer trust.
+the release build script; there is no runtime environment override for issuer trust, and such a
+build reports `authority_unavailable` instead of admitting license installation.
 
 ## Verification
 
