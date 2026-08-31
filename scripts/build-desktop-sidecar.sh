@@ -15,11 +15,16 @@ OUTPUT_DIRECTORY="$PROJECT_DIRECTORY/desktop/src-tauri/binaries"
 OUTPUT_PATH="$OUTPUT_DIRECTORY/eom-mail-engine-$TARGET_TRIPLE"
 OAUTH_CLIENT_SOURCE="${EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE:-}"
 OAUTH_STAGE_DIRECTORY=""
+ENTITLEMENT_KEYRING_SOURCE="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
+ENTITLEMENT_STAGE_DIRECTORY=""
 PYINSTALLER_EXTRA_ARGS=()
 
 cleanup() {
   if [[ -n "$OAUTH_STAGE_DIRECTORY" ]]; then
     rm -rf -- "$OAUTH_STAGE_DIRECTORY"
+  fi
+  if [[ -n "$ENTITLEMENT_STAGE_DIRECTORY" ]]; then
+    rm -rf -- "$ENTITLEMENT_STAGE_DIRECTORY"
   fi
 }
 trap cleanup EXIT
@@ -68,6 +73,32 @@ PY
     "$OAUTH_STAGE_DIRECTORY/google-oauth-client.json"
   PYINSTALLER_EXTRA_ARGS+=(
     --add-data "$OAUTH_STAGE_DIRECTORY/google-oauth-client.json:eom_email_watcher_data"
+  )
+fi
+
+if [[ -n "$ENTITLEMENT_KEYRING_SOURCE" ]]; then
+  if [[ ! -f "$ENTITLEMENT_KEYRING_SOURCE" ]]; then
+    echo "Connect entitlement public-key ring is not a regular file" >&2
+    exit 2
+  fi
+  uv run --project "$PROJECT_DIRECTORY" python - "$ENTITLEMENT_KEYRING_SOURCE" <<'PY'
+import sys
+from pathlib import Path
+
+from eom_email_watcher.entitlement import _parse_keyring
+
+try:
+    keys = _parse_keyring(Path(sys.argv[1]).read_bytes())
+except (OSError, ValueError) as exc:
+    raise SystemExit("Connect entitlement public-key ring is invalid") from exc
+if not keys:
+    raise SystemExit("Connect-enabled release key ring must contain at least one public key")
+PY
+  ENTITLEMENT_STAGE_DIRECTORY="$(mktemp -d "$BUILD_DIRECTORY/connect-keyring.XXXXXX")"
+  install -m 0600 -- "$ENTITLEMENT_KEYRING_SOURCE" \
+    "$ENTITLEMENT_STAGE_DIRECTORY/connect-entitlement-keyring.json"
+  PYINSTALLER_EXTRA_ARGS+=(
+    --add-data "$ENTITLEMENT_STAGE_DIRECTORY/connect-entitlement-keyring.json:eom_email_watcher_data"
   )
 fi
 

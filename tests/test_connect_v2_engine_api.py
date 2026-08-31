@@ -18,6 +18,15 @@ TOKEN = "A" * 43
 PDF = b"%PDF-1.4\nreal attachment\nEOF"
 
 
+@pytest.fixture(autouse=True)
+def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
+
+
 def write_config(path: Path) -> None:
     path.write_text(
         f'''timezone = "America/Chicago"
@@ -257,6 +266,101 @@ def test_invoke_rejects_stale_capability_version_before_handoff(
 
     assert response["error"]["code"] == "capability_unavailable"
     assert runtime.store.connect_job(REQUEST_ID) is None
+
+
+def test_unentitled_invoke_stops_before_discovery_gmail_or_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.EXPIRED,
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("unentitled invocation reached provider discovery")
+        ),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("unentitled invocation reached Gmail")
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["error"]["code"] == "connect_entitlement_required"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+
+
+def test_completed_connect_result_remains_readable_after_entitlement_expires(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    job = connect.prepare_capability_job(
+        selected,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="text/plain",
+        display_name="translation.txt",
+        byte_size=5,
+        sha256=hashlib.sha256(b"saved").hexdigest(),
+        payload=b"saved",
+    )
+    persist_completed_outputs(runtime, job, (output,))
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.EXPIRED,
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("completed result attempted provider discovery")
+        ),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("completed result attempted Gmail access")
+        ),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["status"] == "completed"
+    assert response["data"]["outputs"][0]["byte_size"] == 5
 
 
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(

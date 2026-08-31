@@ -21,11 +21,12 @@ the default application. The host attempts to remove the temporary directory on 
 Its path is not returned to frontend JavaScript.
 
 For compatible PDF attachments, the same card shows a provider-neutral Summarize action only while
-exactly one authenticated local `document.summarize` v1.0 capability is discoverable. The frontend
-knows the capability and media type, not a provider app ID. The Python engine re-discovers before
-submission, fetches only the selected Gmail attachment, persists job state and the verified summary,
-and never sends mail metadata or credentials to the provider. Inbox loading succeeds even when
-Connect discovery fails.
+the paid Connect entitlement is active and exactly one authenticated local `document.summarize`
+v1.0 capability is discoverable. The frontend knows the capability and media type, not a provider
+app ID or license contents. The Python engine rechecks entitlement and discovery before submission,
+fetches only the selected Gmail attachment, persists job state and the verified summary, and never
+sends mail metadata or credentials to the provider. Inbox loading succeeds even when Connect
+discovery fails.
 
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
@@ -93,6 +94,18 @@ account grants rather than only the reusable Desktop client identity. A build wi
 remains suitable for development but requires the existing external credentials file before Gmail
 can connect.
 
+An official Connect-enabled sidecar must also embed the production issuer public-key ring:
+
+```bash
+LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json \
+  pnpm tauri build --bundles deb
+```
+
+The key ring contains public verification keys only. Private signing keys must never be supplied
+to the build or committed. A build without this variable remains a healthy standalone Email
+Watcher but Connect capability discovery and invocation fail closed. This variable is consumed by
+the release build script; there is no runtime environment override for issuer trust.
+
 ## Verification
 
 ```bash
@@ -114,12 +127,18 @@ verification schemas:
 ```bash
 .venv/bin/python scripts/connect-local-proof.py \
   --provider-binary /path/to/document-summarizer \
-  --pdf /path/to/structured-report.pdf
+  --pdf /path/to/structured-report.pdf \
+  --entitlement-keyring /path/to/test-keyring.json \
+  --active-entitlement /path/to/active-entitlement.json \
+  --expired-entitlement /path/to/expired-entitlement.json
 ```
 
 The proof uses attachment-scoped v2 discovery and explicit provider/capability selection, persists a
 stable request identity and generic output, stops the provider, replays the completed job while it is
-offline, and verifies the Inbox remains healthy. A deterministic reference provider then advertises
+offline, and verifies the Inbox remains healthy. It also replaces the shared signed entitlement with
+an expired one, proves both consumer discovery and the provider manifest deny capability exchange,
+replays the already completed result without Gmail access, restores the active entitlement without
+restarting either app, and observes the capability return. A deterministic reference provider then advertises
 the same summary capability plus `document.translate` and `document.inspect`. The proof observes two
 summary-provider choices, invokes both non-summary capabilities through the same generic contract,
 persists their provenance and parameters into the Inbox, presents bounded text natively, keeps an

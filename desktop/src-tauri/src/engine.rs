@@ -509,6 +509,9 @@ impl Engine {
         )
     }
 
+    // These fields mirror the explicit, versioned engine request instead of hiding
+    // provider or effect-confirmation identity in a loosely typed object.
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke_attachment_capability(
         &self,
         request_id: String,

@@ -19,10 +19,10 @@ inference request.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
 - Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. An explicit
   Open action fetches only that attachment into a mode-0600 process-owned temporary file.
-- Discovers the provider-neutral `document.summarize` capability at runtime. For a compatible PDF,
-  an explicit Summarize action fetches only that attachment and streams its bytes to the selected
-  authenticated exact-loopback provider. It does not transfer mailbox paths, sender, subject,
-  message ID, email body, or Gmail credentials.
+- With an active paid Connect entitlement, discovers the provider-neutral `document.summarize`
+  capability at runtime. For a compatible PDF, an explicit Summarize action fetches only that
+  attachment and streams its bytes to the selected authenticated exact-loopback provider. It does
+  not transfer mailbox paths, sender, subject, message ID, email body, or Gmail credentials.
 - Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
   are never stored.
 - Deduplicates by Gmail message ID.
@@ -133,11 +133,23 @@ state. The app does not replace the systemd scheduler or the existing CLI's opti
 ## Local Connect capability
 
 Inbox attachment cards show every compatible capability advertised by live Local Connect v2
-providers. One provider produces a normal action; multiple providers produce an explicit native
-picker. The host revalidates the exact provider, capability version, parameters, size, and effect
-confirmation before handoff. Actions disappear when their providers stop, while Gmail monitoring
-and the rest of the desktop remain usable. Jobs, results, errors, and complete provider/input/output
-provenance remain in Email Watcher's private SQLite database under a stable caller request ID.
+providers only when this installation has an active signed entitlement containing
+`connect.capability_exchange`. One provider produces a normal action; multiple providers produce
+an explicit native picker. The host revalidates both entitlement and the exact provider,
+capability version, parameters, size, and effect confirmation before handoff. Denied invocation
+stops before Gmail attachment download or Connect-job persistence. Actions disappear when the
+entitlement expires or providers stop, while Gmail monitoring and the rest of the desktop remain
+usable. Completed persisted results remain readable. Jobs, results, errors, and complete
+provider/input/output provenance remain in Email Watcher's private SQLite database under a stable
+caller request ID.
+
+On Linux, the entitlement is read on every discovery/invocation from
+`$XDG_CONFIG_HOME/local-connect/entitlement-v1.json`, or from
+`$HOME/.config/local-connect/entitlement-v1.json` when `XDG_CONFIG_HOME` is unset. The directory
+must be owner-only mode `700`; the regular non-symlink file must be owner-only mode `600`. Validity
+is exact (`not_before <= now < expires_at`) with no hidden grace. Replacing the file with a valid
+signed entitlement restores capability discovery without restarting Email Watcher. Gmail OAuth is
+not a Connect license and is never shared with a provider.
 
 The current machine contract, including generic discovery, invocation, durable reconciliation, and
 safe output presentation/export, is documented in [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The
@@ -155,6 +167,16 @@ CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \
 The check reads fixtures from canonical Git revision
 `4d46af25ef5112f76daf841c7622987f05d25142`; it does not trust or copy the contracts checkout's
 working tree. Updating that pin requires an explicit compatibility change.
+
+Run the signed-entitlement conformance check against its independently pinned canonical revision:
+
+```bash
+CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \
+  uv run pytest -q tests/test_entitlement.py::test_canonical_entitlement_v1_fixtures
+```
+
+That check reads entitlement fixtures from Git revision
+`3aef9c78186dca29949c10e4fc129d12ab932cf6`.
 
 ## Two-hour user timer
 
