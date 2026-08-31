@@ -314,7 +314,16 @@ pub struct NotificationIntent {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalModelSettings {
+    #[serde(default)]
+    pub editable: bool,
+    pub endpoint: String,
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
+    pub local_model: LocalModelSettings,
     pub notifications_enabled: bool,
     pub poll_interval_minutes: u64,
     pub polling_supported: bool,
@@ -623,15 +632,21 @@ impl Engine {
         poll_interval_minutes: u64,
         retention_days: u64,
         notifications_enabled: bool,
+        model_base_url: Option<String>,
+        model_name: Option<String>,
     ) -> Result<EngineSettings, EngineError> {
-        self.request(
-            "settings.update",
-            json!({
-                "notifications_enabled": notifications_enabled,
-                "poll_interval_minutes": poll_interval_minutes,
-                "retention_days": retention_days,
-            }),
-        )
+        let mut payload = json!({
+            "notifications_enabled": notifications_enabled,
+            "poll_interval_minutes": poll_interval_minutes,
+            "retention_days": retention_days,
+        });
+        if let Some(value) = model_base_url {
+            payload["model_base_url"] = Value::String(value);
+        }
+        if let Some(value) = model_name {
+            payload["model_name"] = Value::String(value);
+        }
+        self.request("settings.update", payload)
     }
 
     pub fn with_request_timeout(&self, timeout: Duration) -> Self {
@@ -1013,6 +1028,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn protocol_v1_settings_without_editability_default_to_read_only() {
+        let settings: EngineSettings = serde_json::from_value(json!({
+            "local_model": {
+                "endpoint": "http://127.0.0.1:8080/v1",
+                "model": "local-model"
+            },
+            "notifications_enabled": true,
+            "poll_interval_minutes": 120,
+            "polling_supported": true,
+            "retention_days": 180
+        }))
+        .expect("deserialize settings from an older protocol-v1 engine");
+
+        assert!(!settings.local_model.editable);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_settings_request_terminates_a_stalled_engine() {
@@ -1173,6 +1205,11 @@ esac"#,
             ConfigInitialization {
                 created: true,
                 settings: EngineSettings {
+                    local_model: LocalModelSettings {
+                        editable: true,
+                        endpoint: "http://127.0.0.1:8080/v1".into(),
+                        model: "local-model".into(),
+                    },
                     notifications_enabled: true,
                     poll_interval_minutes: 120,
                     polling_supported: true,
@@ -1245,6 +1282,11 @@ notifications_enabled = true
                 .settings_with_timeout(Duration::from_secs(5))
                 .expect("read engine settings"),
             EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://127.0.0.1:9/v1".into(),
+                    model: "local-model".into(),
+                },
                 notifications_enabled: true,
                 poll_interval_minutes: 120,
                 polling_supported: true,
@@ -1253,16 +1295,27 @@ notifications_enabled = true
         );
         assert_eq!(
             engine
-                .update_settings(0, 180, true)
+                .update_settings(0, 180, true, None, None)
                 .expect_err("invalid polling cadence must fail")
                 .code,
             "invalid_request"
         );
         assert_eq!(
             engine
-                .update_settings(45, 365, false)
+                .update_settings(
+                    45,
+                    365,
+                    false,
+                    Some("http://localhost:8080/v1/".into()),
+                    Some("replacement-model".into()),
+                )
                 .expect("update safe desktop settings"),
             EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://localhost:8080/v1".into(),
+                    model: "replacement-model".into(),
+                },
                 notifications_enabled: false,
                 poll_interval_minutes: 45,
                 polling_supported: true,
@@ -1272,6 +1325,11 @@ notifications_enabled = true
         assert_eq!(
             engine.settings().expect("read updated desktop settings"),
             EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://localhost:8080/v1".into(),
+                    model: "replacement-model".into(),
+                },
                 notifications_enabled: false,
                 poll_interval_minutes: 45,
                 polling_supported: true,

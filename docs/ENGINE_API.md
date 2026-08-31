@@ -101,13 +101,18 @@ address that is not watched returns `not_found`, and malformed payload values re
 pending-notification counting continue so removing the final sender cannot strand prior state.
 Adding the first sender activates later Gmail checks.
 
-`settings.update` accepts only `poll_interval_minutes` (1 through 1440), `retention_days` (1 through
-3650), and an exact boolean `notifications_enabled`. Mutation uses the same serialized,
+`settings.get` reports the configured inference endpoint and model under `local_model` without
+exposing token values or paths. Its `editable` flag is true only for the exact-loopback backend.
+`settings.update` accepts `poll_interval_minutes` (1 through 1440), `retention_days` (1 through
+3650), an exact boolean `notifications_enabled`, and, for an editable loopback backend only,
+`model_base_url` and `model_name`. The endpoint remains restricted to explicit-port HTTP on
+`localhost` or `127.0.0.1`; the model identifier must be nonblank printable text. Gateway-managed
+inference configuration is read-only through this operation. Mutation uses the same serialized,
 same-directory atomic replacement as watchlist updates and preserves all unrelated TOML fields and
-comments. Empty payloads, unknown fields, wrong types, and out-of-range values return
-`invalid_request` without changing the file. Model endpoint, model identifier, credentials, token
-paths, Gmail settings, timezone, and EOM outbound configuration are not mutable through this
-operation.
+comments. Empty payloads, unknown fields, wrong types, unsafe values, and attempts to mutate
+gateway-managed model settings return `invalid_request` without changing the file. Backend choice,
+credentials, token paths, Gmail settings, timezone, and EOM outbound configuration are not mutable
+through this operation.
 
 Each inbox item carries an `attachments` array. An attachment contains the Gmail MIME `part_id`,
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine

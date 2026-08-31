@@ -1253,6 +1253,7 @@ def _settings_data(config: Config) -> dict[str, object]:
         "body_char_limit": config.body_char_limit,
         "local_model": {
             "authentication_required": config.model_require_auth,
+            "editable": config.model_backend == "loopback",
             "endpoint": config.model_base_url,
             "model": config.model_name,
             "timeout_seconds": config.model_timeout_seconds,

@@ -194,6 +194,11 @@ interface CheckResult {
 }
 
 interface WatcherSettings {
+  local_model: {
+    editable: boolean;
+    endpoint: string;
+    model: string;
+  };
   notifications_enabled: boolean;
   poll_interval_minutes: number;
   polling_supported: boolean;
@@ -321,6 +326,15 @@ app.innerHTML = `
       </form>
       <form id="settings-form" class="settings-form" hidden>
         <label>
+          <span>Local AI endpoint</span>
+          <input id="model-endpoint" name="modelBaseUrl" type="url" autocomplete="url" required />
+        </label>
+        <label>
+          <span>Model identifier</span>
+          <input id="model-name" name="modelName" autocomplete="off" required />
+        </label>
+        <p id="model-settings-note" class="settings-note"></p>
+        <label>
           <span>Polling cadence <small>minutes</small></span>
           <input id="poll-interval" name="pollIntervalMinutes" type="number" min="1" max="1440" step="1" required />
         </label>
@@ -377,6 +391,9 @@ const initialModelEndpointInput = requiredElement<HTMLInputElement>(
 );
 const initialModelNameInput = requiredElement<HTMLInputElement>("#initial-model-name");
 const settingsForm = requiredElement<HTMLFormElement>("#settings-form");
+const modelEndpointInput = requiredElement<HTMLInputElement>("#model-endpoint");
+const modelNameInput = requiredElement<HTMLInputElement>("#model-name");
+const modelSettingsNote = requiredElement<HTMLParagraphElement>("#model-settings-note");
 const pollIntervalInput = requiredElement<HTMLInputElement>("#poll-interval");
 const retentionDaysInput = requiredElement<HTMLInputElement>("#retention-days");
 const notificationsEnabledInput = requiredElement<HTMLInputElement>(
@@ -400,6 +417,7 @@ const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
 let settingsInFlight = false;
+let localModelSettingsEditable = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
 
@@ -1336,6 +1354,12 @@ async function runCheck(): Promise<void> {
 }
 
 function renderSettings(settings: WatcherSettings): void {
+  localModelSettingsEditable = settings.local_model.editable;
+  modelEndpointInput.value = settings.local_model.endpoint;
+  modelNameInput.value = settings.local_model.model;
+  modelSettingsNote.textContent = localModelSettingsEditable
+    ? "Use an OpenAI-compatible HTTP endpoint on localhost or 127.0.0.1. Model changes apply to the next analysis."
+    : "Inference settings are managed by your administrator and are read-only here.";
   pollIntervalInput.value = String(settings.poll_interval_minutes);
   retentionDaysInput.value = String(settings.retention_days);
   notificationsEnabledInput.checked = settings.notifications_enabled;
@@ -1423,7 +1447,9 @@ function setSettingsBusy(busy: boolean): void {
   settingsInFlight = busy;
   for (const control of settingsForm.elements) {
     if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
-      control.disabled = busy;
+      const managedModelSetting =
+        control === modelEndpointInput || control === modelNameInput;
+      control.disabled = busy || (managedModelSetting && !localModelSettingsEditable);
     }
   }
 }
@@ -1454,14 +1480,26 @@ settingsForm.addEventListener("submit", (event) => {
     settingsStatus.textContent = "Saving settings…";
     delete settingsStatus.dataset.kind;
     try {
-      const settings = await invoke<WatcherSettings>("settings_update", {
+      const updates: {
+        modelBaseUrl?: string;
+        modelName?: string;
+        notificationsEnabled: boolean;
+        pollIntervalMinutes: number;
+        retentionDays: number;
+      } = {
         notificationsEnabled: notificationsEnabledInput.checked,
         pollIntervalMinutes: Number(pollIntervalInput.value),
         retentionDays: Number(retentionDaysInput.value),
-      });
+      };
+      if (localModelSettingsEditable) {
+        updates.modelBaseUrl = modelEndpointInput.value;
+        updates.modelName = modelNameInput.value;
+      }
+      const settings = await invoke<WatcherSettings>("settings_update", updates);
       renderSettings(settings);
-      settingsStatus.textContent =
-        "Settings saved. Restart the app to use the new polling cadence.";
+      settingsStatus.textContent = settings.local_model.editable
+        ? "Settings saved. Model changes apply to the next analysis; restart the app to use the new polling cadence."
+        : "Settings saved. Restart the app to use the new polling cadence.";
       settingsStatus.dataset.kind = "success";
     } catch (error) {
       settingsStatus.textContent = errorMessage(error);
