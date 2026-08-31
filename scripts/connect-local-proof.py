@@ -15,6 +15,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
+from connect_reference_provider import (
+    REFERENCE_APP_ID,
+    SUMMARY_CAPABILITY_ID,
+    TRANSLATE_CAPABILITY_ID,
+    ReferenceProvider,
+)
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.db import SCHEMA_VERSION
@@ -303,11 +309,12 @@ def main() -> None:
     provider: subprocess.Popen[bytes] | None = None
     restarted: subprocess.Popen[bytes] | None = None
     recovered: subprocess.Popen[bytes] | None = None
+    reference_provider: ReferenceProvider | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     original_connect_client_factory = connect._client
 
     def stop_active_providers() -> None:
-        nonlocal provider, recovered, restarted
+        nonlocal provider, recovered, reference_provider, restarted
         if provider is not None:
             stop_provider(provider)
             provider = None
@@ -317,6 +324,9 @@ def main() -> None:
         if recovered is not None:
             stop_provider(recovered)
             recovered = None
+        if reference_provider is not None:
+            reference_provider.stop()
+            reference_provider = None
 
     try:
         with (
@@ -453,6 +463,112 @@ def main() -> None:
             if rendered["kind"] != "document_summary":
                 raise RuntimeError("Unexpected Connect output presentation kind")
             summary_text = rendered["summary"]["text"]
+
+            reference_provider = ReferenceProvider.start(runtime_dir)
+            reference_capabilities = engine_api._response(
+                request(
+                    config_path,
+                    "connect.attachment.capabilities",
+                    {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
+                )
+            )
+            if not reference_capabilities["ok"]:
+                raise RuntimeError(
+                    f"Reference capability discovery failed: {reference_capabilities}"
+                )
+            reference_items = reference_capabilities["data"]["items"]
+            summary_choices = [
+                item
+                for item in reference_items
+                if item["capability"]["id"] == SUMMARY_CAPABILITY_ID
+                and item["capability"]["version"] == "1.0"
+            ]
+            translation_choices = [
+                item
+                for item in reference_items
+                if item["provider"]["app_id"] == REFERENCE_APP_ID
+                and item["capability"]["id"] == TRANSLATE_CAPABILITY_ID
+                and item["capability"]["version"] == "1.0"
+            ]
+            if len(translation_choices) != 1:
+                raise RuntimeError(
+                    f"Reference provider did not expose its generic capabilities: "
+                    f"{reference_capabilities}"
+                )
+            translation = translation_choices[0]
+            translation_request_id = str(uuid4())
+            translation_invocation = {
+                "request_id": translation_request_id,
+                "message_id": "fixture-message",
+                "part_id": FIXTURE_PART_ID,
+                "provider": {
+                    "app_id": translation["provider"]["app_id"],
+                    "version": translation["provider"]["version"],
+                    "instance_id": translation["provider"]["instance_id"],
+                },
+                "capability": {
+                    "id": translation["capability"]["id"],
+                    "version": translation["capability"]["version"],
+                },
+                "parameters": {"target-language": "Spanish"},
+                "confirmed": False,
+            }
+            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            try:
+                translation_response = engine_api._response(
+                    request(
+                        config_path,
+                        "connect.attachment.invoke",
+                        translation_invocation,
+                    )
+                )
+            finally:
+                engine_api.GmailGateway.from_token = original_from_token
+            if not translation_response["ok"]:
+                raise RuntimeError(
+                    f"Reference capability invocation failed: {translation_response}"
+                )
+            translation_output = translation_response["data"]["outputs"][0]
+            translation_presentation = engine_api._response(
+                request(
+                    config_path,
+                    "connect.output.present",
+                    {
+                        "message_id": "fixture-message",
+                        "part_id": FIXTURE_PART_ID,
+                        "job_id": translation_request_id,
+                        "artifact_id": translation_output["artifact_id"],
+                    },
+                )
+            )
+            if not translation_presentation["ok"]:
+                raise RuntimeError(
+                    f"Reference output presentation failed: {translation_presentation}"
+                )
+            translation_job = runtime.store.connect_job(translation_request_id)
+            reference_requests = reference_provider.requests()
+            reference_request_json = json.dumps(
+                privacy_projection(reference_requests), separators=(",", ":"), sort_keys=True
+            )
+            reference_instance_id = reference_provider.instance_id
+            translation_submissions = reference_provider.submission_count(translation_request_id)
+            reference_provider.stop()
+            reference_provider = None
+            after_reference_stop = engine_api._response(
+                request(
+                    config_path,
+                    "connect.attachment.capabilities",
+                    {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
+                )
+            )
+            reference_inbox_after_stop = engine_api._response(
+                request(config_path, "inbox.recent", {"limit": 1})
+            )
+            if not after_reference_stop["ok"] or not reference_inbox_after_stop["ok"]:
+                raise RuntimeError(
+                    "Reference provider removal damaged Email Watcher state: "
+                    f"capabilities={after_reference_stop}, inbox={reference_inbox_after_stop}"
+                )
 
             stop_provider(provider)
             provider = None
@@ -611,6 +727,26 @@ def main() -> None:
                     "source_app_id",
                 }
             )
+            reference_capability_ids = {
+                item["capability"]["id"]
+                for item in reference_items
+                if item["provider"]["app_id"] == REFERENCE_APP_ID
+            }
+            reference_inbox_results = reference_inbox_after_stop["data"]["items"][0]["attachments"][
+                0
+            ]["capability_results"]
+            reference_results = [
+                item
+                for item in reference_inbox_results
+                if item.get("provider", {}).get("app_id") == REFERENCE_APP_ID
+            ]
+            reference_result = reference_results[0] if len(reference_results) == 1 else None
+            after_reference_items = after_reference_stop["data"]["items"]
+            translation_durable_request = (
+                json.loads(translation_job.request_json)
+                if translation_job is not None and translation_job.request_json is not None
+                else None
+            )
             proof_checks = {
                 "before_provider_absent": not before["items"],
                 "provider_available": bool(during["items"]),
@@ -645,6 +781,91 @@ def main() -> None:
                 ),
                 "interrupted_provider_submitted_once": interrupted_provider_submissions == 1,
                 "interrupted_reconciliation_skipped_gmail": gmail_reconciliation_reads == 0,
+                "multiple_provider_selection_available": (
+                    len(summary_choices) == 2
+                    and {item["provider"]["app_id"] for item in summary_choices}
+                    == {selected["provider"]["app_id"], REFERENCE_APP_ID}
+                ),
+                "reference_capabilities_discovered": reference_capability_ids
+                == {
+                    SUMMARY_CAPABILITY_ID,
+                    TRANSLATE_CAPABILITY_ID,
+                },
+                "reference_capability_jobs_completed": (
+                    translation_response["data"]["status"] == "completed"
+                    and translation_job is not None
+                    and translation_job.status == "completed"
+                ),
+                "reference_capability_provenance_persisted": (
+                    translation_job is not None
+                    and translation_job.provider_app_id == REFERENCE_APP_ID
+                    and translation_job.provider_instance_id == reference_instance_id
+                    and translation_job.capability_id == TRANSLATE_CAPABILITY_ID
+                ),
+                "reference_capability_parameters_persisted": (
+                    isinstance(translation_durable_request, dict)
+                    and translation_durable_request["parameters"] == {"target-language": "Spanish"}
+                    and translation_durable_request["inputs"][0]["source_app_id"]
+                    == connect.SOURCE_APP_ID
+                ),
+                "reference_output_presented_as_text": (
+                    translation_presentation["data"]["presentation"]
+                    == {
+                        "kind": "text",
+                        "text": "Reference translation target: Spanish.\n",
+                    }
+                ),
+                "reference_provider_requests_private": (
+                    len(reference_requests) == 1
+                    and all(
+                        private_value not in reference_request_json
+                        for private_value in (
+                            "fixture-message",
+                            FIXTURE_PART_ID,
+                            "fixture-attachment",
+                            "fixture@example.invalid",
+                            "Fixture Sender",
+                            "Fixture document",
+                        )
+                    )
+                ),
+                "reference_provider_submitted_once": translation_submissions == 1,
+                "reference_result_reached_inbox": (
+                    translation_job is not None
+                    and reference_result
+                    == {
+                        "job_id": translation_request_id,
+                        "capability_id": TRANSLATE_CAPABILITY_ID,
+                        "capability_version": translation["capability"]["version"],
+                        "status": "completed",
+                        "updated_at": translation_job.updated_at,
+                        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                        "provider": {
+                            "app_id": REFERENCE_APP_ID,
+                            "version": translation["provider"]["version"],
+                            "instance_id": reference_instance_id,
+                        },
+                        "parameters": {"target-language": "Spanish"},
+                        "outputs": [translation_output],
+                    }
+                ),
+                "reference_removal_preserves_watcher": (
+                    after_reference_stop["ok"]
+                    and all(
+                        item["provider"]["app_id"] != REFERENCE_APP_ID
+                        for item in after_reference_items
+                    )
+                    and len(
+                        [
+                            item
+                            for item in after_reference_items
+                            if item["capability"]["id"] == SUMMARY_CAPABILITY_ID
+                            and item["provider"]["app_id"] == selected["provider"]["app_id"]
+                        ]
+                    )
+                    == 1
+                    and reference_inbox_after_stop["ok"]
+                ),
                 "email_database_healthy": quick_check == "ok",
                 "email_database_current": schema_version == SCHEMA_VERSION,
                 "inbox_healthy_without_connect": (
@@ -713,7 +934,10 @@ def main() -> None:
                 "persisted_protocol_version": job_row[1],
                 "proof_input": "synthetic Gmail attachment bytes",
                 "proof_passed": all(proof_checks.values()),
+                "reference_capability_count": len(reference_capability_ids),
+                "reference_translation_submissions": translation_submissions,
                 "source_app_id": job_row[10],
+                "summary_provider_choices": len(summary_choices),
                 "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
                 **proof_checks,
             }
@@ -727,6 +951,8 @@ def main() -> None:
             stop_provider(restarted)
         if recovered is not None:
             stop_provider(recovered)
+        if reference_provider is not None:
+            reference_provider.stop()
         model_server.shutdown()
         model_server.server_close()
         model_thread.join(timeout=5)

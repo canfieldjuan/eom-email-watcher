@@ -119,14 +119,19 @@ verification schemas:
 
 The proof uses attachment-scoped v2 discovery and explicit provider/capability selection, persists a
 stable request identity and generic output, stops the provider, replays the completed job while it is
-offline, and verifies the Inbox remains healthy. It then restarts the provider under the same durable
-v2 identity, interrupts a second job after provider acceptance, restarts again, and reconciles the
-same request to the provider's authoritative `PROVIDER_RESTARTED` failure without reopening Gmail or
-resubmitting. Any false lifecycle, privacy, persistence, or provenance predicate exits nonzero. Its
-single JSON result contains booleans/counts and a summary digest rather than document text or
-credentials. Supplying `--model-base-url` and `--model-name` exercises that exact-loopback model for
-the completed-output path; the deterministic interruption path still uses the bounded fixture model
-so it can pause safely. An authenticated endpoint may additionally use `--model-api-token-file`.
+offline, and verifies the Inbox remains healthy. A deterministic reference provider then advertises
+the same summary capability plus `document.translate`. The proof observes two summary-provider
+choices, invokes the non-summary capability through the same generic contract, persists its
+provenance and parameters into the Inbox, presents bounded text natively, and removes the reference
+provider without disrupting Document Summarizer or the Inbox. It then restarts Document Summarizer
+under the same durable v2 identity, interrupts a job after provider acceptance, restarts again, and
+reconciles the same request to the provider's authoritative `PROVIDER_RESTARTED` failure without
+reopening Gmail or resubmitting. Any false lifecycle, privacy, persistence, or provenance predicate
+exits nonzero. Its single JSON result contains booleans/counts and a summary digest rather than
+document text or credentials. Supplying `--model-base-url` and `--model-name` exercises that
+exact-loopback model for the completed-output path; the deterministic interruption path still uses
+the bounded fixture model so it can pause safely. An authenticated endpoint may additionally use
+`--model-api-token-file`.
 Both configured-model fields are required together, and the provider retains final endpoint
 validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 

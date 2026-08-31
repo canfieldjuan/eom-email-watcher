@@ -134,6 +134,12 @@ matching. It never returns the registration path, loopback endpoint, or bearer t
 providers returns an empty list; multiple compatible providers remain available for explicit host
 selection rather than being collapsed into an ambiguity error.
 
+`scripts/connect-local-proof.py` also registers a deterministic synthetic provider that is unknown
+to application runtime code. It proves that a second capability, required string parameters, two
+providers for one capability, generic persistence/Inbox rendering, and bounded text presentation
+all travel through these same operations. Removing that registration removes its actions while the
+remaining provider and normal Inbox stay healthy.
+
 `connect.attachment.invoke` requires a caller-generated UUIDv4 plus exact provider application,
 version, instance, capability, version, declared parameters, and confirmation state. It revalidates
 that selection immediately before a new handoff. Only then does it fetch the already inventoried

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import runpy
+import sys
 from pathlib import Path
 
 import pytest
 
-PROOF_SCRIPT = runpy.run_path(str(Path(__file__).parents[1] / "scripts/connect-local-proof.py"))
+SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
 
