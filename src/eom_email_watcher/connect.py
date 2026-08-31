@@ -29,6 +29,8 @@ from pydantic import (
     model_validator,
 )
 
+from . import entitlement
+
 PROTOCOL_VERSION = 1
 GENERIC_PROTOCOL_VERSION = 2
 CAPABILITY_ID = "document.summarize"
@@ -797,12 +799,23 @@ def _client() -> httpx.Client:
     )
 
 
+def require_connect_entitlement() -> None:
+    if entitlement.connect_entitlement_decision().is_active:
+        return
+    raise ConnectError(
+        "CONNECT_ENTITLEMENT_REQUIRED",
+        "An active Connect entitlement is required.",
+    )
+
+
 def discover_summary_capability(
     runtime_dir: Path | None = None,
     *,
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
 ) -> CapabilityDiscovery:
+    if not entitlement.connect_entitlement_decision().is_active:
+        return CapabilityDiscovery(None, "connect_entitlement_required")
     root_value = runtime_dir or (
         Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
     )
@@ -944,6 +957,8 @@ def discover_capabilities(
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
 ) -> CapabilityCatalog:
+    if not entitlement.connect_entitlement_decision().is_active:
+        return CapabilityCatalog((), "connect_entitlement_required")
     root_value = runtime_dir or (
         Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
     )

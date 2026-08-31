@@ -11,6 +11,15 @@ from eom_email_watcher.runtime import load_runtime
 INSTANCE = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.fixture(autouse=True)
+def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
+
+
 def write_config(path: Path) -> None:
     path.write_text(
         f'''timezone = "America/Chicago"
@@ -246,6 +255,7 @@ def test_provider_failure_is_durable_and_never_masquerades_as_success(
     jobs = runtime.store.recent(1)[0]["attachments"][0]["capability_results"]
     assert jobs == [
         {
+            "job_id": jobs[0]["job_id"],
             "capability_id": "document.summarize",
             "capability_version": "1.0",
             "status": "failed",

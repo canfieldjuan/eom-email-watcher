@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from contextlib import ExitStack, suppress
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,7 @@ from connect_reference_provider import (
     ReferenceProvider,
 )
 
-from eom_email_watcher import connect, engine_api
+from eom_email_watcher import connect, engine_api, entitlement
 from eom_email_watcher.db import SCHEMA_VERSION
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
@@ -273,6 +274,9 @@ def main() -> None:
     )
     parser.add_argument("--provider-binary", type=Path, required=True)
     parser.add_argument("--pdf", type=Path, required=True)
+    parser.add_argument("--entitlement-keyring", type=Path, required=True)
+    parser.add_argument("--active-entitlement", type=Path, required=True)
+    parser.add_argument("--expired-entitlement", type=Path, required=True)
     parser.add_argument(
         "--model-base-url",
         help="Use an existing exact-loopback OpenAI-compatible endpoint instead of the fixture",
@@ -289,6 +293,9 @@ def main() -> None:
     provider_binary = args.provider_binary.resolve(strict=True)
     pdf_path = args.pdf.resolve(strict=True)
     pdf = pdf_path.read_bytes()
+    entitlement_keyring = args.entitlement_keyring.resolve(strict=True).read_bytes()
+    active_entitlement = args.active_entitlement.resolve(strict=True).read_bytes()
+    expired_entitlement = args.expired_entitlement.resolve(strict=True).read_bytes()
 
     model_server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureModelHandler)
     model_thread = threading.Thread(target=model_server.serve_forever, daemon=True)
@@ -314,7 +321,9 @@ def main() -> None:
     recovered: subprocess.Popen[bytes] | None = None
     reference_provider: ReferenceProvider | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    original_config_home = os.environ.get("XDG_CONFIG_HOME")
     original_connect_client_factory = connect._client
+    original_entitlement_decision = entitlement.connect_entitlement_decision
 
     def stop_active_providers() -> None:
         nonlocal provider, recovered, reference_provider, restarted
@@ -341,9 +350,24 @@ def main() -> None:
             runtime_dir = root / "runtime"
             data_dir = root / "data"
             email_dir = root / "email"
-            for directory in (runtime_dir, data_dir, email_dir):
+            config_dir = root / "config"
+            for directory in (runtime_dir, data_dir, email_dir, config_dir):
                 directory.mkdir(mode=0o700)
+            entitlement_dir = config_dir / "local-connect"
+            entitlement_dir.mkdir(mode=0o700)
+            entitlement_path = entitlement_dir / entitlement.ENTITLEMENT_FILE_NAME
+            entitlement_path.write_bytes(active_entitlement)
+            entitlement_path.chmod(0o600)
+            proof_entitlement = entitlement.EntitlementGate.for_test(
+                entitlement_path,
+                entitlement_keyring,
+                datetime.now(UTC),
+            )
+            if proof_entitlement.decision() is not entitlement.EntitlementDecision.ACTIVE:
+                raise RuntimeError("The supplied active Connect entitlement is not active")
             os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+            os.environ["XDG_CONFIG_HOME"] = str(config_dir)
+            entitlement.connect_entitlement_decision = proof_entitlement.decision
             environment = os.environ.copy()
             environment.pop("DOC_SUM_MODEL_API_TOKEN_FILE", None)
             environment.update(
@@ -466,6 +490,42 @@ def main() -> None:
             if rendered["kind"] != "document_summary":
                 raise RuntimeError("Unexpected Connect output presentation kind")
             summary_text = rendered["summary"]["text"]
+
+            entitlement_path.write_bytes(expired_entitlement)
+            entitlement_path.chmod(0o600)
+            expired_decision = proof_entitlement.decision()
+            while_expired = wait_for_capability(False)
+            registration_paths = sorted(
+                (runtime_dir / "local-connect/v2/providers").glob("*.json")
+            )
+            if len(registration_paths) != 1:
+                raise RuntimeError("Expected one provider registration during entitlement denial")
+            registration = json.loads(registration_paths[0].read_bytes())
+            with httpx.Client(follow_redirects=False, trust_env=False) as entitlement_client:
+                denied_manifest = entitlement_client.get(
+                    f"{registration['transport']['base_url']}v2/manifest",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {registration['auth']['token']}",
+                    },
+                )
+            denied_manifest_body = denied_manifest.json()
+            engine_api.GmailGateway.from_token = staticmethod(
+                lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("completed result replay reopened Gmail while unentitled")
+                )
+            )
+            try:
+                cached_while_expired = engine_api._response(
+                    request(config_path, "connect.attachment.invoke", invocation)
+                )
+            finally:
+                engine_api.GmailGateway.from_token = original_from_token
+
+            entitlement_path.write_bytes(active_entitlement)
+            entitlement_path.chmod(0o600)
+            restored_entitlement_decision = proof_entitlement.decision()
+            after_entitlement_restore = wait_for_capability(True)
 
             reference_provider = ReferenceProvider.start(runtime_dir)
             reference_capabilities = engine_api._response(
@@ -858,6 +918,25 @@ def main() -> None:
             proof_checks = {
                 "before_provider_absent": not before["items"],
                 "provider_available": bool(during["items"]),
+                "consumer_denies_expired_entitlement": (
+                    expired_decision is entitlement.EntitlementDecision.EXPIRED
+                    and not while_expired["items"]
+                ),
+                "provider_denies_expired_entitlement": (
+                    denied_manifest.status_code == 403
+                    and denied_manifest_body.get("protocol_version")
+                    == connect.GENERIC_PROTOCOL_VERSION
+                    and denied_manifest_body.get("error", {}).get("code")
+                    == "CONNECT_ENTITLEMENT_REQUIRED"
+                ),
+                "completed_result_survives_entitlement_expiry": (
+                    cached_while_expired.get("ok") is True
+                    and cached_while_expired.get("data") == response["data"]
+                ),
+                "entitlement_restores_capability_without_restart": (
+                    restored_entitlement_decision is entitlement.EntitlementDecision.ACTIVE
+                    and len(after_entitlement_restore["items"]) == 1
+                ),
                 "provider_removed": not after_stop["items"],
                 "provider_restored": len(restarted_matches) == 1,
                 "provider_instance_stable": (
@@ -1097,6 +1176,8 @@ def main() -> None:
                 "capability_id": selected["capability"]["id"],
                 "capability_version": selected["capability"]["version"],
                 "during_provider_capabilities": len(during["items"]),
+                "expired_entitlement_capabilities": len(while_expired["items"]),
+                "restored_entitlement_capabilities": len(after_entitlement_restore["items"]),
                 "email_database_quick_check": quick_check,
                 "email_database_schema_version": schema_version,
                 "job_status": response["data"]["status"],
@@ -1125,6 +1206,7 @@ def main() -> None:
             require_proof_checks(proof_checks)
     finally:
         connect._client = original_connect_client_factory
+        entitlement.connect_entitlement_decision = original_entitlement_decision
         if provider is not None:
             stop_provider(provider)
         if restarted is not None:
@@ -1140,6 +1222,10 @@ def main() -> None:
             os.environ.pop("XDG_RUNTIME_DIR", None)
         else:
             os.environ["XDG_RUNTIME_DIR"] = original_runtime_dir
+        if original_config_home is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = original_config_home
 
 
 if __name__ == "__main__":

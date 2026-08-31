@@ -20,6 +20,15 @@ OUTPUT_ID_B = "44444444-4444-4444-8444-444444444444"
 JOB_ID = "5aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
+@pytest.fixture(autouse=True)
+def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
+
+
 def registration(
     *,
     instance_id: str,
@@ -170,6 +179,64 @@ def test_discovery_uses_capability_not_provider_identity(tmp_path: Path) -> None
     assert requests[0].url == "http://127.0.0.1:32123/v1/manifest"
     assert requests[0].headers["authorization"] == f"Bearer {TOKEN}"
     assert "origin" not in requests[0].headers
+
+
+def test_entitlement_dynamically_hides_and_restores_both_discovery_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v1_directory = providers_dir(tmp_path)
+    v2_directory = providers_dir_v2(tmp_path)
+    write_registration(
+        v1_directory / "provider.json",
+        registration(
+            instance_id=INSTANCE_A,
+            app_id="generic-provider",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    write_registration(
+        v2_directory / "provider.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="generic-provider",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    current = [connect.entitlement.EntitlementDecision.EXPIRED]
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: current[0],
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/manifest":
+            return httpx.Response(200, json=manifest(INSTANCE_A, "generic-provider"))
+        return httpx.Response(200, json=manifest_v2(INSTANCE_A, "generic-provider"))
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), trust_env=False, follow_redirects=False
+    ) as client:
+        denied_v1 = connect.discover_summary_capability(tmp_path, client=client)
+        denied_v2 = connect.discover_capabilities(tmp_path, client=client)
+        assert denied_v1.provider is None
+        assert denied_v1.diagnostic_code == "connect_entitlement_required"
+        assert denied_v2.items == ()
+        assert denied_v2.diagnostic_code == "connect_entitlement_required"
+        assert requests == []
+
+        current[0] = connect.entitlement.EntitlementDecision.ACTIVE
+        assert connect.discover_summary_capability(tmp_path, client=client).provider is not None
+        assert len(connect.discover_capabilities(tmp_path, client=client).items) == 1
+        assert len(requests) == 2
+
+        current[0] = connect.entitlement.EntitlementDecision.MISSING
+        assert connect.discover_summary_capability(tmp_path, client=client).provider is None
+        assert connect.discover_capabilities(tmp_path, client=client).items == ()
+        assert len(requests) == 2
 
 
 @pytest.mark.parametrize(
