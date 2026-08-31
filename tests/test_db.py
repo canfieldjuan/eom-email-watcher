@@ -384,7 +384,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
@@ -429,7 +429,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -691,7 +691,7 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     assert restored.result_json is None
     assert restored.result_metadata_json is None
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         assert (
             db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -889,13 +889,55 @@ def test_connect_v2_active_identity_scopes_protocol_provider_and_parameters(
         assert restored is not None
         assert restored.job_id == expected_job_id
 
-    with pytest.raises(sqlite3.IntegrityError):
-        create_v2_connect_job(
-            store,
-            "77777777-7777-4777-8777-777777777777",
-            capability_id="document.summarize",
-            parameters={"target-language": "Spanish"},
+    create_v2_connect_job(
+        store,
+        "77777777-7777-4777-8777-777777777777",
+        capability_id="document.summarize",
+        parameters={"target-language": "Spanish"},
+    )
+    assert store.connect_job("44444444-4444-4444-8444-444444444444") is not None
+    assert store.connect_job("77777777-7777-4777-8777-777777777777") is not None
+
+
+def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    create_v2_connect_job(
+        store,
+        "44444444-4444-4444-8444-444444444444",
+        capability_id="document.summarize",
+        parameters={"target-language": "Spanish"},
+    )
+    with store.connection() as db:
+        db.execute("DROP INDEX idx_connect_attachment_jobs_active")
+        db.execute(
+            """CREATE UNIQUE INDEX idx_connect_attachment_jobs_active
+            ON connect_attachment_jobs(
+                message_id, part_id, protocol_version, capability_id,
+                capability_version, invocation_fingerprint
+            )
+            WHERE status IN ('requested', 'accepted', 'processing')"""
         )
+        db.execute("PRAGMA user_version = 6")
+
+    Store(database).initialize()
+    create_v2_connect_job(
+        store,
+        "77777777-7777-4777-8777-777777777777",
+        capability_id="document.summarize",
+        parameters={"target-language": "Spanish"},
+    )
+
+    with store.connection() as db:
+        index_sql = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_connect_attachment_jobs_active'"
+        ).fetchone()[0]
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 2
+    assert "protocol_version = 1" in index_sql
 
 
 def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(

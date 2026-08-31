@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -169,6 +169,7 @@ ON connect_attachment_jobs(
     invocation_fingerprint
 )
 WHERE status IN ('requested', 'accepted', 'processing')
+  AND protocol_version = 1
 """
 
 _CONNECT_JOBS_DELETE_TRIGGER_SQL = """
@@ -290,7 +291,7 @@ class ConnectOutput:
         }
 
 
-def _ensure_connect_jobs_schema(db: sqlite3.Connection) -> None:
+def _ensure_connect_jobs_schema(db: sqlite3.Connection, current_version: int) -> None:
     table_exists = (
         db.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connect_attachment_jobs'"
@@ -309,6 +310,8 @@ def _ensure_connect_jobs_schema(db: sqlite3.Connection) -> None:
         db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_lookup")
         db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_active")
         db.execute("ALTER TABLE connect_attachment_jobs RENAME TO connect_attachment_jobs_v5")
+    elif table_exists and current_version < 7:
+        db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_active")
 
     db.execute(_CONNECT_JOBS_TABLE_SQL)
     db.execute(_CONNECT_JOBS_LOOKUP_INDEX_SQL)
@@ -782,7 +785,7 @@ class Store:
                 );
                 """
             )
-            _ensure_connect_jobs_schema(db)
+            _ensure_connect_jobs_schema(db, version)
             columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()
             }
@@ -961,6 +964,46 @@ class Store:
         if job.status != "completed" or job.protocol_version != 2 or job.result_json is None:
             raise RuntimeError("Completed Connect v2 job is missing its durable result")
         return _decode_generic_result(job.result_json)
+
+    @staticmethod
+    def canonical_connect_parameters(value: object) -> dict[str, str | int | bool]:
+        return _canonical_v2_parameters(value)
+
+    @staticmethod
+    def connect_job_parameters(job: ConnectJob) -> dict[str, str | int | bool]:
+        if (
+            job.protocol_version != 2
+            or job.provider_app_id is None
+            or job.provider_app_version is None
+            or job.provider_instance_id is None
+            or job.input_display_name is None
+            or job.source_app_id is None
+            or job.request_json is None
+        ):
+            raise RuntimeError("Connect v2 job is missing its durable request")
+        try:
+            fingerprint = _validate_v2_request_record(
+                job.request_json,
+                job_id=job.job_id,
+                capability_id=job.capability_id,
+                capability_version=job.capability_version,
+                provider_app_id=job.provider_app_id,
+                provider_app_version=job.provider_app_version,
+                provider_instance_id=job.provider_instance_id,
+                input_artifact_id=job.input_artifact_id,
+                input_media_type=job.input_media_type,
+                input_byte_size=job.input_byte_size,
+                input_sha256=job.input_sha256,
+                input_display_name=job.input_display_name,
+                source_app_id=job.source_app_id,
+            )
+            request = _decode_v2_request(job.request_json)
+            parameters = _canonical_v2_parameters(request.get("parameters"))
+        except ValueError as exc:
+            raise RuntimeError("Connect v2 job has an invalid durable request") from exc
+        if fingerprint != job.invocation_fingerprint:
+            raise RuntimeError("Connect v2 job has an invalid durable request")
+        return parameters
 
     def active_connect_job(
         self,
