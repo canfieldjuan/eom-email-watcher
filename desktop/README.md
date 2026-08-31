@@ -8,6 +8,9 @@ through Tauri's native notification plugin on startup and after `Check now`. On 
 single-instance process also polls automatically using `poll_interval_minutes` (120 minutes by
 default) and publishes the next scheduled check in Health. Polling remains disabled when production
 locking or host-owned notification delivery is unsupported by the current configuration.
+Closing the main window hides it while the host keeps automatic polling and notification delivery
+alive. The system-tray menu restores the window or explicitly quits the host. The application must
+still be launched after login; automatic startup is not implemented yet.
 
 Settings can safely update polling cadence, message retention, and native-notification enablement
 through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
@@ -34,7 +37,7 @@ The host acknowledges an intent only after the platform notification API accepts
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
 window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-tray/autostart behavior or public Google OAuth verification. When an OAuth desktop-client identity
+autostart behavior or public Google OAuth verification. When an OAuth desktop-client identity
 is configured externally or injected into the release build, Health can run the read-only Gmail
 browser authorization flow and initialize the current-mailbox baseline. The existing systemd
 watcher remains the production polling path while equivalent live behavior is evaluated; the
@@ -46,7 +49,7 @@ processes have a 30-minute upper bound, and wall-clock deadline checks catch up 
 - the repository's Python 3.13/uv environment (`uv sync --locked --all-groups` at the repo root)
 - Node.js 26 and pnpm 11
 - current stable Rust with Cargo
-- Tauri's Linux WebKitGTK prerequisites
+- Tauri's Linux WebKitGTK prerequisites, including `libayatana-appindicator3-dev` for tray builds
 - a compatible local OpenAI-style model endpoint
 
 Install frontend dependencies and run the app:

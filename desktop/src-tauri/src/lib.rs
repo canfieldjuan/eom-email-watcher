@@ -20,6 +20,68 @@ use tauri_plugin_opener::OpenerExt;
 const INBOX_LIMIT: u16 = 50;
 const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
 const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(desktop)]
+const TRAY_OPEN_ID: &str = "open";
+#[cfg(desktop)]
+const TRAY_QUIT_ID: &str = "quit";
+
+#[cfg(desktop)]
+#[derive(Debug, PartialEq, Eq)]
+enum TrayMenuAction {
+    Open,
+    Quit,
+    Ignore,
+}
+
+#[cfg(desktop)]
+fn tray_menu_action(id: &str) -> TrayMenuAction {
+    match id {
+        TRAY_OPEN_ID => TrayMenuAction::Open,
+        TRAY_QUIT_ID => TrayMenuAction::Quit,
+        _ => TrayMenuAction::Ignore,
+    }
+}
+
+#[cfg(desktop)]
+fn show_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        eprintln!("watcher main window is unavailable");
+        return;
+    };
+    if let Err(error) = window.unminimize() {
+        eprintln!("watcher main window could not be unminimized: {error}");
+    }
+    if let Err(error) = window.show() {
+        eprintln!("watcher main window could not be shown: {error}");
+    }
+    if let Err(error) = window.set_focus() {
+        eprintln!("watcher main window could not be focused: {error}");
+    }
+}
+
+#[cfg(desktop)]
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let open = MenuItem::with_id(app, TRAY_OPEN_ID, "Open Email Watcher", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "Quit Email Watcher", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut tray = TrayIconBuilder::new()
+        .tooltip("Email Watcher")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match tray_menu_action(event.id().as_ref()) {
+            TrayMenuAction::Open => show_main_window(app),
+            TrayMenuAction::Quit => app.exit(0),
+            TrayMenuAction::Ignore => {}
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
 
 #[derive(Serialize)]
 struct DesktopCheckResult {
@@ -354,16 +416,26 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
+        show_main_window(app);
     }));
+    #[cfg(desktop)]
+    let builder = builder.on_window_event(|window, event| {
+        if window.label() == "main"
+            && let tauri::WindowEvent::CloseRequested { api, .. } = event
+        {
+            api.prevent_close();
+            if let Err(error) = window.hide() {
+                eprintln!("watcher main window could not be hidden: {error}");
+            }
+        }
+    });
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
+            #[cfg(desktop)]
+            install_tray(app)?;
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
             let exports = AttachmentExports {
@@ -437,4 +509,16 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop host");
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_menu_routing_is_explicit() {
+        assert_eq!(tray_menu_action(TRAY_OPEN_ID), TrayMenuAction::Open);
+        assert_eq!(tray_menu_action(TRAY_QUIT_ID), TrayMenuAction::Quit);
+        assert_eq!(tray_menu_action("unexpected"), TrayMenuAction::Ignore);
+    }
 }
