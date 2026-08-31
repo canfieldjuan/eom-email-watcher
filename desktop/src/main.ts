@@ -1287,44 +1287,46 @@ async function refreshConnectStatus(): Promise<void> {
 
 async function selectAndInstallConnectEntitlement(): Promise<void> {
   if (connectInstalling) return;
-  let selected: string | null;
-  try {
-    selected = await open({
-      multiple: false,
-      filters: [{ name: "Connect license", extensions: ["json"] }],
-    });
-  } catch (error) {
-    setHealthValue(connectHealth, false, "Selection failed");
-    connectDetail.textContent = errorMessage(error);
-    return;
-  }
-  if (selected === null) return;
-
   connectInstalling = true;
   connectActivate.disabled = true;
-  setHealthValue(connectHealth, false, "Activating…");
-  connectDetail.textContent = "Verifying and installing your signed license…";
   try {
-    renderConnectStatus(
-      await invoke<ConnectEntitlementStatus>("connect_entitlement_install", {
-        sourcePath: selected,
-      }),
-    );
-  } catch (error) {
-    const failure = errorMessage(error);
+    let selected: string | null;
     try {
-      const current = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
-      renderConnectStatus(current);
-      setHealthValue(
-        connectHealth,
-        current.active,
-        current.active ? "Active — replacement failed" : "Activation failed",
-      );
-      connectDetail.textContent = failure;
-    } catch {
-      setHealthValue(connectHealth, false, "Activation failed");
-      connectDetail.textContent = failure;
-      connectActivate.hidden = false;
+      selected = await open({
+        multiple: false,
+        filters: [{ name: "Connect license", extensions: ["json"] }],
+      });
+    } catch (error) {
+      setHealthValue(connectHealth, false, "Selection failed");
+      connectDetail.textContent = errorMessage(error);
+      return;
+    }
+    if (selected === null) return;
+
+    setHealthValue(connectHealth, false, "Activating…");
+    connectDetail.textContent = "Verifying and installing your signed license…";
+    try {
+      const status = await invoke<ConnectEntitlementStatus>("connect_entitlement_install", {
+        sourcePath: selected,
+      });
+      renderConnectStatus(status);
+      if (status.active && configurationReady) void loadInbox();
+    } catch (error) {
+      const failure = errorMessage(error);
+      try {
+        const current = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
+        renderConnectStatus(current);
+        setHealthValue(
+          connectHealth,
+          current.active,
+          current.active ? "Active — replacement failed" : "Activation failed",
+        );
+        connectDetail.textContent = failure;
+      } catch {
+        setHealthValue(connectHealth, false, "Activation failed");
+        connectDetail.textContent = failure;
+        connectActivate.hidden = false;
+      }
     }
   } finally {
     connectInstalling = false;

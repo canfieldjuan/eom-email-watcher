@@ -331,6 +331,33 @@ def test_source_destination_and_authority_boundaries_fail_closed(tmp_path: Path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_unusable_private_directory_mode_is_rejected_before_replacement(
+    tmp_path: Path,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(key, claims(expires_at="2028-01-01T00:00:00Z"))
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    source = tmp_path / "replacement.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    destination.parent.chmod(0o300)
+    try:
+        with pytest.raises(entitlement.EntitlementInstallError) as failure:
+            gate.install(source)
+        assert failure.value.code == entitlement.STORAGE_UNAVAILABLE
+        assert destination.read_bytes() == existing
+    finally:
+        destination.parent.chmod(0o700)
+
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
 def test_commit_time_revalidation_preserves_existing_entitlement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

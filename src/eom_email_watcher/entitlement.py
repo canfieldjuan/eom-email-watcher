@@ -466,7 +466,7 @@ def _ensure_private_directory(path: Path) -> None:
             if (
                 not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.geteuid()
-                or metadata.st_mode & 0o077
+                or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 raise _install_error(STORAGE_UNAVAILABLE) from None
     except OSError as exc:
@@ -479,7 +479,7 @@ def _ensure_private_directory(path: Path) -> None:
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
+        or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise _install_error(STORAGE_UNAVAILABLE)
 
