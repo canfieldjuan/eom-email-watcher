@@ -12,6 +12,8 @@ use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+#[cfg(desktop)]
+use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
@@ -24,6 +26,8 @@ const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 const TRAY_OPEN_ID: &str = "open";
 #[cfg(desktop)]
 const TRAY_QUIT_ID: &str = "quit";
+#[cfg(desktop)]
+const AUTOSTART_BACKGROUND_ARG: &str = "--background";
 
 #[cfg(desktop)]
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +44,16 @@ fn tray_menu_action(id: &str) -> TrayMenuAction {
         TRAY_QUIT_ID => TrayMenuAction::Quit,
         _ => TrayMenuAction::Ignore,
     }
+}
+
+#[cfg(desktop)]
+fn starts_in_background<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .any(|arg| arg.as_ref() == OsStr::new(AUTOSTART_BACKGROUND_ARG))
 }
 
 #[cfg(desktop)]
@@ -81,6 +95,117 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     }
     tray.build(app)?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct AutostartStatus {
+    available: bool,
+    enabled: bool,
+}
+
+#[cfg(desktop)]
+#[derive(Debug, PartialEq, Eq)]
+enum AutostartUpdateError {
+    Write,
+    ReadBack,
+    NotApplied,
+}
+
+#[cfg(desktop)]
+fn apply_autostart_update<E>(
+    enabled: bool,
+    update: impl FnOnce(bool) -> Result<(), E>,
+    inspect: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, AutostartUpdateError> {
+    update(enabled).map_err(|_| AutostartUpdateError::Write)?;
+    let actual = inspect().map_err(|_| AutostartUpdateError::ReadBack)?;
+    if actual != enabled {
+        return Err(AutostartUpdateError::NotApplied);
+    }
+    Ok(actual)
+}
+
+#[tauri::command]
+fn autostart_get(app: AppHandle) -> Result<AutostartStatus, EngineError> {
+    #[cfg(desktop)]
+    {
+        let Some(manager) = app.try_state::<tauri_plugin_autostart::AutoLaunchManager>() else {
+            return Ok(AutostartStatus {
+                available: false,
+                enabled: false,
+            });
+        };
+        let enabled = manager.is_enabled().map_err(|_| {
+            EngineError::host(
+                "autostart_unavailable",
+                "Start-on-login status could not be read",
+            )
+        })?;
+        Ok(AutostartStatus {
+            available: true,
+            enabled,
+        })
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Ok(AutostartStatus {
+            available: false,
+            enabled: false,
+        })
+    }
+}
+
+#[tauri::command]
+fn autostart_set(app: AppHandle, enabled: bool) -> Result<AutostartStatus, EngineError> {
+    #[cfg(desktop)]
+    {
+        let manager = app
+            .try_state::<tauri_plugin_autostart::AutoLaunchManager>()
+            .ok_or_else(|| {
+                EngineError::host(
+                    "autostart_unavailable",
+                    "Start on login is unavailable on this installation",
+                )
+            })?;
+        let actual = apply_autostart_update(
+            enabled,
+            |requested| {
+                if requested {
+                    manager.enable()
+                } else {
+                    manager.disable()
+                }
+            },
+            || manager.is_enabled(),
+        )
+        .map_err(|error| match error {
+            AutostartUpdateError::Write => EngineError::host(
+                "autostart_update_failed",
+                "Start-on-login setting could not be updated",
+            ),
+            AutostartUpdateError::ReadBack => EngineError::host(
+                "autostart_unavailable",
+                "Start-on-login status could not be verified",
+            ),
+            AutostartUpdateError::NotApplied => EngineError::host(
+                "autostart_update_failed",
+                "Start-on-login setting did not reach the requested state",
+            ),
+        })?;
+        Ok(AutostartStatus {
+            available: true,
+            enabled: actual,
+        })
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, enabled);
+        Err(EngineError::host(
+            "autostart_unsupported",
+            "Start on login is not supported on this platform",
+        ))
+    }
 }
 
 #[derive(Serialize)]
@@ -413,10 +538,14 @@ async fn watchlist_remove(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(desktop)]
+    let launch_in_background = starts_in_background(std::env::args_os());
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        show_main_window(app);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        if !starts_in_background(args.iter()) {
+            show_main_window(app);
+        }
     }));
     #[cfg(desktop)]
     let builder = builder.on_window_event(|window, event| {
@@ -433,9 +562,23 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(desktop)]
             install_tray(app)?;
+            #[cfg(desktop)]
+            if let Err(error) = app.handle().plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                Some(vec![AUTOSTART_BACKGROUND_ARG]),
+            )) {
+                eprintln!("watcher start-on-login support is unavailable: {error}");
+            }
+            #[cfg(desktop)]
+            if launch_in_background
+                && let Some(window) = app.get_webview_window("main")
+                && let Err(error) = window.hide()
+            {
+                eprintln!("watcher main window could not start hidden: {error}");
+            }
             let engine = Engine::for_app(app.handle())?;
             let delivery = NotificationDelivery::default();
             let exports = AttachmentExports {
@@ -493,6 +636,8 @@ pub fn run() {
             attachment_capabilities,
             attachment_capability_invoke,
             attachment_open,
+            autostart_get,
+            autostart_set,
             capability_output_export,
             capability_output_present,
             config_initialize,
@@ -520,5 +665,43 @@ mod tests {
         assert_eq!(tray_menu_action(TRAY_OPEN_ID), TrayMenuAction::Open);
         assert_eq!(tray_menu_action(TRAY_QUIT_ID), TrayMenuAction::Quit);
         assert_eq!(tray_menu_action("unexpected"), TrayMenuAction::Ignore);
+    }
+
+    #[test]
+    fn background_launch_requires_the_exact_argument() {
+        assert!(starts_in_background(["email-watcher", "--background"]));
+        assert!(!starts_in_background(["email-watcher"]));
+        assert!(!starts_in_background([
+            "email-watcher",
+            "--background=true"
+        ]));
+        assert!(!starts_in_background([
+            "email-watcher",
+            "prefix--background"
+        ]));
+    }
+
+    #[test]
+    fn autostart_update_verifies_the_persisted_state() {
+        assert_eq!(
+            apply_autostart_update(true, |_| Ok::<_, ()>(()), || Ok(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            apply_autostart_update(false, |_| Ok::<_, ()>(()), || Ok(false)),
+            Ok(false)
+        );
+        assert_eq!(
+            apply_autostart_update(true, |_| Ok::<_, ()>(()), || Ok(false)),
+            Err(AutostartUpdateError::NotApplied)
+        );
+        assert_eq!(
+            apply_autostart_update(true, |_| Err::<(), _>(()), || Ok(true)),
+            Err(AutostartUpdateError::Write)
+        );
+        assert_eq!(
+            apply_autostart_update(true, |_| Ok::<_, ()>(()), || Err(())),
+            Err(AutostartUpdateError::ReadBack)
+        );
     }
 }
