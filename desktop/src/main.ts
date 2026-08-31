@@ -229,6 +229,11 @@ interface ConfigInitialization {
   settings: WatcherSettings;
 }
 
+interface AutostartStatus {
+  available: boolean;
+  enabled: boolean;
+}
+
 function requiredElement<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
   if (!element) throw new Error(`Required element is missing: ${selector}`);
@@ -369,6 +374,11 @@ app.innerHTML = `
           <input id="notifications-enabled" name="notificationsEnabled" type="checkbox" />
           <span>Deliver native notifications</span>
         </label>
+        <label class="settings-toggle">
+          <input id="start-at-login" name="startAtLogin" type="checkbox" disabled />
+          <span>Start Email Watcher when I sign in</span>
+        </label>
+        <p id="autostart-settings-note" class="settings-note">Checking start-on-login status…</p>
         <p class="settings-note">Polling cadence changes apply after the app restarts. Retention and notification changes apply on later watcher operations.</p>
         <button type="submit">Save settings</button>
       </form>
@@ -425,6 +435,10 @@ const retentionDaysInput = requiredElement<HTMLInputElement>("#retention-days");
 const notificationsEnabledInput = requiredElement<HTMLInputElement>(
   "#notifications-enabled",
 );
+const autostartEnabledInput = requiredElement<HTMLInputElement>("#start-at-login");
+const autostartSettingsNote = requiredElement<HTMLParagraphElement>(
+  "#autostart-settings-note",
+);
 const settingsStatus = requiredElement<HTMLParagraphElement>("#settings-status");
 let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
@@ -445,6 +459,8 @@ const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
 let settingsInFlight = false;
+let autostartInFlight = false;
+let autostartAvailable = false;
 let localModelSettingsEditable = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
@@ -1509,6 +1525,7 @@ function startConfiguredDesktop(): void {
   settingsForm.hidden = false;
   void loadInbox();
   void loadHealth();
+  void loadAutostart();
   void loadSenders().then((loaded) => {
     if (loaded) finishOperation();
   });
@@ -1565,14 +1582,70 @@ configInitializeForm.addEventListener("submit", (event) => {
   })();
 });
 
-function setSettingsBusy(busy: boolean): void {
-  settingsInFlight = busy;
+function refreshSettingsControls(): void {
+  const busy = settingsInFlight || autostartInFlight;
   for (const control of settingsForm.elements) {
     if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
       const managedModelSetting =
         control === modelEndpointInput || control === modelNameInput;
-      control.disabled = busy || (managedModelSetting && !localModelSettingsEditable);
+      const managedAutostartSetting = control === autostartEnabledInput;
+      control.disabled =
+        busy ||
+        (managedModelSetting && !localModelSettingsEditable) ||
+        (managedAutostartSetting && !autostartAvailable);
     }
+  }
+}
+
+function setSettingsBusy(busy: boolean): void {
+  settingsInFlight = busy;
+  refreshSettingsControls();
+}
+
+function setAutostartBusy(busy: boolean): void {
+  autostartInFlight = busy;
+  refreshSettingsControls();
+}
+
+function renderAutostart(status: AutostartStatus): void {
+  autostartAvailable = status.available;
+  autostartEnabledInput.checked = status.enabled;
+  if (!status.available) {
+    autostartSettingsNote.textContent = "Start on login is unavailable on this installation.";
+  } else {
+    autostartSettingsNote.textContent = status.enabled
+      ? "Email Watcher will start in the tray after you sign in."
+      : "Start on login is off.";
+  }
+}
+
+async function loadAutostart(): Promise<void> {
+  if (autostartInFlight) return;
+  setAutostartBusy(true);
+  autostartSettingsNote.textContent = "Checking start-on-login status…";
+  try {
+    renderAutostart(await invoke<AutostartStatus>("autostart_get"));
+  } catch (error) {
+    autostartAvailable = false;
+    autostartSettingsNote.textContent = errorMessage(error);
+  } finally {
+    setAutostartBusy(false);
+  }
+}
+
+async function updateAutostart(enabled: boolean): Promise<void> {
+  if (!autostartAvailable || autostartInFlight || settingsInFlight) return;
+  setAutostartBusy(true);
+  autostartSettingsNote.textContent = enabled
+    ? "Enabling start on login…"
+    : "Disabling start on login…";
+  try {
+    renderAutostart(await invoke<AutostartStatus>("autostart_set", { enabled }));
+  } catch (error) {
+    autostartEnabledInput.checked = !enabled;
+    autostartSettingsNote.textContent = errorMessage(error);
+  } finally {
+    setAutostartBusy(false);
   }
 }
 
@@ -1757,7 +1830,10 @@ healthTab.addEventListener("click", () => {
 });
 settingsTab.addEventListener("click", () => {
   showView("settings");
-  if (configurationReady) void loadSettings();
+  if (configurationReady) void Promise.all([loadSettings(), loadAutostart()]);
+});
+autostartEnabledInput.addEventListener("change", () => {
+  void updateAutostart(autostartEnabledInput.checked);
 });
 checkNow.addEventListener("click", () => void runCheck());
 gmailAuthorize.addEventListener("click", () => void authorizeGmail());
