@@ -499,6 +499,7 @@ def main() -> None:
                 if item["provider"]["app_id"] == REFERENCE_APP_ID
                 and item["capability"]["id"] == INSPECT_CAPABILITY_ID
                 and item["capability"]["version"] == "1.0"
+                and item["capability"]["produces"] == [INSPECT_OUTPUT_MEDIA_TYPE]
             ]
             if len(translation_choices) != 1 or len(inspection_choices) != 1:
                 raise RuntimeError(
@@ -904,6 +905,14 @@ def main() -> None:
                 ),
                 "unknown_output_uses_safe_path": (
                     inspection_output["media_type"] == INSPECT_OUTPUT_MEDIA_TYPE
+                    and set(inspection_output)
+                    == {
+                        "artifact_id",
+                        "media_type",
+                        "display_name",
+                        "byte_size",
+                        "sha256",
+                    }
                     and inspection_presentation
                     == {
                         "data": {
