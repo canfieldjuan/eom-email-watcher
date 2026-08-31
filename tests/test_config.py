@@ -38,10 +38,10 @@ name = "Trusted Person"
     path.write_text(
         f'''model_base_url = "{base_url}"
 model_name = "local-model"
-model_api_token_file = "{path.parent / "lm-token"}"
-database_file = "{path.parent / "db.sqlite3"}"
-gmail_credentials_file = "{path.parent / "credentials.json"}"
-gmail_token_file = "{path.parent / "token.json"}"
+model_api_token_file = "{(path.parent / "lm-token").as_posix()}"
+database_file = "{(path.parent / "db.sqlite3").as_posix()}"
+gmail_credentials_file = "{(path.parent / "credentials.json").as_posix()}"
+gmail_token_file = "{(path.parent / "token.json").as_posix()}"
 {extra}
 {sender}
 ''',

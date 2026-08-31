@@ -1054,7 +1054,13 @@ def test_unsupported_platform_is_reported_before_production_check(
         return FakeGmail()
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
-    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda: False)
+    checked_lock_paths: list[Path] = []
+
+    def operation_lock_unsupported(lock_path: Path) -> bool:
+        checked_lock_paths.append(lock_path)
+        return False
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", operation_lock_unsupported)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
 
     health = engine_api._response(request(config_path, "health.get"))
@@ -1065,6 +1071,10 @@ def test_unsupported_platform_is_reported_before_production_check(
     assert health["data"]["notifications"]["host_delivery_ready"] is False
     assert settings["data"]["polling_supported"] is False
     assert checked["error"]["code"] == "unsupported_platform"
+    expected_lock_path = loaded.config.database_file.with_name(
+        f"{loaded.config.database_file.name}.check.lock"
+    )
+    assert checked_lock_paths == [expected_lock_path, expected_lock_path, expected_lock_path]
     assert gmail_calls == 0
     assert loaded.store.state()[0] == "100"
 

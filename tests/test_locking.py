@@ -24,8 +24,17 @@ except RuntimeError as exc:
 """
 
 
-def test_native_operation_lock_is_available() -> None:
-    assert locking.operation_lock_supported() is True
+def test_native_operation_lock_is_available(tmp_path: Path) -> None:
+    assert locking.operation_lock_supported(tmp_path / "watcher.lock") is True
+
+
+def test_support_probe_does_not_require_or_create_first_run_directory(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "not-created-yet" / "watcher.lock"
+
+    assert locking.operation_lock_supported(lock_path) is True
+    assert list(tmp_path.iterdir()) == []
 
 
 def _probe_lock(lock_path: Path) -> int:
@@ -61,7 +70,7 @@ def test_soft_lock_fallback_is_not_advertised_or_used(
     monkeypatch.setattr(locking, "FileLock", locking.SoftFileLock)
     lock_path = tmp_path / "watcher.lock"
 
-    assert locking.operation_lock_supported() is False
+    assert locking.operation_lock_supported(lock_path) is False
     with (
         pytest.raises(RuntimeError, match="not available"),
         locking.operation_lock(lock_path, "watcher busy"),
@@ -70,17 +79,25 @@ def test_soft_lock_fallback_is_not_advertised_or_used(
     assert not lock_path.exists()
 
 
-def test_runtime_soft_lock_fallback_is_released_and_rejected(
+def test_runtime_soft_lock_fallback_is_not_advertised_or_used(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    probe_paths: list[Path] = []
+
+    def soft_lock(path: Path, *args, **kwargs):
+        probe_paths.append(Path(path))
+        return locking.SoftFileLock(path, *args, **kwargs)
+
     monkeypatch.setattr(
         locking,
         "FileLock",
-        lambda *args, **kwargs: locking.SoftFileLock(*args, **kwargs),
+        soft_lock,
     )
     lock_path = tmp_path / "watcher.lock"
 
-    assert locking.operation_lock_supported() is True
+    assert locking.operation_lock_supported(lock_path) is False
+    assert probe_paths[0].parent.parent == tmp_path
+    assert not probe_paths[0].parent.exists()
     with (
         pytest.raises(RuntimeError, match="not available"),
         locking.operation_lock(lock_path, "watcher busy"),
