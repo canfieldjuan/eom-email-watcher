@@ -11,6 +11,9 @@ from eom_email_watcher import connect
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from connect_reference_provider import (  # noqa: E402
+    INSPECT_CAPABILITY_ID,
+    INSPECT_OUTPUT_MEDIA_TYPE,
+    INSPECT_PAYLOAD,
     REFERENCE_APP_ID,
     SUMMARY_CAPABILITY_ID,
     TRANSLATE_CAPABILITY_ID,
@@ -28,6 +31,7 @@ def test_reference_provider_is_discoverable_generic_and_idempotent(tmp_path) -> 
             item.capability_id: item for item in catalog.items if item.app_id == REFERENCE_APP_ID
         }
         assert set(capabilities) == {
+            INSPECT_CAPABILITY_ID,
             SUMMARY_CAPABILITY_ID,
             TRANSLATE_CAPABILITY_ID,
         }
@@ -64,6 +68,20 @@ def test_reference_provider_is_discoverable_generic_and_idempotent(tmp_path) -> 
         with pytest.raises(connect.ConnectError) as conflict:
             client.submit(changed, content + b"changed")
         assert conflict.value.code == "JOB_CONFLICT"
+
+        inspect_capability = capabilities[INSPECT_CAPABILITY_ID]
+        inspect_job = connect.prepare_capability_job(
+            inspect_capability,
+            content,
+            "application/pdf",
+            "received.pdf",
+        )
+        inspection = connect.ConnectV2Client(inspect_capability).submit(inspect_job, content)
+        assert inspection.result is not None
+        assert inspection.result.outputs[0].media_type == INSPECT_OUTPUT_MEDIA_TYPE
+        assert inspection.result.outputs[0].display_name == "../../reference-inspection.json"
+        assert inspection.result.outputs[0].payload == INSPECT_PAYLOAD
+        assert provider.submission_count(inspect_job.job_id) == 1
     finally:
         provider.stop()
 

@@ -18,6 +18,9 @@ from uuid import UUID, uuid4
 REFERENCE_APP_ID = "connect-reference-provider"
 SUMMARY_CAPABILITY_ID = "document.summarize"
 TRANSLATE_CAPABILITY_ID = "document.translate"
+INSPECT_CAPABILITY_ID = "document.inspect"
+INSPECT_OUTPUT_MEDIA_TYPE = "application/vnd.local-connect.inspection+json"
+INSPECT_PAYLOAD = b"opaque-reference-output-must-not-reach-the-dom"
 MAX_INPUT_BYTES = 50 * 1024 * 1024
 
 
@@ -30,6 +33,7 @@ def _capability(
     label: str,
     *,
     parameters: list[dict[str, object]] | None = None,
+    output_media_type: str = "text/plain",
 ) -> dict[str, object]:
     return {
         "id": capability_id,
@@ -39,7 +43,7 @@ def _capability(
             "description": f"{label} this PDF with the deterministic reference provider.",
         },
         "accepts": [{"media_type": "application/pdf", "max_bytes": MAX_INPUT_BYTES}],
-        "produces": ["text/plain"],
+        "produces": [output_media_type],
         "parameters": parameters or [],
         "effects": {"external": False, "confirmation_required": False},
     }
@@ -59,6 +63,11 @@ CAPABILITIES = (
                 "description": "Language to produce.",
             }
         ],
+    ),
+    _capability(
+        INSPECT_CAPABILITY_ID,
+        "Reference inspection",
+        output_media_type=INSPECT_OUTPUT_MEDIA_TYPE,
     ),
 )
 
@@ -198,7 +207,12 @@ class _Handler(BaseHTTPRequestHandler):
             or not isinstance(job_id, str)
             or not _uuid4(job_id)
             or not isinstance(capability, dict)
-            or capability.get("id") not in {SUMMARY_CAPABILITY_ID, TRANSLATE_CAPABILITY_ID}
+            or capability.get("id")
+            not in {
+                SUMMARY_CAPABILITY_ID,
+                TRANSLATE_CAPABILITY_ID,
+                INSPECT_CAPABILITY_ID,
+            }
             or capability.get("version") != "1.0"
             or not isinstance(inputs, list)
             or len(inputs) != 1
@@ -232,14 +246,24 @@ class _Handler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("Capability parameters are invalid.")
             output = f"Reference translation target: {parameters['target-language']}.\n".encode()
-        else:
+            output_media_type = "text/plain"
+            display_name = "reference-translation.txt"
+        elif capability_id == SUMMARY_CAPABILITY_ID:
             if parameters != {}:
                 raise ValueError("Capability parameters are invalid.")
             output = b"Reference summary completed locally.\n"
+            output_media_type = "text/plain"
+            display_name = "reference-summary.txt"
+        else:
+            if parameters != {}:
+                raise ValueError("Capability parameters are invalid.")
+            output = INSPECT_PAYLOAD
+            output_media_type = INSPECT_OUTPUT_MEDIA_TYPE
+            display_name = "../../reference-inspection.json"
         output_artifact = {
             "artifact_id": str(uuid4()),
-            "media_type": "text/plain",
-            "display_name": "reference-result.txt",
+            "media_type": output_media_type,
+            "display_name": display_name,
             "byte_size": len(output),
             "sha256": hashlib.sha256(output).hexdigest(),
             "payload_base64": base64.b64encode(output).decode("ascii"),
