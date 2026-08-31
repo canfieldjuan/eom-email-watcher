@@ -284,6 +284,7 @@ name = "eom-email-watcher"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "filelock" },
     { name = "google-api-python-client" },
     { name = "google-auth-oauthlib" },
@@ -302,6 +303,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=45,<50" },
     { name = "filelock", specifier = ">=3.18,<4" },
     { name = "google-api-python-client", specifier = ">=2.179,<3" },
     { name = "google-auth-oauthlib", specifier = ">=1.2,<2" },

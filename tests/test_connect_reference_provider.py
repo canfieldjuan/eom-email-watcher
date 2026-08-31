@@ -21,6 +21,15 @@ from connect_reference_provider import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.ACTIVE,
+    )
+
+
 def test_reference_provider_is_discoverable_generic_and_idempotent(tmp_path) -> None:
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir(mode=0o700)

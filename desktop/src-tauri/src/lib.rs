@@ -148,6 +148,8 @@ async fn attachment_capabilities(
 }
 
 #[tauri::command]
+// Tauri deserializes these named fields directly from the frozen frontend command.
+#[allow(clippy::too_many_arguments)]
 async fn attachment_capability_invoke(
     engine: State<'_, Engine>,
     request_id: String,

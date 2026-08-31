@@ -955,6 +955,8 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         if existing.status == "failed":
             raise _stored_connect_failure(existing)
 
+    connect.require_connect_entitlement()
+
     capability, parameters = _discover_selected_generic_capability(
         provider_ref,
         capability_ref,
@@ -1081,6 +1083,8 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     )
     if completed is not None:
         return _connect_result(completed)
+
+    connect.require_connect_entitlement()
 
     active = runtime.store.active_connect_job(
         message_id=message_id,
