@@ -196,7 +196,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     if not dry_run and not operation_lock_supported():
         raise ApiError(
             "unsupported_platform",
-            "Production watcher checks require POSIX operation locking",
+            "Production watcher checks require native operation locking",
         )
 
     lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")

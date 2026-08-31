@@ -26,6 +26,10 @@ def write_config(
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
+    credentials_file = (path.parent / "credentials.json").as_posix()
+    token_file = (path.parent / "token.json").as_posix()
+    send_token_file = (path.parent / "send-token.json").as_posix()
+    database_file = (path.parent / "watcher.sqlite3").as_posix()
     senders = (
         '''[[senders]]
 email = "z@example.com"
@@ -40,10 +44,10 @@ name = "Trusted A"
     )
     path.write_text(
         f'''timezone = "{timezone}"
-gmail_credentials_file = "{path.parent / "credentials.json"}"
-gmail_token_file = "{path.parent / "token.json"}"
-gmail_send_token_file = "{path.parent / "send-token.json"}"
-database_file = "{path.parent / "watcher.sqlite3"}"
+gmail_credentials_file = "{credentials_file}"
+gmail_token_file = "{token_file}"
+gmail_send_token_file = "{send_token_file}"
+database_file = "{database_file}"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false

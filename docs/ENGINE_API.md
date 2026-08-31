@@ -181,10 +181,10 @@ watchlist, health, or normal watcher operations.
 The v1 `connect.capabilities` and `connect.attachment.summarize` operations remain for compatibility
 with the existing Linux/EOM path; new desktop capability actions use the generic v2 operations.
 
-Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
-`production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A
-future Windows host must add an equivalent lock before enabling production checks; dry-run and
-read-only operations remain available meanwhile.
+Non-dry `watcher.check` requires the native hard-lock backend selected by `filelock`. Linux/macOS
+use the platform `flock` implementation and Windows uses its native file-lock implementation.
+`health.get` reports `production_check_supported` and keeps `host_delivery_ready` false if only the
+soft fallback is available; dry-run and read-only operations remain available meanwhile.
 
 ## Native notification handoff
 
