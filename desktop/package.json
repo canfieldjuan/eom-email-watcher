@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "build:sidecar": "uv run --project .. python ../scripts/build_desktop_sidecar.py",
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri"

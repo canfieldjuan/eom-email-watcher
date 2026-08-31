@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.canfieldjuan.email-watcher",
   "build": {
-    "beforeDevCommand": "../scripts/build-desktop-sidecar.sh && pnpm dev",
+    "beforeDevCommand": "pnpm build:sidecar && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build && ../scripts/build-desktop-sidecar.sh",
+    "beforeBuildCommand": "pnpm build && pnpm build:sidecar",
     "frontendDist": "../dist"
   },
   "app": {
