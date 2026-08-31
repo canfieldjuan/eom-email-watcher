@@ -176,7 +176,7 @@ CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \
 ```
 
 That check reads entitlement fixtures from Git revision
-`3aef9c78186dca29949c10e4fc129d12ab932cf6`.
+`3851b4c55901ef18470c63b92a99a8348e2f1459`.
 
 ## Two-hour user timer
 

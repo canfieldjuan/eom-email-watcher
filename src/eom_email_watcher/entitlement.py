@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import stat
 import sys
@@ -151,7 +152,7 @@ def _load_bundled_keyring() -> MappingProxyType[str, bytes] | None:
 def _parse_keyring(content: bytes) -> MappingProxyType[str, bytes]:
     if not content or len(content) > MAX_KEYRING_BYTES:
         raise ValueError("Connect entitlement key ring is empty or oversized")
-    document = _Keyring.model_validate_json(content)
+    document = _Keyring.model_validate(_strict_json_object(content))
     keys: dict[str, bytes] = {}
     for item in document.keys:
         public_key = _decode_base64url(item.public_key_base64url, PUBLIC_KEY_BYTES)
@@ -159,6 +160,22 @@ def _parse_keyring(content: bytes) -> MappingProxyType[str, bytes]:
             raise ValueError("Connect entitlement key ring is invalid")
         keys[item.key_id] = public_key
     return MappingProxyType(keys)
+
+
+def _reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, child in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object member: {key}")
+        value[key] = child
+    return value
+
+
+def _strict_json_object(content: bytes) -> dict[str, object]:
+    document = json.loads(content, object_pairs_hook=_reject_duplicate_members)
+    if not isinstance(document, dict):
+        raise ValueError("Connect entitlement JSON must be an object")
+    return document
 
 
 def _decode_base64url(value: str, max_bytes: int) -> bytes:
@@ -192,7 +209,7 @@ def _evaluate_entitlement(
     if not content or len(content) > MAX_ENTITLEMENT_BYTES or now.tzinfo is None:
         return EntitlementDecision.INVALID
     try:
-        envelope = _Envelope.model_validate_json(content)
+        envelope = _Envelope.model_validate(_strict_json_object(content))
         payload = _decode_base64url(
             envelope.payload_base64url,
             MAX_PAYLOAD_BASE64URL_CHARS * 3 // 4,
@@ -204,7 +221,7 @@ def _evaluate_entitlement(
         if public_key is None:
             return EntitlementDecision.INVALID
         Ed25519PublicKey.from_public_bytes(public_key).verify(signature, payload)
-        claims = _Claims.model_validate_json(payload)
+        claims = _Claims.model_validate(_strict_json_object(payload))
         if len(set(claims.features)) != len(claims.features):
             return EntitlementDecision.INVALID
         issued_at = _parse_utc(claims.issued_at)

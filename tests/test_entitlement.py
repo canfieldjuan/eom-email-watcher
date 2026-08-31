@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from eom_email_watcher import entitlement
 
-CONTRACTS_REVISION = "3aef9c78186dca29949c10e4fc129d12ab932cf6"
+CONTRACTS_REVISION = "3851b4c55901ef18470c63b92a99a8348e2f1459"
 
 
 def encoded(value: bytes) -> str:
@@ -57,6 +57,14 @@ def signed_license(
     key_id: str = "test-key",
 ) -> bytes:
     payload = json.dumps(payload_claims, separators=(",", ":")).encode()
+    return signed_payload(key, payload, key_id)
+
+
+def signed_payload(
+    key: Ed25519PrivateKey,
+    payload: bytes,
+    key_id: str = "test-key",
+) -> bytes:
     return json.dumps(
         {
             "format_version": 1,
@@ -105,6 +113,28 @@ def test_signature_feature_and_exact_time_boundaries(tmp_path: Path) -> None:
     path.write_text(json.dumps(tampered), encoding="utf-8")
     path.chmod(0o600)
     assert decision("2026-08-31T00:00:00Z") is entitlement.EntitlementDecision.INVALID
+
+
+def test_duplicate_claim_members_are_rejected_before_authorization(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    payload = (
+        b'{"format_version":1,'
+        b'"entitlement_id":"11111111-1111-4111-8111-111111111111",'
+        b'"subject":"test-customer",'
+        b'"features":["document.local_processing"],'
+        b'"features":["connect.capability_exchange"],'
+        b'"issued_at":"2026-01-01T00:00:00Z",'
+        b'"not_before":"2026-01-01T00:00:00Z",'
+        b'"expires_at":"2027-01-01T00:00:00Z"}'
+    )
+    path = private_entitlement_path(tmp_path, signed_payload(key, payload))
+    gate = entitlement.EntitlementGate.for_test(
+        path,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    assert gate.decision() is entitlement.EntitlementDecision.INVALID
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix permission boundary")
