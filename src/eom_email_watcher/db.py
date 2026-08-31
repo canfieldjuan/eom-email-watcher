@@ -1663,7 +1663,7 @@ class Store:
                     invocation_fingerprint,
                     input_artifact_id, input_media_type, input_byte_size, input_sha256,
                     input_display_name, source_app_id,
-                    NULL AS request_json, status,
+                    request_json, status,
                     output_artifact_id, output_media_type, output_byte_size, output_sha256,
                     summary_version, summary_text, warnings_json,
                     NULL AS result_json, result_metadata_json,
@@ -1675,12 +1675,13 @@ class Store:
                         provider_app_id, provider_app_version, provider_instance_id,
                         invocation_fingerprint,
                         input_artifact_id, input_media_type, input_byte_size, input_sha256,
-                        input_display_name, source_app_id, status,
+                        input_display_name, source_app_id, request_json, status,
                         output_artifact_id, output_media_type, output_byte_size, output_sha256,
                         summary_version, summary_text, warnings_json, result_metadata_json,
                         error_code, error_message, error_retryable, created_at, updated_at,
                         ROW_NUMBER() OVER (
-                        PARTITION BY message_id, part_id, capability_id, capability_version
+                        PARTITION BY message_id, part_id, protocol_version,
+                            capability_id, capability_version, invocation_fingerprint
                         ORDER BY created_at DESC, rowid DESC
                         ) AS recency
                     FROM connect_attachment_jobs
@@ -1706,18 +1707,24 @@ class Store:
                 str(row["capability_version"]),
             )
             item: dict[str, object] = {
+                "job_id": str(row["job_id"]),
                 "capability_id": key[2],
                 "capability_version": key[3],
                 "status": str(row["status"]),
                 "updated_at": str(row["updated_at"]),
             }
             if int(row["protocol_version"]) == 2:
+                request_json = row["request_json"]
+                if not isinstance(request_json, bytes):
+                    raise RuntimeError("Connect v2 job is missing its durable request")
+                request = _decode_v2_request(request_json)
                 item["protocol_version"] = 2
                 item["provider"] = {
                     "app_id": str(row["provider_app_id"]),
                     "version": str(row["provider_app_version"]),
                     "instance_id": str(row["provider_instance_id"]),
                 }
+                item["parameters"] = _canonical_v2_parameters(request.get("parameters"))
             if row["status"] == "completed":
                 completed = self._connect_job(row)
                 if completed.protocol_version == 1:

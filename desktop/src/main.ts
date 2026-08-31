@@ -28,19 +28,62 @@ interface ConnectSummary {
 }
 
 interface AttachmentCapabilityResult {
+  job_id?: string;
   capability_id: string;
   capability_version: string;
+  protocol_version?: number;
+  provider?: ConnectProviderIdentity;
+  parameters?: Record<string, string | number | boolean>;
   status: "requested" | "accepted" | "processing" | "completed" | "failed";
   updated_at: string;
   summary: ConnectSummary | null;
+  outputs?: ConnectOutputMetadata[];
   error: { code: string; message: string } | null;
 }
 
-interface ConnectCapability {
+interface ConnectProviderIdentity {
+  app_id: string;
+  version: string;
+  instance_id: string;
+}
+
+interface ConnectProvider extends ConnectProviderIdentity {
+  name: string;
+}
+
+interface ConnectCapabilityRef {
   id: string;
   version: string;
-  accepts: string[];
-  max_input_bytes: number;
+}
+
+interface ConnectParameter {
+  name: string;
+  value_type: "string" | "integer" | "boolean";
+  required: boolean;
+  label: string;
+  description: string;
+}
+
+interface ConnectCapabilityDeclaration extends ConnectCapabilityRef {
+  action: { label: string; description: string };
+  accepts: { media_type: string; max_bytes: number }[];
+  produces: string[];
+  parameters: ConnectParameter[];
+  effects: { external: boolean; confirmation_required: boolean };
+}
+
+interface ConnectCapability {
+  protocol_version: 2;
+  provider: ConnectProvider;
+  capability: ConnectCapabilityDeclaration;
+}
+
+interface ConnectOutputMetadata {
+  artifact_id: string;
+  media_type: string;
+  display_name: string;
+  byte_size: number;
+  sha256: string;
 }
 
 interface ConnectCapabilities {
@@ -48,12 +91,13 @@ interface ConnectCapabilities {
   diagnostic: { code: string } | null;
 }
 
-interface ConnectSummaryResult {
+interface ConnectInvocationResult {
+  protocol_version: 2;
   job_id: string;
-  capability_id: string;
-  capability_version: string;
+  provider: ConnectProviderIdentity;
+  capability: ConnectCapabilityRef;
   status: "completed";
-  summary: ConnectSummary;
+  outputs: ConnectOutputMetadata[];
 }
 
 interface InboxItem {
@@ -331,8 +375,10 @@ let gmailAuthorizationInFlight = false;
 let gmailConnected = false;
 let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
-let connectCapabilities: ConnectCapability[] = [];
-const attachmentSummariesInFlight = new Set<string>();
+const attachmentCapabilities = new Map<string, ConnectCapability[]>();
+const attachmentInvocationsInFlight = new Set<string>();
+const attachmentRequestIds = new Map<string, string>();
+let inboxRequestGeneration = 0;
 let settingsInFlight = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
@@ -404,24 +450,168 @@ function stateLabel(item: InboxItem): string {
   return "Waiting for analysis";
 }
 
-function summaryCapability(attachment: InboxAttachment): ConnectCapability | undefined {
-  return connectCapabilities.find(
-    (capability) =>
-      capability.id === "document.summarize" &&
-      capability.version === "1.0" &&
-      capability.accepts.includes(attachment.media_type.toLowerCase()) &&
-      attachment.byte_size > 0 &&
-      attachment.byte_size <= capability.max_input_bytes,
+function attachmentKey(messageId: string, partId: string): string {
+  return JSON.stringify([messageId, partId]);
+}
+
+function canonicalCapabilityParameters(
+  parameters: Record<string, string | number | boolean>,
+): string {
+  return JSON.stringify(
+    Object.entries(parameters).sort(([left], [right]) => left.localeCompare(right)),
   );
 }
 
-function attachmentSummary(
+function capabilityInvocationKey(
+  messageId: string,
+  partId: string,
+  provider: ConnectProviderIdentity,
+  capability: ConnectCapabilityRef,
+  parameters: Record<string, string | number | boolean>,
+): string {
+  return JSON.stringify([
+    messageId,
+    partId,
+    provider.app_id,
+    provider.version,
+    provider.instance_id,
+    capability.id,
+    capability.version,
+    canonicalCapabilityParameters(parameters),
+  ]);
+}
+
+function capabilityGroups(
+  messageId: string,
   attachment: InboxAttachment,
+): ConnectCapability[][] {
+  const groups = new Map<string, ConnectCapability[]>();
+  for (const capability of attachmentCapabilities.get(
+    attachmentKey(messageId, attachment.part_id),
+  ) ?? []) {
+    const key = JSON.stringify([
+      capability.capability.id,
+      capability.capability.version,
+    ]);
+    const providers = groups.get(key) ?? [];
+    providers.push(capability);
+    groups.set(key, providers);
+  }
+  return [...groups.values()];
+}
+
+function matchingCapabilityResult(
+  attachment: InboxAttachment,
+  selected: ConnectCapability,
+  parameters?: Record<string, string | number | boolean>,
 ): AttachmentCapabilityResult | undefined {
-  return (attachment.capability_results ?? []).find(
+  const matches = (attachment.capability_results ?? []).filter(
     (result) =>
-      result.capability_id === "document.summarize" && result.capability_version === "1.0",
+      result.protocol_version === 2 &&
+      result.provider?.app_id === selected.provider.app_id &&
+      result.provider.version === selected.provider.version &&
+      result.provider.instance_id === selected.provider.instance_id &&
+      result.capability_id === selected.capability.id &&
+      result.capability_version === selected.capability.version &&
+      (parameters === undefined ||
+        canonicalCapabilityParameters(result.parameters ?? {}) ===
+          canonicalCapabilityParameters(parameters)),
   );
+  return matches.find(activeCapabilityResult) ?? matches[0];
+}
+
+function activeCapabilityResult(result: AttachmentCapabilityResult | undefined): boolean {
+  return ["requested", "accepted", "processing"].includes(result?.status ?? "");
+}
+
+function collectCapabilityParameters(
+  capability: ConnectCapabilityDeclaration,
+  initial: Record<string, string | number | boolean> = {},
+): Record<string, string | number | boolean> | null {
+  const values: Record<string, string | number | boolean> = {};
+  for (const parameter of capability.parameters) {
+    const omission = parameter.required
+      ? "Cancel stops this action."
+      : "Cancel leaves this optional value unset.";
+    const raw = window.prompt(
+      `${parameter.label}\n${parameter.description}\nExpected ${parameter.value_type}. ${omission}`,
+      parameter.name in initial ? String(initial[parameter.name]) : "",
+    );
+    if (raw === null) {
+      if (parameter.required) return null;
+      continue;
+    }
+    if (parameter.value_type === "string") {
+      values[parameter.name] = raw;
+      continue;
+    }
+    if (parameter.value_type === "integer") {
+      if (!/^-?(0|[1-9]\d*)$/.test(raw)) {
+        throw new Error(`${parameter.label} must be a whole number.`);
+      }
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value)) {
+        throw new Error(`${parameter.label} is outside the supported number range.`);
+      }
+      values[parameter.name] = value;
+      continue;
+    }
+    const normalized = raw.trim().toLowerCase();
+    if (normalized !== "true" && normalized !== "false") {
+      throw new Error(`${parameter.label} must be true or false.`);
+    }
+    values[parameter.name] = normalized === "true";
+  }
+  return values;
+}
+
+function renderCapabilityResult(
+  row: HTMLLIElement,
+  result: AttachmentCapabilityResult,
+): void {
+  if (result.summary) {
+    const summary = document.createElement("div");
+    summary.className = "attachment-summary";
+    const label = document.createElement("strong");
+    label.textContent = "Document summary";
+    const text = document.createElement("p");
+    text.textContent = result.summary.text;
+    summary.append(label, text);
+    if (result.summary.warnings.length) {
+      const warnings = document.createElement("p");
+      warnings.className = "attachment-summary-warnings";
+      warnings.textContent = result.summary.warnings
+        .map((warning) => warning.message)
+        .join(" ");
+      summary.append(warnings);
+    }
+    row.append(summary);
+    return;
+  }
+
+  const presentation = document.createElement("div");
+  presentation.className =
+    result.status === "failed" ? "attachment-summary-error" : "attachment-summary";
+  const label = document.createElement("strong");
+  label.textContent = result.provider
+    ? `${result.capability_id} · ${result.provider.app_id}`
+    : result.capability_id;
+  presentation.append(label);
+  if (result.status === "completed") {
+    for (const output of result.outputs ?? []) {
+      const detail = document.createElement("p");
+      detail.textContent = `${output.display_name} · ${output.media_type} · ${output.byte_size.toLocaleString()} bytes`;
+      presentation.append(detail);
+    }
+  } else {
+    const detail = document.createElement("p");
+    detail.textContent =
+      result.status === "failed" && result.error
+        ? result.error.message
+        : `Local capability status: ${result.status}`;
+    presentation.append(detail);
+  }
+  row.append(presentation);
 }
 
 function renderInbox(items: InboxItem[]): void {
@@ -527,76 +717,162 @@ function renderInbox(items: InboxItem[]): void {
       actions.className = "attachment-actions";
       actions.append(openButton);
 
-      const existingSummary = attachmentSummary(attachment);
-      const capability = summaryCapability(attachment);
-      const summaryInvocationKey = JSON.stringify([item.message_id, attachment.part_id]);
-      const summaryInvocationInFlight = attachmentSummariesInFlight.has(
-        summaryInvocationKey,
-      );
-      const activeSummary = ["requested", "accepted", "processing"].includes(
-        existingSummary?.status ?? "",
-      );
-      if ((capability || activeSummary) && existingSummary?.status !== "completed") {
-        const summarizeButton = document.createElement("button");
-        summarizeButton.type = "button";
-        summarizeButton.textContent = activeSummary
-          ? "Resume summary"
-          : existingSummary?.status === "failed"
-            ? "Retry summary"
-            : "Summarize";
-        if (summaryInvocationInFlight) {
-          summarizeButton.disabled = true;
-          summarizeButton.textContent = "Summarizing…";
+      for (const result of attachment.capability_results ?? []) {
+        if (result.protocol_version !== 2 || !result.provider || !result.job_id) continue;
+        const key = capabilityInvocationKey(
+          item.message_id,
+          attachment.part_id,
+          result.provider,
+          { id: result.capability_id, version: result.capability_version },
+          result.parameters ?? {},
+        );
+        if (activeCapabilityResult(result)) attachmentRequestIds.set(key, result.job_id);
+        else attachmentRequestIds.delete(key);
+      }
+
+      for (const providers of capabilityGroups(item.message_id, attachment)) {
+        let selected = providers.length === 1 ? providers[0] : undefined;
+        let providerSelect: HTMLSelectElement | undefined;
+        if (providers.length > 1) {
+          providerSelect = document.createElement("select");
+          providerSelect.className = "capability-provider";
+          providerSelect.setAttribute(
+            "aria-label",
+            `Choose a provider for ${providers[0].capability.id}`,
+          );
+          const placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = "Choose provider…";
+          providerSelect.append(placeholder);
+          providers.forEach((provider, index) => {
+            const option = document.createElement("option");
+            option.value = String(index);
+            option.textContent = `${provider.provider.name} (${provider.provider.version}) · ${provider.provider.instance_id.slice(0, 8)}`;
+            providerSelect?.append(option);
+          });
+          actions.append(providerSelect);
         }
-        summarizeButton.addEventListener("click", async () => {
-          attachmentSummariesInFlight.add(summaryInvocationKey);
-          summarizeButton.disabled = true;
-          summarizeButton.textContent = "Summarizing…";
-          inboxStatus.textContent = `Summarizing ${attachment.filename} locally…`;
-          delete inboxStatus.dataset.kind;
+
+        const invokeButton = document.createElement("button");
+        invokeButton.type = "button";
+        const syncButton = (): void => {
+          if (!selected) {
+            invokeButton.disabled = true;
+            invokeButton.textContent = "Choose provider";
+            invokeButton.removeAttribute("title");
+            return;
+          }
+          const existing = matchingCapabilityResult(attachment, selected);
+          const key = capabilityInvocationKey(
+            item.message_id,
+            attachment.part_id,
+            selected.provider,
+            selected.capability,
+            existing?.parameters ?? {},
+          );
+          const active = activeCapabilityResult(existing);
+          const inFlight = attachmentInvocationsInFlight.has(key);
+          invokeButton.disabled = inFlight;
+          invokeButton.textContent = inFlight
+            ? `Running ${selected.capability.action.label}…`
+            : active
+              ? `Resume ${selected.capability.action.label}`
+              : selected.capability.action.label;
+          invokeButton.title = selected.capability.action.description;
+        };
+        providerSelect?.addEventListener("change", () => {
+          selected =
+            providerSelect?.value === ""
+              ? undefined
+              : providers[Number(providerSelect?.value)];
+          syncButton();
+        });
+        syncButton();
+        invokeButton.addEventListener("click", async () => {
+          const capability = selected;
+          if (!capability) return;
+          let parameters: Record<string, string | number | boolean> | null;
           try {
-            await invoke<ConnectSummaryResult>("attachment_summarize", {
-              messageId: item.message_id,
-              partId: attachment.part_id,
-            });
-            attachmentSummariesInFlight.delete(summaryInvocationKey);
-            await loadInbox();
-            inboxStatus.textContent = `Summary ready for ${attachment.filename}.`;
-            inboxStatus.dataset.kind = "success";
+            parameters = collectCapabilityParameters(
+              capability.capability,
+              matchingCapabilityResult(attachment, capability)?.parameters,
+            );
           } catch (error) {
-            attachmentSummariesInFlight.delete(summaryInvocationKey);
-            await loadInbox();
             inboxStatus.textContent = errorMessage(error);
             inboxStatus.dataset.kind = "error";
+            return;
+          }
+          if (parameters === null) return;
+          const requiresConfirmation =
+            capability.capability.effects.external ||
+            capability.capability.effects.confirmation_required;
+          const confirmed = requiresConfirmation
+            ? window.confirm(
+                `${capability.capability.action.label}\n${capability.capability.action.description}\n\nContinue with ${capability.provider.name}?`,
+              )
+            : false;
+          if (requiresConfirmation && !confirmed) return;
+
+          const key = capabilityInvocationKey(
+            item.message_id,
+            attachment.part_id,
+            capability.provider,
+            capability.capability,
+            parameters,
+          );
+          const active = matchingCapabilityResult(attachment, capability, parameters);
+          const requestId =
+            (activeCapabilityResult(active) ? active?.job_id : undefined) ??
+            attachmentRequestIds.get(key) ??
+            crypto.randomUUID();
+          attachmentRequestIds.set(key, requestId);
+          attachmentInvocationsInFlight.add(key);
+          invokeButton.disabled = true;
+          invokeButton.textContent = `Running ${capability.capability.action.label}…`;
+          inboxStatus.textContent = `Running ${capability.capability.action.label} for ${attachment.filename}…`;
+          delete inboxStatus.dataset.kind;
+          let result: ConnectInvocationResult | undefined;
+          let invocationError: unknown;
+          try {
+            result = await invoke<ConnectInvocationResult>(
+              "attachment_capability_invoke",
+              {
+                requestId,
+                messageId: item.message_id,
+                partId: attachment.part_id,
+                provider: {
+                  app_id: capability.provider.app_id,
+                  version: capability.provider.version,
+                  instance_id: capability.provider.instance_id,
+                },
+                capability: {
+                  id: capability.capability.id,
+                  version: capability.capability.version,
+                },
+                parameters,
+                confirmed,
+              },
+            );
+            attachmentRequestIds.delete(key);
+          } catch (error) {
+            invocationError = error;
           } finally {
-            attachmentSummariesInFlight.delete(summaryInvocationKey);
+            attachmentInvocationsInFlight.delete(key);
+          }
+          await loadInbox();
+          if (result) {
+            inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
+            inboxStatus.dataset.kind = "success";
+          } else {
+            inboxStatus.textContent = errorMessage(invocationError);
+            inboxStatus.dataset.kind = "error";
           }
         });
-        actions.append(summarizeButton);
+        actions.append(invokeButton);
       }
       row.append(attachmentDetails, actions);
-      if (existingSummary?.status === "completed" && existingSummary.summary) {
-        const result = document.createElement("div");
-        result.className = "attachment-summary";
-        const label = document.createElement("strong");
-        label.textContent = "Document summary";
-        const text = document.createElement("p");
-        text.textContent = existingSummary.summary.text;
-        result.append(label, text);
-        if (existingSummary.summary.warnings.length) {
-          const warnings = document.createElement("p");
-          warnings.className = "attachment-summary-warnings";
-          warnings.textContent = existingSummary.summary.warnings
-            .map((warning) => warning.message)
-            .join(" ");
-          result.append(warnings);
-        }
-        row.append(result);
-      } else if (existingSummary?.status === "failed" && existingSummary.error) {
-        const failure = document.createElement("p");
-        failure.className = "attachment-summary-error";
-        failure.textContent = existingSummary.error.message;
-        row.append(failure);
+      for (const result of attachment.capability_results ?? []) {
+        renderCapabilityResult(row, result);
       }
       attachments.append(row);
     }
@@ -641,29 +917,81 @@ function renderInbox(items: InboxItem[]): void {
   }
 }
 
+async function loadAttachmentCapabilities(
+  items: InboxItem[],
+): Promise<{ capabilities: Map<string, ConnectCapability[]>; unavailable: number }> {
+  const attachments = items.flatMap((item) =>
+    item.attachments.map((attachment) => ({
+      attachment,
+      messageId: item.message_id,
+    })),
+  );
+  const capabilities = new Map<string, ConnectCapability[]>();
+  const discoveries: PromiseSettledResult<ConnectCapabilities>[] = [];
+  const batchSize = 4;
+  for (let offset = 0; offset < attachments.length; offset += batchSize) {
+    const batch = attachments.slice(offset, offset + batchSize);
+    discoveries.push(
+      ...(await Promise.allSettled(
+        batch.map(({ attachment, messageId }) =>
+          invoke<ConnectCapabilities>("attachment_capabilities", {
+            messageId,
+            partId: attachment.part_id,
+          }),
+        ),
+      )),
+    );
+  }
+  let unavailable = 0;
+  discoveries.forEach((discovery, index) => {
+    const target = attachments[index];
+    const key = attachmentKey(target.messageId, target.attachment.part_id);
+    if (discovery.status === "fulfilled") {
+      capabilities.set(key, discovery.value.items);
+      if (discovery.value.diagnostic) unavailable += 1;
+    } else {
+      capabilities.set(key, []);
+      unavailable += 1;
+    }
+  });
+  return { capabilities, unavailable };
+}
+
 async function loadInbox(): Promise<void> {
+  const generation = ++inboxRequestGeneration;
+  let items: InboxItem[];
   try {
-    const [inboxResult, capabilityResult] = await Promise.allSettled([
-      invoke<InboxItem[]>("inbox_recent"),
-      invoke<ConnectCapabilities>("connect_capabilities"),
-    ]);
-    if (inboxResult.status === "rejected") throw inboxResult.reason;
-    const items = inboxResult.value;
-    const capabilities =
-      capabilityResult.status === "fulfilled"
-        ? capabilityResult.value
-        : { items: [], diagnostic: null };
-    connectCapabilities = capabilities.items;
-    renderInbox(items);
-    inboxStatus.textContent =
-      capabilities.diagnostic?.code === "ambiguous_provider"
-        ? "Document summary actions are unavailable while multiple compatible providers are running."
-        : "Showing the most recent watched messages.";
-    inboxStatus.dataset.kind = "success";
+    items = await invoke<InboxItem[]>("inbox_recent");
   } catch (error) {
-    connectCapabilities = [];
+    if (generation !== inboxRequestGeneration) return;
+    attachmentCapabilities.clear();
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
+    return;
+  }
+  if (generation !== inboxRequestGeneration) return;
+
+  attachmentCapabilities.clear();
+  renderInbox(items);
+  inboxStatus.textContent = "Showing recent messages while local capabilities refresh.";
+  delete inboxStatus.dataset.kind;
+  try {
+    const discovery = await loadAttachmentCapabilities(items);
+    if (generation !== inboxRequestGeneration) return;
+    for (const [key, capabilities] of discovery.capabilities) {
+      attachmentCapabilities.set(key, capabilities);
+    }
+    renderInbox(items);
+    inboxStatus.textContent = discovery.unavailable
+      ? "Showing recent messages. Some local capability providers are unavailable."
+      : "Showing the most recent watched messages.";
+    inboxStatus.dataset.kind = "success";
+  } catch (error) {
+    if (generation !== inboxRequestGeneration) return;
+    attachmentCapabilities.clear();
+    renderInbox(items);
+    inboxStatus.textContent = `Showing recent messages. Local capabilities could not refresh: ${errorMessage(error)}`;
+    inboxStatus.dataset.kind = "warning";
   }
 }
 
