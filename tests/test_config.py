@@ -1,4 +1,5 @@
 from pathlib import Path
+from zoneinfo import ZoneInfo, reset_tzpath
 
 import pytest
 
@@ -54,6 +55,20 @@ def test_config_normalizes_exact_sender(tmp_path: Path) -> None:
     config = load_config(path)
     assert config.allowlist == frozenset({"trusted@example.com"})
     assert normalize_address("Person <TRUSTED@example.com>") == "trusted@example.com"
+
+
+def test_packaged_tzdata_supports_default_zone_without_system_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    ZoneInfo.clear_cache()
+    reset_tzpath(())
+    try:
+        assert load_config(path).timezone == "America/Chicago"
+    finally:
+        reset_tzpath()
+        ZoneInfo.clear_cache()
 
 
 def test_remote_model_url_is_rejected(tmp_path: Path) -> None:

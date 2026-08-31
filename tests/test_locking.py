@@ -68,3 +68,22 @@ def test_soft_lock_fallback_is_not_advertised_or_used(
     ):
         raise AssertionError("unsupported locking must fail closed")
     assert not lock_path.exists()
+
+
+def test_runtime_soft_lock_fallback_is_released_and_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        locking,
+        "FileLock",
+        lambda *args, **kwargs: locking.SoftFileLock(*args, **kwargs),
+    )
+    lock_path = tmp_path / "watcher.lock"
+
+    assert locking.operation_lock_supported() is True
+    with (
+        pytest.raises(RuntimeError, match="not available"),
+        locking.operation_lock(lock_path, "watcher busy"),
+    ):
+        raise AssertionError("a runtime soft fallback must fail closed")
+    assert not lock_path.exists()

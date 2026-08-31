@@ -184,7 +184,9 @@ with the existing Linux/EOM path; new desktop capability actions use the generic
 Non-dry `watcher.check` requires the native hard-lock backend selected by `filelock`. Linux/macOS
 use the platform `flock` implementation and Windows uses its native file-lock implementation.
 `health.get` reports `production_check_supported` and keeps `host_delivery_ready` false if only the
-soft fallback is available; dry-run and read-only operations remain available meanwhile.
+soft fallback is available; dry-run and read-only operations remain available meanwhile. The
+runtime includes the first-party `tzdata` package so IANA configuration keys work on Windows hosts
+that do not provide a system timezone database.
 
 ## Native notification handoff
 

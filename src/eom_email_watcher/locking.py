@@ -23,6 +23,9 @@ def operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
         lock.acquire()
     except FileLockTimeout as exc:
         raise RuntimeError(busy_message) from exc
+    if isinstance(lock, SoftFileLock):
+        lock.release()
+        raise RuntimeError("Production operation locking is not available on this platform")
     try:
         yield
     finally:

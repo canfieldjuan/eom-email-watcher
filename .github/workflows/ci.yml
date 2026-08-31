@@ -33,6 +33,7 @@ jobs:
       - run: >-
           uv run pytest
           tests/test_locking.py
+          tests/test_config.py::test_packaged_tzdata_supports_default_zone_without_system_database
           tests/test_engine_api.py::test_read_operations_are_versioned_and_do_not_expose_token_paths
           tests/test_engine_api.py::test_check_defers_delivery_until_state_checked_ack
 
