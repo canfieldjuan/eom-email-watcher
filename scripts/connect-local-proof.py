@@ -843,8 +843,8 @@ def main() -> None:
             reference_inbox_results = reference_inbox_after_stop["data"]["items"][0]["attachments"][
                 0
             ]["capability_results"]
-            reference_result_ids = {
-                item["capability_id"]
+            reference_results_by_job = {
+                item["job_id"]: item
                 for item in reference_inbox_results
                 if item.get("provider", {}).get("app_id") == REFERENCE_APP_ID
             }
@@ -981,8 +981,43 @@ def main() -> None:
                 "reference_provider_submitted_once_per_job": (
                     translation_submissions == 1 and inspection_submissions == 1
                 ),
-                "reference_results_reached_inbox": reference_result_ids
-                == {INSPECT_CAPABILITY_ID, TRANSLATE_CAPABILITY_ID},
+                "reference_results_reached_inbox": (
+                    translation_job is not None
+                    and inspection_job is not None
+                    and reference_results_by_job
+                    == {
+                        translation_request_id: {
+                            "job_id": translation_request_id,
+                            "capability_id": TRANSLATE_CAPABILITY_ID,
+                            "capability_version": translation["capability"]["version"],
+                            "status": "completed",
+                            "updated_at": translation_job.updated_at,
+                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                            "provider": {
+                                "app_id": REFERENCE_APP_ID,
+                                "version": translation["provider"]["version"],
+                                "instance_id": reference_instance_id,
+                            },
+                            "parameters": {"target-language": "Spanish"},
+                            "outputs": [translation_output],
+                        },
+                        inspection_request_id: {
+                            "job_id": inspection_request_id,
+                            "capability_id": INSPECT_CAPABILITY_ID,
+                            "capability_version": inspection["capability"]["version"],
+                            "status": "completed",
+                            "updated_at": inspection_job.updated_at,
+                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                            "provider": {
+                                "app_id": REFERENCE_APP_ID,
+                                "version": inspection["provider"]["version"],
+                                "instance_id": reference_instance_id,
+                            },
+                            "parameters": {},
+                            "outputs": [inspection_output],
+                        },
+                    }
+                ),
                 "reference_removal_preserves_watcher": (
                     after_reference_stop["ok"]
                     and all(
@@ -1028,7 +1063,8 @@ def main() -> None:
                 "request_excludes_gmail_identity": (
                     request_has_safe_shape
                     and durable_request["job_id"] == request_id
-                    and request_inputs[0]["display_name"] == pdf_path.name
+                    and request_inputs[0]["display_name"]
+                    == connect._safe_artifact_display_name(pdf_path.name)
                     and all(
                         private_value not in serialized_request
                         for private_value in (
