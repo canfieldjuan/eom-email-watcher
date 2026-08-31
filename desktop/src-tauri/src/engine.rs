@@ -189,6 +189,28 @@ pub struct ConnectInvocationResult {
     pub outputs: Vec<ConnectOutputMetadata>,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectOutputView {
+    pub job_id: String,
+    pub output: ConnectOutputMetadata,
+    pub presentation: ConnectOutputPresentation,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConnectOutputPresentation {
+    DocumentSummary { summary: ConnectSummary },
+    Text { text: String },
+    Opaque,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ExportedCapabilityOutput {
+    pub job_id: String,
+    pub output: ConnectOutputMetadata,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct ExportedAttachment {
     pub filename: String,
@@ -507,6 +529,44 @@ impl Engine {
                 "capability": capability,
                 "parameters": parameters,
                 "confirmed": confirmed,
+            }),
+        )
+    }
+
+    pub fn present_capability_output(
+        &self,
+        message_id: String,
+        part_id: String,
+        job_id: String,
+        artifact_id: String,
+    ) -> Result<ConnectOutputView, EngineError> {
+        self.request(
+            "connect.output.present",
+            json!({
+                "message_id": message_id,
+                "part_id": part_id,
+                "job_id": job_id,
+                "artifact_id": artifact_id,
+            }),
+        )
+    }
+
+    pub fn export_capability_output(
+        &self,
+        message_id: String,
+        part_id: String,
+        job_id: String,
+        artifact_id: String,
+        destination_dir: PathBuf,
+    ) -> Result<ExportedCapabilityOutput, EngineError> {
+        self.request(
+            "connect.output.export",
+            json!({
+                "message_id": message_id,
+                "part_id": part_id,
+                "job_id": job_id,
+                "artifact_id": artifact_id,
+                "destination_dir": destination_dir,
             }),
         )
     }
@@ -915,6 +975,25 @@ mod tests {
             Some("22222222-2222-4222-8222-222222222222")
         );
         assert_eq!(result.outputs[0].display_name, "summary.json");
+
+        let view: ConnectOutputView = serde_json::from_value(json!({
+            "job_id": "22222222-2222-4222-8222-222222222222",
+            "output": {
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "media_type": "text/plain",
+                "display_name": "translation.txt",
+                "byte_size": 7,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "presentation": {"kind": "text", "text": "bonjour"}
+        }))
+        .expect("deserialize trusted output presentation");
+        assert_eq!(
+            view.presentation,
+            ConnectOutputPresentation::Text {
+                text: "bonjour".into()
+            }
+        );
     }
 
     #[test]
@@ -1240,6 +1319,31 @@ notifications_enabled = true
                     false,
                 )
                 .expect_err("missing attachment must not invoke a capability")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .present_capability_output(
+                    "missing-message".into(),
+                    "2".into(),
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "33333333-3333-4333-8333-333333333333".into(),
+                )
+                .expect_err("missing capability output must not be presented")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .export_capability_output(
+                    "missing-message".into(),
+                    "2".into(),
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "33333333-3333-4333-8333-333333333333".into(),
+                    directory.path().to_path_buf(),
+                )
+                .expect_err("missing capability output must not be exported")
                 .code,
             "not_found"
         );

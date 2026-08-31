@@ -600,6 +600,42 @@ class SummaryResult:
         }
 
 
+def decode_document_summary_output(
+    output: CapabilityOutput,
+    expected_input: ArtifactIdentity,
+) -> SummaryResult:
+    if (
+        output.media_type != OUTPUT_MEDIA_TYPE
+        or len(output.payload) != output.byte_size
+        or hashlib.sha256(output.payload).hexdigest() != output.sha256
+    ):
+        raise ConnectError(
+            "OUTPUT_CONTENT_INVALID",
+            "The document summary output failed integrity validation.",
+        )
+    try:
+        content = _SummaryContent.model_validate_json(output.payload)
+    except ValueError as exc:
+        raise ConnectError(
+            "OUTPUT_CONTENT_INVALID",
+            "The document summary output is invalid.",
+        ) from exc
+    if content.input_artifact.model_dump() != expected_input.public_dict():
+        raise ConnectError(
+            "OUTPUT_PROVENANCE_MISMATCH",
+            "The document summary output does not match its input artifact.",
+        )
+    return SummaryResult(
+        artifact_id=output.artifact_id,
+        media_type=output.media_type,
+        byte_size=output.byte_size,
+        sha256=output.sha256,
+        summary_version=content.summary_version,
+        text=content.text,
+        warnings=tuple(warning.model_dump() for warning in content.warnings),
+    )
+
+
 @dataclass(frozen=True)
 class JobUpdate:
     job_id: str

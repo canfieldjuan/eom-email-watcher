@@ -446,6 +446,29 @@ input:focus {
   white-space: pre-wrap;
 }
 
+.capability-output {
+  display: grid;
+  gap: 6px;
+}
+
+.capability-output-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.capability-output-preview:empty {
+  display: none;
+}
+
+.capability-output-text {
+  max-height: 320px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .attachment-summary .attachment-summary-warnings,
 .attachment-summary-error {
   color: #765a2d;
