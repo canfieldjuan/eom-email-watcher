@@ -52,9 +52,74 @@ def manifest(instance_id: str, app_id: str, max_bytes: int = 1024) -> dict[str, 
     }
 
 
+def registration_v2(
+    *, instance_id: str, app_id: str, base_url: str, token: str = TOKEN
+) -> dict[str, object]:
+    return {
+        "protocol_version": 2,
+        "instance_id": instance_id,
+        "app_id": app_id,
+        "pid": os.getpid(),
+        "started_at": datetime.now(UTC).isoformat(),
+        "transport": {"kind": "http-loopback-v2", "base_url": base_url},
+        "auth": {"scheme": "bearer", "token": token},
+    }
+
+
+def capability_v2(
+    capability_id: str,
+    *,
+    label: str,
+    accepts: str,
+    produces: str,
+    max_bytes: int = 1024,
+    parameters: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "id": capability_id,
+        "version": "1.0",
+        "action": {"label": label, "description": f"{label} this artifact locally."},
+        "accepts": [{"media_type": accepts, "max_bytes": max_bytes}],
+        "produces": [produces],
+        "parameters": parameters or [],
+        "effects": {"external": False, "confirmation_required": False},
+    }
+
+
+def manifest_v2(
+    instance_id: str,
+    app_id: str,
+    *,
+    name: str = "Capability Provider",
+    capabilities: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "protocol_version": 2,
+        "instance_id": instance_id,
+        "app": {"id": app_id, "name": name, "version": "1.2.3"},
+        "capabilities": capabilities
+        or [
+            capability_v2(
+                "document.summarize",
+                label="Summarize",
+                accepts="application/pdf",
+                produces="application/vnd.local-connect.document-summary+json",
+            )
+        ],
+    }
+
+
 def providers_dir(tmp_path: Path) -> Path:
     tmp_path.chmod(0o700)
     path = tmp_path / "local-connect/v1/providers"
+    path.mkdir(parents=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def providers_dir_v2(tmp_path: Path) -> Path:
+    tmp_path.chmod(0o700)
+    path = tmp_path / "local-connect/v2/providers"
     path.mkdir(parents=True, mode=0o700)
     path.chmod(0o700)
     return path
@@ -217,6 +282,250 @@ def test_discovery_ignores_stale_provider_and_reports_multiple_live_providers(
     assert selected.provider.instance_id == INSTANCE_A
     assert missing.provider is None
     assert missing.diagnostic_code == "provider_unavailable"
+
+
+def test_generic_discovery_returns_every_capability_without_provider_secrets(
+    tmp_path: Path,
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "provider.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="some-other-provider",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    capabilities = [
+        capability_v2(
+            "document.summarize",
+            label="Summarize",
+            accepts="application/pdf",
+            produces="application/vnd.local-connect.document-summary+json",
+        ),
+        capability_v2(
+            "text.translate",
+            label="Translate",
+            accepts="text/plain",
+            produces="text/plain",
+            max_bytes=connect.MAX_INPUT_BYTES * 2,
+            parameters=[
+                {
+                    "name": "target-language",
+                    "value_type": "string",
+                    "required": True,
+                    "label": "Target language",
+                    "description": "Language for the translated output.",
+                }
+            ],
+        ),
+    ]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json=manifest_v2(
+                INSTANCE_A,
+                "some-other-provider",
+                name="Other Local Tools",
+                capabilities=capabilities,
+            ),
+        )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), trust_env=False, follow_redirects=False
+    ) as client:
+        catalog = connect.discover_capabilities(tmp_path, client=client)
+
+    assert [item.capability_id for item in catalog.items] == [
+        "document.summarize",
+        "text.translate",
+    ]
+    assert [item.capability_id for item in catalog.compatible("APPLICATION/PDF", 1024)] == [
+        "document.summarize"
+    ]
+    assert [item.capability_id for item in catalog.compatible("text/plain", 2048)] == [
+        "text.translate"
+    ]
+    assert [
+        item.capability_id
+        for item in catalog.compatible("text/plain", connect.MAX_INPUT_BYTES)
+    ] == ["text.translate"]
+    assert catalog.compatible("text/plain", connect.MAX_INPUT_BYTES + 1) == ()
+    assert catalog.compatible("application/pdf", 1025) == ()
+    assert [item.capability_id for item in catalog.compatible("application/pdf", 0)] == [
+        "document.summarize"
+    ]
+    assert catalog.compatible("application/pdf", -1) == ()
+    public = catalog.public_result()
+    assert public["diagnostic"] is None
+    assert public["items"][1]["provider"] == {  # type: ignore[index]
+        "app_id": "some-other-provider",
+        "name": "Other Local Tools",
+        "version": "1.2.3",
+        "instance_id": INSTANCE_A,
+        "available": True,
+    }
+    assert public["items"][1]["capability"]["accepts"] == [  # type: ignore[index]
+        {"media_type": "text/plain", "max_bytes": connect.MAX_INPUT_BYTES}
+    ]
+    assert public["items"][1]["capability"]["parameters"][0] == {  # type: ignore[index]
+        "name": "target-language",
+        "value_type": "string",
+        "required": True,
+        "label": "Target language",
+        "description": "Language for the translated output.",
+    }
+    public_json = json.dumps(public)
+    assert TOKEN not in public_json
+    assert "base_url" not in public_json
+    assert requests[0].url == "http://127.0.0.1:32123/v2/manifest"
+    assert requests[0].headers["authorization"] == f"Bearer {TOKEN}"
+    assert "origin" not in requests[0].headers
+
+
+def test_generic_discovery_preserves_multiple_provider_choices(tmp_path: Path) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "b.json",
+        registration_v2(
+            instance_id=INSTANCE_B,
+            app_id="provider-b",
+            base_url="http://127.0.0.1:32124/",
+        ),
+    )
+    write_registration(
+        directory / "a.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider-a",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        instance_id = INSTANCE_A if request.url.port == 32123 else INSTANCE_B
+        app_id = "provider-a" if request.url.port == 32123 else "provider-b"
+        return httpx.Response(200, json=manifest_v2(instance_id, app_id))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        catalog = connect.discover_capabilities(tmp_path, client=client)
+        selected = connect.discover_capabilities(
+            tmp_path,
+            client=client,
+            provider_instance_id=INSTANCE_B,
+        )
+
+    assert catalog.diagnostic_code is None
+    assert [item.app_id for item in catalog.items] == ["provider-a", "provider-b"]
+    assert [item.instance_id for item in selected.items] == [INSTANCE_B]
+
+
+@pytest.mark.parametrize(
+    "registration_value",
+    [
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider",
+            base_url="http://192.0.2.10:32123/",
+        ),
+        {
+            **registration_v2(
+                instance_id=INSTANCE_A,
+                app_id="provider",
+                base_url="http://127.0.0.1:32123/",
+            ),
+            "protocol_version": 1,
+        },
+    ],
+)
+def test_generic_discovery_rejects_unsafe_registration_before_http(
+    tmp_path: Path, registration_value: dict[str, object]
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(directory / "provider.json", registration_value)
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unsafe registration reached HTTP: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client:
+        catalog = connect.discover_capabilities(tmp_path, client=client)
+
+    assert catalog.items == ()
+    assert catalog.diagnostic_code == "provider_unavailable"
+
+
+@pytest.mark.parametrize("duplicate", ["capability", "accepted_media", "parameter"])
+def test_generic_discovery_rejects_ambiguous_manifest_members(
+    tmp_path: Path, duplicate: str
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "provider.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    declared = capability_v2(
+        "document.summarize",
+        label="Summarize",
+        accepts="application/pdf",
+        produces="application/vnd.local-connect.document-summary+json",
+    )
+    capabilities = [declared, dict(declared)]
+    if duplicate == "accepted_media":
+        declared["accepts"] = [
+            {"media_type": "application/pdf", "max_bytes": 1024},
+            {"media_type": "application/pdf", "max_bytes": 2048},
+        ]
+        capabilities = [declared]
+    elif duplicate == "parameter":
+        parameter = {
+            "name": "mode",
+            "value_type": "string",
+            "required": False,
+            "label": "Mode",
+            "description": "Summary mode.",
+        }
+        declared["parameters"] = [parameter, dict(parameter)]
+        capabilities = [declared]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=manifest_v2(INSTANCE_A, "provider", capabilities=capabilities),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        catalog = connect.discover_capabilities(tmp_path, client=client)
+
+    assert catalog.items == ()
+    assert catalog.diagnostic_code == "provider_unavailable"
+
+
+def test_generic_discovery_requires_registration_manifest_attribution(tmp_path: Path) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "provider.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="registered-provider",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=manifest_v2(INSTANCE_B, "different-provider"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        catalog = connect.discover_capabilities(tmp_path, client=client)
+
+    assert catalog.items == ()
+    assert catalog.diagnostic_code == "provider_unavailable"
 
 
 def test_discovery_does_not_follow_provider_redirects(tmp_path: Path) -> None:

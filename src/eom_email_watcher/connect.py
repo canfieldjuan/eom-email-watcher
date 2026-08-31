@@ -27,6 +27,7 @@ from pydantic import (
 )
 
 PROTOCOL_VERSION = 1
+GENERIC_PROTOCOL_VERSION = 2
 CAPABILITY_ID = "document.summarize"
 CAPABILITY_VERSION = "1.0"
 INPUT_MEDIA_TYPE = "application/pdf"
@@ -97,6 +98,23 @@ class _RuntimeRegistration(_WireModel):
     _timestamp = field_validator("started_at")(_validate_timestamp)
 
 
+class _TransportRegistrationV2(_WireModel):
+    kind: Literal["http-loopback-v2"]
+    base_url: Annotated[StrictStr, Field(max_length=100)]
+
+
+class _RuntimeRegistrationV2(_WireModel):
+    protocol_version: Literal[2]
+    instance_id: UuidV4
+    app_id: Identifier
+    pid: Annotated[StrictInt, Field(ge=1)]
+    started_at: StrictStr
+    transport: _TransportRegistrationV2
+    auth: _AuthRegistration
+
+    _timestamp = field_validator("started_at")(_validate_timestamp)
+
+
 class _AppDescription(_WireModel):
     id: Identifier
     name: Annotated[StrictStr, Field(min_length=1, max_length=100)]
@@ -120,6 +138,58 @@ class _AppManifest(_WireModel):
     instance_id: UuidV4
     app: _AppDescription
     capabilities: Annotated[list[_CapabilityDeclaration], Field(min_length=1, max_length=64)]
+
+
+class _ActionDescription(_WireModel):
+    label: Annotated[StrictStr, Field(min_length=1, max_length=80)]
+    description: Annotated[StrictStr, Field(min_length=1, max_length=500)]
+
+
+class _ParameterDeclaration(_WireModel):
+    name: Identifier
+    value_type: Literal["string", "integer", "boolean"]
+    required: StrictBool
+    label: Annotated[StrictStr, Field(min_length=1, max_length=80)]
+    description: Annotated[StrictStr, Field(min_length=1, max_length=500)]
+
+
+class _CapabilityEffects(_WireModel):
+    external: StrictBool
+    confirmation_required: StrictBool
+
+
+class _CapabilityDeclarationV2(_WireModel):
+    id: Identifier
+    version: CapabilityVersion
+    action: _ActionDescription
+    accepts: Annotated[list[_AcceptedMedia], Field(min_length=1, max_length=16)]
+    produces: Annotated[list[MediaType], Field(min_length=1, max_length=16)]
+    parameters: Annotated[list[_ParameterDeclaration], Field(max_length=16)]
+    effects: _CapabilityEffects
+
+    @model_validator(mode="after")
+    def validate_unique_members(self) -> _CapabilityDeclarationV2:
+        accepted_media_types = [accepted.media_type for accepted in self.accepts]
+        if len(accepted_media_types) != len(set(accepted_media_types)):
+            raise ValueError("accepted media types must be unique")
+        parameter_names = [parameter.name for parameter in self.parameters]
+        if len(parameter_names) != len(set(parameter_names)):
+            raise ValueError("capability parameter names must be unique")
+        return self
+
+
+class _AppManifestV2(_WireModel):
+    protocol_version: Literal[2]
+    instance_id: UuidV4
+    app: _AppDescription
+    capabilities: Annotated[list[_CapabilityDeclarationV2], Field(min_length=1, max_length=64)]
+
+    @model_validator(mode="after")
+    def validate_unique_capabilities(self) -> _AppManifestV2:
+        references = [(capability.id, capability.version) for capability in self.capabilities]
+        if len(references) != len(set(references)):
+            raise ValueError("capability identifiers and versions must be unique")
+        return self
 
 
 class _CapabilityRef(_WireModel):
@@ -240,6 +310,110 @@ class CapabilityDiscovery:
 
 
 @dataclass(frozen=True)
+class AcceptedArtifactType:
+    media_type: str
+    max_bytes: int
+
+    def public_dict(self) -> dict[str, object]:
+        return {"media_type": self.media_type, "max_bytes": self.max_bytes}
+
+
+@dataclass(frozen=True)
+class CapabilityParameter:
+    name: str
+    value_type: str
+    required: bool
+    label: str
+    description: str
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "value_type": self.value_type,
+            "required": self.required,
+            "label": self.label,
+            "description": self.description,
+        }
+
+
+@dataclass(frozen=True)
+class DiscoveredCapability:
+    protocol_version: int
+    base_url: str
+    token: str
+    app_id: str
+    app_name: str
+    app_version: str
+    instance_id: str
+    capability_id: str
+    capability_version: str
+    action_label: str
+    action_description: str
+    accepts: tuple[AcceptedArtifactType, ...]
+    produces: tuple[str, ...]
+    parameters: tuple[CapabilityParameter, ...]
+    external_effects: bool
+    confirmation_required: bool
+
+    def accepts_artifact(self, media_type: str, byte_size: int) -> bool:
+        if byte_size < 0 or byte_size > MAX_INPUT_BYTES:
+            return False
+        normalized_media_type = media_type.casefold()
+        return any(
+            accepted.media_type == normalized_media_type and byte_size <= accepted.max_bytes
+            for accepted in self.accepts
+        )
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "protocol_version": self.protocol_version,
+            "provider": {
+                "app_id": self.app_id,
+                "name": self.app_name,
+                "version": self.app_version,
+                "instance_id": self.instance_id,
+                "available": True,
+            },
+            "capability": {
+                "id": self.capability_id,
+                "version": self.capability_version,
+                "action": {
+                    "label": self.action_label,
+                    "description": self.action_description,
+                },
+                "accepts": [accepted.public_dict() for accepted in self.accepts],
+                "produces": list(self.produces),
+                "parameters": [parameter.public_dict() for parameter in self.parameters],
+                "effects": {
+                    "external": self.external_effects,
+                    "confirmation_required": self.confirmation_required,
+                },
+            },
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityCatalog:
+    items: tuple[DiscoveredCapability, ...]
+    diagnostic_code: str | None = None
+
+    def compatible(self, media_type: str, byte_size: int) -> tuple[DiscoveredCapability, ...]:
+        return tuple(
+            capability
+            for capability in self.items
+            if capability.accepts_artifact(media_type, byte_size)
+        )
+
+    def public_result(self) -> dict[str, object]:
+        return {
+            "items": [capability.public_dict() for capability in self.items],
+            "diagnostic": (
+                {"code": self.diagnostic_code} if self.diagnostic_code is not None else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class ArtifactIdentity:
     artifact_id: str
     media_type: str
@@ -310,7 +484,7 @@ def _secure_directory(path: Path) -> bool:
     )
 
 
-def _read_registration(path: Path) -> _RuntimeRegistration | None:
+def _read_private_json(path: Path, limit: int) -> object | None:
     try:
         info = path.lstat()
         if (
@@ -318,7 +492,7 @@ def _read_registration(path: Path) -> _RuntimeRegistration | None:
             or path.is_symlink()
             or info.st_uid != os.getuid()
             or info.st_mode & 0o077 != 0
-            or not 0 < info.st_size <= MAX_REGISTRATION_BYTES
+            or not 0 < info.st_size <= limit
         ):
             return None
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -328,14 +502,33 @@ def _read_registration(path: Path) -> _RuntimeRegistration | None:
             if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid():
                 return None
             with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                raw = stream.read(MAX_REGISTRATION_BYTES + 1)
+                raw = stream.read(limit + 1)
         finally:
             os.close(descriptor)
-        if len(raw) > MAX_REGISTRATION_BYTES:
+        if len(raw) > limit:
             return None
-        value = json.loads(raw)
-        return _RuntimeRegistration.model_validate(value)
+        return json.loads(raw)
     except (OSError, ValueError, TypeError):
+        return None
+
+
+def _read_registration(path: Path) -> _RuntimeRegistration | None:
+    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+    if value is None:
+        return None
+    try:
+        return _RuntimeRegistration.model_validate(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_registration_v2(path: Path) -> _RuntimeRegistrationV2 | None:
+    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+    if value is None:
+        return None
+    try:
+        return _RuntimeRegistrationV2.model_validate(value)
+    except (ValueError, TypeError):
         return None
 
 
@@ -499,6 +692,148 @@ def discover_summary_capability(
     if not providers:
         return CapabilityDiscovery(None, "provider_unavailable")
     return CapabilityDiscovery(next(iter(providers.values())))
+
+
+def _generic_capabilities(
+    registration: _RuntimeRegistrationV2,
+    manifest: _AppManifestV2,
+    base_url: str,
+) -> tuple[DiscoveredCapability, ...]:
+    capabilities = [
+        DiscoveredCapability(
+            protocol_version=GENERIC_PROTOCOL_VERSION,
+            base_url=base_url,
+            token=registration.auth.token,
+            app_id=manifest.app.id,
+            app_name=manifest.app.name,
+            app_version=manifest.app.version,
+            instance_id=manifest.instance_id,
+            capability_id=capability.id,
+            capability_version=capability.version,
+            action_label=capability.action.label,
+            action_description=capability.action.description,
+            accepts=tuple(
+                AcceptedArtifactType(
+                    accepted.media_type,
+                    min(accepted.max_bytes, MAX_INPUT_BYTES),
+                )
+                for accepted in capability.accepts
+            ),
+            produces=tuple(capability.produces),
+            parameters=tuple(
+                CapabilityParameter(
+                    name=parameter.name,
+                    value_type=parameter.value_type,
+                    required=parameter.required,
+                    label=parameter.label,
+                    description=parameter.description,
+                )
+                for parameter in capability.parameters
+            ),
+            external_effects=capability.effects.external,
+            confirmation_required=capability.effects.confirmation_required,
+        )
+        for capability in manifest.capabilities
+    ]
+    return tuple(
+        sorted(
+            capabilities,
+            key=lambda capability: (
+                capability.capability_id,
+                capability.capability_version,
+            ),
+        )
+    )
+
+
+def discover_capabilities(
+    runtime_dir: Path | None = None,
+    *,
+    client: httpx.Client | None = None,
+    provider_instance_id: str | None = None,
+) -> CapabilityCatalog:
+    root_value = runtime_dir or (
+        Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
+    )
+    if root_value is None or not root_value.is_absolute() or not _secure_directory(root_value):
+        return CapabilityCatalog((), "connect_unavailable")
+    providers_dir = root_value / "local-connect/v2/providers"
+    if not _secure_directory(providers_dir):
+        return CapabilityCatalog((), "provider_unavailable")
+
+    owned_client = client is None
+    active_client = client or _client()
+    providers: dict[str, tuple[DiscoveredCapability, ...]] = {}
+    conflicting_instances: set[str] = set()
+    try:
+        try:
+            registrations = sorted(providers_dir.iterdir(), key=lambda item: item.name)
+        except OSError:
+            return CapabilityCatalog((), "provider_unavailable")
+        for path in registrations:
+            registration = _read_registration_v2(path)
+            if registration is None or registration.instance_id in conflicting_instances:
+                continue
+            if (
+                provider_instance_id is not None
+                and registration.instance_id != provider_instance_id
+            ):
+                continue
+            base_url = _validated_base_url(registration.transport.base_url)
+            if base_url is None:
+                continue
+            try:
+                with active_client.stream(
+                    "GET",
+                    f"{base_url}v2/manifest",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {registration.auth.token}",
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        continue
+                    manifest = _AppManifestV2.model_validate(
+                        _response_json(response, MAX_MANIFEST_BYTES)
+                    )
+            except (httpx.HTTPError, ConnectError, ValueError, TypeError):
+                continue
+            if (
+                manifest.instance_id != registration.instance_id
+                or manifest.app.id != registration.app_id
+            ):
+                continue
+            capabilities = _generic_capabilities(registration, manifest, base_url)
+            existing = providers.get(manifest.instance_id)
+            if existing is not None and existing != capabilities:
+                providers.pop(manifest.instance_id)
+                conflicting_instances.add(manifest.instance_id)
+                continue
+            providers[manifest.instance_id] = capabilities
+    finally:
+        if owned_client:
+            active_client.close()
+
+    items = tuple(
+        sorted(
+            (
+                capability
+                for provider_capabilities in providers.values()
+                for capability in provider_capabilities
+            ),
+            key=lambda capability: (
+                capability.action_label.casefold(),
+                capability.capability_id,
+                capability.capability_version,
+                capability.app_name.casefold(),
+                capability.app_id,
+                capability.instance_id,
+            ),
+        )
+    )
+    if not items:
+        return CapabilityCatalog((), "provider_unavailable")
+    return CapabilityCatalog(items)
 
 
 def _safe_display_name(filename: str) -> str:
