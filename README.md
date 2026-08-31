@@ -144,6 +144,18 @@ safe output presentation/export, is documented in [`docs/ENGINE_API.md`](docs/EN
 legacy v1 summary-only boundary remains documented in [`docs/CONNECT_V1.md`](docs/CONNECT_V1.md).
 Language-neutral wire schemas and fixtures live in the separate `connect-contracts` repository.
 
+Run the opt-in consumer conformance check against the pinned canonical v2 corpus from the repository
+root:
+
+```bash
+CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \
+  uv run pytest -q conformance/test_connect_v2_contracts.py
+```
+
+The check reads fixtures from canonical Git revision
+`4d46af25ef5112f76daf841c7622987f05d25142`; it does not trust or copy the contracts checkout's
+working tree. Updating that pin requires an explicit compatibility change.
+
 ## Two-hour user timer
 
 After Gmail setup succeeds:
