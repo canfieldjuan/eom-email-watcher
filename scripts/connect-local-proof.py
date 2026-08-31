@@ -515,7 +515,8 @@ def main() -> None:
                 "request_excludes_gmail_identity": (
                     request_has_safe_shape
                     and durable_request["job_id"] == request_id
-                    and request_inputs[0]["display_name"] == pdf_path.name
+                    and request_inputs[0]["display_name"]
+                    == connect._safe_artifact_display_name(pdf_path.name)
                     and all(
                         private_value not in serialized_request
                         for private_value in (
