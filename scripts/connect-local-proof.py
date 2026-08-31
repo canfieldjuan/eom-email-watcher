@@ -552,9 +552,6 @@ def main() -> None:
             )
             reference_instance_id = reference_provider.instance_id
             translation_submissions = reference_provider.submission_count(translation_request_id)
-            reference_inbox = engine_api._response(
-                request(config_path, "inbox.recent", {"limit": 1})
-            )
             reference_provider.stop()
             reference_provider = None
             after_reference_stop = engine_api._response(
@@ -564,6 +561,14 @@ def main() -> None:
                     {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
                 )
             )
+            reference_inbox_after_stop = engine_api._response(
+                request(config_path, "inbox.recent", {"limit": 1})
+            )
+            if not after_reference_stop["ok"] or not reference_inbox_after_stop["ok"]:
+                raise RuntimeError(
+                    "Reference provider removal damaged Email Watcher state: "
+                    f"capabilities={after_reference_stop}, inbox={reference_inbox_after_stop}"
+                )
 
             stop_provider(provider)
             provider = None
@@ -727,14 +732,15 @@ def main() -> None:
                 for item in reference_items
                 if item["provider"]["app_id"] == REFERENCE_APP_ID
             }
-            reference_inbox_results = reference_inbox["data"]["items"][0]["attachments"][0][
-                "capability_results"
-            ]
-            reference_result_ids = {
-                item["capability_id"]
+            reference_inbox_results = reference_inbox_after_stop["data"]["items"][0]["attachments"][
+                0
+            ]["capability_results"]
+            reference_results = [
+                item
                 for item in reference_inbox_results
                 if item.get("provider", {}).get("app_id") == REFERENCE_APP_ID
-            }
+            ]
+            reference_result = reference_results[0] if len(reference_results) == 1 else None
             after_reference_items = after_reference_stop["data"]["items"]
             translation_durable_request = (
                 json.loads(translation_job.request_json)
@@ -824,7 +830,25 @@ def main() -> None:
                     )
                 ),
                 "reference_provider_submitted_once": translation_submissions == 1,
-                "reference_result_reached_inbox": reference_result_ids == {TRANSLATE_CAPABILITY_ID},
+                "reference_result_reached_inbox": (
+                    translation_job is not None
+                    and reference_result
+                    == {
+                        "job_id": translation_request_id,
+                        "capability_id": TRANSLATE_CAPABILITY_ID,
+                        "capability_version": translation["capability"]["version"],
+                        "status": "completed",
+                        "updated_at": translation_job.updated_at,
+                        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                        "provider": {
+                            "app_id": REFERENCE_APP_ID,
+                            "version": translation["provider"]["version"],
+                            "instance_id": reference_instance_id,
+                        },
+                        "parameters": {"target-language": "Spanish"},
+                        "outputs": [translation_output],
+                    }
+                ),
                 "reference_removal_preserves_watcher": (
                     after_reference_stop["ok"]
                     and all(
@@ -840,7 +864,7 @@ def main() -> None:
                         ]
                     )
                     == 1
-                    and reference_inbox["ok"]
+                    and reference_inbox_after_stop["ok"]
                 ),
                 "email_database_healthy": quick_check == "ok",
                 "email_database_current": schema_version == SCHEMA_VERSION,
