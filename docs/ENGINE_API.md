@@ -52,8 +52,12 @@ only to stderr.
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
-| `connect.capabilities` | `{}` | Compatible capability declarations available now; provider identity and bearer token are not exposed |
-| `connect.attachment.summarize` | `message_id`, `part_id` | Explicitly fetch and hand off one inventoried PDF; return or reuse the durable terminal result |
+| `connect.attachment.capabilities` | `message_id`, `part_id` | Every live v2 capability compatible with the inventoried attachment; transport credentials are not exposed |
+| `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate and invoke one selected v2 capability; return or reuse its durable terminal result |
+| `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
+| `connect.output.export` | attachment, `job_id`, `artifact_id`, `destination_dir` | Export one validated completed output to a private random `.bin` file for the trusted host |
+| `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
+| `connect.attachment.summarize` | `message_id`, `part_id` | Legacy v1 document-summary invocation |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
@@ -123,24 +127,38 @@ automatically selected by later checks. `analysis.requeue` accepts only such a p
 row, clears its prior request identity and retry directives, and makes it eligible for a fresh
 attempt. It does not acknowledge or discard a pending fallback notification.
 
-`connect.capabilities` performs live runtime discovery. Zero providers returns an empty list,
-exactly one compatible provider returns `document.summarize` version `1.0`, and multiple providers
-return an empty list with an `ambiguous_provider` diagnostic. Transport credentials and provider
-identity stay inside the engine.
+`connect.attachment.capabilities` performs live v2 runtime discovery and filters every declaration
+against the inventoried attachment's media type and byte size. It returns all compatible providers,
+including exact application/instance attribution and the declaration fields required for native UI
+matching. It never returns the registration path, loopback endpoint, or bearer token. Zero live
+providers returns an empty list; multiple compatible providers remain available for explicit host
+selection rather than being collapsed into an ambiguity error.
 
-`connect.attachment.summarize` accepts only an existing PDF attachment identity. It rechecks live
-discovery and the provider's byte limit before fetching bytes through the existing read-only Gmail
-grant. The Connect request carries generated artifact/job IDs, media type, exact byte size, SHA-256,
-sanitized display name, and source-app attribution. It does not carry the Gmail message ID, sender,
-subject, body, path, OAuth data, or attachment ID. The provider receives the PDF as a multipart byte
-stream, never as a caller filesystem path.
+`connect.attachment.invoke` requires a caller-generated UUIDv4 plus exact provider application,
+version, instance, capability, version, declared parameters, and confirmation state. It revalidates
+that selection immediately before a new handoff. Only then does it fetch the already inventoried
+attachment through the existing read-only Gmail grant, verify its stored byte count, and persist the
+request before provider submission. The provider receives generated artifact/job IDs, media type,
+exact size, SHA-256, sanitized display name, source-app attribution, declared parameters, and the
+artifact bytes. It does not receive the Gmail message/attachment IDs, sender, subject, body, local
+path, OAuth data, or mailbox access.
 
-Email Watcher persists `requested -> accepted -> processing -> completed | failed` in schema v4.
-Expected-state updates and a partial unique index protect one active job per attachment/capability
-version. A completed result is reused on later calls; terminal failures never masquerade as a
-summary. Stored output size, digest, input provenance, and media type are revalidated before a
-summary is returned after reopen. Provider absence or Connect failure does not affect
-`inbox.recent`, watchlist, health, or normal watcher operations.
+Schema v7 persists v2 request identity, provider/capability versions, input provenance, parameters,
+state, outputs, errors, and timestamps. Repeated calls with the same active identity reconcile the
+same job. A lost submission acknowledgement remains nonterminal: the next call queries that
+identity, and only authenticated `JOB_NOT_FOUND` evidence permits resubmission with the same ID.
+Completed and failed requests replay from durable state before live discovery, so a provider outage
+cannot erase an already authoritative result. Distinct caller request IDs remain distinct work.
+
+`connect.output.present` revalidates stored output integrity and returns only bounded UTF-8 text or
+the known document-summary schema to frontend code; every other media type is opaque. The trusted
+host may use `connect.output.export` to write any validated output as a mode-0600 random `.bin` file
+inside its private destination and open only the containing directory. Provider filenames are never
+used as executable paths. Provider absence or Connect failure does not affect `inbox.recent`,
+watchlist, health, or normal watcher operations.
+
+The v1 `connect.capabilities` and `connect.attachment.summarize` operations remain for compatibility
+with the existing Linux/EOM path; new desktop capability actions use the generic v2 operations.
 
 Non-dry `watcher.check` currently requires POSIX advisory locking. `health.get` reports
 `production_check_supported` and keeps `host_delivery_ready` false on unsupported platforms. A

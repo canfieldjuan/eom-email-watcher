@@ -9,12 +9,17 @@ import subprocess
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import uuid4
 
 from eom_email_watcher import connect, engine_api
+from eom_email_watcher.db import SCHEMA_VERSION
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
+
+FIXTURE_PART_ID = "fixture-mime-part"
 
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
@@ -44,16 +49,70 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
-        except (ValueError, json.JSONDecodeError):
+            schema_name = request["response_format"]["json_schema"]["name"]
+            user_prompt = next(
+                message["content"] for message in request["messages"] if message["role"] == "user"
+            )
+            prompt = json.loads(user_prompt)
+            text = self._structured_output(schema_name, prompt)
+        except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             self.send_error(400)
             return
-        max_tokens = request.get("max_tokens")
-        text = (
-            "The structured report records Q1 revenue of $1,247,392.17 and a change of -4.75%."
-            if max_tokens == 512
-            else "Q1 revenue was $1,247,392.17, with a -4.75% change."
-        )
         self._json({"choices": [{"message": {"content": text}}]})
+
+    @staticmethod
+    def _structured_output(schema_name: str, prompt: dict[str, object]) -> str:
+        if schema_name == "document_chunk_evidence_v1":
+            evidence = []
+            for block in prompt["source_blocks"]:
+                exact_quote = next(
+                    line.strip() for line in block["text"].splitlines() if line.strip()
+                )[:200]
+                evidence.append(
+                    {
+                        "block_id": block["block_id"],
+                        "claim_text": exact_quote,
+                        "exact_quote": exact_quote,
+                    }
+                )
+            return json.dumps({"evidence": evidence}, separators=(",", ":"))
+        if schema_name == "document_summary_claims_v1":
+            return json.dumps(
+                {
+                    "claims": [
+                        {
+                            "text": evidence["claim_text"],
+                            "evidence_ids": [evidence["evidence_id"]],
+                        }
+                        for evidence in prompt["evidence"]
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        if schema_name == "document_candidate_claims_v1":
+            candidate = prompt["candidates"][0]
+            return json.dumps(
+                {
+                    "claims": [
+                        {
+                            "text": candidate["text"],
+                            "candidate_ids": [candidate["candidate_id"]],
+                        }
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        if schema_name == "document_claim_verdicts_v1":
+            return json.dumps(
+                {
+                    "verdicts": [
+                        {"claim_id": claim["claim_id"], "verdict": "supported"}
+                        for claim in prompt["claims"]
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        raise ValueError("unsupported fixture response schema")
 
 
 class FixtureGmail:
@@ -63,7 +122,7 @@ class FixtureGmail:
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if (message_id, part_id, attachment_id) != (
             "fixture-message",
-            "2",
+            FIXTURE_PART_ID,
             "fixture-attachment",
         ):
             raise AssertionError("Unexpected fixture attachment identity")
@@ -100,8 +159,14 @@ def wait_for_capability(available: bool, timeout_seconds: float = 15) -> dict[st
     deadline = time.monotonic() + timeout_seconds
     latest: dict[str, object] = {"items": [], "diagnostic": None}
     while time.monotonic() < deadline:
-        latest = connect.discover_summary_capability().public_result()
-        if bool(latest["items"]) is available:
+        latest = connect.discover_capabilities().public_result()
+        summary_items = [
+            item
+            for item in latest["items"]
+            if item["capability"]["id"] == connect.CAPABILITY_ID
+            and item["capability"]["version"] == connect.CAPABILITY_VERSION
+        ]
+        if bool(summary_items) is available:
             return latest
         time.sleep(0.1)
     raise RuntimeError(f"Capability availability did not become {available}: {latest}")
@@ -117,9 +182,18 @@ def start_provider(binary: Path, environment: dict[str, str]) -> subprocess.Pope
     )
     try:
         wait_for_capability(True)
-    except BaseException:
+    except BaseException as error:
+        return_code = process.poll()
         stop_provider(process)
-        raise
+        detail = (
+            f"provider exited with status {return_code}"
+            if return_code is not None
+            else "provider stayed running without publishing a usable v2 registration"
+        )
+        raise RuntimeError(
+            f"Document Summarizer did not advertise Local Connect v2 ({detail}); "
+            "build the provider from its current main branch before running this proof"
+        ) from error
     return process
 
 
@@ -142,6 +216,27 @@ def positive_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return seconds
+
+
+def require_proof_checks(checks: dict[str, bool]) -> None:
+    failed_checks = sorted(name for name, passed in checks.items() if not passed)
+    if failed_checks:
+        raise RuntimeError(f"Connect proof failed checks: {', '.join(failed_checks)}")
+
+
+def privacy_projection(value: object) -> object:
+    if isinstance(value, list):
+        return [privacy_projection(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    projected = dict(value)
+    inputs = value.get("inputs")
+    if not isinstance(inputs, list) or not inputs or not isinstance(inputs[0], dict):
+        return projected
+    first_input = dict(inputs[0])
+    first_input["display_name"] = "<allowed-artifact-display-name>"
+    projected["inputs"] = [first_input, *inputs[1:]]
+    return projected
 
 
 def main() -> None:
@@ -190,8 +285,22 @@ def main() -> None:
     provider: subprocess.Popen[bytes] | None = None
     restarted: subprocess.Popen[bytes] | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+
+    def stop_active_providers() -> None:
+        nonlocal provider, restarted
+        if provider is not None:
+            stop_provider(provider)
+            provider = None
+        if restarted is not None:
+            stop_provider(restarted)
+            restarted = None
+
     try:
-        with tempfile.TemporaryDirectory(prefix="connect-proof-") as temporary:
+        with (
+            tempfile.TemporaryDirectory(prefix="connect-proof-") as temporary,
+            ExitStack() as provider_scope,
+        ):
+            provider_scope.callback(stop_active_providers)
             root = Path(temporary)
             runtime_dir = root / "runtime"
             data_dir = root / "data"
@@ -231,7 +340,7 @@ def main() -> None:
                 "fixture-message",
                 (
                     AttachmentDescriptor(
-                        "2",
+                        FIXTURE_PART_ID,
                         "fixture-attachment",
                         pdf_path.name,
                         "application/pdf",
@@ -240,24 +349,88 @@ def main() -> None:
                     ),
                 ),
             )
+            capabilities = engine_api._response(
+                request(
+                    config_path,
+                    "connect.attachment.capabilities",
+                    {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
+                )
+            )
+            if not capabilities["ok"]:
+                raise RuntimeError(f"Connect capability discovery failed: {capabilities}")
+            matches = [
+                item
+                for item in capabilities["data"]["items"]
+                if item["capability"]["id"] == connect.CAPABILITY_ID
+                and item["capability"]["version"] == connect.CAPABILITY_VERSION
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Expected one compatible document summary capability: {capabilities}"
+                )
+            selected = matches[0]
+            request_id = str(uuid4())
+            invocation = {
+                "request_id": request_id,
+                "message_id": "fixture-message",
+                "part_id": FIXTURE_PART_ID,
+                "provider": {
+                    "app_id": selected["provider"]["app_id"],
+                    "version": selected["provider"]["version"],
+                    "instance_id": selected["provider"]["instance_id"],
+                },
+                "capability": {
+                    "id": selected["capability"]["id"],
+                    "version": selected["capability"]["version"],
+                },
+                "parameters": {},
+                "confirmed": False,
+            }
             original_from_token = engine_api.GmailGateway.__dict__["from_token"]
             engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
             try:
                 response = engine_api._response(
                     request(
                         config_path,
-                        "connect.attachment.summarize",
-                        {"message_id": "fixture-message", "part_id": "2"},
+                        "connect.attachment.invoke",
+                        invocation,
                     )
                 )
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
             if not response["ok"]:
                 raise RuntimeError(f"Connect proof job failed: {response}")
+            outputs = response["data"]["outputs"]
+            if len(outputs) != 1:
+                raise RuntimeError(f"Expected one Connect output: {response}")
+            presentation = engine_api._response(
+                request(
+                    config_path,
+                    "connect.output.present",
+                    {
+                        "message_id": "fixture-message",
+                        "part_id": FIXTURE_PART_ID,
+                        "job_id": request_id,
+                        "artifact_id": outputs[0]["artifact_id"],
+                    },
+                )
+            )
+            if not presentation["ok"]:
+                raise RuntimeError(f"Connect output presentation failed: {presentation}")
+            rendered = presentation["data"]["presentation"]
+            if rendered["kind"] != "document_summary":
+                raise RuntimeError("Unexpected Connect output presentation kind")
+            summary_text = rendered["summary"]["text"]
 
             stop_provider(provider)
             provider = None
             after_stop = wait_for_capability(False)
+            replayed = engine_api._response(
+                request(config_path, "connect.attachment.invoke", invocation)
+            )
+            inbox_without_connect = engine_api._response(
+                request(config_path, "inbox.recent", {"limit": 1})
+            )
             restarted = start_provider(provider_binary, environment)
             after_restart = wait_for_capability(True)
 
@@ -265,34 +438,121 @@ def main() -> None:
                 quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
                 schema_version = database.execute("PRAGMA user_version").fetchone()[0]
                 job_row = database.execute(
-                    """SELECT status, summary_text, input_sha256
-                    FROM connect_attachment_jobs ORDER BY created_at DESC LIMIT 1"""
+                    """SELECT job_id, protocol_version, capability_id, capability_version,
+                    provider_app_id, provider_app_version, provider_instance_id,
+                    input_media_type, input_byte_size, input_sha256, source_app_id,
+                    status, request_json, result_json
+                    FROM connect_attachment_jobs WHERE job_id = ?""",
+                    (request_id,),
                 ).fetchone()
             if job_row is None:
                 raise RuntimeError("Connect proof result was not durable")
-            summary_text = str(response["data"]["summary"]["text"])
-            print(
-                json.dumps(
-                    {
-                        "after_restart_capabilities": len(after_restart["items"]),
-                        "after_stop_capabilities": len(after_stop["items"]),
-                        "before_provider_capabilities": len(before["items"]),
-                        "during_provider_capabilities": len(during["items"]),
-                        "email_database_quick_check": quick_check,
-                        "email_database_schema_version": schema_version,
-                        "input_sha256_matches": job_row[2] == hashlib.sha256(pdf).hexdigest(),
-                        "job_status": response["data"]["status"],
-                        "model_id": model_name,
-                        "model_mode": model_mode,
-                        "persisted_job_status": job_row[0],
-                        "persisted_summary_matches": job_row[1] == summary_text,
-                        "proof_input": "synthetic Gmail attachment bytes",
-                        "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
+            durable_request = json.loads(job_row[12])
+            replayed_data = replayed.get("data") if replayed["ok"] else None
+            restarted_matches = [
+                item
+                for item in after_restart["items"]
+                if item["provider"]["app_id"] == selected["provider"]["app_id"]
+                and item["provider"]["version"] == selected["provider"]["version"]
+                and item["capability"]["id"] == selected["capability"]["id"]
+                and item["capability"]["version"] == selected["capability"]["version"]
+            ]
+            request_inputs = durable_request.get("inputs")
+            serialized_request = json.dumps(
+                privacy_projection(durable_request), separators=(",", ":"), sort_keys=True
             )
+            request_has_safe_shape = (
+                set(durable_request)
+                == {"protocol_version", "job_id", "capability", "inputs", "parameters"}
+                and isinstance(request_inputs, list)
+                and len(request_inputs) == 1
+                and isinstance(request_inputs[0], dict)
+                and set(request_inputs[0])
+                == {
+                    "artifact_id",
+                    "media_type",
+                    "byte_size",
+                    "sha256",
+                    "display_name",
+                    "source_app_id",
+                }
+            )
+            proof_checks = {
+                "before_provider_absent": not before["items"],
+                "provider_available": bool(during["items"]),
+                "provider_removed": not after_stop["items"],
+                "provider_restored": len(restarted_matches) == 1,
+                "email_database_healthy": quick_check == "ok",
+                "email_database_current": schema_version == SCHEMA_VERSION,
+                "inbox_healthy_without_connect": (
+                    inbox_without_connect["ok"]
+                    and inbox_without_connect["data"]["items"][0]["message_id"] == "fixture-message"
+                ),
+                "input_media_type_matches": job_row[7] == "application/pdf",
+                "input_byte_size_matches": job_row[8] == len(pdf),
+                "input_sha256_matches": job_row[9] == hashlib.sha256(pdf).hexdigest(),
+                "job_completed": response["data"]["status"] == "completed",
+                "persisted_capability_matches": (
+                    job_row[2] == selected["capability"]["id"]
+                    and job_row[3] == selected["capability"]["version"]
+                ),
+                "persisted_job_completed": job_row[11] == "completed",
+                "persisted_protocol_matches": job_row[1] == connect.GENERIC_PROTOCOL_VERSION,
+                "persisted_provider_matches": (
+                    job_row[4] == selected["provider"]["app_id"]
+                    and job_row[5] == selected["provider"]["version"]
+                    and job_row[6] == selected["provider"]["instance_id"]
+                ),
+                "persisted_result_present": job_row[13] is not None,
+                "provider_instance_rotated": (
+                    len(restarted_matches) == 1
+                    and restarted_matches[0]["provider"]["instance_id"]
+                    != selected["provider"]["instance_id"]
+                ),
+                "replayed_completed_job_without_provider": (
+                    replayed_data is not None and replayed_data == response["data"]
+                ),
+                "request_excludes_gmail_identity": (
+                    request_has_safe_shape
+                    and durable_request["job_id"] == request_id
+                    and request_inputs[0]["display_name"]
+                    == connect._safe_artifact_display_name(pdf_path.name)
+                    and all(
+                        private_value not in serialized_request
+                        for private_value in (
+                            "fixture-message",
+                            FIXTURE_PART_ID,
+                            "fixture-attachment",
+                            "fixture@example.invalid",
+                            "Fixture Sender",
+                            "Fixture document",
+                        )
+                    )
+                ),
+                "source_app_matches": job_row[10] == connect.SOURCE_APP_ID,
+            }
+            result = {
+                "after_restart_capabilities": len(after_restart["items"]),
+                "after_stop_capabilities": len(after_stop["items"]),
+                "before_provider_capabilities": len(before["items"]),
+                "capability_id": selected["capability"]["id"],
+                "capability_version": selected["capability"]["version"],
+                "during_provider_capabilities": len(during["items"]),
+                "email_database_quick_check": quick_check,
+                "email_database_schema_version": schema_version,
+                "job_status": response["data"]["status"],
+                "model_id": model_name,
+                "model_mode": model_mode,
+                "persisted_job_status": job_row[11],
+                "persisted_protocol_version": job_row[1],
+                "proof_input": "synthetic Gmail attachment bytes",
+                "proof_passed": all(proof_checks.values()),
+                "source_app_id": job_row[10],
+                "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
+                **proof_checks,
+            }
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+            require_proof_checks(proof_checks)
     finally:
         if provider is not None:
             stop_provider(provider)
