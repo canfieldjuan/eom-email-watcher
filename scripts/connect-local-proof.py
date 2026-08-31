@@ -253,18 +253,18 @@ def require_proof_checks(checks: dict[str, bool]) -> None:
 
 
 def privacy_projection(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            key: (
-                "<allowed-artifact-display-name>"
-                if key == "display_name"
-                else privacy_projection(item)
-            )
-            for key, item in value.items()
-        }
     if isinstance(value, list):
         return [privacy_projection(item) for item in value]
-    return value
+    if not isinstance(value, dict):
+        return value
+    projected = dict(value)
+    inputs = value.get("inputs")
+    if not isinstance(inputs, list) or not inputs or not isinstance(inputs[0], dict):
+        return projected
+    first_input = dict(inputs[0])
+    first_input["display_name"] = "<allowed-artifact-display-name>"
+    projected["inputs"] = [first_input, *inputs[1:]]
+    return projected
 
 
 def main() -> None:
@@ -499,6 +499,7 @@ def main() -> None:
                 if item["provider"]["app_id"] == REFERENCE_APP_ID
                 and item["capability"]["id"] == INSPECT_CAPABILITY_ID
                 and item["capability"]["version"] == "1.0"
+                and item["capability"]["produces"] == [INSPECT_OUTPUT_MEDIA_TYPE]
             ]
             if len(translation_choices) != 1 or len(inspection_choices) != 1:
                 raise RuntimeError(
@@ -939,6 +940,14 @@ def main() -> None:
                 ),
                 "unknown_output_uses_safe_path": (
                     inspection_output["media_type"] == INSPECT_OUTPUT_MEDIA_TYPE
+                    and set(inspection_output)
+                    == {
+                        "artifact_id",
+                        "media_type",
+                        "display_name",
+                        "byte_size",
+                        "sha256",
+                    }
                     and inspection_presentation
                     == {
                         "data": {

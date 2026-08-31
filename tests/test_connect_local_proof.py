@@ -26,12 +26,26 @@ def test_proof_check_gate_accepts_only_complete_success() -> None:
 def test_privacy_projection_allows_only_artifact_display_names() -> None:
     projected = privacy_projection(
         {
+            "display_name": "top-level-name",
             "message_id": "private-message",
-            "inputs": [{"display_name": "private-message.pdf"}],
+            "parameters": {"display_name": "parameter-name"},
+            "inputs": [
+                {
+                    "display_name": "private-message.pdf",
+                    "metadata": {"display_name": "nested-name"},
+                }
+            ],
         }
     )
 
     assert projected == {
+        "display_name": "top-level-name",
         "message_id": "private-message",
-        "inputs": [{"display_name": "<allowed-artifact-display-name>"}],
+        "parameters": {"display_name": "parameter-name"},
+        "inputs": [
+            {
+                "display_name": "<allowed-artifact-display-name>",
+                "metadata": {"display_name": "nested-name"},
+            }
+        ],
     }
