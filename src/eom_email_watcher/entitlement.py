@@ -186,11 +186,12 @@ class EntitlementGate:
         parent = self.path.parent
         _ensure_private_directory(parent)
         with _activation_lock(parent):
-            _validate_existing_destination(self.path)
+            previous = _read_existing_destination(self.path)
             _require_active_candidate(candidate, self.keys, self._current_time())
             _install_candidate(self.path, candidate)
             status = self.status()
             if not status.active:
+                _restore_previous_entitlement(self.path, previous)
                 raise _install_error(INSTALL_FAILED)
             return status
 
@@ -469,6 +470,9 @@ def _ensure_private_directory(path: Path) -> None:
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 raise _install_error(STORAGE_UNAVAILABLE) from None
+            if created:
+                _sync_directory(directory)
+                _sync_directory(directory.parent)
     except OSError as exc:
         raise _install_error(STORAGE_UNAVAILABLE) from exc
 
@@ -484,19 +488,50 @@ def _ensure_private_directory(path: Path) -> None:
         raise _install_error(STORAGE_UNAVAILABLE)
 
 
-def _validate_existing_destination(path: Path) -> None:
+def _read_existing_destination(path: Path) -> bytes | None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
-        return
+        return None
     except OSError as exc:
         raise _install_error(STORAGE_UNAVAILABLE) from exc
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()
         or metadata.st_mode & 0o077
+        or metadata.st_size > MAX_ENTITLEMENT_BYTES
     ):
         raise _install_error(STORAGE_UNAVAILABLE)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077
+            or opened.st_size > MAX_ENTITLEMENT_BYTES
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise _install_error(STORAGE_UNAVAILABLE)
+        content = bytearray()
+        while len(content) <= MAX_ENTITLEMENT_BYTES:
+            chunk = os.read(descriptor, min(8192, MAX_ENTITLEMENT_BYTES + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_ENTITLEMENT_BYTES:
+            raise _install_error(STORAGE_UNAVAILABLE)
+        return bytes(content)
+    except EntitlementInstallError:
+        raise
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
 
 
 @contextmanager
@@ -638,3 +673,23 @@ def _install_candidate(destination: Path, content: bytes) -> None:
         if not replaced:
             with suppress(OSError):
                 temporary.unlink(missing_ok=True)
+
+
+def _restore_previous_entitlement(destination: Path, previous: bytes | None) -> None:
+    if previous is None:
+        try:
+            destination.unlink()
+        except OSError as exc:
+            raise _install_error(INSTALL_FAILED) from exc
+        _sync_directory(destination.parent)
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise _install_error(INSTALL_FAILED) from exc
+        raise _install_error(INSTALL_FAILED)
+
+    _install_candidate(destination, previous)
+    if _read_existing_destination(destination) != previous:
+        raise _install_error(INSTALL_FAILED)

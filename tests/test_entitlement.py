@@ -391,6 +391,109 @@ def test_commit_time_revalidation_preserves_existing_entitlement(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_final_validation_failure_restores_existing_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(key, claims(expires_at="2028-01-01T00:00:00Z"))
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    source = tmp_path / "replacement.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    times = iter(
+        [
+            datetime(2026, 8, 31, tzinfo=UTC),
+            datetime(2026, 8, 31, tzinfo=UTC),
+            datetime(2027, 1, 1, tzinfo=UTC),
+        ]
+    )
+    monkeypatch.setattr(
+        entitlement.EntitlementGate,
+        "_current_time",
+        lambda _gate: next(times),
+    )
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert destination.read_bytes() == existing
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_final_validation_failure_removes_candidate_without_previous_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    times = iter(
+        [
+            datetime(2026, 8, 31, tzinfo=UTC),
+            datetime(2026, 8, 31, tzinfo=UTC),
+            datetime(2027, 1, 1, tzinfo=UTC),
+        ]
+    )
+    monkeypatch.setattr(
+        entitlement.EntitlementGate,
+        "_current_time",
+        lambda _gate: next(times),
+    )
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert not destination.exists()
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_new_private_directories_sync_their_parent_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    synced: list[Path] = []
+    original_sync = entitlement._sync_directory
+
+    def record_sync(path: Path) -> None:
+        synced.append(path)
+        original_sync(path)
+
+    monkeypatch.setattr(entitlement, "_sync_directory", record_sync)
+
+    assert gate.install(source).active is True
+    assert synced[:4] == [
+        destination.parent.parent,
+        tmp_path,
+        destination.parent,
+        destination.parent.parent,
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
 def test_held_lock_blocks_installer_and_child_process(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
     source = tmp_path / "candidate.json"
