@@ -596,25 +596,33 @@ def main() -> None:
             )
             export_dir = root / "reference-export"
             export_dir.mkdir(mode=0o700)
-            inspection_export = engine_api._response(
-                request(
-                    config_path,
-                    "connect.output.export",
-                    {
-                        "message_id": "fixture-message",
-                        "part_id": FIXTURE_PART_ID,
-                        "job_id": inspection_request_id,
-                        "artifact_id": inspection_output["artifact_id"],
-                        "destination_dir": str(export_dir),
-                    },
+
+            def export_inspection_output() -> dict[str, object]:
+                return engine_api._response(
+                    request(
+                        config_path,
+                        "connect.output.export",
+                        {
+                            "message_id": "fixture-message",
+                            "part_id": FIXTURE_PART_ID,
+                            "job_id": inspection_request_id,
+                            "artifact_id": inspection_output["artifact_id"],
+                            "destination_dir": str(export_dir),
+                        },
+                    )
                 )
-            )
-            if not inspection_presentation["ok"] or not inspection_export["ok"]:
+
+            inspection_exports = tuple(export_inspection_output() for _ in range(2))
+            if not inspection_presentation["ok"] or any(
+                not export["ok"] for export in inspection_exports
+            ):
                 raise RuntimeError(
                     "Opaque output handling failed: "
-                    f"present={inspection_presentation}, export={inspection_export}"
+                    f"present={inspection_presentation}, exports={inspection_exports}"
                 )
-            inspection_export_path = Path(inspection_export["data"]["path"])
+            inspection_export_paths = tuple(
+                Path(export["data"]["path"]) for export in inspection_exports
+            )
             translation_job = runtime.store.connect_job(translation_request_id)
             inspection_job = runtime.store.connect_job(inspection_request_id)
             reference_requests = reference_provider.requests()
@@ -624,9 +632,6 @@ def main() -> None:
             reference_instance_id = reference_provider.instance_id
             translation_submissions = reference_provider.submission_count(translation_request_id)
             inspection_submissions = reference_provider.submission_count(inspection_request_id)
-            reference_inbox = engine_api._response(
-                request(config_path, "inbox.recent", {"limit": 1})
-            )
             reference_provider.stop()
             reference_provider = None
             after_reference_stop = engine_api._response(
@@ -636,6 +641,14 @@ def main() -> None:
                     {"message_id": "fixture-message", "part_id": FIXTURE_PART_ID},
                 )
             )
+            reference_inbox_after_stop = engine_api._response(
+                request(config_path, "inbox.recent", {"limit": 1})
+            )
+            if not after_reference_stop["ok"] or not reference_inbox_after_stop["ok"]:
+                raise RuntimeError(
+                    "Reference provider removal damaged Email Watcher state: "
+                    f"capabilities={after_reference_stop}, inbox={reference_inbox_after_stop}"
+                )
 
             stop_provider(provider)
             provider = None
@@ -799,9 +812,9 @@ def main() -> None:
                 for item in reference_items
                 if item["provider"]["app_id"] == REFERENCE_APP_ID
             }
-            reference_inbox_results = reference_inbox["data"]["items"][0]["attachments"][0][
-                "capability_results"
-            ]
+            reference_inbox_results = reference_inbox_after_stop["data"]["items"][0]["attachments"][
+                0
+            ]["capability_results"]
             reference_result_ids = {
                 item["capability_id"]
                 for item in reference_inbox_results
@@ -891,14 +904,30 @@ def main() -> None:
                 ),
                 "unknown_output_uses_safe_path": (
                     inspection_output["media_type"] == INSPECT_OUTPUT_MEDIA_TYPE
-                    and inspection_presentation["data"]["presentation"] == {"kind": "opaque"}
-                    and INSPECT_PAYLOAD.decode()
-                    not in json.dumps(inspection_presentation, separators=(",", ":"))
-                    and inspection_export_path.parent == export_dir
-                    and inspection_export_path.suffix == ".bin"
-                    and "reference-inspection" not in inspection_export_path.name
-                    and inspection_export_path.read_bytes() == INSPECT_PAYLOAD
-                    and (os.name == "nt" or inspection_export_path.stat().st_mode & 0o777 == 0o600)
+                    and inspection_presentation
+                    == {
+                        "data": {
+                            "job_id": inspection_request_id,
+                            "output": inspection_output,
+                            "presentation": {"kind": "opaque"},
+                        },
+                        "ok": True,
+                        "operation": "connect.output.present",
+                        "protocol": engine_api.PROTOCOL_VERSION,
+                    }
+                    and len(set(inspection_export_paths)) == 2
+                    and all(path.parent == export_dir for path in inspection_export_paths)
+                    and all(path.suffix == ".bin" for path in inspection_export_paths)
+                    and all(
+                        "reference-inspection" not in path.name for path in inspection_export_paths
+                    )
+                    and all(
+                        path.read_bytes() == INSPECT_PAYLOAD for path in inspection_export_paths
+                    )
+                    and all(
+                        os.name == "nt" or path.stat().st_mode & 0o777 == 0o600
+                        for path in inspection_export_paths
+                    )
                 ),
                 "reference_provider_requests_private": (
                     len(reference_requests) == 2
@@ -934,7 +963,7 @@ def main() -> None:
                         ]
                     )
                     == 1
-                    and reference_inbox["ok"]
+                    and reference_inbox_after_stop["ok"]
                 ),
                 "email_database_healthy": quick_check == "ok",
                 "email_database_current": schema_version == SCHEMA_VERSION,
