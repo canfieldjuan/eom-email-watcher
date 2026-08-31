@@ -180,6 +180,24 @@ pub struct ConnectCapabilities {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectEntitlementState {
+    Active,
+    AuthorityUnavailable,
+    Missing,
+    Invalid,
+    NotYetValid,
+    Expired,
+    FeatureMissing,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectEntitlementStatus {
+    pub state: ConnectEntitlementState,
+    pub active: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConnectInvocationResult {
     pub protocol_version: u32,
     pub job_id: String,
@@ -585,6 +603,20 @@ impl Engine {
 
     pub fn health(&self) -> Result<HealthStatus, EngineError> {
         self.request("health.get", json!({}))
+    }
+
+    pub fn connect_entitlement_status(&self) -> Result<ConnectEntitlementStatus, EngineError> {
+        self.request("connect.entitlement.status", json!({}))
+    }
+
+    pub fn install_connect_entitlement(
+        &self,
+        source_path: PathBuf,
+    ) -> Result<ConnectEntitlementStatus, EngineError> {
+        self.request(
+            "connect.entitlement.install",
+            json!({"source_path": source_path}),
+        )
     }
 
     pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
@@ -1032,6 +1064,23 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v1_entitlement_status_is_typed_and_claim_free() {
+        let status: ConnectEntitlementStatus = serde_json::from_value(json!({
+            "state": "expired",
+            "active": false
+        }))
+        .expect("deserialize claim-free entitlement status");
+
+        assert_eq!(
+            status,
+            ConnectEntitlementStatus {
+                state: ConnectEntitlementState::Expired,
+                active: false,
+            }
+        );
+    }
+
+    #[test]
     fn protocol_v1_settings_without_editability_default_to_read_only() {
         let settings: EngineSettings = serde_json::from_value(json!({
             "local_model": {
@@ -1261,6 +1310,15 @@ notifications_enabled = true
         let engine = real_engine(config_path);
 
         let health = engine.health().expect("read engine health");
+        assert_eq!(
+            engine
+                .connect_entitlement_status()
+                .expect("read entitlement status without watcher configuration coupling"),
+            ConnectEntitlementStatus {
+                state: ConnectEntitlementState::AuthorityUnavailable,
+                active: false,
+            }
+        );
         assert_eq!(
             health.database,
             DatabaseHealth {

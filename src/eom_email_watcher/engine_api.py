@@ -13,7 +13,7 @@ from pathlib import Path
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import connect
+from . import connect, entitlement
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
@@ -150,6 +150,26 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         "production_check_supported": production_check_supported,
         "watchlist_count": len(config.senders),
     }
+
+
+def _connect_entitlement_status(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    return entitlement.connect_entitlement_status().public_dict()
+
+
+def _connect_entitlement_install(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"source_path"})
+    value = payload.get("source_path")
+    if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
+        raise ApiError(
+            entitlement.SOURCE_INVALID,
+            "the selected Connect entitlement is not a safe, valid license file",
+        )
+    try:
+        status = entitlement.install_connect_entitlement(Path(value))
+    except entitlement.EntitlementInstallError as exc:
+        raise ApiError(exc.code, str(exc)) from exc
+    return status.public_dict()
 
 
 def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
@@ -1390,6 +1410,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.attachment.invoke": _connect_attachment_invoke,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
+    "connect.entitlement.install": _connect_entitlement_install,
+    "connect.entitlement.status": _connect_entitlement_status,
     "connect.output.export": _connect_output_export,
     "connect.output.present": _connect_output_present,
     "gmail.authorize": _gmail_authorize,

@@ -565,6 +565,14 @@ input:focus {
   content: "";
 }
 
+.connect-health-card {
+  grid-column: 1 / -1;
+}
+
+.connect-health-card::before {
+  background: #2f7250;
+}
+
 .health-card dt {
   color: #6a766e;
   font-size: 0.75rem;
@@ -607,7 +615,8 @@ input:focus {
   font-weight: 400;
 }
 
-.gmail-action {
+.gmail-action,
+.connect-action {
   padding: 8px 11px;
   border: 1px solid #9fb2a5;
   border-radius: 8px;

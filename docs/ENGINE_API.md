@@ -52,6 +52,8 @@ only to stderr.
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
+| `connect.entitlement.status` | `{}` | Claim-free shared-license state and active boolean |
+| `connect.entitlement.install` | absolute `source_path` | Verify and atomically install an active signed license at the internally derived shared path |
 | `connect.attachment.capabilities` | `message_id`, `part_id` | Every live v2 capability compatible with the inventoried attachment; transport credentials are not exposed |
 | `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate and invoke one selected v2 capability; return or reuse its durable terminal result |
 | `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
@@ -84,7 +86,22 @@ reauthorization path, while other Gmail errors remain failures. The browser help
 prompt is suppressed because stdout is reserved exclusively for the JSON engine envelope. This
 operation does not expose or request the separate EOM `gmail.send` capability.
 
-`config.initialize` is the only operation that may run before the configuration file exists. It
+`connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than
+Connect wire routes. They do not load watcher configuration or private mailbox state. Status
+returns only `active`, `authority_unavailable`, `missing`, `invalid`, `not_yet_valid`, `expired`, or
+`feature_missing` plus an active boolean; it never returns IDs, subjects, timestamps, claims, or key
+material. Install accepts no destination. It reads bounded bytes from an absolute regular source
+without following a final symlink, applies the same compiled-authority signature, claim, feature,
+and time checks as live discovery, and admits only a currently active license. Under the shared
+owner-private `.entitlement-v1.lock`, it rechecks time, writes and syncs an exclusive mode-0600
+same-directory temporary file, atomically replaces the shared entitlement, syncs the directory,
+and re-evaluates before returning success. Expected validation, lock, write, and pre-replacement
+failures preserve the existing entitlement and selected source. Stable failure codes follow the
+accepted Connect activation v1 contract. Successful replacement is visible to both apps on their
+next gated operation without restart.
+
+`config.initialize` is the only watcher-configuration operation that may run before the
+configuration file exists. It
 requires an explicit IANA timezone, exact-loopback HTTP model endpoint, and nonblank printable model
 identifier. It creates a mode-0600 configuration with zero senders, desktop notifications enabled,
 the existing polling/retention defaults, and unauthenticated loopback inference. Publication is
