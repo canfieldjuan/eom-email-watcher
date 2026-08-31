@@ -37,40 +37,29 @@ def _target_family(target_triple: str) -> str:
     raise SidecarBuildError(f"Unsupported Rust target triple: {target_triple}")
 
 
-def _host_family(host_platform: str = sys.platform) -> str:
-    if host_platform == "win32":
-        return "windows"
-    if host_platform == "darwin":
-        return "macos"
-    if host_platform.startswith("linux"):
-        return "linux"
-    raise SidecarBuildError(f"Unsupported sidecar build host: {host_platform}")
-
-
-def validate_target_triple(target_triple: str, host_platform: str = sys.platform) -> str:
-    if not target_triple or TARGET_TRIPLE_PATTERN.fullmatch(target_triple) is None:
-        raise SidecarBuildError(f"Unsupported Rust target triple: {target_triple}")
-    target_family = _target_family(target_triple)
-    host_family = _host_family(host_platform)
-    if target_family != host_family:
+def validate_target_triple(target_triple: str, host_target_triple: str) -> str:
+    for triple in (target_triple, host_target_triple):
+        if not triple or TARGET_TRIPLE_PATTERN.fullmatch(triple) is None:
+            raise SidecarBuildError(f"Unsupported Rust target triple: {triple}")
+        _target_family(triple)
+    if target_triple != host_target_triple:
         raise SidecarBuildError(
-            "PyInstaller must build on the target operating system; "
-            f"cannot create a {target_family} sidecar on {host_family}"
+            "PyInstaller must build for the native Rust host target; "
+            f"cannot label a {host_target_triple} sidecar as {target_triple}"
         )
     return target_triple
 
 
 def determine_target_triple() -> str:
-    configured = os.environ.get("CARGO_BUILD_TARGET")
-    if configured is not None:
-        return validate_target_triple(configured)
     result = subprocess.run(
         ["rustc", "--print", "host-tuple"],
         check=True,
         capture_output=True,
         text=True,
     )
-    return validate_target_triple(result.stdout.strip())
+    host_target_triple = result.stdout.strip()
+    configured = os.environ.get("CARGO_BUILD_TARGET", host_target_triple)
+    return validate_target_triple(configured, host_target_triple)
 
 
 def executable_suffix(target_triple: str) -> str:

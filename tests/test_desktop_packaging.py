@@ -23,38 +23,57 @@ build_desktop_sidecar = _load_builder()
 
 
 @pytest.mark.parametrize(
-    ("target_triple", "host_platform", "suffix"),
+    ("target_triple", "suffix"),
     [
-        ("x86_64-unknown-linux-gnu", "linux", ""),
-        ("aarch64-apple-darwin", "darwin", ""),
-        ("x86_64-pc-windows-msvc", "win32", ".exe"),
+        ("x86_64-unknown-linux-gnu", ""),
+        ("aarch64-apple-darwin", ""),
+        ("x86_64-pc-windows-msvc", ".exe"),
     ],
 )
-def test_sidecar_target_contract(
-    target_triple: str, host_platform: str, suffix: str
-) -> None:
-    validated = build_desktop_sidecar.validate_target_triple(target_triple, host_platform)
+def test_sidecar_target_contract(target_triple: str, suffix: str) -> None:
+    validated = build_desktop_sidecar.validate_target_triple(target_triple, target_triple)
 
     assert validated == target_triple
     assert build_desktop_sidecar.executable_suffix(target_triple) == suffix
 
 
 @pytest.mark.parametrize(
-    ("target_triple", "host_platform"),
+    ("target_triple", "host_target_triple"),
     [
-        ("../../outside", "linux"),
-        ("", "linux"),
-        ("x86_64-pc-windows-msvc", "linux"),
-        ("x86_64-unknown-linux-gnu", "win32"),
-        ("xwindows-unknown-unknown", "linux"),
-        ("wasm32-unknown-unknown", "linux"),
+        ("../../outside", "x86_64-unknown-linux-gnu"),
+        ("", "x86_64-unknown-linux-gnu"),
+        ("x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"),
+        ("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"),
+        ("aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+        ("x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"),
+        ("xwindows-unknown-unknown", "x86_64-unknown-linux-gnu"),
+        ("wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"),
     ],
 )
 def test_sidecar_target_contract_rejects_unsafe_or_cross_platform_builds(
-    target_triple: str, host_platform: str
+    target_triple: str, host_target_triple: str
 ) -> None:
     with pytest.raises(build_desktop_sidecar.SidecarBuildError):
-        build_desktop_sidecar.validate_target_triple(target_triple, host_platform)
+        build_desktop_sidecar.validate_target_triple(target_triple, host_target_triple)
+
+
+def test_configured_target_is_checked_against_rustc_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu")
+    monkeypatch.setattr(
+        build_desktop_sidecar.subprocess,
+        "run",
+        lambda *args, **kwargs: build_desktop_sidecar.subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout="x86_64-unknown-linux-gnu\n"
+        ),
+    )
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="cannot label a x86_64-unknown-linux-gnu sidecar as aarch64-unknown-linux-gnu",
+    ):
+        build_desktop_sidecar.determine_target_triple()
 
 
 def test_windows_sidecar_output_uses_tauri_executable_name(monkeypatch: pytest.MonkeyPatch) -> None:
