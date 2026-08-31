@@ -9,8 +9,9 @@ single-instance process also polls automatically using `poll_interval_minutes` (
 default) and publishes the next scheduled check in Health. Polling remains disabled when production
 locking or host-owned notification delivery is unsupported by the current configuration.
 Closing the main window hides it while the host keeps automatic polling and notification delivery
-alive. The system-tray menu restores the window or explicitly quits the host. The application must
-still be launched after login; automatic startup is not implemented yet.
+alive. The system-tray menu restores the window or explicitly quits the host. An opt-in Settings
+control registers the installed application to start after login; that launch stays hidden in the
+tray until the user opens it.
 
 Settings can safely update polling cadence, message retention, and native-notification enablement
 through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
@@ -37,7 +38,7 @@ The host acknowledges an intent only after the platform notification API accepts
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
 retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
 window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-autostart behavior or public Google OAuth verification. When an OAuth desktop-client identity
+public Google OAuth verification. When an OAuth desktop-client identity
 is configured externally or injected into the release build, Health can run the read-only Gmail
 browser authorization flow and initialize the current-mailbox baseline. The existing systemd
 watcher remains the production polling path while equivalent live behavior is evaluated; the
@@ -69,6 +70,9 @@ For an isolated development config, set `EOM_EMAIL_WATCHER_CONFIG` to its path b
 app. `EOM_EMAIL_ENGINE_BIN` may point to an already-installed `eom-mail-engine` executable; when it
 is absent, the packaged sidecar and then the repository/uv development runner are tried in that
 order. These are trusted process-environment settings, not frontend inputs.
+
+Start on login registers the currently running executable. Enable it from the installed application,
+not from `pnpm tauri dev`, so the operating system does not retain a development-build path.
 
 ## Debian package
 
