@@ -10,6 +10,7 @@ SCRIPTS_DIR = Path(__file__).parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
+privacy_projection = PROOF_SCRIPT["privacy_projection"]
 
 
 def test_proof_check_gate_accepts_only_complete_success() -> None:
@@ -20,3 +21,17 @@ def test_proof_check_gate_accepts_only_complete_success() -> None:
         match="Connect proof failed checks: provider_removed, provider_restored",
     ):
         require_proof_checks({"provider_restored": False, "provider_removed": False})
+
+
+def test_privacy_projection_allows_only_artifact_display_names() -> None:
+    projected = privacy_projection(
+        {
+            "message_id": "private-message",
+            "inputs": [{"display_name": "private-message.pdf"}],
+        }
+    )
+
+    assert projected == {
+        "message_id": "private-message",
+        "inputs": [{"display_name": "<allowed-artifact-display-name>"}],
+    }

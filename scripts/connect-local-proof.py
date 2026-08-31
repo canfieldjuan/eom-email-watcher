@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -249,6 +249,21 @@ def require_proof_checks(checks: dict[str, bool]) -> None:
         raise RuntimeError(f"Connect proof failed checks: {', '.join(failed_checks)}")
 
 
+def privacy_projection(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<allowed-artifact-display-name>"
+                if key == "display_name"
+                else privacy_projection(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [privacy_projection(item) for item in value]
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Exercise Connect with a real provider process and synthetic Gmail bytes"
@@ -297,8 +312,25 @@ def main() -> None:
     reference_provider: ReferenceProvider | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     original_connect_client_factory = connect._client
+
+    def stop_active_providers() -> None:
+        nonlocal provider, recovered, restarted
+        if provider is not None:
+            stop_provider(provider)
+            provider = None
+        if restarted is not None:
+            stop_provider(restarted)
+            restarted = None
+        if recovered is not None:
+            stop_provider(recovered)
+            recovered = None
+
     try:
-        with tempfile.TemporaryDirectory(prefix="connect-proof-") as temporary:
+        with (
+            tempfile.TemporaryDirectory(prefix="connect-proof-") as temporary,
+            ExitStack() as provider_scope,
+        ):
+            provider_scope.callback(stop_active_providers)
             root = Path(temporary)
             runtime_dir = root / "runtime"
             data_dir = root / "data"
@@ -655,6 +687,7 @@ def main() -> None:
                 item
                 for item in after_restart["items"]
                 if item["provider"]["app_id"] == selected["provider"]["app_id"]
+                and item["provider"]["version"] == selected["provider"]["version"]
                 and item["capability"]["id"] == selected["capability"]["id"]
                 and item["capability"]["version"] == selected["capability"]["version"]
             ]
@@ -662,11 +695,14 @@ def main() -> None:
                 item
                 for item in after_job_restart["items"]
                 if item["provider"]["app_id"] == selected["provider"]["app_id"]
+                and item["provider"]["version"] == selected["provider"]["version"]
                 and item["capability"]["id"] == selected["capability"]["id"]
                 and item["capability"]["version"] == selected["capability"]["version"]
             ]
             request_inputs = durable_request.get("inputs")
-            serialized_request = json.dumps(durable_request, separators=(",", ":"))
+            serialized_request = json.dumps(
+                privacy_projection(durable_request), separators=(",", ":"), sort_keys=True
+            )
             request_has_safe_shape = (
                 set(durable_request)
                 == {"protocol_version", "job_id", "capability", "inputs", "parameters"}
@@ -831,6 +867,7 @@ def main() -> None:
                 "request_excludes_gmail_identity": (
                     request_has_safe_shape
                     and durable_request["job_id"] == request_id
+                    and request_inputs[0]["display_name"] == pdf_path.name
                     and all(
                         private_value not in serialized_request
                         for private_value in (
