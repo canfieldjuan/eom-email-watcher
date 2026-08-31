@@ -99,6 +99,10 @@ def _host_notification_intent_count(runtime: Runtime) -> int:
     return runtime.store.notification_intent_count()
 
 
+def _production_check_lock_path(config: Config) -> Path:
+    return config.database_file.with_name(f"{config.database_file.name}.check.lock")
+
+
 def _require_host_delivery_compatible(runtime: Runtime) -> None:
     if runtime.config.ntfy_topic:
         raise ApiError(
@@ -111,7 +115,9 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     config = runtime.config
-    production_check_supported = operation_lock_supported()
+    production_check_supported = operation_lock_supported(
+        _production_check_lock_path(config)
+    )
     state = runtime.store.state()
     model_ok, model_detail = runtime.model.health()
     return {
@@ -213,13 +219,12 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             **Watcher.inactive_result(config, runtime.store, dry_run=dry_run),
             "pending_notifications": _host_notification_intent_count(runtime),
         }
-    if not dry_run and not operation_lock_supported():
+    lock_path = _production_check_lock_path(config)
+    if not dry_run and not operation_lock_supported(lock_path):
         raise ApiError(
             "unsupported_platform",
-            "Production watcher checks require POSIX operation locking",
+            "Production watcher checks require native operation locking",
         )
-
-    lock_path = config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
     def run() -> dict[str, int | bool]:
         gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
@@ -1288,7 +1293,8 @@ def _settings_data(config: Config) -> dict[str, object]:
         "notifications_enabled": config.notifications_enabled,
         "poll_interval_minutes": config.poll_interval_minutes,
         "polling_supported": (
-            config.ntfy_topic is None and operation_lock_supported()
+            config.ntfy_topic is None
+            and operation_lock_supported(_production_check_lock_path(config))
         ),
         "retention_days": config.retention_days,
         "timezone": config.timezone,

@@ -21,6 +21,22 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest --cov=eom_email_watcher --cov-report=term-missing
 
+  windows-operation-lock:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: >-
+          uv run pytest
+          tests/test_locking.py
+          tests/test_config.py::test_packaged_tzdata_supports_default_zone_without_system_database
+          tests/test_engine_api.py::test_read_operations_are_versioned_and_do_not_expose_token_paths
+          tests/test_engine_api.py::test_check_defers_delivery_until_state_checked_ack
+
   desktop:
     runs-on: ubuntu-latest
     defaults:

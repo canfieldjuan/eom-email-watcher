@@ -26,6 +26,10 @@ def write_config(
 ) -> None:
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
+    credentials_file = (path.parent / "credentials.json").as_posix()
+    token_file = (path.parent / "token.json").as_posix()
+    send_token_file = (path.parent / "send-token.json").as_posix()
+    database_file = (path.parent / "watcher.sqlite3").as_posix()
     senders = (
         '''[[senders]]
 email = "z@example.com"
@@ -40,10 +44,10 @@ name = "Trusted A"
     )
     path.write_text(
         f'''timezone = "{timezone}"
-gmail_credentials_file = "{path.parent / "credentials.json"}"
-gmail_token_file = "{path.parent / "token.json"}"
-gmail_send_token_file = "{path.parent / "send-token.json"}"
-database_file = "{path.parent / "watcher.sqlite3"}"
+gmail_credentials_file = "{credentials_file}"
+gmail_token_file = "{token_file}"
+gmail_send_token_file = "{send_token_file}"
+database_file = "{database_file}"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "local-model"
 model_require_auth = false
@@ -1050,7 +1054,13 @@ def test_unsupported_platform_is_reported_before_production_check(
         return FakeGmail()
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
-    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda: False)
+    checked_lock_paths: list[Path] = []
+
+    def operation_lock_unsupported(lock_path: Path) -> bool:
+        checked_lock_paths.append(lock_path)
+        return False
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", operation_lock_unsupported)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
 
     health = engine_api._response(request(config_path, "health.get"))
@@ -1061,6 +1071,10 @@ def test_unsupported_platform_is_reported_before_production_check(
     assert health["data"]["notifications"]["host_delivery_ready"] is False
     assert settings["data"]["polling_supported"] is False
     assert checked["error"]["code"] == "unsupported_platform"
+    expected_lock_path = loaded.config.database_file.with_name(
+        f"{loaded.config.database_file.name}.check.lock"
+    )
+    assert checked_lock_paths == [expected_lock_path, expected_lock_path, expected_lock_path]
     assert gmail_calls == 0
     assert loaded.store.state()[0] == "100"
 
