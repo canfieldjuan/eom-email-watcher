@@ -503,6 +503,79 @@ def test_final_validation_failure_removes_candidate_without_previous_entitlement
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_post_promotion_directory_sync_failure_restores_existing_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    existing = signed_license(key, claims(expires_at="2028-01-01T00:00:00Z"))
+    destination = private_entitlement_path(tmp_path / "config", existing)
+    source = tmp_path / "replacement.json"
+    source.write_bytes(signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    original_sync = entitlement._sync_directory
+    sync_calls = 0
+
+    def fail_first_sync(path: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise entitlement._install_error(entitlement.STORAGE_UNAVAILABLE)
+        original_sync(path)
+
+    monkeypatch.setattr(entitlement, "_sync_directory", fail_first_sync)
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert sync_calls == 2
+    assert destination.read_bytes() == existing
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_post_promotion_directory_sync_failure_removes_candidate_without_previous_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    destination.parent.mkdir(parents=True, mode=0o700)
+    destination.parent.chmod(0o700)
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    original_sync = entitlement._sync_directory
+    sync_calls = 0
+
+    def fail_first_sync(path: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise entitlement._install_error(entitlement.STORAGE_UNAVAILABLE)
+        original_sync(path)
+
+    monkeypatch.setattr(entitlement, "_sync_directory", fail_first_sync)
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+
+    assert failure.value.code == entitlement.INSTALL_FAILED
+    assert sync_calls == 2
+    assert not destination.exists()
+    assert not list(destination.parent.glob(f".{entitlement.ENTITLEMENT_FILE_NAME}.tmp.*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
 def test_new_private_directories_sync_their_parent_entries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

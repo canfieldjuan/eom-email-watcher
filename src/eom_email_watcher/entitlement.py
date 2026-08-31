@@ -97,6 +97,12 @@ def _install_error(code: str) -> EntitlementInstallError:
     return EntitlementInstallError(code, _INSTALL_ERROR_MESSAGES[code])
 
 
+class _CandidateInstallError(EntitlementInstallError):
+    def __init__(self, *, promoted: bool):
+        super().__init__(INSTALL_FAILED, _INSTALL_ERROR_MESSAGES[INSTALL_FAILED])
+        self.promoted = promoted
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -189,7 +195,12 @@ class EntitlementGate:
         with _activation_lock(parent):
             previous = _read_existing_destination(self.path)
             _require_active_candidate(candidate, self.keys, self._current_time())
-            _install_candidate(self.path, candidate)
+            try:
+                _install_candidate(self.path, candidate)
+            except _CandidateInstallError as exc:
+                if exc.promoted:
+                    _restore_previous_entitlement(self.path, previous)
+                raise _install_error(INSTALL_FAILED) from exc
             status = self.status()
             if not status.active:
                 _restore_previous_entitlement(self.path, previous)
@@ -681,8 +692,11 @@ def _install_candidate(destination: Path, content: bytes) -> None:
             os.replace(temporary, destination)
             replaced = True
         except OSError as exc:
-            raise _install_error(INSTALL_FAILED) from exc
-        _sync_directory(destination.parent)
+            raise _CandidateInstallError(promoted=replaced) from exc
+        try:
+            _sync_directory(destination.parent)
+        except EntitlementInstallError as exc:
+            raise _CandidateInstallError(promoted=True) from exc
     finally:
         with suppress(OSError):
             os.close(descriptor)
