@@ -177,6 +177,7 @@ class EntitlementGate:
             or not hasattr(os, "geteuid")
             or not hasattr(os, "O_NOFOLLOW")
             or not hasattr(os, "O_CLOEXEC")
+            or not hasattr(os, "O_NONBLOCK")
             or not hasattr(os, "O_DIRECTORY")
         ):
             raise _install_error(STORAGE_UNAVAILABLE)
@@ -349,7 +350,13 @@ def _require_active_candidate(
 
 
 def _read_private_entitlement(path: Path) -> bytes | None:
-    if os.name != "posix" or not hasattr(os, "geteuid") or not hasattr(os, "O_NOFOLLOW"):
+    if (
+        os.name != "posix"
+        or not hasattr(os, "geteuid")
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_CLOEXEC")
+        or not hasattr(os, "O_NONBLOCK")
+    ):
         return None
     try:
         expected_uid = os.geteuid()
@@ -365,7 +372,10 @@ def _read_private_entitlement(path: Path) -> bytes | None:
             or not 0 < candidate.st_size <= MAX_ENTITLEMENT_BYTES
         ):
             return None
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except OSError:
         return None
     try:
@@ -396,7 +406,10 @@ def _read_candidate_entitlement(path: Path) -> bytes:
             or not 0 < candidate.st_size <= MAX_ENTITLEMENT_BYTES
         ):
             raise _install_error(SOURCE_INVALID)
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except EntitlementInstallError:
         raise
     except OSError as exc:
@@ -503,7 +516,10 @@ def _read_existing_destination(path: Path) -> bytes | None:
     ):
         raise _install_error(STORAGE_UNAVAILABLE)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
     except OSError as exc:
         raise _install_error(STORAGE_UNAVAILABLE) from exc
     try:
@@ -559,7 +575,7 @@ def _activation_lock(parent: Path) -> Iterator[None]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
         )
     except OSError as exc:

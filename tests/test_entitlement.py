@@ -331,6 +331,47 @@ def test_source_destination_and_authority_boundaries_fail_closed(tmp_path: Path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
+def test_candidate_swap_to_fifo_is_rejected_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    source = tmp_path / "candidate.json"
+    source.write_bytes(signed_license(key, claims()))
+    destination = tmp_path / "config" / "local-connect" / entitlement.ENTITLEMENT_FILE_NAME
+    gate = entitlement.EntitlementGate.for_test(
+        destination,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+    original_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal swapped
+        if Path(path) == source and not swapped:
+            source.unlink()
+            os.mkfifo(source)
+            swapped = True
+            assert flags & os.O_NONBLOCK
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+
+    with pytest.raises(entitlement.EntitlementInstallError) as failure:
+        gate.install(source)
+
+    assert swapped is True
+    assert failure.value.code == entitlement.SOURCE_INVALID
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix activation boundary")
 def test_unusable_private_directory_mode_is_rejected_before_replacement(
     tmp_path: Path,
 ) -> None:

@@ -450,6 +450,7 @@ let gmailCredentialsConfigured = false;
 let healthRequestGeneration = 0;
 let connectInstalling = false;
 let connectStatusRefreshInFlight = false;
+let connectEntitlementActive: boolean | null = null;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
@@ -1266,6 +1267,14 @@ function renderConnectStatus(status: ConnectEntitlementStatus): void {
   connectDetail.textContent = detail;
 }
 
+function applyConnectStatus(status: ConnectEntitlementStatus, forceCapabilityRefresh = false): void {
+  const activeChanged =
+    connectEntitlementActive !== null && connectEntitlementActive !== status.active;
+  connectEntitlementActive = status.active;
+  renderConnectStatus(status);
+  if ((activeChanged || forceCapabilityRefresh) && configurationReady) void loadInbox();
+}
+
 async function refreshConnectStatus(): Promise<void> {
   if (connectInstalling || connectStatusRefreshInFlight) return;
   connectStatusRefreshInFlight = true;
@@ -1274,7 +1283,7 @@ async function refreshConnectStatus(): Promise<void> {
   connectActivate.hidden = true;
   try {
     const status = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
-    if (!connectInstalling) renderConnectStatus(status);
+    if (!connectInstalling) applyConnectStatus(status);
   } catch (error) {
     if (!connectInstalling) {
       setHealthValue(connectHealth, false, "Unknown");
@@ -1309,13 +1318,12 @@ async function selectAndInstallConnectEntitlement(): Promise<void> {
       const status = await invoke<ConnectEntitlementStatus>("connect_entitlement_install", {
         sourcePath: selected,
       });
-      renderConnectStatus(status);
-      if (status.active && configurationReady) void loadInbox();
+      applyConnectStatus(status, status.active);
     } catch (error) {
       const failure = errorMessage(error);
       try {
         const current = await invoke<ConnectEntitlementStatus>("connect_entitlement_status");
-        renderConnectStatus(current);
+        applyConnectStatus(current);
         setHealthValue(
           connectHealth,
           current.active,
@@ -1867,7 +1875,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") void refreshConnectStatus();
 });
 window.setInterval(() => {
-  if (document.visibilityState === "visible") void refreshConnectStatus();
+  if (document.visibilityState === "visible" && !healthView.hidden) void refreshConnectStatus();
 }, 30_000);
 void refreshConnectStatus();
 void initializeDesktop();
