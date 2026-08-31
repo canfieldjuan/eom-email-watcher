@@ -429,7 +429,7 @@ def main() -> None:
                 raise RuntimeError(f"Connect output presentation failed: {presentation}")
             rendered = presentation["data"]["presentation"]
             if rendered["kind"] != "document_summary":
-                raise RuntimeError(f"Unexpected Connect output presentation: {presentation}")
+                raise RuntimeError("Unexpected Connect output presentation kind")
             summary_text = rendered["summary"]["text"]
 
             reference_provider = ReferenceProvider.start(runtime_dir)
@@ -938,6 +938,8 @@ def main() -> None:
                     inbox_without_connect["ok"]
                     and inbox_without_connect["data"]["items"][0]["message_id"] == "fixture-message"
                 ),
+                "input_media_type_matches": job_row[7] == "application/pdf",
+                "input_byte_size_matches": job_row[8] == len(pdf),
                 "input_sha256_matches": job_row[9] == hashlib.sha256(pdf).hexdigest(),
                 "job_completed": response["data"]["status"] == "completed",
                 "persisted_capability_matches": (
@@ -953,9 +955,7 @@ def main() -> None:
                 ),
                 "persisted_result_present": job_row[13] is not None,
                 "replayed_completed_job_without_provider": (
-                    replayed_data is not None
-                    and replayed_data["job_id"] == request_id
-                    and replayed_data["outputs"] == outputs
+                    replayed_data is not None and replayed_data == response["data"]
                 ),
                 "request_excludes_gmail_identity": (
                     request_has_safe_shape
