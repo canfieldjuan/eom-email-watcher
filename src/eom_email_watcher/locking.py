@@ -1,33 +1,55 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from filelock import FileLock, SoftFileLock
+from filelock import Timeout as FileLockTimeout
 
 
-def operation_lock_supported() -> bool:
-    return os.name == "posix"
+def operation_lock_supported(lock_path: Path) -> bool:
+    if FileLock is SoftFileLock:
+        return False
+
+    probe_parent = lock_path.parent
+    while not probe_parent.exists():
+        parent = probe_parent.parent
+        if parent == probe_parent:
+            return False
+        probe_parent = parent
+
+    try:
+        # First-run settings can precede creation of the configured state directory.
+        # Its nearest existing ancestor is the filesystem that will contain it.
+        with TemporaryDirectory(prefix=".eom-lock-probe-", dir=probe_parent) as directory:
+            probe = FileLock(Path(directory) / "probe.lock", timeout=0, mode=0o600)
+            try:
+                probe.acquire()
+                return not isinstance(probe, SoftFileLock)
+            finally:
+                if probe.is_locked:
+                    probe.release()
+    except (FileLockTimeout, OSError):
+        return False
 
 
 @contextmanager
 def operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
-    """Hold the existing Unix advisory lock behind a platform adapter boundary."""
-    if not operation_lock_supported():
+    """Hold one native, nonblocking process lock on supported desktop platforms."""
+    if FileLock is SoftFileLock:
         raise RuntimeError("Production operation locking is not available on this platform")
 
-    import fcntl
-
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    lock = FileLock(lock_path, timeout=0, mode=0o600)
     try:
-        os.fchmod(descriptor, 0o600)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(busy_message) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        lock.acquire()
+    except FileLockTimeout as exc:
+        raise RuntimeError(busy_message) from exc
+    if isinstance(lock, SoftFileLock):
+        lock.release()
+        raise RuntimeError("Production operation locking is not available on this platform")
+    try:
+        yield
     finally:
-        os.close(descriptor)
+        lock.release()
