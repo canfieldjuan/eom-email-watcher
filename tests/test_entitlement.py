@@ -187,6 +187,12 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
     )
 
 
+def test_empty_xdg_config_home_uses_home_fallback() -> None:
+    assert entitlement._entitlement_path("", "/home/test-user") == Path(
+        "/home/test-user/.config/local-connect/entitlement-v1.json"
+    )
+
+
 def git_fixture(repository: Path, relative_path: str) -> bytes:
     result = subprocess.run(
         [

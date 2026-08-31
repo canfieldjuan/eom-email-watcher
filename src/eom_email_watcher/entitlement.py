@@ -124,9 +124,9 @@ def connect_entitlement_decision() -> EntitlementDecision:
 
 
 def _entitlement_path(xdg_config_home: str | None, home: str | None) -> Path | None:
-    if xdg_config_home is not None:
+    if xdg_config_home:
         root = Path(xdg_config_home)
-    elif home is not None:
+    elif home:
         root = Path(home) / ".config"
     else:
         return None

@@ -56,7 +56,8 @@ The signed entitlement format is versioned independently from Connect protocols 
 an Ed25519 signature over exact JSON payload bytes, a build-embedded issuer public-key ring, a
 unique feature list, and the exact interval `issued_at <= not_before <= now < expires_at`. Runtime
 configuration cannot replace issuer trust. The verified Linux location is
-`$XDG_CONFIG_HOME/local-connect/entitlement-v1.json`, with the documented `$HOME/.config` fallback;
+`$XDG_CONFIG_HOME/local-connect/entitlement-v1.json`, with the documented `$HOME/.config` fallback
+when the XDG value is unset or empty;
 the directory and regular non-symlink file must be owned by the current user and grant no group or
 other access.
 

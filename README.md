@@ -145,9 +145,9 @@ caller request ID.
 
 On Linux, the entitlement is read on every discovery/invocation from
 `$XDG_CONFIG_HOME/local-connect/entitlement-v1.json`, or from
-`$HOME/.config/local-connect/entitlement-v1.json` when `XDG_CONFIG_HOME` is unset. The directory
+`$HOME/.config/local-connect/entitlement-v1.json` when `XDG_CONFIG_HOME` is unset or empty. The directory
 must be owner-only mode `700`; the regular non-symlink file must be owner-only mode `600`. Validity
-is exact (`not_before <= now < expires_at`) with no hidden grace. Replacing the file with a valid
+is exact (`issued_at <= not_before <= now < expires_at`) with no hidden grace. Replacing the file with a valid
 signed entitlement restores capability discovery without restarting Email Watcher. Gmail OAuth is
 not a Connect license and is never shared with a provider.
 
