@@ -16,6 +16,9 @@ from uuid import uuid4
 
 import httpx
 from connect_reference_provider import (
+    INSPECT_CAPABILITY_ID,
+    INSPECT_OUTPUT_MEDIA_TYPE,
+    INSPECT_PAYLOAD,
     REFERENCE_APP_ID,
     SUMMARY_CAPABILITY_ID,
     TRANSLATE_CAPABILITY_ID,
@@ -490,13 +493,23 @@ def main() -> None:
                 and item["capability"]["id"] == TRANSLATE_CAPABILITY_ID
                 and item["capability"]["version"] == "1.0"
             ]
-            if len(translation_choices) != 1:
+            inspection_choices = [
+                item
+                for item in reference_items
+                if item["provider"]["app_id"] == REFERENCE_APP_ID
+                and item["capability"]["id"] == INSPECT_CAPABILITY_ID
+                and item["capability"]["version"] == "1.0"
+                and item["capability"]["produces"] == [INSPECT_OUTPUT_MEDIA_TYPE]
+            ]
+            if len(translation_choices) != 1 or len(inspection_choices) != 1:
                 raise RuntimeError(
                     f"Reference provider did not expose its generic capabilities: "
                     f"{reference_capabilities}"
                 )
             translation = translation_choices[0]
+            inspection = inspection_choices[0]
             translation_request_id = str(uuid4())
+            inspection_request_id = str(uuid4())
             translation_invocation = {
                 "request_id": translation_request_id,
                 "message_id": "fixture-message",
@@ -513,6 +526,22 @@ def main() -> None:
                 "parameters": {"target-language": "Spanish"},
                 "confirmed": False,
             }
+            inspection_invocation = {
+                "request_id": inspection_request_id,
+                "message_id": "fixture-message",
+                "part_id": FIXTURE_PART_ID,
+                "provider": {
+                    "app_id": inspection["provider"]["app_id"],
+                    "version": inspection["provider"]["version"],
+                    "instance_id": inspection["provider"]["instance_id"],
+                },
+                "capability": {
+                    "id": inspection["capability"]["id"],
+                    "version": inspection["capability"]["version"],
+                },
+                "parameters": {},
+                "confirmed": False,
+            }
             engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
             try:
                 translation_response = engine_api._response(
@@ -522,13 +551,22 @@ def main() -> None:
                         translation_invocation,
                     )
                 )
+                inspection_response = engine_api._response(
+                    request(
+                        config_path,
+                        "connect.attachment.invoke",
+                        inspection_invocation,
+                    )
+                )
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
-            if not translation_response["ok"]:
+            if not translation_response["ok"] or not inspection_response["ok"]:
                 raise RuntimeError(
-                    f"Reference capability invocation failed: {translation_response}"
+                    "Reference capability invocation failed: "
+                    f"translation={translation_response}, inspection={inspection_response}"
                 )
             translation_output = translation_response["data"]["outputs"][0]
+            inspection_output = inspection_response["data"]["outputs"][0]
             translation_presentation = engine_api._response(
                 request(
                     config_path,
@@ -545,13 +583,56 @@ def main() -> None:
                 raise RuntimeError(
                     f"Reference output presentation failed: {translation_presentation}"
                 )
+            inspection_presentation = engine_api._response(
+                request(
+                    config_path,
+                    "connect.output.present",
+                    {
+                        "message_id": "fixture-message",
+                        "part_id": FIXTURE_PART_ID,
+                        "job_id": inspection_request_id,
+                        "artifact_id": inspection_output["artifact_id"],
+                    },
+                )
+            )
+            export_dir = root / "reference-export"
+            export_dir.mkdir(mode=0o700)
+
+            def export_inspection_output() -> dict[str, object]:
+                return engine_api._response(
+                    request(
+                        config_path,
+                        "connect.output.export",
+                        {
+                            "message_id": "fixture-message",
+                            "part_id": FIXTURE_PART_ID,
+                            "job_id": inspection_request_id,
+                            "artifact_id": inspection_output["artifact_id"],
+                            "destination_dir": str(export_dir),
+                        },
+                    )
+                )
+
+            inspection_exports = tuple(export_inspection_output() for _ in range(2))
+            if not inspection_presentation["ok"] or any(
+                not export["ok"] for export in inspection_exports
+            ):
+                raise RuntimeError(
+                    "Opaque output handling failed: "
+                    f"present={inspection_presentation}, exports={inspection_exports}"
+                )
+            inspection_export_paths = tuple(
+                Path(export["data"]["path"]) for export in inspection_exports
+            )
             translation_job = runtime.store.connect_job(translation_request_id)
+            inspection_job = runtime.store.connect_job(inspection_request_id)
             reference_requests = reference_provider.requests()
             reference_request_json = json.dumps(
                 privacy_projection(reference_requests), separators=(",", ":"), sort_keys=True
             )
             reference_instance_id = reference_provider.instance_id
             translation_submissions = reference_provider.submission_count(translation_request_id)
+            inspection_submissions = reference_provider.submission_count(inspection_request_id)
             reference_provider.stop()
             reference_provider = None
             after_reference_stop = engine_api._response(
@@ -735,12 +816,11 @@ def main() -> None:
             reference_inbox_results = reference_inbox_after_stop["data"]["items"][0]["attachments"][
                 0
             ]["capability_results"]
-            reference_results = [
-                item
+            reference_results_by_job = {
+                item["job_id"]: item
                 for item in reference_inbox_results
                 if item.get("provider", {}).get("app_id") == REFERENCE_APP_ID
-            ]
-            reference_result = reference_results[0] if len(reference_results) == 1 else None
+            }
             after_reference_items = after_reference_stop["data"]["items"]
             translation_durable_request = (
                 json.loads(translation_job.request_json)
@@ -788,6 +868,7 @@ def main() -> None:
                 ),
                 "reference_capabilities_discovered": reference_capability_ids
                 == {
+                    INSPECT_CAPABILITY_ID,
                     SUMMARY_CAPABILITY_ID,
                     TRANSLATE_CAPABILITY_ID,
                 },
@@ -795,12 +876,19 @@ def main() -> None:
                     translation_response["data"]["status"] == "completed"
                     and translation_job is not None
                     and translation_job.status == "completed"
+                    and inspection_response["data"]["status"] == "completed"
+                    and inspection_job is not None
+                    and inspection_job.status == "completed"
                 ),
                 "reference_capability_provenance_persisted": (
                     translation_job is not None
                     and translation_job.provider_app_id == REFERENCE_APP_ID
                     and translation_job.provider_instance_id == reference_instance_id
                     and translation_job.capability_id == TRANSLATE_CAPABILITY_ID
+                    and inspection_job is not None
+                    and inspection_job.provider_app_id == REFERENCE_APP_ID
+                    and inspection_job.provider_instance_id == reference_instance_id
+                    and inspection_job.capability_id == INSPECT_CAPABILITY_ID
                 ),
                 "reference_capability_parameters_persisted": (
                     isinstance(translation_durable_request, dict)
@@ -815,8 +903,43 @@ def main() -> None:
                         "text": "Reference translation target: Spanish.\n",
                     }
                 ),
+                "unknown_output_uses_safe_path": (
+                    inspection_output["media_type"] == INSPECT_OUTPUT_MEDIA_TYPE
+                    and set(inspection_output)
+                    == {
+                        "artifact_id",
+                        "media_type",
+                        "display_name",
+                        "byte_size",
+                        "sha256",
+                    }
+                    and inspection_presentation
+                    == {
+                        "data": {
+                            "job_id": inspection_request_id,
+                            "output": inspection_output,
+                            "presentation": {"kind": "opaque"},
+                        },
+                        "ok": True,
+                        "operation": "connect.output.present",
+                        "protocol": engine_api.PROTOCOL_VERSION,
+                    }
+                    and len(set(inspection_export_paths)) == 2
+                    and all(path.parent == export_dir for path in inspection_export_paths)
+                    and all(path.suffix == ".bin" for path in inspection_export_paths)
+                    and all(
+                        "reference-inspection" not in path.name for path in inspection_export_paths
+                    )
+                    and all(
+                        path.read_bytes() == INSPECT_PAYLOAD for path in inspection_export_paths
+                    )
+                    and all(
+                        os.name == "nt" or path.stat().st_mode & 0o777 == 0o600
+                        for path in inspection_export_paths
+                    )
+                ),
                 "reference_provider_requests_private": (
-                    len(reference_requests) == 1
+                    len(reference_requests) == 2
                     and all(
                         private_value not in reference_request_json
                         for private_value in (
@@ -829,24 +952,44 @@ def main() -> None:
                         )
                     )
                 ),
-                "reference_provider_submitted_once": translation_submissions == 1,
-                "reference_result_reached_inbox": (
+                "reference_provider_submitted_once_per_job": (
+                    translation_submissions == 1 and inspection_submissions == 1
+                ),
+                "reference_results_reached_inbox": (
                     translation_job is not None
-                    and reference_result
+                    and inspection_job is not None
+                    and reference_results_by_job
                     == {
-                        "job_id": translation_request_id,
-                        "capability_id": TRANSLATE_CAPABILITY_ID,
-                        "capability_version": translation["capability"]["version"],
-                        "status": "completed",
-                        "updated_at": translation_job.updated_at,
-                        "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
-                        "provider": {
-                            "app_id": REFERENCE_APP_ID,
-                            "version": translation["provider"]["version"],
-                            "instance_id": reference_instance_id,
+                        translation_request_id: {
+                            "job_id": translation_request_id,
+                            "capability_id": TRANSLATE_CAPABILITY_ID,
+                            "capability_version": translation["capability"]["version"],
+                            "status": "completed",
+                            "updated_at": translation_job.updated_at,
+                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                            "provider": {
+                                "app_id": REFERENCE_APP_ID,
+                                "version": translation["provider"]["version"],
+                                "instance_id": reference_instance_id,
+                            },
+                            "parameters": {"target-language": "Spanish"},
+                            "outputs": [translation_output],
                         },
-                        "parameters": {"target-language": "Spanish"},
-                        "outputs": [translation_output],
+                        inspection_request_id: {
+                            "job_id": inspection_request_id,
+                            "capability_id": INSPECT_CAPABILITY_ID,
+                            "capability_version": inspection["capability"]["version"],
+                            "status": "completed",
+                            "updated_at": inspection_job.updated_at,
+                            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+                            "provider": {
+                                "app_id": REFERENCE_APP_ID,
+                                "version": inspection["provider"]["version"],
+                                "instance_id": reference_instance_id,
+                            },
+                            "parameters": {},
+                            "outputs": [inspection_output],
+                        },
                     }
                 ),
                 "reference_removal_preserves_watcher": (
@@ -935,6 +1078,7 @@ def main() -> None:
                 "proof_input": "synthetic Gmail attachment bytes",
                 "proof_passed": all(proof_checks.values()),
                 "reference_capability_count": len(reference_capability_ids),
+                "reference_inspection_submissions": inspection_submissions,
                 "reference_translation_submissions": translation_submissions,
                 "source_app_id": job_row[10],
                 "summary_provider_choices": len(summary_choices),

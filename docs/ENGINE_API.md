@@ -137,8 +137,9 @@ selection rather than being collapsed into an ambiguity error.
 `scripts/connect-local-proof.py` also registers a deterministic synthetic provider that is unknown
 to application runtime code. It proves that a second capability, required string parameters, two
 providers for one capability, generic persistence/Inbox rendering, and bounded text presentation
-all travel through these same operations. Removing that registration removes its actions while the
-remaining provider and normal Inbox stay healthy.
+all travel through these same operations. It also proves an unknown output remains opaque until the
+trusted host exports it to a private random `.bin` path. Removing that registration removes its
+actions while the remaining provider and normal Inbox stay healthy.
 
 `connect.attachment.invoke` requires a caller-generated UUIDv4 plus exact provider application,
 version, instance, capability, version, declared parameters, and confirmation state. It revalidates

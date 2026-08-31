@@ -120,10 +120,11 @@ verification schemas:
 The proof uses attachment-scoped v2 discovery and explicit provider/capability selection, persists a
 stable request identity and generic output, stops the provider, replays the completed job while it is
 offline, and verifies the Inbox remains healthy. A deterministic reference provider then advertises
-the same summary capability plus `document.translate`. The proof observes two summary-provider
-choices, invokes the non-summary capability through the same generic contract, persists its
-provenance and parameters into the Inbox, presents bounded text natively, and removes the reference
-provider without disrupting Document Summarizer or the Inbox. It then restarts Document Summarizer
+the same summary capability plus `document.translate` and `document.inspect`. The proof observes two
+summary-provider choices, invokes both non-summary capabilities through the same generic contract,
+persists their provenance and parameters into the Inbox, presents bounded text natively, keeps an
+unknown output opaque until private export, and removes the reference provider without disrupting
+Document Summarizer or the Inbox. It then restarts Document Summarizer
 under the same durable v2 identity, interrupts a job after provider acceptance, restarts again, and
 reconciles the same request to the provider's authoritative `PROVIDER_RESTARTED` failure without
 reopening Gmail or resubmitting. Any false lifecycle, privacy, persistence, or provenance predicate
