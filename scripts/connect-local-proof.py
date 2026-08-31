@@ -9,10 +9,12 @@ import subprocess
 import tempfile
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
+
+import httpx
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.db import SCHEMA_VERSION
@@ -24,6 +26,9 @@ FIXTURE_PART_ID = "fixture-mime-part"
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
     model_id = "connect-proof-model"
+    pause_next_generation = False
+    generation_started = threading.Event()
+    generation_release = threading.Event()
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -34,7 +39,14 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
-        self.wfile.write(encoded)
+        with suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(encoded)
+
+    @classmethod
+    def pause_one_generation(cls) -> None:
+        cls.generation_started.clear()
+        cls.generation_release.clear()
+        cls.pause_next_generation = True
 
     def do_GET(self) -> None:
         if self.path != "/v1/models":
@@ -54,6 +66,13 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
                 message["content"] for message in request["messages"] if message["role"] == "user"
             )
             prompt = json.loads(user_prompt)
+            handler = type(self)
+            if handler.pause_next_generation:
+                handler.pause_next_generation = False
+                handler.generation_started.set()
+                if not handler.generation_release.wait(timeout=15):
+                    self.send_error(504)
+                    return
             text = self._structured_output(schema_name, prompt)
         except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             self.send_error(400)
@@ -262,18 +281,17 @@ def main() -> None:
     pdf_path = args.pdf.resolve(strict=True)
     pdf = pdf_path.read_bytes()
 
-    model_server: ThreadingHTTPServer | None = None
-    model_thread: threading.Thread | None = None
+    model_server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureModelHandler)
+    model_thread = threading.Thread(target=model_server.serve_forever, daemon=True)
+    model_thread.start()
+    fixture_model_base_url = f"http://127.0.0.1:{model_server.server_port}/v1/"
     if configured_model:
         model_base_url = args.model_base_url
         model_name = args.model_name
         model_mode = "configured"
         model_timeout_seconds = args.model_timeout_seconds or 120
     else:
-        model_server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureModelHandler)
-        model_thread = threading.Thread(target=model_server.serve_forever, daemon=True)
-        model_thread.start()
-        model_base_url = f"http://127.0.0.1:{model_server.server_port}/v1/"
+        model_base_url = fixture_model_base_url
         model_name = FixtureModelHandler.model_id
         model_mode = "fixture"
         model_timeout_seconds = args.model_timeout_seconds or 10
@@ -284,16 +302,21 @@ def main() -> None:
     )
     provider: subprocess.Popen[bytes] | None = None
     restarted: subprocess.Popen[bytes] | None = None
+    recovered: subprocess.Popen[bytes] | None = None
     original_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    original_connect_client_factory = connect._client
 
     def stop_active_providers() -> None:
-        nonlocal provider, restarted
+        nonlocal provider, recovered, restarted
         if provider is not None:
             stop_provider(provider)
             provider = None
         if restarted is not None:
             stop_provider(restarted)
             restarted = None
+        if recovered is not None:
+            stop_provider(recovered)
+            recovered = None
 
     try:
         with (
@@ -320,6 +343,15 @@ def main() -> None:
             )
             if token_path is not None:
                 environment["DOC_SUM_MODEL_API_TOKEN_FILE"] = str(token_path)
+            restart_environment = environment.copy()
+            restart_environment.pop("DOC_SUM_MODEL_API_TOKEN_FILE", None)
+            restart_environment.update(
+                {
+                    "DOC_SUM_MODEL_BASE_URL": fixture_model_base_url,
+                    "DOC_SUM_MODEL_NAME": FixtureModelHandler.model_id,
+                    "DOC_SUM_MODEL_TIMEOUT_SECONDS": "10",
+                }
+            )
 
             before = wait_for_capability(False)
             provider = start_provider(provider_binary, environment)
@@ -431,8 +463,87 @@ def main() -> None:
             inbox_without_connect = engine_api._response(
                 request(config_path, "inbox.recent", {"limit": 1})
             )
-            restarted = start_provider(provider_binary, environment)
+            restarted = start_provider(provider_binary, restart_environment)
             after_restart = wait_for_capability(True)
+
+            interrupted_invocation = {**invocation, "request_id": str(uuid4())}
+            interrupted_result: dict[str, object] = {}
+            interrupted_provider_submissions = 0
+
+            def instrumented_connect_client() -> httpx.Client:
+                client = original_connect_client_factory()
+
+                def record_request(request: httpx.Request) -> None:
+                    nonlocal interrupted_provider_submissions
+                    if request.method == "POST" and request.url.path == "/v2/jobs":
+                        interrupted_provider_submissions += 1
+
+                client.event_hooks["request"].append(record_request)
+                return client
+
+            connect._client = instrumented_connect_client
+
+            def invoke_interrupted_job() -> None:
+                try:
+                    interrupted_result["response"] = engine_api._response(
+                        request(
+                            config_path,
+                            "connect.attachment.invoke",
+                            interrupted_invocation,
+                        )
+                    )
+                except BaseException as error:
+                    interrupted_result["error_type"] = type(error).__name__
+
+            FixtureModelHandler.pause_one_generation()
+            engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
+            interrupted_thread = threading.Thread(
+                target=invoke_interrupted_job,
+                name="connect-interrupted-invocation",
+            )
+            interrupted_thread.start()
+            try:
+                if not FixtureModelHandler.generation_started.wait(timeout=10):
+                    raise RuntimeError(
+                        "Interrupted Connect job did not reach deterministic model work"
+                    )
+                stop_provider(restarted)
+                restarted = None
+                after_interruption = wait_for_capability(False)
+            finally:
+                FixtureModelHandler.generation_release.set()
+                interrupted_thread.join(timeout=15)
+                engine_api.GmailGateway.from_token = original_from_token
+            if interrupted_thread.is_alive():
+                raise RuntimeError("Interrupted Connect invocation did not stop")
+            if "error_type" in interrupted_result:
+                raise RuntimeError(
+                    f"Interrupted Connect invocation raised {interrupted_result['error_type']}"
+                )
+            interrupted_response = interrupted_result.get("response")
+            if not isinstance(interrupted_response, dict):
+                raise RuntimeError("Interrupted Connect invocation returned no response")
+
+            recovered = start_provider(provider_binary, restart_environment)
+            after_job_restart = wait_for_capability(True)
+            gmail_reconciliation_reads = 0
+
+            def reject_gmail_reopen(*_args: object) -> FixtureGmail:
+                nonlocal gmail_reconciliation_reads
+                gmail_reconciliation_reads += 1
+                raise AssertionError("Provider reconciliation must not reopen Gmail")
+
+            engine_api.GmailGateway.from_token = staticmethod(reject_gmail_reopen)
+            try:
+                reconciled_interruption = engine_api._response(
+                    request(
+                        config_path,
+                        "connect.attachment.invoke",
+                        interrupted_invocation,
+                    )
+                )
+            finally:
+                engine_api.GmailGateway.from_token = original_from_token
 
             with sqlite3.connect(runtime.config.database_file) as database:
                 quick_check = database.execute("PRAGMA quick_check").fetchone()[0]
@@ -445,13 +556,36 @@ def main() -> None:
                     FROM connect_attachment_jobs WHERE job_id = ?""",
                     (request_id,),
                 ).fetchone()
+                interrupted_rows = database.execute(
+                    """SELECT job_id, provider_instance_id, status, error_code,
+                    error_retryable
+                    FROM connect_attachment_jobs WHERE job_id = ?""",
+                    (interrupted_invocation["request_id"],),
+                ).fetchall()
             if job_row is None:
                 raise RuntimeError("Connect proof result was not durable")
             durable_request = json.loads(job_row[12])
             replayed_data = replayed.get("data") if replayed["ok"] else None
+            interrupted_error = interrupted_response.get("error")
+            interrupted_error_code = (
+                interrupted_error.get("code") if isinstance(interrupted_error, dict) else None
+            )
+            reconciled_error = reconciled_interruption.get("error")
+            reconciled_error_code = (
+                reconciled_error.get("code") if isinstance(reconciled_error, dict) else None
+            )
+            interrupted_row = interrupted_rows[0] if len(interrupted_rows) == 1 else None
             restarted_matches = [
                 item
                 for item in after_restart["items"]
+                if item["provider"]["app_id"] == selected["provider"]["app_id"]
+                and item["provider"]["version"] == selected["provider"]["version"]
+                and item["capability"]["id"] == selected["capability"]["id"]
+                and item["capability"]["version"] == selected["capability"]["version"]
+            ]
+            recovered_matches = [
+                item
+                for item in after_job_restart["items"]
                 if item["provider"]["app_id"] == selected["provider"]["app_id"]
                 and item["provider"]["version"] == selected["provider"]["version"]
                 and item["capability"]["id"] == selected["capability"]["id"]
@@ -482,6 +616,35 @@ def main() -> None:
                 "provider_available": bool(during["items"]),
                 "provider_removed": not after_stop["items"],
                 "provider_restored": len(restarted_matches) == 1,
+                "provider_instance_stable": (
+                    len(restarted_matches) == 1
+                    and restarted_matches[0]["provider"]["instance_id"]
+                    == selected["provider"]["instance_id"]
+                ),
+                "interrupted_provider_removed": not after_interruption["items"],
+                "interrupted_provider_restored": (
+                    len(recovered_matches) == 1
+                    and recovered_matches[0]["provider"]["instance_id"]
+                    == selected["provider"]["instance_id"]
+                ),
+                "interrupted_submission_ambiguous": (
+                    interrupted_response.get("ok") is False
+                    and interrupted_error_code == "provider_unavailable"
+                ),
+                "interrupted_job_reconciled": (
+                    reconciled_interruption.get("ok") is False
+                    and reconciled_error_code == "provider_restarted"
+                ),
+                "interrupted_job_persisted_once": (
+                    interrupted_row is not None
+                    and interrupted_row[0] == interrupted_invocation["request_id"]
+                    and interrupted_row[1] == selected["provider"]["instance_id"]
+                    and interrupted_row[2] == "failed"
+                    and interrupted_row[3] == "PROVIDER_RESTARTED"
+                    and interrupted_row[4] == 1
+                ),
+                "interrupted_provider_submitted_once": interrupted_provider_submissions == 1,
+                "interrupted_reconciliation_skipped_gmail": gmail_reconciliation_reads == 0,
                 "email_database_healthy": quick_check == "ok",
                 "email_database_current": schema_version == SCHEMA_VERSION,
                 "inbox_healthy_without_connect": (
@@ -504,11 +667,6 @@ def main() -> None:
                     and job_row[6] == selected["provider"]["instance_id"]
                 ),
                 "persisted_result_present": job_row[13] is not None,
-                "provider_instance_rotated": (
-                    len(restarted_matches) == 1
-                    and restarted_matches[0]["provider"]["instance_id"]
-                    != selected["provider"]["instance_id"]
-                ),
                 "replayed_completed_job_without_provider": (
                     replayed_data is not None and replayed_data == response["data"]
                 ),
@@ -532,6 +690,8 @@ def main() -> None:
                 "source_app_matches": job_row[10] == connect.SOURCE_APP_ID,
             }
             result = {
+                "after_interruption_capabilities": len(after_interruption["items"]),
+                "after_job_restart_capabilities": len(after_job_restart["items"]),
                 "after_restart_capabilities": len(after_restart["items"]),
                 "after_stop_capabilities": len(after_stop["items"]),
                 "before_provider_capabilities": len(before["items"]),
@@ -541,8 +701,14 @@ def main() -> None:
                 "email_database_quick_check": quick_check,
                 "email_database_schema_version": schema_version,
                 "job_status": response["data"]["status"],
+                "interrupted_initial_error_code": interrupted_error_code,
+                "interrupted_provider_submissions": interrupted_provider_submissions,
+                "interrupted_reconciled_error_code": reconciled_error_code,
                 "model_id": model_name,
                 "model_mode": model_mode,
+                "persisted_interrupted_job_status": (
+                    interrupted_row[2] if interrupted_row is not None else None
+                ),
                 "persisted_job_status": job_row[11],
                 "persisted_protocol_version": job_row[1],
                 "proof_input": "synthetic Gmail attachment bytes",
@@ -554,15 +720,16 @@ def main() -> None:
             print(json.dumps(result, separators=(",", ":"), sort_keys=True))
             require_proof_checks(proof_checks)
     finally:
+        connect._client = original_connect_client_factory
         if provider is not None:
             stop_provider(provider)
         if restarted is not None:
             stop_provider(restarted)
-        if model_server is not None:
-            model_server.shutdown()
-            model_server.server_close()
-        if model_thread is not None:
-            model_thread.join(timeout=5)
+        if recovered is not None:
+            stop_provider(recovered)
+        model_server.shutdown()
+        model_server.server_close()
+        model_thread.join(timeout=5)
         if original_runtime_dir is None:
             os.environ.pop("XDG_RUNTIME_DIR", None)
         else:
