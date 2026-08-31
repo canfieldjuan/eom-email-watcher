@@ -314,7 +314,7 @@ def main() -> None:
     original_connect_client_factory = connect._client
 
     def stop_active_providers() -> None:
-        nonlocal provider, recovered, restarted
+        nonlocal provider, recovered, reference_provider, restarted
         if provider is not None:
             stop_provider(provider)
             provider = None
@@ -324,6 +324,9 @@ def main() -> None:
         if recovered is not None:
             stop_provider(recovered)
             recovered = None
+        if reference_provider is not None:
+            reference_provider.stop()
+            reference_provider = None
 
     try:
         with (
@@ -545,7 +548,7 @@ def main() -> None:
             translation_job = runtime.store.connect_job(translation_request_id)
             reference_requests = reference_provider.requests()
             reference_request_json = json.dumps(
-                reference_requests, separators=(",", ":"), sort_keys=True
+                privacy_projection(reference_requests), separators=(",", ":"), sort_keys=True
             )
             reference_instance_id = reference_provider.instance_id
             translation_submissions = reference_provider.submission_count(translation_request_id)
