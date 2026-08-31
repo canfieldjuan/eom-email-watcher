@@ -10,9 +10,11 @@ default) and publishes the next scheduled check in Health. Polling remains disab
 locking or host-owned notification delivery is unsupported by the current configuration.
 
 Settings can safely update polling cadence, message retention, and native-notification enablement
-through the engine contract without exposing TOML or secret-bearing fields to the frontend. A new
-polling cadence takes effect after the app restarts; retention and notification changes are read by
-later watcher operations. Model/gateway settings and credentials remain outside this UI.
+through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
+exact-loopback inference, the same UI can update the HTTP endpoint and model identifier. A gateway
+endpoint and model are read-only, while gateway trust and authentication credentials remain managed
+externally. A new polling cadence takes effect after the app restarts; model, retention, and
+notification changes are read by later watcher operations.
 
 Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
 ledger. Open fetches only the selected attachment through the read-only Gmail engine, writes it to a
