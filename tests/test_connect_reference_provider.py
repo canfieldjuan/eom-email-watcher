@@ -82,6 +82,7 @@ def test_reference_provider_is_discoverable_generic_and_idempotent(tmp_path) -> 
         assert inspection.result.outputs[0].display_name == "../../reference-inspection.json"
         assert inspection.result.outputs[0].payload == INSPECT_PAYLOAD
         assert provider.submission_count(inspect_job.job_id) == 1
+        assert provider.post_attempt_count() == 4
     finally:
         provider.stop()
 

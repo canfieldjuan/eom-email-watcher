@@ -515,6 +515,7 @@ def main() -> None:
                 "parameters": {},
                 "confirmed": False,
             }
+            stale_post_attempts_before = reference_provider.post_attempt_count()
             engine_api.GmailGateway.from_token = staticmethod(
                 lambda *_args: (_ for _ in ()).throw(
                     AssertionError("stale capability selection reached Gmail")
@@ -530,6 +531,7 @@ def main() -> None:
                 )
             finally:
                 engine_api.GmailGateway.from_token = original_from_token
+            stale_post_attempts_after = reference_provider.post_attempt_count()
             engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
             try:
                 translation_response = engine_api._response(
@@ -844,6 +846,7 @@ def main() -> None:
                     and stale_response.get("error", {}).get("code") == "capability_unavailable"
                     and stale_job is None
                     and stale_submissions == 0
+                    and stale_post_attempts_after == stale_post_attempts_before
                 ),
                 "reference_capabilities_discovered": reference_capability_ids
                 == {

@@ -81,6 +81,7 @@ class _Server(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.jobs: dict[str, tuple[str, dict[str, object], dict[str, object]]] = {}
         self.submissions: dict[str, int] = {}
+        self.post_attempts = 0
         self.lock = threading.Lock()
 
     @property
@@ -145,6 +146,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(404, "NOT_FOUND", "Reference provider route was not found.")
 
     def do_POST(self) -> None:
+        if self.path == "/v2/jobs":
+            with self.server.lock:
+                self.server.post_attempts += 1
         if not self._authorized():
             self._error(401, "UNAUTHORIZED", "Reference provider authorization failed.")
             return
@@ -364,6 +368,10 @@ class ReferenceProvider:
     def submission_count(self, job_id: str) -> int:
         with self.server.lock:
             return self.server.submissions.get(job_id, 0)
+
+    def post_attempt_count(self) -> int:
+        with self.server.lock:
+            return self.server.post_attempts
 
     def stop(self) -> None:
         self.registration_path.unlink(missing_ok=True)
