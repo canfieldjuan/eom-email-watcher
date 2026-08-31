@@ -490,6 +490,15 @@ def main() -> None:
                 "parameters": {"target-language": "Spanish"},
                 "confirmed": False,
             }
+            stale_request_id = str(uuid4())
+            stale_invocation = {
+                **translation_invocation,
+                "request_id": stale_request_id,
+                "capability": {
+                    **translation_invocation["capability"],
+                    "version": "9.0",
+                },
+            }
             inspection_invocation = {
                 "request_id": inspection_request_id,
                 "message_id": "fixture-message",
@@ -506,6 +515,21 @@ def main() -> None:
                 "parameters": {},
                 "confirmed": False,
             }
+            engine_api.GmailGateway.from_token = staticmethod(
+                lambda *_args: (_ for _ in ()).throw(
+                    AssertionError("stale capability selection reached Gmail")
+                )
+            )
+            try:
+                stale_response = engine_api._response(
+                    request(
+                        config_path,
+                        "connect.attachment.invoke",
+                        stale_invocation,
+                    )
+                )
+            finally:
+                engine_api.GmailGateway.from_token = original_from_token
             engine_api.GmailGateway.from_token = staticmethod(lambda *_args: FixtureGmail(pdf))
             try:
                 translation_response = engine_api._response(
@@ -587,6 +611,8 @@ def main() -> None:
                 reference_requests, separators=(",", ":"), sort_keys=True
             )
             reference_instance_id = reference_provider.instance_id
+            stale_job = runtime.store.connect_job(stale_request_id)
+            stale_submissions = reference_provider.submission_count(stale_request_id)
             translation_submissions = reference_provider.submission_count(translation_request_id)
             inspection_submissions = reference_provider.submission_count(inspection_request_id)
             reference_inbox = engine_api._response(
@@ -813,6 +839,12 @@ def main() -> None:
                     and {item["provider"]["app_id"] for item in summary_choices}
                     == {selected["provider"]["app_id"], REFERENCE_APP_ID}
                 ),
+                "stale_capability_version_rejected_before_handoff": (
+                    stale_response.get("ok") is False
+                    and stale_response.get("error", {}).get("code") == "capability_unavailable"
+                    and stale_job is None
+                    and stale_submissions == 0
+                ),
                 "reference_capabilities_discovered": reference_capability_ids
                 == {
                     INSPECT_CAPABILITY_ID,
@@ -967,6 +999,7 @@ def main() -> None:
                 "reference_inspection_submissions": inspection_submissions,
                 "reference_translation_submissions": translation_submissions,
                 "source_app_id": job_row[10],
+                "stale_capability_error_code": stale_response.get("error", {}).get("code"),
                 "summary_provider_choices": len(summary_choices),
                 "summary_sha256": hashlib.sha256(summary_text.encode()).hexdigest(),
                 **proof_checks,

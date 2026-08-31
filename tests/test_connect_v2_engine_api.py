@@ -228,6 +228,37 @@ def test_attachment_capabilities_are_contextual_and_do_not_expose_transport_secr
     assert "127.0.0.1" not in str(response)
 
 
+def test_invoke_rejects_stale_capability_version_before_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    payload = invocation_payload(selected)
+    payload["capability"] = {"id": selected.capability_id, "version": "9.0"}
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: (_ for _ in ()).throw(AssertionError("stale selection reached Gmail")),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *args: (_ for _ in ()).throw(AssertionError("stale selection reached handoff")),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.attachment.invoke", payload))
+
+    assert response["error"]["code"] == "capability_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+
+
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

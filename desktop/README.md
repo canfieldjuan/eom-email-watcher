@@ -124,7 +124,8 @@ the same summary capability plus `document.translate` and `document.inspect`. Th
 summary-provider choices, invokes both non-summary capabilities through the same generic contract,
 persists their provenance and parameters into the Inbox, presents bounded text natively, keeps an
 unknown output opaque until private export, and removes the reference provider without disrupting
-Document Summarizer or the Inbox. It then restarts Document Summarizer
+Document Summarizer or the Inbox. It also rejects a stale capability version before Gmail access,
+durable job creation, or provider submission. It then restarts Document Summarizer
 under the same durable v2 identity, interrupts a job after provider acceptance, restarts again, and
 reconciles the same request to the provider's authoritative `PROVIDER_RESTARTED` failure without
 reopening Gmail or resubmitting. Any false lifecycle, privacy, persistence, or provenance predicate
