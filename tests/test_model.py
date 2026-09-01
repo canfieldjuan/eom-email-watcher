@@ -120,6 +120,49 @@ def test_unsupported_payment_card_semantics_are_rejected(
 
 
 @pytest.mark.parametrize(
+    "source_text",
+    [
+        "These are access badges, not credit cards.",
+        "Do not provide cardholder data; send the access badge identifiers.",
+        "No bank card numbers are needed, only building-access card numbers.",
+        "CVV is not requested; provide the access badge numbers.",
+        "Credit card details are not needed; provide the access badge numbers.",
+    ],
+)
+def test_negated_payment_card_semantics_do_not_authorize_positive_output(
+    source_text: str,
+) -> None:
+    raw = valid_result()
+    raw["summary"] = "The sender requests credit card details."
+    raw["suggested_action"] = "Provide the credit card details."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text=source_text,
+        )
+
+
+def test_negated_payment_card_output_remains_valid_without_source_support() -> None:
+    raw = valid_result()
+    raw["summary"] = "Credit card details are not needed; access badge numbers are requested."
+    raw["suggested_action"] = "Do not provide credit card details; send access badge numbers."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    result = validate_analysis(
+        raw,
+        "2026-07-18T12:00:00+00:00",
+        source_text="Please send the building-access badge numbers.",
+    )
+
+    assert result.suggested_action == raw["suggested_action"]
+
+
+@pytest.mark.parametrize(
     ("source_text", "suggested_action"),
     [
         (

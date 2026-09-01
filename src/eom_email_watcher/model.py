@@ -47,11 +47,22 @@ GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PAYMENT_CARD_SEMANTICS_RE = re.compile(
     r"\b(?:"
     r"(?:credit|debit|payment|bank|charge|prepaid)[\s-]+cards?"
+    r"(?:[\s-]+(?:numbers?|details|data|information))?"
     r"|pay(?:ment)?\s+by\s+card"
     r"|card[\s-]+payments?"
     r"|cardholder[\s-]+(?:data|information)"
     r"|cvv|cvc"
     r")\b",
+    re.IGNORECASE,
+)
+PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
+    r"(?:\b(?:no|never|without)\b|\bnot\b(?!\s+only\b)"
+    r"|\b(?:isn|aren|wasn|weren|don|doesn|didn)['’]t\b)"
+    r"(?:\W+\w+){0,4}\W*$",
+    re.IGNORECASE,
+)
+PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
+    r"^\W*(?:(?:is|are|was|were|will|should|must|do|does|did)\W+)?(?:not|never)\b",
     re.IGNORECASE,
 )
 
@@ -133,6 +144,18 @@ def _json_object(text: str) -> dict[str, object]:
     return value
 
 
+def _has_affirmed_payment_card_semantics(text: str) -> bool:
+    for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text):
+        prefix = re.split(r"[.!?;:,\n]", text[: match.start()])[-1]
+        suffix = re.split(r"[.!?;:,\n]", text[match.end() :], maxsplit=1)[0]
+        if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
+            continue
+        if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
+            continue
+        return True
+    return False
+
+
 def validate_analysis(
     raw: dict[str, object], received_at: str, *, source_text: str | None = None
 ) -> Analysis:
@@ -149,8 +172,8 @@ def validate_analysis(
     )
     if (
         source_text is not None
-        and PAYMENT_CARD_SEMANTICS_RE.search(output_text)
-        and not PAYMENT_CARD_SEMANTICS_RE.search(source_text)
+        and _has_affirmed_payment_card_semantics(output_text)
+        and not _has_affirmed_payment_card_semantics(source_text)
     ):
         raise ModelError("Local model introduced unsupported payment-card semantics")
     if analysis.deadline_iso:
