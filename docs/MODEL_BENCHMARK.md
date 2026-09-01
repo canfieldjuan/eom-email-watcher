@@ -52,8 +52,9 @@ contradictory raw analysis at the deterministic validation boundary.
 
 `benchmarks/email-obligation-v1.json` is a separate synthetic regression corpus for assigning who
 must act and who owes whom. It covers a customer requesting copies of invoices overdue on the
-customer's side, a vendor asking the mailbox owner to pay, quoted invoice history, and the boundary
-between building-access cards and payment cards.
+customer's side, a vendor asking the mailbox owner to pay, a sender adopting a deadline from a
+forwarded invoice, quoted invoice history, and the boundary between building-access cards and
+financial-card paraphrases.
 
 The corpus is separate so the hash and meaning of `email-analysis-v1.json` and its historical
 results remain unchanged. Validate it with:

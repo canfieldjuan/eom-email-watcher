@@ -89,12 +89,25 @@ def test_prompt_assigns_obligations_from_the_mailbox_owner_perspective() -> None
     assert "quoted history" in SYSTEM_PROMPT
     assert "building-access card" in SYSTEM_PROMPT
     assert "payment card" in SYSTEM_PROMPT
+    assert "explicitly adopts or assigns" in SYSTEM_PROMPT
 
 
-def test_unsupported_payment_card_semantics_are_rejected() -> None:
+@pytest.mark.parametrize(
+    "unsupported_semantics",
+    [
+        "payment card numbers",
+        "bank card numbers",
+        "charge card details",
+        "CVV",
+        "cardholder data",
+    ],
+)
+def test_unsupported_payment_card_semantics_are_rejected(
+    unsupported_semantics: str,
+) -> None:
     raw = valid_result()
-    raw["summary"] = "The sender requests payment card numbers."
-    raw["suggested_action"] = "Provide the payment card details."
+    raw["summary"] = f"The sender requests {unsupported_semantics}."
+    raw["suggested_action"] = f"Provide the {unsupported_semantics}."
     raw["deadline_text"] = None
     raw["deadline_iso"] = None
 
@@ -120,6 +133,10 @@ def test_unsupported_payment_card_semantics_are_rejected() -> None:
         (
             "Please pay by card through the secure portal.",
             "Use the requested payment card through the secure portal.",
+        ),
+        (
+            "Please provide the bank card details.",
+            "Provide the requested bank card details.",
         ),
     ],
 )

@@ -45,7 +45,13 @@ MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PAYMENT_CARD_SEMANTICS_RE = re.compile(
-    r"\b(?:(?:credit|debit|payment)[\s-]+cards?|pay(?:ment)?\s+by\s+card|card[\s-]+payments?)\b",
+    r"\b(?:"
+    r"(?:credit|debit|payment|bank|charge|prepaid)[\s-]+cards?"
+    r"|pay(?:ment)?\s+by\s+card"
+    r"|card[\s-]+payments?"
+    r"|cardholder[\s-]+(?:data|information)"
+    r"|cvv|cvc"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -89,9 +95,11 @@ not introduce a financial-card type that the current or quoted text never states
 Use concise plain language. Mark urgent only for an explicit near-term operational or payment risk.
 If the email states an explicit due date (e.g. "due September 5, 2026"), you MUST set
 deadline_text to that phrase and deadline_iso to its YYYY-MM-DD value only when it governs an
-action or obligation of the mailbox owner. Ignore dates that govern another party or appear only
-in quoted history. If no mailbox-owner deadline is explicit, set both to null. deadline_iso must
-be YYYY-MM-DD and supported by the email text.
+action or obligation of the mailbox owner. Ignore dates that govern another party. A date in quoted
+history governs the mailbox owner only when the newest sender explicitly adopts or assigns that
+quoted obligation (for example, "Please pay this"); otherwise ignore dates that appear only in
+quoted history. If no mailbox-owner deadline is explicit, set both to null. deadline_iso must be
+YYYY-MM-DD and supported by the email text.
 Set action_required=true and give a specific suggested_action (e.g. "Pay invoice by the due
 date", "Reply to confirm the reschedule", "Call the customer") whenever a human must act. Set
 action_required=false with suggested_action=null for any message that needs no human action at

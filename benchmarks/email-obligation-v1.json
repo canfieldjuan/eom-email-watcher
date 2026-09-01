@@ -47,6 +47,25 @@
       }
     },
     {
+      "id": "colleague-adopts-forwarded-invoice-deadline",
+      "sender": "manager@example.org",
+      "subject": "FW: Vendor invoice 2051",
+      "received_at": "2026-09-01T19:00:00+00:00",
+      "current_local_time": "2026-09-01T14:00:00-05:00",
+      "body": "Please pay this invoice.\n\n-----Original Message-----\nFrom: vendor@example.net\nSent: August 31, 2026\nSubject: Invoice 2051\nInvoice 2051 for $875.00 is due September 12, 2026.",
+      "attachment_names": [
+        "invoice-2051.pdf"
+      ],
+      "expected": {
+        "category": "invoice",
+        "priority": "high",
+        "action_required": true,
+        "deadline_text": "due September 12, 2026",
+        "deadline_iso": "2026-09-12",
+        "forbidden_output_substrings": []
+      }
+    },
+    {
       "id": "customer-confirms-their-payment",
       "sender": "accounts-payable@example.com",
       "subject": "RE: Overdue invoice 3011",
