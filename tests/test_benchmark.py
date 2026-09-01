@@ -126,6 +126,7 @@ def test_public_result_omits_email_and_free_form_model_text() -> None:
     assert public["aggregate"]["priority_accuracy"] == 1.0
     assert public["aggregate"]["action_required_precision"] == 1.0
     assert public["aggregate"]["action_required_recall"] == 1.0
+    assert public["aggregate"]["suggested_action_human_review"] == "pending"
     assert public["latency_seconds"] == {
         "runtime_cold_start": 5.34,
         "first_request": 0.4,
@@ -239,6 +240,31 @@ def test_obligation_grounding_has_separate_public_metric() -> None:
     assert public["aggregate"]["grounding_failure_rate"] == 1.0
 
 
+def test_grounding_error_on_unmarked_case_uses_total_run_denominator() -> None:
+    corpus = load_corpus(
+        Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
+    )
+    case = next(
+        item for item in corpus.email_cases if item.id == "vendor-requests-mailbox-owner-payment"
+    )
+    single_case_corpus = corpus.model_copy(update={"email_cases": [case]})
+
+    def reject_unsupported_card(_case: BenchmarkEmailCase) -> Analysis:
+        raise ModelError("Local model introduced unsupported payment-card semantics")
+
+    public, _private = run_benchmark(
+        single_case_corpus,
+        _candidate(),
+        repetitions=1,
+        analyze=reject_unsupported_card,
+        timer=iter([0.0, 0.1]).__next__,
+    )
+
+    assert public["cases"][0]["grounding_failures"] == 1
+    assert public["aggregate"]["grounding_failures"] == 1
+    assert public["aggregate"]["grounding_failure_rate"] == 1.0
+
+
 def test_obligation_corpus_accepts_grounded_customer_request() -> None:
     corpus = load_corpus(
         Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
@@ -347,6 +373,15 @@ def test_blind_review_hides_candidate_identity_and_keeps_source_local() -> None:
     assert len(packet["items"]) == 1
     assert [item["alias"] for item in packet["items"][0]["summaries"]] == sorted(
         item["alias"] for item in packet["items"][0]["summaries"]
+    )
+    assert all(
+        item["suggested_action"] == "Reply to confirm the requested date."
+        for item in packet["items"][0]["summaries"]
+    )
+    assert all(
+        item["suggested_action_faithfulness"] is None
+        and item["suggested_action_usefulness"] is None
+        for item in packet["items"][0]["summaries"]
     )
 
 

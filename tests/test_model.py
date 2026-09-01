@@ -146,20 +146,34 @@ def test_negated_payment_card_semantics_do_not_authorize_positive_output(
         )
 
 
-def test_negated_payment_card_output_remains_valid_without_source_support() -> None:
+def test_negative_raising_payment_card_output_is_still_rejected() -> None:
     raw = valid_result()
-    raw["summary"] = "Credit card details are not needed; access badge numbers are requested."
-    raw["suggested_action"] = "Do not provide credit card details; send access badge numbers."
+    raw["summary"] = "Access badge numbers are requested."
+    raw["suggested_action"] = "Do not forget to provide credit card details."
     raw["deadline_text"] = None
     raw["deadline_iso"] = None
 
-    result = validate_analysis(
-        raw,
-        "2026-07-18T12:00:00+00:00",
-        source_text="Please send the building-access badge numbers.",
-    )
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Please send the building-access badge numbers.",
+        )
 
-    assert result.suggested_action == raw["suggested_action"]
+
+def test_payment_card_semantics_in_deadline_are_rejected() -> None:
+    raw = valid_result()
+    raw["summary"] = "Access badge numbers are requested."
+    raw["suggested_action"] = "Send the building-access badge numbers."
+    raw["deadline_text"] = "credit card payment due September 5"
+    raw["deadline_iso"] = "2026-09-05"
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Please send the building-access badge numbers by September 5.",
+        )
 
 
 @pytest.mark.parametrize(

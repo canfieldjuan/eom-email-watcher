@@ -168,11 +168,13 @@ def validate_analysis(
     ):
         raise ModelError("Local model response contains unsupported control characters")
     output_text = "\n".join(
-        value for value in (analysis.summary, analysis.suggested_action) if value is not None
+        value
+        for value in (analysis.summary, analysis.suggested_action, analysis.deadline_text)
+        if value is not None
     )
     if (
         source_text is not None
-        and _has_affirmed_payment_card_semantics(output_text)
+        and PAYMENT_CARD_SEMANTICS_RE.search(output_text)
         and not _has_affirmed_payment_card_semantics(source_text)
     ):
         raise ModelError("Local model introduced unsupported payment-card semantics")

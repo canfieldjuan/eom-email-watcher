@@ -478,13 +478,10 @@ def run_benchmark(
             "grounding_failures": totals["grounding_failure"],
             "grounding_failure_rate": _rate(
                 totals["grounding_failure"],
-                sum(
-                    repetitions
-                    for case in corpus.email_cases
-                    if _forbidden_marker_roles(case)[1]
-                ),
+                total_runs,
             ),
             "summary_human_review": "pending",
+            "suggested_action_human_review": "pending",
         },
         "latency_seconds": {
             "runtime_cold_start": candidate.cold_start_seconds,
@@ -565,8 +562,11 @@ def build_blind_review(
                 {
                     "alias": alias,
                     "summary": output.get("summary"),
+                    "suggested_action": output.get("suggested_action"),
                     "faithfulness": None,
                     "usefulness": None,
+                    "suggested_action_faithfulness": None,
+                    "suggested_action_usefulness": None,
                     "notes": "",
                 }
             )
