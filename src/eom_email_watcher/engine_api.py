@@ -304,36 +304,37 @@ def _check(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "dry_run must be a boolean")
 
     runtime = _runtime(request)
-    config = runtime.config
     _require_host_delivery_compatible(runtime)
-    if not config.senders:
+
+    def run(active_runtime: Runtime) -> dict[str, object]:
+        config = active_runtime.config
+        _require_host_delivery_compatible(active_runtime)
+        if not config.senders:
+            return {
+                **Watcher.inactive_result(config, active_runtime.store, dry_run=dry_run),
+                "pending_notifications": _host_notification_intent_count(active_runtime),
+            }
+        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+        result = Watcher(config, active_runtime.store, gmail, active_runtime.model).check(
+            dry_run=dry_run,
+            deliver_notifications=False,
+        )
         return {
-            **Watcher.inactive_result(config, runtime.store, dry_run=dry_run),
-            "pending_notifications": _host_notification_intent_count(runtime),
+            **result,
+            "pending_notifications": _host_notification_intent_count(active_runtime),
         }
-    lock_path = _production_check_lock_path(config)
+
+    if dry_run or not runtime.config.senders:
+        return run(runtime)
+
+    lock_path = _production_check_lock_path(runtime.config)
     if not dry_run and not operation_lock_supported(lock_path):
         raise ApiError(
             "unsupported_platform",
             "Production watcher checks require native operation locking",
         )
-
-    def run() -> dict[str, int | bool]:
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-        return Watcher(config, runtime.store, gmail, runtime.model).check(
-            dry_run=dry_run,
-            deliver_notifications=False,
-        )
-
-    if dry_run:
-        result = run()
-    else:
-        with operation_lock(lock_path, "Another production check is already running"):
-            result = run()
-    return {
-        **result,
-        "pending_notifications": _host_notification_intent_count(runtime),
-    }
+    with operation_lock(lock_path, "Another production check is already running"):
+        return run(_runtime(request))
 
 
 def _recent(request: dict[str, object]) -> dict[str, object]:
@@ -1541,13 +1542,21 @@ def _notifications_pending(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"limit"})
     limit = _bounded_limit(payload, default=25)
     runtime = _runtime(request)
-    config = runtime.config
     _require_host_delivery_compatible(runtime)
-    intents = _host_notification_intents(runtime, limit)
-    sender_names = {sender.email: sender.name for sender in config.senders}
-    return {
-        "items": [_notification_payload(intent, sender_names) for intent in intents]
-    }
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Host notification delivery requires native operation locking",
+        )
+    with operation_lock(lock_path, "Another watcher operation is already running"):
+        runtime = _runtime(request)
+        config = runtime.config
+        _require_host_delivery_compatible(runtime)
+        runtime.store.purge(config.retention_days)
+        intents = _host_notification_intents(runtime, limit)
+        sender_names = {sender.email: sender.name for sender in config.senders}
+    return {"items": [_notification_payload(intent, sender_names) for intent in intents]}
 
 
 def _notifications_ack(request: dict[str, object]) -> dict[str, object]:

@@ -121,13 +121,20 @@ impl NotificationDelivery {
         })
     }
 
+    pub fn run_exclusive<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let _guard = self.lock()?;
+        operation()
+    }
+
     pub fn deliver(
         &self,
         app: &AppHandle,
         engine: &Engine,
     ) -> Result<DeliveryOutcome, EngineError> {
-        let _guard = self.lock()?;
-        deliver_batch(engine, &TauriNotificationSink { app })
+        self.run_exclusive(|| deliver_batch(engine, &TauriNotificationSink { app }))
     }
 
     pub fn check_and_deliver(
@@ -135,14 +142,16 @@ impl NotificationDelivery {
         app: &AppHandle,
         engine: &Engine,
     ) -> Result<CoordinatedCheck, EngineError> {
-        let _guard = self.lock()?;
-        check_and_deliver(engine, &TauriNotificationSink { app })
+        self.run_exclusive(|| check_and_deliver(engine, &TauriNotificationSink { app }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+    use std::time::Duration;
 
     struct FakeQueue {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -301,5 +310,48 @@ mod tests {
             *events.lock().expect("events lock"),
             ["check", "show", "acknowledge"]
         );
+    }
+
+    #[test]
+    fn exclusive_operations_wait_for_active_notification_delivery() {
+        let delivery = NotificationDelivery::default();
+        let active_delivery = delivery.clone();
+        let queued_mutation = delivery.clone();
+        let (active_tx, active_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (mutation_tx, mutation_rx) = mpsc::channel();
+
+        let delivery_thread = thread::spawn(move || {
+            active_delivery
+                .run_exclusive(|| {
+                    active_tx.send(()).expect("signal active delivery");
+                    release_rx.recv().expect("release active delivery");
+                    Ok(())
+                })
+                .expect("active delivery finishes");
+        });
+        active_rx.recv().expect("delivery acquired lock");
+        let mutation_thread = thread::spawn(move || {
+            attempt_tx.send(()).expect("signal mutation attempt");
+            queued_mutation
+                .run_exclusive(|| {
+                    mutation_tx.send(()).expect("signal mutation");
+                    Ok(())
+                })
+                .expect("mutation finishes");
+        });
+        attempt_rx.recv().expect("mutation reached delivery lock");
+
+        assert_eq!(
+            mutation_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        release_tx.send(()).expect("release delivery");
+        mutation_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutation proceeds after delivery");
+        delivery_thread.join().expect("delivery thread joins");
+        mutation_thread.join().expect("mutation thread joins");
     }
 }

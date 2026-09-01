@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -596,6 +597,99 @@ def test_settings_update_applies_shortened_retention_immediately(tmp_path: Path)
     assert response["ok"] is True
     assert response["data"]["retention_days"] == 1
     assert [row["message_id"] for row in runtime.store.recent(10)] == ["current"]
+
+
+def test_production_check_reloads_retention_after_acquiring_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 180")
+    stale_runtime = load_runtime(config_path)
+    stale_runtime.store.set_state("100", datetime.now(UTC))
+    expired_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+
+    class ExpiredGmail:
+        def history_message_ids(self, cursor: str):
+            return ["expired"], "200"
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            return MessageMetadata(
+                message_id,
+                None,
+                "a@example.com",
+                "Trusted A",
+                "Expired message",
+                expired_at,
+                frozenset({"INBOX"}),
+            )
+
+        def full_payload(self, message_id: str):
+            raise AssertionError("expired message must not reach full-body retrieval")
+
+    real_load_runtime = engine_api.load_runtime
+    load_count = 0
+
+    def load_runtime_with_stale_first(path: Path) -> Runtime:
+        nonlocal load_count
+        load_count += 1
+        if load_count == 1:
+            return stale_runtime
+        return real_load_runtime(path)
+
+    @contextmanager
+    def shorten_retention_before_lock_entry(lock_path: Path, busy_message: str):
+        engine_api.update_settings(config_path, {"retention_days": 1})
+        stale_runtime.store.purge(1)
+        yield
+
+    monkeypatch.setattr(engine_api, "load_runtime", load_runtime_with_stale_first)
+    monkeypatch.setattr(engine_api, "operation_lock", shorten_retention_before_lock_entry)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiredGmail())
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["ok"] is True
+    assert response["data"]["discovered"] == 0
+    assert load_count == 2
+    assert load_config(config_path).retention_days == 1
+    assert stale_runtime.store.recent(10) == []
+
+
+def test_notifications_pending_purges_expired_intents_before_host_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 1")
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="expired",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name="Trusted A",
+        subject="Expired message",
+        received_at=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+    )
+    runtime.store.mark_analyzed(
+        "expired",
+        {
+            "category": "customer_request",
+            "priority": "high",
+            "summary": "Please respond.",
+            "action_required": True,
+            "suggested_action": "Reply.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    response = engine_api._response(request(config_path, "notifications.pending"))
+
+    assert response["ok"] is True
+    assert response["data"]["items"] == []
+    assert runtime.store.notification_intents() == []
+    assert runtime.store.recent(10) == []
 
 
 def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(

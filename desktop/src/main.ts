@@ -1351,7 +1351,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
 
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
-  setInboxControlsBusy(false);
+  setInboxControlsBusy(true);
   renderInbox(inboxItems);
   try {
     await invoke<void>("inbox_delete", { messageId: item.message_id });
@@ -1364,6 +1364,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxStatus.dataset.kind = "error";
   } finally {
     inboxDeletionsInFlight.delete(item.message_id);
+    setInboxControlsBusy(false);
     renderInbox(inboxItems);
   }
 }
@@ -1410,6 +1411,7 @@ function inboxStatusLabel(): string {
 }
 
 async function loadInbox(append = false): Promise<void> {
+  if (inboxClearInFlight || inboxDeletionsInFlight.size > 0) return;
   if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
