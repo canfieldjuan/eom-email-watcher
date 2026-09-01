@@ -167,9 +167,10 @@ message is older than the maximum supported retention window.
 
 Schema v8 makes retention a source-time privacy boundary. Each non-dry watcher operation purges by
 `received_at` before pending analysis or notification delivery, rejects malformed or already
-expired metadata before body fetch, bounds stale-cursor search to the same cutoff, and purges once
-more before returning. Expiry removes pending analysis and notification state as well as
-message-owned attachment and Connect state.
+expired metadata before body fetch, clamps future-dated metadata to its observation time, bounds
+stale-cursor search to the same cutoff, and reuses one cutoff through the complete check. Existing
+future-dated rows use their local discovery time only as a safe retention fallback. Expiry removes
+pending analysis and notification state as well as message-owned attachment and Connect state.
 
 Inbox rows also expose `analysis_retryable`, `analysis_error_code`, and
 `analysis_retry_after_seconds`. A retryable gateway failure remains scheduled in the durable

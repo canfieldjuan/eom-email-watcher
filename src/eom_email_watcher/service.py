@@ -13,14 +13,14 @@ from .notifications import NotificationError, send_analysis, send_fallback
 logger = logging.getLogger(__name__)
 
 
-def _received_at_or_none(value: str) -> datetime | None:
+def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
     try:
         received = datetime.fromisoformat(value)
     except ValueError:
         return None
     if received.tzinfo is None:
         return None
-    return received.astimezone(UTC)
+    return min(received.astimezone(UTC), observed_at)
 
 
 class Watcher:
@@ -88,7 +88,7 @@ class Watcher:
                 continue
             if "INBOX" not in metadata.labels or metadata.sender not in self.config.allowlist:
                 continue
-            received_at = _received_at_or_none(metadata.received_at)
+            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
             if received_at is None or received_at < retention_cutoff:
                 logger.info(
                     "Skipping message %s outside the configured retention window",
@@ -101,7 +101,7 @@ class Watcher:
                 "sender": metadata.sender,
                 "sender_name": metadata.sender_name or self.sender_names.get(metadata.sender),
                 "subject": metadata.subject,
-                "received_at": metadata.received_at,
+                "received_at": received_at.isoformat(),
             }
             if dry_run:
                 dry_run_messages.append(
@@ -125,9 +125,10 @@ class Watcher:
             deliver_notifications=deliver_notifications,
             extra=dry_run_messages,
             retention_cutoff=retention_cutoff,
+            retention_observed_at=checked_at,
         )
         if not dry_run:
-            purged += self.store.purge(self.config.retention_days)
+            purged += self.store.purge(self.config.retention_days, now=checked_at)
         return {
             "active": True,
             "discovered": added,
@@ -212,11 +213,14 @@ class Watcher:
         deliver_notifications: bool,
         extra: list[PendingMessage] | None = None,
         retention_cutoff: datetime,
+        retention_observed_at: datetime,
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
         for message in self.store.pending_delivery():
-            received_at = _received_at_or_none(message.received_at)
+            received_at = _received_at_or_none(
+                message.received_at, observed_at=retention_observed_at
+            )
             if received_at is None or received_at < retention_cutoff:
                 continue
             if deliver_notifications:
@@ -226,7 +230,9 @@ class Watcher:
             elif not self.config.notifications_enabled and not dry_run:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
         for message in [*self.store.pending(), *(extra or [])]:
-            received_at = _received_at_or_none(message.received_at)
+            received_at = _received_at_or_none(
+                message.received_at, observed_at=retention_observed_at
+            )
             if received_at is None or received_at < retention_cutoff:
                 continue
             try:

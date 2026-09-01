@@ -1351,6 +1351,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
 
   inboxDeletionsInFlight.add(item.message_id);
   inboxRequestGeneration += 1;
+  setInboxControlsBusy(false);
   renderInbox(inboxItems);
   try {
     await invoke<void>("inbox_delete", { messageId: item.message_id });

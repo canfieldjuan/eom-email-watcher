@@ -53,6 +53,12 @@ class FreshGmail(FakeGmail):
         return replace(super().metadata(message_id), received_at=datetime.now(UTC).isoformat())
 
 
+class FutureDatedGmail(FakeGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        future = datetime.now(UTC) + service_module.timedelta(days=3650)
+        return replace(super().metadata(message_id), received_at=future.isoformat())
+
+
 class FakeModel:
     def __init__(self):
         self.calls = 0
@@ -230,6 +236,46 @@ def test_stale_cursor_recovery_is_bounded_by_retention_before_content_fetch(
     assert model.calls == 0
     assert gmail.search_since_value is not None
     assert before_cutoff <= gmail.search_since_value <= after_cutoff
+
+
+def test_future_received_time_is_clamped_before_persistence(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = FutureDatedGmail()
+    before = datetime.now(UTC)
+
+    result = Watcher(cfg, store, gmail, FakeModel()).check()
+
+    after = datetime.now(UTC)
+    stored = datetime.fromisoformat(store.recent(1)[0]["received_at"])
+    assert result["discovered"] == 1
+    assert before <= stored <= after
+
+
+def test_check_reuses_one_retention_snapshot_for_both_purges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = FreshGmail()
+    purge_times: list[datetime | None] = []
+    real_purge = store.purge
+
+    def record_purge(retention_days: int, *, now: datetime | None = None) -> int:
+        purge_times.append(now)
+        return real_purge(retention_days, now=now)
+
+    monkeypatch.setattr(store, "purge", record_purge)
+
+    Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=False)
+
+    assert len(purge_times) == 2
+    assert purge_times[0] is not None
+    assert purge_times[0] == purge_times[1]
 
 
 @pytest.mark.parametrize(("dry_run", "expected_purged"), [(False, 1), (True, 0)])

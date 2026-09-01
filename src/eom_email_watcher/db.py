@@ -1918,8 +1918,23 @@ class Store:
             cursor = db.execute(
                 """DELETE FROM messages
                 WHERE julianday(received_at) IS NULL
-                   OR julianday(received_at) < julianday(?)""",
-                (cutoff.isoformat(),),
+                   OR (
+                       julianday(received_at) > julianday(?)
+                       AND (
+                           julianday(discovered_at) IS NULL
+                           OR julianday(discovered_at) < julianday(?)
+                       )
+                   )
+                   OR (
+                       julianday(received_at) <= julianday(?)
+                       AND julianday(received_at) < julianday(?)
+                   )""",
+                (
+                    stamp.isoformat(),
+                    cutoff.isoformat(),
+                    stamp.isoformat(),
+                    cutoff.isoformat(),
+                ),
             )
             db.execute(
                 """DELETE FROM suppressed_messages

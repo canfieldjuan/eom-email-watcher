@@ -338,6 +338,27 @@ def test_purge_uses_source_received_time_not_local_discovery_time(tmp_path: Path
     assert [row["message_id"] for row in store.recent(10)] == ["source-current"]
 
 
+def test_purge_bounds_legacy_future_source_time_by_discovery_time(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="future-source",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed future source time",
+        received_at="2036-09-01T00:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ? WHERE message_id = ?",
+            ("2026-08-01T00:00:00+00:00", "future-source"),
+        )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert store.recent(10) == []
+
+
 def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     tmp_path: Path,
 ) -> None:
