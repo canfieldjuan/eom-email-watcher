@@ -52,6 +52,103 @@ def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
     assert recent["notified_at"] is not None
 
 
+def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    stamp = "2026-08-31T12:00:00+00:00"
+    with store.connection() as db:
+        db.executemany(
+            """INSERT INTO messages(
+                message_id, sender, subject, received_at, discovered_at, category
+            ) VALUES (?, 'sender@example.com', 'Update', ?, ?, 'informational')""",
+            [(f"message-{index:03}", stamp, stamp) for index in range(55)],
+        )
+
+    cursor: tuple[str, str] | None = None
+    message_ids: list[str] = []
+    while True:
+        items, cursor = store.query_inbox(limit=7, cursor=cursor)
+        message_ids.extend(str(item["message_id"]) for item in items)
+        assert all(item["category"] == "informational" for item in items)
+        if cursor is None:
+            break
+
+    assert message_ids == [f"message-{index:03}" for index in reversed(range(55))]
+    assert len(message_ids) == len(set(message_ids))
+
+
+def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    with store.connection() as db:
+        db.executemany(
+            """INSERT INTO messages(
+                message_id, sender, sender_name, subject, received_at, discovered_at,
+                status, category, priority, summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    f"noise-{index:03}",
+                    "noise@example.com",
+                    "Noise",
+                    "Routine update",
+                    f"2026-08-31T13:{index:02}:00+00:00",
+                    "2026-08-31T14:00:00+00:00",
+                    "analyzed",
+                    "invoice",
+                    "high",
+                    "Nothing actionable.",
+                )
+                for index in range(60)
+            ]
+            + [
+                (
+                    "target",
+                    "billing@acme.example",
+                    "ACME Billing",
+                    "Overdue % balance",
+                    "2026-08-30T12:00:00+00:00",
+                    "2026-08-31T14:00:00+00:00",
+                    "analyzed",
+                    "invoice",
+                    "high",
+                    "Please review the balance.",
+                ),
+                (
+                    "untriaged",
+                    "billing@acme.example",
+                    None,
+                    "Waiting",
+                    "2026-08-29T12:00:00+00:00",
+                    "2026-08-31T14:00:00+00:00",
+                    "pending",
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        )
+
+    items, cursor = store.query_inbox(
+        limit=10,
+        sender_query="acme",
+        priority="high",
+        category="invoice",
+        status="analyzed",
+        keyword="OVERDUE % BALANCE",
+    )
+    assert [item["message_id"] for item in items] == ["target"]
+    assert cursor is None
+    percent_items, _ = store.query_inbox(limit=10, keyword="%")
+    assert [item["message_id"] for item in percent_items] == ["target"]
+    untriaged_items, _ = store.query_inbox(limit=10, priority="untriaged", category="unclassified")
+    assert [item["message_id"] for item in untriaged_items] == ["untriaged"]
+
+
 def test_analysis_notification_ack_is_state_checked_and_idempotent(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()

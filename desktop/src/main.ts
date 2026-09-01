@@ -124,6 +124,7 @@ interface InboxItem {
   sender_name: string | null;
   subject: string;
   status: string;
+  category: string | null;
   priority: string | null;
   summary: string | null;
   action_required: number | null;
@@ -137,6 +138,21 @@ interface InboxItem {
   analysis_error_code: string | null;
   analysis_retry_after_seconds: number | null;
   attachments: InboxAttachment[];
+}
+
+interface InboxQuery {
+  limit: number;
+  cursor: string | null;
+  sender_query: string | null;
+  priority: string | null;
+  category: string | null;
+  status: string | null;
+  keyword: string | null;
+}
+
+interface InboxPage {
+  items: InboxItem[];
+  next_cursor: string | null;
 }
 
 interface OpenedAttachment {
@@ -258,8 +274,68 @@ app.innerHTML = `
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
+      <form id="inbox-filter-form" class="inbox-filter-form">
+        <label>
+          <span>Subject or summary</span>
+          <input id="inbox-keyword" name="keyword" maxlength="200" />
+        </label>
+        <label>
+          <span>Sender</span>
+          <input id="inbox-sender" name="sender" maxlength="320" />
+        </label>
+        <label>
+          <span>Priority</span>
+          <select id="inbox-priority" name="priority">
+            <option value="">Any priority</option>
+            <option value="urgent">Urgent</option>
+            <option value="high">High</option>
+            <option value="normal">Normal</option>
+            <option value="low">Low</option>
+            <option value="untriaged">Untriaged</option>
+          </select>
+        </label>
+        <label>
+          <span>Topic</span>
+          <select id="inbox-category" name="category">
+            <option value="">Any topic</option>
+            <option value="invoice">Invoice</option>
+            <option value="scheduling">Scheduling</option>
+            <option value="customer_request">Customer request</option>
+            <option value="automated_notice">Automated notice</option>
+            <option value="informational">Informational</option>
+            <option value="other">Other</option>
+            <option value="unclassified">Unclassified</option>
+          </select>
+        </label>
+        <label>
+          <span>Status</span>
+          <select id="inbox-state" name="status">
+            <option value="">Any status</option>
+            <option value="pending">Pending</option>
+            <option value="analyzed">Analyzed</option>
+            <option value="summarized">Notified</option>
+            <option value="skipped">Unavailable</option>
+          </select>
+        </label>
+        <label>
+          <span>Page size</span>
+          <select id="inbox-page-size" name="pageSize">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+        <div class="inbox-filter-actions">
+          <button type="submit">Apply filters</button>
+          <button id="inbox-reset" class="secondary-action" type="button">Reset</button>
+        </div>
+      </form>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <ul id="inbox-list" class="inbox-list" aria-label="Recent watched messages"></ul>
+      <div class="inbox-page-actions">
+        <button id="inbox-load-more" type="button" hidden>Load more</button>
+      </div>
     </section>
 
     <section id="watchlist-view" class="view" aria-labelledby="watchlist-tab" hidden>
@@ -397,6 +473,15 @@ const healthView = requiredElement<HTMLElement>("#health-view");
 const settingsView = requiredElement<HTMLElement>("#settings-view");
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
+const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
+const inboxKeywordInput = requiredElement<HTMLInputElement>("#inbox-keyword");
+const inboxSenderInput = requiredElement<HTMLInputElement>("#inbox-sender");
+const inboxPrioritySelect = requiredElement<HTMLSelectElement>("#inbox-priority");
+const inboxCategorySelect = requiredElement<HTMLSelectElement>("#inbox-category");
+const inboxStateSelect = requiredElement<HTMLSelectElement>("#inbox-state");
+const inboxPageSizeSelect = requiredElement<HTMLSelectElement>("#inbox-page-size");
+const inboxReset = requiredElement<HTMLButtonElement>("#inbox-reset");
+const inboxLoadMore = requiredElement<HTMLButtonElement>("#inbox-load-more");
 const form = requiredElement<HTMLFormElement>("#sender-form");
 const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
@@ -459,6 +544,17 @@ const capabilityOutputPresentationsInFlight = new Set<string>();
 const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
+let inboxItems: InboxItem[] = [];
+let inboxNextCursor: string | null = null;
+let inboxCapabilityUnavailableCount = 0;
+let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
+  limit: 25,
+  sender_query: null,
+  priority: null,
+  category: null,
+  status: null,
+  keyword: null,
+};
 let settingsInFlight = false;
 let autostartInFlight = false;
 let autostartAvailable = false;
@@ -846,7 +942,12 @@ function renderInbox(items: InboxItem[]): void {
     capabilityOutputPresentations.clear();
     const empty = document.createElement("li");
     empty.className = "empty-state";
-    empty.textContent = "No watched messages yet. Add a sender in Watchlist, then run the watcher.";
+    const filtered = Object.entries(activeInboxQuery).some(
+      ([key, value]) => key !== "limit" && value !== null,
+    );
+    empty.textContent = filtered
+      ? "No watched messages match these filters."
+      : "No watched messages yet. Add a sender in Watchlist, then run the watcher.";
     inboxList.append(empty);
     return;
   }
@@ -1106,12 +1207,18 @@ function renderInbox(items: InboxItem[]): void {
 
     const footer = document.createElement("div");
     footer.className = "message-footer";
+    const badges = document.createElement("div");
+    badges.className = "message-badges";
     const badge = document.createElement("span");
     badge.className = "priority-badge";
     badge.textContent = item.priority || "Untriaged";
+    const category = document.createElement("span");
+    category.className = "category-badge";
+    category.textContent = (item.category || "Unclassified").replace(/_/g, " ");
+    badges.append(badge, category);
     const state = document.createElement("span");
     state.textContent = stateLabel(item);
-    footer.append(badge, state);
+    footer.append(badges, state);
     if (item.status === "pending" && item.analysis_retryable === false) {
       const retryButton = document.createElement("button");
       retryButton.type = "button";
@@ -1187,42 +1294,93 @@ async function loadAttachmentCapabilities(
   return { capabilities, unavailable };
 }
 
-async function loadInbox(): Promise<void> {
+function optionalFilterValue(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
+  return {
+    limit: Number(inboxPageSizeSelect.value),
+    sender_query: optionalFilterValue(inboxSenderInput.value),
+    priority: optionalFilterValue(inboxPrioritySelect.value),
+    category: optionalFilterValue(inboxCategorySelect.value),
+    status: optionalFilterValue(inboxStateSelect.value),
+    keyword: optionalFilterValue(inboxKeywordInput.value),
+  };
+}
+
+function setInboxControlsBusy(busy: boolean): void {
+  for (const control of inboxFilterForm.elements) {
+    if (
+      control instanceof HTMLInputElement ||
+      control instanceof HTMLSelectElement ||
+      control instanceof HTMLButtonElement
+    ) {
+      control.disabled = busy;
+    }
+  }
+  inboxLoadMore.disabled = busy;
+}
+
+function inboxStatusLabel(): string {
+  const count = inboxItems.length;
+  const availability = inboxCapabilityUnavailableCount
+    ? " Some local capability providers are unavailable."
+    : "";
+  const more = inboxNextCursor ? " More matching messages are available." : "";
+  return `Showing ${count} matching message${count === 1 ? "" : "s"}.${more}${availability}`;
+}
+
+async function loadInbox(append = false): Promise<void> {
+  if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
-  let items: InboxItem[];
+  const cursor = append ? inboxNextCursor : null;
+  setInboxControlsBusy(true);
+  let page: InboxPage;
   try {
-    items = await invoke<InboxItem[]>("inbox_recent");
+    page = await invoke<InboxPage>("inbox_query", {
+      query: { ...activeInboxQuery, cursor },
+    });
   } catch (error) {
     if (generation !== inboxRequestGeneration) return;
-    attachmentCapabilities.clear();
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
+    setInboxControlsBusy(false);
     return;
   }
   if (generation !== inboxRequestGeneration) return;
 
-  attachmentCapabilities.clear();
-  renderInbox(items);
-  inboxStatus.textContent = "Showing recent messages while local capabilities refresh.";
+  if (!append) {
+    attachmentCapabilities.clear();
+    inboxCapabilityUnavailableCount = 0;
+    inboxItems = page.items;
+  } else {
+    const known = new Set(inboxItems.map((item) => item.message_id));
+    inboxItems = [...inboxItems, ...page.items.filter((item) => !known.has(item.message_id))];
+  }
+  inboxNextCursor = page.next_cursor;
+  inboxLoadMore.hidden = inboxNextCursor === null;
+  renderInbox(inboxItems);
+  inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities are refreshing.`;
   delete inboxStatus.dataset.kind;
   try {
-    const discovery = await loadAttachmentCapabilities(items);
+    const discovery = await loadAttachmentCapabilities(page.items);
     if (generation !== inboxRequestGeneration) return;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
     }
-    renderInbox(items);
-    inboxStatus.textContent = discovery.unavailable
-      ? "Showing recent messages. Some local capability providers are unavailable."
-      : "Showing the most recent watched messages.";
+    inboxCapabilityUnavailableCount += discovery.unavailable;
+    renderInbox(inboxItems);
+    inboxStatus.textContent = inboxStatusLabel();
     inboxStatus.dataset.kind = "success";
   } catch (error) {
     if (generation !== inboxRequestGeneration) return;
-    attachmentCapabilities.clear();
-    renderInbox(items);
-    inboxStatus.textContent = `Showing recent messages. Local capabilities could not refresh: ${errorMessage(error)}`;
+    renderInbox(inboxItems);
+    inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
     inboxStatus.dataset.kind = "warning";
   }
+  if (generation === inboxRequestGeneration) setInboxControlsBusy(false);
 }
 
 function setHealthValue(element: HTMLElement, ready: boolean, text: string): void {
@@ -1845,6 +2003,17 @@ settingsTab.addEventListener("click", () => {
 autostartEnabledInput.addEventListener("change", () => {
   void updateAutostart(autostartEnabledInput.checked);
 });
+inboxFilterForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  activeInboxQuery = queryFromInboxControls();
+  void loadInbox();
+});
+inboxReset.addEventListener("click", () => {
+  inboxFilterForm.reset();
+  activeInboxQuery = queryFromInboxControls();
+  void loadInbox();
+});
+inboxLoadMore.addEventListener("click", () => void loadInbox(true));
 checkNow.addEventListener("click", () => void runCheck());
 gmailAuthorize.addEventListener("click", () => void authorizeGmail());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());

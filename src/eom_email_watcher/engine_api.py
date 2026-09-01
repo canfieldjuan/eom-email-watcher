@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -46,6 +48,20 @@ PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
 GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS = 30
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
+MAX_INBOX_CURSOR_BYTES = 1024
+INBOX_PRIORITIES = frozenset({"urgent", "high", "normal", "low", "untriaged"})
+INBOX_CATEGORIES = frozenset(
+    {
+        "invoice",
+        "scheduling",
+        "customer_request",
+        "automated_notice",
+        "informational",
+        "other",
+        "unclassified",
+    }
+)
+INBOX_STATUSES = frozenset({"pending", "analyzed", "summarized", "skipped"})
 REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
 
 logger = logging.getLogger(__name__)
@@ -76,11 +92,87 @@ def _config_path(request: dict[str, object]) -> Path:
     return Path(value).expanduser()
 
 
-def _bounded_limit(payload: dict[str, object], *, default: int) -> int:
+def _bounded_limit(
+    payload: dict[str, object], *, default: int, maximum: int = 500
+) -> int:
     value = payload.get("limit", default)
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 500:
-        raise ApiError("invalid_request", "limit must be an integer between 1 and 500")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise ApiError("invalid_request", f"limit must be an integer between 1 and {maximum}")
     return value
+
+
+def _optional_inbox_text(
+    payload: dict[str, object], name: str, *, maximum: int
+) -> str | None:
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise ApiError(
+            "invalid_request",
+            f"{name} must be a non-empty string of at most {maximum} characters",
+        )
+    return value.strip()
+
+
+def _optional_inbox_choice(
+    payload: dict[str, object], name: str, choices: frozenset[str]
+) -> str | None:
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in choices:
+        raise ApiError(
+            "invalid_request", f"{name} must be one of: {', '.join(sorted(choices))}"
+        )
+    return value
+
+
+def _encode_inbox_cursor(cursor: tuple[str, str] | None) -> str | None:
+    if cursor is None:
+        return None
+    encoded = json.dumps(
+        {"message_id": cursor[1], "received_at": cursor[0], "v": 1},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(encoded).rstrip(b"=").decode("ascii")
+
+
+def _decode_inbox_cursor(value: object) -> tuple[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > MAX_INBOX_CURSOR_BYTES * 2:
+        raise ApiError("invalid_request", "cursor is invalid")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+        if len(raw) > MAX_INBOX_CURSOR_BYTES:
+            raise ValueError
+        decoded = json.loads(raw)
+    except (
+        UnicodeDecodeError,
+        UnicodeEncodeError,
+        ValueError,
+        binascii.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ApiError("invalid_request", "cursor is invalid") from exc
+    if not isinstance(decoded, dict) or set(decoded) != {"message_id", "received_at", "v"}:
+        raise ApiError("invalid_request", "cursor is invalid")
+    message_id = decoded["message_id"]
+    received_at = decoded["received_at"]
+    if (
+        type(decoded["v"]) is not int
+        or decoded["v"] != 1
+        or not isinstance(message_id, str)
+        or not 0 < len(message_id) <= 512
+        or not isinstance(received_at, str)
+        or not 0 < len(received_at) <= 64
+    ):
+        raise ApiError("invalid_request", "cursor is invalid")
+    return received_at, message_id
 
 
 def _runtime(request: dict[str, object]) -> Runtime:
@@ -249,6 +341,38 @@ def _recent(request: dict[str, object]) -> dict[str, object]:
     limit = _bounded_limit(payload, default=20)
     rows = _runtime(request).store.recent(limit)
     return {"items": rows}
+
+
+def _query_inbox(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {
+            "category",
+            "cursor",
+            "keyword",
+            "limit",
+            "priority",
+            "sender_query",
+            "status",
+        },
+    )
+    limit = _bounded_limit(payload, default=25, maximum=100)
+    cursor = _decode_inbox_cursor(payload.get("cursor"))
+    sender_query = _optional_inbox_text(payload, "sender_query", maximum=320)
+    keyword = _optional_inbox_text(payload, "keyword", maximum=200)
+    priority = _optional_inbox_choice(payload, "priority", INBOX_PRIORITIES)
+    category = _optional_inbox_choice(payload, "category", INBOX_CATEGORIES)
+    status = _optional_inbox_choice(payload, "status", INBOX_STATUSES)
+    rows, next_cursor = _runtime(request).store.query_inbox(
+        limit=limit,
+        cursor=cursor,
+        sender_query=sender_query,
+        priority=priority,
+        category=category,
+        status=status,
+        keyword=keyword,
+    )
+    return {"items": rows, "next_cursor": _encode_inbox_cursor(next_cursor)}
 
 
 def _analysis_requeue(request: dict[str, object]) -> dict[str, object]:
@@ -1416,6 +1540,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.output.present": _connect_output_present,
     "gmail.authorize": _gmail_authorize,
     "health.get": _health,
+    "inbox.query": _query_inbox,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,
     "notifications.pending": _notifications_pending,

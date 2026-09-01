@@ -123,6 +123,90 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
+def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    for message_id in ("message-1", "message-2"):
+        runtime.store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="billing@example.com",
+            sender_name="Billing",
+            subject="Invoice status",
+            received_at="2026-08-31T12:00:00+00:00",
+        )
+    runtime.store.mark_analyzed(
+        "message-2",
+        {
+            "category": "invoice",
+            "priority": "high",
+            "summary": "Invoice needs review.",
+            "action_required": True,
+            "suggested_action": "Review it.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_external_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Inbox query attempted external provider access")
+
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", reject_external_access)
+    monkeypatch.setattr(runtime.model, "analyze", reject_external_access)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_external_access)
+    monkeypatch.setattr(engine_api.connect, "discover_summary_capability", reject_external_access)
+    first = engine_api._response(
+        request(
+            config_path,
+            "inbox.query",
+            {"category": "invoice", "limit": 1, "sender_query": "BILL"},
+        )
+    )
+    assert first["ok"] is True
+    assert first["data"]["items"][0]["message_id"] == "message-2"
+    assert first["data"]["items"][0]["category"] == "invoice"
+    assert first["data"]["next_cursor"] is None
+
+    unfiltered = engine_api._response(request(config_path, "inbox.query", {"limit": 1}))
+    cursor = unfiltered["data"]["next_cursor"]
+    assert isinstance(cursor, str) and cursor
+    second = engine_api._response(
+        request(config_path, "inbox.query", {"cursor": cursor, "limit": 1})
+    )
+    assert [item["message_id"] for item in unfiltered["data"]["items"]] == ["message-2"]
+    assert [item["message_id"] for item in second["data"]["items"]] == ["message-1"]
+    assert second["data"]["next_cursor"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"limit": False},
+        {"limit": 0},
+        {"limit": 101},
+        {"cursor": "not-valid-base64!"},
+        {"cursor": "eyJtZXNzYWdlX2lkIjoibTEiLCJyZWNlaXZlZF9hdCI6InQiLCJ2Ijp0cnVlfQ"},
+        {"sender_query": ""},
+        {"keyword": "x" * 201},
+        {"priority": "critical"},
+        {"category": "payments"},
+        {"status": "deleted"},
+    ],
+)
+def test_inbox_query_rejects_invalid_bounds_and_cursors(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    response = engine_api._response(request(tmp_path / "unused.toml", "inbox.query", payload))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_request"
+
+
 def test_health_recognizes_bundled_desktop_oauth_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

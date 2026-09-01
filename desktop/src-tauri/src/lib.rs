@@ -6,7 +6,7 @@ use delivery::NotificationDelivery;
 use engine::{
     CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
     ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
-    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxItem,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
     WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
@@ -20,7 +20,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-const INBOX_LIMIT: u16 = 50;
 const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
 const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(desktop)]
@@ -274,9 +273,12 @@ async fn config_initialize(
 }
 
 #[tauri::command]
-async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
+async fn inbox_query(
+    engine: State<'_, Engine>,
+    query: InboxQuery,
+) -> Result<InboxPage, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.recent(INBOX_LIMIT))
+    tauri::async_runtime::spawn_blocking(move || engine.query_inbox(query))
         .await
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
@@ -671,7 +673,7 @@ pub fn run() {
             config_status,
             gmail_authorize,
             health_get,
-            inbox_recent,
+            inbox_query,
             settings_get,
             settings_update,
             watcher_check,

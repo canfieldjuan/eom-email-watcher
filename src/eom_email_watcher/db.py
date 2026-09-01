@@ -21,6 +21,11 @@ MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
 MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 
+
+def _sqlite_casefold(value: object) -> str:
+    return value.casefold() if isinstance(value, str) else ""
+
+
 _CONNECT_JOBS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
     job_id TEXT PRIMARY KEY,
@@ -689,6 +694,7 @@ class Store:
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
         try:
             yield connection
         except Exception:
@@ -749,6 +755,8 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_pending
                     ON messages(status, next_retry_at);
+                CREATE INDEX IF NOT EXISTS idx_messages_inbox_order
+                    ON messages(received_at DESC, message_id DESC);
                 CREATE TABLE IF NOT EXISTS message_attachments (
                     message_id TEXT NOT NULL,
                     part_id TEXT NOT NULL,
@@ -1631,32 +1639,106 @@ class Store:
             return "acknowledged"
 
     def recent(self, limit: int) -> list[dict[str, object]]:
+        items, _ = self.query_inbox(limit=limit)
+        return items
+
+    def query_inbox(
+        self,
+        *,
+        limit: int,
+        cursor: tuple[str, str] | None = None,
+        sender_query: str | None = None,
+        priority: str | None = None,
+        category: str | None = None,
+        status: str | None = None,
+        keyword: str | None = None,
+    ) -> tuple[list[dict[str, object]], tuple[str, str] | None]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if cursor is not None:
+            clauses.append("(received_at < ? OR (received_at = ? AND message_id < ?))")
+            parameters.extend((cursor[0], cursor[0], cursor[1]))
+        if sender_query is not None:
+            folded_sender = sender_query.casefold()
+            clauses.append(
+                "(instr(casefold(sender), ?) > 0 "
+                "OR instr(casefold(COALESCE(sender_name, '')), ?) > 0)"
+            )
+            parameters.extend((folded_sender, folded_sender))
+        if priority == "untriaged":
+            clauses.append("priority IS NULL")
+        elif priority is not None:
+            clauses.append("priority = ?")
+            parameters.append(priority)
+        if category == "unclassified":
+            clauses.append("category IS NULL")
+        elif category is not None:
+            clauses.append("category = ?")
+            parameters.append(category)
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status)
+        if keyword is not None:
+            folded_keyword = keyword.casefold()
+            clauses.append(
+                "(instr(casefold(subject), ?) > 0 OR instr(casefold(COALESCE(summary, '')), ?) > 0)"
+            )
+            parameters.extend((folded_keyword, folded_keyword))
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit + 1)
         with self.connection() as db:
             rows = db.execute(
-                """SELECT message_id, received_at, sender, sender_name, subject, status,
-                analysis_at, priority, summary, action_required, suggested_action,
+                f"""SELECT message_id, received_at, sender, sender_name, subject, status,
+                analysis_at, category, priority, summary, action_required, suggested_action,
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
                 fallback_notified_at, notified_at, last_error, analysis_retryable,
                 analysis_error_code, analysis_retry_after_seconds
-                FROM messages ORDER BY received_at DESC LIMIT ?""",
-                (limit,),
+                FROM messages{where}
+                ORDER BY received_at DESC, message_id DESC LIMIT ?""",
+                parameters,
             ).fetchall()
-            items = [dict(row) for row in rows]
-            for item in items:
-                if item["analysis_retryable"] is not None:
-                    item["analysis_retryable"] = bool(item["analysis_retryable"])
-            if not items:
-                return []
-            message_ids = [str(item["message_id"]) for item in items]
-            placeholders = ",".join("?" for _ in message_ids)
-            attachment_rows = db.execute(
-                f"""SELECT message_id, part_id, attachment_id, filename, media_type, byte_size
-                FROM message_attachments WHERE message_id IN ({placeholders})
-                ORDER BY message_id, position""",
-                message_ids,
-            ).fetchall()
-            connect_rows = db.execute(
-                f"""SELECT
+            has_more = len(rows) > limit
+            page_rows = rows[:limit]
+            items = self._hydrate_inbox_rows(db, page_rows)
+        next_cursor = None
+        if has_more and page_rows:
+            last = page_rows[-1]
+            next_cursor = (str(last["received_at"]), str(last["message_id"]))
+        return items, next_cursor
+
+    def _hydrate_inbox_rows(
+        self, db: sqlite3.Connection, rows: list[sqlite3.Row]
+    ) -> list[dict[str, object]]:
+        items = [dict(row) for row in rows]
+        for item in items:
+            if item["analysis_retryable"] is not None:
+                item["analysis_retryable"] = bool(item["analysis_retryable"])
+        if not items:
+            return []
+        message_ids = [str(item["message_id"]) for item in items]
+        placeholders = ",".join("?" for _ in message_ids)
+        attachment_rows = db.execute(
+            f"""SELECT message_id, part_id, attachment_id, filename, media_type, byte_size
+            FROM message_attachments WHERE message_id IN ({placeholders})
+            ORDER BY message_id, position""",
+            message_ids,
+        ).fetchall()
+        connect_rows = db.execute(
+            f"""SELECT
+                job_id, message_id, part_id, protocol_version,
+                capability_id, capability_version,
+                provider_app_id, provider_app_version, provider_instance_id,
+                invocation_fingerprint,
+                input_artifact_id, input_media_type, input_byte_size, input_sha256,
+                input_display_name, source_app_id,
+                request_json, status,
+                output_artifact_id, output_media_type, output_byte_size, output_sha256,
+                summary_version, summary_text, warnings_json,
+                NULL AS result_json, result_metadata_json,
+                error_code, error_message, error_retryable, created_at, updated_at
+            FROM (
+                SELECT
                     job_id, message_id, part_id, protocol_version,
                     capability_id, capability_version,
                     provider_app_id, provider_app_version, provider_instance_id,
@@ -1665,32 +1747,20 @@ class Store:
                     input_display_name, source_app_id,
                     request_json, status,
                     output_artifact_id, output_media_type, output_byte_size, output_sha256,
-                    summary_version, summary_text, warnings_json,
-                    NULL AS result_json, result_metadata_json,
-                    error_code, error_message, error_retryable, created_at, updated_at
-                FROM (
-                    SELECT
-                        job_id, message_id, part_id, protocol_version,
-                        capability_id, capability_version,
-                        provider_app_id, provider_app_version, provider_instance_id,
-                        invocation_fingerprint,
-                        input_artifact_id, input_media_type, input_byte_size, input_sha256,
-                        input_display_name, source_app_id, request_json, status,
-                        output_artifact_id, output_media_type, output_byte_size, output_sha256,
-                        summary_version, summary_text, warnings_json, result_metadata_json,
-                        error_code, error_message, error_retryable, created_at, updated_at,
-                        ROW_NUMBER() OVER (
-                        PARTITION BY message_id, part_id, protocol_version,
-                            capability_id, capability_version, invocation_fingerprint
-                        ORDER BY created_at DESC, rowid DESC
-                        ) AS recency
-                    FROM connect_attachment_jobs
-                    WHERE message_id IN ({placeholders})
-                )
-                WHERE recency = 1
-                ORDER BY created_at DESC""",
-                message_ids,
-            ).fetchall()
+                    summary_version, summary_text, warnings_json, result_metadata_json,
+                    error_code, error_message, error_retryable, created_at, updated_at,
+                    ROW_NUMBER() OVER (
+                    PARTITION BY message_id, part_id, protocol_version,
+                        capability_id, capability_version, invocation_fingerprint
+                    ORDER BY created_at DESC, rowid DESC
+                    ) AS recency
+                FROM connect_attachment_jobs
+                WHERE message_id IN ({placeholders})
+            )
+            WHERE recency = 1
+            ORDER BY created_at DESC""",
+            message_ids,
+        ).fetchall()
         attachments_by_message: dict[str, list[dict[str, object]]] = {
             message_id: [] for message_id in message_ids
         }

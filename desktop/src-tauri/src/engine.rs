@@ -441,6 +441,8 @@ pub struct InboxItem {
     pub subject: String,
     pub status: String,
     pub analysis_at: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
     pub priority: Option<String>,
     pub summary: Option<String>,
     pub action_required: Option<i64>,
@@ -458,6 +460,23 @@ pub struct InboxItem {
     pub last_error: Option<String>,
     #[serde(default)]
     pub attachments: Vec<InboxAttachment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxQuery {
+    pub limit: u16,
+    pub cursor: Option<String>,
+    pub sender_query: Option<String>,
+    pub priority: Option<String>,
+    pub category: Option<String>,
+    pub status: Option<String>,
+    pub keyword: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxPage {
+    pub items: Vec<InboxItem>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -585,11 +604,6 @@ struct SenderItem {
 }
 
 #[derive(Deserialize)]
-struct InboxItems {
-    items: Vec<InboxItem>,
-}
-
-#[derive(Deserialize)]
 struct NotificationItems {
     items: Vec<NotificationIntent>,
 }
@@ -689,9 +703,19 @@ impl Engine {
             .map(|data| data.items)
     }
 
-    pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
-        self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
-            .map(|data| data.items)
+    pub fn query_inbox(&self, query: InboxQuery) -> Result<InboxPage, EngineError> {
+        self.request(
+            "inbox.query",
+            json!({
+                "limit": query.limit,
+                "cursor": query.cursor,
+                "sender_query": query.sender_query,
+                "priority": query.priority,
+                "category": query.category,
+                "status": query.status,
+                "keyword": query.keyword,
+            }),
+        )
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -1196,6 +1220,40 @@ mod tests {
         .expect("protocol-v1 inbox row without attachments must remain valid");
 
         assert!(item.attachments.is_empty());
+        assert_eq!(item.category, None);
+    }
+
+    #[test]
+    fn inbox_query_and_page_contract_are_typed() {
+        let query = InboxQuery {
+            limit: 25,
+            cursor: Some("opaque-cursor".into()),
+            sender_query: Some("billing".into()),
+            priority: Some("high".into()),
+            category: Some("invoice".into()),
+            status: Some("analyzed".into()),
+            keyword: Some("overdue".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(query).expect("serialize inbox query"),
+            json!({
+                "limit": 25,
+                "cursor": "opaque-cursor",
+                "sender_query": "billing",
+                "priority": "high",
+                "category": "invoice",
+                "status": "analyzed",
+                "keyword": "overdue"
+            })
+        );
+
+        let page: InboxPage = serde_json::from_value(json!({
+            "items": [],
+            "next_cursor": "next-page"
+        }))
+        .expect("deserialize inbox page");
+        assert_eq!(page.items, vec![]);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
     }
 
     #[test]
@@ -1751,7 +1809,21 @@ notifications_enabled = true
             }
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
-        assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
+        assert_eq!(
+            engine
+                .query_inbox(InboxQuery {
+                    limit: 20,
+                    cursor: None,
+                    sender_query: None,
+                    priority: None,
+                    category: None,
+                    status: None,
+                    keyword: None,
+                })
+                .expect("list empty inbox")
+                .items,
+            vec![]
+        );
         assert_eq!(
             engine
                 .attachment_capabilities("missing-message".into(), "2".into())
