@@ -10,10 +10,10 @@ The current observed comparison and its unresolved acceptance items are recorded
 The benchmark answers issue #18 in two stages:
 
 1. deterministic model/schema/latency measurements produced by the runner; and
-2. a blinded human review of summary faithfulness and usefulness.
+2. a blinded human review of summary and suggested-action faithfulness and usefulness.
 
 Do not recommend a model until both stages are complete. String similarity is not a substitute for
-the human summary review.
+the human analysis review.
 
 ## Privacy boundary
 
@@ -25,7 +25,7 @@ Every run has two outputs:
 
 - a public result containing model/runtime metadata, aggregate metrics, case IDs, pass/fail counts,
   latency, and no source email fields or free-form model output; and
-- a mode-0600 local review file containing source text and model summaries. Put these files under
+- a mode-0600 local review file containing source text and model analyses. Put these files under
   `benchmarks/local/`, which Git ignores.
 
 The runner rejects collisions between every input and output path. It also requires every
@@ -47,6 +47,26 @@ The corpus covers action/no-action, invoices versus receipts, explicit/absent/am
 deadlines, urgent operational risk, scheduling, every stable category, body and attachment-name
 prompt injection, HTML-derived text, empty and long bodies, attachment filenames, and malformed or
 contradictory raw analysis at the deterministic validation boundary.
+
+## Obligation-direction regression corpus
+
+`benchmarks/email-obligation-v1.json` is a separate synthetic regression corpus for assigning who
+must act and who owes whom. It covers a customer requesting copies of invoices overdue on the
+customer's side, a vendor asking the mailbox owner to pay, a sender adopting a deadline from a
+forwarded invoice, quoted invoice history, and the boundary between building-access cards and
+financial-card paraphrases.
+
+The corpus is separate so the hash and meaning of `email-analysis-v1.json` and its historical
+results remain unchanged. Validate it with:
+
+```bash
+uv run eom-model-benchmark validate \
+  --corpus benchmarks/email-obligation-v1.json
+```
+
+When comparing models for this failure class, run every candidate against this exact file with the
+same settings and repetitions. Keep content-bearing review output under `benchmarks/local/` as
+described above; do not commit real email text or local review artifacts.
 
 ## LM Studio CPU-only procedure
 
@@ -199,7 +219,7 @@ runtime that cannot honor that request is recorded as schema/request failure; do
 schema for compatibility. The public result records the CPU-only method as
 `ollama-gpus-hidden`. No benchmark command pulls or bundles a model.
 
-## Blinded summary review
+## Blinded analysis review
 
 After every candidate run, combine the private files into a blinded packet. Use a seed that is not
 shared with the reviewer until scoring is complete.
@@ -215,8 +235,10 @@ uv run eom-model-benchmark blind \
 
 The review packet omits model identity and includes only case/repetition pairs for which every
 candidate produced a schema-valid result. A human reviewer reads each synthetic source and scores
-the paired summaries from 1 to 5 for faithfulness and usefulness. Keep the alias key separate until
-scoring is finished. Publish only aggregate scores and non-identifying observations in the
+both the paired summaries and suggested actions from 1 to 5 for faithfulness and usefulness. The
+suggested-action review is the semantic check for direction-sensitive wording such as who should
+send payment; do not replace it with an ever-growing phrase denylist. Keep the alias key separate
+until scoring is finished. Publish only aggregate scores and non-identifying observations in the
 comparison report.
 
 ## Metrics and decision rule
@@ -229,14 +251,21 @@ The public artifact records:
 - suggested-action structural validity;
 - exact final deadline text/date and hallucinations;
 - prompt-injection canary reproduction;
+- unsupported-output grounding failures, reported separately from prompt injection;
 - cold, median, and p95 request latency;
 - peak resident memory when it is actually exposed or measured; and
-- the status of blinded human summary review.
+- the status of blinded human summary and suggested-action review.
+
+`forbidden_output_substrings` has one deterministic role boundary: a marker that appears in the
+untrusted source fields is a prompt-injection canary; a marker absent from those fields is an
+unsupported-output grounding marker. The public artifact reports those failure classes separately.
+The grounding-failure aggregate uses all benchmark runs as its denominator so candidate rates stay
+comparable even when individual corpora carry different numbers of grounding markers.
 
 A smaller model may replace the 4B baseline only when it does not materially worsen schema success,
 action recall, deadline exactness/hallucination, priority safety, prompt-injection resistance, or
-human-rated summary faithfulness/usefulness. Observed corpus results must remain separate from
-vendor or general benchmark claims.
+human-rated summary and suggested-action faithfulness/usefulness. Observed corpus results must
+remain separate from vendor or general benchmark claims.
 
 ## Attachment capability boundary
 

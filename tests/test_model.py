@@ -83,6 +83,15 @@ def test_prompt_treats_email_as_untrusted() -> None:
     assert datetime.now(UTC).tzinfo is UTC
 
 
+def test_prompt_assigns_obligations_from_the_mailbox_owner_perspective() -> None:
+    assert "mailbox owner" in SYSTEM_PROMPT
+    assert "who owes whom" in SYSTEM_PROMPT
+    assert "quoted history" in SYSTEM_PROMPT
+    assert "building-access card" in SYSTEM_PROMPT
+    assert "payment card" in SYSTEM_PROMPT
+    assert "explicitly adopts or assigns" in SYSTEM_PROMPT
+
+
 def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("secret-value\n", encoding="utf-8")

@@ -1,0 +1,104 @@
+{
+  "name": "email-obligation-grounding-synthetic",
+  "version": 1,
+  "privacy_reviewed": true,
+  "email_cases": [
+    {
+      "id": "customer-requests-overdue-invoice-copies",
+      "sender": "accounts-payable@example.org",
+      "subject": "RE: Invoice INV-2042 - Example Cleaning - $1,250.00",
+      "received_at": "2026-09-01T18:34:00+00:00",
+      "current_local_time": "2026-09-01T13:34:00-05:00",
+      "body": "Please send copies of the invoices that are past due on our end. We also need the building access card numbers.\n\n-----Original Message-----\nFrom: billing@example.com\nSent: August 28, 2026\nSubject: Invoice INV-2042\nInvoice INV-2042 for $1,250.00 is due September 5, 2026.",
+      "attachment_names": [],
+      "expected": {
+        "category": "customer_request",
+        "priority": "high",
+        "action_required": true,
+        "deadline_text": null,
+        "deadline_iso": null,
+        "forbidden_output_substrings": [
+          "requests payment",
+          "pay invoice",
+          "pay the invoice",
+          "payment card",
+          "credit card",
+          "debit card"
+        ]
+      }
+    },
+    {
+      "id": "vendor-requests-mailbox-owner-payment",
+      "sender": "billing@example.net",
+      "subject": "Invoice 2048 due August 31",
+      "received_at": "2026-08-19T19:00:00+00:00",
+      "current_local_time": "2026-08-19T14:00:00-05:00",
+      "body": "Please pay invoice 2048 by August 31, 2026.",
+      "attachment_names": [
+        "invoice-2048.pdf"
+      ],
+      "expected": {
+        "category": "invoice",
+        "priority": "high",
+        "action_required": true,
+        "deadline_text": "by August 31, 2026",
+        "deadline_iso": "2026-08-31",
+        "forbidden_output_substrings": []
+      }
+    },
+    {
+      "id": "colleague-adopts-forwarded-invoice-deadline",
+      "sender": "manager@example.org",
+      "subject": "FW: Vendor invoice 2051",
+      "received_at": "2026-09-01T19:00:00+00:00",
+      "current_local_time": "2026-09-01T14:00:00-05:00",
+      "body": "Please pay this invoice.\n\n-----Original Message-----\nFrom: vendor@example.net\nSent: August 31, 2026\nSubject: Invoice 2051\nInvoice 2051 for $875.00 is due September 12, 2026.",
+      "attachment_names": [
+        "invoice-2051.pdf"
+      ],
+      "expected": {
+        "category": "invoice",
+        "priority": "high",
+        "action_required": true,
+        "deadline_text": "due September 12, 2026",
+        "deadline_iso": "2026-09-12",
+        "forbidden_output_substrings": []
+      }
+    },
+    {
+      "id": "customer-confirms-their-payment",
+      "sender": "accounts-payable@example.com",
+      "subject": "RE: Overdue invoice 3011",
+      "received_at": "2026-08-20T15:00:00+00:00",
+      "current_local_time": "2026-08-20T10:00:00-05:00",
+      "body": "We scheduled payment of your invoice for tomorrow. No action is needed from you.\n\n-----Original Message-----\nFrom: billing@example.com\nSent: August 18, 2026\nSubject: Overdue invoice 3011\nInvoice 3011 was due August 15, 2026. Please send payment.",
+      "attachment_names": [],
+      "expected": {
+        "category": "informational",
+        "priority": "low",
+        "action_required": false,
+        "deadline_text": null,
+        "deadline_iso": null,
+        "forbidden_output_substrings": []
+      }
+    }
+  ],
+  "validation_cases": [
+    {
+      "id": "reject-action-without-suggestion",
+      "received_at": "2026-09-01T18:34:00+00:00",
+      "raw": {
+        "category": "customer_request",
+        "priority": "high",
+        "summary": "The customer requests invoice copies.",
+        "action_required": true,
+        "suggested_action": null,
+        "deadline_text": null,
+        "deadline_iso": null,
+        "confidence": 0.9
+      },
+      "expected_outcome": "error",
+      "expected_values": {}
+    }
+  ]
+}
