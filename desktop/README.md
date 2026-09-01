@@ -85,7 +85,7 @@ order. These are trusted process-environment settings, not frontend inputs.
 Start on login registers the currently running executable. Enable it from the installed application,
 not from `pnpm tauri dev`, so the operating system does not retain a development-build path.
 
-## Debian package
+## Packaged applications
 
 Build the Linux application and bundled engine from the repository root environment:
 
@@ -94,12 +94,27 @@ cd desktop
 pnpm tauri build --bundles deb
 ```
 
-The package contains both `eom-email-watcher-desktop` and `eom-mail-engine`. The bundled engine is a
-PyInstaller one-file executable built by `scripts/build-desktop-sidecar.sh`; installed runtime does
-not require the source checkout, Python, or `uv`. The sidecar carries its own IANA timezone data so
-its behavior does not depend on the build interpreter's filesystem paths. Every sidecar build runs
-an isolated first-use configuration smoke with `America/Chicago` and fails before packaging if the
-frozen engine cannot resolve that timezone.
+The Debian package contains both `eom-email-watcher-desktop` and `eom-mail-engine`. The bundled
+engine is a PyInstaller one-file executable built by the cross-platform
+`scripts/build_desktop_sidecar.py`; `scripts/build-desktop-sidecar.sh` remains the Linux convenience
+entrypoint. Installed runtime does not require the source checkout, Python, or `uv`. The sidecar
+carries its own IANA timezone data so its behavior does not depend on the build interpreter's
+filesystem paths. Every sidecar build runs an isolated first-use configuration smoke with
+`America/Chicago` and fails before packaging if the frozen engine cannot resolve that timezone.
+
+On Windows, build the NSIS installer on a Windows host:
+
+```powershell
+cd desktop
+pnpm tauri build --bundles nsis
+```
+
+The Windows build emits the Tauri-required `eom-mail-engine-<target-triple>.exe`, runs the same
+isolated first-run/health/inactive-check smoke used by Linux builds, and bundles it into the setup
+executable. PyInstaller is not a cross-compiler, so a Linux build cannot prove the Windows sidecar.
+The `windows-package` GitHub job is the canonical Windows acceptance path and uploads the unsigned
+NSIS installer for inspection. Code signing and public release publication remain separate release
+work.
 
 An approved Google Desktop OAuth client can be injected into the sidecar at release build time
 without committing it:
@@ -109,8 +124,9 @@ EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE=/secure/path/desktop-client.json \
   pnpm tauri build --bundles deb
 ```
 
-The build accepts only a downloaded Desktop-client JSON shape and rejects files containing access
-or refresh-token fields. A configured operator credential file remains authoritative; otherwise
+The same environment variable is supported by Windows builds. The build accepts only a downloaded
+Desktop-client JSON shape and rejects files containing access or refresh-token fields. A configured
+operator credential file remains authoritative; otherwise
 the packaged client identity is used. Account tokens are still created and stored only in the
 user's private local state. Atlas token-store files are not valid build inputs because they contain
 account grants rather than only the reusable Desktop client identity. A build without this variable

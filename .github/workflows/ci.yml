@@ -37,6 +37,46 @@ jobs:
           tests/test_engine_api.py::test_read_operations_are_versioned_and_do_not_expose_token_paths
           tests/test_engine_api.py::test_check_defers_delivery_until_state_checked_ack
 
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - run: uv run pytest tests/test_desktop_packaging.py
+      - run: pnpm --dir desktop install --frozen-lockfile
+      - name: Build Windows NSIS installer
+        run: pnpm --dir desktop tauri build --bundles nsis
+      - name: Verify Windows engine process-tree lifecycle
+        run: >-
+          cargo test --release --manifest-path desktop/src-tauri/Cargo.toml
+          engine::tests::windows_job_ -- --test-threads=1
+      - name: Re-run packaged engine acceptance smoke
+        shell: pwsh
+        run: |
+          $triple = (rustc --print host-tuple).Trim()
+          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: email-watcher-windows-nsis
+          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+
   desktop:
     runs-on: ubuntu-latest
     defaults:
