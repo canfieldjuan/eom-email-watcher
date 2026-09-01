@@ -241,6 +241,9 @@ Required rules:
 - An expired request is never dispatched. The gateway returns permanent `request_expired`; the
   client stops automatic retries for that identity and exposes an explicit requeue that creates a
   new request ID and expiry.
+- Expiry terminalizes the request and any in-flight worker attempt. The gateway requests best-effort
+  cancellation but does not depend on cancellation succeeding: output arriving after expiry is
+  discarded and cannot recreate the result buffer or change the terminal tombstone.
 
 Illustrative success:
 
@@ -348,6 +351,7 @@ credential and canonical request. It is excluded from logs, metrics, diagnostics
 is deleted on durable application acknowledgement or immutable request expiry. For a bounded
 replay-protection period beyond expiry, a metadata-only tombstone retains request ID, credential
 hash, canonical digest, terminal status, timestamps, and expiry, but no prompt or generated content.
+Late worker output is discarded before durable storage and cannot resurrect expired content.
 
 ## Availability and standalone behavior
 
@@ -452,8 +456,9 @@ synthetic content only:
 13. a lost response returns the protected result to the same credential/request after gateway
     restart, and application acknowledgement deletes that result content while retaining its
     metadata tombstone;
-14. an expired request never dispatches again, returns permanent `request_expired`, and permits only
-    an explicit new-identity requeue;
+14. an expired request terminalizes any in-flight attempt, never dispatches again, discards late
+    output without recreating retained content, returns permanent `request_expired`, and permits
+    only an explicit new-identity requeue;
 15. an application-validation rejection becomes terminal for its original identity, is
     acknowledged to release the protected result, and permits only explicit new-identity requeue;
 16. authentication, authorization, request-contract, and output-validation failures do not trigger
