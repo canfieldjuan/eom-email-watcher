@@ -30,7 +30,8 @@ Current code cannot use that shape directly:
 Earlier direction notes disagreed about the selected worker: Email Watcher Issue #13 named
 llama.cpp, while Document Summarizer selected Ollama. Applications must still remain independent of
 that choice. The administrator deployment policy now selects vLLM as the primary worker and Ollama
-as the fallback, subject to task-specific compatibility and capacity proof.
+as the planned fallback, subject to task-specific quality, compatibility, privacy, and capacity
+proof.
 
 ## Decision
 
@@ -57,10 +58,13 @@ per-desktop loopback proxy unless real client-platform evidence later proves one
 ## Worker deployment policy
 
 - vLLM is the primary inference worker. Its continuous serving, OpenAI-compatible chat endpoint,
-  and structured-output support fit the shared-appliance workload, but each application task must
-  pass its existing deterministic output validation before promotion.
-- Ollama is the fallback worker. It remains independently configured and tested for every task it
-  may receive; protocol similarity alone is not evidence of semantic compatibility.
+  and structured-output support fit the shared-appliance workload. Promotion requires each task to
+  pass its task-specific deterministic metrics and validation plus blinded human review for
+  semantic outputs; structural validity alone is not evidence of useful model behavior.
+- Ollama is the planned fallback worker. Before it is eligible for a task, it must pass the same
+  task-specific acceptance independently, use an already-local approved model, and run with cloud
+  access disabled (`OLLAMA_NO_CLOUD=1`). Protocol similarity alone is not evidence of semantic or
+  privacy compatibility.
 - LM Studio and llama.cpp are no longer supported production-worker targets. Existing deployment
   files and compatibility evidence remain until an accepted cutover removes their operational use,
   but no new application client should bind to either runtime.
@@ -73,13 +77,19 @@ per-desktop loopback proxy unless real client-platform evidence later proves one
 Fallback is fail-closed and identity-preserving:
 
 1. A new request may use Ollama only when policy marks the primary unavailable before that work is
-   admitted and Ollama is healthy and approved for the same task requirements.
-2. An ambiguous or in-flight vLLM failure remains tied to the same gateway request identity. It is
-   not immediately replayed as unrelated work; a later reconciliation or retry may route that same
-   identity under gateway policy.
+   admitted and Ollama is healthy and qualified for the same task requirements.
+2. An ambiguous or in-flight vLLM failure remains unresolved on its original gateway request and
+   worker-attempt identity. The gateway must recover the primary's authoritative result, prove that
+   the primary never accepted the request, or confirm cancellation before Ollama may execute it.
+   Reusing the request ID alone is not evidence that duplicate work cannot occur.
 3. Authentication, authorization, malformed input, unsupported-task, and application-validation
    failures do not trigger fallback.
 4. Client health reports task availability or degradation, never the chosen worker name.
+
+Before worker dispatch, the gateway durably reserves the authenticated request ID, canonical
+request digest, and selected worker attempt. Exact repeats join active work or return the retained
+terminal result; a reused ID with different content is rejected. The reservation and result survive
+gateway restarts for a bounded, documented retention period.
 
 Warm versus cold standby is deliberately not fixed here. The primary and fallback may require
 different model artifacts, and keeping both resident may exceed the appliance's usable VRAM. The
@@ -90,7 +100,9 @@ On 2026-09-01, the development machine's existing environment reported vLLM 0.16
 deployment was available. That is installation evidence only, not workload or failover proof. The
 selected Ollama Qwen model is stored as GGUF, while current vLLM documentation describes GGUF
 support as experimental and under-optimized. The vLLM proof must select and pin an appropriate
-supported artifact rather than assuming the Ollama blob is the production vLLM artifact.
+supported model artifact plus the exact vLLM package/container provenance and serving
+configuration rather than assuming the installed package or Ollama blob is the production
+deployment.
 
 ## Ownership boundaries
 
@@ -209,8 +221,9 @@ Required rules:
   current policy.
 - The gateway treats prompts and content as opaque untrusted data. Task IDs control policy; prompt
   text cannot select workers or elevate limits.
-- A repeated active `request_id` for the same credential and canonical request joins or reuses that
-  work. Reuse with different content is rejected.
+- Before dispatch, the gateway durably reserves `request_id`, credential identity, a canonical
+  request digest, and worker-attempt identity. An exact repeat joins active work or returns the
+  retained terminal result across gateway restarts. Reuse with different content is rejected.
 
 Illustrative success:
 
@@ -379,22 +392,30 @@ What becomes harder:
 
 ## First implementation proof after acceptance
 
-Build one gateway process with vLLM primary, Ollama fallback, and two administrator-allowed task
-IDs: `email.analyze@1` and `document.chunk.summarize@1`. Prove, with synthetic content only:
+Build one gateway process with vLLM primary, planned Ollama fallback, and two
+administrator-allowed task IDs: `email.analyze@1` and `document.chunk.summarize@1`. Prove, with
+synthetic content only:
 
 1. paired Email Watcher and Document Summarizer clients can authenticate over verified HTTPS;
 2. neither request contains a model ID;
-3. task policy selects vLLM without exposing that choice to either application;
-4. concurrent mixed requests complete without starvation at the admitted limit;
-5. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
-6. making vLLM unavailable before admission moves an Ollama-approved task to degraded-but-available
-   service, while an unapproved fallback task remains unavailable;
-7. an in-flight or ambiguous primary failure retains the original request identity and is not
-   duplicated across workers;
-8. authentication, authorization, request-contract, and output-validation failures do not trigger
-   fallback;
-9. stopping the gateway degrades only model-dependent actions in both applications;
-10. Connect discovery and each application's private persistence remain unchanged.
+3. the exact vLLM package or container, model artifact, runtime dependencies, and serving
+   configuration are pinned and reproducible;
+4. task policy selects vLLM without exposing that choice to either application;
+5. both tasks pass their deterministic acceptance metrics and validators plus blinded human review
+   of semantic output before promotion;
+6. concurrent mixed requests complete without starvation at the admitted limit;
+7. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
+8. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses an already-local approved model, and passes independent
+   task acceptance before becoming eligible;
+9. making vLLM unavailable before admission moves an Ollama-qualified task to
+   degraded-but-available service, while an unqualified fallback task remains unavailable;
+10. an in-flight or ambiguous primary failure remains unresolved until the primary result is
+    recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
+    request proceed without duplicate worker execution;
+11. authentication, authorization, request-contract, and output-validation failures do not trigger
+    fallback;
+12. stopping the gateway degrades only model-dependent actions in both applications;
+13. Connect discovery and each application's private persistence remain unchanged.
 
 Do not implement administrator UI, auto-discovery, additional runtime families, vision, or
 production cutover in that proof.
