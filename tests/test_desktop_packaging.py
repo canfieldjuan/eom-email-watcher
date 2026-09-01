@@ -233,4 +233,6 @@ def test_windows_package_has_required_icon_and_hidden_console_contract() -> None
         encoding="utf-8"
     )
     assert 'windows_subsystem = "windows"' in main_source
-    assert "command.creation_flags(CREATE_NO_WINDOW);" in engine_source
+    assert (
+        "command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);" in engine_source
+    )

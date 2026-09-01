@@ -17,15 +17,24 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+use windows_sys::Win32::{
+    Foundation::INVALID_HANDLE_VALUE,
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        },
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
+        Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        },
+    },
 };
 
 const PROTOCOL_VERSION: u8 = 1;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -48,8 +57,16 @@ impl WindowsJob {
 
         // SAFETY: CreateJobObjectW returned a non-null, newly owned handle.
         let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        let job = Self { handle };
+        job.set_kill_on_close(true)?;
+        Ok(job)
+    }
+
+    fn set_kill_on_close(&self, enabled: bool) -> io::Result<()> {
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if enabled {
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
         let limits_size = u32::try_from(std::mem::size_of_val(&limits))
             .expect("Windows job limit structure size fits in u32");
         // SAFETY: the handle is a live job object and `limits` remains valid for
@@ -65,7 +82,7 @@ impl WindowsJob {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { handle })
+        Ok(())
     }
 
     fn assign(&self, child: &Child) -> io::Result<()> {
@@ -84,6 +101,60 @@ impl WindowsJob {
         // fail-safe because the job was configured with KILL_ON_JOB_CLOSE.
         let _ = unsafe { TerminateJobObject(self.handle.as_raw_handle(), 1) };
     }
+
+    fn release_descendants(&self) -> io::Result<()> {
+        // The request completed normally. Clear KILL_ON_JOB_CLOSE before the
+        // last job handle closes so user-facing descendants such as the OAuth
+        // browser remain open.
+        self.set_kill_on_close(false)
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> io::Result<()> {
+    // SAFETY: this creates an owned system snapshot handle; the process id is
+    // the child returned by Command::spawn and is used only for matching.
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw_snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateToolhelp32Snapshot returned a valid, newly owned handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
+            .expect("Windows thread entry size fits in u32"),
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: `entry` has the required size and remains live for enumeration.
+    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    loop {
+        if entry.th32OwnerProcessID == process_id {
+            // SAFETY: the enumerated thread belongs to our suspended child and
+            // the returned owned handle is closed on every path.
+            let raw_thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if raw_thread.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: OpenThread returned a non-null, newly owned handle.
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread) };
+            // SAFETY: this is the primary thread of the child created with
+            // CREATE_SUSPENDED; u32::MAX is the documented failure sentinel.
+            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        // SAFETY: `entry` and the snapshot remain valid for enumeration.
+        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "suspended engine primary thread was unavailable",
+            ));
+        }
+    }
 }
 
 struct EngineChild {
@@ -96,12 +167,22 @@ impl EngineChild {
     fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
+        #[cfg(windows)]
+        // CREATE_SUSPENDED closes the spawn-before-assignment race: the engine
+        // cannot create descendants until it belongs to the terminating job.
+        // CREATE_NO_WINDOW preserves the sidecar's piped JSON protocol without
+        // flashing a console window.
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let process = command.spawn()?;
         #[cfg(windows)]
-        let process = match job.assign(&process) {
+        let process = match job
+            .assign(&process)
+            .and_then(|()| resume_suspended_process(process.id()))
+        {
             Ok(()) => process,
             Err(error) => {
                 let mut process = process;
+                job.terminate();
                 let _ = process.kill();
                 let _ = process.wait();
                 return Err(error);
@@ -132,7 +213,21 @@ impl EngineChild {
     }
 
     fn wait_with_output(self) -> io::Result<Output> {
-        self.process.wait_with_output()
+        #[cfg(windows)]
+        {
+            let Self { process, job } = self;
+            let output = process.wait_with_output()?;
+            if output.status.success() {
+                job.release_descendants()?;
+            } else {
+                job.terminate();
+            }
+            Ok(output)
+        }
+        #[cfg(not(windows))]
+        {
+            self.process.wait_with_output()
+        }
     }
 }
 
@@ -883,10 +978,6 @@ impl Engine {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         command.process_group(0);
-        #[cfg(windows)]
-        // The engine's JSON protocol needs its standard streams, so keep the
-        // console-subsystem sidecar but prevent Windows from creating a window.
-        command.creation_flags(CREATE_NO_WINDOW);
         let mut child = EngineChild::spawn(&mut command).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
@@ -999,8 +1090,33 @@ mod tests {
     #[cfg(windows)]
     use windows_sys::Win32::{
         Foundation::WAIT_TIMEOUT,
-        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+            WaitForSingleObject,
+        },
     };
+
+    #[cfg(windows)]
+    struct WindowsTestProcess(u32);
+
+    #[cfg(windows)]
+    impl Drop for WindowsTestProcess {
+        fn drop(&mut self) {
+            // SAFETY: the PID came from the test child. If it is still live,
+            // terminate only that disposable probe and wait for handle signal.
+            let raw_handle =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, self.0) };
+            if raw_handle.is_null() {
+                return;
+            }
+            // SAFETY: OpenProcess returned a non-null, newly owned handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+            // SAFETY: the handle grants PROCESS_TERMINATE for this test probe.
+            let _ = unsafe { TerminateProcess(handle.as_raw_handle(), 1) };
+            // SAFETY: the process handle remains live for this bounded wait.
+            let _ = unsafe { WaitForSingleObject(handle.as_raw_handle(), 5_000) };
+        }
+    }
 
     #[test]
     fn default_config_matches_python_watcher_location() {
@@ -1283,14 +1399,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn bounded_engine_terminates_a_stalled_windows_process_tree() {
+    fn windows_job_terminates_immediate_descendant_on_timeout() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let script_path = directory.path().join("process-tree-probe.ps1");
         let descendant_pid_file = directory.path().join("descendant.pid");
         fs::write(
             &script_path,
             r#"
-Start-Sleep -Milliseconds 100
 $descendant = Start-Process -PassThru -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30")
 Set-Content -LiteralPath $args[0] -Value $descendant.Id
 Wait-Process -Id $descendant.Id
@@ -1331,6 +1446,51 @@ Wait-Process -Id $descendant.Id
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed-out Windows engine descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_releases_descendant_after_successful_request() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let script_path = directory.path().join("successful-process-tree-probe.ps1");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        fs::write(
+            &script_path,
+            r#"
+$null = [Console]::In.ReadToEnd()
+$descendant = Start-Process -PassThru -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30")
+Set-Content -LiteralPath $args[0] -Value $descendant.Id
+[Console]::Out.WriteLine('{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":false,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}')
+"#,
+        )
+        .expect("write successful process-tree probe");
+        let engine = Engine::with_command(
+            "powershell.exe",
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script_path.as_os_str().to_owned(),
+                descendant_pid_file.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_secs(5));
+
+        let result = engine.check().expect("probe request must succeed");
+        assert!(!result.active);
+        let descendant_pid: u32 = fs::read_to_string(descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        let _cleanup = WindowsTestProcess(descendant_pid);
+        assert!(
+            windows_process_is_running(descendant_pid),
+            "successful request must not terminate descendant {descendant_pid}"
+        );
     }
 
     #[cfg(unix)]
