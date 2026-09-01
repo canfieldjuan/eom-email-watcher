@@ -127,6 +127,9 @@ def test_unsupported_payment_card_semantics_are_rejected(
         "No bank card numbers are needed, only building-access card numbers.",
         "CVV is not requested; provide the access badge numbers.",
         "Credit card details are not needed; provide the access badge numbers.",
+        "Credit card details aren't accepted; provide the access badge numbers.",
+        "Credit card details shouldn’t be sent; provide the access badge numbers.",
+        "Credit card details won't be needed; provide the access badge numbers.",
     ],
 )
 def test_negated_payment_card_semantics_do_not_authorize_positive_output(
