@@ -196,5 +196,36 @@ the bounded fixture model so it can pause safely. An authenticated endpoint may 
 Both configured-model fields are required together, and the provider retains final endpoint
 validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
+### Packaged Debian interoperability proof
+
+After building both Debian packages from their current checkouts with the canonical test public key
+ring, exercise the two shipped binaries together. Set `LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
+`connect-contracts/entitlements/v1/fixtures/test-keyring.json` for both builds so the fixture license
+below is accepted; production packages instead require an entitlement signed by their embedded
+production authority.
+
+```bash
+uv run python scripts/connect-packaged-deb-proof.py \
+  --consumer-deb "desktop/src-tauri/target/release/bundle/deb/Email Watcher_0.1.0_amd64.deb" \
+  --provider-deb "/path/to/Document Summarizer_0.1.0_amd64.deb" \
+  --active-entitlement "/path/to/connect-contracts/entitlements/v1/fixtures/valid/active.json"
+```
+
+The harness requires `dpkg-deb`, `dbus-run-session`, and `xvfb-run`. It extracts rather than
+system-installs the packages, starts the packaged provider in an isolated desktop session, and
+drives the packaged `eom-mail-engine` JSON contract. Every config, database, entitlement, runtime,
+and application-data path is confined to a private temporary root; the parent shell's home and
+credential environment are not forwarded. The source `Store` is used only to create one synthetic
+PDF attachment-metadata row—no message body or attachment bytes are persisted or handed off.
+
+A passing result proves generic v2 capability visibility changes `0 -> 1 -> 0 -> 1` across packaged
+provider launch, stop, and restart, the provider's durable instance identity survives restart, and
+the packaged consumer Inbox remains readable while the provider is absent. It does not contact
+Gmail or a model, submit a capability job, install either package through the OS package manager, or
+exercise a human UI click. The source-level `connect-local-proof.py` remains the job handoff,
+idempotency, persistence, output, and privacy proof. Native Windows execution remains separate:
+the Windows Email Watcher installer is built and checked by `windows-package`, while a two-app
+Windows proof requires a native Document Summarizer package and an actual Windows test session.
+
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.
