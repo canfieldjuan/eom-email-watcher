@@ -209,6 +209,10 @@ def test_payment_card_semantics_in_deadline_are_rejected() -> None:
             "I'm not sure which credit card I should use; please advise.",
             "Reply with guidance about which credit card to use.",
         ),
+        (
+            "My credit card doesn't work; how else can I pay?",
+            "Reply about the credit card that does not work.",
+        ),
     ],
 )
 def test_supported_card_semantics_remain_valid(
@@ -227,6 +231,46 @@ def test_supported_card_semantics_remain_valid(
     )
 
     assert result.suggested_action == suggested_action
+
+
+def test_affirmed_card_subtype_does_not_authorize_another_subtype() -> None:
+    raw = valid_result()
+    raw["summary"] = "Debit cards are accepted."
+    raw["suggested_action"] = "Pay by credit card."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Credit cards are not accepted; debit cards are accepted.",
+        )
+
+
+@pytest.mark.parametrize(
+    "unsupported_action",
+    [
+        "Provide the credit card details.",
+        "Provide the cardholder data.",
+        "Provide the CVV.",
+    ],
+)
+def test_card_reference_does_not_authorize_sensitive_data_request(
+    unsupported_action: str,
+) -> None:
+    raw = valid_result()
+    raw["summary"] = "Credit cards are accepted for payment."
+    raw["suggested_action"] = unsupported_action
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Credit cards are accepted for payment.",
+        )
 
 
 def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:

@@ -46,14 +46,16 @@ GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PAYMENT_CARD_SEMANTICS_RE = re.compile(
     r"\b(?:"
-    r"(?:credit|debit|payment|bank|charge|prepaid)[\s-]+cards?"
-    r"(?:[\s-]+(?:numbers?|details|data|information))?"
-    r"|pay(?:ment)?\s+by\s+card"
-    r"|card[\s-]+payments?"
-    r"|cardholder[\s-]+(?:data|information)"
-    r"|cvv|cvc"
+    r"(?P<typed_card>(?P<card_type>credit|debit|payment|bank|charge|prepaid)"
+    r"[\s-]+cards?)(?P<card_data>[\s-]+(?:numbers?|details|data|information))?"
+    r"|(?P<card_payment>pay(?:ment)?\s+by\s+card|card[\s-]+payments?)"
+    r"|(?P<cardholder_data>cardholder[\s-]+(?:data|information))"
+    r"|(?P<security_code>cvv|cvc)"
     r")\b",
     re.IGNORECASE,
+)
+PAYMENT_CARD_TYPES = frozenset(
+    {"payment_card", "credit_card", "debit_card", "bank_card", "charge_card", "prepaid_card"}
 )
 PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
     r"(?:"
@@ -75,7 +77,10 @@ PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
     r"(?:not|never)\b"
     r"|cannot\b"
     r"|[a-z]+n['’]t\b"
-    r")",
+    r")"
+    r"(?:\W+to)?(?:\W+be)?\W+"
+    r"(?:accepted|allowed|available|needed|required|requested|supported|used|valid|permitted"
+    r"|sent|provided|shared|submitted|included|entered|disclosed|stored|processed)\b",
     re.IGNORECASE,
 )
 
@@ -157,13 +162,48 @@ def _json_object(text: str) -> dict[str, object]:
     return value
 
 
-def _has_affirmed_payment_card_semantics(text: str) -> bool:
+def _payment_card_semantic(match: re.Match[str]) -> tuple[str, str]:
+    if match.group("security_code"):
+        return ("security_code", "data")
+    if match.group("cardholder_data"):
+        return ("cardholder_data", "data")
+    if match.group("card_payment"):
+        return ("payment_card", "payment")
+    card_type = match.group("card_type")
+    if card_type is None:  # pragma: no cover - regex alternatives are exhaustive
+        raise AssertionError("Unclassified payment-card semantic")
+    role = "data" if match.group("card_data") else "reference"
+    return (f"{card_type.lower()}_card", role)
+
+
+def _payment_card_semantics(text: str, *, affirmed_only: bool) -> set[tuple[str, str]]:
+    semantics: set[tuple[str, str]] = set()
     for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text):
-        prefix = re.split(r"[.!?;:,\n]", text[: match.start()])[-1]
-        suffix = re.split(r"[.!?;:,\n]", text[match.end() :], maxsplit=1)[0]
-        if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
+        if affirmed_only:
+            prefix = re.split(r"[.!?;:,\n]", text[: match.start()])[-1]
+            suffix = re.split(r"[.!?;:,\n]", text[match.end() :], maxsplit=1)[0]
+            if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
+                continue
+            if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
+                continue
+        semantics.add(_payment_card_semantic(match))
+    return semantics
+
+
+def _source_supports_payment_card_semantic(
+    source_semantics: set[tuple[str, str]], output_semantic: tuple[str, str]
+) -> bool:
+    output_type, output_role = output_semantic
+    for source_type, source_role in source_semantics:
+        if output_type == "payment_card":
+            type_supported = source_type in PAYMENT_CARD_TYPES
+        else:
+            type_supported = source_type == output_type
+        if not type_supported:
             continue
-        if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
+        if output_role == "data" and source_role != "data":
+            continue
+        if output_role == "payment" and source_role != "payment":
             continue
         return True
     return False
@@ -185,12 +225,17 @@ def validate_analysis(
         for value in (analysis.summary, analysis.suggested_action, analysis.deadline_text)
         if value is not None
     )
-    if (
-        source_text is not None
-        and PAYMENT_CARD_SEMANTICS_RE.search(output_text)
-        and not _has_affirmed_payment_card_semantics(source_text)
-    ):
-        raise ModelError("Local model introduced unsupported payment-card semantics")
+    if source_text is not None:
+        output_card_semantics = _payment_card_semantics(output_text, affirmed_only=False)
+        if output_card_semantics:
+            source_card_semantics = _payment_card_semantics(source_text, affirmed_only=True)
+            if any(
+                not _source_supports_payment_card_semantic(
+                    source_card_semantics, output_semantic
+                )
+                for output_semantic in output_card_semantics
+            ):
+                raise ModelError("Local model introduced unsupported payment-card semantics")
     if analysis.deadline_iso:
         try:
             deadline = datetime.strptime(analysis.deadline_iso, "%Y-%m-%d").date()
