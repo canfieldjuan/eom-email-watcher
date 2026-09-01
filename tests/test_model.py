@@ -85,6 +85,7 @@ def test_prompt_treats_email_as_untrusted() -> None:
 
 def test_prompt_assigns_obligations_from_the_mailbox_owner_perspective() -> None:
     assert "mailbox owner" in SYSTEM_PROMPT
+    assert "commercial cleaning" not in SYSTEM_PROMPT
     assert "who owes whom" in SYSTEM_PROMPT
     assert "quoted history" in SYSTEM_PROMPT
     assert "building-access card" in SYSTEM_PROMPT
