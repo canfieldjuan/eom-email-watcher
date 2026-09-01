@@ -63,8 +63,10 @@ PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
 )
 PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
     r"^\W*(?:"
-    r"(?:(?:is|are|was|were|will|should|must|do|does|did)\W+)?(?:not|never)\b"
-    r"|(?:isn|aren|wasn|weren|won|shouldn|mustn|don|doesn|didn)['’]t\b"
+    r"(?:(?:is|are|was|were|will|would|shall|should|must|can|could|do|does|did|need)\W+)?"
+    r"(?:not|never)\b"
+    r"|cannot\b"
+    r"|[a-z]+n['’]t\b"
     r")",
     re.IGNORECASE,
 )
