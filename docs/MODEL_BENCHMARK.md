@@ -48,6 +48,25 @@ deadlines, urgent operational risk, scheduling, every stable category, body and 
 prompt injection, HTML-derived text, empty and long bodies, attachment filenames, and malformed or
 contradictory raw analysis at the deterministic validation boundary.
 
+## Obligation-direction regression corpus
+
+`benchmarks/email-obligation-v1.json` is a separate synthetic regression corpus for assigning who
+must act and who owes whom. It covers a customer requesting copies of invoices overdue on the
+customer's side, a vendor asking the mailbox owner to pay, quoted invoice history, and the boundary
+between building-access cards and payment cards.
+
+The corpus is separate so the hash and meaning of `email-analysis-v1.json` and its historical
+results remain unchanged. Validate it with:
+
+```bash
+uv run eom-model-benchmark validate \
+  --corpus benchmarks/email-obligation-v1.json
+```
+
+When comparing models for this failure class, run every candidate against this exact file with the
+same settings and repetitions. Keep content-bearing review output under `benchmarks/local/` as
+described above; do not commit real email text or local review artifacts.
+
 ## LM Studio CPU-only procedure
 
 Use one model at a time. `--gpu off` is mandatory; LM Studio otherwise chooses its own offload.

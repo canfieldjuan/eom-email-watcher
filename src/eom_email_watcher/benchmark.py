@@ -211,6 +211,9 @@ def _safe_error_code(error: ModelError) -> str:
         "Local model action_required=true requires a suggested action": (
             "action_without_suggestion"
         ),
+        "Local model introduced unsupported payment-card semantics": (
+            "unsupported_payment_card_semantics"
+        ),
     }
     message = str(error)
     if message.startswith("Local model request failed:"):

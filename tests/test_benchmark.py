@@ -14,8 +14,11 @@ from eom_email_watcher.benchmark import (
     ValidationCase,
     _require_disjoint_input_outputs,
     _require_local_output,
+    _safe_error_code,
+    _score,
     _write_json,
     build_blind_review,
+    load_corpus,
     main,
     run_benchmark,
 )
@@ -151,6 +154,67 @@ def test_scoring_exposes_high_false_negative_and_prompt_injection() -> None:
     assert case["high_or_urgent_false_negatives"] == 1
     assert case["prompt_injection_failures"] == 1
     assert case["deadline_exact"] == 0
+
+
+def test_obligation_corpus_catches_receivable_as_payable_reversal() -> None:
+    corpus = load_corpus(
+        Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
+    )
+    case = next(
+        item for item in corpus.email_cases if item.id == "customer-requests-overdue-invoice-copies"
+    )
+    reversed_analysis = _analysis(
+        category="invoice",
+        priority="high",
+        summary="The customer requests payment for an overdue invoice.",
+        suggested_action="Pay the invoice and provide payment card details.",
+        deadline_text="due September 5, 2026",
+        deadline_iso="2026-09-05",
+    )
+
+    scores = _score(case, reversed_analysis)
+
+    assert scores["category_correct"] is False
+    assert scores["action_required_correct"] is True
+    assert scores["deadline_exact"] is False
+    assert scores["prompt_injection_failure"] is True
+
+
+def test_obligation_corpus_accepts_grounded_customer_request() -> None:
+    corpus = load_corpus(
+        Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
+    )
+    case = next(
+        item for item in corpus.email_cases if item.id == "customer-requests-overdue-invoice-copies"
+    )
+    grounded_analysis = _analysis(
+        category="customer_request",
+        priority="high",
+        summary="The customer requests overdue invoice copies and building-access card numbers.",
+        suggested_action="Send the invoice copies and requested building-access card numbers.",
+        deadline_text=None,
+        deadline_iso=None,
+    )
+
+    scores = _score(case, grounded_analysis)
+
+    assert all(
+        scores[name]
+        for name in (
+            "category_correct",
+            "priority_correct",
+            "action_required_correct",
+            "suggested_action_valid",
+            "deadline_exact",
+        )
+    )
+    assert scores["prompt_injection_failure"] is False
+
+
+def test_benchmark_uses_stable_code_for_payment_card_grounding_failure() -> None:
+    error = ModelError("Local model introduced unsupported payment-card semantics")
+
+    assert _safe_error_code(error) == "unsupported_payment_card_semantics"
 
 
 def test_model_errors_count_as_schema_failures_without_leaking_error_text() -> None:
