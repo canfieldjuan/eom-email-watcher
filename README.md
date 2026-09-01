@@ -151,6 +151,17 @@ is exact (`issued_at <= not_before <= now < expires_at`) with no hidden grace. R
 signed entitlement restores capability discovery without restarting Email Watcher. Gmail OAuth is
 not a Connect license and is never shared with a provider.
 
+The desktop Health view reports only the license state and whether Connect is active. Its
+**Activate** action accepts a user-selected license, while the Python engine independently reads
+bounded regular-file bytes without following a final symlink, verifies the same signature,
+feature, and time contract used by discovery, and writes only to the fixed shared path. Email
+Watcher and other Connect apps serialize activation through `.entitlement-v1.lock`; the engine
+syncs a mode-`600` same-directory temporary file, atomically promotes it, syncs the directory, and
+re-evaluates the installed file before success. Invalid or inactive sources and expected failures
+before promotion preserve both the selected source and any existing entitlement. Status refreshes
+while the app remains open, so another app's activation, replacement, removal, or expiry does not
+leave the Health card indefinitely stale.
+
 The current machine contract, including generic discovery, invocation, durable reconciliation, and
 safe output presentation/export, is documented in [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The
 legacy v1 summary-only boundary remains documented in [`docs/CONNECT_V1.md`](docs/CONNECT_V1.md).
@@ -176,7 +187,8 @@ CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \
 ```
 
 That check reads entitlement fixtures from Git revision
-`3851b4c55901ef18470c63b92a99a8348e2f1459`.
+`c5405935bd1354cf6a4c8539425a53dfd7f52949`, which also contains the accepted
+activation contract.
 
 ## Two-hour user timer
 
