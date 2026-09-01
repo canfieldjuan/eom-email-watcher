@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -78,6 +79,58 @@ def test_second_production_check_stops_before_gmail(
         RuntimeError, match="production check is already running"
     ):
         cli._check(tmp_path / "config.toml", dry_run=False)
+
+
+def test_production_check_reloads_runtime_after_acquiring_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale_config = SimpleNamespace(
+        **{
+            **vars(_check_config(tmp_path)),
+            "retention_days": 180,
+        }
+    )
+    fresh_config = SimpleNamespace(
+        **{
+            **vars(stale_config),
+            "gmail_credentials_file": tmp_path / "fresh-credentials.json",
+            "gmail_token_file": tmp_path / "fresh-token.json",
+            "retention_days": 1,
+        }
+    )
+    runtimes = iter(
+        (
+            (stale_config, object(), object()),
+            (fresh_config, object(), object()),
+        )
+    )
+    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+
+    @contextmanager
+    def acquired_lock(database_file: Path):
+        assert database_file == stale_config.database_file
+        yield
+
+    monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
+
+    def gmail_from_token(credentials_file: Path, token_file: Path):
+        assert credentials_file == fresh_config.gmail_credentials_file
+        assert token_file == fresh_config.gmail_token_file
+        return object()
+
+    monkeypatch.setattr(cli.GmailGateway, "from_token", gmail_from_token)
+
+    class FakeWatcher:
+        def __init__(self, config, store, gmail, model):
+            assert config is fresh_config
+
+        def check(self, *, dry_run: bool):
+            assert dry_run is False
+            return {"retention_days": fresh_config.retention_days}
+
+    monkeypatch.setattr(cli, "Watcher", FakeWatcher)
+
+    assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
 
 
 def test_dry_run_does_not_take_production_lock(

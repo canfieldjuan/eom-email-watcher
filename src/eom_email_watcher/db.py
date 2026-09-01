@@ -27,6 +27,16 @@ def _sqlite_casefold(value: object) -> str:
     return value.casefold() if isinstance(value, str) else ""
 
 
+def _sqlite_is_aware_iso_datetime(value: object) -> int:
+    if not isinstance(value, str):
+        return 0
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return 0
+    return int(parsed.tzinfo is not None)
+
+
 def _message_suppression_key(message_id: str) -> str:
     return hashlib.sha256(message_id.encode("utf-8")).hexdigest()
 
@@ -713,6 +723,12 @@ class Store:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
+        connection.create_function(
+            "is_aware_iso_datetime",
+            1,
+            _sqlite_is_aware_iso_datetime,
+            deterministic=True,
+        )
         try:
             yield connection
         except Exception:
@@ -1917,11 +1933,11 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """DELETE FROM messages
-                WHERE julianday(received_at) IS NULL
+                WHERE is_aware_iso_datetime(received_at) = 0
                    OR (
                        julianday(received_at) > julianday(?)
                        AND (
-                           julianday(discovered_at) IS NULL
+                           is_aware_iso_datetime(discovered_at) = 0
                            OR julianday(discovered_at) < julianday(?)
                        )
                    )

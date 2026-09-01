@@ -338,6 +338,36 @@ def test_purge_uses_source_received_time_not_local_discovery_time(tmp_path: Path
     assert [row["message_id"] for row in store.recent(10)] == ["source-current"]
 
 
+def test_purge_rejects_timezone_less_source_timestamp(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="timezone-less",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed source time",
+        received_at="2026-09-01T11:00:00",
+    )
+    store.mark_analyzed(
+        "timezone-less",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "Summary.",
+            "action_required": False,
+            "suggested_action": None,
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert store.recent(10) == []
+    assert store.notification_intents() == []
+
+
 def test_purge_bounds_legacy_future_source_time_by_discovery_time(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
