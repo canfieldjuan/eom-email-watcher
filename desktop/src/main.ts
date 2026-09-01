@@ -119,6 +119,8 @@ interface RevealedCapabilityOutput {
 
 interface InboxItem {
   message_id: string;
+  provider: string;
+  account_id: string;
   received_at: string;
   sender: string;
   sender_name: string | null;
@@ -143,6 +145,8 @@ interface InboxItem {
 interface InboxQuery {
   limit: number;
   cursor: string | null;
+  provider: string | null;
+  account_id: string | null;
   sender_query: string | null;
   priority: string | null;
   category: string | null;
@@ -553,6 +557,8 @@ const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
+  provider: null,
+  account_id: null,
   sender_query: null,
   priority: null,
   category: null,
@@ -1347,6 +1353,8 @@ function optionalFilterValue(value: string): string | null {
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
   return {
     limit: Number(inboxPageSizeSelect.value),
+    provider: null,
+    account_id: null,
     sender_query: optionalFilterValue(inboxSenderInput.value),
     priority: optionalFilterValue(inboxPrioritySelect.value),
     category: optionalFilterValue(inboxCategorySelect.value),

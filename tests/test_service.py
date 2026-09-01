@@ -7,7 +7,18 @@ import pytest
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
-from eom_email_watcher.gmail import MessageMetadata, MessageUnavailable, StaleHistoryCursor
+from eom_email_watcher.gmail import (
+    MessageMetadata,
+    MessageUnavailable,
+    StaleHistoryCursor,
+)
+from eom_email_watcher.mailbox import (
+    MailboxChanges,
+    MailboxSession,
+    MessageContent,
+    scoped_message_id,
+)
+from eom_email_watcher.mime import extract_body
 from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
 from eom_email_watcher.notifications import NotificationError
 from eom_email_watcher.service import Watcher
@@ -22,14 +33,24 @@ class FakeGmail:
     def profile_history_id(self) -> str:
         return "200"
 
+    def initial_cursor(self) -> str:
+        return self.profile_history_id()
+
     def history_message_ids(self, cursor: str):
         if self.stale:
             raise StaleHistoryCursor()
         return ["allowed", "blocked"], "200"
 
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        message_ids, newest = self.history_message_ids(cursor)
+        return MailboxChanges(tuple(message_ids), newest)
+
     def search_since(self, addresses, since):
         self.search_since_value = since
         return ["allowed"]
+
+    def recover_since(self, addresses, since) -> MailboxChanges:
+        return MailboxChanges(tuple(self.search_since(addresses, since)), self.initial_cursor())
 
     def metadata(self, message_id: str) -> MessageMetadata:
         sender = "trusted@example.com" if message_id == "allowed" else "stranger@example.com"
@@ -46,6 +67,12 @@ class FakeGmail:
     def full_payload(self, message_id: str):
         self.full_payload_calls += 1
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        body, attachment_names, attachments = extract_body(
+            self.full_payload(message_id), body_char_limit
+        )
+        return MessageContent(body, attachment_names, attachments)
 
 
 class FreshGmail(FakeGmail):
@@ -150,6 +177,58 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert watcher.check()["discovered"] == 0
 
 
+def test_watcher_scopes_sync_and_source_fetch_to_mailbox_session(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", provider="microsoft365", account_id="account-2")
+    gateway = FakeGmail()
+    session = MailboxSession("microsoft365", "account-2", gateway)
+
+    result = Watcher(cfg, store, session, FakeModel()).check()
+
+    local_id = scoped_message_id("microsoft365", "account-2", "allowed")
+    item = store.recent(1)[0]
+    assert result["discovered"] == 1
+    assert item["message_id"] == local_id
+    assert item["provider"] == "microsoft365"
+    assert item["account_id"] == "account-2"
+    assert store.message_source(local_id).provider_message_id == "allowed"
+    assert store.state(provider="microsoft365", account_id="account-2")[0] == "200"
+    assert store.state() is None
+
+
+def test_watcher_does_not_fetch_pending_content_from_another_account(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+    other_local_id = scoped_message_id("microsoft365", "account-2", "other-message")
+    store.add_message(
+        message_id=other_local_id,
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id="other-message",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Other account",
+        received_at=datetime.now(UTC).isoformat(),
+    )
+    gateway = FakeGmail()
+    gateway.history_message_ids = lambda cursor: ([], "200")
+
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+
+    assert result["summarized"] == 0
+    assert gateway.full_payload_calls == 0
+    assert [item.message_id for item in store.pending()] == [other_local_id]
+
+
 def test_attachment_inventory_is_durable_before_model_failure(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
@@ -172,7 +251,9 @@ def test_attachment_inventory_is_durable_before_model_failure(tmp_path: Path) ->
     ]
 
 
-def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path) -> None:
+def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
+    tmp_path: Path,
+) -> None:
     cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
@@ -351,9 +432,7 @@ def test_dry_run_ignores_pending_source_time_that_overflows_utc(
     assert result["purged"] == 0
     assert gmail.full_payload_calls == 0
     assert model.calls == 0
-    assert [item["message_id"] for item in store.recent(10)] == [
-        "overflowing-source-time"
-    ]
+    assert [item["message_id"] for item in store.recent(10)] == ["overflowing-source-time"]
 
 
 def test_dry_run_does_not_advance_cursor_or_store_messages(tmp_path: Path) -> None:
@@ -417,9 +496,7 @@ def _make_retries_due(store: Store) -> None:
         db.execute("UPDATE messages SET next_retry_at = NULL")
 
 
-def test_notification_retry_uses_persisted_analysis(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_notification_retry_uses_persisted_analysis(tmp_path: Path, monkeypatch) -> None:
     cfg = replace(config(tmp_path), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
@@ -514,9 +591,7 @@ def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
     assert first["analysis_retry_after_seconds"] == 30
 
     _make_retries_due(store)
-    retry_watcher = Watcher(
-        replace(cfg, timezone="America/New_York"), store, FakeGmail(), model
-    )
+    retry_watcher = Watcher(replace(cfg, timezone="America/New_York"), store, FakeGmail(), model)
     assert retry_watcher.check()["summarized"] == 1
     assert model.requests[0] == model.requests[1]
     assert store.recent(1)[0]["status"] == "summarized"
@@ -542,9 +617,7 @@ def test_gateway_permanent_failure_waits_for_explicit_requeue(tmp_path: Path) ->
     assert model.requests[1][0] != first_request_id
 
 
-def test_fallback_does_not_suppress_recovered_analysis(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_fallback_does_not_suppress_recovered_analysis(tmp_path: Path, monkeypatch) -> None:
     cfg = replace(config(tmp_path), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
@@ -579,9 +652,7 @@ def test_fallback_does_not_suppress_recovered_analysis(
     assert model.calls == 2
 
 
-def test_deferred_delivery_retention_expires_queued_analysis(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_deferred_delivery_retention_expires_queued_analysis(tmp_path: Path, monkeypatch) -> None:
     cfg = replace(config(tmp_path), notifications_enabled=True, retention_days=1)
     store = Store(cfg.database_file)
     store.initialize()
@@ -595,9 +666,7 @@ def test_deferred_delivery_retention_expires_queued_analysis(
     )
 
     gmail = FreshGmail()
-    result = Watcher(cfg, store, gmail, FakeModel()).check(
-        deliver_notifications=False
-    )
+    result = Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=False)
 
     assert result["summarized"] == 1
     assert store.recent(1)[0]["status"] == "analyzed"

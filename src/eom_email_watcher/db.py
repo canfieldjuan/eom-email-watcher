@@ -14,9 +14,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .config import MAX_RETENTION_DAYS
+from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -40,8 +41,13 @@ def _sqlite_aware_iso_epoch(value: object) -> float | None:
         return None
 
 
-def _message_suppression_key(message_id: str) -> str:
-    return hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+def _message_suppression_key(provider: str, account_id: str, provider_message_id: str) -> str:
+    encoded = "\0".join((provider, account_id, provider_message_id)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_message_suppression_key(provider_message_id: str) -> str:
+    return hashlib.sha256(provider_message_id.encode("utf-8")).hexdigest()
 
 
 def _suppression_expiry(received_at: str, now: datetime) -> str:
@@ -226,6 +232,9 @@ class AnalysisRequest:
 @dataclass(frozen=True)
 class PendingMessage:
     message_id: str
+    provider: str
+    account_id: str
+    provider_message_id: str
     thread_id: str | None
     sender: str
     sender_name: str | None
@@ -270,6 +279,14 @@ class NotificationIntent:
     suggested_action: str | None
     deadline_iso: str | None
     last_error: str | None
+
+
+@dataclass(frozen=True)
+class MessageSource:
+    message_id: str
+    provider: str
+    account_id: str
+    provider_message_id: str
 
 
 @dataclass(frozen=True)
@@ -458,7 +475,14 @@ def _v2_invocation_fingerprint(
         or len(inputs) != 1
         or not isinstance(inputs[0], dict)
         or set(inputs[0])
-        != {"artifact_id", "media_type", "byte_size", "sha256", "display_name", "source_app_id"}
+        != {
+            "artifact_id",
+            "media_type",
+            "byte_size",
+            "sha256",
+            "display_name",
+            "source_app_id",
+        }
     ):
         raise ValueError("Connect v2 request provenance is invalid")
     input_artifact = inputs[0]
@@ -472,7 +496,13 @@ def _v2_invocation_fingerprint(
         "capability": capability,
         "input": {
             key: input_artifact[key]
-            for key in ("media_type", "byte_size", "sha256", "display_name", "source_app_id")
+            for key in (
+                "media_type",
+                "byte_size",
+                "sha256",
+                "display_name",
+                "source_app_id",
+            )
         },
         "parameters": _canonical_v2_parameters(request.get("parameters")),
     }
@@ -671,7 +701,9 @@ def _decode_generic_result(result_json: bytes) -> tuple[ConnectOutput, ...]:
         raise RuntimeError("Completed Connect v2 result is invalid") from exc
 
 
-def _decode_generic_result_metadata(result_metadata_json: bytes) -> list[dict[str, object]]:
+def _decode_generic_result_metadata(
+    result_metadata_json: bytes,
+) -> list[dict[str, object]]:
     if not 0 < len(result_metadata_json) <= MAX_CONNECT_RESULT_METADATA_BYTES:
         raise RuntimeError("Completed Connect v2 result metadata is invalid")
     try:
@@ -717,6 +749,95 @@ def _decode_generic_result_metadata(result_metadata_json: bytes) -> list[dict[st
     return outputs
 
 
+def _ensure_mailbox_scope_schema(db: sqlite3.Connection) -> None:
+    message_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "provider" not in message_columns:
+        db.execute("ALTER TABLE messages ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail'")
+    if "account_id" not in message_columns:
+        db.execute(
+            "ALTER TABLE messages ADD COLUMN account_id TEXT NOT NULL DEFAULT 'gmail-default'"
+        )
+    if "provider_message_id" not in message_columns:
+        db.execute("ALTER TABLE messages ADD COLUMN provider_message_id TEXT")
+        db.execute("UPDATE messages SET provider_message_id = message_id")
+    db.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity
+        ON messages(provider, account_id, provider_message_id)"""
+    )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_require_source_identity_insert
+        BEFORE INSERT ON messages
+        WHEN NEW.provider = '' OR NEW.account_id = ''
+          OR NEW.provider_message_id IS NULL OR NEW.provider_message_id = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'message source identity is required');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_require_source_identity_update
+        BEFORE UPDATE OF provider, account_id, provider_message_id ON messages
+        WHEN NEW.provider = '' OR NEW.account_id = ''
+          OR NEW.provider_message_id IS NULL OR NEW.provider_message_id = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'message source identity is required');
+        END
+        """
+    )
+
+    state_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(mailbox_state)").fetchall()
+    }
+    if "provider" not in state_columns:
+        db.execute("ALTER TABLE mailbox_state RENAME TO mailbox_state_v8")
+        db.execute(
+            """CREATE TABLE mailbox_state (
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                cursor TEXT NOT NULL,
+                last_success_at TEXT NOT NULL,
+                PRIMARY KEY (provider, account_id)
+            )"""
+        )
+        db.execute(
+            """INSERT INTO mailbox_state(provider, account_id, cursor, last_success_at)
+            SELECT ?, ?, history_id, last_success_at FROM mailbox_state_v8 WHERE id = 1""",
+            (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID),
+        )
+        db.execute("DROP TABLE mailbox_state_v8")
+
+    suppression_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(suppressed_messages)").fetchall()
+    }
+    if "provider" not in suppression_columns:
+        db.execute("DROP INDEX IF EXISTS idx_suppressed_messages_expiry")
+        db.execute("ALTER TABLE suppressed_messages RENAME TO suppressed_messages_v8")
+        db.execute(
+            """CREATE TABLE suppressed_messages (
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                message_key TEXT NOT NULL CHECK (length(message_key) = 64),
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY (provider, account_id, message_key)
+            )"""
+        )
+        db.execute(
+            """INSERT INTO suppressed_messages(
+                provider, account_id, message_key, expires_at
+            ) SELECT ?, ?, message_key, expires_at FROM suppressed_messages_v8""",
+            (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID),
+        )
+        db.execute("DROP TABLE suppressed_messages_v8")
+        db.execute(
+            """CREATE INDEX idx_suppressed_messages_expiry
+            ON suppressed_messages(expires_at)"""
+        )
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -756,12 +877,17 @@ class Store:
                 """
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS mailbox_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    history_id TEXT NOT NULL,
-                    last_success_at TEXT NOT NULL
+                    provider TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    cursor TEXT NOT NULL,
+                    last_success_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, account_id)
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    provider_message_id TEXT NOT NULL,
                     thread_id TEXT,
                     sender TEXT NOT NULL,
                     sender_name TEXT,
@@ -795,8 +921,11 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_messages_inbox_order
                     ON messages(received_at DESC, message_id DESC);
                 CREATE TABLE IF NOT EXISTS suppressed_messages (
-                    message_key TEXT PRIMARY KEY CHECK (length(message_key) = 64),
-                    expires_at TEXT NOT NULL
+                    provider TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    message_key TEXT NOT NULL CHECK (length(message_key) = 64),
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, account_id, message_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_suppressed_messages_expiry
                     ON suppressed_messages(expires_at);
@@ -836,10 +965,9 @@ class Store:
                 );
                 """
             )
+            _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
-            columns = {
-                row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()
-            }
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()}
             if "analysis_at" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN analysis_at TEXT")
             migrations = {
@@ -856,21 +984,37 @@ class Store:
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
-    def state(self) -> tuple[str, str] | None:
+    def state(
+        self,
+        *,
+        provider: str = DEFAULT_MAIL_PROVIDER,
+        account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+    ) -> tuple[str, str] | None:
         with self.connection() as db:
             row = db.execute(
-                "SELECT history_id, last_success_at FROM mailbox_state WHERE id = 1"
+                """SELECT cursor, last_success_at FROM mailbox_state
+                WHERE provider = ? AND account_id = ?""",
+                (provider, account_id),
             ).fetchone()
-        return (row["history_id"], row["last_success_at"]) if row else None
+        return (row["cursor"], row["last_success_at"]) if row else None
 
-    def set_state(self, history_id: str, at: datetime | None = None) -> None:
+    def set_state(
+        self,
+        cursor: str,
+        at: datetime | None = None,
+        *,
+        provider: str = DEFAULT_MAIL_PROVIDER,
+        account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+    ) -> None:
         stamp = (at or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             db.execute(
-                """INSERT INTO mailbox_state(id, history_id, last_success_at) VALUES(1, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET history_id=excluded.history_id,
+                """INSERT INTO mailbox_state(
+                    provider, account_id, cursor, last_success_at
+                ) VALUES(?, ?, ?, ?)
+                ON CONFLICT(provider, account_id) DO UPDATE SET cursor=excluded.cursor,
                 last_success_at=excluded.last_success_at""",
-                (history_id, stamp),
+                (provider, account_id, cursor, stamp),
             )
 
     def has_message(self, message_id: str) -> bool:
@@ -880,16 +1024,44 @@ class Store:
                 is not None
             )
 
-    def has_seen_message(self, message_id: str) -> bool:
-        message_key = _message_suppression_key(message_id)
+    def message_source(self, message_id: str) -> MessageSource:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT message_id, provider, account_id, provider_message_id
+                FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(message_id)
+        return MessageSource(**dict(row))
+
+    def has_seen_message(
+        self,
+        provider_message_id: str,
+        *,
+        provider: str = DEFAULT_MAIL_PROVIDER,
+        account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+    ) -> bool:
+        message_key = _message_suppression_key(provider, account_id, provider_message_id)
+        legacy_message_key = _legacy_message_suppression_key(provider_message_id)
         with self.connection() as db:
             return (
                 db.execute(
-                    """SELECT 1 FROM messages WHERE message_id = ?
+                    """SELECT 1 FROM messages
+                    WHERE provider = ? AND account_id = ? AND provider_message_id = ?
                     UNION ALL
-                    SELECT 1 FROM suppressed_messages WHERE message_key = ?
+                    SELECT 1 FROM suppressed_messages
+                    WHERE provider = ? AND account_id = ? AND message_key IN (?, ?)
                     LIMIT 1""",
-                    (message_id, message_key),
+                    (
+                        provider,
+                        account_id,
+                        provider_message_id,
+                        provider,
+                        account_id,
+                        message_key,
+                        legacy_message_key,
+                    ),
                 ).fetchone()
                 is not None
             )
@@ -903,25 +1075,38 @@ class Store:
         sender_name: str | None,
         subject: str,
         received_at: str,
+        provider: str = DEFAULT_MAIL_PROVIDER,
+        account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+        provider_message_id: str | None = None,
     ) -> bool:
-        message_key = _message_suppression_key(message_id)
+        source_message_id = provider_message_id or message_id
+        message_key = _message_suppression_key(provider, account_id, source_message_id)
+        legacy_message_key = _legacy_message_suppression_key(source_message_id)
         with self.connection() as db:
             cursor = db.execute(
                 """INSERT OR IGNORE INTO messages(
-                    message_id, thread_id, sender, sender_name, subject, received_at, discovered_at
-                ) SELECT ?, ?, ?, ?, ?, ?, ?
+                    message_id, provider, account_id, provider_message_id,
+                    thread_id, sender, sender_name, subject, received_at, discovered_at
+                ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM suppressed_messages WHERE message_key = ?
+                    SELECT 1 FROM suppressed_messages
+                    WHERE provider = ? AND account_id = ? AND message_key IN (?, ?)
                 )""",
                 (
                     message_id,
+                    provider,
+                    account_id,
+                    source_message_id,
                     thread_id,
                     sender,
                     sender_name,
                     subject,
                     received_at,
                     datetime.now(UTC).isoformat(),
+                    provider,
+                    account_id,
                     message_key,
+                    legacy_message_key,
                 ),
             )
         return cursor.rowcount == 1
@@ -931,15 +1116,26 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT received_at FROM messages WHERE message_id = ?", (message_id,)
+                """SELECT provider, account_id, provider_message_id, received_at
+                FROM messages WHERE message_id = ?""",
+                (message_id,),
             ).fetchone()
             if row is None:
                 return False
             db.execute(
-                """INSERT INTO suppressed_messages(message_key, expires_at) VALUES (?, ?)
-                ON CONFLICT(message_key) DO UPDATE SET expires_at = excluded.expires_at""",
+                """INSERT INTO suppressed_messages(
+                    provider, account_id, message_key, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, account_id, message_key)
+                DO UPDATE SET expires_at = excluded.expires_at""",
                 (
-                    _message_suppression_key(message_id),
+                    str(row["provider"]),
+                    str(row["account_id"]),
+                    _message_suppression_key(
+                        str(row["provider"]),
+                        str(row["account_id"]),
+                        str(row["provider_message_id"]),
+                    ),
                     _suppression_expiry(str(row["received_at"]), stamp),
                 ),
             )
@@ -950,13 +1146,25 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT message_id, received_at FROM messages").fetchall()
+            rows = db.execute(
+                """SELECT provider, account_id, provider_message_id, received_at
+                FROM messages"""
+            ).fetchall()
             db.executemany(
-                """INSERT INTO suppressed_messages(message_key, expires_at) VALUES (?, ?)
-                ON CONFLICT(message_key) DO UPDATE SET expires_at = excluded.expires_at""",
+                """INSERT INTO suppressed_messages(
+                    provider, account_id, message_key, expires_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, account_id, message_key)
+                DO UPDATE SET expires_at = excluded.expires_at""",
                 [
                     (
-                        _message_suppression_key(str(row["message_id"])),
+                        str(row["provider"]),
+                        str(row["account_id"]),
+                        _message_suppression_key(
+                            str(row["provider"]),
+                            str(row["account_id"]),
+                            str(row["provider_message_id"]),
+                        ),
                         _suppression_expiry(str(row["received_at"]), stamp),
                     )
                     for row in rows
@@ -971,9 +1179,10 @@ class Store:
         items = tuple(attachments)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute(
-                "SELECT 1 FROM messages WHERE message_id = ?", (message_id,)
-            ).fetchone() is None:
+            if (
+                db.execute("SELECT 1 FROM messages WHERE message_id = ?", (message_id,)).fetchone()
+                is None
+            ):
                 raise KeyError(message_id)
             db.execute("DELETE FROM message_attachments WHERE message_id = ?", (message_id,))
             db.executemany(
@@ -1028,8 +1237,7 @@ class Store:
         if (
             job.status != "completed"
             or job.output_artifact_id is None
-            or job.output_media_type
-            != "application/vnd.local-connect.document-summary+json"
+            or job.output_media_type != "application/vnd.local-connect.document-summary+json"
             or job.output_byte_size is None
             or job.output_sha256 is None
             or job.summary_version is None
@@ -1477,17 +1685,33 @@ class Store:
             raise RuntimeError("Connect job was not readable after resubmission reset")
         return self._connect_job(row)
 
-    def pending(self, now: datetime | None = None, limit: int = 25) -> list[PendingMessage]:
+    def pending(
+        self,
+        now: datetime | None = None,
+        limit: int = 25,
+        *,
+        provider: str | None = None,
+        account_id: str | None = None,
+    ) -> list[PendingMessage]:
+        if (provider is None) != (account_id is None):
+            raise ValueError("provider and account_id must be supplied together")
         stamp = (now or datetime.now(UTC)).isoformat()
+        scope = ""
+        parameters: list[object] = [stamp]
+        if provider is not None and account_id is not None:
+            scope = " AND provider = ? AND account_id = ?"
+            parameters.extend((provider, account_id))
+        parameters.append(limit)
         with self.connection() as db:
             rows = db.execute(
-                """SELECT message_id, thread_id, sender, sender_name, subject, received_at,
+                f"""SELECT message_id, provider, account_id, provider_message_id,
+                thread_id, sender, sender_name, subject, received_at,
                 attempts, fallback_notified_at, analysis_request_id, analysis_context_at,
                 analysis_body_char_limit FROM messages
                 WHERE status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
-                AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                AND (next_retry_at IS NULL OR next_retry_at <= ?){scope}
                 ORDER BY received_at LIMIT ?""",
-                (stamp, limit),
+                parameters,
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
 
@@ -1753,6 +1977,8 @@ class Store:
         category: str | None = None,
         status: str | None = None,
         keyword: str | None = None,
+        provider: str | None = None,
+        account_id: str | None = None,
     ) -> tuple[list[dict[str, object]], tuple[str, str] | None]:
         clauses: list[str] = []
         parameters: list[object] = []
@@ -1785,12 +2011,19 @@ class Store:
                 "(instr(casefold(subject), ?) > 0 OR instr(casefold(COALESCE(summary, '')), ?) > 0)"
             )
             parameters.extend((folded_keyword, folded_keyword))
+        if provider is not None:
+            clauses.append("provider = ?")
+            parameters.append(provider)
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            parameters.append(account_id)
 
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         parameters.append(limit + 1)
         with self.connection() as db:
             rows = db.execute(
-                f"""SELECT message_id, received_at, sender, sender_name, subject, status,
+                f"""SELECT message_id, provider, account_id, received_at,
+                sender, sender_name, subject, status,
                 analysis_at, category, priority, summary, action_required, suggested_action,
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
                 fallback_notified_at, notified_at, last_error, analysis_retryable,
@@ -2056,9 +2289,7 @@ class Store:
                     datetime.now(UTC).isoformat(),
                 ),
             )
-            db.execute(
-                "DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,)
-            )
+            db.execute("DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,))
 
     def release_outbound(self, dedupe_key: str) -> None:
         with self.connection() as db:
@@ -2107,6 +2338,4 @@ class Store:
                     datetime.now(UTC).isoformat(),
                 ),
             )
-            db.execute(
-                "DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,)
-            )
+            db.execute("DELETE FROM outbound_reservations WHERE dedupe_key = ?", (dedupe_key,))

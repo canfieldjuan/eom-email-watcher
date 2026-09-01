@@ -10,8 +10,20 @@ import pytest
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import load_config
-from eom_email_watcher.gmail import GmailAuthorizationRejected, GmailError, MessageMetadata
-from eom_email_watcher.mime import AttachmentDescriptor
+from eom_email_watcher.gmail import (
+    GmailAuthorizationRejected,
+    GmailError,
+    MessageMetadata,
+)
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxChanges,
+    MailboxSession,
+    MessageContent,
+    scoped_message_id,
+)
+from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -32,14 +44,14 @@ def write_config(
     send_token_file = (path.parent / "send-token.json").as_posix()
     database_file = (path.parent / "watcher.sqlite3").as_posix()
     senders = (
-        '''[[senders]]
+        """[[senders]]
 email = "z@example.com"
 name = "Zed"
 
 [[senders]]
 email = "A@Example.com"
 name = "Trusted A"
-'''
+"""
         if include_senders
         else ""
     )
@@ -121,6 +133,8 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     )
     inbox = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert inbox["data"]["items"][0]["message_id"] == "m1"
+    assert inbox["data"]["items"][0]["provider"] == "gmail"
+    assert inbox["data"]["items"][0]["account_id"] == "gmail-default"
     assert inbox["data"]["items"][0]["attachments"] == []
 
 
@@ -165,7 +179,13 @@ def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
         request(
             config_path,
             "inbox.query",
-            {"category": "invoice", "limit": 1, "sender_query": "BILL"},
+            {
+                "account_id": "gmail-default",
+                "category": "invoice",
+                "limit": 1,
+                "provider": "gmail",
+                "sender_query": "BILL",
+            },
         )
     )
     assert first["ok"] is True
@@ -236,9 +256,7 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
     deleted = engine_api._response(
         request(config_path, "inbox.delete", {"message_id": "message-1"})
     )
-    missing = engine_api._response(
-        request(config_path, "inbox.delete", {"message_id": "missing"})
-    )
+    missing = engine_api._response(request(config_path, "inbox.delete", {"message_id": "missing"}))
     cleared = engine_api._response(request(config_path, "inbox.clear"))
 
     assert deleted["data"] == {"deleted": True, "message_id": "message-1"}
@@ -249,9 +267,7 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
 
 
 @pytest.mark.parametrize("message_id", [None, "", "x" * 513])
-def test_inbox_delete_rejects_invalid_message_identity(
-    tmp_path: Path, message_id: object
-) -> None:
+def test_inbox_delete_rejects_invalid_message_identity(tmp_path: Path, message_id: object) -> None:
     response = engine_api._response(
         request(tmp_path / "unused.toml", "inbox.delete", {"message_id": message_id})
     )
@@ -437,9 +453,7 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
         def profile_history_id(self) -> str:
             return "new-history-id"
 
-    def authorize_with_status(
-        credentials_file, token_file, *, force_reauthorize: bool = False
-    ):
+    def authorize_with_status(credentials_file, token_file, *, force_reauthorize: bool = False):
         authorization_calls.append(force_reauthorize)
         if force_reauthorize:
             return ReauthorizedGmail(), True
@@ -511,13 +525,15 @@ def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
     original_state = runtime.store.state
     original_set_state = runtime.store.set_state
 
-    def state():
+    def state(*, provider: str, account_id: str):
         assert lock_held
-        return original_state()
+        assert (provider, account_id) == (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+        return original_state(provider=provider, account_id=account_id)
 
-    def set_state(history_id: str):
+    def set_state(history_id: str, *, provider: str, account_id: str):
         assert lock_held
-        original_set_state(history_id)
+        assert (provider, account_id) == (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+        original_set_state(history_id, provider=provider, account_id=account_id)
 
     monkeypatch.setattr(engine_api, "FileLock", AuthorizationLock)
     monkeypatch.setattr(engine_api, "_runtime", lambda request: runtime)
@@ -573,7 +589,9 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
     assert "send-token.json" not in encoded
 
 
-def test_settings_update_applies_shortened_retention_immediately(tmp_path: Path) -> None:
+def test_settings_update_applies_shortened_retention_immediately(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, extra_settings="retention_days = 180")
     runtime = load_runtime(config_path)
@@ -590,9 +608,7 @@ def test_settings_update_applies_shortened_retention_immediately(tmp_path: Path)
             received_at=received_at.isoformat(),
         )
 
-    response = engine_api._response(
-        request(config_path, "settings.update", {"retention_days": 1})
-    )
+    response = engine_api._response(request(config_path, "settings.update", {"retention_days": 1}))
 
     assert response["ok"] is True
     assert response["data"]["retention_days"] == 1
@@ -611,6 +627,10 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
     class ExpiredGmail:
         def history_message_ids(self, cursor: str):
             return ["expired"], "200"
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            message_ids, newest = self.history_message_ids(cursor)
+            return MailboxChanges(tuple(message_ids), newest)
 
         def metadata(self, message_id: str) -> MessageMetadata:
             return MessageMetadata(
@@ -707,7 +727,9 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
         assert count_response["data"] == {"count": 0}
 
 
-def test_host_operation_lock_returns_configured_database_lock_path(tmp_path: Path) -> None:
+def test_host_operation_lock_returns_configured_database_lock_path(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     config = load_config(config_path)
@@ -822,9 +844,7 @@ def test_settings_update_preserves_missing_configuration_error(
     tmp_path: Path, missing_parent: bool
 ) -> None:
     config_path = (
-        tmp_path / "absent" / "missing.toml"
-        if missing_parent
-        else tmp_path / "missing.toml"
+        tmp_path / "absent" / "missing.toml" if missing_parent else tmp_path / "missing.toml"
     )
 
     response = engine_api._response(
@@ -863,17 +883,13 @@ def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     assert inbox["data"]["items"][0]["analysis_retryable"] is False
     assert inbox["data"]["items"][0]["analysis_error_code"] == "forbidden"
 
-    requeued = engine_api._response(
-        request(config_path, "analysis.requeue", {"message_id": "m1"})
-    )
+    requeued = engine_api._response(request(config_path, "analysis.requeue", {"message_id": "m1"}))
     assert requeued["data"] == {"status": "requeued"}
     assert runtime.store.pending()[0].analysis_request_id is None
     refreshed = engine_api._response(request(config_path, "inbox.recent", {"limit": 1}))
     assert refreshed["data"]["items"][0]["analysis_retryable"] is None
 
-    duplicate = engine_api._response(
-        request(config_path, "analysis.requeue", {"message_id": "m1"})
-    )
+    duplicate = engine_api._response(request(config_path, "analysis.requeue", {"message_id": "m1"}))
     assert duplicate["error"]["code"] == "conflict"
 
     missing = engine_api._response(
@@ -882,7 +898,9 @@ def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     assert missing["error"]["code"] == "not_found"
 
 
-def test_watchlist_mutations_are_normalized_and_return_explicit_errors(tmp_path: Path) -> None:
+def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
+    tmp_path: Path,
+) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, include_senders=False)
 
@@ -920,8 +938,12 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
+    local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
     runtime.store.add_message(
-        message_id="m1",
+        message_id=local_message_id,
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id="provider-message",
         thread_id=None,
         sender="a@example.com",
         sender_name=None,
@@ -929,7 +951,7 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
         received_at="2026-07-18T14:00:00+00:00",
     )
     runtime.store.replace_attachments(
-        "m1",
+        local_message_id,
         (
             AttachmentDescriptor(
                 "", "gmail-attachment", "../../private.PDF", "application/pdf", 4, 0
@@ -944,7 +966,7 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
             self, message_id: str, part_id: str, attachment_id: str | None
         ) -> bytes:
             assert (message_id, part_id, attachment_id) == (
-                "m1",
+                "provider-message",
                 "",
                 "gmail-attachment",
             )
@@ -952,14 +974,29 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
-        engine_api.GmailGateway, "from_token", lambda *args: FakeAttachmentGmail()
+        engine_api,
+        "configured_mailbox_identity",
+        lambda _config: ("microsoft365", "account-2"),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "load_configured_mailbox",
+        lambda _config: MailboxSession(
+            "microsoft365",
+            "account-2",
+            FakeAttachmentGmail(),
+        ),
     )
 
     response = engine_api._response(
         request(
             config_path,
             "attachment.export",
-            {"message_id": "m1", "part_id": "", "destination_dir": str(destination)},
+            {
+                "message_id": local_message_id,
+                "part_id": "",
+                "destination_dir": str(destination),
+            },
         )
     )
 
@@ -977,6 +1014,53 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
         "media_type": "application/pdf",
         "path": str(exported),
     }
+
+
+def test_attachment_export_rejects_an_unconfigured_account_before_provider_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
+    runtime.store.add_message(
+        message_id=local_message_id,
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id="provider-message",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Attachment",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        local_message_id,
+        (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 4, 0),),
+    )
+    destination = tmp_path / "exports"
+    destination.mkdir()
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_configured_mailbox",
+        lambda _config: pytest.fail("An unavailable account must not be opened"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {
+                "message_id": local_message_id,
+                "part_id": "2",
+                "destination_dir": str(destination),
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "account_unavailable"
+    assert list(destination.iterdir()) == []
 
 
 def test_attachment_export_fails_closed_before_gmail_or_file_write(
@@ -998,7 +1082,11 @@ def test_attachment_export_fails_closed_before_gmail_or_file_write(
         request(
             config_path,
             "attachment.export",
-            {"message_id": "missing", "part_id": "", "destination_dir": str(destination)},
+            {
+                "message_id": "missing",
+                "part_id": "",
+                "destination_dir": str(destination),
+            },
         )
     )
     relative = engine_api._response(
@@ -1181,6 +1269,10 @@ class FakeGmail:
     def history_message_ids(self, cursor: str):
         return ["m1"], "200"
 
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        message_ids, newest = self.history_message_ids(cursor)
+        return MailboxChanges(tuple(message_ids), newest)
+
     def metadata(self, message_id: str) -> MessageMetadata:
         return MessageMetadata(
             message_id,
@@ -1194,6 +1286,12 @@ class FakeGmail:
 
     def full_payload(self, message_id: str):
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        body, attachment_names, attachments = extract_body(
+            self.full_payload(message_id), body_char_limit
+        )
+        return MessageContent(body, attachment_names, attachments)
 
 
 class FakeModel:
@@ -1362,7 +1460,11 @@ def test_unsupported_platform_is_reported_before_production_check(
     expected_lock_path = loaded.config.database_file.with_name(
         f"{loaded.config.database_file.name}.check.lock"
     )
-    assert checked_lock_paths == [expected_lock_path, expected_lock_path, expected_lock_path]
+    assert checked_lock_paths == [
+        expected_lock_path,
+        expected_lock_path,
+        expected_lock_path,
+    ]
     assert gmail_calls == 0
     assert loaded.store.state()[0] == "100"
 
@@ -1408,13 +1510,14 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
     pending = engine_api._response(request(config_path, "notifications.pending"))
-    checked = engine_api._response(
-        request(config_path, "watcher.check", {"dry_run": True})
-    )
+    checked = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
 
     assert pending["data"]["items"] == []
     assert checked["data"]["pending_notifications"] == 0
-    assert {row["status"] for row in runtime.store.recent(10)} == {"pending", "analyzed"}
+    assert {row["status"] for row in runtime.store.recent(10)} == {
+        "pending",
+        "analyzed",
+    }
 
 
 def test_check_reports_complete_notification_backlog(
@@ -1429,9 +1532,7 @@ def test_check_reports_complete_notification_backlog(
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
     monkeypatch.setattr(runtime.store, "notification_intent_count", lambda: 501)
 
-    checked = engine_api._response(
-        request(config_path, "watcher.check", {"dry_run": True})
-    )
+    checked = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
 
     assert checked["data"]["pending_notifications"] == 501
 

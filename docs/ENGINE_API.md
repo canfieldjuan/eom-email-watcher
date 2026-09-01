@@ -49,7 +49,7 @@ only to stderr.
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `gmail.authorize` | `{}` | Run the configured read-only Gmail OAuth flow and initialize a new mailbox baseline when required |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
-| `inbox.query` | optional bounded `limit`, opaque `cursor`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
+| `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
 | `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
@@ -146,7 +146,8 @@ credentials, token paths, Gmail settings, timezone, and EOM outbound configurati
 through this operation. When retention is included, the engine serializes the settings write with
 watcher checks and applies the resulting source-time cutoff to SQLite before returning.
 
-Each inbox item carries an `attachments` array. An attachment contains the Gmail MIME `part_id`,
+Each inbox item identifies its source mail `provider` and local `account_id` and carries an
+`attachments` array. An attachment contains the provider's opaque `part_id`,
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine
 persists this inventory before local-model analysis, so a temporary inference failure does not lose
 the user's attachment list. Attachment bytes remain in Gmail and are not fetched or stored by this
@@ -161,9 +162,10 @@ JavaScript.
 `received_at DESC, message_id DESC`; its opaque cursor preserves that ordering when timestamps are
 equal. Optional filters are combined with `AND`: sender matches literal case-insensitive text in
 the address or display name, keyword matches literal case-insensitive text in subject or summary,
-and priority, category, and status use fixed values. `untriaged` and `unclassified` select missing
-priority and category values. Filtering and pagination read only local SQLite state and never call
-Gmail, inference, or a Connect provider. Rows include their existing category plus ordered
+and priority, category, and status use fixed values. Mail provider and account filters select exact
+source attribution. `untriaged` and `unclassified` select missing priority and category values.
+Filtering and pagination read only local SQLite state and never call a mail provider, inference, or
+a Connect provider. Rows include their mail source, existing category, and ordered
 attachment and durable capability-result metadata. `inbox.recent` remains available for existing
 CLI and host compatibility.
 
@@ -176,7 +178,11 @@ suppression marker prevents a later history replay from restoring manually delet
 no sender, subject, body, attachment, provider result, or raw Gmail message ID and expires once the
 message is older than the maximum supported retention window.
 
-Schema v8 makes retention a source-time privacy boundary. Each non-dry watcher operation purges by
+Schema v9 keeps the v8 source-time privacy boundary and adds provider/account-scoped cursors,
+message source identities, and deletion-suppression identities. Existing Gmail rows, cursor state,
+attachments, and Connect results migrate locally to `gmail` / `gmail-default`; migration performs
+no network access and preserves the existing local `message_id` used by the UI and relationships.
+Each non-dry watcher operation purges by
 `received_at` before pending analysis or notification delivery, rejects malformed or already
 expired metadata before body fetch, clamps future-dated metadata to its observation time, bounds
 stale-cursor search to the same cutoff, and reuses one cutoff through the complete check. Existing

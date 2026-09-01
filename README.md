@@ -25,7 +25,8 @@ inference request.
   not transfer mailbox paths, sender, subject, message ID, email body, or Gmail credentials.
 - Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
   are never stored.
-- Deduplicates by Gmail message ID.
+- Deduplicates by mail provider, local account, and provider message ID. Existing single-account
+  Gmail history retains its original local identifiers during the offline schema migration.
 - Recovers an expired History cursor with an exact-sender search beginning five minutes before the
   last successful check, then saves a fresh cursor.
 - If LM Studio is unavailable or times out, sends one metadata-only fallback notification and
