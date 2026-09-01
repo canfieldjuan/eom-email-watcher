@@ -13,9 +13,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from .config import MAX_RETENTION_DAYS
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -24,6 +25,22 @@ MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 
 def _sqlite_casefold(value: object) -> str:
     return value.casefold() if isinstance(value, str) else ""
+
+
+def _message_suppression_key(message_id: str) -> str:
+    return hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+
+
+def _suppression_expiry(received_at: str, now: datetime) -> str:
+    try:
+        received = datetime.fromisoformat(received_at)
+        if received.tzinfo is None:
+            raise ValueError("received_at must include a timezone")
+        received = received.astimezone(UTC)
+    except ValueError:
+        received = now
+    # A future-dated source message must not create an effectively unbounded marker.
+    return (min(received, now) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
 
 
 _CONNECT_JOBS_TABLE_SQL = """
@@ -214,6 +231,7 @@ class AnalyzedMessage:
     sender: str
     sender_name: str | None
     subject: str
+    received_at: str
     attempts: int
     fallback_notified_at: str | None
     category: str
@@ -757,6 +775,12 @@ class Store:
                     ON messages(status, next_retry_at);
                 CREATE INDEX IF NOT EXISTS idx_messages_inbox_order
                     ON messages(received_at DESC, message_id DESC);
+                CREATE TABLE IF NOT EXISTS suppressed_messages (
+                    message_key TEXT PRIMARY KEY CHECK (length(message_key) = 64),
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_suppressed_messages_expiry
+                    ON suppressed_messages(expires_at);
                 CREATE TABLE IF NOT EXISTS message_attachments (
                     message_id TEXT NOT NULL,
                     part_id TEXT NOT NULL,
@@ -837,6 +861,20 @@ class Store:
                 is not None
             )
 
+    def has_seen_message(self, message_id: str) -> bool:
+        message_key = _message_suppression_key(message_id)
+        with self.connection() as db:
+            return (
+                db.execute(
+                    """SELECT 1 FROM messages WHERE message_id = ?
+                    UNION ALL
+                    SELECT 1 FROM suppressed_messages WHERE message_key = ?
+                    LIMIT 1""",
+                    (message_id, message_key),
+                ).fetchone()
+                is not None
+            )
+
     def add_message(
         self,
         *,
@@ -847,11 +885,15 @@ class Store:
         subject: str,
         received_at: str,
     ) -> bool:
+        message_key = _message_suppression_key(message_id)
         with self.connection() as db:
             cursor = db.execute(
                 """INSERT OR IGNORE INTO messages(
                     message_id, thread_id, sender, sender_name, subject, received_at, discovered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ) SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM suppressed_messages WHERE message_key = ?
+                )""",
                 (
                     message_id,
                     thread_id,
@@ -860,9 +902,49 @@ class Store:
                     subject,
                     received_at,
                     datetime.now(UTC).isoformat(),
+                    message_key,
                 ),
             )
         return cursor.rowcount == 1
+
+    def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT received_at FROM messages WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            db.execute(
+                """INSERT INTO suppressed_messages(message_key, expires_at) VALUES (?, ?)
+                ON CONFLICT(message_key) DO UPDATE SET expires_at = excluded.expires_at""",
+                (
+                    _message_suppression_key(message_id),
+                    _suppression_expiry(str(row["received_at"]), stamp),
+                ),
+            )
+            cursor = db.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
+        return cursor.rowcount == 1
+
+    def clear_messages(self, *, now: datetime | None = None) -> int:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT message_id, received_at FROM messages").fetchall()
+            db.executemany(
+                """INSERT INTO suppressed_messages(message_key, expires_at) VALUES (?, ?)
+                ON CONFLICT(message_key) DO UPDATE SET expires_at = excluded.expires_at""",
+                [
+                    (
+                        _message_suppression_key(str(row["message_id"])),
+                        _suppression_expiry(str(row["received_at"]), stamp),
+                    )
+                    for row in rows
+                ],
+            )
+            cursor = db.execute("DELETE FROM messages")
+        return cursor.rowcount
 
     def replace_attachments(
         self, message_id: str, attachments: Iterable[AttachmentDescriptor]
@@ -1433,7 +1515,7 @@ class Store:
         stamp = (now or datetime.now(UTC)).isoformat()
         with self.connection() as db:
             rows = db.execute(
-                """SELECT message_id, sender, sender_name, subject, attempts,
+                """SELECT message_id, sender, sender_name, subject, received_at, attempts,
                 fallback_notified_at, category, priority, summary, action_required,
                 suggested_action, deadline_text, deadline_iso, confidence FROM messages
                 WHERE status = 'analyzed' AND (next_retry_at IS NULL OR next_retry_at <= ?)
@@ -1828,30 +1910,23 @@ class Store:
             item["attachments"] = attachments_by_message[str(item["message_id"])]
         return items
 
-    def purge(
-        self, retention_days: int, *, preserve_notification_intents: bool = False
-    ) -> int:
-        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        cutoff = stamp - timedelta(days=retention_days)
         with self.connection() as db:
-            if preserve_notification_intents:
-                cursor = db.execute(
-                    """DELETE FROM messages WHERE discovered_at < ?
-                    AND (notified_at IS NULL OR notified_at < ?)
-                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)
-                    AND NOT (
-                        (status = 'analyzed' AND notified_at IS NULL)
-                        OR (status = 'pending' AND last_error IS NOT NULL
-                            AND fallback_notified_at IS NULL)
-                    )""",
-                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
-                )
-            else:
-                cursor = db.execute(
-                    """DELETE FROM messages WHERE discovered_at < ?
-                    AND (notified_at IS NULL OR notified_at < ?)
-                    AND (fallback_notified_at IS NULL OR fallback_notified_at < ?)""",
-                    (cutoff.isoformat(), cutoff.isoformat(), cutoff.isoformat()),
-                )
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """DELETE FROM messages
+                WHERE julianday(received_at) IS NULL
+                   OR julianday(received_at) < julianday(?)""",
+                (cutoff.isoformat(),),
+            )
+            db.execute(
+                """DELETE FROM suppressed_messages
+                WHERE julianday(expires_at) IS NULL
+                   OR julianday(expires_at) < julianday(?)""",
+                (stamp.isoformat(),),
+            )
         return cursor.rowcount
 
     def outbound_status(self, dedupe_key: str) -> str | None:

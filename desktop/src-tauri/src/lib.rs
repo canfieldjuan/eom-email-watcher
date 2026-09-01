@@ -284,6 +284,22 @@ async fn inbox_query(
 }
 
 #[tauri::command]
+async fn inbox_delete(engine: State<'_, Engine>, message_id: String) -> Result<(), EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.delete_inbox_item(message_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_clear(engine: State<'_, Engine>) -> Result<u64, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.clear_inbox())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn analysis_requeue(
     engine: State<'_, Engine>,
     message_id: String,
@@ -673,6 +689,8 @@ pub fn run() {
             config_status,
             gmail_authorize,
             health_get,
+            inbox_clear,
+            inbox_delete,
             inbox_query,
             settings_get,
             settings_update,

@@ -479,6 +479,17 @@ pub struct InboxPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxDeletion {
+    deleted: bool,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxClear {
+    deleted: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HealthStatus {
     pub database: DatabaseHealth,
@@ -716,6 +727,23 @@ impl Engine {
                 "keyword": query.keyword,
             }),
         )
+    }
+
+    pub fn delete_inbox_item(&self, message_id: String) -> Result<(), EngineError> {
+        let response = self
+            .request::<InboxDeletion>("inbox.delete", json!({"message_id": message_id.clone()}))?;
+        if response.deleted && response.message_id == message_id {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid inbox deletion result",
+        ))
+    }
+
+    pub fn clear_inbox(&self) -> Result<u64, EngineError> {
+        self.request::<InboxClear>("inbox.clear", json!({}))
+            .map(|response| response.deleted)
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -1254,6 +1282,18 @@ mod tests {
         .expect("deserialize inbox page");
         assert_eq!(page.items, vec![]);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+
+        let deletion: InboxDeletion = serde_json::from_value(json!({
+            "deleted": true,
+            "message_id": "message-1"
+        }))
+        .expect("deserialize inbox deletion");
+        assert!(deletion.deleted);
+        assert_eq!(deletion.message_id, "message-1");
+
+        let cleared: InboxClear =
+            serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
+        assert_eq!(cleared.deleted, 3);
     }
 
     #[test]
@@ -1823,6 +1863,14 @@ notifications_enabled = true
                 .expect("list empty inbox")
                 .items,
             vec![]
+        );
+        assert_eq!(engine.clear_inbox().expect("clear empty inbox"), 0);
+        assert_eq!(
+            engine
+                .delete_inbox_item("missing-message".into())
+                .expect_err("missing inbox item must not be deleted")
+                .code,
+            "not_found"
         );
         assert_eq!(
             engine

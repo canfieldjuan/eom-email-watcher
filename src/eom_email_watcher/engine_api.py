@@ -375,6 +375,46 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
     return {"items": rows, "next_cursor": _encode_inbox_cursor(next_cursor)}
 
 
+def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"message_id"})
+    message_id = payload.get("message_id")
+    if (
+        not isinstance(message_id, str)
+        or not message_id.strip()
+        or len(message_id) > 512
+    ):
+        raise ApiError(
+            "invalid_request",
+            "message_id must be a non-empty string of at most 512 characters",
+        )
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Local inbox changes require native operation locking",
+        )
+    with operation_lock(lock_path, "Another watcher operation is already running"):
+        deleted = runtime.store.delete_message(message_id)
+    if not deleted:
+        raise ApiError("not_found", "Message was not found")
+    return {"deleted": True, "message_id": message_id}
+
+
+def _inbox_clear(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Local inbox changes require native operation locking",
+        )
+    with operation_lock(lock_path, "Another watcher operation is already running"):
+        deleted = runtime.store.clear_messages()
+    return {"deleted": deleted}
+
+
 def _analysis_requeue(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id"})
     message_id = payload.get("message_id")
@@ -1453,7 +1493,19 @@ def _settings_update(request: dict[str, object]) -> dict[str, object]:
         set(MUTABLE_DESKTOP_SETTINGS),
     )
     try:
-        config = update_settings(_config_path(request), payload)
+        if "retention_days" not in payload:
+            config = update_settings(_config_path(request), payload)
+        else:
+            runtime = _runtime(request)
+            lock_path = _production_check_lock_path(runtime.config)
+            if not operation_lock_supported(lock_path):
+                raise ApiError(
+                    "unsupported_platform",
+                    "Retention changes require native operation locking",
+                )
+            with operation_lock(lock_path, "Another watcher operation is already running"):
+                config = update_settings(_config_path(request), payload)
+                runtime.store.purge(config.retention_days)
     except InvalidSettingsUpdateError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
     return _settings_data(config)
@@ -1540,6 +1592,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.output.present": _connect_output_present,
     "gmail.authorize": _gmail_authorize,
     "health.get": _health,
+    "inbox.clear": _inbox_clear,
+    "inbox.delete": _inbox_delete,
     "inbox.query": _query_inbox,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,

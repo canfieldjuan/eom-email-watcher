@@ -231,8 +231,17 @@ select:focus {
 
 .inbox-page-actions {
   display: flex;
+  align-items: center;
+  gap: 10px;
   justify-content: center;
   margin-top: 16px;
+}
+
+.inbox-page-actions .danger-action {
+  margin-left: auto;
+  border: 1px solid #d9aaa7;
+  color: #8f2f2b;
+  background: #fff8f7;
 }
 
 .sender-form button {
@@ -365,6 +374,12 @@ select:focus {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
+}
+
+.message-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
 }
 
 .category-badge {
@@ -754,6 +769,15 @@ select:focus {
 
   .health-grid {
     grid-template-columns: 1fr;
+  }
+
+  .message-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .message-footer-actions {
+    flex-wrap: wrap;
   }
 
   .health-details div {

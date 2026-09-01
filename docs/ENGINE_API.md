@@ -51,6 +51,8 @@ only to stderr.
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
+| `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
+| `inbox.clear` | `{}` | Delete all local inbox messages and message-owned state while preserving mailbox and outbound state |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
 | `connect.entitlement.status` | `{}` | Claim-free shared-license state and active boolean |
@@ -130,7 +132,8 @@ same-directory atomic replacement as watchlist updates and preserves all unrelat
 comments. Empty payloads, unknown fields, wrong types, unsafe values, and attempts to mutate
 gateway-managed model settings return `invalid_request` without changing the file. Backend choice,
 credentials, token paths, Gmail settings, timezone, and EOM outbound configuration are not mutable
-through this operation.
+through this operation. When retention is included, the engine serializes the settings write with
+watcher checks and applies the resulting source-time cutoff to SQLite before returning.
 
 Each inbox item carries an `attachments` array. An attachment contains the Gmail MIME `part_id`,
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine
@@ -152,6 +155,21 @@ priority and category values. Filtering and pagination read only local SQLite st
 Gmail, inference, or a Connect provider. Rows include their existing category plus ordered
 attachment and durable capability-result metadata. `inbox.recent` remains available for existing
 CLI and host compatibility.
+
+`inbox.delete` and `inbox.clear` are local-only privacy operations. They take the same production
+operation lock as watcher checks, delete message rows transactionally, and rely on the existing
+message-delete triggers to remove attachment inventory and Connect jobs/results. Notification
+state is stored on the deleted message row. Mailbox cursor state and the isolated EOM outbound-send
+ledger remain intact, and neither operation constructs a Gmail gateway. A bounded SHA-256
+suppression marker prevents a later history replay from restoring manually deleted rows; it stores
+no sender, subject, body, attachment, provider result, or raw Gmail message ID and expires once the
+message is older than the maximum supported retention window.
+
+Schema v8 makes retention a source-time privacy boundary. Each non-dry watcher operation purges by
+`received_at` before pending analysis or notification delivery, rejects malformed or already
+expired metadata before body fetch, bounds stale-cursor search to the same cutoff, and purges once
+more before returning. Expiry removes pending analysis and notification state as well as
+message-owned attachment and Connect state.
 
 Inbox rows also expose `analysis_retryable`, `analysis_error_code`, and
 `analysis_retry_after_seconds`. A retryable gateway failure remains scheduled in the durable
@@ -188,7 +206,8 @@ exact size, SHA-256, sanitized display name, source-app attribution, declared pa
 artifact bytes. It does not receive the Gmail message/attachment IDs, sender, subject, body, local
 path, OAuth data, or mailbox access.
 
-Schema v7 persists v2 request identity, provider/capability versions, input provenance, parameters,
+The Connect columns introduced through schema v7 persist v2 request identity,
+provider/capability versions, input provenance, parameters,
 state, outputs, errors, and timestamps. Repeated calls with the same active identity reconcile the
 same job. A lost submission acknowledgement remains nonterminal: the next call queries that
 identity, and only authenticated `JOB_NOT_FOUND` evidence permits resubmission with the same ID.
@@ -239,6 +258,8 @@ restart. An unacknowledged intent is never treated as delivered.
 
 When notifications are disabled, the host receives no pending analysis or fallback intents,
 including intents queued before the setting changed. New analysis is completed without creating a
-host-delivery intent. Retention never purges an unacknowledged host-delivery intent. Pending
-notification titles prefer the configured watchlist name over untrusted message-header display
-names. The existing `eom-mail-watch check` command retains its Linux notification behavior.
+host-delivery intent. Inside the configured retention window, an unacknowledged intent remains
+durable and retryable. Once its source message crosses the hard retention boundary, the intent and
+all other message-owned local state expire together. Pending notification titles prefer the
+configured watchlist name over untrusted message-header display names. The existing
+`eom-mail-watch check` command retains its Linux notification behavior.

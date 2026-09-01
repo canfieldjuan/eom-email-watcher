@@ -1,7 +1,7 @@
 import io
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -204,6 +204,57 @@ def test_inbox_query_rejects_invalid_bounds_and_cursors(
     response = engine_api._response(request(tmp_path / "unused.toml", "inbox.query", payload))
 
     assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_request"
+
+
+def test_inbox_delete_and_clear_are_local_only_and_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("100", datetime.now(UTC))
+    for message_id in ("message-1", "message-2"):
+        runtime.store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="billing@example.com",
+            sender_name="Billing",
+            subject="Invoice status",
+            received_at=datetime.now(UTC).isoformat(),
+        )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_external_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Local inbox mutation attempted external provider access")
+
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", reject_external_access)
+    monkeypatch.setattr(runtime.model, "analyze", reject_external_access)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_external_access)
+
+    deleted = engine_api._response(
+        request(config_path, "inbox.delete", {"message_id": "message-1"})
+    )
+    missing = engine_api._response(
+        request(config_path, "inbox.delete", {"message_id": "missing"})
+    )
+    cleared = engine_api._response(request(config_path, "inbox.clear"))
+
+    assert deleted["data"] == {"deleted": True, "message_id": "message-1"}
+    assert missing["error"]["code"] == "not_found"
+    assert cleared["data"] == {"deleted": 1}
+    assert runtime.store.recent(10) == []
+    assert runtime.store.state()[0] == "100"
+
+
+@pytest.mark.parametrize("message_id", [None, "", "x" * 513])
+def test_inbox_delete_rejects_invalid_message_identity(
+    tmp_path: Path, message_id: object
+) -> None:
+    response = engine_api._response(
+        request(tmp_path / "unused.toml", "inbox.delete", {"message_id": message_id})
+    )
+
     assert response["error"]["code"] == "invalid_request"
 
 
@@ -519,6 +570,32 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
     encoded = json.dumps(response)
     assert "token.json" not in encoded
     assert "send-token.json" not in encoded
+
+
+def test_settings_update_applies_shortened_retention_immediately(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 180")
+    runtime = load_runtime(config_path)
+    for message_id, received_at in (
+        ("expired", datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)),
+        ("current", datetime.now(UTC).replace(microsecond=0)),
+    ):
+        runtime.store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="billing@example.com",
+            sender_name="Billing",
+            subject=message_id,
+            received_at=received_at.isoformat(),
+        )
+
+    response = engine_api._response(
+        request(config_path, "settings.update", {"retention_days": 1})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["retention_days"] == 1
+    assert [row["message_id"] for row in runtime.store.recent(10)] == ["current"]
 
 
 def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(

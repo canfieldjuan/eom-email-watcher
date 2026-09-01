@@ -114,9 +114,8 @@ def test_zero_sender_check_stops_before_lock_and_gmail(
     )
 
     class FakeStore:
-        def purge(self, retention_days: int, *, preserve_notification_intents: bool) -> int:
+        def purge(self, retention_days: int) -> int:
             assert retention_days == 180
-            assert preserve_notification_intents is True
             return 2
 
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, FakeStore(), object()))
