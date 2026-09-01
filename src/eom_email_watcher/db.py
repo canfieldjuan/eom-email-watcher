@@ -1945,6 +1945,7 @@ class Store:
                        AND (
                            aware_iso_epoch(discovered_at) IS NULL
                            OR aware_iso_epoch(discovered_at) < ?
+                           OR aware_iso_epoch(discovered_at) > ?
                        )
                    )
                    OR (
@@ -1954,6 +1955,7 @@ class Store:
                 (
                     stamp_epoch,
                     cutoff_epoch,
+                    stamp_epoch,
                     stamp_epoch,
                     cutoff_epoch,
                 ),

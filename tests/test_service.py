@@ -59,6 +59,11 @@ class FutureDatedGmail(FakeGmail):
         return replace(super().metadata(message_id), received_at=future.isoformat())
 
 
+class InvalidDatedGmail(FakeGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return replace(super().metadata(message_id), received_at="")
+
+
 class FakeModel:
     def __init__(self):
         self.calls = 0
@@ -254,6 +259,22 @@ def test_future_received_time_is_clamped_before_persistence(tmp_path: Path) -> N
     assert before <= stored <= after
 
 
+def test_invalid_source_time_is_rejected_before_content_fetch(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = InvalidDatedGmail()
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check()
+
+    assert result["discovered"] == 0
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert store.recent(10) == []
+
+
 def test_check_reuses_one_retention_snapshot_for_both_purges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -304,6 +325,35 @@ def test_expired_pending_message_is_excluded_before_content_fetch(
     assert gmail.full_payload_calls == 0
     assert model.calls == 0
     assert (store.recent(10) == []) is (not dry_run)
+
+
+def test_dry_run_ignores_pending_source_time_that_overflows_utc(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.add_message(
+        message_id="overflowing-source-time",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Malformed",
+        received_at="0001-01-01T00:00:00+23:59",
+    )
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check(dry_run=True)
+
+    assert result["purged"] == 0
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert [item["message_id"] for item in store.recent(10)] == [
+        "overflowing-source-time"
+    ]
 
 
 def test_dry_run_does_not_advance_cursor_or_store_messages(tmp_path: Path) -> None:

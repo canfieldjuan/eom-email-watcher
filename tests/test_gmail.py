@@ -36,6 +36,24 @@ def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
     assert parsed.labels == frozenset({"INBOX", "UNREAD"})
 
 
+def test_parse_metadata_keeps_missing_source_time_invalid() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m1",
+            "internalDate": "not-a-timestamp",
+            "labelIds": ["INBOX"],
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "trusted@example.com"},
+                    {"name": "Date", "value": "not-a-date"},
+                ]
+            },
+        }
+    )
+
+    assert parsed.received_at == ""
+
+
 class FakeRequest:
     def __init__(self, response: dict[str, object]):
         self.response = response

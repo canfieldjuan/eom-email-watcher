@@ -673,6 +673,33 @@ function capabilityOutputKey(
   return JSON.stringify([messageId, partId, jobId, artifactId]);
 }
 
+function clearMessageOwnedUiState(messageId?: string): void {
+  const collections = [
+    attachmentCapabilities,
+    attachmentInvocationsInFlight,
+    attachmentRequestIds,
+    capabilityOutputPresentations,
+    capabilityOutputPresentationsInFlight,
+    capabilityOutputPreviews,
+    capabilityOutputViewButtons,
+  ];
+  for (const collection of collections) {
+    if (messageId === undefined) {
+      collection.clear();
+      continue;
+    }
+    for (const key of collection.keys()) {
+      try {
+        const parts: unknown = JSON.parse(key);
+        if (Array.isArray(parts) && parts[0] === messageId) collection.delete(key);
+      } catch {
+        // Keys are constructed locally; an unrecognized key cannot be assigned
+        // to a message safely, so leave it for a full-history clear.
+      }
+    }
+  }
+}
+
 function capabilityGroups(
   messageId: string,
   attachment: InboxAttachment,
@@ -1360,6 +1387,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
   renderInbox(inboxItems);
   try {
     await invoke<void>("inbox_delete", { messageId: item.message_id });
+    clearMessageOwnedUiState(item.message_id);
     inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
     renderInbox(inboxItems);
     inboxStatus.textContent = `Deleted "${item.subject}" from local history. The source email was not changed.`;
@@ -1390,10 +1418,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxItems = [];
     inboxNextCursor = null;
     inboxCapabilityUnavailableCount = 0;
-    attachmentCapabilities.clear();
-    capabilityOutputPresentations.clear();
-    capabilityOutputPreviews.clear();
-    capabilityOutputViewButtons.clear();
+    clearMessageOwnedUiState();
     inboxLoadMore.hidden = true;
     renderInbox(inboxItems);
     inboxStatus.textContent = `Cleared ${deleted} local message${deleted === 1 ? "" : "s"}. Source email was not changed.`;

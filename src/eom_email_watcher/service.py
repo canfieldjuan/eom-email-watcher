@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
     try:
         received = datetime.fromisoformat(value)
-    except ValueError:
+        if received.tzinfo is None:
+            return None
+        return min(received.astimezone(UTC), observed_at)
+    except (OverflowError, ValueError):
         return None
-    if received.tzinfo is None:
-        return None
-    return min(received.astimezone(UTC), observed_at)
 
 
 class Watcher:

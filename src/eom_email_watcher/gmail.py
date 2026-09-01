@@ -92,8 +92,9 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC).isoformat()
-    except (TypeError, ValueError):
-        return datetime.now(UTC).isoformat()
+    except (OverflowError, TypeError, ValueError):
+        # Keep malformed source time invalid so retention admission rejects it.
+        return ""
 
 
 def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
