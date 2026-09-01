@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -13,7 +13,15 @@ use tauri_plugin_shell::ShellExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
 
 const PROTOCOL_VERSION: u8 = 1;
 #[cfg(windows)]
@@ -23,19 +31,109 @@ fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
 }
 
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    if let Ok(group_id) = i32::try_from(child.id()) {
-        // The child starts a dedicated process group, so this also terminates
-        // uv-launched Python descendants that would otherwise retain locks.
-        // SAFETY: the negative id targets only the process group created for
-        // this child; it is not derived from frontend or engine input.
-        unsafe {
-            libc::kill(-group_id, libc::SIGKILL);
+#[cfg(windows)]
+struct WindowsJob {
+    handle: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn new() -> io::Result<Self> {
+        // SAFETY: null security attributes and name request a private job with
+        // default security. The returned owned handle is closed on every path.
+        let raw_handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_handle.is_null() {
+            return Err(io::Error::last_os_error());
         }
+
+        // SAFETY: CreateJobObjectW returned a non-null, newly owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits_size = u32::try_from(std::mem::size_of_val(&limits))
+            .expect("Windows job limit structure size fits in u32");
+        // SAFETY: the handle is a live job object and `limits` remains valid for
+        // the duration of this synchronous call.
+        if unsafe {
+            SetInformationJobObject(
+                handle.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                limits_size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle })
     }
-    let _ = child.kill();
-    let _ = child.wait();
+
+    fn assign(&self, child: &Child) -> io::Result<()> {
+        // SAFETY: both handles remain live for the duration of this call. A
+        // successful assignment causes future descendants to inherit the job.
+        if unsafe { AssignProcessToJobObject(self.handle.as_raw_handle(), child.as_raw_handle()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        // SAFETY: the owned handle remains live. Closing it later is a second
+        // fail-safe because the job was configured with KILL_ON_JOB_CLOSE.
+        let _ = unsafe { TerminateJobObject(self.handle.as_raw_handle(), 1) };
+    }
+}
+
+struct EngineChild {
+    process: Child,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl EngineChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        #[cfg(windows)]
+        let job = WindowsJob::new()?;
+        let process = command.spawn()?;
+        #[cfg(windows)]
+        let process = match job.assign(&process) {
+            Ok(()) => process,
+            Err(error) => {
+                let mut process = process;
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            process,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Ok(group_id) = i32::try_from(self.process.id()) {
+            // The child starts a dedicated process group, so this also terminates
+            // uv-launched Python descendants that would otherwise retain locks.
+            // SAFETY: the negative id targets only the process group created for
+            // this child; it is not derived from frontend or engine input.
+            unsafe {
+                libc::kill(-group_id, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        self.job.terminate();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+
+    fn wait_with_output(self) -> io::Result<Output> {
+        self.process.wait_with_output()
+    }
 }
 
 #[derive(Clone)]
@@ -789,7 +887,7 @@ impl Engine {
         // The engine's JSON protocol needs its standard streams, so keep the
         // console-subsystem sidecar but prevent Windows from creating a window.
         command.creation_flags(CREATE_NO_WINDOW);
-        let mut child = command.spawn().map_err(|_| {
+        let mut child = EngineChild::spawn(&mut command).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
                 "Watcher engine is unavailable; reinstall it or inspect desktop logs",
@@ -797,6 +895,7 @@ impl Engine {
         })?;
 
         let write_result = child
+            .process
             .stdin
             .take()
             .ok_or_else(|| EngineError::host("host_error", "Engine stdin was unavailable"))
@@ -809,27 +908,27 @@ impl Engine {
                 })
             });
         if let Err(error) = write_result {
-            terminate_child(&mut child);
+            child.terminate();
             return Err(error);
         }
 
         if let Some(timeout) = timeout {
             let started = Instant::now();
             loop {
-                match child.try_wait() {
+                match child.process.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if started.elapsed() < timeout => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Ok(None) => {
-                        terminate_child(&mut child);
+                        child.terminate();
                         return Err(EngineError::host(
                             "engine_timeout",
                             "Watcher engine did not respond before its timeout",
                         ));
                     }
                     Err(_) => {
-                        terminate_child(&mut child);
+                        child.terminate();
                         return Err(EngineError::host(
                             "engine_unavailable",
                             "Watcher engine status could not be inspected",
@@ -895,6 +994,13 @@ impl Engine {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    #[cfg(windows)]
+    use windows_sys::Win32::{
+        Foundation::WAIT_TIMEOUT,
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
 
     #[test]
     fn default_config_matches_python_watcher_location() {
@@ -1159,6 +1265,72 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("timed-out engine descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(windows)]
+    fn windows_process_is_running(process_id: u32) -> bool {
+        // SAFETY: OpenProcess receives a PID produced by the test child, and
+        // the returned owned handle is closed before this helper returns.
+        let raw_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+        if raw_handle.is_null() {
+            return false;
+        }
+        // SAFETY: OpenProcess returned a non-null, newly owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        // SAFETY: the process handle remains live for this nonblocking wait.
+        unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_engine_terminates_a_stalled_windows_process_tree() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let script_path = directory.path().join("process-tree-probe.ps1");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        fs::write(
+            &script_path,
+            r#"
+Start-Sleep -Milliseconds 100
+$descendant = Start-Process -PassThru -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30")
+Set-Content -LiteralPath $args[0] -Value $descendant.Id
+Wait-Process -Id $descendant.Id
+"#,
+        )
+        .expect("write process-tree probe");
+        let engine = Engine::with_command(
+            "powershell.exe",
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script_path.as_os_str().to_owned(),
+                descendant_pid_file.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_secs(2));
+
+        assert_eq!(
+            engine
+                .check()
+                .expect_err("stalled check must time out")
+                .code,
+            "engine_timeout"
+        );
+        let descendant_pid: u32 = fs::read_to_string(descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        for _ in 0..100 {
+            if !windows_process_is_running(descendant_pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out Windows engine descendant {descendant_pid} is still running");
     }
 
     #[cfg(unix)]

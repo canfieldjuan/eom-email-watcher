@@ -164,6 +164,34 @@ def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
     build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
+@pytest.mark.parametrize(
+    "target_triple",
+    ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
+)
+def test_entitlement_keyring_target_accepts_supported_platforms(target_triple: str) -> None:
+    build_desktop_sidecar.validate_entitlement_keyring_target(target_triple)
+
+
+def test_windows_build_rejects_connect_keyring_before_packaging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", tmp_path / "build")
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", tmp_path / "output")
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "determine_target_triple",
+        lambda: "x86_64-pc-windows-msvc",
+    )
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(tmp_path / "keyring.json"))
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="activation storage is not supported on Windows",
+    ):
+        build_desktop_sidecar.build_sidecar()
+
+
 @pytest.mark.parametrize("document", [{"keys": []}, {"keys": "not-a-list"}, {}])
 def test_entitlement_build_input_rejects_invalid_keyring(
     tmp_path: Path, document: object

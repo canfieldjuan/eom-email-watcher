@@ -115,6 +115,14 @@ def validate_entitlement_keyring(path: Path) -> None:
         )
 
 
+def validate_entitlement_keyring_target(target_triple: str) -> None:
+    if _target_family(target_triple) == "windows":
+        raise SidecarBuildError(
+            "Connect entitlement activation storage is not supported on Windows; "
+            "unset LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE to build the public package"
+        )
+
+
 @contextmanager
 def _staged_build_input(source: Path, filename: str, prefix: str) -> Iterator[Path]:
     directory = Path(tempfile.mkdtemp(prefix=prefix, dir=BUILD_DIRECTORY))
@@ -194,6 +202,7 @@ def build_sidecar() -> Path:
 
         keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
         if keyring_source_value:
+            validate_entitlement_keyring_target(target_triple)
             keyring_source = Path(keyring_source_value)
             validate_entitlement_keyring(keyring_source)
             staged_keyring = stack.enter_context(
