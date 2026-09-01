@@ -135,6 +135,8 @@ def test_unsupported_payment_card_semantics_are_rejected(
         "Credit card details can not be used; provide the access badge numbers.",
         "Credit card details cannot be used; provide the access badge numbers.",
         "Credit card details couldn't be used; provide the access badge numbers.",
+        "You shouldn't provide credit card details; send the access badge numbers.",
+        "You cannot use credit cards here; send the access badge numbers.",
     ],
 )
 def test_negated_payment_card_semantics_do_not_authorize_positive_output(
@@ -202,6 +204,10 @@ def test_payment_card_semantics_in_deadline_are_rejected() -> None:
         (
             "Please provide the bank card details.",
             "Provide the requested bank card details.",
+        ),
+        (
+            "I'm not sure which credit card I should use; please advise.",
+            "Reply with guidance about which credit card to use.",
         ),
     ],
 )

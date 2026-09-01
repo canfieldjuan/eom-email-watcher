@@ -56,9 +56,17 @@ PAYMENT_CARD_SEMANTICS_RE = re.compile(
     re.IGNORECASE,
 )
 PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
-    r"(?:\b(?:no|never|without)\b|\bnot\b(?!\s+only\b)"
-    r"|\b(?:isn|aren|wasn|weren|don|doesn|didn)['’]t\b)"
-    r"(?:\W+\w+){0,4}\W*$",
+    r"(?:"
+    r"\b(?:no|without)\b"
+    r"|\bnot\b(?!\W+only\b)"
+    r"(?:\W+(?:a|an|any|the|this|that|these|those|my|your|his|her|our|their))?"
+    r"|\b(?:do|does|did|should|must|can|could|will|would|need)\W+(?:not|never)\W+\w+"
+    r"|\b(?:don|doesn|didn|shouldn|mustn|can|couldn|won|wouldn|needn)['’]t\W+\w+"
+    r"|\bcannot\W+\w+"
+    r"|\bnever\W+\w+"
+    r"|\b(?:isn|aren|wasn|weren)['’]t"
+    r"(?:\W+(?:a|an|any|the|this|that|these|those|my|your|his|her|our|their))?"
+    r")\W*$",
     re.IGNORECASE,
 )
 PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
