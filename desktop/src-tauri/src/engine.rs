@@ -12,8 +12,12 @@ use tauri_plugin_shell::ShellExt;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 const PROTOCOL_VERSION: u8 = 1;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -781,6 +785,10 @@ impl Engine {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(windows)]
+        // The engine's JSON protocol needs its standard streams, so keep the
+        // console-subsystem sidecar but prevent Windows from creating a window.
+        command.creation_flags(CREATE_NO_WINDOW);
         let mut child = command.spawn().map_err(|_| {
             EngineError::host(
                 "engine_unavailable",

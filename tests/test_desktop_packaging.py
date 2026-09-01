@@ -187,3 +187,22 @@ def test_tauri_uses_cross_platform_hook_and_platform_bundle_targets() -> None:
     assert base_config["build"]["beforeBuildCommand"] == "pnpm build && pnpm build:sidecar"
     assert base_config["bundle"]["targets"] == ["deb"]
     assert windows_config["bundle"]["targets"] == ["nsis"]
+
+
+def test_windows_package_has_required_icon_and_hidden_console_contract() -> None:
+    repository = Path(__file__).parents[1]
+    windows_config = json.loads(
+        (repository / "desktop/src-tauri/tauri.windows.conf.json").read_text(encoding="utf-8")
+    )
+    icon = repository / "desktop/src-tauri" / windows_config["bundle"]["icon"][0]
+
+    icon_header = icon.read_bytes()[:6]
+    assert icon_header[:4] == b"\x00\x00\x01\x00"
+    assert int.from_bytes(icon_header[4:], byteorder="little") > 0
+
+    main_source = (repository / "desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
+    engine_source = (repository / "desktop/src-tauri/src/engine.rs").read_text(
+        encoding="utf-8"
+    )
+    assert 'windows_subsystem = "windows"' in main_source
+    assert "command.creation_flags(CREATE_NO_WINDOW);" in engine_source
