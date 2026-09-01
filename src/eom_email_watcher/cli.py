@@ -156,7 +156,7 @@ def _check(config_path: Path, dry_run: bool) -> int:
             dry_run=dry_run
         )
 
-    if dry_run or not config.senders:
+    if dry_run:
         result = run(config, store, model)
     else:
         with _production_check_lock(config.database_file):

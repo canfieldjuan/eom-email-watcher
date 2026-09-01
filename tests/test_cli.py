@@ -154,10 +154,10 @@ def test_dry_run_does_not_take_production_lock(
         assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
 
 
-def test_zero_sender_check_stops_before_lock_and_gmail(
+def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    config = SimpleNamespace(
+    stale_config = SimpleNamespace(
         **{
             **vars(_check_config(tmp_path)),
             "senders": (),
@@ -165,18 +165,32 @@ def test_zero_sender_check_stops_before_lock_and_gmail(
             "notifications_enabled": True,
         }
     )
+    fresh_config = SimpleNamespace(
+        **{
+            **vars(stale_config),
+            "retention_days": 1,
+        }
+    )
 
     class FakeStore:
         def purge(self, retention_days: int) -> int:
-            assert retention_days == 180
+            assert retention_days == 1
             return 2
 
-    monkeypatch.setattr(cli, "_runtime", lambda path: (config, FakeStore(), object()))
-    monkeypatch.setattr(
-        cli,
-        "_production_check_lock",
-        lambda path: pytest.fail("inactive check must not take the production lock"),
+    runtimes = iter(
+        (
+            (stale_config, object(), object()),
+            (fresh_config, FakeStore(), object()),
+        )
     )
+    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+
+    @contextmanager
+    def acquired_lock(database_file: Path):
+        assert database_file == stale_config.database_file
+        yield
+
+    monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
     monkeypatch.setattr(
         cli.GmailGateway,
         "from_token",
