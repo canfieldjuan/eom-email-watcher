@@ -62,9 +62,11 @@ per-desktop loopback proxy unless real client-platform evidence later proves one
   pass its task-specific deterministic metrics and validation plus blinded human review for
   semantic outputs; structural validity alone is not evidence of useful model behavior.
 - Ollama is the planned fallback worker. Before it is eligible for a task, it must pass the same
-  task-specific acceptance independently, use an already-local approved model, and run with cloud
-  access disabled (`OLLAMA_NO_CLOUD=1`). Protocol similarity alone is not evidence of semantic or
-  privacy compatibility.
+  task-specific acceptance independently. Qualification pins the exact Ollama package or container,
+  dependency set, model artifact content digest rather than a mutable tag, and complete serving
+  configuration. It uses an already-local approved model and runs with cloud access disabled
+  (`OLLAMA_NO_CLOUD=1`). Protocol similarity alone is not evidence of semantic or privacy
+  compatibility.
 - LM Studio and llama.cpp are no longer supported production-worker targets. Existing deployment
   files and compatibility evidence remain until an accepted cutover removes their operational use,
   but no new application client should bind to either runtime.
@@ -73,6 +75,9 @@ per-desktop loopback proxy unless real client-platform evidence later proves one
   a fallback order.
 - There is no cloud fallback. If neither approved local worker can serve a task, the gateway returns
   the existing bounded availability error and the application preserves its standalone behavior.
+- Worker listeners are gateway-private: bind them to gateway-host loopback or a local socket, or
+  enforce equivalent host/network isolation. Client computers must reach only the gateway and must
+  not be able to connect directly to either worker endpoint.
 
 Fallback is fail-closed and identity-preserving:
 
@@ -86,10 +91,13 @@ Fallback is fail-closed and identity-preserving:
    failures do not trigger fallback.
 4. Client health reports task availability or degradation, never the chosen worker name.
 
-Before worker dispatch, the gateway durably reserves the authenticated request ID, canonical
-request digest, and selected worker attempt. Exact repeats join active work or return the retained
-terminal result; a reused ID with different content is rejected. The reservation and result survive
-gateway restarts for a bounded, documented retention period.
+Before worker dispatch, the gateway durably reserves the authenticated request ID, immutable
+request expiry, canonical request digest, and selected worker attempt. Exact repeats join active
+work or return the protected result until the application acknowledges durable receipt. A reused ID
+with different content is rejected. After acknowledgement or expiry, the gateway deletes the
+content-bearing result but retains a metadata-only terminal tombstone for a bounded replay-protection
+period beyond the request expiry. The client must never reuse an expired request ID, and the gateway
+rejects any request whose immutable expiry has passed rather than dispatching it again.
 
 Warm versus cold standby is deliberately not fixed here. The primary and fallback may require
 different model artifacts, and keeping both resident may exceed the appliance's usable VRAM. The
@@ -190,6 +198,7 @@ Illustrative request:
 {
   "protocol_version": 1,
   "request_id": "018f...uuid",
+  "request_expires_at": "2026-09-08T18:00:00Z",
   "task": {
     "id": "email.analyze",
     "version": 1
@@ -213,17 +222,25 @@ Illustrative request:
 
 Required rules:
 
-- `protocol_version`, `request_id`, task ID/version, requirements, and generation payload are
-  mandatory and bounded.
+- `protocol_version`, `request_id`, `request_expires_at`, task ID/version, requirements, and
+  generation payload are mandatory and bounded. The client chooses and durably records the immutable
+  expiry before first submission; gateway task policy rejects expiries outside its allowed window.
 - The request contains no `model`, worker URL, runtime command, lane name, user role, or routing
   override.
 - The gateway authorizes the task before queueing and rejects requirements unsupported by its
   current policy.
 - The gateway treats prompts and content as opaque untrusted data. Task IDs control policy; prompt
   text cannot select workers or elevate limits.
-- Before dispatch, the gateway durably reserves `request_id`, credential identity, a canonical
-  request digest, and worker-attempt identity. An exact repeat joins active work or returns the
-  retained terminal result across gateway restarts. Reuse with different content is rejected.
+- Before dispatch, the gateway durably reserves `request_id`, `request_expires_at`, credential
+  identity, a canonical request digest, and worker-attempt identity. An exact repeat joins active
+  work or returns the protected unacknowledged result across gateway restarts. Reuse with different
+  content is rejected.
+- The application acknowledges a result only after it has durably persisted either the validated
+  domain result or a terminal application-validation rejection. Acknowledgement authorizes deletion
+  of the gateway's content-bearing result, not deletion of its metadata tombstone.
+- An expired request is never dispatched. The gateway returns permanent `request_expired`; the
+  client stops automatic retries for that identity and exposes an explicit requeue that creates a
+  new request ID and expiry.
 
 Illustrative success:
 
@@ -266,10 +283,11 @@ The gateway returns a stable bounded error envelope with `code`, `retryable`, an
 
 The client rejects malformed envelopes, mismatched request IDs, non-boolean `retryable` values,
 retry delays outside 1 through 86400 seconds, and retry delays on permanent failures. For Email
-Watcher, one analysis attempt keeps the same request ID, context timestamp, and body-size limit
-across process restarts. The request is reconstructed from Gmail's immutable message payload rather
-than persisting the raw body. An explicit requeue after configuration or contract repair creates a
-new request identity.
+Watcher, one analysis attempt keeps the same request ID, expiry, context timestamp, and body-size
+limit across process restarts. The request is reconstructed from Gmail's immutable message payload
+rather than persisting the raw body. Automatic retries stop at the immutable expiry. An explicit
+requeue after expiry, configuration repair, contract repair, or terminal application-output
+rejection creates a new request identity and expiry.
 
 Minimum classes:
 
@@ -283,6 +301,14 @@ Minimum classes:
 | worker_unavailable | Approved worker is unhealthy | Preserve local work and retry later |
 | inference_timeout | Admitted inference exceeded its deadline | Preserve local work and retry per app policy |
 | invalid_worker_output | Worker response violated the gateway envelope | Do not treat as domain-valid output |
+| request_expired | The immutable request lifetime ended | Stop automatic retries; offer explicit new-identity requeue |
+
+Application validation happens after the gateway returns a valid envelope. If the application
+rejects that output, it durably marks the original request terminally rejected and acknowledges
+receipt so the gateway can delete the buffered result. It must not automatically resubmit that
+identity and receive the same retained output forever. Email Watcher's current generic `ModelError`
+path retries such failures, so gateway cutover is blocked until the client maps this case to the
+terminal rejection plus explicit requeue behavior.
 
 v0 scheduling is a bounded fair queue across client credentials, with per-credential in-flight and
 queued limits. It must prevent one document workload from starving small email tasks. Exact queue
@@ -312,9 +338,16 @@ Default logs and metrics may contain:
 - opaque deployment/policy versions.
 
 They must not contain prompts, email/document content, generated output, bearer credentials,
-filenames, sender/subject, attachment bytes, or application database identifiers. Temporary worker
-payloads are memory-only unless an administrator explicitly enables a separately designed and
-audited diagnostic mode.
+filenames, sender/subject, attachment bytes, or application database identifiers. Prompts and
+worker input payloads are memory-only unless an administrator explicitly enables a separately
+designed and audited diagnostic mode.
+
+Generated output awaiting application acknowledgement is a narrow exception: it is encrypted at
+rest in a gateway-owned, credential-scoped result buffer, accessible only to the same authenticated
+credential and canonical request. It is excluded from logs, metrics, diagnostics, and backups and
+is deleted on durable application acknowledgement or immutable request expiry. For a bounded
+replay-protection period beyond expiry, a metadata-only tombstone retains request ID, credential
+hash, canonical digest, terminal status, timestamps, and expiry, but no prompt or generated content.
 
 ## Availability and standalone behavior
 
@@ -400,22 +433,33 @@ synthetic content only:
 2. neither request contains a model ID;
 3. the exact vLLM package or container, model artifact, runtime dependencies, and serving
    configuration are pinned and reproducible;
-4. task policy selects vLLM without exposing that choice to either application;
-5. both tasks pass their deterministic acceptance metrics and validators plus blinded human review
+4. the exact Ollama package or container, dependency set, model artifact content digest, cloud-off
+   environment, and serving configuration are pinned and reproducible;
+5. both worker endpoints are unreachable from a client-network machine while the authenticated
+   gateway remains reachable;
+6. task policy selects vLLM without exposing that choice to either application;
+7. both tasks pass their deterministic acceptance metrics and validators plus blinded human review
    of semantic output before promotion;
-6. concurrent mixed requests complete without starvation at the admitted limit;
-7. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
-8. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses an already-local approved model, and passes independent
+8. concurrent mixed requests complete without starvation at the admitted limit;
+9. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
+10. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses the pinned already-local model, and passes independent
    task acceptance before becoming eligible;
-9. making vLLM unavailable before admission moves an Ollama-qualified task to
+11. making vLLM unavailable before admission moves an Ollama-qualified task to
    degraded-but-available service, while an unqualified fallback task remains unavailable;
-10. an in-flight or ambiguous primary failure remains unresolved until the primary result is
+12. an in-flight or ambiguous primary failure remains unresolved until the primary result is
     recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
     request proceed without duplicate worker execution;
-11. authentication, authorization, request-contract, and output-validation failures do not trigger
+13. a lost response returns the protected result to the same credential/request after gateway
+    restart, and application acknowledgement deletes that result content while retaining its
+    metadata tombstone;
+14. an expired request never dispatches again, returns permanent `request_expired`, and permits only
+    an explicit new-identity requeue;
+15. an application-validation rejection becomes terminal for its original identity, is
+    acknowledged to release the protected result, and permits only explicit new-identity requeue;
+16. authentication, authorization, request-contract, and output-validation failures do not trigger
     fallback;
-12. stopping the gateway degrades only model-dependent actions in both applications;
-13. Connect discovery and each application's private persistence remain unchanged.
+17. stopping the gateway degrades only model-dependent actions in both applications;
+18. Connect discovery and each application's private persistence remain unchanged.
 
 Do not implement administrator UI, auto-discovery, additional runtime families, vision, or
 production cutover in that proof.
