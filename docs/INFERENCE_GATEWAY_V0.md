@@ -266,6 +266,44 @@ Illustrative success:
 The gateway may return opaque deployment provenance for audit and comparison. Applications do not
 branch business behavior on a worker or model name.
 
+### Result acknowledgement operation
+
+After durable application handling, the client calls
+`POST /v1/inference/{request_id}/ack` with the same application credential that owns the reserved
+request:
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "018f...uuid",
+  "disposition": "persisted"
+}
+```
+
+`disposition` is either `persisted` or `application_rejected`. The acknowledgement contains no
+generated output, prompt, validation detail, or other customer content. The path and body request
+IDs must match.
+
+A successful first or exact-repeat acknowledgement returns HTTP 200:
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "018f...uuid",
+  "status": "acknowledged",
+  "disposition": "persisted"
+}
+```
+
+The gateway accepts acknowledgement only from the credential identity that owns the reservation
+and only after that request reaches a terminal result. The first valid acknowledgement atomically
+records its disposition in the metadata tombstone and deletes the content-bearing result. Repeating
+the same acknowledgement is idempotent and returns the same HTTP 200 response while the tombstone
+exists; a conflicting disposition fails permanently with `acknowledgement_conflict` and does not
+change the first outcome. Acknowledging nonterminal work fails with `result_not_terminal`. An
+expired request whose tombstone remains returns `request_expired`; after bounded tombstone cleanup,
+an unknown ID returns `unknown_request`. Neither response can revive work or retain late output.
+
 ## Failure and scheduling contract
 
 The gateway returns a stable bounded error envelope with `code`, `retryable`, and optional
@@ -305,6 +343,9 @@ Minimum classes:
 | inference_timeout | Admitted inference exceeded its deadline | Preserve local work and retry per app policy |
 | invalid_worker_output | Worker response violated the gateway envelope | Do not treat as domain-valid output |
 | request_expired | The immutable request lifetime ended | Stop automatic retries; offer explicit new-identity requeue |
+| unknown_request | No live reservation or retained tombstone identifies the request | Stop acknowledgement/retry for that identity |
+| result_not_terminal | Acknowledgement arrived before a terminal result | Do not delete content; reconcile the request first |
+| acknowledgement_conflict | A different acknowledgement disposition already won | Preserve the first terminal disposition |
 
 Application validation happens after the gateway returns a valid envelope. If the application
 rejects that output, it durably marks the original request terminally rejected and acknowledges
@@ -454,8 +495,9 @@ synthetic content only:
     recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
     request proceed without duplicate worker execution;
 13. a lost response returns the protected result to the same credential/request after gateway
-    restart, and application acknowledgement deletes that result content while retaining its
-    metadata tombstone;
+    restart, and the authenticated acknowledgement operation atomically deletes that result content
+    while retaining its metadata tombstone; exact repeats are idempotent and conflicting
+    dispositions fail closed;
 14. an expired request terminalizes any in-flight attempt, never dispatches again, discards late
     output without recreating retained content, returns permanent `request_expired`, and permits
     only an explicit new-identity requeue;
