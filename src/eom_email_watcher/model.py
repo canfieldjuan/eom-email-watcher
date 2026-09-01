@@ -46,9 +46,12 @@ GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 PAYMENT_CARD_SEMANTICS_RE = re.compile(
     r"\b(?:"
-    r"(?P<typed_card>(?P<card_type>credit|debit|payment|bank|charge|prepaid)"
+    r"(?P<pay_action>pay(?:ment)?\s+(?:by|with|using|via)\s+"
+    r"(?:(?:a|the|your)\s+)?"
+    r"(?:(?P<pay_card_type>credit|debit|payment|bank|charge|prepaid)[\s-]+)?cards?)"
+    r"|(?P<typed_card>(?P<card_type>credit|debit|payment|bank|charge|prepaid)"
     r"[\s-]+cards?)(?P<card_data>[\s-]+(?:numbers?|details|data|information))?"
-    r"|(?P<card_payment>pay(?:ment)?\s+by\s+card|card[\s-]+payments?)"
+    r"|(?P<card_payment>card[\s-]+payments?)"
     r"|(?P<cardholder_data>cardholder[\s-]+(?:data|information))"
     r"|(?P<security_code>cvv|cvc)"
     r")\b",
@@ -68,6 +71,15 @@ PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
     r"|\bnever\W+\w+"
     r"|\b(?:isn|aren|wasn|weren)['’]t"
     r"(?:\W+(?:a|an|any|the|this|that|these|those|my|your|his|her|our|their))?"
+    r")\W*$",
+    re.IGNORECASE,
+)
+PAYMENT_CARD_ACTION_NEGATION_PREFIX_RE = re.compile(
+    r"(?:"
+    r"\b(?:do|does|did|should|must|can|could|will|would|need)\W+(?:not|never)"
+    r"|\bcannot"
+    r"|\b(?:don|doesn|didn|shouldn|mustn|can|couldn|won|wouldn|needn)['’]t"
+    r"|\bnever"
     r")\W*$",
     re.IGNORECASE,
 )
@@ -167,6 +179,10 @@ def _payment_card_semantic(match: re.Match[str]) -> tuple[str, str]:
         return ("security_code", "data")
     if match.group("cardholder_data"):
         return ("cardholder_data", "data")
+    if match.group("pay_action"):
+        card_type = match.group("pay_card_type")
+        semantic_type = f"{card_type.lower()}_card" if card_type else "payment_card"
+        return (semantic_type, "payment")
     if match.group("card_payment"):
         return ("payment_card", "payment")
     card_type = match.group("card_type")
@@ -183,6 +199,11 @@ def _payment_card_semantics(text: str, *, affirmed_only: bool) -> set[tuple[str,
             prefix = re.split(r"[.!?;:,\n]", text[: match.start()])[-1]
             suffix = re.split(r"[.!?;:,\n]", text[match.end() :], maxsplit=1)[0]
             if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
+                continue
+            if (
+                _payment_card_semantic(match)[1] == "payment"
+                and PAYMENT_CARD_ACTION_NEGATION_PREFIX_RE.search(prefix)
+            ):
                 continue
             if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
                 continue

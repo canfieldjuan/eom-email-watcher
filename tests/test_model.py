@@ -186,6 +186,55 @@ def test_payment_card_semantics_in_deadline_are_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize("unsupported_action", ["Pay with a card.", "Pay using a card."])
+def test_unsupported_card_payment_paraphrases_are_rejected(
+    unsupported_action: str,
+) -> None:
+    raw = valid_result()
+    raw["summary"] = "The sender requests building-access card numbers."
+    raw["suggested_action"] = unsupported_action
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Please send the building-access card numbers.",
+        )
+
+
+def test_negated_card_payment_does_not_authorize_positive_payment_output() -> None:
+    raw = valid_result()
+    raw["summary"] = "The sender requests payment by card."
+    raw["suggested_action"] = "Pay by card."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
+        validate_analysis(
+            raw,
+            "2026-07-18T12:00:00+00:00",
+            source_text="Don't pay by card; use cash.",
+        )
+
+
+def test_typed_card_payment_supports_generic_payment_output() -> None:
+    raw = valid_result()
+    raw["summary"] = "A card payment is requested."
+    raw["suggested_action"] = "Make a card payment."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    result = validate_analysis(
+        raw,
+        "2026-07-18T12:00:00+00:00",
+        source_text="Please pay with a credit card.",
+    )
+
+    assert result.suggested_action == "Make a card payment."
+
+
 @pytest.mark.parametrize(
     ("source_text", "suggested_action"),
     [

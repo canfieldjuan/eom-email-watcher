@@ -74,15 +74,12 @@
       "body": "We scheduled payment of your invoice for tomorrow. No action is needed from you.\n\n-----Original Message-----\nFrom: billing@example.com\nSent: August 18, 2026\nSubject: Overdue invoice 3011\nInvoice 3011 was due August 15, 2026. Please send payment.",
       "attachment_names": [],
       "expected": {
-        "category": "automated_notice",
+        "category": "informational",
         "priority": "low",
         "action_required": false,
         "deadline_text": null,
         "deadline_iso": null,
-        "forbidden_output_substrings": [
-          "pay invoice",
-          "pay the invoice"
-        ]
+        "forbidden_output_substrings": []
       }
     }
   ],

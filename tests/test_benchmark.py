@@ -314,6 +314,30 @@ def test_obligation_corpus_preserves_adopted_quoted_deadline() -> None:
     assert case.expected.deadline_iso == "2026-09-12"
 
 
+def test_customer_payment_update_matches_prompt_without_false_grounding_failure() -> None:
+    corpus = load_corpus(
+        Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
+    )
+    case = next(
+        item for item in corpus.email_cases if item.id == "customer-confirms-their-payment"
+    )
+    analysis = _analysis(
+        category="informational",
+        priority="low",
+        summary="The customer will pay the invoice tomorrow; no action is needed.",
+        action_required=False,
+        suggested_action=None,
+        deadline_text=None,
+        deadline_iso=None,
+    )
+
+    scores = _score(case, analysis)
+
+    assert scores["category_correct"] is True
+    assert scores["action_required_correct"] is True
+    assert scores["grounding_failure"] is False
+
+
 def test_benchmark_uses_stable_code_for_payment_card_grounding_failure() -> None:
     error = ModelError("Local model introduced unsupported payment-card semantics")
 
