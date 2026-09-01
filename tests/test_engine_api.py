@@ -1,7 +1,8 @@
 import io
 import json
 import logging
-from datetime import UTC, datetime
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -204,6 +205,57 @@ def test_inbox_query_rejects_invalid_bounds_and_cursors(
     response = engine_api._response(request(tmp_path / "unused.toml", "inbox.query", payload))
 
     assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_request"
+
+
+def test_inbox_delete_and_clear_are_local_only_and_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("100", datetime.now(UTC))
+    for message_id in ("message-1", "message-2"):
+        runtime.store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="billing@example.com",
+            sender_name="Billing",
+            subject="Invoice status",
+            received_at=datetime.now(UTC).isoformat(),
+        )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_external_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Local inbox mutation attempted external provider access")
+
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", reject_external_access)
+    monkeypatch.setattr(runtime.model, "analyze", reject_external_access)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_external_access)
+
+    deleted = engine_api._response(
+        request(config_path, "inbox.delete", {"message_id": "message-1"})
+    )
+    missing = engine_api._response(
+        request(config_path, "inbox.delete", {"message_id": "missing"})
+    )
+    cleared = engine_api._response(request(config_path, "inbox.clear"))
+
+    assert deleted["data"] == {"deleted": True, "message_id": "message-1"}
+    assert missing["error"]["code"] == "not_found"
+    assert cleared["data"] == {"deleted": 1}
+    assert runtime.store.recent(10) == []
+    assert runtime.store.state()[0] == "100"
+
+
+@pytest.mark.parametrize("message_id", [None, "", "x" * 513])
+def test_inbox_delete_rejects_invalid_message_identity(
+    tmp_path: Path, message_id: object
+) -> None:
+    response = engine_api._response(
+        request(tmp_path / "unused.toml", "inbox.delete", {"message_id": message_id})
+    )
+
     assert response["error"]["code"] == "invalid_request"
 
 
@@ -519,6 +571,153 @@ def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -
     encoded = json.dumps(response)
     assert "token.json" not in encoded
     assert "send-token.json" not in encoded
+
+
+def test_settings_update_applies_shortened_retention_immediately(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 180")
+    runtime = load_runtime(config_path)
+    for message_id, received_at in (
+        ("expired", datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)),
+        ("current", datetime.now(UTC).replace(microsecond=0)),
+    ):
+        runtime.store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="billing@example.com",
+            sender_name="Billing",
+            subject=message_id,
+            received_at=received_at.isoformat(),
+        )
+
+    response = engine_api._response(
+        request(config_path, "settings.update", {"retention_days": 1})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["retention_days"] == 1
+    assert [row["message_id"] for row in runtime.store.recent(10)] == ["current"]
+
+
+def test_production_check_reloads_retention_after_acquiring_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 180")
+    stale_runtime = load_runtime(config_path)
+    stale_runtime.store.set_state("100", datetime.now(UTC))
+    expired_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+
+    class ExpiredGmail:
+        def history_message_ids(self, cursor: str):
+            return ["expired"], "200"
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            return MessageMetadata(
+                message_id,
+                None,
+                "a@example.com",
+                "Trusted A",
+                "Expired message",
+                expired_at,
+                frozenset({"INBOX"}),
+            )
+
+        def full_payload(self, message_id: str):
+            raise AssertionError("expired message must not reach full-body retrieval")
+
+    real_load_runtime = engine_api.load_runtime
+    load_count = 0
+
+    def load_runtime_with_stale_first(path: Path) -> Runtime:
+        nonlocal load_count
+        load_count += 1
+        if load_count == 1:
+            return stale_runtime
+        return real_load_runtime(path)
+
+    @contextmanager
+    def shorten_retention_before_lock_entry(lock_path: Path, busy_message: str):
+        engine_api.update_settings(config_path, {"retention_days": 1})
+        stale_runtime.store.purge(1)
+        yield
+
+    monkeypatch.setattr(engine_api, "load_runtime", load_runtime_with_stale_first)
+    monkeypatch.setattr(engine_api, "operation_lock", shorten_retention_before_lock_entry)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiredGmail())
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["ok"] is True
+    assert response["data"]["discovered"] == 0
+    assert load_count == 2
+    assert load_config(config_path).retention_days == 1
+    assert stale_runtime.store.recent(10) == []
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["notifications.pending", "notifications.pending_under_host_lock"],
+)
+def test_notifications_pending_purges_expired_intents_before_host_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, extra_settings="retention_days = 1")
+    runtime = load_runtime(config_path)
+    runtime.store.add_message(
+        message_id="expired",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name="Trusted A",
+        subject="Expired message",
+        received_at=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+    )
+    runtime.store.mark_analyzed(
+        "expired",
+        {
+            "category": "customer_request",
+            "priority": "high",
+            "summary": "Please respond.",
+            "action_required": True,
+            "suggested_action": "Reply.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    count_response = None
+    if operation == "notifications.pending_under_host_lock":
+        lock_path = engine_api._production_check_lock_path(runtime.config)
+        with engine_api.operation_lock(lock_path, "test operation busy"):
+            response = engine_api._response(request(config_path, operation))
+            count_response = engine_api._response(
+                request(config_path, "notifications.count_under_host_lock")
+            )
+    else:
+        response = engine_api._response(request(config_path, operation))
+
+    assert response["ok"] is True
+    assert response["data"]["items"] == []
+    assert runtime.store.notification_intents() == []
+    assert runtime.store.recent(10) == []
+    if count_response is not None:
+        assert count_response["data"] == {"count": 0}
+
+
+def test_host_operation_lock_returns_configured_database_lock_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    config = load_config(config_path)
+
+    response = engine_api._response(request(config_path, "host.operation_lock"))
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "path": str(config.database_file.with_name(f"{config.database_file.name}.check.lock"))
+    }
 
 
 def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(
@@ -910,7 +1109,7 @@ def test_watchlist_mutation_preserves_existing_configuration_errors(
     assert removed["error"]["code"] == "configuration_error"
 
 
-def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
+def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -931,11 +1130,15 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
         "from_token",
         lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
     )
-    monkeypatch.setattr(
-        engine_api,
-        "operation_lock_supported",
-        lambda: (_ for _ in ()).throw(AssertionError("No lock is needed while inactive")),
-    )
+    lock_paths: list[Path] = []
+
+    @contextmanager
+    def acquired_lock(lock_path: Path, _busy_message: str):
+        lock_paths.append(lock_path)
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", acquired_lock)
 
     response = engine_api._response(request(config_path, "watcher.check"))
 
@@ -948,6 +1151,7 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
         "stale_cursor_recovered": False,
         "summarized": 0,
     }
+    assert lock_paths == [engine_api._production_check_lock_path(runtime.config)]
 
 
 def test_zero_sender_check_still_rejects_incompatible_host_delivery(

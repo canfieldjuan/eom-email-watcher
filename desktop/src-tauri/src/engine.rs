@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -38,6 +39,49 @@ const PROTOCOL_VERSION: u8 = 1;
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
+}
+
+#[derive(Debug)]
+struct HostOperationLock {
+    file: File,
+}
+
+impl HostOperationLock {
+    fn acquire(path: &Path) -> Result<Self, EngineError> {
+        let mut options = File::options();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        #[cfg(windows)]
+        // Match Python filelock's read/write sharing while denying deletion so
+        // every contender continues to coordinate through the same pathname.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0x0000_0003);
+        let file = options.open(path).map_err(|_| {
+            EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(EngineError::host(
+                "operation_busy",
+                "Another watcher operation is already running",
+            )),
+            Err(TryLockError::Error(_)) => Err(EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )),
+        }
+    }
+}
+
+impl Drop for HostOperationLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            eprintln!("desktop operation lock could not be released: {error}");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -479,6 +523,17 @@ pub struct InboxPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxDeletion {
+    deleted: bool,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxClear {
+    deleted: u64,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HealthStatus {
     pub database: DatabaseHealth,
@@ -609,8 +664,18 @@ struct NotificationItems {
 }
 
 #[derive(Deserialize)]
+struct NotificationCount {
+    count: u64,
+}
+
+#[derive(Deserialize)]
 struct NotificationAcknowledgement {
     status: String,
+}
+
+#[derive(Deserialize)]
+struct OperationLockLocation {
+    path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -716,6 +781,23 @@ impl Engine {
                 "keyword": query.keyword,
             }),
         )
+    }
+
+    pub fn delete_inbox_item(&self, message_id: String) -> Result<(), EngineError> {
+        let response = self
+            .request::<InboxDeletion>("inbox.delete", json!({"message_id": message_id.clone()}))?;
+        if response.deleted && response.message_id == message_id {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid inbox deletion result",
+        ))
+    }
+
+    pub fn clear_inbox(&self) -> Result<u64, EngineError> {
+        self.request::<InboxClear>("inbox.clear", json!({}))
+            .map(|response| response.deleted)
     }
 
     pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
@@ -919,12 +1001,38 @@ impl Engine {
         self.request("watcher.check", json!({"dry_run": false}))
     }
 
+    pub(crate) fn run_with_operation_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        let _lock = HostOperationLock::acquire(&location.path)?;
+        operation()
+    }
+
+    #[cfg(test)]
     pub fn pending_notifications(
         &self,
         limit: u16,
     ) -> Result<Vec<NotificationIntent>, EngineError> {
         self.request::<NotificationItems>("notifications.pending", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notifications_under_host_lock(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<NotificationIntent>, EngineError> {
+        self.request::<NotificationItems>(
+            "notifications.pending_under_host_lock",
+            json!({"limit": limit}),
+        )
+        .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notification_count_under_host_lock(&self) -> Result<u64, EngineError> {
+        self.request::<NotificationCount>("notifications.count_under_host_lock", json!({}))
+            .map(|data| data.count)
     }
 
     pub fn acknowledge_notification(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -1121,6 +1229,11 @@ mod tests {
     };
 
     #[cfg(windows)]
+    // This bounds a hung probe, not product latency. Hosted Windows runners
+    // can spend more than ten seconds starting the nested PowerShell process.
+    const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[cfg(windows)]
     struct WindowsTestProcess(u32);
 
     #[cfg(windows)]
@@ -1148,6 +1261,19 @@ mod tests {
             default_config_path(Path::new("/home/watcher")),
             PathBuf::from("/home/watcher/.config/eom-email-watcher/config.toml")
         );
+    }
+
+    #[test]
+    fn host_operation_lock_is_exclusive_and_reusable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("watcher.check.lock");
+        let active = HostOperationLock::acquire(&path).expect("first lock acquisition");
+
+        let blocked = HostOperationLock::acquire(&path).expect_err("second lock must contend");
+        assert_eq!(blocked.code, "operation_busy");
+
+        drop(active);
+        HostOperationLock::acquire(&path).expect("released lock is reusable");
     }
 
     #[test]
@@ -1254,6 +1380,18 @@ mod tests {
         .expect("deserialize inbox page");
         assert_eq!(page.items, vec![]);
         assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+
+        let deletion: InboxDeletion = serde_json::from_value(json!({
+            "deleted": true,
+            "message_id": "message-1"
+        }))
+        .expect("deserialize inbox deletion");
+        assert!(deletion.deleted);
+        assert_eq!(deletion.message_id, "message-1");
+
+        let cleared: InboxClear =
+            serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
+        assert_eq!(cleared.deleted, 3);
     }
 
     #[test]
@@ -1483,7 +1621,7 @@ Wait-Process -Id $descendant.Id
             ],
             PathBuf::from("unused.toml"),
         )
-        .with_request_timeout(Duration::from_secs(10));
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
 
         assert_eq!(
             engine
@@ -1535,7 +1673,7 @@ Set-Content -LiteralPath $args[0] -Value $descendant.Id
             ],
             PathBuf::from("unused.toml"),
         )
-        .with_request_timeout(Duration::from_secs(5));
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
 
         let result = engine.check().expect("probe request must succeed");
         assert!(!result.active);
@@ -1738,6 +1876,30 @@ notifications_enabled = true
         assert_eq!(health.watchlist_count, 0);
         assert_eq!(
             engine
+                .run_with_operation_lock(|| {
+                    Ok((
+                        engine.pending_notifications_under_host_lock(25)?,
+                        engine.pending_notification_count_under_host_lock()?,
+                    ))
+                })
+                .expect("host lock must permit lock-aware notification reads"),
+            (vec![], 0)
+        );
+        assert_eq!(
+            engine
+                .run_with_operation_lock(|| engine.clear_inbox())
+                .expect_err("Python mutation must contend with the Rust host lock")
+                .code,
+            "runtime_error"
+        );
+        assert_eq!(
+            engine
+                .clear_inbox()
+                .expect("released host lock is reusable"),
+            0
+        );
+        assert_eq!(
+            engine
                 .settings_with_timeout(Duration::from_secs(5))
                 .expect("read engine settings"),
             EngineSettings {
@@ -1823,6 +1985,14 @@ notifications_enabled = true
                 .expect("list empty inbox")
                 .items,
             vec![]
+        );
+        assert_eq!(engine.clear_inbox().expect("clear empty inbox"), 0);
+        assert_eq!(
+            engine
+                .delete_inbox_item("missing-message".into())
+                .expect_err("missing inbox item must not be deleted")
+                .code,
+            "not_found"
         );
         assert_eq!(
             engine

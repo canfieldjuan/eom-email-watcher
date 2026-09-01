@@ -21,6 +21,9 @@ from tomlkit.items import AoT, Array
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 DEFAULT_POLL_INTERVAL_MINUTES = 120
+DEFAULT_RETENTION_DAYS = 180
+MIN_RETENTION_DAYS = 1
+MAX_RETENTION_DAYS = 3650
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
@@ -273,15 +276,17 @@ def load_config(path: Path | None = None) -> Config:
         senders.append(sender)
 
     body_limit = _integer_setting(data, "body_char_limit", 20_000)
-    retention = _integer_setting(data, "retention_days", 180)
+    retention = _integer_setting(data, "retention_days", DEFAULT_RETENTION_DAYS)
     poll_interval = _integer_setting(
         data, "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES
     )
     timeout = _float_setting(data, "model_timeout_seconds", 60)
     if not 1_000 <= body_limit <= 100_000:
         raise ConfigError("body_char_limit must be between 1000 and 100000")
-    if not 1 <= retention <= 3650:
-        raise ConfigError("retention_days must be between 1 and 3650")
+    if not MIN_RETENTION_DAYS <= retention <= MAX_RETENTION_DAYS:
+        raise ConfigError(
+            f"retention_days must be between {MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS}"
+        )
     if not 1 <= poll_interval <= 1440:
         raise ConfigError("poll_interval_minutes must be between 1 and 1440")
     if not 1 <= timeout <= 300:
@@ -444,7 +449,7 @@ def initialize_config(
     initial = document()
     initial["timezone"] = normalized_timezone
     initial["poll_interval_minutes"] = DEFAULT_POLL_INTERVAL_MINUTES
-    initial["retention_days"] = 180
+    initial["retention_days"] = DEFAULT_RETENTION_DAYS
     initial["model_backend"] = "loopback"
     initial["model_base_url"] = normalized_base_url
     initial["model_name"] = normalized_model_name
@@ -529,8 +534,11 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
     if "retention_days" in updates:
         if type(retention) is not int:
             raise InvalidSettingsUpdateError("retention_days must be an integer")
-        if not 1 <= retention <= 3650:
-            raise InvalidSettingsUpdateError("retention_days must be between 1 and 3650")
+        if not MIN_RETENTION_DAYS <= retention <= MAX_RETENTION_DAYS:
+            raise InvalidSettingsUpdateError(
+                f"retention_days must be between {MIN_RETENTION_DAYS} "
+                f"and {MAX_RETENTION_DAYS}"
+            )
 
     notifications = updates.get("notifications_enabled")
     if "notifications_enabled" in updates and type(notifications) is not bool:

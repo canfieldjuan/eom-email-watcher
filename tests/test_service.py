@@ -2,6 +2,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
@@ -15,6 +17,7 @@ class FakeGmail:
     def __init__(self, stale: bool = False):
         self.stale = stale
         self.full_payload_calls = 0
+        self.search_since_value: datetime | None = None
 
     def profile_history_id(self) -> str:
         return "200"
@@ -25,6 +28,7 @@ class FakeGmail:
         return ["allowed", "blocked"], "200"
 
     def search_since(self, addresses, since):
+        self.search_since_value = since
         return ["allowed"]
 
     def metadata(self, message_id: str) -> MessageMetadata:
@@ -42,6 +46,22 @@ class FakeGmail:
     def full_payload(self, message_id: str):
         self.full_payload_calls += 1
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
+
+
+class FreshGmail(FakeGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return replace(super().metadata(message_id), received_at=datetime.now(UTC).isoformat())
+
+
+class FutureDatedGmail(FakeGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        future = datetime.now(UTC) + service_module.timedelta(days=3650)
+        return replace(super().metadata(message_id), received_at=future.isoformat())
+
+
+class InvalidDatedGmail(FakeGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return replace(super().metadata(message_id), received_at="")
 
 
 class FakeModel:
@@ -183,11 +203,12 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(tmp_path: Path
         "active": False,
         "discovered": 0,
         "fallback_notified": 0,
-        "purged": 1,
+        "purged": 2,
         "stale_cursor_recovered": False,
         "summarized": 0,
     }
-    assert [row["message_id"] for row in store.recent(10)] == ["queued"]
+    assert store.recent(10) == []
+    assert store.notification_intents() == []
 
 
 def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
@@ -198,6 +219,141 @@ def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
     result = Watcher(cfg, store, FakeGmail(stale=True), FakeModel()).check()
     assert result["stale_cursor_recovered"] is True
     assert store.state()[0] == "200"
+
+
+def test_stale_cursor_recovery_is_bounded_by_retention_before_content_fetch(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("old", datetime.now(UTC) - service_module.timedelta(days=30))
+    gmail = FakeGmail(stale=True)
+    model = FakeModel()
+    before_cutoff = datetime.now(UTC) - service_module.timedelta(days=1, seconds=1)
+
+    result = Watcher(cfg, store, gmail, model).check()
+
+    after_cutoff = datetime.now(UTC) - service_module.timedelta(days=1)
+    assert result["stale_cursor_recovered"] is True
+    assert result["discovered"] == 0
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert gmail.search_since_value is not None
+    assert before_cutoff <= gmail.search_since_value <= after_cutoff
+
+
+def test_future_received_time_is_clamped_before_persistence(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = FutureDatedGmail()
+    before = datetime.now(UTC)
+
+    result = Watcher(cfg, store, gmail, FakeModel()).check()
+
+    after = datetime.now(UTC)
+    stored = datetime.fromisoformat(store.recent(1)[0]["received_at"])
+    assert result["discovered"] == 1
+    assert before <= stored <= after
+
+
+def test_invalid_source_time_is_rejected_before_content_fetch(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = InvalidDatedGmail()
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check()
+
+    assert result["discovered"] == 0
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert store.recent(10) == []
+
+
+def test_check_reuses_one_retention_snapshot_for_both_purges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    gmail = FreshGmail()
+    purge_times: list[datetime | None] = []
+    real_purge = store.purge
+
+    def record_purge(retention_days: int, *, now: datetime | None = None) -> int:
+        purge_times.append(now)
+        return real_purge(retention_days, now=now)
+
+    monkeypatch.setattr(store, "purge", record_purge)
+
+    Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=False)
+
+    assert len(purge_times) == 2
+    assert purge_times[0] is not None
+    assert purge_times[0] == purge_times[1]
+
+
+@pytest.mark.parametrize(("dry_run", "expected_purged"), [(False, 1), (True, 0)])
+def test_expired_pending_message_is_excluded_before_content_fetch(
+    tmp_path: Path, dry_run: bool, expected_purged: int
+) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.add_message(
+        message_id="expired-pending",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Expired",
+        received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
+    )
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check(dry_run=dry_run)
+
+    assert result["purged"] == expected_purged
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert (store.recent(10) == []) is (not dry_run)
+
+
+def test_dry_run_ignores_pending_source_time_that_overflows_utc(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime.now(UTC))
+    store.add_message(
+        message_id="overflowing-source-time",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Malformed",
+        received_at="0001-01-01T00:00:00+23:59",
+    )
+    gmail = FakeGmail()
+    gmail.history_message_ids = lambda cursor: ([], "200")
+    model = FakeModel()
+
+    result = Watcher(cfg, store, gmail, model).check(dry_run=True)
+
+    assert result["purged"] == 0
+    assert gmail.full_payload_calls == 0
+    assert model.calls == 0
+    assert [item["message_id"] for item in store.recent(10)] == [
+        "overflowing-source-time"
+    ]
 
 
 def test_dry_run_does_not_advance_cursor_or_store_messages(tmp_path: Path) -> None:
@@ -423,13 +579,13 @@ def test_fallback_does_not_suppress_recovered_analysis(
     assert model.calls == 2
 
 
-def test_deferred_delivery_persists_analysis_without_linux_notification(
+def test_deferred_delivery_retention_expires_queued_analysis(
     tmp_path: Path, monkeypatch
 ) -> None:
     cfg = replace(config(tmp_path), notifications_enabled=True, retention_days=1)
     store = Store(cfg.database_file)
     store.initialize()
-    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.set_state("100", datetime.now(UTC))
     monkeypatch.setattr(
         service_module,
         "send_analysis",
@@ -438,7 +594,8 @@ def test_deferred_delivery_persists_analysis_without_linux_notification(
         ),
     )
 
-    result = Watcher(cfg, store, FakeGmail(), FakeModel()).check(
+    gmail = FreshGmail()
+    result = Watcher(cfg, store, gmail, FakeModel()).check(
         deliver_notifications=False
     )
 
@@ -448,15 +605,17 @@ def test_deferred_delivery_persists_analysis_without_linux_notification(
 
     old = (datetime.now(UTC) - service_module.timedelta(days=2)).isoformat()
     with store.connection() as db:
-        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+        db.execute("UPDATE messages SET received_at = ?", (old,))
+    gmail.history_message_ids = lambda cursor: ([], "200")
 
-    watcher = Watcher(cfg, store, FakeGmail(), FakeModel())
+    watcher = Watcher(cfg, store, gmail, FakeModel())
     watcher.check(deliver_notifications=False)
 
-    assert store.notification_intents()[0].kind == "analysis"
+    assert store.notification_intents() == []
+    assert store.recent(1) == []
 
 
-def test_cli_delivery_failure_preserves_expired_notification_intent(
+def test_expired_notification_intent_is_removed_before_cli_delivery(
     tmp_path: Path, monkeypatch
 ) -> None:
     cfg = replace(config(tmp_path), notifications_enabled=True, retention_days=1)
@@ -469,7 +628,7 @@ def test_cli_delivery_failure_preserves_expired_notification_intent(
         sender="trusted@example.com",
         sender_name="Trusted",
         subject="Action needed",
-        received_at="2026-07-18T14:00:00+00:00",
+        received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
     )
     store.mark_analyzed(
         "old-analysis",
@@ -484,10 +643,6 @@ def test_cli_delivery_failure_preserves_expired_notification_intent(
             "confidence": 0.9,
         },
     )
-    old = (datetime.now(UTC) - service_module.timedelta(days=2)).isoformat()
-    with store.connection() as db:
-        db.execute("UPDATE messages SET discovered_at = ?", (old,))
-
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
     monkeypatch.setattr(
@@ -507,7 +662,8 @@ def test_cli_delivery_failure_preserves_expired_notification_intent(
 
     Watcher(cfg, store, gmail, FakeModel()).check(deliver_notifications=True)
 
-    assert store.notification_intents()[0].message_id == "old-analysis"
+    assert store.notification_intents() == []
+    assert store.recent(1) == []
 
 
 def test_deferred_fallback_ack_preserves_eventual_analysis_intent(

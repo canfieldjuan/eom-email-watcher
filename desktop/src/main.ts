@@ -335,6 +335,7 @@ app.innerHTML = `
       <ul id="inbox-list" class="inbox-list" aria-label="Recent watched messages"></ul>
       <div class="inbox-page-actions">
         <button id="inbox-load-more" type="button" hidden>Load more</button>
+        <button id="inbox-clear" class="danger-action" type="button">Clear local history</button>
       </div>
     </section>
 
@@ -455,7 +456,7 @@ app.innerHTML = `
           <span>Start Email Watcher when I sign in</span>
         </label>
         <p id="autostart-settings-note" class="settings-note">Checking start-on-login status…</p>
-        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention and notification changes apply on later watcher operations.</p>
+        <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired local history immediately. Source email is never deleted.</p>
         <button type="submit">Save settings</button>
       </form>
       <p id="settings-status" class="status" role="status" aria-live="polite">Loading settings…</p>
@@ -482,6 +483,7 @@ const inboxStateSelect = requiredElement<HTMLSelectElement>("#inbox-state");
 const inboxPageSizeSelect = requiredElement<HTMLSelectElement>("#inbox-page-size");
 const inboxReset = requiredElement<HTMLButtonElement>("#inbox-reset");
 const inboxLoadMore = requiredElement<HTMLButtonElement>("#inbox-load-more");
+const inboxClear = requiredElement<HTMLButtonElement>("#inbox-clear");
 const form = requiredElement<HTMLFormElement>("#sender-form");
 const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
@@ -547,6 +549,8 @@ let inboxRequestGeneration = 0;
 let inboxItems: InboxItem[] = [];
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
+const inboxDeletionsInFlight = new Set<string>();
+let inboxClearInFlight = false;
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
   sender_query: null,
@@ -667,6 +671,33 @@ function capabilityOutputKey(
   artifactId: string,
 ): string {
   return JSON.stringify([messageId, partId, jobId, artifactId]);
+}
+
+function clearMessageOwnedUiState(messageId?: string): void {
+  const collections = [
+    attachmentCapabilities,
+    attachmentInvocationsInFlight,
+    attachmentRequestIds,
+    capabilityOutputPresentations,
+    capabilityOutputPresentationsInFlight,
+    capabilityOutputPreviews,
+    capabilityOutputViewButtons,
+  ];
+  for (const collection of collections) {
+    if (messageId === undefined) {
+      collection.clear();
+      continue;
+    }
+    for (const key of collection.keys()) {
+      try {
+        const parts: unknown = JSON.parse(key);
+        if (Array.isArray(parts) && parts[0] === messageId) collection.delete(key);
+      } catch {
+        // Keys are constructed locally; an unrecognized key cannot be assigned
+        // to a message safely, so leave it for a full-history clear.
+      }
+    }
+  }
 }
 
 function capabilityGroups(
@@ -955,6 +986,8 @@ function renderInbox(items: InboxItem[]): void {
   for (const item of items) {
     const card = document.createElement("li");
     card.className = "inbox-card";
+    card.inert = inboxMutationInFlight();
+    if (card.inert) card.setAttribute("aria-busy", "true");
     const priority = item.priority?.toLowerCase() ?? "untriaged";
     card.dataset.priority = ["urgent", "high", "normal", "low"].includes(priority)
       ? priority
@@ -1218,7 +1251,10 @@ function renderInbox(items: InboxItem[]): void {
     badges.append(badge, category);
     const state = document.createElement("span");
     state.textContent = stateLabel(item);
-    footer.append(badges, state);
+    const footerActions = document.createElement("div");
+    footerActions.className = "message-footer-actions";
+    footerActions.append(state);
+    footer.append(badges, footerActions);
     if (item.status === "pending" && item.analysis_retryable === false) {
       const retryButton = document.createElement("button");
       retryButton.type = "button";
@@ -1240,8 +1276,17 @@ function renderInbox(items: InboxItem[]): void {
           inboxStatus.dataset.kind = "error";
         }
       });
-      footer.append(retryButton);
+      footerActions.append(retryButton);
     }
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "remove-button";
+    deleteButton.textContent = inboxDeletionsInFlight.has(item.message_id)
+      ? "Deleting…"
+      : "Delete locally";
+    deleteButton.disabled = inboxMutationInFlight();
+    deleteButton.addEventListener("click", () => void deleteInboxItem(item));
+    footerActions.append(deleteButton);
 
     card.append(meta, subject, summary);
     if (details.childElementCount) card.append(details);
@@ -1310,6 +1355,10 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
   };
 }
 
+function inboxMutationInFlight(): boolean {
+  return inboxClearInFlight || inboxDeletionsInFlight.size > 0;
+}
+
 function setInboxControlsBusy(busy: boolean): void {
   for (const control of inboxFilterForm.elements) {
     if (
@@ -1321,6 +1370,67 @@ function setInboxControlsBusy(busy: boolean): void {
     }
   }
   inboxLoadMore.disabled = busy;
+  inboxClear.disabled = busy || inboxMutationInFlight();
+}
+
+async function deleteInboxItem(item: InboxItem): Promise<void> {
+  if (inboxMutationInFlight()) return;
+  const confirmed = window.confirm(
+    `Delete "${item.subject}" from Email Watcher's local history? ` +
+      "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
+  );
+  if (!confirmed) return;
+
+  inboxDeletionsInFlight.add(item.message_id);
+  inboxRequestGeneration += 1;
+  setInboxControlsBusy(true);
+  renderInbox(inboxItems);
+  try {
+    await invoke<void>("inbox_delete", { messageId: item.message_id });
+    clearMessageOwnedUiState(item.message_id);
+    inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
+    renderInbox(inboxItems);
+    inboxStatus.textContent = `Deleted "${item.subject}" from local history. The source email was not changed.`;
+    inboxStatus.dataset.kind = "success";
+  } catch (error) {
+    inboxStatus.textContent = errorMessage(error);
+    inboxStatus.dataset.kind = "error";
+  } finally {
+    inboxDeletionsInFlight.delete(item.message_id);
+    setInboxControlsBusy(false);
+    renderInbox(inboxItems);
+  }
+}
+
+async function clearInboxHistory(): Promise<void> {
+  if (inboxMutationInFlight()) return;
+  const confirmed = window.confirm(
+    "Clear all local Email Watcher history? This removes local analyses, attachment metadata, notifications, and capability results. Source email will stay in your mailbox.",
+  );
+  if (!confirmed) return;
+
+  inboxClearInFlight = true;
+  inboxRequestGeneration += 1;
+  setInboxControlsBusy(true);
+  renderInbox(inboxItems);
+  try {
+    const deleted = await invoke<number>("inbox_clear");
+    inboxItems = [];
+    inboxNextCursor = null;
+    inboxCapabilityUnavailableCount = 0;
+    clearMessageOwnedUiState();
+    inboxLoadMore.hidden = true;
+    renderInbox(inboxItems);
+    inboxStatus.textContent = `Cleared ${deleted} local message${deleted === 1 ? "" : "s"}. Source email was not changed.`;
+    inboxStatus.dataset.kind = "success";
+  } catch (error) {
+    inboxStatus.textContent = errorMessage(error);
+    inboxStatus.dataset.kind = "error";
+  } finally {
+    inboxClearInFlight = false;
+    setInboxControlsBusy(false);
+    renderInbox(inboxItems);
+  }
 }
 
 function inboxStatusLabel(): string {
@@ -1333,6 +1443,7 @@ function inboxStatusLabel(): string {
 }
 
 async function loadInbox(append = false): Promise<void> {
+  if (inboxMutationInFlight()) return;
   if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
@@ -1864,6 +1975,7 @@ settingsForm.addEventListener("submit", (event) => {
       }
       const settings = await invoke<WatcherSettings>("settings_update", updates);
       renderSettings(settings);
+      void loadInbox();
       settingsStatus.textContent = settings.local_model.editable
         ? "Settings saved. Model changes apply to the next analysis; restart the app to use the new polling cadence."
         : "Settings saved. Restart the app to use the new polling cadence.";
@@ -2018,6 +2130,7 @@ inboxReset.addEventListener("click", () => {
   void loadInbox();
 });
 inboxLoadMore.addEventListener("click", () => void loadInbox(true));
+inboxClear.addEventListener("click", () => void clearInboxHistory());
 checkNow.addEventListener("click", () => void runCheck());
 gmailAuthorize.addEventListener("click", () => void authorizeGmail());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());

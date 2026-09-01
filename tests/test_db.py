@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, Store
 from eom_email_watcher.mime import AttachmentDescriptor
 
@@ -274,7 +275,9 @@ def test_notification_intent_count_is_not_limited_to_retrieval_page(tmp_path: Pa
     assert store.notification_intent_count() == 501
 
 
-def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path) -> None:
+def test_purge_is_a_hard_source_time_ceiling_including_notification_intents(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     for message_id in ("analysis", "fallback", "ordinary"):
@@ -284,7 +287,7 @@ def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path
             sender="a@b.com",
             sender_name=None,
             subject=message_id,
-            received_at="2026-07-18T14:00:00+00:00",
+            received_at="2026-08-30T12:00:00+00:00",
         )
     store.mark_analyzed(
         "analysis",
@@ -300,42 +303,255 @@ def test_purge_preserves_only_unacknowledged_notification_intents(tmp_path: Path
         },
     )
     store.record_failure("fallback", "local model unavailable", 0)
-    old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    with store.connection() as db:
-        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+    assert store.notification_intent_count() == 2
+    assert store.purge(1, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 3
+    assert store.recent(10) == []
+    assert store.notification_intents() == []
 
-    assert store.purge(1, preserve_notification_intents=True) == 1
-    assert {row["message_id"] for row in store.recent(10)} == {"analysis", "fallback"}
 
-    analysis = next(
-        intent for intent in store.notification_intents() if intent.kind == "analysis"
+def test_purge_uses_source_received_time_not_local_discovery_time(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="source-old",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Old source",
+        received_at="2026-08-01T00:00:00+00:00",
     )
-    store.acknowledge_notification(
-        message_id="analysis", kind="analysis", analysis_at=analysis.analysis_at
+    store.add_message(
+        message_id="source-current",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Current source",
+        received_at="2026-09-01T00:00:00+00:00",
     )
-    store.acknowledge_notification(message_id="fallback", kind="fallback")
-
-    assert store.purge(1, preserve_notification_intents=True) == 0
-    assert (
-        store.acknowledge_notification(
-            message_id="analysis", kind="analysis", analysis_at=analysis.analysis_at
-        )
-        == "already_acknowledged"
-    )
-    assert (
-        store.acknowledge_notification(message_id="fallback", kind="fallback")
-        == "already_acknowledged"
-    )
-
     with store.connection() as db:
         db.execute(
-            """UPDATE messages SET notified_at = ?, fallback_notified_at = ?
-            WHERE message_id IN ('analysis', 'fallback')""",
-            (old, old),
+            "UPDATE messages SET discovered_at = '2020-01-01T00:00:00+00:00' "
+            "WHERE message_id = 'source-current'"
         )
 
-    assert store.purge(1, preserve_notification_intents=True) == 2
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert [row["message_id"] for row in store.recent(10)] == ["source-current"]
+
+
+def test_purge_rejects_timezone_less_source_timestamp(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="timezone-less",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed source time",
+        received_at="2026-09-01T11:00:00",
+    )
+    store.mark_analyzed(
+        "timezone-less",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "Summary.",
+            "action_required": False,
+            "suggested_action": None,
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
     assert store.recent(10) == []
+    assert store.notification_intents() == []
+
+
+def test_purge_uses_one_parser_for_second_precision_timezone_offsets(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for message_id, received_at in (
+        ("old-offset", "2026-08-01T12:00:00+00:00:30"),
+        ("current-offset", "2026-09-01T11:00:00+00:00:30"),
+    ):
+        assert store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject=message_id,
+            received_at=received_at,
+        )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert [row["message_id"] for row in store.recent(10)] == ["current-offset"]
+
+
+def test_purge_bounds_legacy_future_source_time_by_discovery_time(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="future-source",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed future source time",
+        received_at="2036-09-01T00:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ? WHERE message_id = ?",
+            ("2026-08-01T00:00:00+00:00", "future-source"),
+        )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert store.recent(10) == []
+
+
+def test_purge_rejects_future_source_and_discovery_times(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="future-source-and-discovery",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Future local timestamps",
+        received_at="2036-09-01T00:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ? WHERE message_id = ?",
+            ("2036-09-01T00:00:00+00:00", "future-source-and-discovery"),
+        )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert store.recent(10) == []
+
+
+def test_delete_message_cascades_local_state_and_prevents_rediscovery(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.set_state("100", datetime(2026, 9, 1, tzinfo=UTC))
+    seed_pdf_attachment(store)
+    create_connect_job(store, "33333333-3333-4333-8333-333333333333")
+    store.record_failure("m1", "model unavailable", 0)
+
+    assert store.delete_message(
+        "m1", now=datetime(2026, 9, 1, 12, tzinfo=UTC)
+    )
+    assert not store.delete_message("m1")
+    assert store.recent(10) == []
+    assert store.notification_intents() == []
+    assert store.state() == ("100", "2026-09-01T00:00:00+00:00")
+    assert not store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Rediscovered",
+        received_at="2026-08-29T12:00:00+00:00",
+    )
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
+        suppression = db.execute(
+            "SELECT message_key FROM suppressed_messages"
+        ).fetchone()[0]
+    assert suppression == hashlib.sha256(b"m1").hexdigest()
+    assert "m1" not in suppression
+
+
+def test_delete_message_bounds_suppression_when_source_time_conversion_overflows(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="overflowing-source-time",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed source time",
+        received_at="0001-01-01T00:00:00+23:59",
+    )
+    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
+
+    assert store.delete_message("overflowing-source-time", now=now)
+
+    with store.connection() as db:
+        expires_at = db.execute(
+            "SELECT expires_at FROM suppressed_messages"
+        ).fetchone()[0]
+    assert expires_at == (now + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
+
+
+def test_clear_messages_preserves_mailbox_and_outbound_state(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.set_state("200", datetime(2026, 9, 1, tzinfo=UTC))
+    for message_id in ("m1", "m2"):
+        store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject=message_id,
+            received_at="2026-09-01T00:00:00+00:00",
+        )
+    with store.connection() as db:
+        db.execute(
+            """INSERT INTO outbound_sends(
+                dedupe_key, recipient, subject, gmail_message_id, sent_at
+            ) VALUES ('monthly-hours:2026-08', 'owner@example.com', 'Hours', 'sent-id', ?)""",
+            (datetime(2026, 9, 1, tzinfo=UTC).isoformat(),),
+        )
+
+    assert store.clear_messages(now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 2
+    assert store.recent(10) == []
+    assert store.state() == ("200", "2026-09-01T00:00:00+00:00")
+    assert store.outbound_status("monthly-hours:2026-08") == "sent"
+    assert not store.add_message(
+        message_id="m2",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Rediscovered",
+        received_at="2026-09-01T00:00:00+00:00",
+    )
+
+
+def test_manual_delete_suppression_overlaps_maximum_retention_boundary(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    received_at = datetime(2020, 1, 1, tzinfo=UTC)
+    expires_at = received_at + timedelta(days=MAX_RETENTION_DAYS)
+    store.add_message(
+        message_id="boundary-message",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Boundary",
+        received_at=received_at.isoformat(),
+    )
+
+    assert store.delete_message("boundary-message", now=received_at)
+    assert store.purge(MAX_RETENTION_DAYS, now=expires_at) == 0
+    assert not store.add_message(
+        message_id="boundary-message",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Boundary replay",
+        received_at=received_at.isoformat(),
+    )
 
 
 def test_retry_is_not_immediately_due(tmp_path: Path) -> None:
@@ -481,7 +697,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
@@ -492,10 +708,14 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
         connect_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connect_attachment_jobs'"
         ).fetchone()
+        suppression_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='suppressed_messages'"
+        ).fetchone()
     assert "analysis_at" in columns
     assert row == ("pending", None)
     assert attachment_table == (1,)
     assert connect_table == (1,)
+    assert suppression_table == (1,)
 
 
 def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
@@ -526,7 +746,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -593,7 +813,7 @@ def test_attachment_inventory_replaces_in_order_and_is_purged_with_message(
 
     old = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     with store.connection() as db:
-        db.execute("UPDATE messages SET discovered_at = ?", (old,))
+        db.execute("UPDATE messages SET received_at = ?", (old,))
     assert store.purge(1) == 1
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
@@ -788,7 +1008,7 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     assert restored.result_json is None
     assert restored.result_metadata_json is None
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert (
             db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -1046,7 +1266,7 @@ def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path)
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_connect_attachment_jobs_active'"
         ).fetchone()[0]
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 2
     assert "protocol_version = 1" in index_sql
 

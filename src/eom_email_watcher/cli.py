@@ -142,13 +142,25 @@ def _setup(config_path: Path) -> int:
 
 def _check(config_path: Path, dry_run: bool) -> int:
     config, store, model = _runtime(config_path)
-    if not config.senders:
-        print(json.dumps(Watcher.inactive_result(config, store, dry_run=dry_run), indent=2))
-        return 0
-    lock = nullcontext() if dry_run else _production_check_lock(config.database_file)
-    with lock:
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-        result = Watcher(config, store, gmail, model).check(dry_run=dry_run)
+
+    def run(active_config, active_store, active_model):
+        if not active_config.senders:
+            return Watcher.inactive_result(
+                active_config, active_store, dry_run=dry_run
+            )
+        gmail = GmailGateway.from_token(
+            active_config.gmail_credentials_file,
+            active_config.gmail_token_file,
+        )
+        return Watcher(active_config, active_store, gmail, active_model).check(
+            dry_run=dry_run
+        )
+
+    if dry_run:
+        result = run(config, store, model)
+    else:
+        with _production_check_lock(config.database_file):
+            result = run(*_runtime(config_path))
     print(json.dumps(result, indent=2))
     return 0
 

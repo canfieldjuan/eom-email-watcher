@@ -1,6 +1,6 @@
 # Tauri desktop proof
 
-The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger,
+The Linux desktop proof exposes a local Inbox backed by the existing SQLite message ledger,
 the useful watchlist path, and a live Health view. Health can inspect Gmail, local AI, database,
 and notification readiness, then run one production-safe `Check now` through the existing
 versioned Python engine contract. The host drains a bounded batch of durable notification intents
@@ -17,8 +17,14 @@ Settings can safely update polling cadence, message retention, and native-notifi
 through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
 exact-loopback inference, the same UI can update the HTTP endpoint and model identifier. A gateway
 endpoint and model are read-only, while gateway trust and authentication credentials remain managed
-externally. A new polling cadence takes effect after the app restarts; model, retention, and
-notification changes are read by later watcher operations.
+externally. A new polling cadence takes effect after the app restarts; model and notification
+changes are read by later watcher operations, while a retention change immediately removes local
+history older than the new source-time cutoff.
+
+Inbox cards can delete one message from local history, and the Inbox can clear all local history,
+only after native confirmation. These operations remove local analysis, notification state,
+attachment metadata, and capability jobs/results. They never call a mail provider or delete source
+email, and they preserve the mailbox sync cursor and the separate EOM outbound-send ledger.
 
 Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
 ledger. Open fetches only the selected attachment through the read-only Gmail engine, writes it to a
