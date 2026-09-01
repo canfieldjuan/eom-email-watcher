@@ -44,6 +44,8 @@ MAX_GATEWAY_ATTACHMENT_NAME_CHARS = 512
 MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+PAYMENT_CARD_CONTEXT_CHARS = 256
+PAYMENT_CARD_CLAUSE_RE = re.compile(r"[^.!?;:,\n]+")
 PAYMENT_CARD_SEMANTICS_RE = re.compile(
     r"\b(?:"
     r"(?P<pay_action>pay(?:ment)?\s+(?:by|with|using|via)\s+"
@@ -84,7 +86,7 @@ PAYMENT_CARD_ACTION_NEGATION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
-    r"^\W*(?:"
+    r"\W*(?:"
     r"(?:(?:is|are|was|were|will|would|shall|should|must|can|could|do|does|did|need)\W+)?"
     r"(?:not|never)\b"
     r"|cannot\b"
@@ -193,11 +195,20 @@ def _payment_card_semantic(match: re.Match[str]) -> tuple[str, str]:
 
 
 def _payment_card_semantics(text: str, *, affirmed_only: bool) -> set[tuple[str, str]]:
+    if not affirmed_only:
+        return {
+            _payment_card_semantic(match) for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text)
+        }
+
     semantics: set[tuple[str, str]] = set()
-    for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text):
-        if affirmed_only:
-            prefix = re.split(r"[.!?;:,\n]", text[: match.start()])[-1]
-            suffix = re.split(r"[.!?;:,\n]", text[match.end() :], maxsplit=1)[0]
+    for clause in PAYMENT_CARD_CLAUSE_RE.finditer(text):
+        for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text, clause.start(), clause.end()):
+            prefix = text[
+                max(clause.start(), match.start() - PAYMENT_CARD_CONTEXT_CHARS) : match.start()
+            ]
+            suffix = text[
+                match.end() : min(clause.end(), match.end() + PAYMENT_CARD_CONTEXT_CHARS)
+            ]
             if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
                 continue
             if (
@@ -207,7 +218,7 @@ def _payment_card_semantics(text: str, *, affirmed_only: bool) -> set[tuple[str,
                 continue
             if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
                 continue
-        semantics.add(_payment_card_semantic(match))
+            semantics.add(_payment_card_semantic(match))
     return semantics
 
 

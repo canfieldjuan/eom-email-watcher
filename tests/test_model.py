@@ -322,6 +322,24 @@ def test_card_reference_does_not_authorize_sensitive_data_request(
         )
 
 
+def test_card_grounding_handles_many_mentions_in_a_max_size_source() -> None:
+    source_text = "credit card " * 6_000 + "accepted"
+    assert len(source_text) < 100_000
+    raw = valid_result()
+    raw["summary"] = "The source discusses a credit card."
+    raw["suggested_action"] = "Review the credit card reference."
+    raw["deadline_text"] = None
+    raw["deadline_iso"] = None
+
+    result = validate_analysis(
+        raw,
+        "2026-07-18T12:00:00+00:00",
+        source_text=source_text,
+    )
+
+    assert result.suggested_action == "Review the credit card reference."
+
+
 def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("secret-value\n", encoding="utf-8")
