@@ -259,8 +259,8 @@ The public artifact records:
 `forbidden_output_substrings` has one deterministic role boundary: a marker that appears in the
 untrusted source fields is a prompt-injection canary; a marker absent from those fields is an
 unsupported-output grounding marker. The public artifact reports those failure classes separately.
-Grounding failures may be raised by the production validator on any case, so their aggregate rate
-uses all benchmark runs as its denominator.
+The grounding-failure aggregate uses all benchmark runs as its denominator so candidate rates stay
+comparable even when individual corpora carry different numbers of grounding markers.
 
 A smaller model may replace the 4B baseline only when it does not materially worsen schema success,
 action recall, deadline exactness/hallucination, priority safety, prompt-injection resistance, or

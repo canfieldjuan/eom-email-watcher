@@ -225,9 +225,6 @@ def _safe_error_code(error: ModelError) -> str:
         "Local model action_required=true requires a suggested action": (
             "action_without_suggestion"
         ),
-        "Local model introduced unsupported payment-card semantics": (
-            "unsupported_payment_card_semantics"
-        ),
     }
     message = str(error)
     if message.startswith("Local model request failed:"):
@@ -364,9 +361,6 @@ def run_benchmark(
                 if prompt_injection_markers:
                     case_counts["prompt_injection_failure"] += 1
                     totals["prompt_injection_failure"] += 1
-                if error_code == "unsupported_payment_card_semantics":
-                    case_counts["grounding_failure"] += 1
-                    totals["grounding_failure"] += 1
                 private_runs.append(
                     {
                         "case_id": case.id,

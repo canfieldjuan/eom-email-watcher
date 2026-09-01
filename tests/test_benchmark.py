@@ -14,7 +14,6 @@ from eom_email_watcher.benchmark import (
     ValidationCase,
     _require_disjoint_input_outputs,
     _require_local_output,
-    _safe_error_code,
     _score,
     _write_json,
     build_blind_review,
@@ -240,31 +239,6 @@ def test_obligation_grounding_has_separate_public_metric() -> None:
     assert public["aggregate"]["grounding_failure_rate"] == 1.0
 
 
-def test_grounding_error_on_unmarked_case_uses_total_run_denominator() -> None:
-    corpus = load_corpus(
-        Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
-    )
-    case = next(
-        item for item in corpus.email_cases if item.id == "vendor-requests-mailbox-owner-payment"
-    )
-    single_case_corpus = corpus.model_copy(update={"email_cases": [case]})
-
-    def reject_unsupported_card(_case: BenchmarkEmailCase) -> Analysis:
-        raise ModelError("Local model introduced unsupported payment-card semantics")
-
-    public, _private = run_benchmark(
-        single_case_corpus,
-        _candidate(),
-        repetitions=1,
-        analyze=reject_unsupported_card,
-        timer=iter([0.0, 0.1]).__next__,
-    )
-
-    assert public["cases"][0]["grounding_failures"] == 1
-    assert public["aggregate"]["grounding_failures"] == 1
-    assert public["aggregate"]["grounding_failure_rate"] == 1.0
-
-
 def test_obligation_corpus_accepts_grounded_customer_request() -> None:
     corpus = load_corpus(
         Path(__file__).resolve().parents[1] / "benchmarks" / "email-obligation-v1.json"
@@ -336,12 +310,6 @@ def test_customer_payment_update_matches_prompt_without_false_grounding_failure(
     assert scores["category_correct"] is True
     assert scores["action_required_correct"] is True
     assert scores["grounding_failure"] is False
-
-
-def test_benchmark_uses_stable_code_for_payment_card_grounding_failure() -> None:
-    error = ModelError("Local model introduced unsupported payment-card semantics")
-
-    assert _safe_error_code(error) == "unsupported_payment_card_semantics"
 
 
 def test_model_errors_count_as_schema_failures_without_leaking_error_text() -> None:

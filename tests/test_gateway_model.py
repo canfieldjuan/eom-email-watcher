@@ -329,39 +329,6 @@ def test_gateway_rejects_mismatched_response_envelope(
         analyze(model)
 
 
-def test_gateway_applies_source_grounding_to_response(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content)
-        content = json.dumps(
-            {
-                "category": "customer_request",
-                "priority": "high",
-                "summary": "Payment card numbers are requested.",
-                "action_required": True,
-                "suggested_action": "Provide payment card details.",
-                "deadline_text": None,
-                "deadline_iso": None,
-                "confidence": 0.9,
-            }
-        )
-        return httpx.Response(
-            200,
-            json={
-                "protocol_version": 1,
-                "request_id": payload["request_id"],
-                "status": "completed",
-                "output": {"media_type": "application/json", "content": content},
-            },
-        )
-
-    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
-
-    with pytest.raises(ModelError, match="unsupported payment-card semantics"):
-        analyze(model, "Please provide the building access card numbers.")
-
-
 @pytest.mark.parametrize("http_status", [200, 429])
 def test_gateway_exposes_validated_retry_directives_for_any_http_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, http_status: int

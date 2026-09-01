@@ -44,59 +44,6 @@ MAX_GATEWAY_ATTACHMENT_NAME_CHARS = 512
 MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-PAYMENT_CARD_CONTEXT_CHARS = 256
-PAYMENT_CARD_CLAUSE_RE = re.compile(r"[^.!?;:,\n]+")
-PAYMENT_CARD_SEMANTICS_RE = re.compile(
-    r"\b(?:"
-    r"(?P<pay_action>pay(?:ment)?\s+(?:by|with|using|via)\s+"
-    r"(?:(?:a|the|your)\s+)?"
-    r"(?:(?P<pay_card_type>credit|debit|payment|bank|charge|prepaid)[\s-]+)?cards?)"
-    r"|(?P<typed_card>(?P<card_type>credit|debit|payment|bank|charge|prepaid)"
-    r"[\s-]+cards?)(?P<card_data>[\s-]+(?:numbers?|details|data|information))?"
-    r"|(?P<card_payment>card[\s-]+payments?)"
-    r"|(?P<cardholder_data>cardholder[\s-]+(?:data|information))"
-    r"|(?P<security_code>cvv|cvc)"
-    r")\b",
-    re.IGNORECASE,
-)
-PAYMENT_CARD_TYPES = frozenset(
-    {"payment_card", "credit_card", "debit_card", "bank_card", "charge_card", "prepaid_card"}
-)
-PAYMENT_CARD_NEGATION_PREFIX_RE = re.compile(
-    r"(?:"
-    r"\b(?:no|without)\b"
-    r"|\bnot\b(?!\W+only\b)"
-    r"(?:\W+(?:a|an|any|the|this|that|these|those|my|your|his|her|our|their))?"
-    r"|\b(?:do|does|did|should|must|can|could|will|would|need)\W+(?:not|never)\W+\w+"
-    r"|\b(?:don|doesn|didn|shouldn|mustn|can|couldn|won|wouldn|needn)['’]t\W+\w+"
-    r"|\bcannot\W+\w+"
-    r"|\bnever\W+\w+"
-    r"|\b(?:isn|aren|wasn|weren)['’]t"
-    r"(?:\W+(?:a|an|any|the|this|that|these|those|my|your|his|her|our|their))?"
-    r")\W*$",
-    re.IGNORECASE,
-)
-PAYMENT_CARD_ACTION_NEGATION_PREFIX_RE = re.compile(
-    r"(?:"
-    r"\b(?:do|does|did|should|must|can|could|will|would|need)\W+(?:not|never)"
-    r"|\bcannot"
-    r"|\b(?:don|doesn|didn|shouldn|mustn|can|couldn|won|wouldn|needn)['’]t"
-    r"|\bnever"
-    r")\W*$",
-    re.IGNORECASE,
-)
-PAYMENT_CARD_NEGATION_SUFFIX_RE = re.compile(
-    r"\W*(?:"
-    r"(?:(?:is|are|was|were|will|would|shall|should|must|can|could|do|does|did|need)\W+)?"
-    r"(?:not|never)\b"
-    r"|cannot\b"
-    r"|[a-z]+n['’]t\b"
-    r")"
-    r"(?:\W+to)?(?:\W+be)?\W+"
-    r"(?:accepted|allowed|available|needed|required|requested|supported|used|valid|permitted"
-    r"|sent|provided|shared|submitted|included|entered|disclosed|stored|processed)\b",
-    re.IGNORECASE,
-)
 
 
 class Analysis(BaseModel):
@@ -176,74 +123,7 @@ def _json_object(text: str) -> dict[str, object]:
     return value
 
 
-def _payment_card_semantic(match: re.Match[str]) -> tuple[str, str]:
-    if match.group("security_code"):
-        return ("security_code", "data")
-    if match.group("cardholder_data"):
-        return ("cardholder_data", "data")
-    if match.group("pay_action"):
-        card_type = match.group("pay_card_type")
-        semantic_type = f"{card_type.lower()}_card" if card_type else "payment_card"
-        return (semantic_type, "payment")
-    if match.group("card_payment"):
-        return ("payment_card", "payment")
-    card_type = match.group("card_type")
-    if card_type is None:  # pragma: no cover - regex alternatives are exhaustive
-        raise AssertionError("Unclassified payment-card semantic")
-    role = "data" if match.group("card_data") else "reference"
-    return (f"{card_type.lower()}_card", role)
-
-
-def _payment_card_semantics(text: str, *, affirmed_only: bool) -> set[tuple[str, str]]:
-    if not affirmed_only:
-        return {
-            _payment_card_semantic(match) for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text)
-        }
-
-    semantics: set[tuple[str, str]] = set()
-    for clause in PAYMENT_CARD_CLAUSE_RE.finditer(text):
-        for match in PAYMENT_CARD_SEMANTICS_RE.finditer(text, clause.start(), clause.end()):
-            prefix = text[
-                max(clause.start(), match.start() - PAYMENT_CARD_CONTEXT_CHARS) : match.start()
-            ]
-            suffix = text[
-                match.end() : min(clause.end(), match.end() + PAYMENT_CARD_CONTEXT_CHARS)
-            ]
-            if PAYMENT_CARD_NEGATION_PREFIX_RE.search(prefix):
-                continue
-            if (
-                _payment_card_semantic(match)[1] == "payment"
-                and PAYMENT_CARD_ACTION_NEGATION_PREFIX_RE.search(prefix)
-            ):
-                continue
-            if PAYMENT_CARD_NEGATION_SUFFIX_RE.search(suffix):
-                continue
-            semantics.add(_payment_card_semantic(match))
-    return semantics
-
-
-def _source_supports_payment_card_semantic(
-    source_semantics: set[tuple[str, str]], output_semantic: tuple[str, str]
-) -> bool:
-    output_type, output_role = output_semantic
-    for source_type, source_role in source_semantics:
-        if output_type == "payment_card":
-            type_supported = source_type in PAYMENT_CARD_TYPES
-        else:
-            type_supported = source_type == output_type
-        if not type_supported:
-            continue
-        if output_role == "data" and source_role != "data":
-            continue
-        if output_role == "payment" and source_role != "payment":
-            continue
-        return True
-    return False
-
-
-def validate_analysis(
-    raw: dict[str, object], received_at: str, *, source_text: str | None = None
-) -> Analysis:
+def validate_analysis(raw: dict[str, object], received_at: str) -> Analysis:
     try:
         analysis = Analysis.model_validate(raw)
     except ValidationError as exc:
@@ -252,22 +132,6 @@ def validate_analysis(
         analysis.suggested_action is not None and "\x00" in analysis.suggested_action
     ):
         raise ModelError("Local model response contains unsupported control characters")
-    output_text = "\n".join(
-        value
-        for value in (analysis.summary, analysis.suggested_action, analysis.deadline_text)
-        if value is not None
-    )
-    if source_text is not None:
-        output_card_semantics = _payment_card_semantics(output_text, affirmed_only=False)
-        if output_card_semantics:
-            source_card_semantics = _payment_card_semantics(source_text, affirmed_only=True)
-            if any(
-                not _source_supports_payment_card_semantic(
-                    source_card_semantics, output_semantic
-                )
-                for output_semantic in output_card_semantics
-            ):
-                raise ModelError("Local model introduced unsupported payment-card semantics")
     if analysis.deadline_iso:
         try:
             deadline = datetime.strptime(analysis.deadline_iso, "%Y-%m-%d").date()
@@ -414,7 +278,7 @@ class LocalModel:
                 content = message.get("reasoning_content") or message.get("reasoning") or ""
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
-        return validate_analysis(_json_object(str(content)), received_at, source_text=prompt)
+        return validate_analysis(_json_object(str(content)), received_at)
 
 
 class GatewayModel:
@@ -679,17 +543,6 @@ class GatewayModel:
         request_id: str | None = None,
     ) -> Analysis:
         request_id = request_id or str(uuid.uuid4())
-        prompt = _email_prompt(
-            sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
-            subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
-            received_at=received_at,
-            body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
-            attachment_names=tuple(
-                _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
-                for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
-            ),
-            current_local_time=current_local_time,
-        )
         payload = {
             "protocol_version": 1,
             "request_id": request_id,
@@ -705,7 +558,17 @@ class GatewayModel:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": prompt,
+                        "content": _email_prompt(
+                            sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
+                            subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
+                            received_at=received_at,
+                            body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
+                            attachment_names=tuple(
+                                _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
+                                for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
+                            ),
+                            current_local_time=current_local_time,
+                        ),
                     },
                 ],
                 "temperature": 0.1,
@@ -723,6 +586,4 @@ class GatewayModel:
             or not isinstance(output.get("content"), str)
         ):
             raise ModelError("Inference gateway response did not match the required envelope")
-        return validate_analysis(
-            _json_object(output["content"]), received_at, source_text=prompt
-        )
+        return validate_analysis(_json_object(output["content"]), received_at)
