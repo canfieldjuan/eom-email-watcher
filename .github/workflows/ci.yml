@@ -60,12 +60,12 @@ jobs:
           workspaces: desktop/src-tauri -> target
       - run: uv run pytest tests/test_desktop_packaging.py
       - run: pnpm --dir desktop install --frozen-lockfile
+      - name: Build Windows NSIS installer
+        run: pnpm --dir desktop tauri build --bundles nsis
       - name: Verify Windows engine process-tree timeout
         run: >-
           cargo test --manifest-path desktop/src-tauri/Cargo.toml
           engine::tests::bounded_engine_terminates_a_stalled_windows_process_tree
-      - name: Build Windows NSIS installer
-        run: pnpm --dir desktop tauri build --bundles nsis
       - name: Re-run packaged engine acceptance smoke
         shell: pwsh
         run: |
