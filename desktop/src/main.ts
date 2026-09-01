@@ -1255,8 +1255,7 @@ function renderInbox(items: InboxItem[]): void {
     deleteButton.textContent = inboxDeletionsInFlight.has(item.message_id)
       ? "Deleting…"
       : "Delete locally";
-    deleteButton.disabled =
-      inboxClearInFlight || inboxDeletionsInFlight.has(item.message_id);
+    deleteButton.disabled = inboxMutationInFlight();
     deleteButton.addEventListener("click", () => void deleteInboxItem(item));
     footerActions.append(deleteButton);
 
@@ -1327,6 +1326,10 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
   };
 }
 
+function inboxMutationInFlight(): boolean {
+  return inboxClearInFlight || inboxDeletionsInFlight.size > 0;
+}
+
 function setInboxControlsBusy(busy: boolean): void {
   for (const control of inboxFilterForm.elements) {
     if (
@@ -1338,11 +1341,11 @@ function setInboxControlsBusy(busy: boolean): void {
     }
   }
   inboxLoadMore.disabled = busy;
-  inboxClear.disabled = busy || inboxClearInFlight;
+  inboxClear.disabled = busy || inboxMutationInFlight();
 }
 
 async function deleteInboxItem(item: InboxItem): Promise<void> {
-  if (inboxClearInFlight || inboxDeletionsInFlight.has(item.message_id)) return;
+  if (inboxMutationInFlight()) return;
   const confirmed = window.confirm(
     `Delete "${item.subject}" from Email Watcher's local history? ` +
       "Its local analysis, attachment metadata, notifications, and capability results will be removed. The source email will stay in your mailbox.",
@@ -1370,7 +1373,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
 }
 
 async function clearInboxHistory(): Promise<void> {
-  if (inboxClearInFlight || inboxDeletionsInFlight.size > 0) return;
+  if (inboxMutationInFlight()) return;
   const confirmed = window.confirm(
     "Clear all local Email Watcher history? This removes local analyses, attachment metadata, notifications, and capability results. Source email will stay in your mailbox.",
   );
@@ -1411,7 +1414,7 @@ function inboxStatusLabel(): string {
 }
 
 async function loadInbox(append = false): Promise<void> {
-  if (inboxClearInFlight || inboxDeletionsInFlight.size > 0) return;
+  if (inboxMutationInFlight()) return;
   if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
