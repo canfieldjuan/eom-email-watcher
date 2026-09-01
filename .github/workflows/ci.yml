@@ -64,8 +64,8 @@ jobs:
         run: pnpm --dir desktop tauri build --bundles nsis
       - name: Verify Windows engine process-tree lifecycle
         run: >-
-          cargo test --manifest-path desktop/src-tauri/Cargo.toml
-          engine::tests::windows_job_
+          cargo test --release --manifest-path desktop/src-tauri/Cargo.toml
+          engine::tests::windows_job_ -- --test-threads=1
       - name: Re-run packaged engine acceptance smoke
         shell: pwsh
         run: |

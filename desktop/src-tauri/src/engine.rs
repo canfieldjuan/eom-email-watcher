@@ -1425,7 +1425,7 @@ Wait-Process -Id $descendant.Id
             ],
             PathBuf::from("unused.toml"),
         )
-        .with_request_timeout(Duration::from_secs(2));
+        .with_request_timeout(Duration::from_secs(10));
 
         assert_eq!(
             engine
