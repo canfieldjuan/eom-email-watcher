@@ -73,7 +73,7 @@ impl WindowsJob {
         // the duration of this synchronous call.
         if unsafe {
             SetInformationJobObject(
-                handle.as_raw_handle(),
+                self.handle.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&limits).cast(),
                 limits_size,
