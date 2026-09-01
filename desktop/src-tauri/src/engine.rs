@@ -1229,6 +1229,11 @@ mod tests {
     };
 
     #[cfg(windows)]
+    // This bounds a hung probe, not product latency. Hosted Windows runners
+    // can spend more than ten seconds starting the nested PowerShell process.
+    const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[cfg(windows)]
     struct WindowsTestProcess(u32);
 
     #[cfg(windows)]
@@ -1616,7 +1621,7 @@ Wait-Process -Id $descendant.Id
             ],
             PathBuf::from("unused.toml"),
         )
-        .with_request_timeout(Duration::from_secs(10));
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
 
         assert_eq!(
             engine
@@ -1668,7 +1673,7 @@ Set-Content -LiteralPath $args[0] -Value $descendant.Id
             ],
             PathBuf::from("unused.toml"),
         )
-        .with_request_timeout(Duration::from_secs(5));
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
 
         let result = engine.check().expect("probe request must succeed");
         assert!(!result.active);
