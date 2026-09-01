@@ -1344,6 +1344,10 @@ async function loadInbox(append = false): Promise<void> {
     });
   } catch (error) {
     if (generation !== inboxRequestGeneration) return;
+    if (!append) {
+      inboxNextCursor = null;
+      inboxLoadMore.hidden = true;
+    }
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
     setInboxControlsBusy(false);
