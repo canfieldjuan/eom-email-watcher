@@ -27,14 +27,17 @@ def _sqlite_casefold(value: object) -> str:
     return value.casefold() if isinstance(value, str) else ""
 
 
-def _sqlite_is_aware_iso_datetime(value: object) -> int:
+def _sqlite_aware_iso_epoch(value: object) -> float | None:
     if not isinstance(value, str):
-        return 0
+        return None
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return 0
-    return int(parsed.tzinfo is not None)
+        if parsed.tzinfo is None:
+            return None
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        return (parsed.astimezone(UTC) - epoch).total_seconds()
+    except (OverflowError, ValueError):
+        return None
 
 
 def _message_suppression_key(message_id: str) -> str:
@@ -724,9 +727,9 @@ class Store:
         connection.row_factory = sqlite3.Row
         connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
         connection.create_function(
-            "is_aware_iso_datetime",
+            "aware_iso_epoch",
             1,
-            _sqlite_is_aware_iso_datetime,
+            _sqlite_aware_iso_epoch,
             deterministic=True,
         )
         try:
@@ -1929,27 +1932,30 @@ class Store:
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         cutoff = stamp - timedelta(days=retention_days)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        stamp_epoch = (stamp - epoch).total_seconds()
+        cutoff_epoch = (cutoff - epoch).total_seconds()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """DELETE FROM messages
-                WHERE is_aware_iso_datetime(received_at) = 0
+                WHERE aware_iso_epoch(received_at) IS NULL
                    OR (
-                       julianday(received_at) > julianday(?)
+                       aware_iso_epoch(received_at) > ?
                        AND (
-                           is_aware_iso_datetime(discovered_at) = 0
-                           OR julianday(discovered_at) < julianday(?)
+                           aware_iso_epoch(discovered_at) IS NULL
+                           OR aware_iso_epoch(discovered_at) < ?
                        )
                    )
                    OR (
-                       julianday(received_at) <= julianday(?)
-                       AND julianday(received_at) < julianday(?)
+                       aware_iso_epoch(received_at) <= ?
+                       AND aware_iso_epoch(received_at) < ?
                    )""",
                 (
-                    stamp.isoformat(),
-                    cutoff.isoformat(),
-                    stamp.isoformat(),
-                    cutoff.isoformat(),
+                    stamp_epoch,
+                    cutoff_epoch,
+                    stamp_epoch,
+                    cutoff_epoch,
                 ),
             )
             db.execute(

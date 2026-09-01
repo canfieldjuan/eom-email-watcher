@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -38,6 +39,49 @@ const PROTOCOL_VERSION: u8 = 1;
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
+}
+
+#[derive(Debug)]
+struct HostOperationLock {
+    file: File,
+}
+
+impl HostOperationLock {
+    fn acquire(path: &Path) -> Result<Self, EngineError> {
+        let mut options = File::options();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        #[cfg(windows)]
+        // Match Python filelock's read/write sharing while denying deletion so
+        // every contender continues to coordinate through the same pathname.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0x0000_0003);
+        let file = options.open(path).map_err(|_| {
+            EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(EngineError::host(
+                "operation_busy",
+                "Another watcher operation is already running",
+            )),
+            Err(TryLockError::Error(_)) => Err(EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )),
+        }
+    }
+}
+
+impl Drop for HostOperationLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            eprintln!("desktop operation lock could not be released: {error}");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -625,6 +669,11 @@ struct NotificationAcknowledgement {
 }
 
 #[derive(Deserialize)]
+struct OperationLockLocation {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
 struct AnalysisRequeue {
     status: String,
 }
@@ -947,12 +996,33 @@ impl Engine {
         self.request("watcher.check", json!({"dry_run": false}))
     }
 
+    pub(crate) fn run_with_operation_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        let _lock = HostOperationLock::acquire(&location.path)?;
+        operation()
+    }
+
+    #[cfg(test)]
     pub fn pending_notifications(
         &self,
         limit: u16,
     ) -> Result<Vec<NotificationIntent>, EngineError> {
         self.request::<NotificationItems>("notifications.pending", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notifications_under_host_lock(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<NotificationIntent>, EngineError> {
+        self.request::<NotificationItems>(
+            "notifications.pending_under_host_lock",
+            json!({"limit": limit}),
+        )
+        .map(|data| data.items)
     }
 
     pub fn acknowledge_notification(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -1176,6 +1246,19 @@ mod tests {
             default_config_path(Path::new("/home/watcher")),
             PathBuf::from("/home/watcher/.config/eom-email-watcher/config.toml")
         );
+    }
+
+    #[test]
+    fn host_operation_lock_is_exclusive_and_reusable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("watcher.check.lock");
+        let active = HostOperationLock::acquire(&path).expect("first lock acquisition");
+
+        let blocked = HostOperationLock::acquire(&path).expect_err("second lock must contend");
+        assert_eq!(blocked.code, "operation_busy");
+
+        drop(active);
+        HostOperationLock::acquire(&path).expect("released lock is reusable");
     }
 
     #[test]
@@ -1776,6 +1859,25 @@ notifications_enabled = true
         assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);
+        assert!(
+            engine
+                .run_with_operation_lock(|| engine.pending_notifications_under_host_lock(25))
+                .expect("host lock must permit lock-aware notification reads")
+                .is_empty()
+        );
+        assert_eq!(
+            engine
+                .run_with_operation_lock(|| engine.clear_inbox())
+                .expect_err("Python mutation must contend with the Rust host lock")
+                .code,
+            "runtime_error"
+        );
+        assert_eq!(
+            engine
+                .clear_inbox()
+                .expect("released host lock is reusable"),
+            0
+        );
         assert_eq!(
             engine
                 .settings_with_timeout(Duration::from_secs(5))

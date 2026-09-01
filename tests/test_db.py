@@ -368,6 +368,28 @@ def test_purge_rejects_timezone_less_source_timestamp(tmp_path: Path) -> None:
     assert store.notification_intents() == []
 
 
+def test_purge_uses_one_parser_for_second_precision_timezone_offsets(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for message_id, received_at in (
+        ("old-offset", "2026-08-01T12:00:00+00:00:30"),
+        ("current-offset", "2026-09-01T11:00:00+00:00:30"),
+    ):
+        assert store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject=message_id,
+            received_at=received_at,
+        )
+
+    assert store.purge(7, now=datetime(2026, 9, 1, 12, tzinfo=UTC)) == 1
+    assert [row["message_id"] for row in store.recent(10)] == ["current-offset"]
+
+
 def test_purge_bounds_legacy_future_source_time_by_discovery_time(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()

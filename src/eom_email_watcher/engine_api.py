@@ -195,6 +195,18 @@ def _production_check_lock_path(config: Config) -> Path:
     return config.database_file.with_name(f"{config.database_file.name}.check.lock")
 
 
+def _host_operation_lock(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Host operations require native operation locking",
+        )
+    return {"path": str(lock_path)}
+
+
 def _require_host_delivery_compatible(runtime: Runtime) -> None:
     if runtime.config.ntfy_topic:
         raise ApiError(
@@ -1551,12 +1563,25 @@ def _notifications_pending(request: dict[str, object]) -> dict[str, object]:
         )
     with operation_lock(lock_path, "Another watcher operation is already running"):
         runtime = _runtime(request)
-        config = runtime.config
-        _require_host_delivery_compatible(runtime)
-        runtime.store.purge(config.retention_days)
-        intents = _host_notification_intents(runtime, limit)
-        sender_names = {sender.email: sender.name for sender in config.senders}
-    return {"items": [_notification_payload(intent, sender_names) for intent in intents]}
+        items = _pending_notification_payloads(runtime, limit)
+    return {"items": items}
+
+
+def _pending_notification_payloads(runtime: Runtime, limit: int) -> list[dict[str, object]]:
+    config = runtime.config
+    _require_host_delivery_compatible(runtime)
+    runtime.store.purge(config.retention_days)
+    intents = _host_notification_intents(runtime, limit)
+    sender_names = {sender.email: sender.name for sender in config.senders}
+    return [_notification_payload(intent, sender_names) for intent in intents]
+
+
+def _notifications_pending_under_host_lock(
+    request: dict[str, object],
+) -> dict[str, object]:
+    payload = _payload(request, {"limit"})
+    limit = _bounded_limit(payload, default=25)
+    return {"items": _pending_notification_payloads(_runtime(request), limit)}
 
 
 def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
@@ -1601,12 +1626,14 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.output.present": _connect_output_present,
     "gmail.authorize": _gmail_authorize,
     "health.get": _health,
+    "host.operation_lock": _host_operation_lock,
     "inbox.clear": _inbox_clear,
     "inbox.delete": _inbox_delete,
     "inbox.query": _query_inbox,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,
     "notifications.pending": _notifications_pending,
+    "notifications.pending_under_host_lock": _notifications_pending_under_host_lock,
     "settings.get": _settings,
     "settings.update": _settings_update,
     "watcher.check": _check,

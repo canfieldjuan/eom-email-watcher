@@ -655,8 +655,12 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
     assert stale_runtime.store.recent(10) == []
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["notifications.pending", "notifications.pending_under_host_lock"],
+)
 def test_notifications_pending_purges_expired_intents_before_host_delivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, extra_settings="retention_days = 1")
@@ -684,12 +688,30 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
     )
     monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
 
-    response = engine_api._response(request(config_path, "notifications.pending"))
+    if operation == "notifications.pending_under_host_lock":
+        lock_path = engine_api._production_check_lock_path(runtime.config)
+        with engine_api.operation_lock(lock_path, "test operation busy"):
+            response = engine_api._response(request(config_path, operation))
+    else:
+        response = engine_api._response(request(config_path, operation))
 
     assert response["ok"] is True
     assert response["data"]["items"] == []
     assert runtime.store.notification_intents() == []
     assert runtime.store.recent(10) == []
+
+
+def test_host_operation_lock_returns_configured_database_lock_path(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    config = load_config(config_path)
+
+    response = engine_api._response(request(config_path, "host.operation_lock"))
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "path": str(config.database_file.with_name(f"{config.database_file.name}.check.lock"))
+    }
 
 
 def test_settings_reports_gateway_model_as_read_only_and_rejects_mutation(

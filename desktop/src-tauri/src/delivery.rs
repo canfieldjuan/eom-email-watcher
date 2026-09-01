@@ -6,18 +6,20 @@ use tauri_plugin_notification::NotificationExt;
 const DELIVERY_BATCH_LIMIT: u16 = 25;
 
 trait NotificationQueue {
+    #[cfg(test)]
     fn check(&self) -> Result<CheckResult, EngineError>;
     fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError>;
     fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError>;
 }
 
 impl NotificationQueue for Engine {
+    #[cfg(test)]
     fn check(&self) -> Result<CheckResult, EngineError> {
         self.check()
     }
 
     fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError> {
-        self.pending_notifications(limit)
+        self.pending_notifications_under_host_lock(limit)
     }
 
     fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -83,12 +85,20 @@ fn deliver_batch(
     Ok(DeliveryOutcome { delivered, failed })
 }
 
+#[cfg(test)]
 fn check_and_deliver(
     queue: &impl NotificationQueue,
     sink: &impl NotificationSink,
 ) -> Result<CoordinatedCheck, EngineError> {
     let check = queue.check();
     let delivery = deliver_batch(queue, sink);
+    coordinated_result(check, delivery)
+}
+
+fn coordinated_result(
+    check: Result<CheckResult, EngineError>,
+    delivery: Result<DeliveryOutcome, EngineError>,
+) -> Result<CoordinatedCheck, EngineError> {
     match check {
         Ok(check) => Ok(CoordinatedCheck {
             check,
@@ -134,7 +144,9 @@ impl NotificationDelivery {
         app: &AppHandle,
         engine: &Engine,
     ) -> Result<DeliveryOutcome, EngineError> {
-        self.run_exclusive(|| deliver_batch(engine, &TauriNotificationSink { app }))
+        self.run_exclusive(|| {
+            engine.run_with_operation_lock(|| deliver_batch(engine, &TauriNotificationSink { app }))
+        })
     }
 
     pub fn check_and_deliver(
@@ -142,7 +154,12 @@ impl NotificationDelivery {
         app: &AppHandle,
         engine: &Engine,
     ) -> Result<CoordinatedCheck, EngineError> {
-        self.run_exclusive(|| check_and_deliver(engine, &TauriNotificationSink { app }))
+        self.run_exclusive(|| {
+            let check = engine.check();
+            let delivery = engine
+                .run_with_operation_lock(|| deliver_batch(engine, &TauriNotificationSink { app }));
+            coordinated_result(check, delivery)
+        })
     }
 }
 

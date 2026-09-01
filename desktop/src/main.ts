@@ -959,6 +959,8 @@ function renderInbox(items: InboxItem[]): void {
   for (const item of items) {
     const card = document.createElement("li");
     card.className = "inbox-card";
+    card.inert = inboxMutationInFlight();
+    if (card.inert) card.setAttribute("aria-busy", "true");
     const priority = item.priority?.toLowerCase() ?? "untriaged";
     card.dataset.priority = ["urgent", "high", "normal", "low"].includes(priority)
       ? priority
@@ -1382,6 +1384,7 @@ async function clearInboxHistory(): Promise<void> {
   inboxClearInFlight = true;
   inboxRequestGeneration += 1;
   setInboxControlsBusy(true);
+  renderInbox(inboxItems);
   try {
     const deleted = await invoke<number>("inbox_clear");
     inboxItems = [];
@@ -1401,6 +1404,7 @@ async function clearInboxHistory(): Promise<void> {
   } finally {
     inboxClearInFlight = false;
     setInboxControlsBusy(false);
+    renderInbox(inboxItems);
   }
 }
 

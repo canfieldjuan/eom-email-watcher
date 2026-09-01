@@ -68,8 +68,17 @@ only to stderr.
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
 | `settings.get` | `{}` | Safe public settings, polling interval/support, and token-presence boolean |
 | `settings.update` | one or more safe setting fields | Persist and return safe desktop settings |
+| `host.operation_lock` | `{}` | Trusted-host-only canonical native operation-lock path |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
+| `notifications.pending_under_host_lock` | optional `limit` | Trusted-host-only intents while that lock is held |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
+
+`host.operation_lock` and `notifications.pending_under_host_lock` are a paired trusted-host
+interface. The first returns the configured operation-lock path; the second may be called only
+while the host holds that native exclusive lock. They let the desktop keep one cross-process lock
+across intent selection, platform delivery, and acknowledgement without exposing the path or the
+lock-aware operation to frontend code. Other callers use `notifications.pending`, which acquires
+the lock itself.
 
 `gmail.authorize` uses only the existing `gmail.readonly` authorization and never returns OAuth
 credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
@@ -238,11 +247,18 @@ IANA configuration keys work on Windows hosts that do not provide a system timez
 
 ## Native notification handoff
 
-`watcher.check` persists analysis without invoking `notify-send`. The host then:
+`watcher.check` persists analysis without invoking `notify-send`. The desktop host then:
 
-1. calls `notifications.pending`;
-2. sends each intent through the native platform notification API;
-3. calls `notifications.ack` only after the platform accepts it.
+1. resolves the canonical lock through `host.operation_lock`;
+2. acquires that native exclusive lock;
+3. calls `notifications.pending_under_host_lock`;
+4. sends each intent through the native platform notification API;
+5. calls `notifications.ack` only after the platform accepts it;
+6. releases the lock after the entire batch.
+
+The lock spans fetch through acknowledgement, so a concurrent CLI/systemd check, retention update,
+or local-history mutation cannot remove or replace the selected state between native display and
+acknowledgement. The standalone `notifications.pending` operation retains its self-locking behavior.
 
 An analysis acknowledgement must echo `message_id`, `kind`, and `analysis_at` from the pending
 intent. A fallback acknowledgement uses `message_id` and `kind`. Stale identities are rejected so
