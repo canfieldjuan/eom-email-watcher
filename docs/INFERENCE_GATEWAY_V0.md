@@ -225,6 +225,9 @@ Required rules:
 - `protocol_version`, `request_id`, `request_expires_at`, task ID/version, requirements, and
   generation payload are mandatory and bounded. The client chooses and durably records the immutable
   expiry before first submission; gateway task policy rejects expiries outside its allowed window.
+- `request_id` is the canonical lowercase UUIDv4 text form matching
+  `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`. Alternate or
+  percent-encoded forms are rejected, so the same value is unambiguous in JSON and a URL segment.
 - The request contains no `model`, worker URL, runtime command, lane name, user role, or routing
   override.
 - The gateway authorizes the task before queueing and rejects requirements unsupported by its
@@ -295,14 +298,19 @@ A successful first or exact-repeat acknowledgement returns HTTP 200:
 }
 ```
 
-The gateway accepts acknowledgement only from the credential identity that owns the reservation
-and only after that request reaches a terminal result. The first valid acknowledgement atomically
-records its disposition in the metadata tombstone and deletes the content-bearing result. Repeating
-the same acknowledgement is idempotent and returns the same HTTP 200 response while the tombstone
-exists; a conflicting disposition fails permanently with `acknowledgement_conflict` and does not
-change the first outcome. Acknowledging nonterminal work fails with `result_not_terminal`. An
-expired request whose tombstone remains returns `request_expired`; after bounded tombstone cleanup,
-an unknown ID returns `unknown_request`. Neither response can revive work or retain late output.
+The gateway accepts acknowledgement only from the credential identity that owns the reservation.
+Another valid credential receives `forbidden`; the gateway makes no state change or deletion, and
+the protected result remains available to its owner. The first valid acknowledgement of a terminal,
+unexpired result atomically records its disposition in the metadata tombstone and deletes the
+content-bearing result.
+
+Acknowledgement and expiry use one serialized state transition. If acknowledgement commits first,
+its tombstone disposition takes precedence over later wall-clock expiry: an exact repeat returns the
+same HTTP 200 response while that tombstone exists, even after request expiry, while a conflicting
+disposition fails permanently with `acknowledgement_conflict`. If expiry commits first, the request
+returns `request_expired` and cannot be acknowledged. A nonterminal, unexpired request returns
+`result_not_terminal`. After bounded tombstone cleanup, an unknown ID returns `unknown_request`.
+None of these responses can revive work or retain late output.
 
 ## Failure and scheduling contract
 
@@ -494,19 +502,23 @@ synthetic content only:
 12. an in-flight or ambiguous primary failure remains unresolved until the primary result is
     recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
     request proceed without duplicate worker execution;
-13. a lost response returns the protected result to the same credential/request after gateway
+13. request IDs accept only canonical URL-segment-safe UUIDv4 text, and mismatched or encoded
+    acknowledgement identifiers fail closed;
+14. a different valid credential cannot acknowledge or delete another credential's result, and the
+    owning credential can still retrieve the protected result afterward;
+15. a lost response returns the protected result to the same credential/request after gateway
     restart, and the authenticated acknowledgement operation atomically deletes that result content
-    while retaining its metadata tombstone; exact repeats are idempotent and conflicting
-    dispositions fail closed;
-14. an expired request terminalizes any in-flight attempt, never dispatches again, discards late
+    while retaining its metadata tombstone; exact repeats are idempotent, an acknowledged tombstone
+    wins over later expiry, and conflicting dispositions fail closed;
+16. an expired request terminalizes any in-flight attempt, never dispatches again, discards late
     output without recreating retained content, returns permanent `request_expired`, and permits
     only an explicit new-identity requeue;
-15. an application-validation rejection becomes terminal for its original identity, is
+17. an application-validation rejection becomes terminal for its original identity, is
     acknowledged to release the protected result, and permits only explicit new-identity requeue;
-16. authentication, authorization, request-contract, and output-validation failures do not trigger
+18. authentication, authorization, request-contract, and output-validation failures do not trigger
     fallback;
-17. stopping the gateway degrades only model-dependent actions in both applications;
-18. Connect discovery and each application's private persistence remain unchanged.
+19. stopping the gateway degrades only model-dependent actions in both applications;
+20. Connect discovery and each application's private persistence remain unchanged.
 
 Do not implement administrator UI, auto-discovery, additional runtime families, vision, or
 production cutover in that proof.
