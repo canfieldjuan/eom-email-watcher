@@ -49,6 +49,7 @@ only to stderr.
 | `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
 | `gmail.authorize` | `{}` | Run the configured read-only Gmail OAuth flow and initialize a new mailbox baseline when required |
 | `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
+| `inbox.query` | optional bounded `limit`, opaque `cursor`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `analysis.requeue` | `message_id` | Explicitly requeue one permanently paused analysis with a fresh request identity |
 | `attachment.export` | `message_id`, `part_id`, `destination_dir` | Fetch one inventoried attachment into a private random file for a trusted host |
@@ -141,6 +142,16 @@ existing read-only Gmail authorization, rejects a byte-count mismatch, and creat
 mode-0600 file that uses at most a validated alphanumeric extension from the email filename. The
 response path is host-only; the Tauri command opens it natively and does not return it to frontend
 JavaScript.
+
+`inbox.query` is the desktop Inbox read contract. It returns at most 100 rows ordered by
+`received_at DESC, message_id DESC`; its opaque cursor preserves that ordering when timestamps are
+equal. Optional filters are combined with `AND`: sender matches literal case-insensitive text in
+the address or display name, keyword matches literal case-insensitive text in subject or summary,
+and priority, category, and status use fixed values. `untriaged` and `unclassified` select missing
+priority and category values. Filtering and pagination read only local SQLite state and never call
+Gmail, inference, or a Connect provider. Rows include their existing category plus ordered
+attachment and durable capability-result metadata. `inbox.recent` remains available for existing
+CLI and host compatibility.
 
 Inbox rows also expose `analysis_retryable`, `analysis_error_code`, and
 `analysis_retry_after_seconds`. A retryable gateway failure remains scheduled in the durable
