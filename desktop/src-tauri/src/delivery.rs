@@ -9,6 +9,7 @@ trait NotificationQueue {
     #[cfg(test)]
     fn check(&self) -> Result<CheckResult, EngineError>;
     fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError>;
+    fn pending_count(&self) -> Result<u64, EngineError>;
     fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError>;
 }
 
@@ -20,6 +21,10 @@ impl NotificationQueue for Engine {
 
     fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError> {
         self.pending_notifications_under_host_lock(limit)
+    }
+
+    fn pending_count(&self) -> Result<u64, EngineError> {
+        self.pending_notification_count_under_host_lock()
     }
 
     fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -56,6 +61,7 @@ impl NotificationSink for TauriNotificationSink<'_> {
 pub struct DeliveryOutcome {
     pub delivered: u64,
     pub failed: u64,
+    pub remaining: u64,
 }
 
 #[derive(Debug)]
@@ -82,7 +88,12 @@ fn deliver_batch(
         }
         delivered += 1;
     }
-    Ok(DeliveryOutcome { delivered, failed })
+    let remaining = queue.pending_count()?;
+    Ok(DeliveryOutcome {
+        delivered,
+        failed,
+        remaining,
+    })
 }
 
 #[cfg(test)]
@@ -174,6 +185,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         intents: Vec<NotificationIntent>,
         check_error: bool,
+        check_pending: u64,
     }
 
     impl NotificationQueue for FakeQueue {
@@ -189,13 +201,24 @@ mod tests {
                 fallback_notified: 0,
                 purged: 0,
                 stale_cursor_recovered: false,
-                pending_notifications: self.intents.len() as u64,
+                pending_notifications: self.check_pending,
             })
         }
 
         fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError> {
             assert_eq!(limit, DELIVERY_BATCH_LIMIT);
             Ok(self.intents.clone())
+        }
+
+        fn pending_count(&self) -> Result<u64, EngineError> {
+            let acknowledged = self
+                .events
+                .lock()
+                .expect("events lock")
+                .iter()
+                .filter(|event| **event == "acknowledge")
+                .count();
+            Ok(self.intents.len().saturating_sub(acknowledged) as u64)
         }
 
         fn acknowledge(&self, _intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -240,6 +263,7 @@ mod tests {
             events: events.clone(),
             intents: vec![intent("message-1")],
             check_error: false,
+            check_pending: 1,
         };
         let sink = FakeSink {
             events: events.clone(),
@@ -250,7 +274,8 @@ mod tests {
             deliver_batch(&queue, &sink).expect("delivery succeeds"),
             DeliveryOutcome {
                 delivered: 1,
-                failed: 0
+                failed: 0,
+                remaining: 0,
             }
         );
         assert_eq!(
@@ -266,6 +291,7 @@ mod tests {
             events: events.clone(),
             intents: vec![intent("message-1")],
             check_error: false,
+            check_pending: 1,
         };
         let sink = FakeSink {
             events: events.clone(),
@@ -276,7 +302,8 @@ mod tests {
             deliver_batch(&queue, &sink).expect("batch remains available"),
             DeliveryOutcome {
                 delivered: 0,
-                failed: 1
+                failed: 1,
+                remaining: 1,
             }
         );
         assert_eq!(*events.lock().expect("events lock"), ["show"]);
@@ -289,6 +316,7 @@ mod tests {
             events: events.clone(),
             intents: vec![intent("blocked"), intent("deliverable")],
             check_error: false,
+            check_pending: 2,
         };
         let sink = FakeSink {
             events: events.clone(),
@@ -299,7 +327,8 @@ mod tests {
             deliver_batch(&queue, &sink).expect("batch remains available"),
             DeliveryOutcome {
                 delivered: 1,
-                failed: 1
+                failed: 1,
+                remaining: 1,
             }
         );
         assert_eq!(
@@ -315,6 +344,7 @@ mod tests {
             events: events.clone(),
             intents: vec![intent("queued")],
             check_error: true,
+            check_pending: 1,
         };
         let sink = FakeSink {
             events: events.clone(),
@@ -327,6 +357,26 @@ mod tests {
             *events.lock().expect("events lock"),
             ["check", "show", "acknowledge"]
         );
+    }
+
+    #[test]
+    fn reports_post_delivery_count_instead_of_the_check_snapshot() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let queue = FakeQueue {
+            events: events.clone(),
+            intents: vec![intent("still-current")],
+            check_error: false,
+            check_pending: 2,
+        };
+        let sink = FakeSink {
+            events,
+            failed_message: None,
+        };
+
+        let outcome = check_and_deliver(&queue, &sink).expect("check and delivery succeed");
+
+        assert_eq!(outcome.check.pending_notifications, 2);
+        assert_eq!(outcome.delivery.remaining, 0);
     }
 
     #[test]

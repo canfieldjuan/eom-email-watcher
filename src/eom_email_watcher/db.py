@@ -50,7 +50,7 @@ def _suppression_expiry(received_at: str, now: datetime) -> str:
         if received.tzinfo is None:
             raise ValueError("received_at must include a timezone")
         received = received.astimezone(UTC)
-    except ValueError:
+    except (OverflowError, ValueError):
         received = now
     # A future-dated source message must not create an effectively unbounded marker.
     return (min(received, now) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()

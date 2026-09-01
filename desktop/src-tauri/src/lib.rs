@@ -547,15 +547,11 @@ async fn watcher_check(
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let outcome = delivery.check_and_deliver(&app, &engine)?;
-        let remaining_notifications = outcome
-            .check
-            .pending_notifications
-            .saturating_sub(outcome.delivery.delivered);
         Ok(DesktopCheckResult {
             check: outcome.check,
             delivered_notifications: outcome.delivery.delivered,
             failed_notifications: outcome.delivery.failed,
-            remaining_notifications,
+            remaining_notifications: outcome.delivery.remaining,
         })
     })
     .await
@@ -674,8 +670,8 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(move || {
                 match startup_delivery.deliver(&startup_app, &startup_engine) {
                     Ok(outcome) if outcome.failed > 0 => eprintln!(
-                        "{} watcher startup notifications remain queued after delivery errors",
-                        outcome.failed
+                        "{} watcher startup notification deliveries failed; {} remain queued",
+                        outcome.failed, outcome.remaining
                     ),
                     Ok(_) => {}
                     Err(error) => {

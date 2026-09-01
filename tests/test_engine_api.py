@@ -688,10 +688,14 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
     )
     monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
 
+    count_response = None
     if operation == "notifications.pending_under_host_lock":
         lock_path = engine_api._production_check_lock_path(runtime.config)
         with engine_api.operation_lock(lock_path, "test operation busy"):
             response = engine_api._response(request(config_path, operation))
+            count_response = engine_api._response(
+                request(config_path, "notifications.count_under_host_lock")
+            )
     else:
         response = engine_api._response(request(config_path, operation))
 
@@ -699,6 +703,8 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
     assert response["data"]["items"] == []
     assert runtime.store.notification_intents() == []
     assert runtime.store.recent(10) == []
+    if count_response is not None:
+        assert count_response["data"] == {"count": 0}
 
 
 def test_host_operation_lock_returns_configured_database_lock_path(tmp_path: Path) -> None:
@@ -1103,7 +1109,7 @@ def test_watchlist_mutation_preserves_existing_configuration_errors(
     assert removed["error"]["code"] == "configuration_error"
 
 
-def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
+def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -1124,11 +1130,15 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
         "from_token",
         lambda *args: (_ for _ in ()).throw(AssertionError("Gmail must not be called")),
     )
-    monkeypatch.setattr(
-        engine_api,
-        "operation_lock_supported",
-        lambda: (_ for _ in ()).throw(AssertionError("No lock is needed while inactive")),
-    )
+    lock_paths: list[Path] = []
+
+    @contextmanager
+    def acquired_lock(lock_path: Path, _busy_message: str):
+        lock_paths.append(lock_path)
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", acquired_lock)
 
     response = engine_api._response(request(config_path, "watcher.check"))
 
@@ -1141,6 +1151,7 @@ def test_zero_sender_check_is_inactive_without_gmail_or_initialization(
         "stale_cursor_recovered": False,
         "summarized": 0,
     }
+    assert lock_paths == [engine_api._production_check_lock_path(runtime.config)]
 
 
 def test_zero_sender_check_still_rejects_incompatible_host_delivery(

@@ -336,11 +336,11 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "pending_notifications": _host_notification_intent_count(active_runtime),
         }
 
-    if dry_run or not runtime.config.senders:
+    if dry_run:
         return run(runtime)
 
     lock_path = _production_check_lock_path(runtime.config)
-    if not dry_run and not operation_lock_supported(lock_path):
+    if not operation_lock_supported(lock_path):
         raise ApiError(
             "unsupported_platform",
             "Production watcher checks require native operation locking",
@@ -1584,6 +1584,14 @@ def _notifications_pending_under_host_lock(
     return {"items": _pending_notification_payloads(_runtime(request), limit)}
 
 
+def _notifications_count_under_host_lock(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    runtime = _runtime(request)
+    _require_host_delivery_compatible(runtime)
+    runtime.store.purge(runtime.config.retention_days)
+    return {"count": _host_notification_intent_count(runtime)}
+
+
 def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id", "kind", "analysis_at"})
     message_id = payload.get("message_id")
@@ -1632,6 +1640,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "inbox.query": _query_inbox,
     "inbox.recent": _recent,
     "notifications.ack": _notifications_ack,
+    "notifications.count_under_host_lock": _notifications_count_under_host_lock,
     "notifications.pending": _notifications_pending,
     "notifications.pending_under_host_lock": _notifications_pending_under_host_lock,
     "settings.get": _settings,

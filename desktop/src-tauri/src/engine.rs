@@ -664,6 +664,11 @@ struct NotificationItems {
 }
 
 #[derive(Deserialize)]
+struct NotificationCount {
+    count: u64,
+}
+
+#[derive(Deserialize)]
 struct NotificationAcknowledgement {
     status: String,
 }
@@ -1023,6 +1028,11 @@ impl Engine {
             json!({"limit": limit}),
         )
         .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notification_count_under_host_lock(&self) -> Result<u64, EngineError> {
+        self.request::<NotificationCount>("notifications.count_under_host_lock", json!({}))
+            .map(|data| data.count)
     }
 
     pub fn acknowledge_notification(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -1859,11 +1869,16 @@ notifications_enabled = true
         assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);
-        assert!(
+        assert_eq!(
             engine
-                .run_with_operation_lock(|| engine.pending_notifications_under_host_lock(25))
-                .expect("host lock must permit lock-aware notification reads")
-                .is_empty()
+                .run_with_operation_lock(|| {
+                    Ok((
+                        engine.pending_notifications_under_host_lock(25)?,
+                        engine.pending_notification_count_under_host_lock()?,
+                    ))
+                })
+                .expect("host lock must permit lock-aware notification reads"),
+            (vec![], 0)
         );
         assert_eq!(
             engine

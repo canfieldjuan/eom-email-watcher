@@ -71,14 +71,16 @@ only to stderr.
 | `host.operation_lock` | `{}` | Trusted-host-only canonical native operation-lock path |
 | `notifications.pending` | optional `limit` | Durable native-notification intents |
 | `notifications.pending_under_host_lock` | optional `limit` | Trusted-host-only intents while that lock is held |
+| `notifications.count_under_host_lock` | `{}` | Trusted-host-only authoritative post-delivery queue count |
 | `notifications.ack` | intent identity fields | State-checked, idempotent delivery acknowledgement |
 
-`host.operation_lock` and `notifications.pending_under_host_lock` are a paired trusted-host
-interface. The first returns the configured operation-lock path; the second may be called only
-while the host holds that native exclusive lock. They let the desktop keep one cross-process lock
-across intent selection, platform delivery, and acknowledgement without exposing the path or the
-lock-aware operation to frontend code. Other callers use `notifications.pending`, which acquires
-the lock itself.
+`host.operation_lock`, `notifications.pending_under_host_lock`, and
+`notifications.count_under_host_lock` are a trusted-host interface. The first returns the
+configured operation-lock path; the notification operations may be called only while the host holds
+that native exclusive lock. They let the desktop keep one cross-process lock across intent
+selection, platform delivery, acknowledgement, and the final queue count without exposing the path
+or lock-aware operations to frontend code. Other callers use `notifications.pending`, which
+acquires the lock itself.
 
 `gmail.authorize` uses only the existing `gmail.readonly` authorization and never returns OAuth
 credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
@@ -254,7 +256,8 @@ IANA configuration keys work on Windows hosts that do not provide a system timez
 3. calls `notifications.pending_under_host_lock`;
 4. sends each intent through the native platform notification API;
 5. calls `notifications.ack` only after the platform accepts it;
-6. releases the lock after the entire batch.
+6. reads the authoritative remaining count through `notifications.count_under_host_lock`;
+7. releases the lock after the entire batch.
 
 The lock spans fetch through acknowledgement, so a concurrent CLI/systemd check, retention update,
 or local-history mutation cannot remove or replace the selected state between native display and

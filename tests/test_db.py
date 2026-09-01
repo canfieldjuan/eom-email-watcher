@@ -446,6 +446,30 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     assert "m1" not in suppression
 
 
+def test_delete_message_bounds_suppression_when_source_time_conversion_overflows(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="overflowing-source-time",
+        thread_id=None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="Malformed source time",
+        received_at="0001-01-01T00:00:00+23:59",
+    )
+    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
+
+    assert store.delete_message("overflowing-source-time", now=now)
+
+    with store.connection() as db:
+        expires_at = db.execute(
+            "SELECT expires_at FROM suppressed_messages"
+        ).fetchone()[0]
+    assert expires_at == (now + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
+
+
 def test_clear_messages_preserves_mailbox_and_outbound_state(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
