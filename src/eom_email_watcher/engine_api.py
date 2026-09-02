@@ -33,7 +33,7 @@ from .config import (
     remove_sender,
     update_settings,
 )
-from .db import ConnectJob, ConnectOutput, NotificationIntent, Store
+from .db import ConnectJob, ConnectOutput, MessageSource, NotificationIntent, Store
 from .gmail import (
     GmailAuthorizationRejected,
     GmailError,
@@ -507,7 +507,7 @@ def _write_capability_output(destination: Path, content: bytes) -> Path:
     return _write_private_file(destination, "email-watcher-output-", ".bin", content)
 
 
-def _configured_attachment_source(runtime: Runtime, message_id: str) -> tuple[MailboxGateway, str]:
+def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSource:
     try:
         source = runtime.store.message_source(message_id)
     except KeyError as exc:
@@ -518,10 +518,14 @@ def _configured_attachment_source(runtime: Runtime, message_id: str) -> tuple[Ma
             "account_unavailable",
             "The message's mailbox account is not available in this application version.",
         )
+    return source
+
+
+def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
     mailbox = load_configured_mailbox(runtime.config)
-    if (mailbox.provider, mailbox.account_id) != (configured_provider, configured_account_id):
+    if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Configured mailbox identity changed while opening the provider")
-    return mailbox.gateway, source.provider_message_id
+    return mailbox.gateway
 
 
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
@@ -538,8 +542,13 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    gateway, provider_message_id = _configured_attachment_source(runtime, message_id)
-    content = gateway.attachment_bytes(provider_message_id, part_id, attachment.attachment_id)
+    source = _configured_message_source(runtime, message_id)
+    gateway = _configured_mailbox_gateway(runtime, source)
+    content = gateway.attachment_bytes(
+        source.provider_message_id,
+        part_id,
+        attachment.attachment_id,
+    )
     if len(content) != attachment.byte_size:
         raise MailboxError("Mailbox attachment size did not match stored metadata")
     try:
@@ -578,6 +587,7 @@ def _connect_attachment_capabilities(request: dict[str, object]) -> dict[str, ob
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
+    _configured_message_source(runtime, message_id)
     catalog = connect.discover_capabilities()
     items = catalog.compatible(attachment.media_type, attachment.byte_size)
     return {
@@ -1171,6 +1181,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
+    source = _configured_message_source(runtime, message_id)
     provider_ref, capability_ref, requested_parameters, confirmed = _generic_invocation_selection(
         payload
     )
@@ -1201,9 +1212,9 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     def attachment_content() -> bytes:
         nonlocal cached_content
         if cached_content is None:
-            gateway, provider_message_id = _configured_attachment_source(runtime, message_id)
+            gateway = _configured_mailbox_gateway(runtime, source)
             cached_content = gateway.attachment_bytes(
-                provider_message_id,
+                source.provider_message_id,
                 part_id,
                 attachment.attachment_id,
             )
@@ -1303,6 +1314,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
+    source = _configured_message_source(runtime, message_id)
     if not connect.capability_matches_attachment(attachment.media_type, attachment.byte_size):
         raise ApiError("unsupported_attachment", "This attachment is not a supported PDF")
 
@@ -1381,8 +1393,12 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
 
     if attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    gateway, provider_message_id = _configured_attachment_source(runtime, message_id)
-    content = gateway.attachment_bytes(provider_message_id, part_id, attachment.attachment_id)
+    gateway = _configured_mailbox_gateway(runtime, source)
+    content = gateway.attachment_bytes(
+        source.provider_message_id,
+        part_id,
+        attachment.attachment_id,
+    )
     if len(content) != attachment.byte_size:
         raise MailboxError("Mailbox attachment size did not match stored metadata")
     if job is None:

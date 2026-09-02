@@ -1063,6 +1063,87 @@ def test_attachment_export_rejects_an_unconfigured_account_before_provider_acces
     assert list(destination.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("operation", "operation_payload"),
+    [
+        (
+            "connect.attachment.capabilities",
+            {"message_id": "MESSAGE_ID", "part_id": "2"},
+        ),
+        (
+            "connect.attachment.invoke",
+            {
+                "request_id": "11111111-1111-4111-8111-111111111111",
+                "message_id": "MESSAGE_ID",
+                "part_id": "2",
+                "provider": {
+                    "app_id": "provider",
+                    "version": "1.0.0",
+                    "instance_id": "provider-instance",
+                },
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "parameters": {},
+                "confirmed": False,
+            },
+        ),
+        (
+            "connect.attachment.summarize",
+            {"message_id": "MESSAGE_ID", "part_id": "2"},
+        ),
+    ],
+)
+def test_connect_paths_reject_an_unconfigured_account_before_provider_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    operation_payload: dict[str, object],
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
+    runtime.store.add_message(
+        message_id=local_message_id,
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id="provider-message",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Attachment",
+        received_at="2026-07-18T14:00:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        local_message_id,
+        (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 4, 0),),
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_provider_interaction(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("An unavailable mailbox must be rejected before provider interaction")
+
+    monkeypatch.setattr(engine_api, "load_configured_mailbox", reject_provider_interaction)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_provider_interaction)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        reject_provider_interaction,
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "require_connect_entitlement",
+        reject_provider_interaction,
+    )
+    payload = {
+        key: local_message_id if value == "MESSAGE_ID" else value
+        for key, value in operation_payload.items()
+    }
+
+    response = engine_api._response(request(config_path, operation, payload))
+
+    assert response["error"]["code"] == "account_unavailable"
+
+
 def test_attachment_export_fails_closed_before_gmail_or_file_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
