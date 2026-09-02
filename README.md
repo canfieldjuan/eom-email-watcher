@@ -1,43 +1,44 @@
 # EOM Email Watcher
 
-A private, local-first Gmail watcher for Effingham Office Maids. It checks Gmail every two
-hours, selects messages only from an exact sender allowlist, asks a local LM Studio model for
-a short structured summary, and sends a Linux desktop notification (and, optionally, a phone
-push via [ntfy](https://ntfy.sh)).
+A private, local-first watched-sender email application. It checks one selected Gmail or Microsoft
+365 mailbox, selects messages only from an exact sender allowlist, asks a configured local model for
+a short structured summary, and sends a desktop notification (and, optionally, a phone push via
+[ntfy](https://ntfy.sh)).
 
-Email content is never sent to a cloud model. The Gmail grant is read-only, attachment content is
+Email content is never sent to a cloud model. Mailbox grants are read-only, attachment content is
 downloaded only when the user explicitly opens it or requests an available local capability,
 non-matching message metadata is not stored, and message bodies are discarded after each local
 inference request.
 
 ## Behavior
 
-- Starts at the current Gmail `historyId`; setup does not backfill old mail.
-- Polls Gmail History for `messageAdded` events in `INBOX`.
+- Starts at the provider's current cursor; setup does not backfill old mail.
+- Polls Gmail History or Microsoft Graph inbox delta for newly created messages.
 - Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
 - Fetches message bodies only after a sender matches.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
-- Records attachment filenames, Gmail part/attachment IDs, media types, and byte sizes. An explicit
-  Open action fetches only that attachment into a mode-0600 process-owned temporary file.
+- Records attachment filenames, provider-owned attachment IDs, media types, and byte sizes. An
+  explicit Open action fetches only that attachment into a mode-0600 process-owned temporary file.
 - With an active paid Connect entitlement, discovers the provider-neutral `document.summarize`
   capability at runtime. For a compatible PDF, an explicit Summarize action fetches only that
   attachment and streams its bytes to the selected authenticated exact-loopback provider. It does
-  not transfer mailbox paths, sender, subject, message ID, email body, or Gmail credentials.
+  not transfer mailbox paths, sender, subject, message ID, email body, or mailbox credentials.
 - Stores message metadata, attachment metadata, and model summaries in SQLite for 180 days. Bodies
   are never stored.
 - Deduplicates by mail provider, local account, and provider message ID. Existing single-account
   Gmail history retains its original local identifiers during the offline schema migration.
-- Recovers an expired History cursor with an exact-sender search beginning five minutes before the
-  last successful check, then saves a fresh cursor.
-- If LM Studio is unavailable or times out, sends one metadata-only fallback notification and
-  retries the summary later with backoff.
+- Recovers an expired provider cursor beginning five minutes before the last successful check,
+  bounded by retention, then saves a fresh cursor. Exact sender admission still occurs locally.
+- If the configured model endpoint is unavailable or times out, sends one metadata-only fallback
+  notification and retries the summary later with backoff.
 
 ## Requirements
 
 - Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
 - LM Studio `llmster` with its API bound to `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
-- A Google Workspace or Gmail account and a Google Cloud Desktop OAuth client
+- A Gmail/Google Workspace account with a Google Desktop OAuth client, or a Microsoft 365 work or
+  school account with an Entra public desktop-client registration
 - Optional: an [ntfy](https://ntfy.sh) topic for phone push notifications alongside the desktop
   one -- set `ntfy_topic`/`ntfy_url` in `config.toml` (see `config.example.toml`)
 
@@ -105,6 +106,29 @@ The browser consent request asks only for
 `https://www.googleapis.com/auth/gmail.readonly`. The token is stored mode `0600`. Setup saves the
 current Gmail cursor, so only future arrivals are processed.
 
+## Microsoft 365 read-only OAuth setup
+
+Microsoft 365 uses the same native **Add account** control in the desktop Health view. A release
+build may embed this non-secret public-client file; a source build can place it at
+`~/.local/state/eom-email-watcher/microsoft-oauth-client.json`:
+
+```json
+{
+  "client_id": "00000000-0000-0000-0000-000000000001",
+  "tenant": "organizations"
+}
+```
+
+The Entra registration must be a public mobile/desktop client, allow the `http://localhost`
+redirect URI, and have delegated Microsoft Graph `Mail.Read` permission. `tenant` may be
+`organizations` for a multi-tenant work/school release or one tenant UUID. Client secrets are
+rejected: desktop public clients cannot keep one, and this file is reusable application identity,
+not a user grant. The browser flow stores each user's MSAL cache only in private local account
+state. It requests no `Mail.ReadWrite`, `Mail.Send`, or application permission. Setup records a
+local start boundary without importing existing mail; the first watcher check completes that delta
+round and later checks persist Graph's opaque delta URL. This keeps mail that arrives while account
+setup is finishing inside the normal exact-sender gate.
+
 ## Commands
 
 ```bash
@@ -115,7 +139,8 @@ uv run eom-mail-watch recent --limit 20
 uv run eom-mail-watch requeue-analysis MESSAGE_ID
 ```
 
-`--dry-run` does not advance the Gmail cursor, add database rows, or send real notifications.
+`--dry-run` does not advance the active mailbox cursor, add database rows, or send real
+notifications.
 
 Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
@@ -127,14 +152,13 @@ health status, a safe one-shot `Check now` action, and
 contextual local capabilities for attachments. Its Debian package includes the Python engine as a
 Tauri sidecar, so the installed application does not depend on a source checkout or `uv`. It still
 requires an existing private config; see [`desktop/README.md`](desktop/README.md). A release build
-may include an approved Google Desktop OAuth client identity; source and development builds without
-one require an externally configured desktop OAuth credentials file. In either case, Health can run
-the existing read-only browser authorization, list retained accounts, connect or reconnect Gmail
-accounts, disconnect only their local read token, and explicitly choose the one account polled by
-the watcher. Account tokens remain in the user's private local state, and disconnecting an account
-does not remove its local Inbox history or the separate EOM send authorization. Gmail is the only
-selectable provider in the current build; the account contract is provider-neutral so another
-adapter can join without changing the Inbox or account UI. The app does not replace the systemd
+may include approved Google and Microsoft public desktop-client identities; source and development
+builds without them require the corresponding external client files. In either case, Health can run
+the read-only browser authorization, list retained accounts, connect or reconnect Gmail and
+Microsoft 365 accounts, disconnect only their local read token/cache, and explicitly choose the one
+account polled by the watcher. Account tokens remain in the user's private local state, and disconnecting an account
+does not remove its local Inbox history or the separate EOM send authorization. Both adapters use
+the same provider-neutral account and Inbox UI. The app does not replace the systemd
 scheduler or the existing CLI's optional ntfy delivery.
 
 ## Local Connect capability
@@ -144,8 +168,8 @@ providers only when this installation has an active signed entitlement containin
 `connect.capability_exchange`. One provider produces a normal action; multiple providers produce
 an explicit native picker. The host revalidates both entitlement and the exact provider,
 capability version, parameters, size, and effect confirmation before handoff. Denied invocation
-stops before Gmail attachment download or Connect-job persistence. Actions disappear when the
-entitlement expires or providers stop, while Gmail monitoring and the rest of the desktop remain
+stops before source attachment download or Connect-job persistence. Actions disappear when the
+entitlement expires or providers stop, while mailbox monitoring and the rest of the desktop remain
 usable. Completed persisted results remain readable. Jobs, results, errors, and complete
 provider/input/output provenance remain in Email Watcher's private SQLite database under a stable
 caller request ID.
@@ -155,7 +179,7 @@ On Linux, the entitlement is read on every discovery/invocation from
 `$HOME/.config/local-connect/entitlement-v1.json` when `XDG_CONFIG_HOME` is unset or empty. The directory
 must be owner-only mode `700`; the regular non-symlink file must be owner-only mode `600`. Validity
 is exact (`issued_at <= not_before <= now < expires_at`) with no hidden grace. Replacing the file with a valid
-signed entitlement restores capability discovery without restarting Email Watcher. Gmail OAuth is
+signed entitlement restores capability discovery without restarting Email Watcher. Mailbox OAuth is
 not a Connect license and is never shared with a provider.
 
 The desktop Health view reports only the license state and whether Connect is active. Its
@@ -199,7 +223,7 @@ activation contract.
 
 ## Two-hour user timer
 
-After Gmail setup succeeds:
+After mailbox setup succeeds:
 
 ```bash
 ./scripts/install-user-services.sh
@@ -220,8 +244,8 @@ suggested action, deadline text/date, and confidence. The prompt treats the enti
 untrusted data and denies instructions embedded in it. A model-proposed deadline before the
 message date is removed while its original deadline text remains available for human review.
 
-The local model has no Gmail tools and cannot send, delete, label, archive, or reply to mail. This
-project requests no Gmail write scope.
+The local model has no mailbox tools and cannot send, delete, label, archive, or reply to mail. The
+watcher requests no mailbox write scope.
 
 ## Monthly Firefly hours request
 

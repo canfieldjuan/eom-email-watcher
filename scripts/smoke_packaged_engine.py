@@ -126,6 +126,14 @@ def smoke_packaged_engine(binary: Path) -> None:
         )
         if health["data"].get("watchlist_count") != 0:
             raise PackagedEngineSmokeError("Packaged engine health did not report zero senders")
+        mail = health["data"].get("mail")
+        providers = mail.get("providers") if isinstance(mail, dict) else None
+        if not isinstance(providers, list) or "microsoft365" not in {
+            item.get("provider") for item in providers if isinstance(item, dict)
+        }:
+            raise PackagedEngineSmokeError(
+                "Packaged engine did not advertise the Microsoft 365 provider"
+            )
 
         inactive_check = _request(
             isolated_binary,

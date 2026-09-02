@@ -80,6 +80,7 @@ class Config:
     retention_days: int
     poll_interval_minutes: int
     gmail_credentials_file: Path
+    microsoft_credentials_file: Path
     gmail_token_file: Path
     gmail_send_token_file: Path
     monthly_hours_recipient: str | None
@@ -341,6 +342,13 @@ def load_config(path: Path | None = None) -> Config:
         gmail_credentials_file=_path(
             data.get("gmail_credentials_file", DEFAULT_STATE / "credentials.json"),
             "gmail_credentials_file",
+        ),
+        microsoft_credentials_file=_path(
+            data.get(
+                "microsoft_credentials_file",
+                DEFAULT_STATE / "microsoft-oauth-client.json",
+            ),
+            "microsoft_credentials_file",
         ),
         gmail_token_file=_path(
             data.get("gmail_token_file", DEFAULT_STATE / "token.json"),

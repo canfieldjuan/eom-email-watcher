@@ -143,6 +143,93 @@ def test_oauth_build_input_rejects_non_desktop_shapes(
         build_desktop_sidecar.validate_oauth_client(path)
 
 
+def _write_microsoft_oauth_client(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "client_id": "11111111-2222-4333-8444-555555555555",
+                "tenant": "organizations",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_microsoft_oauth_build_input_accepts_public_client_without_secrets(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "microsoft.json"
+    _write_microsoft_oauth_client(path)
+
+    build_desktop_sidecar.validate_microsoft_oauth_client(path)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "client_id": "11111111-2222-4333-8444-555555555555",
+            "tenant": "organizations",
+            "client_secret": "must-not-ship",
+        },
+        {"client_id": "not-a-uuid", "tenant": "organizations"},
+        {"client_id": "11111111-2222-4333-8444-555555555555", "tenant": "common"},
+    ],
+)
+def test_microsoft_oauth_build_input_rejects_secret_or_invalid_shapes(
+    tmp_path: Path,
+    document: object,
+) -> None:
+    path = tmp_path / "microsoft.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError):
+        build_desktop_sidecar.validate_microsoft_oauth_client(path)
+
+
+def test_sidecar_build_stages_microsoft_public_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "microsoft.json"
+    _write_microsoft_oauth_client(source)
+    build_directory = tmp_path / "build"
+    output_directory = tmp_path / "output"
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "determine_target_triple",
+        lambda: "x86_64-unknown-linux-gnu",
+    )
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.delenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", raising=False)
+    monkeypatch.setenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", str(source))
+
+    def run(arguments: list[str], **kwargs):
+        calls.append(arguments)
+        if "PyInstaller" in arguments:
+            built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
+            built.write_bytes(b"engine")
+        return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", run)
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    add_data = [
+        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    ]
+    assert len(add_data) == 1
+    staged_source, destination = add_data[0].rsplit(":", 1)
+    assert Path(staged_source).name == "microsoft-oauth-client.json"
+    assert destination == "eom_email_watcher_data"
+    assert not Path(staged_source).exists()
+
+
 def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
     path = tmp_path / "keyring.json"
     public_key = base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode("ascii")
@@ -183,6 +270,7 @@ def test_windows_build_rejects_connect_keyring_before_packaging(
         lambda: "x86_64-pc-windows-msvc",
     )
     monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
     monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(tmp_path / "keyring.json"))
 
     with pytest.raises(
