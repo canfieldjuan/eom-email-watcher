@@ -52,8 +52,8 @@ from .mailbox import (
 from .runtime import (
     MAIL_PROVIDER_NAMES,
     Runtime,
-    configured_mailbox_identity,
     load_configured_mailbox,
+    load_mailbox_account,
     load_runtime,
     mail_account_connected,
     mail_account_token_file,
@@ -318,6 +318,24 @@ def _authorize_gmail_account(
     *,
     reuse_valid_token: bool,
 ) -> dict[str, object]:
+    if account is None:
+        legacy = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+        if legacy is not None and legacy.address is None:
+            legacy_token = mail_account_token_file(runtime.config, legacy)
+            if legacy_token.is_file():
+                try:
+                    legacy_profile = GmailGateway.from_token(
+                        runtime.config.gmail_credentials_file, legacy_token
+                    ).profile()
+                except GmailAuthorizationRejected:
+                    pass
+                else:
+                    runtime.store.update_mail_account_identity(
+                        legacy.provider,
+                        legacy.account_id,
+                        display_name=MAIL_PROVIDER_NAMES[legacy.provider],
+                        address=legacy_profile.email_address,
+                    )
     token_file = mail_account_token_file(runtime.config, account) if account else None
     if (
         account is not None
@@ -797,8 +815,8 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
         source = runtime.store.message_source(message_id)
     except KeyError as exc:
         raise ApiError("not_found", "Message was not found") from exc
-    configured_provider, configured_account_id = configured_mailbox_identity(runtime.store)
-    if source.provider != configured_provider or source.account_id != configured_account_id:
+    account = runtime.store.mail_account(source.provider, source.account_id)
+    if account is None or not mail_account_connected(runtime.config, account):
         raise ApiError(
             "account_unavailable",
             "The message's mailbox account is not available in this application version.",
@@ -807,9 +825,14 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
 
 
 def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
-    mailbox = load_configured_mailbox(runtime.config, runtime.store)
+    mailbox = load_mailbox_account(
+        runtime.config,
+        runtime.store,
+        source.provider,
+        source.account_id,
+    )
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
-        raise RuntimeError("Configured mailbox identity changed while opening the provider")
+        raise RuntimeError("Mailbox identity changed while opening the provider")
     return mailbox.gateway
 
 

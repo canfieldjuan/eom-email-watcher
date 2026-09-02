@@ -20,7 +20,6 @@ from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
     MailboxChanges,
-    MailboxSession,
     MessageContent,
     scoped_message_id,
 )
@@ -936,6 +935,58 @@ def test_mail_account_connect_reuses_matching_account_without_duplicate(
     assert len(runtime.store.mail_accounts()) == 1
 
 
+def test_mail_account_connect_reuses_verified_legacy_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
+    runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
+
+    class ExistingGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "authorized-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("replacement token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert response["data"]["account"]["account_id"] == "gmail-default"
+    assert runtime.store.active_mail_account().address == "owner@example.com"
+    assert runtime.store.state()[0] == "legacy-cursor"
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "replacement token"
+    assert len(runtime.store.mail_accounts()) == 1
+
+
 def test_mail_account_connect_keeps_unidentified_legacy_history_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1398,17 +1449,28 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
     assert listed["data"]["items"] == []
 
 
-def test_attachment_export_uses_stored_identity_and_safe_private_path(
+def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
+    runtime.config.gmail_token_file.write_text("source token", encoding="utf-8")
+    active_account = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'a' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+    active_token = mail_account_token_file(runtime.config, active_account)
+    active_token.parent.mkdir(parents=True)
+    active_token.write_text("active token", encoding="utf-8")
+    local_message_id = scoped_message_id("gmail", "gmail-default", "provider-message")
     runtime.store.add_message(
         message_id=local_message_id,
-        provider="microsoft365",
-        account_id="account-2",
+        provider="gmail",
+        account_id="gmail-default",
         provider_message_id="provider-message",
         thread_id=None,
         sender="a@example.com",
@@ -1438,21 +1500,14 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
             )
             return b"%PDF"
 
+    opened_tokens: list[Path] = []
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda _credentials, token: opened_tokens.append(token) or FakeAttachmentGmail(),
+    )
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
-    monkeypatch.setattr(
-        engine_api,
-        "configured_mailbox_identity",
-        lambda _config: ("microsoft365", "account-2"),
-    )
-    monkeypatch.setattr(
-        engine_api,
-        "load_configured_mailbox",
-        lambda _config, _store: MailboxSession(
-            "microsoft365",
-            "account-2",
-            FakeAttachmentGmail(),
-        ),
-    )
 
     response = engine_api._response(
         request(
@@ -1467,6 +1522,8 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
     )
 
     assert response["ok"] is True
+    assert runtime.store.active_mail_account().account_id == active_account.account_id
+    assert opened_tokens == [runtime.config.gmail_token_file]
     exported = Path(response["data"]["path"])
     assert exported.parent == destination.resolve()
     assert exported.name.startswith("email-watcher-attachment-")
@@ -1509,8 +1566,8 @@ def test_attachment_export_rejects_an_unconfigured_account_before_provider_acces
     monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
     monkeypatch.setattr(
         engine_api,
-        "load_configured_mailbox",
-        lambda _config, _store: pytest.fail("An unavailable account must not be opened"),
+        "load_mailbox_account",
+        lambda *_args: pytest.fail("An unavailable account must not be opened"),
     )
 
     response = engine_api._response(
@@ -1588,7 +1645,7 @@ def test_connect_paths_reject_an_unconfigured_account_before_provider_interactio
     def reject_provider_interaction(*_args: object, **_kwargs: object) -> None:
         pytest.fail("An unavailable mailbox must be rejected before provider interaction")
 
-    monkeypatch.setattr(engine_api, "load_configured_mailbox", reject_provider_interaction)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_interaction)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_provider_interaction)
     monkeypatch.setattr(
         engine_api.connect,

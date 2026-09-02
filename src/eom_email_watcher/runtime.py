@@ -57,6 +57,26 @@ def configured_mailbox_identity(store: Store) -> tuple[str, str]:
     return account.provider, account.account_id
 
 
+def load_mailbox_account(
+    config: Config,
+    store: Store,
+    provider: str,
+    account_id: str,
+) -> MailboxSession:
+    """Load one persisted mailbox account without changing the polling selection."""
+    account = store.mail_account(provider, account_id)
+    if account is None:
+        raise MailboxAccountUnavailable("The selected email account is not configured")
+    token_file = mail_account_token_file(config, account)
+    if not token_file.is_file():
+        raise MailboxAccountUnavailable("The selected email account is disconnected")
+    return MailboxSession(
+        account.provider,
+        account.account_id,
+        GmailGateway.from_token(config.gmail_credentials_file, token_file),
+    )
+
+
 def load_configured_mailbox(config: Config, store: Store) -> MailboxSession:
     """Load the currently configured mailbox behind the provider-neutral boundary."""
     account = store.active_mail_account()
@@ -65,11 +85,7 @@ def load_configured_mailbox(config: Config, store: Store) -> MailboxSession:
     token_file = mail_account_token_file(config, account)
     if not token_file.is_file():
         raise MailboxAccountUnavailable("The active email account is disconnected")
-    return MailboxSession(
-        account.provider,
-        account.account_id,
-        GmailGateway.from_token(config.gmail_credentials_file, token_file),
-    )
+    return load_mailbox_account(config, store, account.provider, account.account_id)
 
 
 def load_runtime(config_path: Path) -> Runtime:
