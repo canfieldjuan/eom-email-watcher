@@ -1607,11 +1607,37 @@ function renderInboxAccountOptions(): void {
   inboxAccountSelect.value = values.has(previous) ? previous : "active";
 }
 
-function renderMailAccounts(data: MailAccounts): void {
+function reconcileInboxAccountScope(): boolean {
+  const selected = selectedInboxAccount();
+  if (
+    activeInboxQuery.provider === selected.provider &&
+    activeInboxQuery.account_id === selected.account_id
+  ) {
+    return false;
+  }
+
+  activeInboxQuery = {
+    ...activeInboxQuery,
+    provider: selected.provider,
+    account_id: selected.account_id,
+  };
+  inboxRequestGeneration += 1;
+  inboxItems = [];
+  inboxNextCursor = null;
+  inboxCapabilityUnavailableCount = 0;
+  clearMessageOwnedUiState();
+  inboxLoadMore.hidden = true;
+  renderInbox(inboxItems);
+  inboxStatus.textContent = "Active email account changed. Refreshing local history…";
+  delete inboxStatus.dataset.kind;
+  return true;
+}
+
+function renderMailAccounts(data: MailAccounts): boolean {
   mailProviders = data.providers;
   mailAccounts = data.accounts;
   renderInboxAccountOptions();
-  activeInboxQuery = { ...activeInboxQuery, ...selectedInboxAccount() };
+  const inboxScopeChanged = reconcileInboxAccountScope();
   mailAccountList.replaceChildren();
   mailProviderActions.replaceChildren();
 
@@ -1682,6 +1708,7 @@ function renderMailAccounts(data: MailAccounts): void {
     connect.addEventListener("click", () => void connectMailProvider(provider.provider));
     mailProviderActions.append(connect);
   }
+  return inboxScopeChanged;
 }
 
 async function refreshAfterMailMutation(message: string): Promise<void> {
@@ -1907,7 +1934,8 @@ function renderHealthUnknown(): void {
 }
 
 function renderHealth(health: HealthStatus): void {
-  renderMailAccounts(health.mail);
+  const inboxScopeChanged = renderMailAccounts(health.mail);
+  if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
   const activeAccount = health.mail.accounts.find((account) => account.active);
   const activeProvider = activeAccount
     ? health.mail.providers.find((provider) => provider.provider === activeAccount.provider)
