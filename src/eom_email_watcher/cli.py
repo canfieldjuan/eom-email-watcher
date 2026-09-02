@@ -127,17 +127,27 @@ def _doctor(config_path: Path) -> int:
 
 
 def _setup(config_path: Path) -> int:
-    from .engine_api import dispatch
+    from .engine_api import ApiError, dispatch
 
     config, _store, _model = _runtime(config_path)
-    authorization = dispatch(
-        {
-            "protocol": 1,
-            "operation": "gmail.authorize",
-            "config_path": str(config_path),
-            "payload": {},
-        }
-    )
+    request = {
+        "protocol": 1,
+        "operation": "gmail.authorize",
+        "config_path": str(config_path),
+        "payload": {},
+    }
+    try:
+        authorization = dispatch(request)
+    except ApiError as exc:
+        if exc.code != "account_identity_unverified":
+            raise
+        authorization = dispatch(
+            {
+                **request,
+                "operation": "mail.accounts.connect",
+                "payload": {"provider": "gmail"},
+            }
+        )
     if config.notifications_enabled:
         try:
             delivery = send_fallback(

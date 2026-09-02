@@ -1045,6 +1045,20 @@ function renderInbox(items: InboxItem[]): void {
       senderAddress.textContent = item.sender;
       senderIdentity.append(senderAddress);
     }
+    if (activeInboxQuery.provider === null && activeInboxQuery.account_id === null) {
+      const account = mailAccounts.find(
+        (candidate) =>
+          candidate.provider === item.provider && candidate.account_id === item.account_id,
+      );
+      const provider = mailProviders.find((candidate) => candidate.provider === item.provider);
+      const sourceAccount = document.createElement("span");
+      sourceAccount.textContent = `Mailbox: ${
+        account?.address ||
+        (account ? `${account.display_name} · ${account.account_id}` : undefined) ||
+        `${provider?.display_name || item.provider} · ${item.account_id}`
+      }`;
+      senderIdentity.append(sourceAccount);
+    }
     const received = document.createElement("time");
     received.dateTime = item.received_at;
     received.textContent = receivedLabel(item.received_at);

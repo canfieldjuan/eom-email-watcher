@@ -7,6 +7,7 @@ import pytest
 
 from eom_email_watcher import cli
 from eom_email_watcher.db import Store
+from eom_email_watcher.engine_api import ApiError
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
 
 
@@ -43,6 +44,34 @@ def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch,
     output = capsys.readouterr()
     assert "ntfy delivery failed: ConnectError" in output.err
     assert "Baseline initialized" in output.out
+
+
+def test_setup_connects_a_replacement_for_unidentified_migrated_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SimpleNamespace(
+        notifications_enabled=False,
+        ntfy_topic=None,
+        ntfy_url="https://ntfy.sh",
+    )
+    operations: list[str] = []
+
+    def dispatch(request: dict[str, object]) -> dict[str, object]:
+        operation = str(request["operation"])
+        operations.append(operation)
+        if operation == "gmail.authorize":
+            raise ApiError(
+                "account_identity_unverified",
+                "The existing mailbox identity cannot be verified; connect it as a new account",
+            )
+        assert request["payload"] == {"provider": "gmail"}
+        return {"baseline_initialized": True, "account": {"connected": True}}
+
+    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr("eom_email_watcher.engine_api.dispatch", dispatch)
+
+    assert cli._setup(tmp_path / "config.toml") == 0
+    assert operations == ["gmail.authorize", "mail.accounts.connect"]
 
 
 def _check_config(tmp_path: Path) -> SimpleNamespace:
