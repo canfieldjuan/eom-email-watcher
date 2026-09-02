@@ -38,6 +38,7 @@ from .db import ConnectJob, ConnectOutput, MailAccount, MessageSource, Notificat
 from .gmail import (
     TOKEN_LOCK_TIMEOUT_SECONDS,
     GmailAuthorizationRejected,
+    GmailError,
     GmailGateway,
     gmail_credentials_configured,
 )
@@ -49,6 +50,10 @@ from .mailbox import (
     MailboxError,
     MailboxGateway,
 )
+from .microsoft365 import (
+    MICROSOFT365_PROVIDER,
+    Microsoft365Gateway,
+)
 from .runtime import (
     MAIL_PROVIDER_NAMES,
     Runtime,
@@ -57,6 +62,7 @@ from .runtime import (
     load_runtime,
     mail_account_connected,
     mail_account_token_file,
+    mail_provider_connection_available,
 )
 from .service import Watcher
 
@@ -264,13 +270,11 @@ def _mail_accounts_public(runtime: Runtime) -> dict[str, object]:
         "accounts": [_mail_account_public(runtime, account) for account in accounts],
         "providers": [
             {
-                "connection_available": (
-                    gmail_credentials_configured(runtime.config.gmail_credentials_file)
-                    if provider == DEFAULT_MAIL_PROVIDER
-                    else False
+                "connection_available": mail_provider_connection_available(
+                    runtime.config, provider
                 ),
                 "display_name": display_name,
-                "multiple_accounts": provider == DEFAULT_MAIL_PROVIDER,
+                "multiple_accounts": True,
                 "provider": provider,
             }
             for provider, display_name in sorted(MAIL_PROVIDER_NAMES.items())
@@ -372,7 +376,7 @@ def _authorize_gmail_account(
                     address=current_profile.email_address,
                 )
             if reuse_valid_token and current_profile.email_address == account.address:
-                return _finish_gmail_authorization(runtime, account, current_profile.history_id)
+                return _finish_mail_authorization(runtime, account, current_profile.history_id)
 
     authorization_parent = (
         token_file.parent if token_file is not None else runtime.config.database_file.parent
@@ -436,26 +440,114 @@ def _authorize_gmail_account(
     )
     if activate_after_connect and not account.active:
         account = runtime.store.activate_mail_account(account.provider, account.account_id)
-    return _finish_gmail_authorization(runtime, account, profile.history_id)
+    return _finish_mail_authorization(runtime, account, profile.history_id)
 
 
-def _finish_gmail_authorization(
+def _finish_mail_authorization(
     runtime: Runtime,
     account: MailAccount,
-    history_id: str,
+    cursor: str,
 ) -> dict[str, object]:
     initialize_baseline = (
         runtime.store.state(provider=account.provider, account_id=account.account_id) is None
     )
     if initialize_baseline:
         runtime.store.set_state(
-            history_id,
+            cursor,
             provider=account.provider,
             account_id=account.account_id,
         )
     return {
         "account": _mail_account_public(runtime, account),
         "baseline_initialized": initialize_baseline,
+    }
+
+
+def _authorize_microsoft_account(
+    runtime: Runtime,
+    account: MailAccount | None,
+) -> dict[str, object]:
+    connect_request = account is None
+    if (
+        account is not None
+        and account.address is None
+        and runtime.store.mail_account_has_history(account.provider, account.account_id)
+    ):
+        raise ApiError(
+            "account_identity_unverified",
+            "The existing mailbox identity cannot be verified; connect it as a new account",
+        )
+
+    authorization_parent = (
+        mail_account_token_file(runtime.config, account).parent
+        if account is not None
+        else runtime.config.database_file.parent
+    )
+    authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(
+        prefix=".microsoft365-authorization-",
+        dir=authorization_parent,
+    ) as directory:
+        staged_token = Path(directory) / "msal-cache.json"
+        microsoft, _changed = Microsoft365Gateway.authorize_with_status(
+            runtime.config.microsoft_credentials_file,
+            staged_token,
+            force_reauthorize=True,
+        )
+        profile = microsoft.profile()
+
+        if account is None:
+            account = runtime.store.mail_account_by_address(
+                MICROSOFT365_PROVIDER,
+                profile.email_address,
+            )
+        elif account.address is not None and profile.email_address != account.address:
+            raise ApiError(
+                "account_identity_mismatch",
+                "The authorized mailbox does not match the selected email account",
+            )
+
+        initialize_baseline = (
+            account is None
+            or runtime.store.state(
+                provider=account.provider,
+                account_id=account.account_id,
+            )
+            is None
+        )
+        baseline = microsoft.initial_cursor() if initialize_baseline else None
+
+        activate_after_connect = False
+        if connect_request:
+            active = runtime.store.active_mail_account()
+            activate_after_connect = active is None or not mail_account_connected(
+                runtime.config, active
+            )
+        if account is None:
+            account = runtime.store.register_mail_account(
+                MICROSOFT365_PROVIDER,
+                f"microsoft365-{uuid.uuid4().hex}",
+                display_name=MAIL_PROVIDER_NAMES[MICROSOFT365_PROVIDER],
+                address=profile.email_address,
+                active=False,
+            )
+        token_file = mail_account_token_file(runtime.config, account)
+        _install_private_token(staged_token, token_file)
+
+    account = runtime.store.update_mail_account_identity(
+        account.provider,
+        account.account_id,
+        display_name=MAIL_PROVIDER_NAMES[account.provider],
+        address=profile.email_address,
+    )
+    if activate_after_connect and not account.active:
+        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+    if initialize_baseline:
+        assert baseline is not None
+        return _finish_mail_authorization(runtime, account, baseline)
+    return {
+        "account": _mail_account_public(runtime, account),
+        "baseline_initialized": False,
     }
 
 
@@ -554,9 +646,11 @@ def _mail_account_connect(request: dict[str, object]) -> dict[str, object]:
     provider = _mail_provider(payload.get("provider"))
 
     def connect(runtime: Runtime) -> dict[str, object]:
-        if provider != DEFAULT_MAIL_PROVIDER:
-            raise ApiError("unsupported_provider", "That email provider is not available")
-        return _authorize_gmail_account(runtime, None, reuse_valid_token=False)
+        if provider == DEFAULT_MAIL_PROVIDER:
+            return _authorize_gmail_account(runtime, None, reuse_valid_token=False)
+        if provider == MICROSOFT365_PROVIDER:
+            return _authorize_microsoft_account(runtime, None)
+        raise ApiError("unsupported_provider", "That email provider is not available")
 
     return _with_mail_account_mutation(request, connect)
 
@@ -569,7 +663,11 @@ def _mail_account_reconnect(request: dict[str, object]) -> dict[str, object]:
         account = runtime.store.mail_account(provider, account_id)
         if account is None:
             raise ApiError("not_found", "The email account was not found")
-        return _authorize_gmail_account(runtime, account, reuse_valid_token=False)
+        if provider == DEFAULT_MAIL_PROVIDER:
+            return _authorize_gmail_account(runtime, account, reuse_valid_token=False)
+        if provider == MICROSOFT365_PROVIDER:
+            return _authorize_microsoft_account(runtime, account)
+        raise ApiError("unsupported_provider", "That email provider is not available")
 
     return _with_mail_account_mutation(request, reconnect)
 
@@ -2057,14 +2155,23 @@ def _response(request: object) -> dict[str, object]:
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
         }
-    except MailboxError as exc:
-        # Gmail remains the only configured adapter in this slice, so preserve the
-        # established public error envelope while the host boundary is generalized.
+    except GmailError as exc:
         logger.warning("Gmail operation failed: %s", exc)
         return {
             "error": {
                 "code": "gmail_error",
                 "message": "Gmail operation failed; see stderr for details",
+            },
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except MailboxError as exc:
+        logger.warning("Mailbox operation failed: %s", exc)
+        return {
+            "error": {
+                "code": "mailbox_error",
+                "message": "Email provider operation failed; see stderr for details",
             },
             "ok": False,
             "operation": operation,

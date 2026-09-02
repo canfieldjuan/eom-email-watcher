@@ -100,6 +100,20 @@ def validate_oauth_client(path: Path) -> None:
         raise SidecarBuildError("Google OAuth Desktop client input must not contain account tokens")
 
 
+def validate_microsoft_oauth_client(path: Path) -> None:
+    if not path.is_file():
+        raise SidecarBuildError("Microsoft OAuth public-client file is not a regular file")
+    from eom_email_watcher.microsoft365 import (
+        MicrosoftConfigurationError,
+        load_microsoft_public_client,
+    )
+
+    try:
+        load_microsoft_public_client(path)
+    except MicrosoftConfigurationError as exc:
+        raise SidecarBuildError(str(exc)) from exc
+
+
 def validate_entitlement_keyring(path: Path) -> None:
     if not path.is_file():
         raise SidecarBuildError("Connect entitlement public-key ring is not a regular file")
@@ -198,6 +212,21 @@ def build_sidecar() -> Path:
             )
             pyinstaller_arguments.extend(
                 ["--add-data", f"{staged_oauth}:eom_email_watcher_data"]
+            )
+
+        microsoft_source_value = os.environ.get("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE")
+        if microsoft_source_value:
+            microsoft_source = Path(microsoft_source_value)
+            validate_microsoft_oauth_client(microsoft_source)
+            staged_microsoft = stack.enter_context(
+                _staged_build_input(
+                    microsoft_source,
+                    "microsoft-oauth-client.json",
+                    "microsoft-oauth-client.",
+                )
+            )
+            pyinstaller_arguments.extend(
+                ["--add-data", f"{staged_microsoft}:eom_email_watcher_data"]
             )
 
         keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")

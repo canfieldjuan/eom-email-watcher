@@ -38,7 +38,7 @@ Success and error responses are deterministic JSON objects:
 
 Exit status is `0` for success and `2` for a handled error. Requests are limited to 1 MB. Unknown
 top-level and payload fields are rejected. Responses never contain OAuth tokens, model token
-contents, token paths, the ntfy topic, or raw email bodies. Detailed Gmail diagnostics are written
+contents, token paths, the ntfy topic, or raw email bodies. Detailed mailbox diagnostics are written
 only to stderr.
 
 ## Operations
@@ -88,8 +88,8 @@ or lock-aware operations to frontend code. Other callers use `notifications.pend
 acquires the lock itself.
 
 The `mail.accounts.*` operations are the provider-neutral desktop account contract. The current
-build advertises Gmail and supports multiple retained Gmail identities, with exactly one active
-polling account. Connect and reconnect stage authorization in private temporary storage, verify the
+build advertises Gmail and Microsoft 365 and supports multiple retained identities, with exactly one
+active polling account. Connect and reconnect stage authorization in private temporary storage, verify the
 provider-reported mailbox identity, and only then atomically replace the internally derived token
 file. Reconnect refuses an authorization for a different address. A new account receives its own
 private token path; paths and token contents never enter the response. Disconnect removes only the
@@ -115,6 +115,17 @@ succeeds. A locally valid token is also probed against Gmail; an HTTP 401 trigge
 reauthorization path, while other Gmail errors remain failures. The browser helper's authorization
 prompt is suppressed because stdout is reserved exclusively for the JSON engine envelope. This
 operation does not expose or request the separate EOM `gmail.send` capability.
+
+Microsoft 365 connect/reconnect uses an MSAL public desktop client and delegated Graph `Mail.Read`
+only. The application identity comes from a strict non-secret JSON file containing `client_id` and
+either `organizations` or one tenant UUID; account grants are stored in a per-account private MSAL
+cache. Authorization derives mailbox attribution from MSAL's authenticated account and persists a
+local start boundary. The first watcher check completes the initial inbox delta round, so arrivals
+during setup are admitted normally; subsequent checks persist Graph's complete opaque delta URL.
+Every continuation is restricted to HTTPS on `graph.microsoft.com` and the expected folder-message
+delta path before the bearer token is attached. Graph immutable IDs are requested on every call.
+Cursor expiry enters the shared retention-bounded recovery path, and the shared watcher performs
+metadata-only exact-sender admission before body or attachment retrieval.
 
 `connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than
 Connect wire routes. They do not load watcher configuration or private mailbox state. Status
@@ -158,7 +169,7 @@ inference configuration is read-only through this operation. Mutation uses the s
 same-directory atomic replacement as watchlist updates and preserves all unrelated TOML fields and
 comments. Empty payloads, unknown fields, wrong types, unsafe values, and attempts to mutate
 gateway-managed model settings return `invalid_request` without changing the file. Backend choice,
-credentials, token paths, Gmail settings, timezone, and EOM outbound configuration are not mutable
+credentials, token paths, mailbox settings, timezone, and EOM outbound configuration are not mutable
 through this operation. When retention is included, the engine serializes the settings write with
 watcher checks and applies the resulting source-time cutoff to SQLite before returning.
 
@@ -166,10 +177,10 @@ Each inbox item identifies its source mail `provider` and local `account_id` and
 `attachments` array. An attachment contains the provider's opaque `part_id`,
 optional opaque `attachment_id`, display `filename`, `media_type`, and `byte_size`. The engine
 persists this inventory before local-model analysis, so a temporary inference failure does not lose
-the user's attachment list. Attachment bytes remain in Gmail and are not fetched or stored by this
-operation. The trusted desktop host may call `attachment.export` with its private absolute temporary
+the user's attachment list. Attachment bytes remain at the source provider and are not fetched or
+stored by this operation. The trusted desktop host may call `attachment.export` with its private absolute temporary
 directory. The engine resolves only an attachment already inventoried for that message, uses the
-existing read-only Gmail authorization, rejects a byte-count mismatch, and creates a random
+existing read-only source-mail authorization, rejects a byte-count mismatch, and creates a random
 mode-0600 file that uses at most a validated alphanumeric extension from the email filename. The
 response path is host-only; the Tauri command opens it natively and does not return it to frontend
 JavaScript.
@@ -189,9 +200,9 @@ CLI and host compatibility.
 operation lock as watcher checks, delete message rows transactionally, and rely on the existing
 message-delete triggers to remove attachment inventory and Connect jobs/results. Notification
 state is stored on the deleted message row. Mailbox cursor state and the isolated EOM outbound-send
-ledger remain intact, and neither operation constructs a Gmail gateway. A bounded SHA-256
+ledger remain intact, and neither operation constructs a mailbox gateway. A bounded SHA-256
 suppression marker prevents a later history replay from restoring manually deleted rows; it stores
-no sender, subject, body, attachment, provider result, or raw Gmail message ID and expires once the
+no sender, subject, body, attachment, provider result, or raw provider message ID and expires once the
 message is older than the maximum supported retention window.
 
 Schema v10 adds the local mail-account registry and seeds the existing Gmail identity as the active

@@ -145,6 +145,7 @@ def config(tmp_path: Path) -> Config:
         retention_days=180,
         poll_interval_minutes=120,
         gmail_credentials_file=tmp_path / "credentials.json",
+        microsoft_credentials_file=tmp_path / "microsoft-oauth-client.json",
         gmail_token_file=tmp_path / "token.json",
         gmail_send_token_file=tmp_path / "send-token.json",
         monthly_hours_recipient="maria@example.com",
@@ -195,6 +196,7 @@ def test_watcher_scopes_sync_and_source_fetch_to_mailbox_session(
     assert item["message_id"] == local_id
     assert item["provider"] == "microsoft365"
     assert item["account_id"] == "account-2"
+    assert gateway.full_payload_calls == 1
     assert store.message_source(local_id).provider_message_id == "allowed"
     assert store.state(provider="microsoft365", account_id="account-2")[0] == "200"
     assert store.state() is None

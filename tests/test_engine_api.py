@@ -23,6 +23,7 @@ from eom_email_watcher.mailbox import (
     MessageContent,
     scoped_message_id,
 )
+from eom_email_watcher.microsoft365 import Microsoft365Error, Microsoft365Profile
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
@@ -40,6 +41,7 @@ def write_config(
     ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
     notifications_setting = str(notifications_enabled).lower()
     credentials_file = (path.parent / "credentials.json").as_posix()
+    microsoft_credentials_file = (path.parent / "microsoft-oauth-client.json").as_posix()
     token_file = (path.parent / "token.json").as_posix()
     send_token_file = (path.parent / "send-token.json").as_posix()
     database_file = (path.parent / "watcher.sqlite3").as_posix()
@@ -58,6 +60,7 @@ name = "Trusted A"
     path.write_text(
         f'''timezone = "{timezone}"
 gmail_credentials_file = "{credentials_file}"
+microsoft_credentials_file = "{microsoft_credentials_file}"
 gmail_token_file = "{token_file}"
 gmail_send_token_file = "{send_token_file}"
 database_file = "{database_file}"
@@ -723,7 +726,13 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
                 "display_name": "Gmail",
                 "multiple_accounts": True,
                 "provider": "gmail",
-            }
+            },
+            {
+                "connection_available": False,
+                "display_name": "Microsoft 365",
+                "multiple_accounts": True,
+                "provider": "microsoft365",
+            },
         ],
     }
     encoded = json.dumps(response)
@@ -778,6 +787,236 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
     assert runtime.store.active_mail_account().address == "owner@example.com"
     assert runtime.store.state()[0] == "current-cursor"
     assert "private readonly token" not in json.dumps(response)
+
+
+def test_mail_account_list_advertises_valid_microsoft_public_client_without_exposing_it(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    public_client = tmp_path / "microsoft-oauth-client.json"
+    public_client.write_text(
+        json.dumps(
+            {
+                "client_id": "11111111-2222-4333-8444-555555555555",
+                "tenant": "organizations",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    response = engine_api._response(request(config_path, "mail.accounts.list"))
+
+    microsoft = next(
+        item for item in response["data"]["providers"] if item["provider"] == "microsoft365"
+    )
+    assert microsoft == {
+        "connection_available": True,
+        "display_name": "Microsoft 365",
+        "multiple_accounts": True,
+        "provider": "microsoft365",
+    }
+    encoded = json.dumps(response)
+    assert "11111111-2222-4333-8444-555555555555" not in encoded
+    assert "microsoft-oauth-client.json" not in encoded
+    assert str(tmp_path) not in encoded
+
+
+def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    class AuthorizedMicrosoft:
+        def profile(self) -> Microsoft365Profile:
+            return Microsoft365Profile("owner@example.com")
+
+        def initial_cursor(self) -> str:
+            return "https://graph.microsoft.com/private-delta-cursor"
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedMicrosoft, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("private Microsoft cache", encoding="utf-8")
+        return AuthorizedMicrosoft(), True
+
+    monkeypatch.setattr(
+        engine_api.Microsoft365Gateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "microsoft365"})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is True
+    account_response = response["data"]["account"]
+    assert account_response["provider"] == "microsoft365"
+    assert account_response["address"] == "owner@example.com"
+    assert account_response["connected"] is True
+    assert account_response["active"] is True
+    runtime = load_runtime(config_path)
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.provider == "microsoft365"
+    assert account.account_id.startswith("microsoft365-")
+    token_file = mail_account_token_file(runtime.config, account)
+    assert token_file.read_text(encoding="utf-8") == "private Microsoft cache"
+    assert token_file.stat().st_mode & 0o777 == 0o600
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        "https://graph.microsoft.com/private-delta-cursor"
+    )
+    encoded = json.dumps(response)
+    assert "private Microsoft cache" not in encoded
+    assert "private-delta-cursor" not in encoded
+
+
+def test_mail_account_reconnect_rejects_different_microsoft_identity_before_cache_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'b' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    token_file = mail_account_token_file(runtime.config, account)
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text("preserved cache", encoding="utf-8")
+    runtime.store.set_state(
+        "preserved cursor",
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+
+    class WrongMicrosoft:
+        def profile(self) -> Microsoft365Profile:
+            return Microsoft365Profile("other@example.com")
+
+        def initial_cursor(self) -> str:
+            pytest.fail("Identity mismatch must fail before baseline access")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        staged_token: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[WrongMicrosoft, bool]:
+        staged_token.write_text("wrong cache", encoding="utf-8")
+        return WrongMicrosoft(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.Microsoft365Gateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["error"]["code"] == "account_identity_mismatch"
+    assert token_file.read_text(encoding="utf-8") == "preserved cache"
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        "preserved cursor"
+    )
+    assert list(tmp_path.glob(".microsoft365-authorization-*")) == []
+
+
+def test_mail_account_connect_reuses_and_activates_known_disconnected_microsoft_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    existing = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'c' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=False,
+    )
+    runtime.store.set_state(
+        "preserved cursor",
+        provider=existing.provider,
+        account_id=existing.account_id,
+    )
+
+    class AuthorizedMicrosoft:
+        def profile(self) -> Microsoft365Profile:
+            return Microsoft365Profile("owner@example.com")
+
+        def initial_cursor(self) -> str:
+            pytest.fail("A reused account must preserve its existing baseline")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedMicrosoft, bool]:
+        token_file.write_text("replacement cache", encoding="utf-8")
+        return AuthorizedMicrosoft(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.Microsoft365Gateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "microsoft365"})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["account"]["account_id"] == existing.account_id
+    assert response["data"]["account"]["active"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert len(runtime.store.mail_accounts()) == 2
+    assert runtime.store.state(provider=existing.provider, account_id=existing.account_id)[0] == (
+        "preserved cursor"
+    )
+
+
+def test_microsoft_provider_error_uses_generic_secret_free_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    def reject(*args, **kwargs):
+        raise Microsoft365Error("provider detail with private-token-value")
+
+    monkeypatch.setattr(engine_api.Microsoft365Gateway, "authorize_with_status", reject)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "microsoft365"})
+    )
+
+    assert response["error"] == {
+        "code": "mailbox_error",
+        "message": "Email provider operation failed; see stderr for details",
+    }
+    assert "private-token-value" not in json.dumps(response)
 
 
 def test_mail_account_reconnect_rejects_different_identity_before_replacing_token(

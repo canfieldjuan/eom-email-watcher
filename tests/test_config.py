@@ -41,6 +41,7 @@ model_name = "local-model"
 model_api_token_file = "{(path.parent / "lm-token").as_posix()}"
 database_file = "{(path.parent / "db.sqlite3").as_posix()}"
 gmail_credentials_file = "{(path.parent / "credentials.json").as_posix()}"
+microsoft_credentials_file = "{(path.parent / "microsoft-oauth-client.json").as_posix()}"
 gmail_token_file = "{(path.parent / "token.json").as_posix()}"
 {extra}
 {sender}
