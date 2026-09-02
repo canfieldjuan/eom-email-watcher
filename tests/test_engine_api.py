@@ -723,6 +723,10 @@ def test_mail_account_reconnect_rejects_different_identity_before_replacing_toke
     )
     runtime.config.gmail_token_file.write_text("preserved token", encoding="utf-8")
 
+    class ExistingGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
     class WrongGmail:
         def profile(self) -> GmailProfile:
             return GmailProfile("other@example.com", "other-cursor")
@@ -736,6 +740,11 @@ def test_mail_account_reconnect_rejects_different_identity_before_replacing_toke
         token_file.write_text("wrong account token", encoding="utf-8")
         return WrongGmail(), force_reauthorize
 
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
+    )
     monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
 
     response = engine_api._response(
