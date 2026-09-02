@@ -13,19 +13,19 @@ from eom_email_watcher.config import load_config
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
+    GmailProfile,
     MessageMetadata,
 )
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
     MailboxChanges,
-    MailboxSession,
     MessageContent,
     scoped_message_id,
 )
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
-from eom_email_watcher.runtime import Runtime, load_runtime
+from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 
 def write_config(
@@ -294,6 +294,36 @@ def test_health_recognizes_bundled_desktop_oauth_client(
     assert health["data"]["gmail"]["credentials_configured"] is True
 
 
+def test_legacy_gmail_health_reports_only_the_active_account_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("retained token", encoding="utf-8")
+    disconnected = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'b' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert runtime.store.active_mail_account() == disconnected
+    assert health["data"]["gmail"]["connected"] is False
+    assert [
+        account["connected"]
+        for account in health["data"]["mail"]["accounts"]
+        if account["account_id"] == "gmail-default"
+    ] == [True]
+
+
 def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
     config_path = tmp_path / "new" / "config.toml"
 
@@ -390,14 +420,20 @@ def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
     write_config(config_path)
 
     class AuthorizedGmail:
-        def profile_history_id(self) -> str:
-            return "private-history-id"
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "private-history-id")
 
-    monkeypatch.setattr(
-        engine_api.GmailGateway,
-        "authorize_with_status",
-        lambda credentials_file, token_file: (AuthorizedGmail(), True),
-    )
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("readonly token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
 
@@ -411,6 +447,49 @@ def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
     assert load_runtime(config_path).store.state()[0] == "private-history-id"
 
 
+def test_gmail_authorize_compatibility_targets_the_active_generated_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("retained legacy token", encoding="utf-8")
+    active = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'c' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("active@example.com", "active-history-id")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("active account token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    assert mail_account_token_file(runtime.config, active).read_text(encoding="utf-8") == (
+        "active account token"
+    )
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "retained legacy token"
+    assert runtime.store.state(provider=active.provider, account_id=active.account_id)[0] == (
+        "active-history-id"
+    )
+
+
 def test_gmail_authorize_preserves_existing_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -421,13 +500,13 @@ def test_gmail_authorize_preserves_existing_baseline(
     runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
 
     class ExistingGmail:
-        def profile_history_id(self) -> str:
-            return "current-probe-history-id"
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-probe-history-id")
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
-        "authorize_with_status",
-        lambda credentials_file, token_file: (ExistingGmail(), False),
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
     )
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
@@ -443,22 +522,33 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
     write_config(config_path)
     runtime = load_runtime(config_path)
     runtime.store.set_state("old-history-id", datetime(2026, 7, 18, tzinfo=UTC))
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.config.gmail_token_file.write_text("rejected token", encoding="utf-8")
     authorization_calls: list[bool] = []
 
     class RejectedGmail:
-        def profile_history_id(self) -> str:
+        def profile(self) -> GmailProfile:
             raise GmailAuthorizationRejected("rejected")
 
     class ReauthorizedGmail:
-        def profile_history_id(self) -> str:
-            return "new-history-id"
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "new-history-id")
 
     def authorize_with_status(credentials_file, token_file, *, force_reauthorize: bool = False):
         authorization_calls.append(force_reauthorize)
-        if force_reauthorize:
-            return ReauthorizedGmail(), True
-        return RejectedGmail(), False
+        token_file.write_text("replacement token", encoding="utf-8")
+        return ReauthorizedGmail(), True
 
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: RejectedGmail(),
+    )
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "authorize_with_status",
@@ -467,9 +557,55 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
 
-    assert response["data"] == {"baseline_initialized": True, "connected": True}
-    assert authorization_calls == [False, True]
-    assert load_runtime(config_path).store.state()[0] == "new-history-id"
+    assert response["data"] == {"baseline_initialized": False, "connected": True}
+    assert authorization_calls == [True]
+    assert load_runtime(config_path).store.state()[0] == "old-history-id"
+
+
+def test_gmail_authorize_preserves_token_on_transient_profile_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.config.gmail_token_file.write_text("valid token", encoding="utf-8")
+
+    class UnavailableGmail:
+        def profile(self) -> GmailProfile:
+            raise GmailError("Gmail profile request failed (HTTP 429)")
+
+    authorization_calls = 0
+
+    def authorize_with_status(*args, **kwargs):
+        nonlocal authorization_calls
+        authorization_calls += 1
+        raise AssertionError("transient Gmail errors must not start browser authorization")
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: UnavailableGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["error"] == {
+        "code": "gmail_error",
+        "message": "Gmail operation failed; see stderr for details",
+    }
+    assert authorization_calls == 0
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "valid token"
 
 
 def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
@@ -481,13 +617,13 @@ def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
     token_file.write_text("existing token", encoding="utf-8")
 
     class ExistingGmail:
-        def profile_history_id(self) -> str:
-            return "current-history-id"
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-history-id")
 
     monkeypatch.setattr(
         engine_api.GmailGateway,
-        "authorize_with_status",
-        lambda credentials_file, configured_token_file: (ExistingGmail(), False),
+        "from_token",
+        lambda credentials_file, configured_token_file: ExistingGmail(),
     )
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
@@ -504,23 +640,21 @@ def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
     runtime = load_runtime(config_path)
     lock_held = False
 
-    class AuthorizationLock:
-        def __init__(self, path: str, timeout: int):
-            assert path.endswith("watcher.sqlite3.gmail-authorize.lock")
-            assert timeout == engine_api.GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS
-
-        def __enter__(self):
-            nonlocal lock_held
-            lock_held = True
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            nonlocal lock_held
+    @contextmanager
+    def account_operation_lock(path: Path, busy_message: str):
+        nonlocal lock_held
+        assert path.name == "watcher.sqlite3.check.lock"
+        assert busy_message == "Another mailbox operation is already running"
+        lock_held = True
+        try:
+            yield
+        finally:
             lock_held = False
 
     class AuthorizedGmail:
-        def profile_history_id(self) -> str:
+        def profile(self) -> GmailProfile:
             assert lock_held
-            return "serialized-history-id"
+            return GmailProfile("owner@example.com", "serialized-history-id")
 
     original_state = runtime.store.state
     original_set_state = runtime.store.set_state
@@ -535,21 +669,526 @@ def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
         assert (provider, account_id) == (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
         original_set_state(history_id, provider=provider, account_id=account_id)
 
-    monkeypatch.setattr(engine_api, "FileLock", AuthorizationLock)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", account_operation_lock)
     monkeypatch.setattr(engine_api, "_runtime", lambda request: runtime)
     monkeypatch.setattr(runtime.store, "state", state)
     monkeypatch.setattr(runtime.store, "set_state", set_state)
-    monkeypatch.setattr(
-        engine_api.GmailGateway,
-        "authorize_with_status",
-        lambda credentials_file, token_file: (AuthorizedGmail(), True),
-    )
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert lock_held
+        token_file.write_text("readonly token", encoding="utf-8")
+        return AuthorizedGmail(), force_reauthorize
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
 
     assert response["data"] == {"baseline_initialized": True, "connected": True}
     assert lock_held is False
     assert original_state()[0] == "serialized-history-id"
+
+
+def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    (tmp_path / "credentials.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "token.json").write_text("private readonly token", encoding="utf-8")
+
+    response = engine_api._response(request(config_path, "mail.accounts.list"))
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "accounts": [
+            {
+                "account_id": "gmail-default",
+                "active": True,
+                "address": None,
+                "connected": True,
+                "display_name": "Gmail",
+                "last_check": None,
+                "provider": "gmail",
+            }
+        ],
+        "providers": [
+            {
+                "connection_available": True,
+                "display_name": "Gmail",
+                "multiple_accounts": True,
+                "provider": "gmail",
+            }
+        ],
+    }
+    encoded = json.dumps(response)
+    assert "private readonly token" not in encoded
+    assert "token.json" not in encoded
+    assert str(tmp_path) not in encoded
+
+
+def test_mail_account_connect_installs_private_token_and_initializes_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("private readonly token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "GMAIL"})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is True
+    account_response = response["data"]["account"]
+    assert isinstance(account_response["last_check"], str)
+    assert {**account_response, "last_check": "<checked>"} == {
+        "account_id": "gmail-default",
+        "active": True,
+        "address": "owner@example.com",
+        "connected": True,
+        "display_name": "Gmail",
+        "last_check": "<checked>",
+        "provider": "gmail",
+    }
+    runtime = load_runtime(config_path)
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"
+    assert runtime.config.gmail_token_file.stat().st_mode & 0o777 == 0o600
+    assert runtime.store.active_mail_account().address == "owner@example.com"
+    assert runtime.store.state()[0] == "current-cursor"
+    assert "private readonly token" not in json.dumps(response)
+
+
+def test_mail_account_reconnect_rejects_different_identity_before_replacing_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.config.gmail_token_file.write_text("preserved token", encoding="utf-8")
+
+    class ExistingGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
+    class WrongGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("other@example.com", "other-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[WrongGmail, bool]:
+        token_file.write_text("wrong account token", encoding="utf-8")
+        return WrongGmail(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+
+    assert response["error"]["code"] == "account_identity_mismatch"
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "preserved token"
+    assert runtime.store.active_mail_account().address == "owner@example.com"
+    assert list(tmp_path.glob(".gmail-authorization-*")) == []
+
+
+def test_mail_account_disconnect_preserves_history_and_send_authorization(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("readonly token", encoding="utf-8")
+    runtime.config.gmail_send_token_file.write_text("send token", encoding="utf-8")
+    runtime.store.set_state("preserved-cursor", datetime(2026, 9, 1, tzinfo=UTC))
+    runtime.store.add_message(
+        message_id="retained",
+        thread_id=None,
+        sender="owner@example.com",
+        sender_name=None,
+        subject="Retained",
+        received_at="2026-09-01T12:00:00+00:00",
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.disconnect",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+
+    assert response["data"]["account"]["connected"] is False
+    assert not runtime.config.gmail_token_file.exists()
+    assert runtime.config.gmail_send_token_file.read_text(encoding="utf-8") == "send token"
+    assert runtime.store.state()[0] == "preserved-cursor"
+    assert runtime.store.has_message("retained")
+    checked = engine_api._response(request(config_path, "watcher.check"))
+    retained = engine_api._response(request(config_path, "inbox.query", {"limit": 25}))
+    assert checked["error"]["code"] == "account_unavailable"
+    assert [item["message_id"] for item in retained["data"]["items"]] == ["retained"]
+
+
+def test_mail_account_activate_rejects_disconnected_account(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.activate",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+
+    assert response["error"]["code"] == "account_unavailable"
+
+
+def test_mail_account_activate_switches_one_connected_account_and_preserves_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("first token", encoding="utf-8")
+    runtime.store.set_state("first-cursor")
+    second = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'a' * 32}",
+        display_name="Gmail",
+        address="second@example.com",
+    )
+    second_token = mail_account_token_file(runtime.config, second)
+    second_token.parent.mkdir(parents=True)
+    second_token.write_text("second token", encoding="utf-8")
+    runtime.store.set_state(
+        "second-cursor",
+        provider=second.provider,
+        account_id=second.account_id,
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.activate",
+            {"provider": second.provider, "account_id": second.account_id},
+        )
+    )
+    monkeypatch.setattr("eom_email_watcher.model.LocalModel.health", lambda self: (True, "ready"))
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert response["data"]["account"]["active"] is True
+    assert runtime.store.active_mail_account().account_id == second.account_id
+    assert [account.active for account in runtime.store.mail_accounts()] == [True, False]
+    assert runtime.store.state()[0] == "first-cursor"
+    assert runtime.store.state(provider=second.provider, account_id=second.account_id)[0] == (
+        "second-cursor"
+    )
+    assert health["data"]["gmail"]["connected"] is True
+    assert [
+        account["account_id"] for account in health["data"]["mail"]["accounts"] if account["active"]
+    ] == [second.account_id]
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload", "code"),
+    [
+        ("mail.accounts.list", {"unexpected": True}, "invalid_request"),
+        ("mail.accounts.connect", {"provider": False}, "invalid_request"),
+        ("mail.accounts.connect", {"provider": "imap"}, "unsupported_provider"),
+        (
+            "mail.accounts.reconnect",
+            {"provider": "gmail", "account_id": ""},
+            "invalid_request",
+        ),
+        (
+            "mail.accounts.disconnect",
+            {"provider": "gmail", "account_id": "x" * 129},
+            "invalid_request",
+        ),
+        (
+            "mail.accounts.activate",
+            {"provider": "gmail", "account_id": "missing"},
+            "not_found",
+        ),
+    ],
+)
+def test_mail_account_operations_reject_invalid_boundaries(
+    tmp_path: Path,
+    operation: str,
+    payload: dict[str, object],
+    code: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    response = engine_api._response(request(config_path, operation, payload))
+
+    assert response["error"]["code"] == code
+
+
+def test_mail_account_connect_reuses_matching_account_without_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "new-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        token_file.write_text("replacement token", encoding="utf-8")
+        return AuthorizedGmail(), force_reauthorize
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["data"]["account"]["account_id"] == "gmail-default"
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "replacement token"
+    assert len(runtime.store.mail_accounts()) == 1
+
+
+def test_mail_account_connect_reuses_verified_legacy_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
+    runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
+
+    class ExistingGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "authorized-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("replacement token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert response["data"]["account"]["account_id"] == "gmail-default"
+    assert runtime.store.active_mail_account().address == "owner@example.com"
+    assert runtime.store.state()[0] == "legacy-cursor"
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "replacement token"
+    assert len(runtime.store.mail_accounts()) == 1
+
+
+def test_mail_account_connect_keeps_unidentified_legacy_history_separate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
+    runtime.store.add_message(
+        message_id="legacy-message",
+        thread_id=None,
+        sender="legacy@example.com",
+        sender_name=None,
+        subject="Legacy history",
+        received_at="2026-08-01T12:00:00+00:00",
+    )
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("new-owner@example.com", "new-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        token_file.write_text("new account token", encoding="utf-8")
+        return AuthorizedGmail(), force_reauthorize
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["ok"] is True
+    new_account = runtime.store.active_mail_account()
+    assert new_account is not None
+    assert new_account.account_id.startswith("gmail-")
+    assert new_account.address == "new-owner@example.com"
+    assert (
+        mail_account_token_file(runtime.config, new_account).read_text(encoding="utf-8")
+        == "new account token"
+    )
+    legacy = runtime.store.mail_account("gmail", "gmail-default")
+    assert legacy is not None
+    assert legacy.active is False
+    assert legacy.address is None
+    assert runtime.store.state(provider="gmail", account_id="gmail-default")[0] == "legacy-cursor"
+    assert (
+        runtime.store.state(provider="gmail", account_id=new_account.account_id)[0] == "new-cursor"
+    )
+    assert runtime.store.has_message("legacy-message")
+
+
+def test_mail_account_connect_activates_replacement_for_rejected_legacy_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
+    runtime.config.gmail_token_file.write_text("rejected legacy token", encoding="utf-8")
+
+    class RejectedGmail:
+        def profile(self) -> GmailProfile:
+            raise GmailAuthorizationRejected("rejected")
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("new-owner@example.com", "new-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        token_file.write_text("new account token", encoding="utf-8")
+        return AuthorizedGmail(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: RejectedGmail(),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["ok"] is True
+    active = runtime.store.active_mail_account()
+    assert active is not None
+    assert active.account_id.startswith("gmail-")
+    assert active.address == "new-owner@example.com"
+    assert response["data"]["account"]["active"] is True
+    legacy = runtime.store.mail_account("gmail", "gmail-default")
+    assert legacy is not None
+    assert legacy.active is False
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == ("rejected legacy token")
+
+
+def test_mail_account_reconnect_refuses_unverifiable_legacy_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor")
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        lambda *args, **kwargs: pytest.fail("OAuth must not rebind unidentified history"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+
+    assert response["error"]["code"] == "account_identity_unverified"
 
 
 def test_settings_update_is_allowlisted_atomic_and_secret_free(tmp_path: Path) -> None:
@@ -621,6 +1260,7 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
     config_path = tmp_path / "config.toml"
     write_config(config_path, extra_settings="retention_days = 180")
     stale_runtime = load_runtime(config_path)
+    stale_runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     stale_runtime.store.set_state("100", datetime.now(UTC))
     expired_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
 
@@ -932,17 +1572,28 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
     assert listed["data"]["items"] == []
 
 
-def test_attachment_export_uses_stored_identity_and_safe_private_path(
+def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
+    runtime.config.gmail_token_file.write_text("source token", encoding="utf-8")
+    active_account = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'a' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+    active_token = mail_account_token_file(runtime.config, active_account)
+    active_token.parent.mkdir(parents=True)
+    active_token.write_text("active token", encoding="utf-8")
+    local_message_id = scoped_message_id("gmail", "gmail-default", "provider-message")
     runtime.store.add_message(
         message_id=local_message_id,
-        provider="microsoft365",
-        account_id="account-2",
+        provider="gmail",
+        account_id="gmail-default",
         provider_message_id="provider-message",
         thread_id=None,
         sender="a@example.com",
@@ -972,21 +1623,14 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
             )
             return b"%PDF"
 
+    opened_tokens: list[Path] = []
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda _credentials, token: opened_tokens.append(token) or FakeAttachmentGmail(),
+    )
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
-    monkeypatch.setattr(
-        engine_api,
-        "configured_mailbox_identity",
-        lambda _config: ("microsoft365", "account-2"),
-    )
-    monkeypatch.setattr(
-        engine_api,
-        "load_configured_mailbox",
-        lambda _config: MailboxSession(
-            "microsoft365",
-            "account-2",
-            FakeAttachmentGmail(),
-        ),
-    )
 
     response = engine_api._response(
         request(
@@ -1001,6 +1645,8 @@ def test_attachment_export_uses_stored_identity_and_safe_private_path(
     )
 
     assert response["ok"] is True
+    assert runtime.store.active_mail_account().account_id == active_account.account_id
+    assert opened_tokens == [runtime.config.gmail_token_file]
     exported = Path(response["data"]["path"])
     assert exported.parent == destination.resolve()
     assert exported.name.startswith("email-watcher-attachment-")
@@ -1043,8 +1689,8 @@ def test_attachment_export_rejects_an_unconfigured_account_before_provider_acces
     monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
     monkeypatch.setattr(
         engine_api,
-        "load_configured_mailbox",
-        lambda _config: pytest.fail("An unavailable account must not be opened"),
+        "load_mailbox_account",
+        lambda *_args: pytest.fail("An unavailable account must not be opened"),
     )
 
     response = engine_api._response(
@@ -1122,7 +1768,7 @@ def test_connect_paths_reject_an_unconfigured_account_before_provider_interactio
     def reject_provider_interaction(*_args: object, **_kwargs: object) -> None:
         pytest.fail("An unavailable mailbox must be rejected before provider interaction")
 
-    monkeypatch.setattr(engine_api, "load_configured_mailbox", reject_provider_interaction)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_interaction)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", reject_provider_interaction)
     monkeypatch.setattr(
         engine_api.connect,
@@ -1189,6 +1835,7 @@ def test_attachment_export_rejects_a_byte_count_mismatch(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     runtime.store.add_message(
         message_id="m1",
         thread_id=None,
@@ -1399,6 +2046,7 @@ def test_check_defers_delivery_until_state_checked_ack(
     write_config(config_path)
     loaded = load_runtime(config_path)
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -1556,6 +2204,7 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
     config_path = tmp_path / "config.toml"
     write_config(config_path, notifications_enabled=False)
     runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     runtime.store.add_message(
         message_id="m1",
         thread_id=None,
@@ -1607,6 +2256,7 @@ def test_check_reports_complete_notification_backlog(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     loaded = load_runtime(config_path)
+    loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
@@ -1653,6 +2303,7 @@ def test_gmail_error_response_redacts_configured_path(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     loaded = load_runtime(config_path)
+    loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
     sensitive_path = tmp_path / "private-token.json"

@@ -129,8 +129,13 @@ Tauri sidecar, so the installed application does not depend on a source checkout
 requires an existing private config; see [`desktop/README.md`](desktop/README.md). A release build
 may include an approved Google Desktop OAuth client identity; source and development builds without
 one require an externally configured desktop OAuth credentials file. In either case, Health can run
-the existing read-only browser authorization and account tokens remain in the user's private local
-state. The app does not replace the systemd scheduler or the existing CLI's optional ntfy delivery.
+the existing read-only browser authorization, list retained accounts, connect or reconnect Gmail
+accounts, disconnect only their local read token, and explicitly choose the one account polled by
+the watcher. Account tokens remain in the user's private local state, and disconnecting an account
+does not remove its local Inbox history or the separate EOM send authorization. Gmail is the only
+selectable provider in the current build; the account contract is provider-neutral so another
+adapter can join without changing the Inbox or account UI. The app does not replace the systemd
+scheduler or the existing CLI's optional ntfy delivery.
 
 ## Local Connect capability
 

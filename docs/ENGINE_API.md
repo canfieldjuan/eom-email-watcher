@@ -46,9 +46,14 @@ only to stderr.
 | Operation | Payload | Result |
 |---|---|---|
 | `config.initialize` | `timezone`, loopback `model_base_url`, `model_name` | Create a private zero-sender first-run config and return safe settings |
-| `health.get` | `{}` | Database, Gmail token presence, local-model health, notification mode, watchlist count, last check |
-| `gmail.authorize` | `{}` | Run the configured read-only Gmail OAuth flow and initialize a new mailbox baseline when required |
-| `watcher.check` | optional `dry_run` boolean | One Gmail poll with native delivery deferred to the host and the exact pending-intent count |
+| `health.get` | `{}` | Database, generic mail-account catalog, legacy Gmail status, local-model health, notification mode, watchlist count, last check |
+| `mail.accounts.list` | `{}` | Available mail providers and retained local accounts, without credential values or paths |
+| `mail.accounts.connect` | `provider` | Run that provider's account flow and safely register or reuse the resulting mailbox identity |
+| `mail.accounts.reconnect` | `provider`, `account_id` | Reauthorize exactly one retained account without changing its identity or mailbox cursor |
+| `mail.accounts.disconnect` | `provider`, `account_id` | Remove that account's local read token while retaining local history and mailbox state |
+| `mail.accounts.activate` | `provider`, `account_id` | Select one connected account for watcher polling |
+| `gmail.authorize` | `{}` | Compatibility wrapper for the original read-only Gmail setup flow |
+| `watcher.check` | optional `dry_run` boolean | Poll the active mail account with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
 | `inbox.delete` | `message_id` | Delete one message and all message-owned local state without changing source mail |
@@ -82,7 +87,18 @@ selection, platform delivery, acknowledgement, and the final queue count without
 or lock-aware operations to frontend code. Other callers use `notifications.pending`, which
 acquires the lock itself.
 
-`gmail.authorize` uses only the existing `gmail.readonly` authorization and never returns OAuth
+The `mail.accounts.*` operations are the provider-neutral desktop account contract. The current
+build advertises Gmail and supports multiple retained Gmail identities, with exactly one active
+polling account. Connect and reconnect stage authorization in private temporary storage, verify the
+provider-reported mailbox identity, and only then atomically replace the internally derived token
+file. Reconnect refuses an authorization for a different address. A new account receives its own
+private token path; paths and token contents never enter the response. Disconnect removes only the
+selected read token, leaving its cursor, Inbox rows, and the separate EOM `gmail.send` token intact.
+Activating an account requires a local read token. Mutations share the production watcher lock, so
+they cannot race a check or one another. Listing and migration perform no provider network access.
+
+`gmail.authorize` remains a compatibility operation that verifies or reauthorizes the active Gmail
+account. It uses only the existing `gmail.readonly` authorization and never returns OAuth
 credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
 at the current mailbox state. Reusing an existing valid token preserves an existing history cursor;
 if watcher state is missing, the operation initializes it from the current mailbox state. The OAuth
@@ -178,7 +194,9 @@ suppression marker prevents a later history replay from restoring manually delet
 no sender, subject, body, attachment, provider result, or raw Gmail message ID and expires once the
 message is older than the maximum supported retention window.
 
-Schema v9 keeps the v8 source-time privacy boundary and adds provider/account-scoped cursors,
+Schema v10 adds the local mail-account registry and seeds the existing Gmail identity as the active
+`gmail` / `gmail-default` account without network access. It preserves the schema v9
+provider/account-scoped cursors,
 message source identities, and deletion-suppression identities. Existing Gmail rows, cursor state,
 attachments, and Connect results migrate locally to `gmail` / `gmail-default`; migration performs
 no network access and preserves the existing local `message_id` used by the UI and relationships.

@@ -7,12 +7,11 @@ import pytest
 
 from eom_email_watcher import cli
 from eom_email_watcher.db import Store
+from eom_email_watcher.engine_api import ApiError
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
 
 
-def test_setup_reports_partial_notification_failure(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch, capsys) -> None:
     token = tmp_path / "token.json"
     token.touch()
     config = SimpleNamespace(
@@ -23,16 +22,10 @@ def test_setup_reports_partial_notification_failure(
         ntfy_url="https://ntfy.sh",
     )
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
-    monkeypatch.setattr(cli.GmailGateway, "from_token", lambda *args: object())
-
-    class FakeWatcher:
-        def __init__(self, *args):
-            pass
-
-        def bootstrap(self) -> str:
-            return "200"
-
-    monkeypatch.setattr(cli, "Watcher", FakeWatcher)
+    monkeypatch.setattr(
+        "eom_email_watcher.engine_api.dispatch",
+        lambda request: {"baseline_initialized": True, "connected": True},
+    )
     monkeypatch.setattr(
         cli,
         "send_fallback",
@@ -50,7 +43,35 @@ def test_setup_reports_partial_notification_failure(
 
     output = capsys.readouterr()
     assert "ntfy delivery failed: ConnectError" in output.err
-    assert "Baseline history cursor saved (200)" in output.out
+    assert "Baseline initialized" in output.out
+
+
+def test_setup_connects_a_replacement_for_unidentified_migrated_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SimpleNamespace(
+        notifications_enabled=False,
+        ntfy_topic=None,
+        ntfy_url="https://ntfy.sh",
+    )
+    operations: list[str] = []
+
+    def dispatch(request: dict[str, object]) -> dict[str, object]:
+        operation = str(request["operation"])
+        operations.append(operation)
+        if operation == "gmail.authorize":
+            raise ApiError(
+                "account_identity_unverified",
+                "The existing mailbox identity cannot be verified; connect it as a new account",
+            )
+        assert request["payload"] == {"provider": "gmail"}
+        return {"baseline_initialized": True, "account": {"connected": True}}
+
+    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr("eom_email_watcher.engine_api.dispatch", dispatch)
+
+    assert cli._setup(tmp_path / "config.toml") == 0
+    assert operations == ["gmail.authorize", "mail.accounts.connect"]
 
 
 def _check_config(tmp_path: Path) -> SimpleNamespace:
@@ -70,13 +91,14 @@ def test_second_production_check_stops_before_gmail(
     config = _check_config(tmp_path)
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
     monkeypatch.setattr(
-        cli.GmailGateway,
-        "from_token",
-        lambda *args: pytest.fail("blocked check must not access Gmail"),
+        cli,
+        "load_configured_mailbox",
+        lambda *args: pytest.fail("blocked check must not access mail"),
     )
 
-    with cli._production_check_lock(config.database_file), pytest.raises(
-        RuntimeError, match="production check is already running"
+    with (
+        cli._production_check_lock(config.database_file),
+        pytest.raises(RuntimeError, match="production check is already running"),
     ):
         cli._check(tmp_path / "config.toml", dry_run=False)
 
@@ -118,7 +140,13 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
         assert token_file == fresh_config.gmail_token_file
         return object()
 
-    monkeypatch.setattr(cli.GmailGateway, "from_token", gmail_from_token)
+    monkeypatch.setattr(
+        cli,
+        "load_configured_mailbox",
+        lambda config, store: gmail_from_token(
+            config.gmail_credentials_file, config.gmail_token_file
+        ),
+    )
 
     class FakeWatcher:
         def __init__(self, config, store, gmail, model):
@@ -138,7 +166,7 @@ def test_dry_run_does_not_take_production_lock(
 ) -> None:
     config = _check_config(tmp_path)
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
-    monkeypatch.setattr(cli.GmailGateway, "from_token", lambda *args: object())
+    monkeypatch.setattr(cli, "load_configured_mailbox", lambda config, store: object())
 
     class FakeWatcher:
         def __init__(self, *args):
@@ -192,9 +220,9 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
     monkeypatch.setattr(
-        cli.GmailGateway,
-        "from_token",
-        lambda *args: pytest.fail("inactive check must not access Gmail"),
+        cli,
+        "load_configured_mailbox",
+        lambda *args: pytest.fail("inactive check must not access mail"),
     )
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0

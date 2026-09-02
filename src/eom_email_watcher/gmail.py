@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -51,6 +52,12 @@ class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     """A specific message could not be fetched -- e.g. it was deleted or
     expunged after the history event that referenced it. Recoverable: the
     caller should skip this one message, not fail the whole run."""
+
+
+@dataclass(frozen=True)
+class GmailProfile:
+    email_address: str
+    history_id: str
 
 
 def resolve_gmail_credentials_file(configured_file: Path) -> Path:
@@ -153,13 +160,24 @@ class GmailGateway:
                     try:
                         credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
                     except (ValueError, json.JSONDecodeError) as exc:
-                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                        raise GmailAuthorizationRejected(
+                            f"Invalid OAuth token file: {token_file}"
+                        ) from exc
                 if credentials and credentials.expired and credentials.refresh_token:
-                    credentials.refresh(Request())
+                    try:
+                        credentials.refresh(Request())
+                    except RefreshError as exc:
+                        if exc.retryable:
+                            raise GmailError("Gmail authorization refresh failed; retry") from exc
+                        raise GmailAuthorizationRejected(
+                            "Gmail rejected the configured authorization"
+                        ) from exc
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
                 if not credentials or not credentials.valid:
-                    raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+                    raise GmailAuthorizationRejected(
+                        "Gmail is not authorized. Run: eom-mail-watch setup"
+                    )
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry the operation") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
@@ -225,7 +243,7 @@ class GmailGateway:
             authorization_changed,
         )
 
-    def profile_history_id(self) -> str:
+    def profile(self) -> GmailProfile:
         try:
             result = self.service.users().getProfile(userId="me").execute()
         except HttpError as exc:
@@ -234,7 +252,25 @@ class GmailGateway:
                     "Gmail rejected the configured authorization"
                 ) from exc
             raise GmailError(f"Gmail profile request failed (HTTP {exc.resp.status})") from exc
-        return str(result["historyId"])
+        email_address = normalize_address(str(result.get("emailAddress", "")))
+        local, separator, domain = email_address.rpartition("@")
+        if (
+            separator != "@"
+            or not local
+            or not domain
+            or "@" in local
+            or any(
+                character.isspace() or not character.isprintable() for character in email_address
+            )
+        ):
+            raise GmailError("Gmail profile response did not contain an email address")
+        history_id = str(result.get("historyId", "")).strip()
+        if not history_id:
+            raise GmailError("Gmail profile response did not contain a history cursor")
+        return GmailProfile(email_address=email_address, history_id=history_id)
+
+    def profile_history_id(self) -> str:
+        return self.profile().history_id
 
     def initial_cursor(self) -> str:
         return self.profile_history_id()

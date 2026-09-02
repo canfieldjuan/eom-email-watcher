@@ -14,13 +14,17 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, ConfigError
 from .db import Store
-from .gmail import GmailGateway
 from .locking import operation_lock
-from .mailbox import MailboxError, default_mailbox_session
+from .mailbox import MailboxError
 from .model import ModelRuntime
 from .notifications import NotificationError, send_fallback
 from .outbound import GmailSender, SendError, previous_month_email
-from .runtime import configured_mailbox_identity, load_configured_mailbox, load_runtime
+from .runtime import (
+    configured_mailbox_identity,
+    load_configured_mailbox,
+    load_runtime,
+    mail_account_connected,
+)
 from .service import Watcher
 
 
@@ -88,7 +92,9 @@ def _doctor(config_path: Path) -> int:
             "ok": stat.S_IMODE(config.database_file.parent.stat().st_mode) == 0o700,
             "mode": oct(stat.S_IMODE(config.database_file.parent.stat().st_mode)),
         }
-        provider, account_id = configured_mailbox_identity(config)
+        provider, account_id = configured_mailbox_identity(store)
+        active_account = store.mail_account(provider, account_id)
+        assert active_account is not None
         checks["database"] = {
             "ok": True,
             "initialized": store.state(
@@ -98,7 +104,7 @@ def _doctor(config_path: Path) -> int:
             is not None,
         }
         checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
-        checks["oauth_token"] = {"ok": config.gmail_token_file.exists()}
+        checks["oauth_token"] = {"ok": mail_account_connected(config, active_account)}
         checks["send_oauth_token"] = {
             "ok": config.gmail_send_token_file.exists() if config.monthly_hours_recipient else True
         }
@@ -121,15 +127,27 @@ def _doctor(config_path: Path) -> int:
 
 
 def _setup(config_path: Path) -> int:
-    config, store, model = _runtime(config_path)
-    if config.gmail_token_file.exists():
-        mailbox = load_configured_mailbox(config)
-    else:
-        mailbox = default_mailbox_session(
-            GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
+    from .engine_api import ApiError, dispatch
+
+    config, _store, _model = _runtime(config_path)
+    request = {
+        "protocol": 1,
+        "operation": "gmail.authorize",
+        "config_path": str(config_path),
+        "payload": {},
+    }
+    try:
+        authorization = dispatch(request)
+    except ApiError as exc:
+        if exc.code != "account_identity_unverified":
+            raise
+        authorization = dispatch(
+            {
+                **request,
+                "operation": "mail.accounts.connect",
+                "payload": {"provider": "gmail"},
+            }
         )
-    watcher = Watcher(config, store, mailbox, model)
-    history_id = watcher.bootstrap()
     if config.notifications_enabled:
         try:
             delivery = send_fallback(
@@ -141,13 +159,15 @@ def _setup(config_path: Path) -> int:
             )
             if delivery.failures:
                 print(
-                    f"Warning: notification test partially failed: "
-                    f"{'; '.join(delivery.failures)}",
+                    f"Warning: notification test partially failed: {'; '.join(delivery.failures)}",
                     file=sys.stderr,
                 )
         except NotificationError as exc:
             print(f"Warning: notification test failed: {exc}", file=sys.stderr)
-    print(f"Gmail authorized. Baseline history cursor saved ({history_id}); no old mail imported.")
+    if authorization["baseline_initialized"]:
+        print("Gmail authorized. Baseline initialized; no old mail imported.")
+    else:
+        print("Gmail authorization verified. Existing mailbox position preserved.")
     return 0
 
 
@@ -156,13 +176,9 @@ def _check(config_path: Path, dry_run: bool) -> int:
 
     def run(active_config, active_store, active_model):
         if not active_config.senders:
-            return Watcher.inactive_result(
-                active_config, active_store, dry_run=dry_run
-            )
-        mailbox = load_configured_mailbox(active_config)
-        return Watcher(active_config, active_store, mailbox, active_model).check(
-            dry_run=dry_run
-        )
+            return Watcher.inactive_result(active_config, active_store, dry_run=dry_run)
+        mailbox = load_configured_mailbox(active_config, active_store)
+        return Watcher(active_config, active_store, mailbox, active_model).check(dry_run=dry_run)
 
     if dry_run:
         result = run(config, store, model)

@@ -7,7 +7,7 @@ use engine::{
     CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
     ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
     Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
-    WatchedSender,
+    MailAccountResult, MailAccounts, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -503,6 +503,65 @@ async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization
 }
 
 #[tauri::command]
+async fn mail_accounts_list(engine: State<'_, Engine>) -> Result<MailAccounts, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.mail_accounts())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_connect(
+    engine: State<'_, Engine>,
+    provider: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.connect_mail_provider(provider))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_reconnect(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.reconnect_mail_account(provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_disconnect(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.disconnect_mail_account(provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_activate(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.activate_mail_account(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.settings())
@@ -703,6 +762,11 @@ pub fn run() {
             inbox_clear,
             inbox_delete,
             inbox_query,
+            mail_account_activate,
+            mail_account_connect,
+            mail_account_disconnect,
+            mail_account_reconnect,
+            mail_accounts_list,
             settings_get,
             settings_update,
             watcher_check,

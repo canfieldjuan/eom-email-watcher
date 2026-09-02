@@ -163,11 +163,6 @@ interface OpenedAttachment {
   filename: string;
 }
 
-interface GmailAuthorization {
-  baseline_initialized: boolean;
-  connected: boolean;
-}
-
 type ConnectEntitlementState =
   | "active"
   | "authority_unavailable"
@@ -182,6 +177,33 @@ interface ConnectEntitlementStatus {
   active: boolean;
 }
 
+interface MailProviderStatus {
+  provider: string;
+  display_name: string;
+  connection_available: boolean;
+  multiple_accounts: boolean;
+}
+
+interface MailAccountStatus {
+  provider: string;
+  account_id: string;
+  display_name: string;
+  address: string | null;
+  connected: boolean;
+  active: boolean;
+  last_check: string | null;
+}
+
+interface MailAccounts {
+  providers: MailProviderStatus[];
+  accounts: MailAccountStatus[];
+}
+
+interface MailAccountResult {
+  account: MailAccountStatus;
+  baseline_initialized?: boolean;
+}
+
 interface HealthStatus {
   database: {
     ok: boolean;
@@ -191,6 +213,7 @@ interface HealthStatus {
     credentials_configured: boolean;
     connected: boolean;
   };
+  mail: MailAccounts;
   last_check: string | null;
   local_model: {
     authentication_required: boolean;
@@ -288,6 +311,13 @@ app.innerHTML = `
           <input id="inbox-sender" name="sender" maxlength="320" />
         </label>
         <label>
+          <span>Email account</span>
+          <select id="inbox-account" name="account">
+            <option value="active">Active account</option>
+            <option value="all">All retained accounts</option>
+          </select>
+        </label>
+        <label>
           <span>Priority</span>
           <select id="inbox-priority" name="priority">
             <option value="">Any priority</option>
@@ -373,13 +403,12 @@ app.innerHTML = `
 
       <p id="health-status" class="status" role="status" aria-live="polite">Loading health…</p>
       <dl class="health-grid">
-        <div class="health-card">
-          <dt>Gmail</dt>
-          <dd id="gmail-health">Checking…</dd>
-          <dd id="gmail-detail" class="health-card-detail"></dd>
-          <dd class="health-card-action">
-            <button id="gmail-authorize" class="gmail-action" type="button" disabled>Connect Gmail</button>
-          </dd>
+        <div class="health-card mail-health-card">
+          <dt>Email accounts</dt>
+          <dd id="mail-health">Checking…</dd>
+          <dd id="mail-detail" class="health-card-detail"></dd>
+          <dd><ul id="mail-account-list" class="mail-account-list" aria-label="Email accounts"></ul></dd>
+          <dd id="mail-provider-actions" class="health-card-action"></dd>
         </div>
         <div class="health-card">
           <dt>Local AI</dt>
@@ -481,6 +510,7 @@ const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
 const inboxKeywordInput = requiredElement<HTMLInputElement>("#inbox-keyword");
 const inboxSenderInput = requiredElement<HTMLInputElement>("#inbox-sender");
+const inboxAccountSelect = requiredElement<HTMLSelectElement>("#inbox-account");
 const inboxPrioritySelect = requiredElement<HTMLSelectElement>("#inbox-priority");
 const inboxCategorySelect = requiredElement<HTMLSelectElement>("#inbox-category");
 const inboxStateSelect = requiredElement<HTMLSelectElement>("#inbox-state");
@@ -495,9 +525,10 @@ const list = requiredElement<HTMLUListElement>("#sender-list");
 const watchlistStatus = requiredElement<HTMLParagraphElement>("#watchlist-status");
 const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
 const checkNow = requiredElement<HTMLButtonElement>("#check-now");
-const gmailHealth = requiredElement<HTMLElement>("#gmail-health");
-const gmailDetail = requiredElement<HTMLElement>("#gmail-detail");
-const gmailAuthorize = requiredElement<HTMLButtonElement>("#gmail-authorize");
+const mailHealth = requiredElement<HTMLElement>("#mail-health");
+const mailDetail = requiredElement<HTMLElement>("#mail-detail");
+const mailAccountList = requiredElement<HTMLUListElement>("#mail-account-list");
+const mailProviderActions = requiredElement<HTMLElement>("#mail-provider-actions");
 const modelHealth = requiredElement<HTMLElement>("#model-health");
 const modelDetail = requiredElement<HTMLElement>("#model-detail");
 const databaseHealth = requiredElement<HTMLElement>("#database-health");
@@ -535,10 +566,12 @@ let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
-let gmailAuthorizationInFlight = false;
-let gmailConnected = false;
-let gmailCredentialsConfigured = false;
+let mailOperationInFlight = false;
+let mailProviders: MailProviderStatus[] = [];
+let mailAccounts: MailAccountStatus[] = [];
 let healthRequestGeneration = 0;
+let mailAccountsRequestGeneration = 0;
+let mailAccountCatalogRevision = 0;
 let connectInstalling = false;
 let connectStatusRefreshInFlight = false;
 let connectEntitlementActive: boolean | null = null;
@@ -555,10 +588,11 @@ let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
+let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
-  provider: null,
-  account_id: null,
+  provider: "__no_active_account__",
+  account_id: "__no_active_account__",
   sender_query: null,
   priority: null,
   category: null,
@@ -1011,6 +1045,20 @@ function renderInbox(items: InboxItem[]): void {
       senderAddress.textContent = item.sender;
       senderIdentity.append(senderAddress);
     }
+    if (activeInboxQuery.provider === null && activeInboxQuery.account_id === null) {
+      const account = mailAccounts.find(
+        (candidate) =>
+          candidate.provider === item.provider && candidate.account_id === item.account_id,
+      );
+      const provider = mailProviders.find((candidate) => candidate.provider === item.provider);
+      const sourceAccount = document.createElement("span");
+      sourceAccount.textContent = `Mailbox: ${
+        account?.address ||
+        (account ? `${account.display_name} · ${account.account_id}` : undefined) ||
+        `${provider?.display_name || item.provider} · ${item.account_id}`
+      }`;
+      senderIdentity.append(sourceAccount);
+    }
     const received = document.createElement("time");
     received.dateTime = item.received_at;
     received.textContent = receivedLabel(item.received_at);
@@ -1350,17 +1398,79 @@ function optionalFilterValue(value: string): string | null {
   return trimmed || null;
 }
 
+function accountOptionValue(account: MailAccountStatus): string {
+  return JSON.stringify([account.provider, account.account_id]);
+}
+
+const unavailableAccountFilter = {
+  provider: "__no_active_account__",
+  account_id: "__no_active_account__",
+};
+
+function inboxAccountForSelection(
+  selection: string,
+): Pick<InboxQuery, "provider" | "account_id"> {
+  if (selection === "all") return { provider: null, account_id: null };
+  if (selection === "active") {
+    const account = mailAccounts.find((candidate) => candidate.active);
+    return account
+      ? { provider: account.provider, account_id: account.account_id }
+      : unavailableAccountFilter;
+  }
+  try {
+    const parsed: unknown = JSON.parse(selection);
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 2 &&
+      parsed.every((value) => typeof value === "string")
+    ) {
+      return { provider: parsed[0], account_id: parsed[1] };
+    }
+  } catch {
+    // A stale option falls back to the current active account.
+  }
+  const active = mailAccounts.find((candidate) => candidate.active);
+  return active
+    ? { provider: active.provider, account_id: active.account_id }
+    : unavailableAccountFilter;
+}
+
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
+  const account = inboxAccountForSelection(inboxAccountSelect.value);
   return {
     limit: Number(inboxPageSizeSelect.value),
-    provider: null,
-    account_id: null,
+    provider: account.provider,
+    account_id: account.account_id,
     sender_query: optionalFilterValue(inboxSenderInput.value),
     priority: optionalFilterValue(inboxPrioritySelect.value),
     category: optionalFilterValue(inboxCategorySelect.value),
     status: optionalFilterValue(inboxStateSelect.value),
     keyword: optionalFilterValue(inboxKeywordInput.value),
   };
+}
+
+function clearInboxPageForAccountChange(message: string): void {
+  inboxRequestGeneration += 1;
+  inboxItems = [];
+  inboxNextCursor = null;
+  inboxCapabilityUnavailableCount = 0;
+  clearMessageOwnedUiState();
+  inboxLoadMore.hidden = true;
+  renderInbox(inboxItems);
+  inboxStatus.textContent = message;
+  delete inboxStatus.dataset.kind;
+}
+
+function commitInboxQueryFromControls(): void {
+  const nextQuery = queryFromInboxControls();
+  const accountScopeChanged =
+    activeInboxQuery.provider !== nextQuery.provider ||
+    activeInboxQuery.account_id !== nextQuery.account_id;
+  activeInboxAccountSelection = inboxAccountSelect.value;
+  activeInboxQuery = nextQuery;
+  if (accountScopeChanged) {
+    clearInboxPageForAccountChange("Email account filter changed. Refreshing local history…");
+  }
 }
 
 function inboxMutationInFlight(): boolean {
@@ -1511,13 +1621,241 @@ function setHealthValue(element: HTMLElement, ready: boolean, text: string): voi
   element.dataset.ready = String(ready);
 }
 
-function syncGmailAuthorizationAction(): void {
-  gmailAuthorize.textContent = gmailAuthorizationInFlight
-    ? "Connecting…"
-    : gmailConnected
-      ? "Reconnect Gmail"
-      : "Connect Gmail";
-  gmailAuthorize.disabled = gmailAuthorizationInFlight || !gmailCredentialsConfigured;
+function providerFor(account: MailAccountStatus): MailProviderStatus | undefined {
+  return mailProviders.find((provider) => provider.provider === account.provider);
+}
+
+function renderInboxAccountOptions(): void {
+  const previous = inboxAccountSelect.value || "active";
+  const active = mailAccounts.find((account) => account.active);
+  const activeOption = document.createElement("option");
+  activeOption.value = "active";
+  activeOption.textContent = active
+    ? `Active — ${active.address || active.display_name}`
+    : "Active account";
+  const allOption = document.createElement("option");
+  allOption.value = "all";
+  allOption.textContent = "All retained accounts";
+  inboxAccountSelect.replaceChildren(activeOption, allOption);
+
+  for (const account of mailAccounts) {
+    const option = document.createElement("option");
+    option.value = accountOptionValue(account);
+    option.textContent = `${account.address || account.display_name} · ${account.display_name}`;
+    inboxAccountSelect.append(option);
+  }
+  const values = new Set(
+    Array.from(inboxAccountSelect.options, (option) => option.value),
+  );
+  inboxAccountSelect.value = values.has(previous) ? previous : "active";
+}
+
+function reconcileInboxAccountScope(): boolean {
+  const selected = inboxAccountForSelection(activeInboxAccountSelection);
+  if (
+    activeInboxQuery.provider === selected.provider &&
+    activeInboxQuery.account_id === selected.account_id
+  ) {
+    return false;
+  }
+
+  activeInboxQuery = {
+    ...activeInboxQuery,
+    provider: selected.provider,
+    account_id: selected.account_id,
+  };
+  clearInboxPageForAccountChange("Active email account changed. Refreshing local history…");
+  return true;
+}
+
+function renderMailAccounts(data: MailAccounts): boolean {
+  mailAccountCatalogRevision += 1;
+  mailProviders = data.providers;
+  mailAccounts = data.accounts;
+  renderInboxAccountOptions();
+  const inboxScopeChanged = reconcileInboxAccountScope();
+  mailAccountList.replaceChildren();
+  mailProviderActions.replaceChildren();
+
+  for (const account of mailAccounts) {
+    const item = document.createElement("li");
+    item.className = "mail-account-item";
+    const identity = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = account.address || account.display_name;
+    const detail = document.createElement("span");
+    detail.textContent = `${account.display_name} · ${account.active ? "Active" : "Retained"} · ${account.connected ? "Connected" : "Disconnected"}`;
+    identity.append(title, detail);
+
+    const actions = document.createElement("div");
+    actions.className = "mail-account-actions";
+    const provider = providerFor(account);
+    if (account.connected) {
+      const reconnect = document.createElement("button");
+      reconnect.type = "button";
+      reconnect.textContent = "Reconnect";
+      reconnect.disabled = mailOperationInFlight || !provider?.connection_available;
+      reconnect.addEventListener("click", () => void reconnectMailAccount(account));
+      const disconnect = document.createElement("button");
+      disconnect.type = "button";
+      disconnect.textContent = "Disconnect";
+      disconnect.className = "danger-action";
+      disconnect.disabled = mailOperationInFlight;
+      disconnect.addEventListener("click", () => void disconnectMailAccount(account));
+      actions.append(reconnect, disconnect);
+      if (!account.active) {
+        const activate = document.createElement("button");
+        activate.type = "button";
+        activate.textContent = "Use this account";
+        activate.disabled = mailOperationInFlight;
+        activate.addEventListener("click", () => void activateMailAccount(account));
+        actions.prepend(activate);
+      }
+    } else {
+      const connect = document.createElement("button");
+      connect.type = "button";
+      connect.textContent = account.address ? "Reconnect" : "Connect";
+      connect.disabled = mailOperationInFlight || !provider?.connection_available;
+      connect.addEventListener("click", () => {
+        if (account.address) void reconnectMailAccount(account);
+        else void connectMailProvider(account.provider);
+      });
+      actions.append(connect);
+    }
+    item.append(identity, actions);
+    mailAccountList.append(item);
+  }
+
+  for (const provider of mailProviders) {
+    if (
+      !provider.multiple_accounts &&
+      mailAccounts.some((account) => account.provider === provider.provider)
+    ) {
+      continue;
+    }
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.textContent = mailAccounts.some(
+      (account) => account.provider === provider.provider,
+    )
+      ? `Add ${provider.display_name} account`
+      : `Connect ${provider.display_name}`;
+    connect.disabled = mailOperationInFlight || !provider.connection_available;
+    connect.addEventListener("click", () => void connectMailProvider(provider.provider));
+    mailProviderActions.append(connect);
+  }
+  return inboxScopeChanged;
+}
+
+async function refreshAfterMailMutation(message: string): Promise<void> {
+  await loadHealth(message);
+  await loadInbox();
+}
+
+async function connectMailProvider(provider: string): Promise<void> {
+  if (mailOperationInFlight) return;
+  mailOperationInFlight = true;
+  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  healthStatus.textContent = "Complete email authorization in your browser…";
+  delete healthStatus.dataset.kind;
+  try {
+    const result = await invoke<MailAccountResult>("mail_account_connect", { provider });
+    const message = result.baseline_initialized
+      ? "Email account connected. Watching begins from its current mailbox state."
+      : "Email account connected. Its saved mailbox position was preserved.";
+    await refreshAfterMailMutation(message);
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    mailOperationInFlight = false;
+    renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  }
+}
+
+async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
+  if (mailOperationInFlight) return;
+  mailOperationInFlight = true;
+  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  healthStatus.textContent = "Complete email authorization in your browser…";
+  delete healthStatus.dataset.kind;
+  try {
+    await invoke<MailAccountResult>("mail_account_reconnect", {
+      provider: account.provider,
+      accountId: account.account_id,
+    });
+    await refreshAfterMailMutation("Email account reconnected. Its saved mailbox position was preserved.");
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    mailOperationInFlight = false;
+    renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  }
+}
+
+async function disconnectMailAccount(account: MailAccountStatus): Promise<void> {
+  if (mailOperationInFlight) return;
+  const confirmed = window.confirm(
+    `Disconnect ${account.address || account.display_name}? Local history remains available and source email is not changed.`,
+  );
+  if (!confirmed) return;
+  mailOperationInFlight = true;
+  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  try {
+    await invoke<MailAccountResult>("mail_account_disconnect", {
+      provider: account.provider,
+      accountId: account.account_id,
+    });
+    await refreshAfterMailMutation("Email account disconnected. Its local history was retained.");
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    mailOperationInFlight = false;
+    renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  }
+}
+
+async function activateMailAccount(account: MailAccountStatus): Promise<void> {
+  if (mailOperationInFlight) return;
+  mailOperationInFlight = true;
+  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  try {
+    await invoke<MailAccountResult>("mail_account_activate", {
+      provider: account.provider,
+      accountId: account.account_id,
+    });
+    await refreshAfterMailMutation("Active email account changed.");
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    mailOperationInFlight = false;
+    renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  }
+}
+
+async function loadMailAccounts(): Promise<boolean> {
+  const requestGeneration = ++mailAccountsRequestGeneration;
+  const catalogRevision = mailAccountCatalogRevision;
+  try {
+    const accounts = await invoke<MailAccounts>("mail_accounts_list");
+    if (
+      requestGeneration !== mailAccountsRequestGeneration ||
+      catalogRevision !== mailAccountCatalogRevision
+    ) {
+      return false;
+    }
+    renderMailAccounts(accounts);
+    return true;
+  } catch (error) {
+    if (
+      requestGeneration !== mailAccountsRequestGeneration ||
+      catalogRevision !== mailAccountCatalogRevision
+    ) {
+      return false;
+    }
+    setHealthValue(mailHealth, false, "Unknown");
+    mailDetail.textContent = errorMessage(error);
+    return false;
+  }
 }
 
 function renderConnectStatus(status: ConnectEntitlementStatus): void {
@@ -1626,7 +1964,7 @@ async function selectAndInstallConnectEntitlement(): Promise<void> {
 function renderHealthUnknown(): void {
   const detail = "Health refresh failed; current status is unknown.";
   for (const [value, description] of [
-    [gmailHealth, gmailDetail],
+    [mailHealth, mailDetail],
     [modelHealth, modelDetail],
     [databaseHealth, databaseDetail],
     [notificationHealth, notificationDetail],
@@ -1638,22 +1976,26 @@ function renderHealthUnknown(): void {
   watchlistCount.textContent = "Unknown";
   pollingCadence.textContent = "Unknown";
   nextCheck.textContent = "Unknown";
-  gmailConnected = false;
-  gmailCredentialsConfigured = false;
-  syncGmailAuthorizationAction();
 }
 
 function renderHealth(health: HealthStatus): void {
-  gmailConnected = health.gmail.connected;
-  gmailCredentialsConfigured = health.gmail.credentials_configured;
-  syncGmailAuthorizationAction();
-  const gmailReady = health.gmail.connected && health.gmail.credentials_configured;
-  setHealthValue(gmailHealth, gmailReady, gmailReady ? "Configured" : "Needs attention");
-  gmailDetail.textContent = gmailReady
-    ? "A read-only watcher token is present."
-    : health.gmail.credentials_configured
-      ? "Finish Gmail authorization to start watching."
-      : "Gmail credentials have not been configured.";
+  const inboxScopeChanged = renderMailAccounts(health.mail);
+  if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
+  const activeAccount = health.mail.accounts.find((account) => account.active);
+  const activeProvider = activeAccount
+    ? health.mail.providers.find((provider) => provider.provider === activeAccount.provider)
+    : undefined;
+  const mailReady = Boolean(
+    activeAccount?.connected && activeProvider?.connection_available,
+  );
+  setHealthValue(mailHealth, mailReady, mailReady ? "Ready" : "Needs attention");
+  mailDetail.textContent = activeAccount
+    ? mailReady
+      ? `${activeAccount.address || activeAccount.display_name} is the active read-only account.`
+      : activeProvider?.connection_available
+        ? "Connect the active email account to resume watching."
+        : `${activeAccount.display_name} connection support is not configured in this build.`
+    : "Choose a connected email account to start watching.";
 
   setHealthValue(modelHealth, health.local_model.ok, health.local_model.ok ? "Ready" : "Unavailable");
   modelDetail.textContent = `${health.local_model.model} · ${health.local_model.endpoint} · ${health.local_model.detail}`;
@@ -1691,32 +2033,12 @@ function renderHealth(health: HealthStatus): void {
     nextCheck.textContent = "Not scheduled";
   }
   const watcherPrerequisitesReady =
-    health.watchlist_count === 0 || (gmailReady && databaseReady);
+    health.watchlist_count === 0 || (mailReady && databaseReady);
   checkSupported =
     health.production_check_supported &&
     health.notifications.host_delivery_ready &&
     watcherPrerequisitesReady;
   checkNow.disabled = checkInFlight || !checkSupported;
-}
-
-async function authorizeGmail(): Promise<void> {
-  if (gmailAuthorizationInFlight || !gmailCredentialsConfigured) return;
-  gmailAuthorizationInFlight = true;
-  syncGmailAuthorizationAction();
-  healthStatus.textContent = "Complete Gmail authorization in your browser…";
-  delete healthStatus.dataset.kind;
-  try {
-    const result = await invoke<GmailAuthorization>("gmail_authorize");
-    const message = result.baseline_initialized
-      ? "Gmail connected. Watching begins from the current mailbox state."
-      : "Gmail connection verified. The existing mailbox position was preserved.";
-    await loadHealth(message);
-  } catch (error) {
-    await loadHealth(errorMessage(error), "error");
-  } finally {
-    gmailAuthorizationInFlight = false;
-    syncGmailAuthorizationAction();
-  }
 }
 
 async function loadHealth(
@@ -1814,7 +2136,9 @@ function startConfiguredDesktop(): void {
   setConfiguredNavigation(true);
   configInitializeForm.hidden = true;
   settingsForm.hidden = false;
-  void loadInbox();
+  void loadMailAccounts().then((loaded) => {
+    if (loaded) return loadInbox();
+  });
   void loadHealth();
   void loadAutostart();
   void loadSenders().then((loaded) => {
@@ -2129,18 +2453,17 @@ autostartEnabledInput.addEventListener("change", () => {
 });
 inboxFilterForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  activeInboxQuery = queryFromInboxControls();
+  commitInboxQueryFromControls();
   void loadInbox();
 });
 inboxReset.addEventListener("click", () => {
   inboxFilterForm.reset();
-  activeInboxQuery = queryFromInboxControls();
+  commitInboxQueryFromControls();
   void loadInbox();
 });
 inboxLoadMore.addEventListener("click", () => void loadInbox(true));
 inboxClear.addEventListener("click", () => void clearInboxHistory());
 checkNow.addEventListener("click", () => void runCheck());
-gmailAuthorize.addEventListener("click", () => void authorizeGmail());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
 void listen<{
   status: "complete" | "delivery_failed" | "check_failed";
@@ -2162,7 +2485,11 @@ void listen<{
   }
 });
 window.addEventListener("focus", () => {
-  if (configurationReady) void loadInbox();
+  if (configurationReady) {
+    void loadMailAccounts().then((loaded) => {
+      if (loaded) return loadInbox();
+    });
+  }
   void refreshConnectStatus();
 });
 document.addEventListener("visibilitychange", () => {

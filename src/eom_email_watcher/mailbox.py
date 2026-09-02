@@ -23,6 +23,10 @@ class MailboxMessageUnavailable(MailboxError):
     """A source message disappeared after it was discovered."""
 
 
+class MailboxAccountUnavailable(MailboxError):
+    """The selected local mailbox account cannot currently be opened."""
+
+
 @dataclass(frozen=True)
 class MailboxSession:
     provider: str
