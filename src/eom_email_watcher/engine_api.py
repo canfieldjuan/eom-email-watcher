@@ -318,6 +318,7 @@ def _authorize_gmail_account(
     *,
     reuse_valid_token: bool,
 ) -> dict[str, object]:
+    rejected_accounts: set[tuple[str, str]] = set()
     if account is None:
         legacy = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
         if legacy is not None and legacy.address is None:
@@ -328,7 +329,7 @@ def _authorize_gmail_account(
                         runtime.config.gmail_credentials_file, legacy_token
                     ).profile()
                 except GmailAuthorizationRejected:
-                    pass
+                    rejected_accounts.add((legacy.provider, legacy.account_id))
                 else:
                     runtime.store.update_mail_account_identity(
                         legacy.provider,
@@ -354,6 +355,7 @@ def _authorize_gmail_account(
             )
             current_profile = current_gmail.profile()
         except GmailAuthorizationRejected as exc:
+            rejected_accounts.add((account.provider, account.account_id))
             if account.address is None and runtime.store.mail_account_has_history(
                 account.provider, account.account_id
             ):
@@ -404,10 +406,6 @@ def _authorize_gmail_account(
                 ):
                     account = legacy
                 else:
-                    active = runtime.store.active_mail_account()
-                    activate_after_connect = active is None or not mail_account_connected(
-                        runtime.config, active
-                    )
                     account = runtime.store.register_mail_account(
                         DEFAULT_MAIL_PROVIDER,
                         f"gmail-{uuid.uuid4().hex}",
@@ -417,9 +415,9 @@ def _authorize_gmail_account(
                     )
             active = runtime.store.active_mail_account()
             activate_after_connect = (
-                activate_after_connect
-                or active is None
-                or not (active.active and mail_account_connected(runtime.config, active))
+                active is None
+                or (active.provider, active.account_id) in rejected_accounts
+                or not mail_account_connected(runtime.config, active)
             )
         elif account.address is not None and profile.email_address != account.address:
             raise ApiError(
@@ -614,9 +612,11 @@ def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
 
     def authorize(runtime: Runtime) -> dict[str, object]:
-        account = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+        account = runtime.store.active_mail_account()
         if account is None:
             raise ApiError("not_found", "The Gmail account was not found")
+        if account.provider != DEFAULT_MAIL_PROVIDER:
+            raise ApiError("unsupported_provider", "The active email account is not Gmail")
         result = _authorize_gmail_account(runtime, account, reuse_valid_token=True)
         return {
             "baseline_initialized": result["baseline_initialized"],

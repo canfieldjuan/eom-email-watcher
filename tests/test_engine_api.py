@@ -447,6 +447,49 @@ def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
     assert load_runtime(config_path).store.state()[0] == "private-history-id"
 
 
+def test_gmail_authorize_compatibility_targets_the_active_generated_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("retained legacy token", encoding="utf-8")
+    active = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'c' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("active@example.com", "active-history-id")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        assert force_reauthorize is True
+        token_file.write_text("active account token", encoding="utf-8")
+        return AuthorizedGmail(), True
+
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    assert mail_account_token_file(runtime.config, active).read_text(encoding="utf-8") == (
+        "active account token"
+    )
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "retained legacy token"
+    assert runtime.store.state(provider=active.provider, account_id=active.account_id)[0] == (
+        "active-history-id"
+    )
+
+
 def test_gmail_authorize_preserves_existing_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1071,6 +1114,56 @@ def test_mail_account_connect_keeps_unidentified_legacy_history_separate(
         runtime.store.state(provider="gmail", account_id=new_account.account_id)[0] == "new-cursor"
     )
     assert runtime.store.has_message("legacy-message")
+
+
+def test_mail_account_connect_activates_replacement_for_rejected_legacy_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
+    runtime.config.gmail_token_file.write_text("rejected legacy token", encoding="utf-8")
+
+    class RejectedGmail:
+        def profile(self) -> GmailProfile:
+            raise GmailAuthorizationRejected("rejected")
+
+    class AuthorizedGmail:
+        def profile(self) -> GmailProfile:
+            return GmailProfile("new-owner@example.com", "new-cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedGmail, bool]:
+        token_file.write_text("new account token", encoding="utf-8")
+        return AuthorizedGmail(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: RejectedGmail(),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "authorize_with_status", authorize_with_status)
+
+    response = engine_api._response(
+        request(config_path, "mail.accounts.connect", {"provider": "gmail"})
+    )
+
+    assert response["ok"] is True
+    active = runtime.store.active_mail_account()
+    assert active is not None
+    assert active.account_id.startswith("gmail-")
+    assert active.address == "new-owner@example.com"
+    assert response["data"]["account"]["active"] is True
+    legacy = runtime.store.mail_account("gmail", "gmail-default")
+    assert legacy is not None
+    assert legacy.active is False
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == ("rejected legacy token")
 
 
 def test_mail_account_reconnect_refuses_unverifiable_legacy_identity(
