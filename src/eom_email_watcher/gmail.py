@@ -160,13 +160,24 @@ class GmailGateway:
                     try:
                         credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
                     except (ValueError, json.JSONDecodeError) as exc:
-                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                        raise GmailAuthorizationRejected(
+                            f"Invalid OAuth token file: {token_file}"
+                        ) from exc
                 if credentials and credentials.expired and credentials.refresh_token:
-                    credentials.refresh(Request())
+                    try:
+                        credentials.refresh(Request())
+                    except RefreshError as exc:
+                        if exc.retryable:
+                            raise GmailError("Gmail authorization refresh failed; retry") from exc
+                        raise GmailAuthorizationRejected(
+                            "Gmail rejected the configured authorization"
+                        ) from exc
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
                 if not credentials or not credentials.valid:
-                    raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+                    raise GmailAuthorizationRejected(
+                        "Gmail is not authorized. Run: eom-mail-watch setup"
+                    )
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry the operation") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))

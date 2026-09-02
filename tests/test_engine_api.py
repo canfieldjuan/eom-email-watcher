@@ -490,6 +490,52 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
     assert load_runtime(config_path).store.state()[0] == "old-history-id"
 
 
+def test_gmail_authorize_preserves_token_on_transient_profile_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.config.gmail_token_file.write_text("valid token", encoding="utf-8")
+
+    class UnavailableGmail:
+        def profile(self) -> GmailProfile:
+            raise GmailError("Gmail profile request failed (HTTP 429)")
+
+    authorization_calls = 0
+
+    def authorize_with_status(*args, **kwargs):
+        nonlocal authorization_calls
+        authorization_calls += 1
+        raise AssertionError("transient Gmail errors must not start browser authorization")
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: UnavailableGmail(),
+    )
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["error"] == {
+        "code": "gmail_error",
+        "message": "Gmail operation failed; see stderr for details",
+    }
+    assert authorization_calls == 0
+    assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "valid token"
+
+
 def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

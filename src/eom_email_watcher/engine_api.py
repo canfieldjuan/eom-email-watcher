@@ -37,7 +37,7 @@ from .config import (
 from .db import ConnectJob, ConnectOutput, MailAccount, MessageSource, NotificationIntent, Store
 from .gmail import (
     TOKEN_LOCK_TIMEOUT_SECONDS,
-    GmailError,
+    GmailAuthorizationRejected,
     GmailGateway,
     gmail_credentials_configured,
 )
@@ -335,7 +335,7 @@ def _authorize_gmail_account(
                 runtime.config.gmail_credentials_file, token_file
             )
             current_profile = current_gmail.profile()
-        except GmailError as exc:
+        except GmailAuthorizationRejected as exc:
             if account.address is None and runtime.store.mail_account_has_history(
                 account.provider, account.account_id
             ):

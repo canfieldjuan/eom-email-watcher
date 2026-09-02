@@ -244,6 +244,73 @@ def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
         GmailGateway.from_token(credentials_file, token_file)
 
 
+@pytest.mark.parametrize("retryable", [False, True])
+def test_from_token_classifies_refresh_failures(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, retryable: bool
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+
+    def refresh(_request) -> None:
+        raise gmail_module.RefreshError("refresh failed", retryable=retryable)
+
+    credentials = SimpleNamespace(
+        valid=False,
+        expired=True,
+        refresh_token="refresh-token",
+        refresh=refresh,
+    )
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        lambda path, scopes: credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module,
+        "build",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("failed refresh must not build a Gmail service")
+        ),
+    )
+
+    with pytest.raises(GmailError) as raised:
+        GmailGateway.from_token(credentials_file, token_file)
+
+    assert isinstance(raised.value, GmailAuthorizationRejected) is not retryable
+    assert token_file.read_text(encoding="utf-8") == "existing token"
+
+
+@pytest.mark.parametrize("stored_token", ["malformed", "unusable"])
+def test_from_token_classifies_unusable_local_authorization_as_rejected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, stored_token: str
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+
+    if stored_token == "malformed":
+
+        def load_credentials(path, scopes):
+            raise ValueError("malformed token")
+
+    else:
+
+        def load_credentials(path, scopes):
+            return SimpleNamespace(valid=False, expired=False, refresh_token=None)
+
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        load_credentials,
+    )
+
+    with pytest.raises(GmailAuthorizationRejected):
+        GmailGateway.from_token(credentials_file, token_file)
+
+
 def test_authorize_serializes_the_entire_browser_flow(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
