@@ -2068,7 +2068,7 @@ def test_attachment_export_fails_closed_before_gmail_or_file_write(
     assert list(destination.iterdir()) == []
 
 
-def test_attachment_export_rejects_a_byte_count_mismatch(
+def test_attachment_export_reports_provider_neutral_byte_count_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -2109,7 +2109,10 @@ def test_attachment_export_rejects_a_byte_count_mismatch(
         )
     )
 
-    assert response["error"]["code"] == "gmail_error"
+    assert response["error"] == {
+        "code": "mailbox_error",
+        "message": "Email provider operation failed; see stderr for details",
+    }
     assert list(destination.iterdir()) == []
 
 
