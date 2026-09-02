@@ -1944,11 +1944,6 @@ function renderHealthUnknown(): void {
   watchlistCount.textContent = "Unknown";
   pollingCadence.textContent = "Unknown";
   nextCheck.textContent = "Unknown";
-  mailProviders = [];
-  mailAccounts = [];
-  mailAccountList.replaceChildren();
-  mailProviderActions.replaceChildren();
-  renderInboxAccountOptions();
 }
 
 function renderHealth(health: HealthStatus): void {
