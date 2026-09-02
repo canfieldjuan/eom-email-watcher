@@ -9,6 +9,7 @@ import pytest
 
 from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, Store
+from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
 
 
@@ -53,6 +54,65 @@ def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
     assert recent["notified_at"] is not None
 
 
+def test_mailbox_state_identity_and_suppression_are_account_scoped(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    store.set_state("gmail-cursor", provider="gmail", account_id="gmail-default")
+    store.set_state("graph-cursor", provider="microsoft365", account_id="account-2")
+
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "gmail-cursor"
+    assert store.state(provider="microsoft365", account_id="account-2")[0] == "graph-cursor"
+
+    source_id = "same-provider-id"
+    assert store.add_message(
+        message_id=scoped_message_id("gmail", "gmail-default", source_id),
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id=source_id,
+        thread_id=None,
+        sender="first@example.com",
+        sender_name=None,
+        subject="Gmail",
+        received_at="2026-08-31T12:00:00+00:00",
+    )
+    assert store.delete_message(source_id)
+    assert store.has_seen_message(source_id, provider="gmail", account_id="gmail-default")
+    assert not store.has_seen_message(source_id, provider="microsoft365", account_id="account-2")
+
+    graph_local_id = scoped_message_id("microsoft365", "account-2", source_id)
+    assert store.add_message(
+        message_id=graph_local_id,
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id=source_id,
+        thread_id=None,
+        sender="second@example.com",
+        sender_name=None,
+        subject="Microsoft 365",
+        received_at="2026-08-31T13:00:00+00:00",
+    )
+    assert not store.add_message(
+        message_id="different-local-id",
+        provider="microsoft365",
+        account_id="account-2",
+        provider_message_id=source_id,
+        thread_id=None,
+        sender="second@example.com",
+        sender_name=None,
+        subject="Duplicate source identity",
+        received_at="2026-08-31T13:00:00+00:00",
+    )
+    assert [
+        item.message_id for item in store.pending(provider="microsoft365", account_id="account-2")
+    ] == [graph_local_id]
+    items, _ = store.query_inbox(limit=10, account_id="account-2")
+    assert [(item["provider"], item["account_id"], item["message_id"]) for item in items] == [
+        ("microsoft365", "account-2", graph_local_id)
+    ]
+
+
 def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     tmp_path: Path,
 ) -> None:
@@ -62,8 +122,12 @@ def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages(
-                message_id, sender, subject, received_at, discovered_at, category
-            ) VALUES (?, 'sender@example.com', 'Update', ?, ?, 'informational')""",
+                    message_id, provider, account_id, provider_message_id,
+                    sender, subject, received_at, discovered_at, category
+                ) VALUES (
+                    ?1, 'gmail', 'gmail-default', ?1,
+                    'sender@example.com', 'Update', ?2, ?3, 'informational'
+                )""",
             [(f"message-{index:03}", stamp, stamp) for index in range(55)],
         )
 
@@ -88,9 +152,13 @@ def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages(
-                message_id, sender, sender_name, subject, received_at, discovered_at,
-                status, category, priority, summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    message_id, provider, account_id, provider_message_id,
+                    sender, sender_name, subject, received_at, discovered_at,
+                    status, category, priority, summary
+                ) VALUES (
+                    ?1, 'gmail', 'gmail-default', ?1,
+                    ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                )""",
             [
                 (
                     f"noise-{index:03}",
@@ -150,7 +218,9 @@ def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
     assert [item["message_id"] for item in untriaged_items] == ["untriaged"]
 
 
-def test_analysis_notification_ack_is_state_checked_and_idempotent(tmp_path: Path) -> None:
+def test_analysis_notification_ack_is_state_checked_and_idempotent(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     store.add_message(
@@ -233,8 +303,7 @@ def test_fallback_ack_does_not_ack_later_analysis(tmp_path: Path) -> None:
     assert analysis.kind == "analysis"
     assert analysis.summary == "Recovered summary."
     assert (
-        store.acknowledge_notification(message_id="m1", kind="fallback")
-        == "already_acknowledged"
+        store.acknowledge_notification(message_id="m1", kind="fallback") == "already_acknowledged"
     )
     assert store.notification_intents()[0].kind == "analysis"
 
@@ -259,15 +328,21 @@ def test_fallback_ack_requires_current_notification_intent(tmp_path: Path) -> No
     assert store.acknowledge_notification(message_id="m1", kind="fallback") == "acknowledged"
 
 
-def test_notification_intent_count_is_not_limited_to_retrieval_page(tmp_path: Path) -> None:
+def test_notification_intent_count_is_not_limited_to_retrieval_page(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     stamp = datetime.now(UTC).isoformat()
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages (
-                message_id, sender, subject, received_at, discovered_at, status, last_error
-            ) VALUES (?, 'a@b.com', 'Update', ?, ?, 'pending', 'model unavailable')""",
+                    message_id, provider, account_id, provider_message_id,
+                    sender, subject, received_at, discovered_at, status, last_error
+                ) VALUES (
+                    ?1, 'gmail', 'gmail-default', ?1,
+                    'a@b.com', 'Update', ?2, ?3, 'pending', 'model unavailable'
+                )""",
             [(f"m{index}", stamp, stamp) for index in range(501)],
         )
 
@@ -309,7 +384,9 @@ def test_purge_is_a_hard_source_time_ceiling_including_notification_intents(
     assert store.notification_intents() == []
 
 
-def test_purge_uses_source_received_time_not_local_discovery_time(tmp_path: Path) -> None:
+def test_purge_uses_source_received_time_not_local_discovery_time(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     store.add_message(
@@ -390,7 +467,9 @@ def test_purge_uses_one_parser_for_second_precision_timezone_offsets(
     assert [row["message_id"] for row in store.recent(10)] == ["current-offset"]
 
 
-def test_purge_bounds_legacy_future_source_time_by_discovery_time(tmp_path: Path) -> None:
+def test_purge_bounds_legacy_future_source_time_by_discovery_time(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     store.add_message(
@@ -442,9 +521,7 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     create_connect_job(store, "33333333-3333-4333-8333-333333333333")
     store.record_failure("m1", "model unavailable", 0)
 
-    assert store.delete_message(
-        "m1", now=datetime(2026, 9, 1, 12, tzinfo=UTC)
-    )
+    assert store.delete_message("m1", now=datetime(2026, 9, 1, 12, tzinfo=UTC))
     assert not store.delete_message("m1")
     assert store.recent(10) == []
     assert store.notification_intents() == []
@@ -460,10 +537,8 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
-        suppression = db.execute(
-            "SELECT message_key FROM suppressed_messages"
-        ).fetchone()[0]
-    assert suppression == hashlib.sha256(b"m1").hexdigest()
+        suppression = db.execute("SELECT message_key FROM suppressed_messages").fetchone()[0]
+    assert suppression == hashlib.sha256(b"gmail\0gmail-default\0m1").hexdigest()
     assert "m1" not in suppression
 
 
@@ -485,9 +560,7 @@ def test_delete_message_bounds_suppression_when_source_time_conversion_overflows
     assert store.delete_message("overflowing-source-time", now=now)
 
     with store.connection() as db:
-        expires_at = db.execute(
-            "SELECT expires_at FROM suppressed_messages"
-        ).fetchone()[0]
+        expires_at = db.execute("SELECT expires_at FROM suppressed_messages").fetchone()[0]
     assert expires_at == (now + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
 
 
@@ -587,9 +660,7 @@ def test_analysis_request_and_server_retry_delay_survive_reopen(tmp_path: Path) 
     first = store.reserve_analysis_request("m1", 20_000, now)
     reopened = Store(database)
     reopened.initialize()
-    second = reopened.reserve_analysis_request(
-        "m1", 99_999, now + timedelta(hours=1)
-    )
+    second = reopened.reserve_analysis_request("m1", 99_999, now + timedelta(hours=1))
 
     assert second == first
     reopened.record_analysis_failure(
@@ -641,7 +712,9 @@ def test_permanent_analysis_failure_requires_explicit_requeue(tmp_path: Path) ->
     assert second.request_id != first.request_id
 
 
-def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Path) -> None:
+def test_initialize_migrates_current_schema_without_losing_messages(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     database.parent.mkdir(parents=True)
     with sqlite3.connect(database) as db:
@@ -676,6 +749,21 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
                 last_error TEXT
             );
             CREATE INDEX idx_messages_pending ON messages(status, next_retry_at);
+            CREATE TABLE suppressed_messages (
+                message_key TEXT PRIMARY KEY CHECK (length(message_key) = 64),
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE message_attachments (
+                message_id TEXT NOT NULL,
+                part_id TEXT NOT NULL,
+                attachment_id TEXT,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (message_id, part_id),
+                UNIQUE (message_id, position)
+            );
             CREATE TABLE outbound_sends (
                 dedupe_key TEXT PRIMARY KEY,
                 recipient TEXT NOT NULL,
@@ -683,13 +771,29 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
                 gmail_message_id TEXT NOT NULL,
                 sent_at TEXT NOT NULL
             );
+            INSERT INTO mailbox_state(id, history_id, last_success_at)
+            VALUES (1, 'legacy-cursor', '2026-07-18T14:01:00+00:00');
             INSERT INTO messages(
                 message_id, sender, subject, received_at, discovered_at
             ) VALUES (
                 'legacy-message', 'trusted@example.com', 'Legacy',
                 '2026-07-18T14:00:00+00:00', '2026-07-18T14:01:00+00:00'
             );
+            INSERT INTO message_attachments(
+                message_id, part_id, attachment_id, filename, media_type,
+                byte_size, position
+            ) VALUES (
+                'legacy-message', '2', 'legacy-attachment', 'legacy.pdf',
+                'application/pdf', 42, 0
+            );
             """
+        )
+        db.execute(
+            "INSERT INTO suppressed_messages(message_key, expires_at) VALUES (?, ?)",
+            (
+                hashlib.sha256(b"legacy-deleted-message").hexdigest(),
+                "2030-01-01T00:00:00+00:00",
+            ),
         )
         db.execute("PRAGMA user_version = 2")
         assert db.execute("PRAGMA user_version").fetchone()[0] == 2
@@ -697,11 +801,16 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
-            "SELECT status, analysis_at FROM messages WHERE message_id = 'legacy-message'"
+            """SELECT status, analysis_at, provider, account_id, provider_message_id
+            FROM messages WHERE message_id = 'legacy-message'"""
         ).fetchone()
+        state = db.execute(
+            """SELECT provider, account_id, cursor
+            FROM mailbox_state"""
+        ).fetchall()
         attachment_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attachments'"
         ).fetchone()
@@ -712,10 +821,20 @@ def test_initialize_migrates_current_schema_without_losing_messages(tmp_path: Pa
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='suppressed_messages'"
         ).fetchone()
     assert "analysis_at" in columns
-    assert row == ("pending", None)
+    assert row == (
+        "pending",
+        None,
+        "gmail",
+        "gmail-default",
+        "legacy-message",
+    )
+    assert state == [("gmail", "gmail-default", "legacy-cursor")]
     assert attachment_table == (1,)
     assert connect_table == (1,)
     assert suppression_table == (1,)
+    migrated = Store(database)
+    assert migrated.attachment("legacy-message", "2").filename == "legacy.pdf"
+    assert migrated.has_seen_message("legacy-deleted-message")
 
 
 def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
@@ -746,7 +865,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -774,12 +893,8 @@ def test_attachment_inventory_replaces_in_order_and_is_purged_with_message(
     store.replace_attachments(
         "m1",
         (
-            AttachmentDescriptor(
-                "10", "gmail-b", "contract.pdf", "application/pdf", 20, 1
-            ),
-            AttachmentDescriptor(
-                "2", "gmail-a", "invoice.pdf", "application/pdf", 10, 0
-            ),
+            AttachmentDescriptor("10", "gmail-b", "contract.pdf", "application/pdf", 20, 1),
+            AttachmentDescriptor("2", "gmail-a", "invoice.pdf", "application/pdf", 10, 0),
         ),
     )
 
@@ -828,11 +943,7 @@ def test_attachment_inventory_rejects_unknown_message_without_partial_rows(
     with pytest.raises(KeyError):
         store.replace_attachments(
             "missing",
-            (
-                AttachmentDescriptor(
-                    "1", None, "invoice.pdf", "application/pdf", 10, 0
-                ),
-            ),
+            (AttachmentDescriptor("1", None, "invoice.pdf", "application/pdf", 10, 0),),
         )
 
     with store.connection() as db:
@@ -1008,7 +1119,7 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     assert restored.result_json is None
     assert restored.result_metadata_json is None
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert (
             db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -1042,13 +1153,9 @@ def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
         Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        columns = {
-            row[1] for row in db.execute("PRAGMA table_info(connect_attachment_jobs)")
-        }
+        columns = {row[1] for row in db.execute("PRAGMA table_info(connect_attachment_jobs)")}
         assert "protocol_version" not in columns
-        assert db.execute("SELECT job_id FROM connect_attachment_jobs").fetchall() == [
-            (job_id,)
-        ]
+        assert db.execute("SELECT job_id FROM connect_attachment_jobs").fetchall() == [(job_id,)]
         assert db.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             db.execute(
@@ -1230,7 +1337,9 @@ def test_connect_v2_active_identity_scopes_protocol_provider_and_parameters(
     }
 
 
-def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path) -> None:
+def test_initialize_replaces_v6_active_index_without_losing_jobs(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
     store.initialize()
@@ -1266,7 +1375,7 @@ def test_initialize_replaces_v6_active_index_without_losing_jobs(tmp_path: Path)
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_connect_attachment_jobs_active'"
         ).fetchone()[0]
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 2
     assert "protocol_version = 1" in index_sql
 
@@ -1277,9 +1386,7 @@ def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)
-    parameters = {
-        (f"p{index:02d}-" + "x" * 96): "😀" * 1000 for index in range(16)
-    }
+    parameters = {(f"p{index:02d}-" + "x" * 96): "😀" * 1000 for index in range(16)}
     large_request = create_v2_connect_job(
         store,
         "33333333-3333-4333-8333-333333333333",
@@ -1300,7 +1407,9 @@ def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(
     assert empty.request_json == empty_request
 
 
-def test_connect_v2_rejects_mismatched_request_and_corrupt_result(tmp_path: Path) -> None:
+def test_connect_v2_rejects_mismatched_request_and_corrupt_result(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
     store.initialize()
@@ -1442,7 +1551,9 @@ def test_connect_job_state_result_and_integrity_survive_reopen(tmp_path: Path) -
     ]
 
 
-def test_connect_job_atomic_constraints_and_single_active_request(tmp_path: Path) -> None:
+def test_connect_job_atomic_constraints_and_single_active_request(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)
@@ -1475,7 +1586,9 @@ def test_connect_job_atomic_constraints_and_single_active_request(tmp_path: Path
     assert store.connect_job(first_job).status == "requested"  # type: ignore[union-attr]
 
 
-def test_connect_job_resubmission_reset_is_atomic_and_provider_scoped(tmp_path: Path) -> None:
+def test_connect_job_resubmission_reset_is_atomic_and_provider_scoped(
+    tmp_path: Path,
+) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)

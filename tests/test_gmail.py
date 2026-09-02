@@ -1,4 +1,5 @@
 import base64
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,31 @@ def test_parse_metadata_keeps_missing_source_time_invalid() -> None:
     )
 
     assert parsed.received_at == ""
+
+
+def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
+    gateway = GmailGateway(None)
+    gateway.history_message_ids = lambda cursor: (["m1", "m2"], "next-cursor")
+    gateway.search_since = lambda addresses, since: ["recovered"]
+    gateway.profile_history_id = lambda: "recovery-cursor"
+    gateway.full_payload = lambda message_id: {
+        "mimeType": "text/plain",
+        "body": {"data": base64.urlsafe_b64encode(b"hello").decode()},
+    }
+
+    changes = gateway.changes_since("cursor")
+    recovered = gateway.recover_since(
+        frozenset({"a@example.com"}), datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    content = gateway.content("m1", 100)
+
+    assert changes.message_ids == ("m1", "m2")
+    assert changes.cursor == "next-cursor"
+    assert recovered.message_ids == ("recovered",)
+    assert recovered.cursor == "recovery-cursor"
+    assert content.body == "hello"
+    assert content.attachment_names == ()
+    assert content.attachments == ()
 
 
 class FakeRequest:
@@ -174,9 +200,7 @@ def test_attachment_bytes_uses_gmail_attachment_identity() -> None:
     gateway = GmailGateway(FakeService(attachments))
 
     assert gateway.attachment_bytes("message-1", "2", "attachment-1") == b"pdf bytes"
-    assert attachments.calls == [
-        {"userId": "me", "messageId": "message-1", "id": "attachment-1"}
-    ]
+    assert attachments.calls == [{"userId": "me", "messageId": "message-1", "id": "attachment-1"}]
 
 
 def test_attachment_bytes_finds_inline_root_part_data() -> None:
@@ -292,6 +316,7 @@ def test_authorize_replaces_an_unusable_existing_token(
             return stored_credentials
 
     else:
+
         def rejected_refresh(request):
             raise gmail_module.RefreshError("revoked token")
 
@@ -334,10 +359,7 @@ def test_authorize_replaces_an_unusable_existing_token(
     assert authorization_changed is True
     assert token_file.read_text(encoding="utf-8") == "replacement token"
     assert browser_calls[0]["authorization_prompt_message"] is None
-    assert (
-        browser_calls[0]["timeout_seconds"]
-        == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
-    )
+    assert browser_calls[0]["timeout_seconds"] == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
 
 
 def test_authorization_timeout_does_not_persist_a_token(
@@ -348,10 +370,7 @@ def test_authorization_timeout_does_not_persist_a_token(
     credentials_file.write_text("{}", encoding="utf-8")
 
     def run_local_server(**kwargs):
-        assert (
-            kwargs["timeout_seconds"]
-            == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
-        )
+        assert kwargs["timeout_seconds"] == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
         raise gmail_module.WSGITimeoutError("browser flow timed out")
 
     flow = SimpleNamespace(run_local_server=run_local_server)

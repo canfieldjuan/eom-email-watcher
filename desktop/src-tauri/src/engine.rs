@@ -479,6 +479,10 @@ pub struct ExportedAttachment {
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
+    #[serde(default = "default_mail_provider")]
+    pub provider: String,
+    #[serde(default = "default_mail_account_id")]
+    pub account_id: String,
     pub received_at: String,
     pub sender: String,
     pub sender_name: Option<String>,
@@ -510,11 +514,21 @@ pub struct InboxItem {
 pub struct InboxQuery {
     pub limit: u16,
     pub cursor: Option<String>,
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
     pub sender_query: Option<String>,
     pub priority: Option<String>,
     pub category: Option<String>,
     pub status: Option<String>,
     pub keyword: Option<String>,
+}
+
+fn default_mail_provider() -> String {
+    "gmail".into()
+}
+
+fn default_mail_account_id() -> String {
+    "gmail-default".into()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -774,6 +788,8 @@ impl Engine {
             json!({
                 "limit": query.limit,
                 "cursor": query.cursor,
+                "provider": query.provider,
+                "account_id": query.account_id,
                 "sender_query": query.sender_query,
                 "priority": query.priority,
                 "category": query.category,
@@ -1347,6 +1363,8 @@ mod tests {
 
         assert!(item.attachments.is_empty());
         assert_eq!(item.category, None);
+        assert_eq!(item.provider, "gmail");
+        assert_eq!(item.account_id, "gmail-default");
     }
 
     #[test]
@@ -1354,6 +1372,8 @@ mod tests {
         let query = InboxQuery {
             limit: 25,
             cursor: Some("opaque-cursor".into()),
+            provider: Some("gmail".into()),
+            account_id: Some("gmail-default".into()),
             sender_query: Some("billing".into()),
             priority: Some("high".into()),
             category: Some("invoice".into()),
@@ -1365,6 +1385,8 @@ mod tests {
             json!({
                 "limit": 25,
                 "cursor": "opaque-cursor",
+                "provider": "gmail",
+                "account_id": "gmail-default",
                 "sender_query": "billing",
                 "priority": "high",
                 "category": "invoice",
@@ -1976,6 +1998,8 @@ notifications_enabled = true
                 .query_inbox(InboxQuery {
                     limit: 20,
                     cursor: None,
+                    provider: None,
+                    account_id: None,
                     sender_query: None,
                     priority: None,
                     category: None,

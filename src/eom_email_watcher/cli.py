@@ -14,12 +14,13 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, ConfigError
 from .db import Store
-from .gmail import GmailError, GmailGateway
+from .gmail import GmailGateway
 from .locking import operation_lock
+from .mailbox import MailboxError, default_mailbox_session
 from .model import ModelRuntime
 from .notifications import NotificationError, send_fallback
 from .outbound import GmailSender, SendError, previous_month_email
-from .runtime import load_runtime
+from .runtime import configured_mailbox_identity, load_configured_mailbox, load_runtime
 from .service import Watcher
 
 
@@ -87,7 +88,15 @@ def _doctor(config_path: Path) -> int:
             "ok": stat.S_IMODE(config.database_file.parent.stat().st_mode) == 0o700,
             "mode": oct(stat.S_IMODE(config.database_file.parent.stat().st_mode)),
         }
-        checks["database"] = {"ok": True, "initialized": store.state() is not None}
+        provider, account_id = configured_mailbox_identity(config)
+        checks["database"] = {
+            "ok": True,
+            "initialized": store.state(
+                provider=provider,
+                account_id=account_id,
+            )
+            is not None,
+        }
         checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
         checks["oauth_token"] = {"ok": config.gmail_token_file.exists()}
         checks["send_oauth_token"] = {
@@ -114,10 +123,12 @@ def _doctor(config_path: Path) -> int:
 def _setup(config_path: Path) -> int:
     config, store, model = _runtime(config_path)
     if config.gmail_token_file.exists():
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+        mailbox = load_configured_mailbox(config)
     else:
-        gmail = GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
-    watcher = Watcher(config, store, gmail, model)
+        mailbox = default_mailbox_session(
+            GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
+        )
+    watcher = Watcher(config, store, mailbox, model)
     history_id = watcher.bootstrap()
     if config.notifications_enabled:
         try:
@@ -148,11 +159,8 @@ def _check(config_path: Path, dry_run: bool) -> int:
             return Watcher.inactive_result(
                 active_config, active_store, dry_run=dry_run
             )
-        gmail = GmailGateway.from_token(
-            active_config.gmail_credentials_file,
-            active_config.gmail_token_file,
-        )
-        return Watcher(active_config, active_store, gmail, active_model).check(
+        mailbox = load_configured_mailbox(active_config)
+        return Watcher(active_config, active_store, mailbox, active_model).check(
             dry_run=dry_run
         )
 
@@ -313,7 +321,7 @@ def main(argv: list[str] | None = None) -> None:
             code = _requeue_analysis(args.config, args.message_id)
         else:
             code = _recent(args.config, args.limit)
-    except (ConfigError, GmailError, SendError, RuntimeError) as exc:
+    except (ConfigError, MailboxError, SendError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

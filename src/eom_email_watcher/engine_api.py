@@ -33,7 +33,7 @@ from .config import (
     remove_sender,
     update_settings,
 )
-from .db import ConnectJob, ConnectOutput, NotificationIntent, Store
+from .db import ConnectJob, ConnectOutput, MessageSource, NotificationIntent, Store
 from .gmail import (
     GmailAuthorizationRejected,
     GmailError,
@@ -41,7 +41,17 @@ from .gmail import (
     gmail_credentials_configured,
 )
 from .locking import operation_lock, operation_lock_supported
-from .runtime import Runtime, load_runtime
+from .mailbox import (
+    MailboxError,
+    MailboxGateway,
+    default_mailbox_session,
+)
+from .runtime import (
+    Runtime,
+    configured_mailbox_identity,
+    load_configured_mailbox,
+    load_runtime,
+)
 from .service import Watcher
 
 PROTOCOL_VERSION = 1
@@ -92,18 +102,14 @@ def _config_path(request: dict[str, object]) -> Path:
     return Path(value).expanduser()
 
 
-def _bounded_limit(
-    payload: dict[str, object], *, default: int, maximum: int = 500
-) -> int:
+def _bounded_limit(payload: dict[str, object], *, default: int, maximum: int = 500) -> int:
     value = payload.get("limit", default)
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ApiError("invalid_request", f"limit must be an integer between 1 and {maximum}")
     return value
 
 
-def _optional_inbox_text(
-    payload: dict[str, object], name: str, *, maximum: int
-) -> str | None:
+def _optional_inbox_text(payload: dict[str, object], name: str, *, maximum: int) -> str | None:
     value = payload.get(name)
     if value is None:
         return None
@@ -122,9 +128,7 @@ def _optional_inbox_choice(
     if value is None:
         return None
     if not isinstance(value, str) or value not in choices:
-        raise ApiError(
-            "invalid_request", f"{name} must be one of: {', '.join(sorted(choices))}"
-        )
+        raise ApiError("invalid_request", f"{name} must be one of: {', '.join(sorted(choices))}")
     return value
 
 
@@ -159,7 +163,11 @@ def _decode_inbox_cursor(value: object) -> tuple[str, str] | None:
         json.JSONDecodeError,
     ) as exc:
         raise ApiError("invalid_request", "cursor is invalid") from exc
-    if not isinstance(decoded, dict) or set(decoded) != {"message_id", "received_at", "v"}:
+    if not isinstance(decoded, dict) or set(decoded) != {
+        "message_id",
+        "received_at",
+        "v",
+    }:
         raise ApiError("invalid_request", "cursor is invalid")
     message_id = decoded["message_id"]
     received_at = decoded["received_at"]
@@ -219,17 +227,14 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     config = runtime.config
-    production_check_supported = operation_lock_supported(
-        _production_check_lock_path(config)
-    )
-    state = runtime.store.state()
+    production_check_supported = operation_lock_supported(_production_check_lock_path(config))
+    provider, account_id = configured_mailbox_identity(config)
+    state = runtime.store.state(provider=provider, account_id=account_id)
     model_ok, model_detail = runtime.model.health()
     return {
         "database": {"ok": True, "initialized": state is not None},
         "gmail": {
-            "credentials_configured": gmail_credentials_configured(
-                config.gmail_credentials_file
-            ),
+            "credentials_configured": gmail_credentials_configured(config.gmail_credentials_file),
             "connected": config.gmail_token_file.exists(),
         },
         "last_check": state[1] if state else None,
@@ -246,9 +251,7 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         "notifications": {
             "delivery": "host",
             "enabled": config.notifications_enabled,
-            "host_delivery_ready": (
-                config.ntfy_topic is None and production_check_supported
-            ),
+            "host_delivery_ready": (config.ntfy_topic is None and production_check_supported),
             "ntfy_configured": config.ntfy_topic is not None,
         },
         "production_check_supported": production_check_supported,
@@ -280,9 +283,7 @@ def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     config = runtime.config
-    lock_path = config.database_file.with_name(
-        f"{config.database_file.name}.gmail-authorize.lock"
-    )
+    lock_path = config.database_file.with_name(f"{config.database_file.name}.gmail-authorize.lock")
     try:
         with FileLock(str(lock_path), timeout=GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS):
             gmail, authorization_changed = GmailGateway.authorize_with_status(
@@ -298,9 +299,21 @@ def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
                     force_reauthorize=True,
                 )
                 current_history_id = gmail.profile_history_id()
-            initialize_baseline = authorization_changed or runtime.store.state() is None
+            mailbox = default_mailbox_session(gmail)
+            initialize_baseline = (
+                authorization_changed
+                or runtime.store.state(
+                    provider=mailbox.provider,
+                    account_id=mailbox.account_id,
+                )
+                is None
+            )
             if initialize_baseline:
-                runtime.store.set_state(current_history_id)
+                runtime.store.set_state(
+                    current_history_id,
+                    provider=mailbox.provider,
+                    account_id=mailbox.account_id,
+                )
     except FileLockTimeout as exc:
         raise GmailError("Gmail authorization is busy; retry the operation") from exc
     return {
@@ -326,8 +339,8 @@ def _check(request: dict[str, object]) -> dict[str, object]:
                 **Watcher.inactive_result(config, active_runtime.store, dry_run=dry_run),
                 "pending_notifications": _host_notification_intent_count(active_runtime),
             }
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-        result = Watcher(config, active_runtime.store, gmail, active_runtime.model).check(
+        mailbox = load_configured_mailbox(config)
+        result = Watcher(config, active_runtime.store, mailbox, active_runtime.model).check(
             dry_run=dry_run,
             deliver_notifications=False,
         )
@@ -361,10 +374,12 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
         request,
         {
             "category",
+            "account_id",
             "cursor",
             "keyword",
             "limit",
             "priority",
+            "provider",
             "sender_query",
             "status",
         },
@@ -373,6 +388,8 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
     cursor = _decode_inbox_cursor(payload.get("cursor"))
     sender_query = _optional_inbox_text(payload, "sender_query", maximum=320)
     keyword = _optional_inbox_text(payload, "keyword", maximum=200)
+    provider = _optional_inbox_text(payload, "provider", maximum=64)
+    account_id = _optional_inbox_text(payload, "account_id", maximum=128)
     priority = _optional_inbox_choice(payload, "priority", INBOX_PRIORITIES)
     category = _optional_inbox_choice(payload, "category", INBOX_CATEGORIES)
     status = _optional_inbox_choice(payload, "status", INBOX_STATUSES)
@@ -384,6 +401,8 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
         category=category,
         status=status,
         keyword=keyword,
+        provider=provider,
+        account_id=account_id,
     )
     return {"items": rows, "next_cursor": _encode_inbox_cursor(next_cursor)}
 
@@ -391,11 +410,7 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
 def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id"})
     message_id = payload.get("message_id")
-    if (
-        not isinstance(message_id, str)
-        or not message_id.strip()
-        or len(message_id) > 512
-    ):
+    if not isinstance(message_id, str) or not message_id.strip() or len(message_id) > 512:
         raise ApiError(
             "invalid_request",
             "message_id must be a non-empty string of at most 512 characters",
@@ -492,6 +507,27 @@ def _write_capability_output(destination: Path, content: bytes) -> Path:
     return _write_private_file(destination, "email-watcher-output-", ".bin", content)
 
 
+def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSource:
+    try:
+        source = runtime.store.message_source(message_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Message was not found") from exc
+    configured_provider, configured_account_id = configured_mailbox_identity(runtime.config)
+    if source.provider != configured_provider or source.account_id != configured_account_id:
+        raise ApiError(
+            "account_unavailable",
+            "The message's mailbox account is not available in this application version.",
+        )
+    return source
+
+
+def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
+    mailbox = load_configured_mailbox(runtime.config)
+    if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
+        raise RuntimeError("Configured mailbox identity changed while opening the provider")
+    return mailbox.gateway
+
+
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id", "part_id", "destination_dir"})
     message_id = payload.get("message_id")
@@ -506,12 +542,15 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    gmail = GmailGateway.from_token(
-        runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
+    source = _configured_message_source(runtime, message_id)
+    gateway = _configured_mailbox_gateway(runtime, source)
+    content = gateway.attachment_bytes(
+        source.provider_message_id,
+        part_id,
+        attachment.attachment_id,
     )
-    content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
     if len(content) != attachment.byte_size:
-        raise GmailError("Gmail attachment size did not match stored metadata")
+        raise MailboxError("Mailbox attachment size did not match stored metadata")
     try:
         path = _write_attachment(destination, attachment.filename, content)
     except OSError as exc:
@@ -548,6 +587,7 @@ def _connect_attachment_capabilities(request: dict[str, object]) -> dict[str, ob
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
+    _configured_message_source(runtime, message_id)
     catalog = connect.discover_capabilities()
     items = catalog.compatible(attachment.media_type, attachment.byte_size)
     return {
@@ -872,7 +912,11 @@ def _mark_connect_failed(
 ) -> None:
     for _attempt in range(4):
         current = store.connect_job(job_id)
-        if current is None or current.status not in {"requested", "accepted", "processing"}:
+        if current is None or current.status not in {
+            "requested",
+            "accepted",
+            "processing",
+        }:
             return
         try:
             store.transition_connect_job(
@@ -1030,9 +1074,7 @@ def _resume_generic_connect_job(
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
     tracked = _tracked_generic_job(refreshed, capability)
-    if not capability.accepts_artifact(
-        tracked.artifact.media_type, tracked.artifact.byte_size
-    ):
+    if not capability.accepts_artifact(tracked.artifact.media_type, tracked.artifact.byte_size):
         raise ApiError(
             "unsupported_attachment",
             "The attachment is no longer accepted by the selected capability.",
@@ -1139,8 +1181,9 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    provider_ref, capability_ref, requested_parameters, confirmed = (
-        _generic_invocation_selection(payload)
+    source = _configured_message_source(runtime, message_id)
+    provider_ref, capability_ref, requested_parameters, confirmed = _generic_invocation_selection(
+        payload
     )
     existing = runtime.store.connect_job(request_id)
     if existing is not None:
@@ -1169,17 +1212,14 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     def attachment_content() -> bytes:
         nonlocal cached_content
         if cached_content is None:
-            gmail = GmailGateway.from_token(
-                runtime.config.gmail_credentials_file,
-                runtime.config.gmail_token_file,
-            )
-            cached_content = gmail.attachment_bytes(
-                message_id,
+            gateway = _configured_mailbox_gateway(runtime, source)
+            cached_content = gateway.attachment_bytes(
+                source.provider_message_id,
                 part_id,
                 attachment.attachment_id,
             )
             if len(cached_content) != attachment.byte_size:
-                raise GmailError("Gmail attachment size did not match stored metadata")
+                raise MailboxError("Mailbox attachment size did not match stored metadata")
         return cached_content
 
     if existing is not None:
@@ -1274,6 +1314,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
+    source = _configured_message_source(runtime, message_id)
     if not connect.capability_matches_attachment(attachment.media_type, attachment.byte_size):
         raise ApiError("unsupported_attachment", "This attachment is not a supported PDF")
 
@@ -1295,9 +1336,7 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
         capability_version=connect.CAPABILITY_VERSION,
     )
     discovery = (
-        connect.discover_summary_capability(
-            provider_instance_id=active.provider_instance_id
-        )
+        connect.discover_summary_capability(provider_instance_id=active.provider_instance_id)
         if active is not None
         else connect.discover_summary_capability()
     )
@@ -1354,12 +1393,14 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
 
     if attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    gmail = GmailGateway.from_token(
-        runtime.config.gmail_credentials_file, runtime.config.gmail_token_file
+    gateway = _configured_mailbox_gateway(runtime, source)
+    content = gateway.attachment_bytes(
+        source.provider_message_id,
+        part_id,
+        attachment.attachment_id,
     )
-    content = gmail.attachment_bytes(message_id, part_id, attachment.attachment_id)
     if len(content) != attachment.byte_size:
-        raise GmailError("Gmail attachment size did not match stored metadata")
+        raise MailboxError("Mailbox attachment size did not match stored metadata")
     if job is None:
         job = connect.prepare_summary_job(content, attachment.filename)
         try:
@@ -1584,7 +1625,9 @@ def _notifications_pending_under_host_lock(
     return {"items": _pending_notification_payloads(_runtime(request), limit)}
 
 
-def _notifications_count_under_host_lock(request: dict[str, object]) -> dict[str, object]:
+def _notifications_count_under_host_lock(
+    request: dict[str, object],
+) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     _require_host_delivery_compatible(runtime)
@@ -1693,7 +1736,9 @@ def _response(request: object) -> dict[str, object]:
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
         }
-    except GmailError as exc:
+    except MailboxError as exc:
+        # Gmail remains the only configured adapter in this slice, so preserve the
+        # established public error envelope while the host boundary is generalized.
         logger.warning("Gmail operation failed: %s", exc)
         return {
             "error": {
@@ -1747,7 +1792,10 @@ def main() -> None:
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             request = None
             response = {
-                "error": {"code": "invalid_json", "message": "Request must be valid JSON"},
+                "error": {
+                    "code": "invalid_json",
+                    "message": "Request must be valid JSON",
+                },
                 "ok": False,
                 "operation": None,
                 "protocol": PROTOCOL_VERSION,
