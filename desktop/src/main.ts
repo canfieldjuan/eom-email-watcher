@@ -570,6 +570,8 @@ let mailOperationInFlight = false;
 let mailProviders: MailProviderStatus[] = [];
 let mailAccounts: MailAccountStatus[] = [];
 let healthRequestGeneration = 0;
+let mailAccountsRequestGeneration = 0;
+let mailAccountCatalogRevision = 0;
 let connectInstalling = false;
 let connectStatusRefreshInFlight = false;
 let connectEntitlementActive: boolean | null = null;
@@ -1653,6 +1655,7 @@ function reconcileInboxAccountScope(): boolean {
 }
 
 function renderMailAccounts(data: MailAccounts): boolean {
+  mailAccountCatalogRevision += 1;
   mailProviders = data.providers;
   mailAccounts = data.accounts;
   renderInboxAccountOptions();
@@ -1816,10 +1819,25 @@ async function activateMailAccount(account: MailAccountStatus): Promise<void> {
 }
 
 async function loadMailAccounts(): Promise<boolean> {
+  const requestGeneration = ++mailAccountsRequestGeneration;
+  const catalogRevision = mailAccountCatalogRevision;
   try {
-    renderMailAccounts(await invoke<MailAccounts>("mail_accounts_list"));
+    const accounts = await invoke<MailAccounts>("mail_accounts_list");
+    if (
+      requestGeneration !== mailAccountsRequestGeneration ||
+      catalogRevision !== mailAccountCatalogRevision
+    ) {
+      return false;
+    }
+    renderMailAccounts(accounts);
     return true;
   } catch (error) {
+    if (
+      requestGeneration !== mailAccountsRequestGeneration ||
+      catalogRevision !== mailAccountCatalogRevision
+    ) {
+      return false;
+    }
     setHealthValue(mailHealth, false, "Unknown");
     mailDetail.textContent = errorMessage(error);
     return false;

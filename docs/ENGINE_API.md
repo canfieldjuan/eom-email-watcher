@@ -97,8 +97,8 @@ selected read token, leaving its cursor, Inbox rows, and the separate EOM `gmail
 Activating an account requires a local read token. Mutations share the production watcher lock, so
 they cannot race a check or one another. Listing and migration perform no provider network access.
 
-`gmail.authorize` remains a compatibility operation for the original default account. It uses only
-the existing `gmail.readonly` authorization and never returns OAuth
+`gmail.authorize` remains a compatibility operation that verifies or reauthorizes the active Gmail
+account. It uses only the existing `gmail.readonly` authorization and never returns OAuth
 credentials, token paths, token contents, or Gmail history identifiers. A new authorization starts
 at the current mailbox state. Reusing an existing valid token preserves an existing history cursor;
 if watcher state is missing, the operation initializes it from the current mailbox state. The OAuth
