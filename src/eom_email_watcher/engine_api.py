@@ -492,9 +492,10 @@ def _health(request: dict[str, object]) -> dict[str, object]:
     )
     model_ok, model_detail = runtime.model.health()
     mail = _mail_accounts_public(runtime)
-    gmail_connected = any(
-        account.provider == DEFAULT_MAIL_PROVIDER and mail_account_connected(config, account)
-        for account in runtime.store.mail_accounts()
+    gmail_connected = bool(
+        active_account is not None
+        and active_account.provider == DEFAULT_MAIL_PROVIDER
+        and mail_account_connected(config, active_account)
     )
     return {
         "database": {"ok": True, "initialized": state is not None},

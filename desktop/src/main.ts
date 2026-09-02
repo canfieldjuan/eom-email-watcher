@@ -586,6 +586,7 @@ let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
+let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
   provider: "__no_active_account__",
@@ -1390,16 +1391,18 @@ const unavailableAccountFilter = {
   account_id: "__no_active_account__",
 };
 
-function selectedInboxAccount(): Pick<InboxQuery, "provider" | "account_id"> {
-  if (inboxAccountSelect.value === "all") return { provider: null, account_id: null };
-  if (inboxAccountSelect.value === "active") {
+function inboxAccountForSelection(
+  selection: string,
+): Pick<InboxQuery, "provider" | "account_id"> {
+  if (selection === "all") return { provider: null, account_id: null };
+  if (selection === "active") {
     const account = mailAccounts.find((candidate) => candidate.active);
     return account
       ? { provider: account.provider, account_id: account.account_id }
       : unavailableAccountFilter;
   }
   try {
-    const parsed: unknown = JSON.parse(inboxAccountSelect.value);
+    const parsed: unknown = JSON.parse(selection);
     if (
       Array.isArray(parsed) &&
       parsed.length === 2 &&
@@ -1417,7 +1420,7 @@ function selectedInboxAccount(): Pick<InboxQuery, "provider" | "account_id"> {
 }
 
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
-  const account = selectedInboxAccount();
+  const account = inboxAccountForSelection(inboxAccountSelect.value);
   return {
     limit: Number(inboxPageSizeSelect.value),
     provider: account.provider,
@@ -1428,6 +1431,30 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
     status: optionalFilterValue(inboxStateSelect.value),
     keyword: optionalFilterValue(inboxKeywordInput.value),
   };
+}
+
+function clearInboxPageForAccountChange(message: string): void {
+  inboxRequestGeneration += 1;
+  inboxItems = [];
+  inboxNextCursor = null;
+  inboxCapabilityUnavailableCount = 0;
+  clearMessageOwnedUiState();
+  inboxLoadMore.hidden = true;
+  renderInbox(inboxItems);
+  inboxStatus.textContent = message;
+  delete inboxStatus.dataset.kind;
+}
+
+function commitInboxQueryFromControls(): void {
+  const nextQuery = queryFromInboxControls();
+  const accountScopeChanged =
+    activeInboxQuery.provider !== nextQuery.provider ||
+    activeInboxQuery.account_id !== nextQuery.account_id;
+  activeInboxAccountSelection = inboxAccountSelect.value;
+  activeInboxQuery = nextQuery;
+  if (accountScopeChanged) {
+    clearInboxPageForAccountChange("Email account filter changed. Refreshing local history…");
+  }
 }
 
 function inboxMutationInFlight(): boolean {
@@ -1608,7 +1635,7 @@ function renderInboxAccountOptions(): void {
 }
 
 function reconcileInboxAccountScope(): boolean {
-  const selected = selectedInboxAccount();
+  const selected = inboxAccountForSelection(activeInboxAccountSelection);
   if (
     activeInboxQuery.provider === selected.provider &&
     activeInboxQuery.account_id === selected.account_id
@@ -1621,15 +1648,7 @@ function reconcileInboxAccountScope(): boolean {
     provider: selected.provider,
     account_id: selected.account_id,
   };
-  inboxRequestGeneration += 1;
-  inboxItems = [];
-  inboxNextCursor = null;
-  inboxCapabilityUnavailableCount = 0;
-  clearMessageOwnedUiState();
-  inboxLoadMore.hidden = true;
-  renderInbox(inboxItems);
-  inboxStatus.textContent = "Active email account changed. Refreshing local history…";
-  delete inboxStatus.dataset.kind;
+  clearInboxPageForAccountChange("Active email account changed. Refreshing local history…");
   return true;
 }
 
@@ -1713,7 +1732,6 @@ function renderMailAccounts(data: MailAccounts): boolean {
 
 async function refreshAfterMailMutation(message: string): Promise<void> {
   await loadHealth(message);
-  activeInboxQuery = queryFromInboxControls();
   await loadInbox();
 }
 
@@ -2408,12 +2426,12 @@ autostartEnabledInput.addEventListener("change", () => {
 });
 inboxFilterForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  activeInboxQuery = queryFromInboxControls();
+  commitInboxQueryFromControls();
   void loadInbox();
 });
 inboxReset.addEventListener("click", () => {
   inboxFilterForm.reset();
-  activeInboxQuery = queryFromInboxControls();
+  commitInboxQueryFromControls();
   void loadInbox();
 });
 inboxLoadMore.addEventListener("click", () => void loadInbox(true));

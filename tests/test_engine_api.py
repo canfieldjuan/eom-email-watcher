@@ -294,6 +294,36 @@ def test_health_recognizes_bundled_desktop_oauth_client(
     assert health["data"]["gmail"]["credentials_configured"] is True
 
 
+def test_legacy_gmail_health_reports_only_the_active_account_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("retained token", encoding="utf-8")
+    disconnected = runtime.store.register_mail_account(
+        "gmail",
+        f"gmail-{'b' * 32}",
+        display_name="Gmail",
+        address="active@example.com",
+        active=True,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert runtime.store.active_mail_account() == disconnected
+    assert health["data"]["gmail"]["connected"] is False
+    assert [
+        account["connected"]
+        for account in health["data"]["mail"]["accounts"]
+        if account["account_id"] == "gmail-default"
+    ] == [True]
+
+
 def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
     config_path = tmp_path / "new" / "config.toml"
 
