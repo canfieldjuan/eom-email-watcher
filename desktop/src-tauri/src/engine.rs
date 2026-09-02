@@ -280,7 +280,7 @@ pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
-    gmail_check_gate: Arc<Mutex<()>>,
+    mailbox_operation_gate: Arc<Mutex<()>>,
     request_timeout: Option<Duration>,
 }
 
@@ -554,6 +554,7 @@ pub struct HealthStatus {
     pub gmail: GmailHealth,
     pub last_check: Option<String>,
     pub local_model: LocalModelHealth,
+    pub mail: MailAccounts,
     pub notifications: NotificationHealth,
     pub production_check_supported: bool,
     pub watchlist_count: u64,
@@ -575,6 +576,39 @@ pub struct GmailHealth {
 pub struct GmailAuthorization {
     pub baseline_initialized: bool,
     pub connected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailProviderStatus {
+    pub provider: String,
+    pub display_name: String,
+    pub connection_available: bool,
+    #[serde(default)]
+    pub multiple_accounts: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccountStatus {
+    pub provider: String,
+    pub account_id: String,
+    pub display_name: String,
+    pub address: Option<String>,
+    pub connected: bool,
+    pub active: bool,
+    pub last_check: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccounts {
+    pub providers: Vec<MailProviderStatus>,
+    pub accounts: Vec<MailAccountStatus>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccountResult {
+    pub account: MailAccountStatus,
+    #[serde(default)]
+    pub baseline_initialized: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -727,7 +761,7 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
-                gmail_check_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
             });
         }
@@ -739,7 +773,7 @@ impl Engine {
                 program: packaged_program,
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
-                gmail_check_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
             });
         }
@@ -757,7 +791,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
-            gmail_check_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         })
     }
@@ -772,7 +806,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
-            gmail_check_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         }
     }
@@ -940,10 +974,70 @@ impl Engine {
 
     pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
         let _guard = self
-            .gmail_check_gate
+            .mailbox_operation_gate
             .lock()
-            .map_err(|_| EngineError::host("host_error", "Gmail operation coordinator stopped"))?;
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request("gmail.authorize", json!({}))
+    }
+
+    pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
+        self.request("mail.accounts.list", json!({}))
+    }
+
+    pub fn connect_mail_provider(
+        &self,
+        provider: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request("mail.accounts.connect", json!({"provider": provider}))
+    }
+
+    pub fn reconnect_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.reconnect",
+            json!({"provider": provider, "account_id": account_id}),
+        )
+    }
+
+    pub fn disconnect_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.disconnect",
+            json!({"provider": provider, "account_id": account_id}),
+        )
+    }
+
+    pub fn activate_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.activate",
+            json!({"provider": provider, "account_id": account_id}),
+        )
     }
 
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
@@ -1011,9 +1105,9 @@ impl Engine {
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
         let _guard = self
-            .gmail_check_gate
+            .mailbox_operation_gate
             .lock()
-            .map_err(|_| EngineError::host("host_error", "Gmail operation coordinator stopped"))?;
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request("watcher.check", json!({"dry_run": false}))
     }
 
@@ -1512,6 +1606,44 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v1_mail_account_contract_is_typed_and_secret_free() {
+        let accounts: MailAccounts = serde_json::from_value(json!({
+            "providers": [{
+                "provider": "gmail",
+                "display_name": "Gmail",
+                "connection_available": true,
+                "multiple_accounts": true
+            }],
+            "accounts": [{
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "display_name": "Gmail",
+                "address": "owner@example.com",
+                "connected": true,
+                "active": true,
+                "last_check": "2026-09-01T12:00:00+00:00"
+            }]
+        }))
+        .expect("deserialize generic email account catalog");
+
+        assert_eq!(
+            accounts.accounts[0].address.as_deref(),
+            Some("owner@example.com")
+        );
+        assert!(accounts.accounts[0].active);
+        assert_eq!(accounts.providers[0].provider, "gmail");
+
+        let result: MailAccountResult = serde_json::from_value(json!({
+            "account": accounts.accounts[0],
+            "baseline_initialized": false
+        }))
+        .expect("deserialize email account mutation result");
+        assert_eq!(result.baseline_initialized, Some(false));
+        let encoded = serde_json::to_string(&result).expect("serialize account result");
+        assert!(!encoded.contains("token"));
+    }
+
+    #[test]
     fn protocol_v1_entitlement_status_is_typed_and_claim_free() {
         let status: ConnectEntitlementStatus = serde_json::from_value(json!({
             "state": "expired",
@@ -1868,6 +2000,7 @@ notifications_enabled = true
         let engine = real_engine(config_path);
 
         let health = engine.health().expect("read engine health");
+        let accounts = engine.mail_accounts().expect("read email accounts");
         assert_eq!(
             engine
                 .connect_entitlement_status()
@@ -1886,6 +2019,11 @@ notifications_enabled = true
         );
         assert!(!health.gmail.credentials_configured);
         assert!(!health.gmail.connected);
+        assert_eq!(accounts.accounts.len(), 1);
+        assert_eq!(accounts.accounts[0].provider, "gmail");
+        assert_eq!(accounts.accounts[0].account_id, "gmail-default");
+        assert!(accounts.accounts[0].active);
+        assert!(!accounts.accounts[0].connected);
         assert_eq!(
             engine
                 .authorize_gmail()

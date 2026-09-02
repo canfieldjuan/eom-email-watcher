@@ -17,7 +17,7 @@ from .config import MAX_RETENTION_DAYS
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -287,6 +287,17 @@ class MessageSource:
     provider: str
     account_id: str
     provider_message_id: str
+
+
+@dataclass(frozen=True)
+class MailAccount:
+    provider: str
+    account_id: str
+    display_name: str
+    address: str | None
+    active: bool
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -883,6 +894,19 @@ class Store:
                     last_success_at TEXT NOT NULL,
                     PRIMARY KEY (provider, account_id)
                 );
+                CREATE TABLE IF NOT EXISTS mail_accounts (
+                    provider TEXT NOT NULL CHECK (provider <> ''),
+                    account_id TEXT NOT NULL CHECK (account_id <> ''),
+                    display_name TEXT NOT NULL CHECK (display_name <> ''),
+                    address TEXT CHECK (address IS NULL OR address <> ''),
+                    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, account_id),
+                    UNIQUE (provider, address)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_accounts_one_active
+                    ON mail_accounts(active) WHERE active = 1;
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -967,6 +991,15 @@ class Store:
             )
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
+            stamp = datetime.now(UTC).isoformat()
+            db.execute(
+                """INSERT INTO mail_accounts(
+                    provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                ) SELECT ?, ?, 'Gmail', NULL, 1, ?, ?
+                WHERE NOT EXISTS (SELECT 1 FROM mail_accounts)""",
+                (DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID, stamp, stamp),
+            )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)").fetchall()}
             if "analysis_at" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN analysis_at TEXT")
@@ -983,6 +1016,178 @@ class Store:
                     db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
+
+    def mail_accounts(self) -> list[MailAccount]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                FROM mail_accounts
+                ORDER BY active DESC, casefold(display_name), provider, account_id"""
+            ).fetchall()
+        return [
+            MailAccount(
+                provider=str(row["provider"]),
+                account_id=str(row["account_id"]),
+                display_name=str(row["display_name"]),
+                address=str(row["address"]) if row["address"] is not None else None,
+                active=bool(row["active"]),
+                created_at=str(row["created_at"]),
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
+    def mail_account(self, provider: str, account_id: str) -> MailAccount | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                FROM mail_accounts WHERE provider = ? AND account_id = ?""",
+                (provider, account_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return MailAccount(
+            provider=str(row["provider"]),
+            account_id=str(row["account_id"]),
+            display_name=str(row["display_name"]),
+            address=str(row["address"]) if row["address"] is not None else None,
+            active=bool(row["active"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def mail_account_by_address(self, provider: str, address: str) -> MailAccount | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                FROM mail_accounts WHERE provider = ? AND address = ?""",
+                (provider, address),
+            ).fetchone()
+        if row is None:
+            return None
+        return MailAccount(
+            provider=str(row["provider"]),
+            account_id=str(row["account_id"]),
+            display_name=str(row["display_name"]),
+            address=str(row["address"]),
+            active=bool(row["active"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def mail_account_has_history(self, provider: str, account_id: str) -> bool:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT
+                    EXISTS(
+                        SELECT 1 FROM mailbox_state
+                        WHERE provider = ?1 AND account_id = ?2
+                    ) OR EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE provider = ?1 AND account_id = ?2
+                    ) AS has_history""",
+                (provider, account_id),
+            ).fetchone()
+        return bool(row["has_history"])
+
+    def active_mail_account(self) -> MailAccount | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                FROM mail_accounts WHERE active = 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        return MailAccount(
+            provider=str(row["provider"]),
+            account_id=str(row["account_id"]),
+            display_name=str(row["display_name"]),
+            address=str(row["address"]) if row["address"] is not None else None,
+            active=bool(row["active"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def register_mail_account(
+        self,
+        provider: str,
+        account_id: str,
+        *,
+        display_name: str,
+        address: str | None = None,
+        active: bool = False,
+    ) -> MailAccount:
+        if not provider or not account_id or not display_name:
+            raise ValueError("Mail account identity and display name must be non-empty")
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if active:
+                db.execute(
+                    "UPDATE mail_accounts SET active = 0, updated_at = ? WHERE active = 1",
+                    (stamp,),
+                )
+            db.execute(
+                """INSERT INTO mail_accounts(
+                    provider, account_id, display_name, address, active,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (provider, account_id, display_name, address, int(active), stamp, stamp),
+            )
+        account = self.mail_account(provider, account_id)
+        assert account is not None
+        return account
+
+    def update_mail_account_identity(
+        self,
+        provider: str,
+        account_id: str,
+        *,
+        display_name: str,
+        address: str,
+    ) -> MailAccount:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            cursor = db.execute(
+                """UPDATE mail_accounts
+                SET display_name = ?, address = ?, updated_at = ?
+                WHERE provider = ? AND account_id = ?""",
+                (display_name, address, stamp, provider, account_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError((provider, account_id))
+        account = self.mail_account(provider, account_id)
+        assert account is not None
+        return account
+
+    def activate_mail_account(self, provider: str, account_id: str) -> MailAccount:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if (
+                db.execute(
+                    "SELECT 1 FROM mail_accounts WHERE provider = ? AND account_id = ?",
+                    (provider, account_id),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError((provider, account_id))
+            db.execute(
+                "UPDATE mail_accounts SET active = 0, updated_at = ? WHERE active = 1",
+                (stamp,),
+            )
+            db.execute(
+                """UPDATE mail_accounts SET active = 1, updated_at = ?
+                WHERE provider = ? AND account_id = ?""",
+                (stamp, provider, account_id),
+            )
+        account = self.mail_account(provider, account_id)
+        assert account is not None
+        return account
 
     def state(
         self,

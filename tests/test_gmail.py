@@ -399,3 +399,34 @@ def test_profile_history_id_classifies_http_401_as_rejected_authorization() -> N
 
     with pytest.raises(GmailAuthorizationRejected, match="rejected"):
         gateway.profile_history_id()
+
+
+def test_profile_returns_normalized_mailbox_identity_and_cursor() -> None:
+    request = SimpleNamespace(
+        execute=lambda: {"emailAddress": "Owner@Example.COM", "historyId": "12345"}
+    )
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    profile = gateway.profile()
+
+    assert profile.email_address == "owner@example.com"
+    assert profile.history_id == "12345"
+    assert gateway.profile_history_id() == "12345"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"emailAddress": "", "historyId": "12345"},
+        {"emailAddress": "@", "historyId": "12345"},
+        {"emailAddress": "owner@example.com", "historyId": ""},
+    ],
+)
+def test_profile_rejects_incomplete_identity(response: dict[str, str]) -> None:
+    request = SimpleNamespace(execute=lambda: response)
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    with pytest.raises(GmailError, match="profile response"):
+        gateway.profile()

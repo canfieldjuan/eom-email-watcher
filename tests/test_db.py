@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher.config import MAX_RETENTION_DAYS
-from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, Store
+from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, SCHEMA_VERSION, Store
 from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
 
@@ -110,6 +110,60 @@ def test_mailbox_state_identity_and_suppression_are_account_scoped(
     items, _ = store.query_inbox(limit=10, account_id="account-2")
     assert [(item["provider"], item["account_id"], item["message_id"]) for item in items] == [
         ("microsoft365", "account-2", graph_local_id)
+    ]
+
+
+def test_mail_account_registry_seeds_legacy_gmail_and_switches_atomically(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+
+    legacy = store.active_mail_account()
+    assert legacy is not None
+    assert (legacy.provider, legacy.account_id, legacy.address, legacy.active) == (
+        "gmail",
+        "gmail-default",
+        None,
+        True,
+    )
+
+    graph = store.register_mail_account(
+        "microsoft365",
+        "microsoft365-default",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+    )
+    assert graph.active is False
+    activated = store.activate_mail_account(graph.provider, graph.account_id)
+
+    assert activated.active is True
+    assert store.active_mail_account() == activated
+    assert [account.active for account in store.mail_accounts()] == [True, False]
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_mail_account_registry_rejects_duplicate_provider_identity(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.register_mail_account(
+            "gmail",
+            "gmail-second",
+            display_name="Gmail",
+            address="owner@example.com",
+        )
+
+    assert [(account.account_id, account.address) for account in store.mail_accounts()] == [
+        ("gmail-default", "owner@example.com")
     ]
 
 
@@ -801,7 +855,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
         row = db.execute(
             """SELECT status, analysis_at, provider, account_id, provider_message_id
@@ -820,6 +874,10 @@ def test_initialize_migrates_current_schema_without_losing_messages(
         suppression_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='suppressed_messages'"
         ).fetchone()
+        account = db.execute(
+            """SELECT provider, account_id, display_name, address, active
+            FROM mail_accounts"""
+        ).fetchone()
     assert "analysis_at" in columns
     assert row == (
         "pending",
@@ -832,6 +890,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(
     assert attachment_table == (1,)
     assert connect_table == (1,)
     assert suppression_table == (1,)
+    assert account == ("gmail", "gmail-default", "Gmail", None, 1)
     migrated = Store(database)
     assert migrated.attachment("legacy-message", "2").filename == "legacy.pdf"
     assert migrated.has_seen_message("legacy-deleted-message")
@@ -865,7 +924,7 @@ def test_initialize_migrates_v1_outbound_schema_without_losing_sends(
     Store(database).initialize()
 
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         sent = db.execute(
             "SELECT gmail_message_id FROM outbound_sends WHERE dedupe_key = ?",
             ("monthly-hours:2026-07",),
@@ -1119,7 +1178,7 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
     assert restored.result_json is None
     assert restored.result_metadata_json is None
     with sqlite3.connect(database) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
@@ -1375,7 +1434,7 @@ def test_initialize_replaces_v6_active_index_without_losing_jobs(
             "SELECT sql FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_connect_attachment_jobs_active'"
         ).fetchone()[0]
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 2
     assert "protocol_version = 1" in index_sql
 

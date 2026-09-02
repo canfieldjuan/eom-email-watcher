@@ -9,6 +9,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -33,30 +34,34 @@ from .config import (
     remove_sender,
     update_settings,
 )
-from .db import ConnectJob, ConnectOutput, MessageSource, NotificationIntent, Store
+from .db import ConnectJob, ConnectOutput, MailAccount, MessageSource, NotificationIntent, Store
 from .gmail import (
-    GmailAuthorizationRejected,
+    TOKEN_LOCK_TIMEOUT_SECONDS,
     GmailError,
     GmailGateway,
     gmail_credentials_configured,
 )
 from .locking import operation_lock, operation_lock_supported
 from .mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxAccountUnavailable,
     MailboxError,
     MailboxGateway,
-    default_mailbox_session,
 )
 from .runtime import (
+    MAIL_PROVIDER_NAMES,
     Runtime,
     configured_mailbox_identity,
     load_configured_mailbox,
     load_runtime,
+    mail_account_connected,
+    mail_account_token_file,
 )
 from .service import Watcher
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
-GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS = 30
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 MAX_INBOX_CURSOR_BYTES = 1024
 INBOX_PRIORITIES = frozenset({"urgent", "high", "normal", "low", "untriaged"})
@@ -223,21 +228,264 @@ def _require_host_delivery_compatible(runtime: Runtime) -> None:
         )
 
 
+def _mail_provider(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 64:
+        raise ApiError("invalid_request", "provider must be a non-empty string")
+    provider = value.strip().casefold()
+    if provider not in MAIL_PROVIDER_NAMES:
+        raise ApiError("unsupported_provider", "That email provider is not available")
+    return provider
+
+
+def _mail_account_key(payload: dict[str, object]) -> tuple[str, str]:
+    provider = _mail_provider(payload.get("provider"))
+    account_id = payload.get("account_id")
+    if not isinstance(account_id, str) or not account_id.strip() or len(account_id) > 128:
+        raise ApiError("invalid_request", "account_id must be a non-empty string")
+    return provider, account_id.strip()
+
+
+def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, object]:
+    state = runtime.store.state(provider=account.provider, account_id=account.account_id)
+    return {
+        "account_id": account.account_id,
+        "active": account.active,
+        "address": account.address,
+        "connected": mail_account_connected(runtime.config, account),
+        "display_name": account.display_name,
+        "last_check": state[1] if state else None,
+        "provider": account.provider,
+    }
+
+
+def _mail_accounts_public(runtime: Runtime) -> dict[str, object]:
+    accounts = runtime.store.mail_accounts()
+    return {
+        "accounts": [_mail_account_public(runtime, account) for account in accounts],
+        "providers": [
+            {
+                "connection_available": (
+                    gmail_credentials_configured(runtime.config.gmail_credentials_file)
+                    if provider == DEFAULT_MAIL_PROVIDER
+                    else False
+                ),
+                "display_name": display_name,
+                "multiple_accounts": provider == DEFAULT_MAIL_PROVIDER,
+                "provider": provider,
+            }
+            for provider, display_name in sorted(MAIL_PROVIDER_NAMES.items())
+        ],
+    }
+
+
+def _install_private_token(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    local_copy: Path | None = None
+    try:
+        with FileLock(f"{destination}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            with source.open("rb") as stream:
+                os.fsync(stream.fileno())
+                content = stream.read()
+            local_copy = _write_private_file(
+                destination.parent,
+                ".readonly-token-",
+                ".json",
+                content,
+            )
+            os.replace(local_copy, destination)
+            local_copy = None
+    except FileLockTimeout as exc:
+        raise MailboxAccountUnavailable("The email account token is busy; retry") from exc
+    finally:
+        if local_copy is not None:
+            local_copy.unlink(missing_ok=True)
+
+
+def _disconnect_mail_account_token(config: Config, account: MailAccount) -> None:
+    token_file = mail_account_token_file(config, account)
+    if not token_file.is_file():
+        return
+    try:
+        with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            token_file.unlink(missing_ok=True)
+    except FileLockTimeout as exc:
+        raise MailboxAccountUnavailable("The email account token is busy; retry") from exc
+
+
+def _authorize_gmail_account(
+    runtime: Runtime,
+    account: MailAccount | None,
+    *,
+    reuse_valid_token: bool,
+) -> dict[str, object]:
+    token_file = mail_account_token_file(runtime.config, account) if account else None
+    if (
+        account is not None
+        and account.address is None
+        and (token_file is None or not token_file.is_file())
+        and runtime.store.mail_account_has_history(account.provider, account.account_id)
+    ):
+        raise ApiError(
+            "account_identity_unverified",
+            "The existing mailbox identity cannot be verified; connect it as a new account",
+        )
+    if account is not None and token_file is not None and token_file.is_file():
+        try:
+            current_gmail = GmailGateway.from_token(
+                runtime.config.gmail_credentials_file, token_file
+            )
+            current_profile = current_gmail.profile()
+        except GmailError as exc:
+            if account.address is None and runtime.store.mail_account_has_history(
+                account.provider, account.account_id
+            ):
+                raise ApiError(
+                    "account_identity_unverified",
+                    "The existing mailbox identity cannot be verified; connect it as a new account",
+                ) from exc
+        else:
+            if account.address is None:
+                account = runtime.store.update_mail_account_identity(
+                    account.provider,
+                    account.account_id,
+                    display_name=MAIL_PROVIDER_NAMES[account.provider],
+                    address=current_profile.email_address,
+                )
+            if reuse_valid_token and current_profile.email_address == account.address:
+                return _finish_gmail_authorization(runtime, account, current_profile.history_id)
+
+    authorization_parent = (
+        token_file.parent if token_file is not None else runtime.config.database_file.parent
+    )
+    authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(
+        prefix=".gmail-authorization-",
+        dir=authorization_parent,
+    ) as directory:
+        staged_token = Path(directory) / "readonly-token.json"
+        gmail, _changed = GmailGateway.authorize_with_status(
+            runtime.config.gmail_credentials_file,
+            staged_token,
+            force_reauthorize=True,
+        )
+        profile = gmail.profile()
+
+        activate_after_connect = False
+        if account is None:
+            account = runtime.store.mail_account_by_address(
+                DEFAULT_MAIL_PROVIDER, profile.email_address
+            )
+            if account is None:
+                legacy = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+                if (
+                    legacy is not None
+                    and legacy.address is None
+                    and not runtime.store.mail_account_has_history(
+                        legacy.provider, legacy.account_id
+                    )
+                ):
+                    account = legacy
+                else:
+                    active = runtime.store.active_mail_account()
+                    activate_after_connect = active is None or not mail_account_connected(
+                        runtime.config, active
+                    )
+                    account = runtime.store.register_mail_account(
+                        DEFAULT_MAIL_PROVIDER,
+                        f"gmail-{uuid.uuid4().hex}",
+                        display_name=MAIL_PROVIDER_NAMES[DEFAULT_MAIL_PROVIDER],
+                        address=profile.email_address,
+                        active=False,
+                    )
+            active = runtime.store.active_mail_account()
+            activate_after_connect = (
+                activate_after_connect
+                or active is None
+                or not (active.active and mail_account_connected(runtime.config, active))
+            )
+        elif account.address is not None and profile.email_address != account.address:
+            raise ApiError(
+                "account_identity_mismatch",
+                "The authorized mailbox does not match the selected email account",
+            )
+
+        token_file = mail_account_token_file(runtime.config, account)
+        _install_private_token(staged_token, token_file)
+
+    account = runtime.store.update_mail_account_identity(
+        account.provider,
+        account.account_id,
+        display_name=MAIL_PROVIDER_NAMES[account.provider],
+        address=profile.email_address,
+    )
+    if activate_after_connect and not account.active:
+        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+    return _finish_gmail_authorization(runtime, account, profile.history_id)
+
+
+def _finish_gmail_authorization(
+    runtime: Runtime,
+    account: MailAccount,
+    history_id: str,
+) -> dict[str, object]:
+    initialize_baseline = (
+        runtime.store.state(provider=account.provider, account_id=account.account_id) is None
+    )
+    if initialize_baseline:
+        runtime.store.set_state(
+            history_id,
+            provider=account.provider,
+            account_id=account.account_id,
+        )
+    return {
+        "account": _mail_account_public(runtime, account),
+        "baseline_initialized": initialize_baseline,
+    }
+
+
+def _with_mail_account_mutation(
+    request: dict[str, object],
+    operation: Callable[[Runtime], dict[str, object]],
+) -> dict[str, object]:
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Email account changes require native operation locking",
+        )
+    with operation_lock(lock_path, "Another mailbox operation is already running"):
+        return operation(_runtime(request))
+
+
 def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
     config = runtime.config
     production_check_supported = operation_lock_supported(_production_check_lock_path(config))
-    provider, account_id = configured_mailbox_identity(config)
-    state = runtime.store.state(provider=provider, account_id=account_id)
+    active_account = runtime.store.active_mail_account()
+    state = (
+        runtime.store.state(
+            provider=active_account.provider,
+            account_id=active_account.account_id,
+        )
+        if active_account is not None
+        else None
+    )
     model_ok, model_detail = runtime.model.health()
+    mail = _mail_accounts_public(runtime)
+    gmail_connected = any(
+        account.provider == DEFAULT_MAIL_PROVIDER and mail_account_connected(config, account)
+        for account in runtime.store.mail_accounts()
+    )
     return {
         "database": {"ok": True, "initialized": state is not None},
         "gmail": {
             "credentials_configured": gmail_credentials_configured(config.gmail_credentials_file),
-            "connected": config.gmail_token_file.exists(),
+            "connected": gmail_connected,
         },
         "last_check": state[1] if state else None,
+        "mail": mail,
         "local_model": {
             "authentication_required": config.model_require_auth,
             "detail": model_detail,
@@ -279,47 +527,84 @@ def _connect_entitlement_install(request: dict[str, object]) -> dict[str, object
     return status.public_dict()
 
 
-def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
+def _mail_accounts(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
-    runtime = _runtime(request)
-    config = runtime.config
-    lock_path = config.database_file.with_name(f"{config.database_file.name}.gmail-authorize.lock")
-    try:
-        with FileLock(str(lock_path), timeout=GMAIL_AUTHORIZATION_LOCK_TIMEOUT_SECONDS):
-            gmail, authorization_changed = GmailGateway.authorize_with_status(
-                config.gmail_credentials_file,
-                config.gmail_token_file,
+    return _mail_accounts_public(_runtime(request))
+
+
+def _mail_account_connect(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider"})
+    provider = _mail_provider(payload.get("provider"))
+
+    def connect(runtime: Runtime) -> dict[str, object]:
+        if provider != DEFAULT_MAIL_PROVIDER:
+            raise ApiError("unsupported_provider", "That email provider is not available")
+        return _authorize_gmail_account(runtime, None, reuse_valid_token=False)
+
+    return _with_mail_account_mutation(request, connect)
+
+
+def _mail_account_reconnect(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id"})
+    provider, account_id = _mail_account_key(payload)
+
+    def reconnect(runtime: Runtime) -> dict[str, object]:
+        account = runtime.store.mail_account(provider, account_id)
+        if account is None:
+            raise ApiError("not_found", "The email account was not found")
+        return _authorize_gmail_account(runtime, account, reuse_valid_token=False)
+
+    return _with_mail_account_mutation(request, reconnect)
+
+
+def _mail_account_disconnect(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id"})
+    provider, account_id = _mail_account_key(payload)
+
+    def disconnect(runtime: Runtime) -> dict[str, object]:
+        account = runtime.store.mail_account(provider, account_id)
+        if account is None:
+            raise ApiError("not_found", "The email account was not found")
+        _disconnect_mail_account_token(runtime.config, account)
+        return {"account": _mail_account_public(runtime, account)}
+
+    return _with_mail_account_mutation(request, disconnect)
+
+
+def _mail_account_activate(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id"})
+    provider, account_id = _mail_account_key(payload)
+
+    def activate(runtime: Runtime) -> dict[str, object]:
+        account = runtime.store.mail_account(provider, account_id)
+        if account is None:
+            raise ApiError("not_found", "The email account was not found")
+        if not mail_account_connected(runtime.config, account):
+            raise ApiError("account_unavailable", "Connect the email account before using it")
+        return {
+            "account": _mail_account_public(
+                runtime, runtime.store.activate_mail_account(provider, account_id)
             )
-            try:
-                current_history_id = gmail.profile_history_id()
-            except GmailAuthorizationRejected:
-                gmail, authorization_changed = GmailGateway.authorize_with_status(
-                    config.gmail_credentials_file,
-                    config.gmail_token_file,
-                    force_reauthorize=True,
-                )
-                current_history_id = gmail.profile_history_id()
-            mailbox = default_mailbox_session(gmail)
-            initialize_baseline = (
-                authorization_changed
-                or runtime.store.state(
-                    provider=mailbox.provider,
-                    account_id=mailbox.account_id,
-                )
-                is None
-            )
-            if initialize_baseline:
-                runtime.store.set_state(
-                    current_history_id,
-                    provider=mailbox.provider,
-                    account_id=mailbox.account_id,
-                )
-    except FileLockTimeout as exc:
-        raise GmailError("Gmail authorization is busy; retry the operation") from exc
-    return {
-        "baseline_initialized": initialize_baseline,
-        "connected": True,
-    }
+        }
+
+    return _with_mail_account_mutation(request, activate)
+
+
+def _gmail_authorize(request: dict[str, object]) -> dict[str, object]:
+    """Compatibility operation for existing CLI/desktop protocol clients."""
+    _payload(request)
+
+    def authorize(runtime: Runtime) -> dict[str, object]:
+        account = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+        if account is None:
+            raise ApiError("not_found", "The Gmail account was not found")
+        result = _authorize_gmail_account(runtime, account, reuse_valid_token=True)
+        return {
+            "baseline_initialized": result["baseline_initialized"],
+            "connected": True,
+        }
+
+    return _with_mail_account_mutation(request, authorize)
 
 
 def _check(request: dict[str, object]) -> dict[str, object]:
@@ -339,7 +624,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
                 **Watcher.inactive_result(config, active_runtime.store, dry_run=dry_run),
                 "pending_notifications": _host_notification_intent_count(active_runtime),
             }
-        mailbox = load_configured_mailbox(config)
+        mailbox = load_configured_mailbox(config, active_runtime.store)
         result = Watcher(config, active_runtime.store, mailbox, active_runtime.model).check(
             dry_run=dry_run,
             deliver_notifications=False,
@@ -512,7 +797,7 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
         source = runtime.store.message_source(message_id)
     except KeyError as exc:
         raise ApiError("not_found", "Message was not found") from exc
-    configured_provider, configured_account_id = configured_mailbox_identity(runtime.config)
+    configured_provider, configured_account_id = configured_mailbox_identity(runtime.store)
     if source.provider != configured_provider or source.account_id != configured_account_id:
         raise ApiError(
             "account_unavailable",
@@ -522,7 +807,7 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
 
 
 def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
-    mailbox = load_configured_mailbox(runtime.config)
+    mailbox = load_configured_mailbox(runtime.config, runtime.store)
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Configured mailbox identity changed while opening the provider")
     return mailbox.gateway
@@ -1682,6 +1967,11 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "inbox.delete": _inbox_delete,
     "inbox.query": _query_inbox,
     "inbox.recent": _recent,
+    "mail.accounts.activate": _mail_account_activate,
+    "mail.accounts.connect": _mail_account_connect,
+    "mail.accounts.disconnect": _mail_account_disconnect,
+    "mail.accounts.list": _mail_accounts,
+    "mail.accounts.reconnect": _mail_account_reconnect,
     "notifications.ack": _notifications_ack,
     "notifications.count_under_host_lock": _notifications_count_under_host_lock,
     "notifications.pending": _notifications_pending,
@@ -1732,6 +2022,13 @@ def _response(request: object) -> dict[str, object]:
     except ConfigError as exc:
         return {
             "error": {"code": "configuration_error", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except MailboxAccountUnavailable as exc:
+        return {
+            "error": {"code": "account_unavailable", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
