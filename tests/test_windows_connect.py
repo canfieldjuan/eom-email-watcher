@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,7 +16,6 @@ from eom_email_watcher.connect_windows import (
     WINDOWS_LOCK_LENGTH,
     WINDOWS_LOCK_OFFSET,
     WindowsFileLock,
-    _current_user_sid,
     local_app_data_root,
     read_bounded_regular_file,
 )
@@ -25,26 +26,15 @@ TOKEN = "A" * 43
 INSTANCE_ID = "11111111-1111-4111-8111-111111111111"
 
 
-def _make_private_root(path: Path) -> None:
-    subprocess.run(
-        [
-            "icacls",
-            str(path),
-            "/grant:r",
-            f"*{_current_user_sid()}:(OI)(CI)F",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["icacls", str(path), "/inheritance:r"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture
+def private_root() -> Iterator[Path]:
+    actual_local_app_data = os.environ.get("LOCALAPPDATA")
+    if not actual_local_app_data:
+        pytest.skip("LOCALAPPDATA is required for native Windows tests")
+    with tempfile.TemporaryDirectory(dir=actual_local_app_data) as directory:
+        root = Path(directory)
+        assert local_app_data_root(str(root)) == root
+        yield root
 
 
 def _contracts_path(relative: str) -> Path:
@@ -109,26 +99,24 @@ def _manifest() -> dict[str, object]:
 
 
 def test_windows_default_connect_paths_use_local_app_data(
-    tmp_path: Path,
+    private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     actual_local_app_data = os.environ.get("LOCALAPPDATA")
     if actual_local_app_data:
         assert local_app_data_root(actual_local_app_data) == Path(actual_local_app_data)
-    _make_private_root(tmp_path)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
 
     root, providers = connect._providers_directory(None, 2)
-    installed = entitlement._entitlement_path(None, None, str(tmp_path))
+    installed = entitlement._entitlement_path(None, None, str(private_root))
 
-    assert root == tmp_path
-    assert providers == tmp_path / "LocalConnect/runtime/v2/providers"
-    assert installed == tmp_path / "LocalConnect/entitlement-v1.json"
+    assert root == private_root
+    assert providers == private_root / "LocalConnect/runtime/v2/providers"
+    assert installed == private_root / "LocalConnect/entitlement-v1.json"
 
 
-def test_windows_bounded_reader_rejects_oversized_file(tmp_path: Path) -> None:
-    _make_private_root(tmp_path)
-    candidate = tmp_path / "oversized.json"
+def test_windows_bounded_reader_rejects_oversized_file(private_root: Path) -> None:
+    candidate = private_root / "oversized.json"
     candidate.write_bytes(b"1234")
 
     with pytest.raises(OSError):
@@ -136,17 +124,16 @@ def test_windows_bounded_reader_rejects_oversized_file(tmp_path: Path) -> None:
 
 
 def test_windows_default_discovery_authenticates_provider_manifest(
-    tmp_path: Path,
+    private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _make_private_root(tmp_path)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
     monkeypatch.setattr(
         connect.entitlement,
         "connect_entitlement_decision",
         lambda: entitlement.EntitlementDecision.ACTIVE,
     )
-    providers = tmp_path / "LocalConnect/runtime/v2/providers"
+    providers = private_root / "LocalConnect/runtime/v2/providers"
     providers.mkdir(parents=True)
     (providers / "website-redesign.json").write_text(
         json.dumps(_registration()),
@@ -169,12 +156,11 @@ def test_windows_default_discovery_authenticates_provider_manifest(
 
 
 def test_windows_entitlement_install_and_status(
-    tmp_path: Path,
+    private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _make_private_root(tmp_path)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    destination = tmp_path / "LocalConnect/entitlement-v1.json"
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
+    destination = private_root / "LocalConnect/entitlement-v1.json"
     source = _contracts_path("entitlements/v1/fixtures/valid/active.json")
     gate = _entitlement_gate(destination)
 
@@ -189,12 +175,11 @@ def test_windows_entitlement_install_and_status(
 
 
 def test_windows_entitlement_lock_contention_is_busy(
-    tmp_path: Path,
+    private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _make_private_root(tmp_path)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    destination = tmp_path / "LocalConnect/entitlement-v1.json"
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
+    destination = private_root / "LocalConnect/entitlement-v1.json"
     source = _contracts_path("entitlements/v1/fixtures/valid/active.json")
     gate = _entitlement_gate(destination)
     destination.parent.mkdir(parents=True)
@@ -213,12 +198,11 @@ def test_windows_entitlement_lock_contention_is_busy(
 
 
 def test_windows_final_validation_failure_restores_previous_bytes(
-    tmp_path: Path,
+    private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _make_private_root(tmp_path)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    destination = tmp_path / "LocalConnect/entitlement-v1.json"
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
+    destination = private_root / "LocalConnect/entitlement-v1.json"
     destination.parent.mkdir(parents=True)
     previous = b"previous-entitlement-bytes"
     destination.write_bytes(previous)
@@ -259,15 +243,13 @@ def test_windows_local_app_data_rejects_directory_junction(tmp_path: Path) -> No
         local_app_data_root(str(junction))
 
 
-def test_windows_local_app_data_rejects_broad_read_acl(tmp_path: Path) -> None:
-    _make_private_root(tmp_path)
-    assert local_app_data_root(str(tmp_path)) == tmp_path
+def test_windows_local_app_data_rejects_broad_read_acl(private_root: Path) -> None:
     subprocess.run(
-        ["icacls", str(tmp_path), "/grant", "*S-1-1-0:(OI)(CI)R"],
+        ["icacls", str(private_root), "/grant", "*S-1-1-0:(OI)(CI)R"],
         check=True,
         capture_output=True,
         text=True,
     )
 
     with pytest.raises(OSError):
-        local_app_data_root(str(tmp_path))
+        local_app_data_root(str(private_root))
