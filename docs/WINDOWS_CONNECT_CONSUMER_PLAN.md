@@ -88,6 +88,34 @@ button or manifest field.
   packaged Website Redesign capability, and completes one authenticated
   deterministic job.
 
+## Verification results
+
+- GitHub Actions run `33791640819` at consumer commit
+  `0dfb8139296600532e8c7256aee02e08e33591eb` completed successfully across the
+  Linux test, desktop, Windows operation-lock, and Windows package jobs.
+- Windows package job `100769381640` ran all 37 desktop-packaging tests
+  successfully, built the NSIS installer, passed two packaged engine
+  process-tree lifecycle tests, and passed its repeated packaged-engine smoke.
+- The consumer installer used for local acceptance had SHA-256
+  `e0f4ad534cdefe50f5a9552b81ef982908ccc1265827b43b6bd13f346e36cf43`.
+- A local Windows 11 VM installed that package and ran its installed
+  `eom-mail-engine.exe`. The engine discovered authenticated provider instance
+  `dab2c8a9-5375-490d-9b5f-fc6e906ad288`, observed an active
+  production-signed entitlement, and reconciled completed job
+  `70056a8f-a173-4ef0-a3bd-67165f12ca30`.
+- The provider result and consumer-exported `test-business-homepage.html` were
+  both 63,616 bytes with SHA-256
+  `97920ed3503ded39ab70e4809af4ba60a3dc3bd6af2eb622302f6cdb1ec500e3`, proving
+  discovery, bearer-authenticated job access, and integrity-bound output
+  reconciliation across the two packaged applications.
+- The acceptance harness initially assumed a wildcard sidecar name, while the
+  installer correctly uses the fixed contract name `eom-mail-engine.exe`.
+  Optical-media copying also preserved a read-only attribute on the seed
+  SQLite file; that media attribute was cleared before the successful engine
+  run. The corrected final media contains both harness fixes, but the proof did
+  not destructively reset the already-installed VM proof root for a clean
+  replay.
+
 ## Deferred
 
 Named pipes, same-user hostile-process attestation, stale-file scavenging,
