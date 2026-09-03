@@ -206,14 +206,18 @@ def test_windows_atomic_replacement_retries_a_short_lived_reader(
 def test_windows_registration_candidate_scan_is_bounded(private_root: Path) -> None:
     providers = private_root / "providers"
     providers.mkdir()
-    for index in range(connect.MAX_WINDOWS_REGISTRATION_CANDIDATES):
+    for index in range(connect.MAX_WINDOWS_REGISTRATION_CANDIDATES - 2):
         (providers / f"{index:03}.json").write_text("{}", encoding="utf-8")
+    (providers / "upper.JSON").write_text("{}", encoding="utf-8")
+    (providers / "counted-directory.json").mkdir()
     (providers / "ignored.tmp").write_text("not a registration", encoding="utf-8")
 
     candidates = connect._registration_candidates(providers)
 
     assert candidates is not None
     assert len(candidates) == connect.MAX_WINDOWS_REGISTRATION_CANDIDATES
+    assert providers / "upper.JSON" in candidates
+    assert providers / "counted-directory.json" in candidates
     (providers / "overflow.json").write_text("{}", encoding="utf-8")
     assert connect._registration_candidates(providers) is None
 
