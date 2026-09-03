@@ -189,12 +189,12 @@ def test_windows_entitlement_lock_contention_is_busy(
     try:
         assert WINDOWS_LOCK_OFFSET == 0
         assert WINDOWS_LOCK_LENGTH == 1
-        assert lock.path.read_bytes() == b"\0"
         with pytest.raises(entitlement.EntitlementInstallError) as failure:
             gate.install(source)
     finally:
         lock.close()
 
+    assert lock.path.read_bytes() == b"\0"
     assert failure.value.code == entitlement.ACTIVATION_BUSY
     assert not destination.exists()
 
