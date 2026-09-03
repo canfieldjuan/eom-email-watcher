@@ -22,7 +22,9 @@ WINDOWS_LOCK_OFFSET = 0
 WINDOWS_LOCK_LENGTH = 1
 _OWNER_SECURITY_INFORMATION = 0x00000001
 _DACL_SECURITY_INFORMATION = 0x00000004
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _SE_FILE_OBJECT = 1
+_SDDL_REVISION_1 = 1
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
 _ACL_SIZE_INFORMATION_CLASS = 2
@@ -95,6 +97,30 @@ def _windows_libraries() -> tuple[object, object]:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     advapi32.GetNamedSecurityInfoW.restype = ctypes.c_uint32
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = ctypes.c_int
+    advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    advapi32.GetSecurityDescriptorDacl.restype = ctypes.c_int
+    advapi32.SetNamedSecurityInfoW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetNamedSecurityInfoW.restype = ctypes.c_uint32
     advapi32.GetAclInformation.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -192,6 +218,53 @@ def _current_user_sid() -> str:
         return _sid_string(user.user.sid)
     finally:
         kernel32.CloseHandle(token)
+
+
+def _protect_windows_directory(path: Path) -> None:
+    """Give a newly created directory one protected, owner-private DACL."""
+    advapi32, kernel32 = _windows_libraries()
+    descriptor = ctypes.c_void_p()
+    descriptor_size = ctypes.c_uint32()
+    dacl = ctypes.c_void_p()
+    dacl_present = ctypes.c_int()
+    dacl_defaulted = ctypes.c_int()
+    user_sid = _current_user_sid()
+    sddl = (
+        "D:P"
+        "(A;OICI;FA;;;SY)"
+        "(A;OICI;FA;;;BA)"
+        f"(A;OICI;FA;;;{user_sid})"
+    )
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        _SDDL_REVISION_1,
+        ctypes.byref(descriptor),
+        ctypes.byref(descriptor_size),
+    ):
+        raise _windows_error("Windows private security descriptor could not be built")
+    try:
+        if not advapi32.GetSecurityDescriptorDacl(
+            descriptor,
+            ctypes.byref(dacl_present),
+            ctypes.byref(dacl),
+            ctypes.byref(dacl_defaulted),
+        ):
+            raise _windows_error("Windows private DACL could not be read")
+        if not dacl_present.value or not dacl.value:
+            raise OSError(errno.EACCES, "Windows private DACL is unavailable")
+        result = advapi32.SetNamedSecurityInfoW(
+            str(path),
+            _SE_FILE_OBJECT,
+            _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            dacl,
+            None,
+        )
+        if result:
+            raise OSError(result, "Windows private DACL could not be applied")
+    finally:
+        kernel32.LocalFree(descriptor)
 
 
 def _private_windows_acl(path: Path) -> bool:
@@ -314,8 +387,14 @@ def ensure_private_directory(path: Path, *, root: Path) -> Path:
         if component in ("", os.curdir, os.pardir):
             raise OSError(errno.EINVAL, "private directory component is unsafe")
         current = current / component
-        with suppress(FileExistsError):
+        created = False
+        try:
             current.mkdir()
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            _protect_windows_directory(current)
         metadata = current.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)

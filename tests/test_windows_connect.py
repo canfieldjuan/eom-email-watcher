@@ -16,6 +16,7 @@ from eom_email_watcher.connect_windows import (
     WINDOWS_LOCK_LENGTH,
     WINDOWS_LOCK_OFFSET,
     WindowsFileLock,
+    _protect_windows_directory,
     local_app_data_root,
     read_bounded_regular_file,
 )
@@ -33,6 +34,7 @@ def private_root() -> Iterator[Path]:
         pytest.skip("LOCALAPPDATA is required for native Windows tests")
     with tempfile.TemporaryDirectory(dir=actual_local_app_data) as directory:
         root = Path(directory)
+        _protect_windows_directory(root)
         assert local_app_data_root(str(root)) == root
         yield root
 
