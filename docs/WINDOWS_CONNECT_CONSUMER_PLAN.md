@@ -103,8 +103,9 @@ button or manifest field.
 - The consumer installer used for local acceptance had SHA-256
   `e0f4ad534cdefe50f5a9552b81ef982908ccc1265827b43b6bd13f346e36cf43`.
   It was built from commit `0dfb8139296600532e8c7256aee02e08e33591eb`;
-  the subsequent fixed-temp recovery correction is covered by the native
-  Windows test rather than this earlier cross-app artifact.
+  the subsequent fixed-temp recovery and build-time authority-pin corrections
+  are covered by native/package tests rather than this earlier cross-app
+  artifact.
 - A local Windows 11 VM installed that package and ran its installed
   `eom-mail-engine.exe`. The engine discovered authenticated provider instance
   `dab2c8a9-5375-490d-9b5f-fc6e906ad288`, observed an active
