@@ -166,6 +166,11 @@ Watcher but Connect capability discovery and invocation fail closed. This variab
 the release build script; there is no runtime environment override for issuer trust, and such a
 build reports `authority_unavailable` instead of admitting license installation.
 
+The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
+arguments using the host platform separator, and the Windows package reads the shared entitlement
+from `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Provider registrations are discovered from
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`; no XDG variables are required on Windows.
+
 ## Verification
 
 ```bash
@@ -243,9 +248,11 @@ provider launch, stop, and restart, the provider's durable instance identity sur
 the packaged consumer Inbox remains readable while the provider is absent. It does not contact
 Gmail or a model, submit a capability job, install either package through the OS package manager, or
 exercise a human UI click. The source-level `connect-local-proof.py` remains the job handoff,
-idempotency, persistence, output, and privacy proof. Native Windows execution remains separate:
-the Windows Email Watcher installer is built and checked by `windows-package`, while a two-app
-Windows proof requires a native Document Summarizer package and an actual Windows test session.
+idempotency, persistence, output, and privacy proof. Native Windows execution remains separate: the
+`windows-package` job embeds the release public key ring, runs native
+placement/activation/discovery probes, builds the Email Watcher installer, and requires the
+packaged engine to report `missing` rather than `authority_unavailable`. The two-app job handoff is
+the remaining release-acceptance step for an actual Windows test session.
 
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.

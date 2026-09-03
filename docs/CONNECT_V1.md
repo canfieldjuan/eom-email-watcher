@@ -27,16 +27,23 @@ empty catalog with `connect_entitlement_required`. No provider request is made. 
 checked again immediately before every new or nonterminal invocation, so a cached capability
 cannot bypass expiry.
 
-Providers atomically publish owner-only registrations under:
+On Linux, providers atomically publish owner-only registrations under:
 
 ```text
 $XDG_RUNTIME_DIR/local-connect/v1/providers/
 ```
 
-The consumer has no fallback to a shared temporary directory. It accepts only owner-owned,
-owner-readable regular registration files in an owner-only runtime directory; symlinks, unsafe
-modes, unsupported protocols, malformed timestamps, non-loopback URLs, and oversized files are
-ignored.
+On Windows, the corresponding root is:
+
+```text
+%LOCALAPPDATA%\LocalConnect\runtime\v1\providers\
+```
+
+The consumer has no fallback to a shared temporary directory. On Linux it accepts only
+owner-owned, owner-readable regular registration files in an owner-only runtime directory. On
+Windows it requires the current user's Local AppData tree and rejects reparse points. Symlinks,
+unsafe placement, unsupported protocols, malformed timestamps, non-loopback URLs, and oversized
+files are ignored on both platforms.
 
 A registration is only a candidate. Availability requires an authenticated `GET /v1/manifest`
 from the exact loopback endpoint and matching instance/app attribution. HTTP proxies are disabled,
@@ -117,15 +124,23 @@ operation. Restoring a compatible provider restores the action without an Email 
 
 ## Packaging and trust boundary
 
-The Debian bundle includes `eom-mail-engine` as a target-triple Tauri sidecar. The installed desktop
-runtime does not execute from a repository or require `uv`. The environment override and source/uv
-fallback remain development/operator mechanisms and are not frontend-controlled.
+The Debian and Windows bundles include `eom-mail-engine` as a target-triple Tauri sidecar. The
+installed desktop runtime does not execute from a repository or require `uv`. The environment
+override and source/uv fallback remain development/operator mechanisms and are not
+frontend-controlled.
 
 Official Connect-enabled sidecars embed issuer public keys at build time from
 `LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE`. The file is validated as a nonempty public-key ring before
 packaging. Builds without it preserve standalone behavior but deny Connect. Private signing keys
 are neither build inputs nor package contents. The offline bearer entitlement is not machine-bound
 and has no online revocation before expiry.
+
+On Windows, discovery registrations live under
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers` and the shared entitlement lives at
+`%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Windows activation and discovery use the same
+loopback HTTP, bearer-token, schema, bounded-file, atomic-replacement, and non-blocking-lock
+contracts as Unix; current-user Local AppData ACL inheritance replaces Unix ownership and mode-bit
+checks. Reparse-point indirection is rejected.
 
 The v1 protection is same-OS-user possession of a fresh per-process bearer token in an owner-only
 runtime registration. The provider rejects browser-Origin requests; the consumer rejects remote

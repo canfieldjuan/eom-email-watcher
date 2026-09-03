@@ -135,6 +135,27 @@ def smoke_packaged_engine(binary: Path) -> None:
                 "Packaged engine did not advertise the Microsoft 365 provider"
             )
 
+        entitlement = _request(
+            isolated_binary,
+            config_path=config_path,
+            operation="connect.entitlement.status",
+            payload=None,
+            working_directory=temporary,
+            environment=environment,
+        )
+        expected_entitlement_state = (
+            "missing"
+            if os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
+            else "authority_unavailable"
+        )
+        if entitlement["data"] != {
+            "state": expected_entitlement_state,
+            "active": False,
+        }:
+            raise PackagedEngineSmokeError(
+                "Packaged engine did not report the expected Connect authority state"
+            )
+
         inactive_check = _request(
             isolated_binary,
             config_path=config_path,

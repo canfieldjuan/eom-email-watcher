@@ -224,14 +224,13 @@ def test_sidecar_build_stages_microsoft_public_client(
         calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
     ]
     assert len(add_data) == 1
-    staged_source, destination = add_data[0].rsplit(":", 1)
+    staged_source, destination = add_data[0].rsplit(build_desktop_sidecar.os.pathsep, 1)
     assert Path(staged_source).name == "microsoft-oauth-client.json"
     assert destination == "eom_email_watcher_data"
     assert not Path(staged_source).exists()
 
 
-def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
-    path = tmp_path / "keyring.json"
+def _write_entitlement_keyring(path: Path) -> None:
     public_key = base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode("ascii")
     path.write_text(
         json.dumps(
@@ -248,36 +247,67 @@ def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+
+def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path)
+
     build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
 @pytest.mark.parametrize(
     "target_triple",
-    ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
+    [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ],
 )
 def test_entitlement_keyring_target_accepts_supported_platforms(target_triple: str) -> None:
     build_desktop_sidecar.validate_entitlement_keyring_target(target_triple)
 
 
-def test_windows_build_rejects_connect_keyring_before_packaging(
+def test_windows_build_stages_connect_keyring_with_platform_separator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", tmp_path / "build")
-    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", tmp_path / "output")
+    source = tmp_path / "keyring.json"
+    _write_entitlement_keyring(source)
+    build_directory = tmp_path / "build"
+    output_directory = tmp_path / "output"
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
     monkeypatch.setattr(
         build_desktop_sidecar,
         "determine_target_triple",
         lambda: "x86_64-pc-windows-msvc",
     )
+    monkeypatch.setattr(build_desktop_sidecar.os, "pathsep", ";")
     monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
     monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
-    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(tmp_path / "keyring.json"))
+    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(source))
 
-    with pytest.raises(
-        build_desktop_sidecar.SidecarBuildError,
-        match="activation storage is not supported on Windows",
-    ):
-        build_desktop_sidecar.build_sidecar()
+    def run(arguments: list[str], **kwargs):
+        calls.append(arguments)
+        if "PyInstaller" in arguments:
+            built = build_directory / "dist" / f"{build_desktop_sidecar.ENGINE_NAME}.exe"
+            built.write_bytes(b"engine")
+        return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", run)
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    add_data = [
+        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    ]
+    assert len(add_data) == 1
+    staged_source, destination = add_data[0].rsplit(";", 1)
+    assert Path(staged_source).name == "connect-entitlement-keyring.json"
+    assert destination == "eom_email_watcher_data"
+    assert not Path(staged_source).exists()
 
 
 @pytest.mark.parametrize("document", [{"keys": []}, {"keys": "not-a-list"}, {}])

@@ -30,6 +30,11 @@ from pydantic import (
 )
 
 from . import entitlement
+from .connect_windows import (
+    local_app_data_root,
+    read_bounded_regular_file,
+    validate_private_directory,
+)
 
 PROTOCOL_VERSION = 1
 GENERIC_PROTOCOL_VERSION = 2
@@ -648,7 +653,14 @@ class JobUpdate:
     error: ConnectError | None
 
 
-def _secure_directory(path: Path) -> bool:
+def _secure_directory(path: Path, *, windows_root: Path | None = None) -> bool:
+    if os.name == "nt":
+        try:
+            root = windows_root or local_app_data_root()
+            validate_private_directory(path, root=root)
+            return True
+        except OSError:
+            return False
     try:
         info = path.lstat()
     except OSError:
@@ -662,6 +674,11 @@ def _secure_directory(path: Path) -> bool:
 
 
 def _read_private_json(path: Path, limit: int) -> object | None:
+    if os.name == "nt":
+        try:
+            return json.loads(read_bounded_regular_file(path, limit))
+        except (OSError, ValueError, TypeError):
+            return None
     try:
         info = path.lstat()
         if (
@@ -687,6 +704,26 @@ def _read_private_json(path: Path, limit: int) -> object | None:
         return json.loads(raw)
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _providers_directory(
+    runtime_dir: Path | None,
+    protocol_version: int,
+) -> tuple[Path, Path] | None:
+    if runtime_dir is not None:
+        root = Path(runtime_dir)
+        return root, root / f"local-connect/v{protocol_version}/providers"
+    if os.name == "nt":
+        try:
+            root = local_app_data_root()
+        except OSError:
+            return None
+        return root, root / f"LocalConnect/runtime/v{protocol_version}/providers"
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        return None
+    root = Path(value)
+    return root, root / f"local-connect/v{protocol_version}/providers"
 
 
 def _read_registration(path: Path) -> _RuntimeRegistration | None:
@@ -816,13 +853,16 @@ def discover_summary_capability(
 ) -> CapabilityDiscovery:
     if not entitlement.connect_entitlement_decision().is_active:
         return CapabilityDiscovery(None, "connect_entitlement_required")
-    root_value = runtime_dir or (
-        Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
-    )
-    if root_value is None or not root_value.is_absolute() or not _secure_directory(root_value):
+    locations = _providers_directory(runtime_dir, PROTOCOL_VERSION)
+    if locations is None:
         return CapabilityDiscovery(None, "connect_unavailable")
-    providers_dir = root_value / "local-connect/v1/providers"
-    if not _secure_directory(providers_dir):
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return CapabilityDiscovery(None, "connect_unavailable")
+    if not _secure_directory(providers_dir, windows_root=root_value):
         return CapabilityDiscovery(None, "provider_unavailable")
 
     owned_client = client is None
@@ -959,13 +999,16 @@ def discover_capabilities(
 ) -> CapabilityCatalog:
     if not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
-    root_value = runtime_dir or (
-        Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
-    )
-    if root_value is None or not root_value.is_absolute() or not _secure_directory(root_value):
+    locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
+    if locations is None:
         return CapabilityCatalog((), "connect_unavailable")
-    providers_dir = root_value / "local-connect/v2/providers"
-    if not _secure_directory(providers_dir):
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return CapabilityCatalog((), "connect_unavailable")
+    if not _secure_directory(providers_dir, windows_root=root_value):
         return CapabilityCatalog((), "provider_unavailable")
 
     owned_client = client is None

@@ -130,11 +130,7 @@ def validate_entitlement_keyring(path: Path) -> None:
 
 
 def validate_entitlement_keyring_target(target_triple: str) -> None:
-    if _target_family(target_triple) == "windows":
-        raise SidecarBuildError(
-            "Connect entitlement activation storage is not supported on Windows; "
-            "unset LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE to build the public package"
-        )
+    _target_family(target_triple)
 
 
 @contextmanager
@@ -211,7 +207,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_oauth}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_oauth}{os.pathsep}eom_email_watcher_data"]
             )
 
         microsoft_source_value = os.environ.get("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE")
@@ -226,7 +222,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_microsoft}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_microsoft}{os.pathsep}eom_email_watcher_data"]
             )
 
         keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
@@ -242,7 +238,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_keyring}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_keyring}{os.pathsep}eom_email_watcher_data"]
             )
 
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))
