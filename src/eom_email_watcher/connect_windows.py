@@ -358,7 +358,11 @@ def validate_private_directory(path: Path, *, root: Path) -> Path:
 
 
 def read_bounded_regular_file(
-    path: Path, maximum: int, *, allow_empty: bool = False
+    path: Path,
+    maximum: int,
+    *,
+    allow_empty: bool = False,
+    require_private_acl: bool = True,
 ) -> bytes:
     """Read one stable, bounded Windows file without accepting reparse points."""
     candidate = Path(path)
@@ -368,7 +372,7 @@ def read_bounded_regular_file(
         or _is_reparse(before)
         or before.st_size > maximum
         or (before.st_size == 0 and not allow_empty)
-        or not _private_windows_acl(candidate)
+        or (require_private_acl and not _private_windows_acl(candidate))
     ):
         raise OSError(errno.EINVAL, "file is not a bounded regular file")
 
@@ -381,7 +385,7 @@ def read_bounded_regular_file(
             or _is_reparse(opened)
             or opened.st_size != before.st_size
             or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            or not _private_windows_acl(candidate)
+            or (require_private_acl and not _private_windows_acl(candidate))
         ):
             raise OSError(errno.EINVAL, "opened file changed identity")
         content = bytearray()

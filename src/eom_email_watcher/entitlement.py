@@ -388,7 +388,11 @@ def _read_private_entitlement(path: Path) -> bytes | None:
         try:
             root = local_app_data_root()
             validate_private_directory(path.parent, root=root)
-            return read_bounded_regular_file(path, MAX_ENTITLEMENT_BYTES)
+            return read_bounded_regular_file(
+                path,
+                MAX_ENTITLEMENT_BYTES,
+                require_private_acl=False,
+            )
         except OSError:
             return None
     if (
