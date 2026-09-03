@@ -140,7 +140,9 @@ On Windows, discovery registrations live under
 `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Windows activation and discovery use the same
 loopback HTTP, bearer-token, schema, bounded-file, atomic-replacement, and non-blocking-lock
 contracts as Unix; current-user Local AppData ACL inheritance replaces Unix ownership and mode-bit
-checks. Reparse-point indirection is rejected.
+checks. The root and every trusted descendant are rejected when their DACL grants content or
+mutation rights beyond the current user, SYSTEM, or built-in Administrators. Reparse-point
+indirection is rejected. Shared Windows locks cover byte offset `0` for length `1`.
 
 The v1 protection is same-OS-user possession of a fresh per-process bearer token in an owner-only
 runtime registration. The provider rejects browser-Origin requests; the consumer rejects remote

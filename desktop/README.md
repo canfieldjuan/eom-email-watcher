@@ -169,7 +169,9 @@ build reports `authority_unavailable` instead of admitting license installation.
 The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
 arguments using the host platform separator, and the Windows package reads the shared entitlement
 from `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Provider registrations are discovered from
-`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`; no XDG variables are required on Windows.
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`. The runtime verifies that the root and every
+trusted descendant have no content or mutation grant beyond the user, SYSTEM, or built-in
+Administrators; no XDG variables are required on Windows.
 
 ## Verification
 

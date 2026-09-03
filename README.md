@@ -185,8 +185,9 @@ not a Connect license and is never shared with a provider.
 On Windows, the shared entitlement is
 `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`, and v1/v2 provider registrations are read from
 `%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`. The implementation relies on the current
-user's Local AppData ACL boundary, rejects reparse-point indirection, and does not require XDG
-variables.
+user's Local AppData ACL boundary, rejects reparse-point indirection, and fails closed when the
+root or a Connect descendant grants content or mutation access beyond the user, SYSTEM, or built-in
+Administrators. It does not require XDG variables.
 
 The desktop Health view reports only the license state and whether Connect is active. Its
 **Activate** action accepts a user-selected license, while the Python engine independently reads

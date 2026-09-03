@@ -17,8 +17,9 @@ button or manifest field.
 1. Derive default Windows discovery and entitlement locations from the accepted
    `%LOCALAPPDATA%\LocalConnect` contract while preserving explicit test roots
    and all Unix behavior.
-2. Add bounded regular-file, reparse-point, atomic-replacement, and non-blocking
-   Windows lock primitives under the existing same-user trust model.
+2. Add bounded regular-file, reparse-point, effective-DACL, atomic-replacement,
+   and non-blocking Windows lock primitives under the existing same-user trust
+   model. The shared lock range is byte offset `0`, length `1`.
 3. Use those primitives for registration reads and entitlement status/install,
    including commit-time revalidation and rollback.
 4. Remove the packaging veto, use the platform data-file separator, and embed

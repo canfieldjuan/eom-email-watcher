@@ -11,6 +11,8 @@ import pytest
 
 from eom_email_watcher import connect, entitlement
 from eom_email_watcher.connect_windows import (
+    WINDOWS_LOCK_LENGTH,
+    WINDOWS_LOCK_OFFSET,
     WindowsFileLock,
     local_app_data_root,
     read_bounded_regular_file,
@@ -167,6 +169,9 @@ def test_windows_entitlement_lock_contention_is_busy(
     destination.parent.mkdir(parents=True)
     lock = WindowsFileLock(destination.parent / entitlement.ENTITLEMENT_LOCK_FILE_NAME)
     try:
+        assert WINDOWS_LOCK_OFFSET == 0
+        assert WINDOWS_LOCK_LENGTH == 1
+        assert lock.path.read_bytes() == b"\0"
         with pytest.raises(entitlement.EntitlementInstallError) as failure:
             gate.install(source)
     finally:
@@ -220,3 +225,15 @@ def test_windows_local_app_data_rejects_directory_junction(tmp_path: Path) -> No
 
     with pytest.raises(OSError):
         local_app_data_root(str(junction))
+
+
+def test_windows_local_app_data_rejects_broad_read_acl(tmp_path: Path) -> None:
+    subprocess.run(
+        ["icacls", str(tmp_path), "/grant", "*S-1-1-0:(OI)(CI)R"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(OSError):
+        local_app_data_root(str(tmp_path))
