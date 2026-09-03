@@ -1019,6 +1019,29 @@ def test_microsoft_provider_error_uses_generic_secret_free_envelope(
     assert "private-token-value" not in json.dumps(response)
 
 
+def test_private_token_install_only_syncs_the_new_writable_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "staged-token.json"
+    destination = tmp_path / "installed" / "readonly-token.json"
+    source.write_bytes(b'{"token": "private"}')
+    original_fsync = engine_api.os.fsync
+    fsync_calls = 0
+
+    def tracking_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(engine_api.os, "fsync", tracking_fsync)
+
+    engine_api._install_private_token(source, destination)
+
+    assert fsync_calls == 1
+    assert destination.read_bytes() == source.read_bytes()
+
+
 def test_mail_account_reconnect_rejects_different_identity_before_replacing_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

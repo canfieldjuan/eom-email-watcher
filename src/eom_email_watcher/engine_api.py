@@ -287,9 +287,9 @@ def _install_private_token(source: Path, destination: Path) -> None:
     local_copy: Path | None = None
     try:
         with FileLock(f"{destination}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
-            with source.open("rb") as stream:
-                os.fsync(stream.fileno())
-                content = stream.read()
+            # Windows rejects fsync on this read-only source descriptor. Durability is
+            # established on the new writable copy before its atomic replacement below.
+            content = source.read_bytes()
             local_copy = _write_private_file(
                 destination.parent,
                 ".readonly-token-",
