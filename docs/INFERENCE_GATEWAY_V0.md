@@ -75,8 +75,10 @@ per-desktop loopback proxy unless real client-platform evidence later proves one
   Qwen3-30B-A3B profile only after fallback admission. Qualification pins the exact LM Studio and
   inference-runtime versions, dependency set, model-content digest, model identifier, context/GPU/
   structured-output settings, JIT/eviction configuration, and authentication/network policy.
-  Protocol similarity or a matching display name is not evidence of artifact, semantic, or privacy
-  compatibility.
+  Before policy marks LM Studio eligible for a task, that task must independently pass the same
+  task-specific deterministic metrics and validation plus blinded human review required of the
+  primary. Protocol similarity or a matching display name is not evidence of artifact, semantic,
+  or privacy compatibility.
 - vLLM and standalone llama.cpp are not selected production-worker targets for this v0 deployment.
   Existing deployment files and compatibility evidence may remain for historical comparison, but
   no application client should bind directly to them or to either selected worker.
@@ -491,46 +493,50 @@ What becomes harder:
 - selecting Ollama, LM Studio, a model, quantization, fallback order, or lane count in the
   application contract;
 - defining Invoice Processor's domain task, schema, or product behavior while that application is
-  in flight.
+  in flight, or requiring its client adoption in the current two-task proof.
 
 ## First implementation proof after acceptance
 
 Build one gateway process with Ollama primary, unloaded-model LM Studio fallback, the single
 Qwen3-30B-A3B deployment profile, and two administrator-allowed task IDs:
-`email.analyze@1` and `document.chunk.summarize@1`. Invoice Processor must use this same client and
-deployment-profile boundary when its in-flight repository publishes a versioned task, but this ADR
-does not invent that task. Prove, with synthetic content only:
+`email.analyze@1` and `document.chunk.summarize@1`. Proving Invoice Processor adoption is a later
+acceptance gate after its in-flight repository publishes a versioned task; that application must
+then use this same client and deployment-profile boundary rather than introduce a direct worker
+binding. Prove the current two-task slice, with synthetic content only:
 
 1. paired Email Watcher and Document Summarizer clients can authenticate over verified HTTPS;
 2. neither request contains a model ID;
-3. Invoice Processor can adopt the same gateway client contract without adding a worker URL,
-   runtime name, model field, or application-specific inference transport;
-4. the exact Ollama package or container, dependency set, immutable model manifest/content digests,
+3. the exact Ollama package or container, dependency set, immutable model manifest/content digests,
    cloud-off environment, and serving configuration are pinned and reproducible;
-5. the exact LM Studio/`llmster` and inference-runtime versions, dependency set, model artifact,
+4. the exact LM Studio/`llmster` and inference-runtime versions, dependency set, model artifact,
    identifier, JIT/eviction behavior, authentication, and serving configuration are pinned and
    reproducible;
-6. both workers resolve the single logical profile to the same approved upstream checkpoint and
+5. both workers resolve the single logical profile to the same approved upstream checkpoint and
    quantization, with runtime-specific immutable digests recorded as deployment provenance;
-7. both worker endpoints are unreachable from a client-network machine while the authenticated
+6. both worker endpoints are unreachable from a client-network machine while the authenticated
    gateway remains reachable;
-8. task policy selects Ollama without exposing that choice to either application;
-9. both tasks pass their deterministic acceptance metrics and validators plus blinded human review
-   of semantic output before promotion;
-10. concurrent mixed requests complete without starvation at the admitted limit;
-11. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
-12. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses the pinned profile, and passes task acceptance before
+7. task policy selects Ollama without exposing that choice to either application;
+8. each task independently passes its deterministic acceptance metrics and validators plus blinded
+   human review of semantic output on both Ollama and LM Studio before that worker is eligible;
+9. concurrent mixed requests complete without starvation at the admitted limit;
+10. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
+11. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses the pinned profile, and passes task acceptance before
     becoming primary;
-13. LM Studio remains healthy with no model resident, then JIT-loads the pinned profile only after
+12. LM Studio remains healthy with no model resident, then JIT-loads the pinned profile only after
     safe fallback admission and unloads it under the configured eviction/TTL policy;
-14. making Ollama unavailable before admission moves an LM-Studio-qualified task to
+13. making Ollama unavailable before admission moves an LM-Studio-qualified task to
    degraded-but-available service, while an unqualified fallback task remains unavailable;
-15. an in-flight or ambiguous primary failure remains unresolved until the primary result is
+14. an in-flight or ambiguous primary failure remains unresolved until the primary result is
     recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
     request proceed without duplicate worker execution;
-16. on a single GPU, fallback does not start until primary work is authoritative and sufficient
-    capacity is proven or the primary model is explicitly unloaded; ambiguous VRAM ownership keeps
-    fallback unavailable;
+15. on a single GPU, fallback does not start until every primary attempt has the authoritative
+    disposition required by item 14 and either capacity evidence proves concurrent residency safe,
+    or the primary model is explicitly unloaded and the reclaimed capacity is verified; ambiguous
+    work or VRAM ownership keeps fallback unavailable;
+16. when Ollama recovers, the gateway stops new LM Studio admissions, waits until every fallback
+    attempt has an authoritative disposition, drains and unloads the fallback model, and verifies
+    capacity before readmitting Ollama; only separate concurrent-residency capacity evidence may
+    waive the drain and unload steps;
 17. request IDs accept only canonical URL-segment-safe UUIDv4 text, and mismatched or encoded
     acknowledgement identifiers fail closed;
 18. a different valid credential cannot acknowledge or delete another credential's result, and the
@@ -546,7 +552,7 @@ does not invent that task. Prove, with synthetic content only:
     acknowledged to release the protected result, and permits only explicit new-identity requeue;
 22. authentication, authorization, request-contract, and output-validation failures do not trigger
     fallback;
-23. stopping the gateway degrades only model-dependent actions in every application;
+23. stopping the gateway degrades only model-dependent actions in both participating applications;
 24. Connect discovery and each application's private persistence remain unchanged.
 
 Do not implement administrator UI, auto-discovery, additional runtime families, vision, or
