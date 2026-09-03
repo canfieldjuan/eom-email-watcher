@@ -67,6 +67,8 @@ button or manifest field.
 
 ## Verification contract
 
+- Both native Windows jobs are pinned to accepted `connect-contracts` commit
+  `3005d82a7be885fba36f8688b5967a5b56a0abea`.
 - Existing Linux Connect, entitlement, engine, and packaging tests remain green.
 - Native Windows tests prove default paths, bounded reads, registration
   discovery and enumeration, replacement after a short-lived reader releases
