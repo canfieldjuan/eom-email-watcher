@@ -130,10 +130,11 @@ override and source/uv fallback remain development/operator mechanisms and are n
 frontend-controlled.
 
 Official Connect-enabled sidecars embed issuer public keys at build time from
-`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE`. The file is validated as a nonempty public-key ring before
-packaging. Builds without it preserve standalone behavior but deny Connect. Private signing keys
-are neither build inputs nor package contents. The offline bearer entitlement is not machine-bound
-and has no online revocation before expiry.
+`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE`. The file is validated as a nonempty production public-key
+ring before packaging; release builds reject development, example, fixture, and test key IDs.
+Builds without it preserve standalone behavior but deny Connect. Private signing keys are neither
+build inputs nor package contents. The offline bearer entitlement is not machine-bound and has no
+online revocation before expiry.
 
 On Windows, discovery registrations live under
 `%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers` and the shared entitlement lives at

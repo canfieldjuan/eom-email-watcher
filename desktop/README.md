@@ -225,17 +225,18 @@ validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
 ### Packaged Debian interoperability proof
 
-After building both Debian packages from their current checkouts with the canonical test public key
-ring, exercise the two shipped binaries together. Set `LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
-`connect-contracts/entitlements/v1/fixtures/test-keyring.json` for both builds so the fixture license
-below is accepted; production packages instead require an entitlement signed by their embedded
-production authority.
+After building both Debian packages from their current checkouts with the canonical production
+public-key ring, exercise the two shipped binaries together. Set
+`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
+`connect-contracts/entitlements/v1/release/keyring.json` for both builds, then supply an acquired
+active entitlement signed by that authority. Fixture/test key IDs are intentionally rejected by the
+release builders; the source-level proof above remains the place for fixture authority.
 
 ```bash
 uv run python scripts/connect-packaged-deb-proof.py \
   --consumer-deb "desktop/src-tauri/target/release/bundle/deb/Email Watcher_0.1.0_amd64.deb" \
   --provider-deb "/path/to/Document Summarizer_0.1.0_amd64.deb" \
-  --active-entitlement "/path/to/connect-contracts/entitlements/v1/fixtures/valid/active.json"
+  --active-entitlement "/secure/path/production-entitlement-v1.json"
 ```
 
 The harness requires `dpkg-deb`, `dbus-run-session`, and `xvfb-run`. It extracts rather than
