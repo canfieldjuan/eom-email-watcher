@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ from pathlib import Path
 
 PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
+EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
 
 
 class PackagedEngineSmokeError(RuntimeError):
@@ -68,9 +70,11 @@ def _request(
     return response
 
 
-def smoke_packaged_engine(binary: Path) -> None:
+def smoke_packaged_engine(binary: Path, expected_entitlement_state: str) -> None:
     if not binary.is_file():
         raise PackagedEngineSmokeError("Packaged engine is not a regular file")
+    if expected_entitlement_state not in EXPECTED_ENTITLEMENT_STATES:
+        raise PackagedEngineSmokeError("Expected Connect authority state is unsupported")
     with tempfile.TemporaryDirectory(prefix="eom-mail-engine-smoke-") as temporary_value:
         temporary = Path(temporary_value)
         isolated_binary = temporary / binary.name
@@ -143,11 +147,6 @@ def smoke_packaged_engine(binary: Path) -> None:
             working_directory=temporary,
             environment=environment,
         )
-        expected_entitlement_state = (
-            "missing"
-            if os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
-            else "authority_unavailable"
-        )
         if entitlement["data"] != {
             "state": expected_entitlement_state,
             "active": False,
@@ -171,10 +170,22 @@ def smoke_packaged_engine(binary: Path) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: smoke_packaged_engine.py <engine-binary>")
+    parser = argparse.ArgumentParser(
+        description="Smoke-test one packaged Email Watcher engine binary."
+    )
+    parser.add_argument("engine_binary", type=Path)
+    parser.add_argument(
+        "--expected-entitlement-state",
+        required=True,
+        choices=EXPECTED_ENTITLEMENT_STATES,
+        help="Authority state embedded in the already-built engine binary.",
+    )
+    args = parser.parse_args()
     try:
-        smoke_packaged_engine(Path(sys.argv[1]).resolve())
+        smoke_packaged_engine(
+            args.engine_binary.resolve(),
+            args.expected_entitlement_state,
+        )
     except PackagedEngineSmokeError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(2) from exc

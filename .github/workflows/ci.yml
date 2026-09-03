@@ -86,7 +86,7 @@ jobs:
         shell: pwsh
         run: |
           $triple = (rustc --print host-tuple).Trim()
-          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe"
+          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" --expected-entitlement-state missing
       - uses: actions/upload-artifact@v7
         with:
           name: email-watcher-windows-nsis

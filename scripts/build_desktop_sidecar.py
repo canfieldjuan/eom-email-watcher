@@ -285,6 +285,8 @@ def build_sidecar() -> Path:
             sys.executable,
             str(SCRIPT_DIRECTORY / "smoke_packaged_engine.py"),
             str(output_path),
+            "--expected-entitlement-state",
+            "missing" if keyring_source_value else "authority_unavailable",
         ],
         check=True,
         cwd=PROJECT_DIRECTORY,

@@ -22,6 +22,30 @@ def _load_builder() -> ModuleType:
 build_desktop_sidecar = _load_builder()
 
 
+def _load_smoke() -> ModuleType:
+    path = Path(__file__).parents[1] / "scripts" / "smoke_packaged_engine.py"
+    spec = importlib.util.spec_from_file_location("smoke_packaged_engine", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load packaged-engine smoke script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+smoke_packaged_engine = _load_smoke()
+
+
+def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"not executed")
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="authority state is unsupported",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(binary, "ambient")
+
+
 @pytest.mark.parametrize(
     ("target_triple", "suffix"),
     [
@@ -228,6 +252,10 @@ def test_sidecar_build_stages_microsoft_public_client(
     assert Path(staged_source).name == "microsoft-oauth-client.json"
     assert destination == "eom_email_watcher_data"
     assert not Path(staged_source).exists()
+    assert calls[1][-2:] == [
+        "--expected-entitlement-state",
+        "authority_unavailable",
+    ]
 
 
 def _write_entitlement_keyring(
@@ -355,6 +383,7 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     assert staged_keyring == [validated_keyring]
     assert source.read_bytes() == b"substituted after validation"
     assert not Path(staged_source).exists()
+    assert calls[1][-2:] == ["--expected-entitlement-state", "missing"]
 
 
 @pytest.mark.parametrize("document", [{"keys": []}, {"keys": "not-a-list"}, {}])

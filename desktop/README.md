@@ -223,6 +223,11 @@ the bounded fixture model so it can pause safely. An authenticated endpoint may 
 Both configured-model fields are required together, and the provider retains final endpoint
 validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
+When `scripts/smoke_packaged_engine.py` is run independently of the build, pass the authority state
+embedded in that already-built binary explicitly: `--expected-entitlement-state missing` for a
+Connect-enabled package or `--expected-entitlement-state authority_unavailable` for a standalone
+package. The smoke test does not infer package contents from the caller's current environment.
+
 ### Packaged Debian interoperability proof
 
 After building both Debian packages from their current checkouts with the canonical production

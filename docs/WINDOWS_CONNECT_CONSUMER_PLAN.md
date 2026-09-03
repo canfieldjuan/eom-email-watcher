@@ -33,7 +33,8 @@ button or manifest field.
    bounded build-input reader rejects symlink/reparse substitution and binds
    the read to one stable file identity. Stage the returned validated bytes
    directly so a later source-path replacement cannot change package authority,
-   and refuse fixture/test key IDs in release packages.
+   refuse fixture/test key IDs in release packages, and make standalone smoke
+   invocations declare the already-built binary's expected authority state.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
    then prove packaged provider discovery and one authenticated job on the local
    Windows VM.
