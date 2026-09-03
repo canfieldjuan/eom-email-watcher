@@ -27,6 +27,14 @@ _SE_FILE_OBJECT = 1
 _SDDL_REVISION_1 = 1
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _ACL_SIZE_INFORMATION_CLASS = 2
 _INHERIT_ONLY_ACE = 0x08
 _ACCESS_ALLOWED_ACE_TYPES = frozenset({0x00, 0x05, 0x09, 0x0B})
@@ -159,11 +167,45 @@ def _windows_libraries() -> tuple[object, object]:
     advapi32.GetTokenInformation.restype = ctypes.c_int
     kernel32.GetCurrentProcess.argtypes = []
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
     return advapi32, kernel32
+
+
+def _open_windows_shared_reader(path: Path) -> int:
+    """Open a reader that cannot block atomic replacement or cleanup."""
+    if os.name != "nt" or msvcrt is None:
+        raise OSError(errno.ENOSYS, "Windows shared file reading is unavailable")
+    _, kernel32 = _windows_libraries()
+    handle = kernel32.CreateFileW(
+        str(path),
+        _GENERIC_READ,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise _windows_error("Windows file could not be opened for shared reading")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    try:
+        return msvcrt.open_osfhandle(handle, flags)
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
 
 
 def _windows_error(message: str) -> OSError:
@@ -455,8 +497,7 @@ def read_bounded_regular_file(
     ):
         raise OSError(errno.EINVAL, "file is not a bounded regular file")
 
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
-    descriptor = os.open(candidate, flags)
+    descriptor = _open_windows_shared_reader(candidate)
     try:
         opened = os.fstat(descriptor)
         if (

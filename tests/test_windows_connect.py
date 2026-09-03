@@ -16,7 +16,9 @@ from eom_email_watcher.connect_windows import (
     WINDOWS_LOCK_LENGTH,
     WINDOWS_LOCK_OFFSET,
     WindowsFileLock,
+    _open_windows_shared_reader,
     _protect_windows_directory,
+    atomic_replace_bytes,
     local_app_data_root,
     read_bounded_regular_file,
 )
@@ -123,6 +125,37 @@ def test_windows_bounded_reader_rejects_oversized_file(private_root: Path) -> No
 
     with pytest.raises(OSError):
         read_bounded_regular_file(candidate, 3)
+
+
+def test_windows_replaceable_reader_allows_atomic_replacement(
+    private_root: Path,
+) -> None:
+    destination = private_root / "replaceable.json"
+    atomic_replace_bytes(destination, b"old", 16)
+
+    descriptor = _open_windows_shared_reader(destination)
+    try:
+        atomic_replace_bytes(destination, b"new", 16)
+        assert os.read(descriptor, 3) == b"old"
+    finally:
+        os.close(descriptor)
+
+    assert destination.read_bytes() == b"new"
+
+
+def test_windows_registration_candidate_scan_is_bounded(private_root: Path) -> None:
+    providers = private_root / "providers"
+    providers.mkdir()
+    for index in range(connect.MAX_WINDOWS_REGISTRATION_CANDIDATES):
+        (providers / f"{index:03}.json").write_text("{}", encoding="utf-8")
+    (providers / "ignored.tmp").write_text("not a registration", encoding="utf-8")
+
+    candidates = connect._registration_candidates(providers)
+
+    assert candidates is not None
+    assert len(candidates) == connect.MAX_WINDOWS_REGISTRATION_CANDIDATES
+    (providers / "overflow.json").write_text("{}", encoding="utf-8")
+    assert connect._registration_candidates(providers) is None
 
 
 def test_windows_default_discovery_authenticates_provider_manifest(

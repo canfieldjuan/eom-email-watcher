@@ -18,11 +18,12 @@ button or manifest field.
    `%LOCALAPPDATA%\LocalConnect` contract while preserving explicit test roots
    and all Unix behavior.
 2. Add protected private-DACL creation plus bounded regular-file, reparse-point,
-   effective-DACL, atomic-replacement, and non-blocking Windows lock primitives
-   under the existing same-user trust model. The shared lock range is byte
-   offset `0`, length `1`.
+   effective-DACL, delete-sharing reads, atomic-replacement, and non-blocking
+   Windows lock primitives under the existing same-user trust model. The shared
+   lock range is byte offset `0`, length `1`.
 3. Use those primitives for registration reads and entitlement status/install,
-   including commit-time revalidation and rollback.
+   including bounded Windows registration enumeration, commit-time revalidation,
+   and rollback.
 4. Remove the packaging veto, use the platform data-file separator, and embed
    the production public keyring in the native Windows sidecar.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
@@ -59,7 +60,8 @@ button or manifest field.
 
 - Existing Linux Connect, entitlement, engine, and packaging tests remain green.
 - Native Windows tests prove default paths, bounded reads, registration
-  discovery, activation, contention, rollback, and reparse refusal.
+  discovery and enumeration, replacement during an active reader, activation,
+  contention, rollback, and reparse refusal.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

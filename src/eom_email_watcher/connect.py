@@ -45,6 +45,7 @@ OUTPUT_MEDIA_TYPE = "application/vnd.local-connect.document-summary+json"
 SOURCE_APP_ID = "email-watcher"
 MAX_INPUT_BYTES = 100 * 1024 * 1024
 MAX_REGISTRATION_BYTES = 16 * 1024
+MAX_WINDOWS_REGISTRATION_CANDIDATES = 256
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 2 * 1024 * 1024 + 64 * 1024
 MAX_GENERIC_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -726,6 +727,26 @@ def _providers_directory(
     return root, root / f"local-connect/v{protocol_version}/providers"
 
 
+def _registration_candidates(providers_dir: Path) -> tuple[Path, ...] | None:
+    if os.name != "nt":
+        try:
+            return tuple(sorted(providers_dir.iterdir(), key=lambda item: item.name))
+        except OSError:
+            return None
+    candidates: list[Path] = []
+    try:
+        with os.scandir(providers_dir) as entries:
+            for entry in entries:
+                if not entry.name.lower().endswith(".json"):
+                    continue
+                if len(candidates) == MAX_WINDOWS_REGISTRATION_CANDIDATES:
+                    return None
+                candidates.append(Path(entry.path))
+    except OSError:
+        return None
+    return tuple(sorted(candidates, key=lambda item: item.name))
+
+
 def _read_registration(path: Path) -> _RuntimeRegistration | None:
     value = _read_private_json(path, MAX_REGISTRATION_BYTES)
     if value is None:
@@ -869,9 +890,8 @@ def discover_summary_capability(
     active_client = client or _client()
     providers: dict[str, ProviderCapability] = {}
     try:
-        try:
-            registrations = sorted(providers_dir.iterdir(), key=lambda item: item.name)
-        except OSError:
+        registrations = _registration_candidates(providers_dir)
+        if registrations is None:
             return CapabilityDiscovery(None, "provider_unavailable")
         for path in registrations:
             registration = _read_registration(path)
@@ -1016,9 +1036,8 @@ def discover_capabilities(
     providers: dict[str, tuple[DiscoveredCapability, ...]] = {}
     conflicting_instances: set[str] = set()
     try:
-        try:
-            registrations = sorted(providers_dir.iterdir(), key=lambda item: item.name)
-        except OSError:
+        registrations = _registration_candidates(providers_dir)
+        if registrations is None:
             return CapabilityCatalog((), "provider_unavailable")
         for path in registrations:
             registration = _read_registration_v2(path)
