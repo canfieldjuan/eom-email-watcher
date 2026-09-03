@@ -21,6 +21,16 @@ TARGET_TRIPLE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 OAUTH_REQUIRED_FIELDS = ("auth_uri", "client_id", "client_secret", "token_uri")
 OAUTH_TOKEN_FIELDS = frozenset({"access_token", "refresh_token"})
 NON_PRODUCTION_KEY_TOKENS = frozenset({"dev", "example", "fixture", "test"})
+APPROVED_RELEASE_AUTHORITIES = frozenset(
+    {
+        (
+            "local-connect-prod-2026-01",
+            bytes.fromhex(
+                "80df29263f56d87f3d2c1b0826a939c9d9a5c4d0ab6d25f101b0436107f57dad"
+            ),
+        )
+    }
+)
 
 
 class SidecarBuildError(RuntimeError):
@@ -138,6 +148,10 @@ def validate_entitlement_keyring(path: Path) -> bytes:
             raise SidecarBuildError(
                 "Connect-enabled release key ring contains a non-production key ID"
             )
+    if frozenset(keys.items()) != APPROVED_RELEASE_AUTHORITIES:
+        raise SidecarBuildError(
+            "Connect entitlement key ring does not match the approved production authority"
+        )
     return content
 
 

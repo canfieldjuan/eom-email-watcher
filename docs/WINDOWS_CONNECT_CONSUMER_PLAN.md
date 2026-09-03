@@ -34,8 +34,10 @@ button or manifest field.
    bounded build-input reader rejects symlink/reparse substitution and binds
    the read to one stable file identity. Stage the returned validated bytes
    directly so a later source-path replacement cannot change package authority,
-   refuse fixture/test key IDs in release packages, and make standalone smoke
-   invocations declare the already-built binary's expected authority state.
+   require the exact issuer ID/public-key set approved by the builder rather
+   than trusting production-shaped IDs, refuse fixture/test key IDs in release
+   packages, and make standalone smoke invocations declare the already-built
+   binary's expected authority state.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
    then prove packaged provider discovery and one authenticated job on the local
    Windows VM.
@@ -78,10 +80,11 @@ button or manifest field.
   discovery, reparse refusal, safe fixed-temp crash recovery, unsafe stale-temp
   refusal, and the exact 256/257 direct-child boundary including non-candidate
   temp/lock names, case-insensitive names, and non-file `.json` entries.
-- Desktop packaging tests prove an ordinary public keyring is accepted while
+- Desktop packaging tests prove the approved production public keyring is accepted while
   Windows reparse metadata fails closed before that authority can be bundled;
   replacing the source after validation still stages the exact validated bytes,
-  and a non-production key ID is rejected.
+  and both a non-production key ID and an unapproved production-shaped
+  authority are rejected.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

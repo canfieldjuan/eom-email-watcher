@@ -259,9 +259,21 @@ def test_sidecar_build_stages_microsoft_public_client(
 
 
 def _write_entitlement_keyring(
-    path: Path, *, key_id: str = "local-connect-prod-2026-01"
+    path: Path,
+    *,
+    key_id: str = "local-connect-prod-2026-01",
+    public_key: bytes | None = None,
 ) -> None:
-    public_key = base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode("ascii")
+    selected_public_key = public_key
+    if selected_public_key is None:
+        selected_public_key = next(
+            key
+            for approved_key_id, key in build_desktop_sidecar.APPROVED_RELEASE_AUTHORITIES
+            if approved_key_id == "local-connect-prod-2026-01"
+        )
+    encoded_public_key = (
+        base64.urlsafe_b64encode(selected_public_key).rstrip(b"=").decode("ascii")
+    )
     path.write_text(
         json.dumps(
             {
@@ -269,7 +281,7 @@ def _write_entitlement_keyring(
                     {
                         "algorithm": "Ed25519",
                         "key_id": key_id,
-                        "public_key_base64url": public_key,
+                        "public_key_base64url": encoded_public_key,
                     }
                 ]
             }
@@ -278,12 +290,25 @@ def _write_entitlement_keyring(
     )
 
 
-def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
+def test_entitlement_build_input_accepts_approved_public_keyring(tmp_path: Path) -> None:
     path = tmp_path / "keyring.json"
     _write_entitlement_keyring(path)
     expected = path.read_bytes()
 
     assert build_desktop_sidecar.validate_entitlement_keyring(path) == expected
+
+
+def test_entitlement_build_input_rejects_unapproved_production_authority(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path, public_key=b"q" * 32)
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="approved production authority",
+    ):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
 def test_entitlement_build_input_rejects_windows_reparse_metadata(

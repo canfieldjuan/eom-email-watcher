@@ -161,10 +161,12 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 ```
 
 The key ring contains public verification keys only. Private signing keys must never be supplied
-to the build or committed. A build without this variable remains a healthy standalone Email
-Watcher but Connect capability discovery and invocation fail closed. This variable is consumed by
-the release build script; there is no runtime environment override for issuer trust, and such a
-build reports `authority_unavailable` instead of admitting license installation.
+to the build or committed. The release builder also requires the parsed issuer ID and public key to
+match the authority explicitly approved in the builder; a merely production-shaped replacement is
+rejected even if a filesystem path is raced. A build without this variable remains a healthy
+standalone Email Watcher but Connect capability discovery and invocation fail closed. This variable
+is consumed by the release build script; there is no runtime environment override for issuer trust,
+and such a build reports `authority_unavailable` instead of admitting license installation.
 
 The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
 arguments using the host platform separator, and the Windows package reads the shared entitlement
