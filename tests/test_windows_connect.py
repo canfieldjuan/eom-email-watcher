@@ -104,6 +104,37 @@ def _manifest() -> dict[str, object]:
     }
 
 
+def _registration_v1() -> dict[str, object]:
+    registration = _registration()
+    registration["protocol_version"] = 1
+    registration["app_id"] = "document-summarizer"
+    registration["transport"] = {
+        "kind": "http-loopback-v1",
+        "base_url": "http://127.0.0.1:32124/",
+    }
+    return registration
+
+
+def _manifest_v1() -> dict[str, object]:
+    return {
+        "protocol_version": 1,
+        "instance_id": INSTANCE_ID,
+        "app": {
+            "id": "document-summarizer",
+            "name": "Document Summarizer",
+            "version": "1.0.0",
+        },
+        "capabilities": [
+            {
+                "id": "document.summarize",
+                "version": "1.0",
+                "accepts": [{"media_type": "application/pdf", "max_bytes": 1024}],
+                "produces": ["application/vnd.local-connect.document-summary+json"],
+            }
+        ],
+    }
+
+
 def test_windows_default_connect_paths_use_local_app_data(
     private_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -217,6 +248,48 @@ def test_windows_default_discovery_authenticates_provider_manifest(
     assert len(requests) == 1
     assert requests[0].url == "http://127.0.0.1:32123/v2/manifest"
     assert requests[0].headers["authorization"] == f"Bearer {TOKEN}"
+
+
+def test_windows_explicit_runtime_root_reaches_v1_and_v2_registrations(
+    private_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit_root = ensure_private_directory(private_root / "explicit", root=private_root)
+    ambient_root = ensure_private_directory(private_root / "ambient", root=private_root)
+    monkeypatch.setenv("LOCALAPPDATA", str(ambient_root))
+    monkeypatch.setattr(
+        connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: entitlement.EntitlementDecision.ACTIVE,
+    )
+    providers_v1 = ensure_private_directory(
+        explicit_root / "local-connect/v1/providers",
+        root=explicit_root,
+    )
+    providers_v2 = ensure_private_directory(
+        explicit_root / "local-connect/v2/providers",
+        root=explicit_root,
+    )
+    (providers_v1 / "document-summarizer.json").write_text(
+        json.dumps(_registration_v1()),
+        encoding="utf-8",
+    )
+    (providers_v2 / "website-redesign.json").write_text(
+        json.dumps(_registration()),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.port == 32124:
+            return httpx.Response(200, json=_manifest_v1())
+        return httpx.Response(200, json=_manifest())
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        v1 = connect.discover_summary_capability(explicit_root, client=client)
+        v2 = connect.discover_capabilities(explicit_root, client=client)
+
+    assert v1.provider is not None
+    assert [item.capability_id for item in v2.items] == ["website.generate"]
 
 
 def test_windows_entitlement_install_and_status(

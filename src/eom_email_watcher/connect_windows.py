@@ -486,11 +486,15 @@ def read_bounded_regular_file(
     *,
     allow_empty: bool = False,
     require_private_acl: bool = True,
+    private_root: Path | None = None,
 ) -> bytes:
     """Read one stable, bounded Windows file without accepting reparse points."""
     candidate = Path(path)
     if require_private_acl:
-        validate_private_regular_file(candidate, root=local_app_data_root())
+        validate_private_regular_file(
+            candidate,
+            root=private_root or local_app_data_root(),
+        )
     before = candidate.lstat()
     if (
         not stat.S_ISREG(before.st_mode)

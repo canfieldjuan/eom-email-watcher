@@ -25,7 +25,8 @@ button or manifest field.
    lock range is byte offset `0`, length `1`.
 3. Use those primitives for registration reads and entitlement status/install,
    including bounded Windows registration enumeration, commit-time revalidation,
-   and rollback.
+   rollback, and propagation of an explicitly selected discovery root through
+   each registration-file admission check.
 4. Remove the packaging veto, use the platform data-file separator, and embed
    the production public keyring in the native Windows sidecar.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
@@ -64,7 +65,8 @@ button or manifest field.
 - Native Windows tests prove default paths, bounded reads, registration
   discovery and enumeration, replacement after a short-lived reader releases
   its handle, source-vs-installed entitlement ACL boundaries, activation,
-  contention, rollback, OWNER RIGHTS admission, and reparse refusal.
+  contention, rollback, OWNER RIGHTS admission, explicit v1/v2 runtime-root
+  discovery, and reparse refusal.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

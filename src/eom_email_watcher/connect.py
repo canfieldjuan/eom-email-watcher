@@ -674,10 +674,21 @@ def _secure_directory(path: Path, *, windows_root: Path | None = None) -> bool:
     )
 
 
-def _read_private_json(path: Path, limit: int) -> object | None:
+def _read_private_json(
+    path: Path,
+    limit: int,
+    *,
+    windows_root: Path | None = None,
+) -> object | None:
     if os.name == "nt":
         try:
-            return json.loads(read_bounded_regular_file(path, limit))
+            return json.loads(
+                read_bounded_regular_file(
+                    path,
+                    limit,
+                    private_root=windows_root,
+                )
+            )
         except (OSError, ValueError, TypeError):
             return None
     try:
@@ -747,8 +758,16 @@ def _registration_candidates(providers_dir: Path) -> tuple[Path, ...] | None:
     return tuple(sorted(candidates, key=lambda item: item.name))
 
 
-def _read_registration(path: Path) -> _RuntimeRegistration | None:
-    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+def _read_registration(
+    path: Path,
+    *,
+    windows_root: Path | None = None,
+) -> _RuntimeRegistration | None:
+    value = _read_private_json(
+        path,
+        MAX_REGISTRATION_BYTES,
+        windows_root=windows_root,
+    )
     if value is None:
         return None
     try:
@@ -757,8 +776,16 @@ def _read_registration(path: Path) -> _RuntimeRegistration | None:
         return None
 
 
-def _read_registration_v2(path: Path) -> _RuntimeRegistrationV2 | None:
-    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+def _read_registration_v2(
+    path: Path,
+    *,
+    windows_root: Path | None = None,
+) -> _RuntimeRegistrationV2 | None:
+    value = _read_private_json(
+        path,
+        MAX_REGISTRATION_BYTES,
+        windows_root=windows_root,
+    )
     if value is None:
         return None
     try:
@@ -894,7 +921,7 @@ def discover_summary_capability(
         if registrations is None:
             return CapabilityDiscovery(None, "provider_unavailable")
         for path in registrations:
-            registration = _read_registration(path)
+            registration = _read_registration(path, windows_root=root_value)
             if registration is None:
                 continue
             base_url = _validated_base_url(registration.transport.base_url)
@@ -1040,7 +1067,7 @@ def discover_capabilities(
         if registrations is None:
             return CapabilityCatalog((), "provider_unavailable")
         for path in registrations:
-            registration = _read_registration_v2(path)
+            registration = _read_registration_v2(path, windows_root=root_value)
             if registration is None or registration.instance_id in conflicting_instances:
                 continue
             if (
