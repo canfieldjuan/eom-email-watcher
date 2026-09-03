@@ -31,7 +31,9 @@ button or manifest field.
 4. Remove the packaging veto, use the platform data-file separator, and embed
    the production public keyring in the native Windows sidecar only after the
    bounded build-input reader rejects symlink/reparse substitution and binds
-   the read to one stable file identity.
+   the read to one stable file identity. Stage the returned validated bytes
+   directly so a later source-path replacement cannot change package authority,
+   and refuse fixture/test key IDs in release packages.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
    then prove packaged provider discovery and one authenticated job on the local
    Windows VM.
@@ -72,7 +74,9 @@ button or manifest field.
   discovery, reparse refusal, and the exact 256/257 candidate boundary including
   case-insensitive names and non-file `.json` entries.
 - Desktop packaging tests prove an ordinary public keyring is accepted while
-  Windows reparse metadata fails closed before that authority can be bundled.
+  Windows reparse metadata fails closed before that authority can be bundled;
+  replacing the source after validation still stages the exact validated bytes,
+  and a non-production key ID is rejected.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

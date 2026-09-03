@@ -230,7 +230,9 @@ def test_sidecar_build_stages_microsoft_public_client(
     assert not Path(staged_source).exists()
 
 
-def _write_entitlement_keyring(path: Path) -> None:
+def _write_entitlement_keyring(
+    path: Path, *, key_id: str = "local-connect-prod-2026-01"
+) -> None:
     public_key = base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode("ascii")
     path.write_text(
         json.dumps(
@@ -238,7 +240,7 @@ def _write_entitlement_keyring(path: Path) -> None:
                 "keys": [
                     {
                         "algorithm": "Ed25519",
-                        "key_id": "release-1",
+                        "key_id": key_id,
                         "public_key_base64url": public_key,
                     }
                 ]
@@ -251,8 +253,9 @@ def _write_entitlement_keyring(path: Path) -> None:
 def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
     path = tmp_path / "keyring.json"
     _write_entitlement_keyring(path)
+    expected = path.read_bytes()
 
-    build_desktop_sidecar.validate_entitlement_keyring(path)
+    assert build_desktop_sidecar.validate_entitlement_keyring(path) == expected
 
 
 def test_entitlement_build_input_rejects_windows_reparse_metadata(
@@ -265,6 +268,17 @@ def test_entitlement_build_input_rejects_windows_reparse_metadata(
     monkeypatch.setattr(connect_windows, "_is_reparse", lambda _metadata: True)
 
     with pytest.raises(build_desktop_sidecar.SidecarBuildError):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
+
+
+def test_entitlement_build_input_rejects_non_production_key_id(tmp_path: Path) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path, key_id="local-connect-test-2026-01")
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="non-production key ID",
+    ):
         build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
@@ -288,6 +302,8 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     build_directory = tmp_path / "build"
     output_directory = tmp_path / "output"
     calls: list[list[str]] = []
+    staged_keyring: list[bytes] = []
+    validated_keyring = source.read_bytes()
 
     monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
     monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
@@ -301,9 +317,25 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
     monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(source))
 
+    validate_keyring = build_desktop_sidecar.validate_entitlement_keyring
+
+    def validate_then_replace(path: Path) -> bytes:
+        content = validate_keyring(path)
+        path.write_bytes(b"substituted after validation")
+        return content
+
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "validate_entitlement_keyring",
+        validate_then_replace,
+    )
+
     def run(arguments: list[str], **kwargs):
         calls.append(arguments)
         if "PyInstaller" in arguments:
+            add_data = arguments[arguments.index("--add-data") + 1]
+            staged_source = Path(add_data.rsplit(";", 1)[0])
+            staged_keyring.append(staged_source.read_bytes())
             built = build_directory / "dist" / f"{build_desktop_sidecar.ENGINE_NAME}.exe"
             built.write_bytes(b"engine")
         return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
@@ -320,6 +352,8 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     staged_source, destination = add_data[0].rsplit(";", 1)
     assert Path(staged_source).name == "connect-entitlement-keyring.json"
     assert destination == "eom_email_watcher_data"
+    assert staged_keyring == [validated_keyring]
+    assert source.read_bytes() == b"substituted after validation"
     assert not Path(staged_source).exists()
 
 

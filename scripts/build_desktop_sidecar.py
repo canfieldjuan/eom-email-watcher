@@ -20,6 +20,7 @@ ENGINE_NAME = "eom-mail-engine"
 TARGET_TRIPLE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 OAUTH_REQUIRED_FIELDS = ("auth_uri", "client_id", "client_secret", "token_uri")
 OAUTH_TOKEN_FIELDS = frozenset({"access_token", "refresh_token"})
+NON_PRODUCTION_KEY_TOKENS = frozenset({"dev", "example", "fixture", "test"})
 
 
 class SidecarBuildError(RuntimeError):
@@ -114,7 +115,7 @@ def validate_microsoft_oauth_client(path: Path) -> None:
         raise SidecarBuildError(str(exc)) from exc
 
 
-def validate_entitlement_keyring(path: Path) -> None:
+def validate_entitlement_keyring(path: Path) -> bytes:
     from eom_email_watcher.connect_windows import read_bounded_regular_file
     from eom_email_watcher.entitlement import MAX_KEYRING_BYTES, _parse_keyring
 
@@ -131,6 +132,13 @@ def validate_entitlement_keyring(path: Path) -> None:
         raise SidecarBuildError(
             "Connect-enabled release key ring must contain at least one public key"
         )
+    for key_id in keys:
+        tokens = frozenset(re.split(r"[.-]", key_id))
+        if "prod" not in tokens or tokens & NON_PRODUCTION_KEY_TOKENS:
+            raise SidecarBuildError(
+                "Connect-enabled release key ring contains a non-production key ID"
+            )
+    return content
 
 
 def validate_entitlement_keyring_target(target_triple: str) -> None:
@@ -143,6 +151,21 @@ def _staged_build_input(source: Path, filename: str, prefix: str) -> Iterator[Pa
     destination = directory / filename
     try:
         shutil.copyfile(source, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+        yield destination
+    finally:
+        destination.unlink(missing_ok=True)
+        with suppress(OSError):
+            directory.rmdir()
+
+
+@contextmanager
+def _staged_build_bytes(content: bytes, filename: str, prefix: str) -> Iterator[Path]:
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=BUILD_DIRECTORY))
+    destination = directory / filename
+    try:
+        destination.write_bytes(content)
         if os.name != "nt":
             destination.chmod(0o600)
         yield destination
@@ -233,10 +256,10 @@ def build_sidecar() -> Path:
         if keyring_source_value:
             validate_entitlement_keyring_target(target_triple)
             keyring_source = Path(keyring_source_value)
-            validate_entitlement_keyring(keyring_source)
+            keyring_content = validate_entitlement_keyring(keyring_source)
             staged_keyring = stack.enter_context(
-                _staged_build_input(
-                    keyring_source,
+                _staged_build_bytes(
+                    keyring_content,
                     "connect-entitlement-keyring.json",
                     "connect-keyring.",
                 )
