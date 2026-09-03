@@ -42,7 +42,12 @@ MAX_CLIENT_CONFIG_BYTES = 32 * 1024
 MAX_GRAPH_URL_LENGTH = 32 * 1024
 BUNDLED_MICROSOFT_OAUTH_CLIENT = Path("eom_email_watcher_data/microsoft-oauth-client.json")
 _INITIAL_CURSOR_PREFIX = "microsoft365-initial:"
-_DELTA_PATH = re.compile(r"\A/v1\.0/me/mailFolders/[A-Za-z0-9_~.%=+-]+/messages/delta\Z")
+_DELTA_PATH = re.compile(
+    r"\A/v1\.0/me/mailFolders"
+    r"(?:/[A-Za-z0-9_~.%=+-]+|\('[A-Za-z0-9_~.%=+-]+'\))"
+    r"/messages/delta\Z",
+    re.IGNORECASE,
+)
 _TRANSIENT_AUTH_ERRORS = frozenset(
     {"temporarily_unavailable", "server_error", "service_not_available"}
 )

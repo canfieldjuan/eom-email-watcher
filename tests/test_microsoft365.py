@@ -227,6 +227,8 @@ def test_silent_refresh_persists_updated_cache(
         "https://graph.microsoft.com:443/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=x",
         "https://graph.microsoft.com/v1.0/me/messages/delta?$deltatoken=x",
         "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$skiptoken=x",
+        "https://graph.microsoft.com/v1.0/me/mailfolders('inbox')/messages/delta?$skiptoken=x",
+        "https://graph.microsoft.com/v1.0/me/mailfolders('in/box')/messages/delta?$deltatoken=x",
     ],
 )
 def test_changes_reject_unsafe_persisted_cursor_without_network(
@@ -247,8 +249,12 @@ def test_changes_reject_unsafe_persisted_cursor_without_network(
 
 def test_delta_changes_paginate_deduplicate_and_keep_immutable_ids() -> None:
     requests: list[httpx.Request] = []
-    next_link = f"{GRAPH_ROOT}/me/mailFolders/inbox/messages/delta?%24skiptoken=next-token"
-    delta_link = f"{GRAPH_ROOT}/me/mailFolders/inbox/messages/delta?%24deltatoken=new-token"
+    next_link = (
+        f"{GRAPH_ROOT}/me/mailfolders('AQMk-folder-id')/messages/delta?%24skiptoken=next-token"
+    )
+    delta_link = (
+        f"{GRAPH_ROOT}/me/mailfolders('AQMk-folder-id')/messages/delta?%24deltatoken=new-token"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
