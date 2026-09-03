@@ -29,7 +29,6 @@ from .connect_windows import (
     local_app_data_root,
     read_bounded_regular_file,
     unlink_regular_file,
-    validate_private_directory,
 )
 
 FEATURE_ID = "connect.capability_exchange"
@@ -386,13 +385,7 @@ def _require_active_candidate(
 def _read_private_entitlement(path: Path) -> bytes | None:
     if os.name == "nt":
         try:
-            root = local_app_data_root()
-            validate_private_directory(path.parent, root=root)
-            return read_bounded_regular_file(
-                path,
-                MAX_ENTITLEMENT_BYTES,
-                require_private_acl=False,
-            )
+            return read_bounded_regular_file(path, MAX_ENTITLEMENT_BYTES)
         except OSError:
             return None
     if (

@@ -20,7 +20,9 @@ button or manifest field.
 2. Add protected private-DACL creation plus bounded regular-file, reparse-point,
    effective-DACL, atomic replacement with bounded sharing-violation retry, and
    non-blocking Windows lock primitives under the existing same-user trust
-   model. The shared lock range is byte offset `0`, length `1`.
+   model. Validate every installed-file ancestor and the file ACL itself while
+   treating OWNER RIGHTS as the already-validated concrete owner. The shared
+   lock range is byte offset `0`, length `1`.
 3. Use those primitives for registration reads and entitlement status/install,
    including bounded Windows registration enumeration, commit-time revalidation,
    and rollback.
@@ -61,7 +63,8 @@ button or manifest field.
 - Existing Linux Connect, entitlement, engine, and packaging tests remain green.
 - Native Windows tests prove default paths, bounded reads, registration
   discovery and enumeration, replacement after a short-lived reader releases
-  its handle, activation, contention, rollback, and reparse refusal.
+  its handle, source-vs-installed entitlement ACL boundaries, activation,
+  contention, rollback, OWNER RIGHTS admission, and reparse refusal.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

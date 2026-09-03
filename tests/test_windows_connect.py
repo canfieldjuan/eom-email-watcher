@@ -20,6 +20,7 @@ from eom_email_watcher.connect_windows import (
     WindowsFileLock,
     _protect_windows_directory,
     atomic_replace_bytes,
+    ensure_private_directory,
     local_app_data_root,
     read_bounded_regular_file,
 )
@@ -128,6 +129,26 @@ def test_windows_bounded_reader_rejects_oversized_file(private_root: Path) -> No
         read_bounded_regular_file(candidate, 3)
 
 
+def test_windows_private_reader_rejects_reparse_point_ancestor(
+    private_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(private_root))
+    target = ensure_private_directory(private_root / "target", root=private_root)
+    candidate = target / "entitlement.json"
+    candidate.write_text("{}", encoding="utf-8")
+    junction = private_root / "LocalConnect"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(OSError):
+        read_bounded_regular_file(junction / candidate.name, 16)
+
+
 def test_windows_atomic_replacement_retries_a_short_lived_reader(
     private_root: Path,
 ) -> None:
@@ -215,6 +236,13 @@ def test_windows_entitlement_install_and_status(
     )
     assert gate.decision() is entitlement.EntitlementDecision.ACTIVE
     assert destination.read_bytes() == source.read_bytes()
+    subprocess.run(
+        ["icacls", str(destination), "/grant", "*S-1-1-0:R"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert gate.decision() is entitlement.EntitlementDecision.MISSING
 
 
 def test_windows_entitlement_lock_contention_is_busy(
@@ -296,3 +324,16 @@ def test_windows_local_app_data_rejects_broad_read_acl(private_root: Path) -> No
 
     with pytest.raises(OSError):
         local_app_data_root(str(private_root))
+
+
+def test_windows_owner_rights_ace_is_not_an_untrusted_principal(
+    private_root: Path,
+) -> None:
+    subprocess.run(
+        ["icacls", str(private_root), "/grant", "*S-1-3-4:(OI)(CI)F"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert local_app_data_root(str(private_root)) == private_root
