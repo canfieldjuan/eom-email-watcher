@@ -161,10 +161,19 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 ```
 
 The key ring contains public verification keys only. Private signing keys must never be supplied
-to the build or committed. A build without this variable remains a healthy standalone Email
-Watcher but Connect capability discovery and invocation fail closed. This variable is consumed by
-the release build script; there is no runtime environment override for issuer trust, and such a
-build reports `authority_unavailable` instead of admitting license installation.
+to the build or committed. The release builder also requires the parsed issuer ID and public key to
+match the authority explicitly approved in the builder; a merely production-shaped replacement is
+rejected even if a filesystem path is raced. A build without this variable remains a healthy
+standalone Email Watcher but Connect capability discovery and invocation fail closed. This variable
+is consumed by the release build script; there is no runtime environment override for issuer trust,
+and such a build reports `authority_unavailable` instead of admitting license installation.
+
+The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
+arguments using the host platform separator, and the Windows package reads the shared entitlement
+from `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Provider registrations are discovered from
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`. The runtime verifies that the root and every
+trusted descendant have no content or mutation grant beyond the user, SYSTEM, or built-in
+Administrators; no XDG variables are required on Windows.
 
 ## Verification
 
@@ -216,19 +225,25 @@ the bounded fixture model so it can pause safely. An authenticated endpoint may 
 Both configured-model fields are required together, and the provider retains final endpoint
 validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
+When `scripts/smoke_packaged_engine.py` is run independently of the build, pass the authority state
+embedded in that already-built binary explicitly: `--expected-entitlement-state missing` for a
+Connect-enabled package or `--expected-entitlement-state authority_unavailable` for a standalone
+package. The smoke test does not infer package contents from the caller's current environment.
+
 ### Packaged Debian interoperability proof
 
-After building both Debian packages from their current checkouts with the canonical test public key
-ring, exercise the two shipped binaries together. Set `LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
-`connect-contracts/entitlements/v1/fixtures/test-keyring.json` for both builds so the fixture license
-below is accepted; production packages instead require an entitlement signed by their embedded
-production authority.
+After building both Debian packages from their current checkouts with the canonical production
+public-key ring, exercise the two shipped binaries together. Set
+`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
+`connect-contracts/entitlements/v1/release/keyring.json` for both builds, then supply an acquired
+active entitlement signed by that authority. Fixture/test key IDs are intentionally rejected by the
+release builders; the source-level proof above remains the place for fixture authority.
 
 ```bash
 uv run python scripts/connect-packaged-deb-proof.py \
   --consumer-deb "desktop/src-tauri/target/release/bundle/deb/Email Watcher_0.1.0_amd64.deb" \
   --provider-deb "/path/to/Document Summarizer_0.1.0_amd64.deb" \
-  --active-entitlement "/path/to/connect-contracts/entitlements/v1/fixtures/valid/active.json"
+  --active-entitlement "/secure/path/production-entitlement-v1.json"
 ```
 
 The harness requires `dpkg-deb`, `dbus-run-session`, and `xvfb-run`. It extracts rather than
@@ -243,9 +258,11 @@ provider launch, stop, and restart, the provider's durable instance identity sur
 the packaged consumer Inbox remains readable while the provider is absent. It does not contact
 Gmail or a model, submit a capability job, install either package through the OS package manager, or
 exercise a human UI click. The source-level `connect-local-proof.py` remains the job handoff,
-idempotency, persistence, output, and privacy proof. Native Windows execution remains separate:
-the Windows Email Watcher installer is built and checked by `windows-package`, while a two-app
-Windows proof requires a native Document Summarizer package and an actual Windows test session.
+idempotency, persistence, output, and privacy proof. Native Windows execution remains separate: the
+`windows-package` job embeds the release public key ring, runs native
+placement/activation/discovery probes, builds the Email Watcher installer, and requires the
+packaged engine to report `missing` rather than `authority_unavailable`. The two-app job handoff is
+the remaining release-acceptance step for an actual Windows test session.
 
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.

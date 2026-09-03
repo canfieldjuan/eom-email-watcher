@@ -21,6 +21,16 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
+from .connect_windows import (
+    WindowsFileLock,
+    WindowsLockBusy,
+    atomic_replace_bytes,
+    ensure_private_directory,
+    local_app_data_root,
+    read_bounded_regular_file,
+    unlink_regular_file,
+)
+
 FEATURE_ID = "connect.capability_exchange"
 ENTITLEMENT_FILE_NAME = "entitlement-v1.json"
 ENTITLEMENT_LOCK_FILE_NAME = ".entitlement-v1.lock"
@@ -146,6 +156,7 @@ class EntitlementGate:
             path=_entitlement_path(
                 os.environ.get("XDG_CONFIG_HOME"),
                 os.environ.get("HOME"),
+                os.environ.get("LOCALAPPDATA"),
             ),
             keys=_load_bundled_keyring(),
             now=None,
@@ -178,6 +189,10 @@ class EntitlementGate:
             raise _install_error(AUTHORITY_UNAVAILABLE)
         if self.path is None:
             raise _install_error(STORAGE_UNAVAILABLE)
+        candidate = _read_candidate_entitlement(source)
+        _require_active_candidate(candidate, self.keys, self._current_time())
+        if os.name == "nt":
+            return _install_windows_entitlement(self, candidate)
         if (
             os.name != "posix"
             or not hasattr(os, "geteuid")
@@ -188,8 +203,6 @@ class EntitlementGate:
         ):
             raise _install_error(STORAGE_UNAVAILABLE)
 
-        candidate = _read_candidate_entitlement(source)
-        _require_active_candidate(candidate, self.keys, self._current_time())
         parent = self.path.parent
         _ensure_private_directory(parent)
         with _activation_lock(parent):
@@ -223,7 +236,16 @@ def install_connect_entitlement(source: Path) -> EntitlementStatus:
     return EntitlementGate.from_installation().install(source)
 
 
-def _entitlement_path(xdg_config_home: str | None, home: str | None) -> Path | None:
+def _entitlement_path(
+    xdg_config_home: str | None,
+    home: str | None,
+    local_app_data: str | None = None,
+) -> Path | None:
+    if os.name == "nt":
+        try:
+            return local_app_data_root(local_app_data) / "LocalConnect" / ENTITLEMENT_FILE_NAME
+        except OSError:
+            return None
     if xdg_config_home:
         root = Path(xdg_config_home)
     elif home:
@@ -361,6 +383,11 @@ def _require_active_candidate(
 
 
 def _read_private_entitlement(path: Path) -> bytes | None:
+    if os.name == "nt":
+        try:
+            return read_bounded_regular_file(path, MAX_ENTITLEMENT_BYTES)
+        except OSError:
+            return None
     if (
         os.name != "posix"
         or not hasattr(os, "geteuid")
@@ -410,6 +437,15 @@ def _read_private_entitlement(path: Path) -> bytes | None:
 
 
 def _read_candidate_entitlement(path: Path) -> bytes:
+    if os.name == "nt":
+        try:
+            return read_bounded_regular_file(
+                path,
+                MAX_ENTITLEMENT_BYTES,
+                require_private_acl=False,
+            )
+        except OSError as exc:
+            raise _install_error(SOURCE_INVALID) from exc
     try:
         candidate = path.lstat()
         if (
@@ -449,6 +485,81 @@ def _read_candidate_entitlement(path: Path) -> bytes:
     finally:
         with suppress(OSError):
             os.close(descriptor)
+
+
+def _install_windows_entitlement(
+    gate: EntitlementGate,
+    candidate: bytes,
+) -> EntitlementStatus:
+    assert gate.path is not None
+    destination = gate.path
+    lock: WindowsFileLock | None = None
+    promoted = False
+    previous: bytes | None = None
+    try:
+        root = local_app_data_root()
+        ensure_private_directory(destination.parent, root=root)
+        try:
+            lock = WindowsFileLock(destination.parent / ENTITLEMENT_LOCK_FILE_NAME)
+        except WindowsLockBusy as exc:
+            raise _install_error(ACTIVATION_BUSY) from exc
+
+        previous = _read_existing_windows_entitlement(destination)
+        assert gate.keys is not None
+        _require_active_candidate(candidate, gate.keys, gate._current_time())
+        atomic_replace_bytes(destination, candidate, MAX_ENTITLEMENT_BYTES)
+        promoted = True
+        installed = read_bounded_regular_file(destination, MAX_ENTITLEMENT_BYTES)
+        decision = _evaluate_entitlement(installed, gate.keys, gate._current_time())
+        if installed != candidate or not decision.is_active:
+            raise _install_error(INSTALL_FAILED)
+        return EntitlementStatus.from_decision(decision)
+    except EntitlementInstallError:
+        if promoted:
+            _restore_windows_entitlement(destination, previous)
+        raise
+    except OSError as exc:
+        if promoted:
+            _restore_windows_entitlement(destination, previous)
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+    finally:
+        if lock is not None:
+            with suppress(OSError):
+                lock.close()
+
+
+def _read_existing_windows_entitlement(path: Path) -> bytes | None:
+    try:
+        return read_bounded_regular_file(path, MAX_ENTITLEMENT_BYTES, allow_empty=True)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _install_error(STORAGE_UNAVAILABLE) from exc
+
+
+def _restore_windows_entitlement(destination: Path, previous: bytes | None) -> None:
+    try:
+        if previous is None:
+            with suppress(FileNotFoundError):
+                unlink_regular_file(destination)
+            if destination.exists():
+                raise OSError(errno.EIO, "candidate removal failed")
+            return
+        atomic_replace_bytes(
+            destination,
+            previous,
+            MAX_ENTITLEMENT_BYTES,
+            allow_empty=True,
+        )
+        restored = read_bounded_regular_file(
+            destination,
+            MAX_ENTITLEMENT_BYTES,
+            allow_empty=True,
+        )
+        if restored != previous:
+            raise OSError(errno.EIO, "prior entitlement restoration mismatch")
+    except OSError as exc:
+        raise _install_error(INSTALL_FAILED) from exc
 
 
 def _ensure_private_directory(path: Path) -> None:

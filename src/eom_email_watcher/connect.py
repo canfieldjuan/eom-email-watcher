@@ -30,6 +30,11 @@ from pydantic import (
 )
 
 from . import entitlement
+from .connect_windows import (
+    local_app_data_root,
+    read_bounded_regular_file,
+    validate_private_directory,
+)
 
 PROTOCOL_VERSION = 1
 GENERIC_PROTOCOL_VERSION = 2
@@ -40,6 +45,7 @@ OUTPUT_MEDIA_TYPE = "application/vnd.local-connect.document-summary+json"
 SOURCE_APP_ID = "email-watcher"
 MAX_INPUT_BYTES = 100 * 1024 * 1024
 MAX_REGISTRATION_BYTES = 16 * 1024
+MAX_WINDOWS_REGISTRATION_ENTRIES = 256
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 2 * 1024 * 1024 + 64 * 1024
 MAX_GENERIC_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -648,7 +654,14 @@ class JobUpdate:
     error: ConnectError | None
 
 
-def _secure_directory(path: Path) -> bool:
+def _secure_directory(path: Path, *, windows_root: Path | None = None) -> bool:
+    if os.name == "nt":
+        try:
+            root = windows_root or local_app_data_root()
+            validate_private_directory(path, root=root)
+            return True
+        except OSError:
+            return False
     try:
         info = path.lstat()
     except OSError:
@@ -661,7 +674,23 @@ def _secure_directory(path: Path) -> bool:
     )
 
 
-def _read_private_json(path: Path, limit: int) -> object | None:
+def _read_private_json(
+    path: Path,
+    limit: int,
+    *,
+    windows_root: Path | None = None,
+) -> object | None:
+    if os.name == "nt":
+        try:
+            return json.loads(
+                read_bounded_regular_file(
+                    path,
+                    limit,
+                    private_root=windows_root,
+                )
+            )
+        except (OSError, ValueError, TypeError):
+            return None
     try:
         info = path.lstat()
         if (
@@ -689,8 +718,58 @@ def _read_private_json(path: Path, limit: int) -> object | None:
         return None
 
 
-def _read_registration(path: Path) -> _RuntimeRegistration | None:
-    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+def _providers_directory(
+    runtime_dir: Path | None,
+    protocol_version: int,
+) -> tuple[Path, Path] | None:
+    if runtime_dir is not None:
+        root = Path(runtime_dir)
+        return root, root / f"local-connect/v{protocol_version}/providers"
+    if os.name == "nt":
+        try:
+            root = local_app_data_root()
+        except OSError:
+            return None
+        return root, root / f"LocalConnect/runtime/v{protocol_version}/providers"
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        return None
+    root = Path(value)
+    return root, root / f"local-connect/v{protocol_version}/providers"
+
+
+def _registration_candidates(providers_dir: Path) -> tuple[Path, ...] | None:
+    if os.name != "nt":
+        try:
+            return tuple(sorted(providers_dir.iterdir(), key=lambda item: item.name))
+        except OSError:
+            return None
+    candidates: list[Path] = []
+    entry_count = 0
+    try:
+        with os.scandir(providers_dir) as entries:
+            for entry in entries:
+                entry_count += 1
+                if entry_count > MAX_WINDOWS_REGISTRATION_ENTRIES:
+                    return None
+                if not entry.name.lower().endswith(".json"):
+                    continue
+                candidates.append(Path(entry.path))
+    except OSError:
+        return None
+    return tuple(sorted(candidates, key=lambda item: item.name))
+
+
+def _read_registration(
+    path: Path,
+    *,
+    windows_root: Path | None = None,
+) -> _RuntimeRegistration | None:
+    value = _read_private_json(
+        path,
+        MAX_REGISTRATION_BYTES,
+        windows_root=windows_root,
+    )
     if value is None:
         return None
     try:
@@ -699,8 +778,16 @@ def _read_registration(path: Path) -> _RuntimeRegistration | None:
         return None
 
 
-def _read_registration_v2(path: Path) -> _RuntimeRegistrationV2 | None:
-    value = _read_private_json(path, MAX_REGISTRATION_BYTES)
+def _read_registration_v2(
+    path: Path,
+    *,
+    windows_root: Path | None = None,
+) -> _RuntimeRegistrationV2 | None:
+    value = _read_private_json(
+        path,
+        MAX_REGISTRATION_BYTES,
+        windows_root=windows_root,
+    )
     if value is None:
         return None
     try:
@@ -816,25 +903,27 @@ def discover_summary_capability(
 ) -> CapabilityDiscovery:
     if not entitlement.connect_entitlement_decision().is_active:
         return CapabilityDiscovery(None, "connect_entitlement_required")
-    root_value = runtime_dir or (
-        Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
-    )
-    if root_value is None or not root_value.is_absolute() or not _secure_directory(root_value):
+    locations = _providers_directory(runtime_dir, PROTOCOL_VERSION)
+    if locations is None:
         return CapabilityDiscovery(None, "connect_unavailable")
-    providers_dir = root_value / "local-connect/v1/providers"
-    if not _secure_directory(providers_dir):
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return CapabilityDiscovery(None, "connect_unavailable")
+    if not _secure_directory(providers_dir, windows_root=root_value):
         return CapabilityDiscovery(None, "provider_unavailable")
 
     owned_client = client is None
     active_client = client or _client()
     providers: dict[str, ProviderCapability] = {}
     try:
-        try:
-            registrations = sorted(providers_dir.iterdir(), key=lambda item: item.name)
-        except OSError:
+        registrations = _registration_candidates(providers_dir)
+        if registrations is None:
             return CapabilityDiscovery(None, "provider_unavailable")
         for path in registrations:
-            registration = _read_registration(path)
+            registration = _read_registration(path, windows_root=root_value)
             if registration is None:
                 continue
             base_url = _validated_base_url(registration.transport.base_url)
@@ -959,13 +1048,16 @@ def discover_capabilities(
 ) -> CapabilityCatalog:
     if not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
-    root_value = runtime_dir or (
-        Path(value) if (value := os.environ.get("XDG_RUNTIME_DIR")) else None
-    )
-    if root_value is None or not root_value.is_absolute() or not _secure_directory(root_value):
+    locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
+    if locations is None:
         return CapabilityCatalog((), "connect_unavailable")
-    providers_dir = root_value / "local-connect/v2/providers"
-    if not _secure_directory(providers_dir):
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return CapabilityCatalog((), "connect_unavailable")
+    if not _secure_directory(providers_dir, windows_root=root_value):
         return CapabilityCatalog((), "provider_unavailable")
 
     owned_client = client is None
@@ -973,12 +1065,11 @@ def discover_capabilities(
     providers: dict[str, tuple[DiscoveredCapability, ...]] = {}
     conflicting_instances: set[str] = set()
     try:
-        try:
-            registrations = sorted(providers_dir.iterdir(), key=lambda item: item.name)
-        except OSError:
+        registrations = _registration_candidates(providers_dir)
+        if registrations is None:
             return CapabilityCatalog((), "provider_unavailable")
         for path in registrations:
-            registration = _read_registration_v2(path)
+            registration = _read_registration_v2(path, windows_root=root_value)
             if registration is None or registration.instance_id in conflicting_instances:
                 continue
             if (

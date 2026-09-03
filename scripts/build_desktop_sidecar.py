@@ -20,6 +20,17 @@ ENGINE_NAME = "eom-mail-engine"
 TARGET_TRIPLE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 OAUTH_REQUIRED_FIELDS = ("auth_uri", "client_id", "client_secret", "token_uri")
 OAUTH_TOKEN_FIELDS = frozenset({"access_token", "refresh_token"})
+NON_PRODUCTION_KEY_TOKENS = frozenset({"dev", "example", "fixture", "test"})
+APPROVED_RELEASE_AUTHORITIES = frozenset(
+    {
+        (
+            "local-connect-prod-2026-01",
+            bytes.fromhex(
+                "80df29263f56d87f3d2c1b0826a939c9d9a5c4d0ab6d25f101b0436107f57dad"
+            ),
+        )
+    }
+)
 
 
 class SidecarBuildError(RuntimeError):
@@ -114,27 +125,38 @@ def validate_microsoft_oauth_client(path: Path) -> None:
         raise SidecarBuildError(str(exc)) from exc
 
 
-def validate_entitlement_keyring(path: Path) -> None:
-    if not path.is_file():
-        raise SidecarBuildError("Connect entitlement public-key ring is not a regular file")
-    from eom_email_watcher.entitlement import _parse_keyring
+def validate_entitlement_keyring(path: Path) -> bytes:
+    from eom_email_watcher.connect_windows import read_bounded_regular_file
+    from eom_email_watcher.entitlement import MAX_KEYRING_BYTES, _parse_keyring
 
     try:
-        keys = _parse_keyring(path.read_bytes())
+        content = read_bounded_regular_file(
+            path,
+            MAX_KEYRING_BYTES,
+            require_private_acl=False,
+        )
+        keys = _parse_keyring(content)
     except (OSError, ValueError) as exc:
         raise SidecarBuildError("Connect entitlement public-key ring is invalid") from exc
     if not keys:
         raise SidecarBuildError(
             "Connect-enabled release key ring must contain at least one public key"
         )
+    for key_id in keys:
+        tokens = frozenset(re.split(r"[.-]", key_id))
+        if "prod" not in tokens or tokens & NON_PRODUCTION_KEY_TOKENS:
+            raise SidecarBuildError(
+                "Connect-enabled release key ring contains a non-production key ID"
+            )
+    if frozenset(keys.items()) != APPROVED_RELEASE_AUTHORITIES:
+        raise SidecarBuildError(
+            "Connect entitlement key ring does not match the approved production authority"
+        )
+    return content
 
 
 def validate_entitlement_keyring_target(target_triple: str) -> None:
-    if _target_family(target_triple) == "windows":
-        raise SidecarBuildError(
-            "Connect entitlement activation storage is not supported on Windows; "
-            "unset LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE to build the public package"
-        )
+    _target_family(target_triple)
 
 
 @contextmanager
@@ -143,6 +165,21 @@ def _staged_build_input(source: Path, filename: str, prefix: str) -> Iterator[Pa
     destination = directory / filename
     try:
         shutil.copyfile(source, destination)
+        if os.name != "nt":
+            destination.chmod(0o600)
+        yield destination
+    finally:
+        destination.unlink(missing_ok=True)
+        with suppress(OSError):
+            directory.rmdir()
+
+
+@contextmanager
+def _staged_build_bytes(content: bytes, filename: str, prefix: str) -> Iterator[Path]:
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=BUILD_DIRECTORY))
+    destination = directory / filename
+    try:
+        destination.write_bytes(content)
         if os.name != "nt":
             destination.chmod(0o600)
         yield destination
@@ -211,7 +248,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_oauth}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_oauth}{os.pathsep}eom_email_watcher_data"]
             )
 
         microsoft_source_value = os.environ.get("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE")
@@ -226,23 +263,23 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_microsoft}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_microsoft}{os.pathsep}eom_email_watcher_data"]
             )
 
         keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
         if keyring_source_value:
             validate_entitlement_keyring_target(target_triple)
             keyring_source = Path(keyring_source_value)
-            validate_entitlement_keyring(keyring_source)
+            keyring_content = validate_entitlement_keyring(keyring_source)
             staged_keyring = stack.enter_context(
-                _staged_build_input(
-                    keyring_source,
+                _staged_build_bytes(
+                    keyring_content,
                     "connect-entitlement-keyring.json",
                     "connect-keyring.",
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_keyring}:eom_email_watcher_data"]
+                ["--add-data", f"{staged_keyring}{os.pathsep}eom_email_watcher_data"]
             )
 
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))
@@ -262,6 +299,8 @@ def build_sidecar() -> Path:
             sys.executable,
             str(SCRIPT_DIRECTORY / "smoke_packaged_engine.py"),
             str(output_path),
+            "--expected-entitlement-state",
+            "missing" if keyring_source_value else "authority_unavailable",
         ],
         check=True,
         cwd=PROJECT_DIRECTORY,

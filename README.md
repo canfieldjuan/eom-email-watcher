@@ -182,16 +182,24 @@ is exact (`issued_at <= not_before <= now < expires_at`) with no hidden grace. R
 signed entitlement restores capability discovery without restarting Email Watcher. Mailbox OAuth is
 not a Connect license and is never shared with a provider.
 
+On Windows, the shared entitlement is
+`%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`, and v1/v2 provider registrations are read from
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`. The implementation relies on the current
+user's Local AppData ACL boundary, rejects reparse-point indirection, and fails closed when the
+root or a Connect descendant grants content or mutation access beyond the user, SYSTEM, or built-in
+Administrators. It does not require XDG variables.
+
 The desktop Health view reports only the license state and whether Connect is active. Its
 **Activate** action accepts a user-selected license, while the Python engine independently reads
 bounded regular-file bytes without following a final symlink, verifies the same signature,
 feature, and time contract used by discovery, and writes only to the fixed shared path. Email
 Watcher and other Connect apps serialize activation through `.entitlement-v1.lock`; the engine
-syncs a mode-`600` same-directory temporary file, atomically promotes it, syncs the directory, and
-re-evaluates the installed file before success. Invalid or inactive sources and expected failures
-before promotion preserve both the selected source and any existing entitlement. Status refreshes
-while the app remains open, so another app's activation, replacement, removal, or expiry does not
-leave the Health card indefinitely stale.
+flushes and atomically promotes a same-directory temporary file, then re-evaluates the installed
+file before success. Linux additionally enforces owner-only modes and syncs the directory; Windows
+uses a non-blocking byte-range lock and atomic replacement under Local AppData. Invalid or inactive
+sources and expected failures before promotion preserve both the selected source and any existing
+entitlement. Status refreshes while the app remains open, so another app's activation, replacement,
+removal, or expiry does not leave the Health card indefinitely stale.
 
 The current machine contract, including generic discovery, invocation, durable reconciliation, and
 safe output presentation/export, is documented in [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The
