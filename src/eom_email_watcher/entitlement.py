@@ -446,7 +446,11 @@ def _read_private_entitlement(path: Path) -> bytes | None:
 def _read_candidate_entitlement(path: Path) -> bytes:
     if os.name == "nt":
         try:
-            return read_bounded_regular_file(path, MAX_ENTITLEMENT_BYTES)
+            return read_bounded_regular_file(
+                path,
+                MAX_ENTITLEMENT_BYTES,
+                require_private_acl=False,
+            )
         except OSError as exc:
             raise _install_error(SOURCE_INVALID) from exc
     try:

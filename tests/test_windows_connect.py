@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +18,6 @@ from eom_email_watcher.connect_windows import (
     WINDOWS_LOCK_LENGTH,
     WINDOWS_LOCK_OFFSET,
     WindowsFileLock,
-    _open_windows_shared_reader,
     _protect_windows_directory,
     atomic_replace_bytes,
     local_app_data_root,
@@ -127,19 +128,26 @@ def test_windows_bounded_reader_rejects_oversized_file(private_root: Path) -> No
         read_bounded_regular_file(candidate, 3)
 
 
-def test_windows_replaceable_reader_allows_atomic_replacement(
+def test_windows_atomic_replacement_retries_a_short_lived_reader(
     private_root: Path,
 ) -> None:
     destination = private_root / "replaceable.json"
     atomic_replace_bytes(destination, b"old", 16)
 
-    descriptor = _open_windows_shared_reader(destination)
-    try:
-        atomic_replace_bytes(destination, b"new", 16)
-        assert os.read(descriptor, 3) == b"old"
-    finally:
+    descriptor = os.open(destination, os.O_RDONLY)
+
+    def release_reader() -> None:
+        time.sleep(0.05)
         os.close(descriptor)
 
+    release = threading.Thread(target=release_reader)
+    release.start()
+    try:
+        atomic_replace_bytes(destination, b"new", 16)
+    finally:
+        release.join(timeout=1)
+
+    assert not release.is_alive()
     assert destination.read_bytes() == b"new"
 
 

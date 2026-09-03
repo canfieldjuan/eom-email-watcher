@@ -6,7 +6,9 @@ import ctypes
 import errno
 import os
 import stat
+import time
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -27,14 +29,6 @@ _SE_FILE_OBJECT = 1
 _SDDL_REVISION_1 = 1
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
-_GENERIC_READ = 0x80000000
-_FILE_SHARE_READ = 0x00000001
-_FILE_SHARE_WRITE = 0x00000002
-_FILE_SHARE_DELETE = 0x00000004
-_OPEN_EXISTING = 3
-_FILE_ATTRIBUTE_NORMAL = 0x00000080
-_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _ACL_SIZE_INFORMATION_CLASS = 2
 _INHERIT_ONLY_ACE = 0x08
 _ACCESS_ALLOWED_ACE_TYPES = frozenset({0x00, 0x05, 0x09, 0x0B})
@@ -57,6 +51,9 @@ _SENSITIVE_FILE_ACCESS = (
 )
 _TRUSTED_FIXED_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})
 _OWNER_PLACEHOLDER_SIDS = frozenset({"S-1-3-0", "S-1-3-4"})
+_WINDOWS_FILE_OPERATION_ATTEMPTS = 20
+_WINDOWS_FILE_OPERATION_DELAY_SECONDS = 0.025
+_WINDOWS_SHARING_WINERRORS = frozenset({5, 32, 33})
 
 
 class _AceHeader(ctypes.Structure):
@@ -167,16 +164,6 @@ def _windows_libraries() -> tuple[object, object]:
     advapi32.GetTokenInformation.restype = ctypes.c_int
     kernel32.GetCurrentProcess.argtypes = []
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel32.CreateFileW.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-    ]
-    kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
@@ -184,28 +171,19 @@ def _windows_libraries() -> tuple[object, object]:
     return advapi32, kernel32
 
 
-def _open_windows_shared_reader(path: Path) -> int:
-    """Open a reader that cannot block atomic replacement or cleanup."""
-    if os.name != "nt" or msvcrt is None:
-        raise OSError(errno.ENOSYS, "Windows shared file reading is unavailable")
-    _, kernel32 = _windows_libraries()
-    handle = kernel32.CreateFileW(
-        str(path),
-        _GENERIC_READ,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-        None,
-        _OPEN_EXISTING,
-        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
-        None,
-    )
-    if handle == _INVALID_HANDLE_VALUE:
-        raise _windows_error("Windows file could not be opened for shared reading")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
-    try:
-        return msvcrt.open_osfhandle(handle, flags)
-    except Exception:
-        kernel32.CloseHandle(handle)
-        raise
+def _retry_windows_file_operation(operation: Callable[[], None]) -> None:
+    for attempt in range(_WINDOWS_FILE_OPERATION_ATTEMPTS):
+        try:
+            operation()
+            return
+        except OSError as exc:
+            sharing_violation = (
+                isinstance(exc, PermissionError)
+                or getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS
+            )
+            if not sharing_violation or attempt + 1 == _WINDOWS_FILE_OPERATION_ATTEMPTS:
+                raise
+            time.sleep(_WINDOWS_FILE_OPERATION_DELAY_SECONDS)
 
 
 def _windows_error(message: str) -> OSError:
@@ -497,7 +475,8 @@ def read_bounded_regular_file(
     ):
         raise OSError(errno.EINVAL, "file is not a bounded regular file")
 
-    descriptor = _open_windows_shared_reader(candidate)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    descriptor = os.open(candidate, flags)
     try:
         opened = os.fstat(descriptor)
         if (
@@ -573,7 +552,7 @@ def atomic_replace_bytes(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-        os.replace(temporary, destination)
+        _retry_windows_file_operation(lambda: os.replace(temporary, destination))
         promoted = True
     finally:
         if descriptor is not None:
@@ -594,7 +573,7 @@ def unlink_regular_file(path: Path) -> None:
         or not _private_windows_acl(candidate)
     ):
         raise OSError(errno.EACCES, "refusing to remove an unsafe path")
-    candidate.unlink()
+    _retry_windows_file_operation(candidate.unlink)
 
 
 class WindowsFileLock:
