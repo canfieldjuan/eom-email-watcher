@@ -255,6 +255,19 @@ def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
     build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
+def test_entitlement_build_input_rejects_windows_reparse_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eom_email_watcher import connect_windows
+
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path)
+    monkeypatch.setattr(connect_windows, "_is_reparse", lambda _metadata: True)
+
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
+
+
 @pytest.mark.parametrize(
     "target_triple",
     [

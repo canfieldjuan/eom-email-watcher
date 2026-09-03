@@ -28,7 +28,9 @@ button or manifest field.
    rollback, and propagation of an explicitly selected discovery root through
    each registration-file admission check.
 4. Remove the packaging veto, use the platform data-file separator, and embed
-   the production public keyring in the native Windows sidecar.
+   the production public keyring in the native Windows sidecar only after the
+   bounded build-input reader rejects symlink/reparse substitution and binds
+   the read to one stable file identity.
 5. Exercise Windows paths and packaged authority in the existing Windows CI,
    then prove packaged provider discovery and one authenticated job on the local
    Windows VM.
@@ -67,6 +69,8 @@ button or manifest field.
   its handle, source-vs-installed entitlement ACL boundaries, activation,
   contention, rollback, OWNER RIGHTS admission, explicit v1/v2 runtime-root
   discovery, and reparse refusal.
+- Desktop packaging tests prove an ordinary public keyring is accepted while
+  Windows reparse metadata fails closed before that authority can be bundled.
 - The Windows NSIS job builds with the production public keyring and the
   packaged sidecar reports `missing`, not `authority_unavailable`, before a
   license is installed.

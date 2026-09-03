@@ -115,12 +115,16 @@ def validate_microsoft_oauth_client(path: Path) -> None:
 
 
 def validate_entitlement_keyring(path: Path) -> None:
-    if not path.is_file():
-        raise SidecarBuildError("Connect entitlement public-key ring is not a regular file")
-    from eom_email_watcher.entitlement import _parse_keyring
+    from eom_email_watcher.connect_windows import read_bounded_regular_file
+    from eom_email_watcher.entitlement import MAX_KEYRING_BYTES, _parse_keyring
 
     try:
-        keys = _parse_keyring(path.read_bytes())
+        content = read_bounded_regular_file(
+            path,
+            MAX_KEYRING_BYTES,
+            require_private_acl=False,
+        )
+        keys = _parse_keyring(content)
     except (OSError, ValueError) as exc:
         raise SidecarBuildError("Connect entitlement public-key ring is invalid") from exc
     if not keys:
