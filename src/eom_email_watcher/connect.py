@@ -45,7 +45,7 @@ OUTPUT_MEDIA_TYPE = "application/vnd.local-connect.document-summary+json"
 SOURCE_APP_ID = "email-watcher"
 MAX_INPUT_BYTES = 100 * 1024 * 1024
 MAX_REGISTRATION_BYTES = 16 * 1024
-MAX_WINDOWS_REGISTRATION_CANDIDATES = 256
+MAX_WINDOWS_REGISTRATION_ENTRIES = 256
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 2 * 1024 * 1024 + 64 * 1024
 MAX_GENERIC_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -745,13 +745,15 @@ def _registration_candidates(providers_dir: Path) -> tuple[Path, ...] | None:
         except OSError:
             return None
     candidates: list[Path] = []
+    entry_count = 0
     try:
         with os.scandir(providers_dir) as entries:
             for entry in entries:
+                entry_count += 1
+                if entry_count > MAX_WINDOWS_REGISTRATION_ENTRIES:
+                    return None
                 if not entry.name.lower().endswith(".json"):
                     continue
-                if len(candidates) == MAX_WINDOWS_REGISTRATION_CANDIDATES:
-                    return None
                 candidates.append(Path(entry.path))
     except OSError:
         return None

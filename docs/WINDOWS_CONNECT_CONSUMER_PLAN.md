@@ -24,10 +24,10 @@ button or manifest field.
    treating OWNER RIGHTS as the already-validated concrete owner. The shared
    lock range is byte offset `0`, length `1`.
 3. Use those primitives for registration reads and entitlement status/install,
-   including the contract-wide per-directory limit of 256 case-insensitive
-   `.json` names, commit-time revalidation, rollback, and propagation of an
-   explicitly selected discovery root through each registration-file admission
-   check.
+   including the contract-wide per-directory traversal limit of 256 direct
+   children before case-insensitive `.json` filtering, commit-time revalidation,
+   rollback, and propagation of an explicitly selected discovery root through
+   each registration-file admission check.
 4. Remove the packaging veto, use the platform data-file separator, and embed
    the production public keyring in the native Windows sidecar only after the
    bounded build-input reader rejects symlink/reparse substitution and binds
@@ -71,8 +71,9 @@ button or manifest field.
   discovery and enumeration, replacement after a short-lived reader releases
   its handle, source-vs-installed entitlement ACL boundaries, activation,
   contention, rollback, OWNER RIGHTS admission, explicit v1/v2 runtime-root
-  discovery, reparse refusal, and the exact 256/257 candidate boundary including
-  case-insensitive names and non-file `.json` entries.
+  discovery, reparse refusal, and the exact 256/257 direct-child boundary
+  including non-candidate temp/lock names, case-insensitive names, and non-file
+  `.json` entries.
 - Desktop packaging tests prove an ordinary public keyring is accepted while
   Windows reparse metadata fails closed before that authority can be bundled;
   replacing the source after validation still stages the exact validated bytes,
