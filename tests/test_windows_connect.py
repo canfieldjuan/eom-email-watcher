@@ -203,6 +203,25 @@ def test_windows_atomic_replacement_retries_a_short_lived_reader(
     assert destination.read_bytes() == b"new"
 
 
+def test_windows_atomic_replacement_reclaims_only_safe_fixed_temporary(
+    private_root: Path,
+) -> None:
+    destination = private_root / "entitlement-v1.json"
+    temporary = private_root / ".entitlement-v1.json.tmp"
+    temporary.write_bytes(b"crash residue")
+
+    atomic_replace_bytes(destination, b"published", 32)
+
+    assert destination.read_bytes() == b"published"
+    assert not temporary.exists()
+
+    temporary.mkdir()
+    with pytest.raises(OSError):
+        atomic_replace_bytes(destination, b"replacement", 32)
+    assert destination.read_bytes() == b"published"
+    assert temporary.is_dir()
+
+
 def test_windows_registration_candidate_scan_is_bounded(private_root: Path) -> None:
     providers = private_root / "providers"
     providers.mkdir()

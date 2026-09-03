@@ -18,7 +18,8 @@ button or manifest field.
    `%LOCALAPPDATA%\LocalConnect` contract while preserving explicit test roots
    and all Unix behavior.
 2. Add protected private-DACL creation plus bounded regular-file, reparse-point,
-   effective-DACL, atomic replacement with bounded sharing-violation retry, and
+   effective-DACL, fixed `.<destination-filename>.tmp` atomic replacement with
+   safe stale-temp reclamation and bounded sharing-violation retry, and
    non-blocking Windows lock primitives under the existing same-user trust
    model. Validate every installed-file ancestor and the file ACL itself while
    treating OWNER RIGHTS as the already-validated concrete owner. The shared
@@ -74,9 +75,9 @@ button or manifest field.
   discovery and enumeration, replacement after a short-lived reader releases
   its handle, source-vs-installed entitlement ACL boundaries, activation,
   contention, rollback, OWNER RIGHTS admission, explicit v1/v2 runtime-root
-  discovery, reparse refusal, and the exact 256/257 direct-child boundary
-  including non-candidate temp/lock names, case-insensitive names, and non-file
-  `.json` entries.
+  discovery, reparse refusal, safe fixed-temp crash recovery, unsafe stale-temp
+  refusal, and the exact 256/257 direct-child boundary including non-candidate
+  temp/lock names, case-insensitive names, and non-file `.json` entries.
 - Desktop packaging tests prove an ordinary public keyring is accepted while
   Windows reparse metadata fails closed before that authority can be bundled;
   replacing the source after validation still stages the exact validated bytes,
@@ -98,6 +99,9 @@ button or manifest field.
   process-tree lifecycle tests, and passed its repeated packaged-engine smoke.
 - The consumer installer used for local acceptance had SHA-256
   `e0f4ad534cdefe50f5a9552b81ef982908ccc1265827b43b6bd13f346e36cf43`.
+  It was built from commit `0dfb8139296600532e8c7256aee02e08e33591eb`;
+  the subsequent fixed-temp recovery correction is covered by the native
+  Windows test rather than this earlier cross-app artifact.
 - A local Windows 11 VM installed that package and ran its installed
   `eom-mail-engine.exe`. The engine discovered authenticated provider instance
   `dab2c8a9-5375-490d-9b5f-fc6e906ad288`, observed an active
