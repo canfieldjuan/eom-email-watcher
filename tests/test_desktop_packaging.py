@@ -46,6 +46,110 @@ def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path)
         smoke_packaged_engine.smoke_packaged_engine(binary, "ambient")
 
 
+def test_packaged_smoke_rejects_unknown_expected_mail_provider(tmp_path: Path) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"not executed")
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="mail provider is unsupported",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(
+            binary,
+            "missing",
+            ("untrusted-provider",),
+        )
+
+
+@pytest.mark.parametrize("connection_available", [False, None])
+def test_packaged_smoke_rejects_unavailable_expected_mail_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    connection_available: object,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = iter(
+        [
+            {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {"data": {"items": []}},
+            {
+                "data": {
+                    "watchlist_count": 0,
+                    "mail": {
+                        "providers": [
+                            {
+                                "provider": "gmail",
+                                "connection_available": connection_available,
+                            },
+                            {
+                                "provider": "microsoft365",
+                                "connection_available": True,
+                            },
+                        ]
+                    },
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        smoke_packaged_engine,
+        "_request",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="expected gmail identity",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(
+            binary,
+            "missing",
+            ("gmail",),
+        )
+
+
+def test_packaged_smoke_accepts_all_expected_mail_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = iter(
+        [
+            {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {"data": {"items": []}},
+            {
+                "data": {
+                    "watchlist_count": 0,
+                    "mail": {
+                        "providers": [
+                            {"provider": "gmail", "connection_available": True},
+                            {
+                                "provider": "microsoft365",
+                                "connection_available": True,
+                            },
+                        ]
+                    },
+                }
+            },
+            {"data": {"state": "missing", "active": False}},
+            {"data": {"active": False}},
+        ]
+    )
+    monkeypatch.setattr(
+        smoke_packaged_engine,
+        "_request",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    smoke_packaged_engine.smoke_packaged_engine(
+        binary,
+        "missing",
+        ("gmail", "microsoft365"),
+    )
+
+
 @pytest.mark.parametrize(
     ("target_triple", "suffix"),
     [
@@ -107,6 +211,71 @@ def test_windows_sidecar_output_uses_tauri_executable_name(monkeypatch: pytest.M
     output = build_desktop_sidecar.sidecar_output_path("x86_64-pc-windows-msvc")
 
     assert output == output_directory / "eom-mail-engine-x86_64-pc-windows-msvc.exe"
+
+
+def test_sidecar_build_profile_defaults_to_development(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, raising=False)
+
+    assert build_desktop_sidecar.determine_build_profile() == "development"
+
+
+def test_sidecar_build_profile_rejects_unknown_value_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "release")
+    monkeypatch.setattr(
+        build_desktop_sidecar.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("build profile must fail before subprocess"),
+    )
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="must be development or public",
+    ):
+        build_desktop_sidecar.build_sidecar()
+
+
+def test_public_build_rejects_missing_mail_identity_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
+    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", "keyring.json")
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.setattr(
+        build_desktop_sidecar.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("public admission must fail before subprocess"),
+    )
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="at least one Google or Microsoft 365 OAuth client identity",
+    ):
+        build_desktop_sidecar.build_sidecar()
+
+
+def test_public_build_rejects_missing_keyring_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
+    monkeypatch.setenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", "google.json")
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.delenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", raising=False)
+    monkeypatch.setattr(
+        build_desktop_sidecar.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("public admission must fail before subprocess"),
+    )
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="approved production Connect entitlement key ring",
+    ):
+        build_desktop_sidecar.build_sidecar()
 
 
 def _write_oauth_client(path: Path) -> None:
@@ -253,8 +422,8 @@ def test_sidecar_build_stages_microsoft_public_client(
     assert destination == "eom_email_watcher_data"
     assert not Path(staged_source).exists()
     assert calls[1][-2:] == [
-        "--expected-entitlement-state",
-        "authority_unavailable",
+        "--expected-mail-provider",
+        "microsoft365",
     ]
 
 
@@ -288,6 +457,169 @@ def _write_entitlement_keyring(
         ),
         encoding="utf-8",
     )
+
+
+def _configure_fake_sidecar_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    profile: str = "development",
+    google: Path | None = None,
+    microsoft: Path | None = None,
+    keyring: Path | None = None,
+) -> tuple[list[list[str]], list[tuple[str, bytes]]]:
+    build_directory = tmp_path / "build"
+    output_directory = tmp_path / "output"
+    calls: list[list[str]] = []
+    staged_files: list[tuple[str, bytes]] = []
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "determine_target_triple",
+        lambda: "x86_64-unknown-linux-gnu",
+    )
+    monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, profile)
+    for environment, value in (
+        ("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", google),
+        ("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", microsoft),
+        ("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", keyring),
+    ):
+        if value is None:
+            monkeypatch.delenv(environment, raising=False)
+        else:
+            monkeypatch.setenv(environment, str(value))
+
+    def run(arguments: list[str], **kwargs):
+        calls.append(arguments)
+        if "PyInstaller" in arguments:
+            for index, argument in enumerate(arguments):
+                if argument == "--add-data":
+                    source, _destination = arguments[index + 1].rsplit(
+                        build_desktop_sidecar.os.pathsep,
+                        1,
+                    )
+                    source_path = Path(source)
+                    staged_files.append((source_path.name, source_path.read_bytes()))
+            built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
+            built.write_bytes(b"engine")
+        return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", run)
+    return calls, staged_files
+
+
+def test_development_build_remains_credential_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, staged_files = _configure_fake_sidecar_build(tmp_path, monkeypatch)
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    assert staged_files == []
+    assert calls[1][-2:] == [
+        "--expected-entitlement-state",
+        "authority_unavailable",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("include_google", "include_microsoft", "expected_providers"),
+    [
+        (True, False, ["gmail"]),
+        (False, True, ["microsoft365"]),
+        (True, True, ["gmail", "microsoft365"]),
+    ],
+)
+def test_public_build_accepts_each_supported_provider_identity_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_google: bool,
+    include_microsoft: bool,
+    expected_providers: list[str],
+) -> None:
+    google = tmp_path / "google.json"
+    microsoft = tmp_path / "microsoft.json"
+    keyring = tmp_path / "keyring.json"
+    _write_oauth_client(google)
+    _write_microsoft_oauth_client(microsoft)
+    _write_entitlement_keyring(keyring)
+    calls, staged_files = _configure_fake_sidecar_build(
+        tmp_path,
+        monkeypatch,
+        profile="public",
+        google=google if include_google else None,
+        microsoft=microsoft if include_microsoft else None,
+        keyring=keyring,
+    )
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    smoke_arguments = calls[1]
+    declared_providers = [
+        smoke_arguments[index + 1]
+        for index, argument in enumerate(smoke_arguments)
+        if argument == "--expected-mail-provider"
+    ]
+    assert declared_providers == expected_providers
+    staged_names = {name for name, _content in staged_files}
+    assert "connect-entitlement-keyring.json" in staged_names
+    assert ("google-oauth-client.json" in staged_names) is include_google
+    assert ("microsoft-oauth-client.json" in staged_names) is include_microsoft
+    assert not list((tmp_path / "build").glob("oauth-client.*"))
+    assert not list((tmp_path / "build").glob("microsoft-oauth-client.*"))
+    assert not list((tmp_path / "build").glob("connect-keyring.*"))
+
+
+def test_google_oauth_build_stages_validated_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    google = tmp_path / "google.json"
+    _write_oauth_client(google)
+    expected = google.read_bytes()
+    calls, staged_files = _configure_fake_sidecar_build(
+        tmp_path,
+        monkeypatch,
+        google=google,
+    )
+
+    build_desktop_sidecar.build_sidecar()
+
+    assert calls[1][-2:] == ["--expected-mail-provider", "gmail"]
+    assert staged_files == [("google-oauth-client.json", expected)]
+    assert not list((tmp_path / "build").glob("oauth-client.*"))
+
+
+def test_public_build_rejects_token_bearing_google_input_before_pyinstaller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    google = tmp_path / "google.json"
+    keyring = tmp_path / "keyring.json"
+    _write_oauth_client(google)
+    document = json.loads(google.read_text(encoding="utf-8"))
+    document["installed"]["refresh_token"] = "account-grant"
+    google.write_text(json.dumps(document), encoding="utf-8")
+    _write_entitlement_keyring(keyring)
+    calls, _staged_files = _configure_fake_sidecar_build(
+        tmp_path,
+        monkeypatch,
+        profile="public",
+        google=google,
+        keyring=keyring,
+    )
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="must not contain account tokens",
+    ):
+        build_desktop_sidecar.build_sidecar()
+
+    assert calls == []
 
 
 def test_entitlement_build_input_accepts_approved_public_keyring(tmp_path: Path) -> None:
@@ -455,3 +787,37 @@ def test_windows_package_has_required_icon_and_hidden_console_contract() -> None
     assert (
         "command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);" in engine_source
     )
+
+
+def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> None:
+    repository = Path(__file__).parents[1]
+    workflow = (repository / ".github/workflows/release-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "\n  workflow_dispatch:" in workflow
+    assert "\n  pull_request:" not in workflow
+    assert "\n  push:" not in workflow
+    assert '"refs/heads/main"' in workflow
+    assert "EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64" in workflow
+    assert "EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64" in workflow
+    assert workflow.count("EOM_EMAIL_WATCHER_BUILD_PROFILE: public") == 2
+    linux_build_profile = (
+        "name: Build Linux DEB\n"
+        "        env:\n"
+        "          EOM_EMAIL_WATCHER_BUILD_PROFILE: public"
+    )
+    assert linux_build_profile in workflow
+    assert (
+        "name: Build Windows NSIS installer\n"
+        "        env:\n"
+        "          EOM_EMAIL_WATCHER_BUILD_PROFILE: public" in workflow
+    )
+    assert "3005d82a7be885fba36f8688b5967a5b56a0abea" in workflow
+    assert "pnpm --dir desktop tauri build --bundles deb" in workflow
+    assert "pnpm --dir desktop tauri build --bundles nsis" in workflow
+    assert workflow.count("if-no-files-found: error") == 2
+    assert workflow.count("retention-days: 7") == 2
+    assert "actions/upload-artifact@v7" in workflow
+    assert "gh release" not in workflow
+    assert "softprops/action-gh-release" not in workflow

@@ -1,0 +1,211 @@
+name: Private release candidate
+
+run-name: Private release candidate ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: email-watcher-release-candidate
+  cancel-in-progress: false
+
+jobs:
+  admit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main and one mail-provider identity
+        env:
+          GOOGLE_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64 }}
+          MICROSOFT_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64 }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Release candidates may only be built from main." >&2
+            exit 1
+          fi
+          if [ -z "$GOOGLE_OAUTH_JSON_B64" ] && [ -z "$MICROSOFT_OAUTH_JSON_B64" ]; then
+            echo "Configure at least one approved mail-provider identity secret." >&2
+            exit 1
+          fi
+
+  linux-deb:
+    needs: admit
+    runs-on: ubuntu-latest
+    env:
+      CONNECT_CONTRACTS_DIR: ${{ github.workspace }}/connect-contracts
+      LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}/connect-contracts/entitlements/v1/release/keyring.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: canfieldjuan/connect-contracts
+          ref: 3005d82a7be885fba36f8688b5967a5b56a0abea
+          path: connect-contracts
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - run: uv sync --locked --all-groups
+      - run: pnpm --dir desktop install --frozen-lockfile
+      - name: Materialize private provider identities
+        env:
+          GOOGLE_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64 }}
+          MICROSOFT_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64 }}
+        run: |
+          set -euo pipefail
+          input_dir="$RUNNER_TEMP/email-watcher-release-inputs"
+          mkdir -p "$input_dir"
+          chmod 700 "$input_dir"
+          if [ -n "$GOOGLE_OAUTH_JSON_B64" ]; then
+            google_path="$input_dir/google-oauth-client.json"
+            printf '%s' "$GOOGLE_OAUTH_JSON_B64" | base64 --decode > "$google_path"
+            chmod 600 "$google_path"
+            echo "EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE=$google_path" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$MICROSOFT_OAUTH_JSON_B64" ]; then
+            microsoft_path="$input_dir/microsoft-oauth-client.json"
+            printf '%s' "$MICROSOFT_OAUTH_JSON_B64" | base64 --decode > "$microsoft_path"
+            chmod 600 "$microsoft_path"
+            echo "EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE=$microsoft_path" >> "$GITHUB_ENV"
+          fi
+      - run: uv run pytest tests/test_desktop_packaging.py
+      - run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets
+      - name: Build Linux DEB
+        env:
+          EOM_EMAIL_WATCHER_BUILD_PROFILE: public
+        run: pnpm --dir desktop tauri build --bundles deb
+      - name: Remove private build inputs
+        if: always()
+        run: rm -f "$RUNNER_TEMP/email-watcher-release-inputs/google-oauth-client.json" "$RUNNER_TEMP/email-watcher-release-inputs/microsoft-oauth-client.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: email-watcher-linux-deb-${{ github.sha }}
+          path: desktop/src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-nsis:
+    needs: admit
+    runs-on: windows-latest
+    env:
+      CONNECT_CONTRACTS_DIR: ${{ github.workspace }}\connect-contracts
+      LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}\connect-contracts\entitlements\v1\release\keyring.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: canfieldjuan/connect-contracts
+          ref: 3005d82a7be885fba36f8688b5967a5b56a0abea
+          path: connect-contracts
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - uses: pnpm/action-setup@v6.0.10
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - run: uv sync --locked --all-groups
+      - run: pnpm --dir desktop install --frozen-lockfile
+      - name: Materialize private provider identities
+        env:
+          GOOGLE_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64 }}
+          MICROSOFT_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64 }}
+        shell: pwsh
+        run: |
+          $inputDirectory = Join-Path $env:RUNNER_TEMP "email-watcher-release-inputs"
+          New-Item -ItemType Directory -Path $inputDirectory -Force | Out-Null
+          if ($env:GOOGLE_OAUTH_JSON_B64) {
+            $googlePath = Join-Path $inputDirectory "google-oauth-client.json"
+            [IO.File]::WriteAllBytes(
+              $googlePath,
+              [Convert]::FromBase64String($env:GOOGLE_OAUTH_JSON_B64)
+            )
+            "EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE=$googlePath" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if ($env:MICROSOFT_OAUTH_JSON_B64) {
+            $microsoftPath = Join-Path $inputDirectory "microsoft-oauth-client.json"
+            [IO.File]::WriteAllBytes(
+              $microsoftPath,
+              [Convert]::FromBase64String($env:MICROSOFT_OAUTH_JSON_B64)
+            )
+            "EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE=$microsoftPath" |
+              Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+      - run: uv run pytest tests/test_desktop_packaging.py
+      - name: Build Windows NSIS installer
+        env:
+          EOM_EMAIL_WATCHER_BUILD_PROFILE: public
+        run: pnpm --dir desktop tauri build --bundles nsis
+      - name: Verify Windows engine process-tree lifecycle
+        run: >-
+          cargo test --release --manifest-path desktop/src-tauri/Cargo.toml
+          engine::tests::windows_job_ -- --test-threads=1
+      - name: Re-run packaged engine acceptance smoke
+        shell: pwsh
+        run: |
+          $triple = (rustc --print host-tuple).Trim()
+          $arguments = @(
+            "scripts/smoke_packaged_engine.py",
+            "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe",
+            "--expected-entitlement-state",
+            "missing"
+          )
+          if ($env:EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE) {
+            $arguments += @("--expected-mail-provider", "gmail")
+          }
+          if ($env:EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE) {
+            $arguments += @("--expected-mail-provider", "microsoft365")
+          }
+          uv run --project . python @arguments
+      - name: Remove private build inputs
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Path "$env:RUNNER_TEMP\email-watcher-release-inputs" -Recurse -Force -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v7
+        with:
+          name: email-watcher-windows-nsis-${{ github.sha }}
+          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7

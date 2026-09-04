@@ -13,6 +13,7 @@ from pathlib import Path
 PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
 EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
+EXPECTED_MAIL_PROVIDERS = ("gmail", "microsoft365")
 
 
 class PackagedEngineSmokeError(RuntimeError):
@@ -70,11 +71,18 @@ def _request(
     return response
 
 
-def smoke_packaged_engine(binary: Path, expected_entitlement_state: str) -> None:
+def smoke_packaged_engine(
+    binary: Path,
+    expected_entitlement_state: str,
+    expected_mail_providers: tuple[str, ...] = (),
+) -> None:
     if not binary.is_file():
         raise PackagedEngineSmokeError("Packaged engine is not a regular file")
     if expected_entitlement_state not in EXPECTED_ENTITLEMENT_STATES:
         raise PackagedEngineSmokeError("Expected Connect authority state is unsupported")
+    unsupported_providers = set(expected_mail_providers) - set(EXPECTED_MAIL_PROVIDERS)
+    if unsupported_providers:
+        raise PackagedEngineSmokeError("Expected mail provider is unsupported")
     with tempfile.TemporaryDirectory(prefix="eom-mail-engine-smoke-") as temporary_value:
         temporary = Path(temporary_value)
         isolated_binary = temporary / binary.name
@@ -132,12 +140,24 @@ def smoke_packaged_engine(binary: Path, expected_entitlement_state: str) -> None
             raise PackagedEngineSmokeError("Packaged engine health did not report zero senders")
         mail = health["data"].get("mail")
         providers = mail.get("providers") if isinstance(mail, dict) else None
-        if not isinstance(providers, list) or "microsoft365" not in {
-            item.get("provider") for item in providers if isinstance(item, dict)
-        }:
+        if not isinstance(providers, list):
+            raise PackagedEngineSmokeError(
+                "Packaged engine did not advertise mail providers"
+            )
+        provider_states = {
+            item.get("provider"): item.get("connection_available")
+            for item in providers
+            if isinstance(item, dict)
+        }
+        if "microsoft365" not in provider_states:
             raise PackagedEngineSmokeError(
                 "Packaged engine did not advertise the Microsoft 365 provider"
             )
+        for provider in expected_mail_providers:
+            if provider_states.get(provider) is not True:
+                raise PackagedEngineSmokeError(
+                    f"Packaged engine did not embed the expected {provider} identity"
+                )
 
         entitlement = _request(
             isolated_binary,
@@ -180,11 +200,19 @@ def main() -> None:
         choices=EXPECTED_ENTITLEMENT_STATES,
         help="Authority state embedded in the already-built engine binary.",
     )
+    parser.add_argument(
+        "--expected-mail-provider",
+        action="append",
+        choices=EXPECTED_MAIL_PROVIDERS,
+        default=[],
+        help="Mail provider identity expected in the already-built engine binary.",
+    )
     args = parser.parse_args()
     try:
         smoke_packaged_engine(
             args.engine_binary.resolve(),
             args.expected_entitlement_state,
+            tuple(args.expected_mail_provider),
         )
     except PackagedEngineSmokeError as exc:
         print(str(exc), file=sys.stderr)

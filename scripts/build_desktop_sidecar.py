@@ -18,6 +18,8 @@ BUILD_DIRECTORY = PROJECT_DIRECTORY / ".sidecar-build"
 OUTPUT_DIRECTORY = PROJECT_DIRECTORY / "desktop" / "src-tauri" / "binaries"
 ENGINE_NAME = "eom-mail-engine"
 TARGET_TRIPLE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+BUILD_PROFILE_ENVIRONMENT = "EOM_EMAIL_WATCHER_BUILD_PROFILE"
+BUILD_PROFILES = frozenset({"development", "public"})
 OAUTH_REQUIRED_FIELDS = ("auth_uri", "client_id", "client_secret", "token_uri")
 OAUTH_TOKEN_FIELDS = frozenset({"access_token", "refresh_token"})
 NON_PRODUCTION_KEY_TOKENS = frozenset({"dev", "example", "fixture", "test"})
@@ -35,6 +37,33 @@ APPROVED_RELEASE_AUTHORITIES = frozenset(
 
 class SidecarBuildError(RuntimeError):
     pass
+
+
+def determine_build_profile() -> str:
+    profile = os.environ.get(BUILD_PROFILE_ENVIRONMENT, "development")
+    if profile not in BUILD_PROFILES:
+        raise SidecarBuildError(
+            f"{BUILD_PROFILE_ENVIRONMENT} must be development or public"
+        )
+    return profile
+
+
+def validate_build_profile_inputs(
+    profile: str,
+    google_oauth_source: str | None,
+    microsoft_oauth_source: str | None,
+    entitlement_keyring_source: str | None,
+) -> None:
+    if profile != "public":
+        return
+    if not google_oauth_source and not microsoft_oauth_source:
+        raise SidecarBuildError(
+            "Public builds require at least one Google or Microsoft 365 OAuth client identity"
+        )
+    if not entitlement_keyring_source:
+        raise SidecarBuildError(
+            "Public builds require the approved production Connect entitlement key ring"
+        )
 
 
 def _target_family(target_triple: str) -> str:
@@ -203,6 +232,19 @@ def _publish_sidecar(source: Path, destination: Path) -> None:
 
 
 def build_sidecar() -> Path:
+    profile = determine_build_profile()
+    oauth_source_value = os.environ.get("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE")
+    microsoft_source_value = os.environ.get(
+        "EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE"
+    )
+    keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
+    validate_build_profile_inputs(
+        profile,
+        oauth_source_value,
+        microsoft_source_value,
+        keyring_source_value,
+    )
+
     target_triple = determine_target_triple()
     suffix = executable_suffix(target_triple)
     output_path = sidecar_output_path(target_triple)
@@ -236,10 +278,13 @@ def build_sidecar() -> Path:
     ]
 
     with ExitStack() as stack:
-        oauth_source_value = os.environ.get("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE")
+        expected_mail_providers: list[str] = []
         if oauth_source_value:
             oauth_source = Path(oauth_source_value)
-            validate_oauth_client(oauth_source)
+            if not oauth_source.is_file():
+                raise SidecarBuildError(
+                    "Google OAuth Desktop client file is not a regular file"
+                )
             staged_oauth = stack.enter_context(
                 _staged_build_input(
                     oauth_source,
@@ -247,14 +292,18 @@ def build_sidecar() -> Path:
                     "oauth-client.",
                 )
             )
+            validate_oauth_client(staged_oauth)
             pyinstaller_arguments.extend(
                 ["--add-data", f"{staged_oauth}{os.pathsep}eom_email_watcher_data"]
             )
+            expected_mail_providers.append("gmail")
 
-        microsoft_source_value = os.environ.get("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE")
         if microsoft_source_value:
             microsoft_source = Path(microsoft_source_value)
-            validate_microsoft_oauth_client(microsoft_source)
+            if not microsoft_source.is_file():
+                raise SidecarBuildError(
+                    "Microsoft OAuth public-client file is not a regular file"
+                )
             staged_microsoft = stack.enter_context(
                 _staged_build_input(
                     microsoft_source,
@@ -262,11 +311,12 @@ def build_sidecar() -> Path:
                     "microsoft-oauth-client.",
                 )
             )
+            validate_microsoft_oauth_client(staged_microsoft)
             pyinstaller_arguments.extend(
                 ["--add-data", f"{staged_microsoft}{os.pathsep}eom_email_watcher_data"]
             )
+            expected_mail_providers.append("microsoft365")
 
-        keyring_source_value = os.environ.get("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE")
         if keyring_source_value:
             validate_entitlement_keyring_target(target_triple)
             keyring_source = Path(keyring_source_value)
@@ -294,14 +344,17 @@ def build_sidecar() -> Path:
 
     built_path = BUILD_DIRECTORY / "dist" / f"{ENGINE_NAME}{suffix}"
     _publish_sidecar(built_path, output_path)
+    smoke_arguments = [
+        sys.executable,
+        str(SCRIPT_DIRECTORY / "smoke_packaged_engine.py"),
+        str(output_path),
+        "--expected-entitlement-state",
+        "missing" if keyring_source_value else "authority_unavailable",
+    ]
+    for provider in expected_mail_providers:
+        smoke_arguments.extend(["--expected-mail-provider", provider])
     subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT_DIRECTORY / "smoke_packaged_engine.py"),
-            str(output_path),
-            "--expected-entitlement-state",
-            "missing" if keyring_source_value else "authority_unavailable",
-        ],
+        smoke_arguments,
         check=True,
         cwd=PROJECT_DIRECTORY,
     )
