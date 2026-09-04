@@ -1929,6 +1929,18 @@ esac"#,
         )
     }
 
+    fn toml_path_literal(path: &Path) -> String {
+        serde_json::to_string(&path.to_string_lossy()).expect("serialize test config path")
+    }
+
+    #[test]
+    fn toml_path_literal_escapes_windows_separators() {
+        assert_eq!(
+            toml_path_literal(Path::new(r"C:\Users\Watcher\state.sqlite3")),
+            r#""C:\\Users\\Watcher\\state.sqlite3""#
+        );
+    }
+
     #[test]
     fn real_engine_initializes_missing_config_once() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1983,17 +1995,17 @@ esac"#,
         fs::write(
             &config_path,
             format!(
-                r#"database_file = "{}"
-gmail_credentials_file = "{}"
-gmail_token_file = "{}"
+                r#"database_file = {}
+gmail_credentials_file = {}
+gmail_token_file = {}
 model_base_url = "http://127.0.0.1:9/v1"
 model_name = "local-model"
 model_require_auth = false
 notifications_enabled = true
 "#,
-                database_path.display(),
-                gmail_credentials_path.display(),
-                gmail_token_path.display()
+                toml_path_literal(&database_path),
+                toml_path_literal(&gmail_credentials_path),
+                toml_path_literal(&gmail_token_path)
             ),
         )
         .expect("write config");
