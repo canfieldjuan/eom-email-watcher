@@ -801,7 +801,14 @@ def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> No
     assert '"refs/heads/main"' in workflow
     assert "EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64" in workflow
     assert "EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64" in workflow
-    assert workflow.count("EOM_EMAIL_WATCHER_BUILD_PROFILE: public") == 2
+    assert workflow.count("EOM_EMAIL_WATCHER_BUILD_PROFILE: public") == 3
+    linux_cargo_sidecar_profile = (
+        "name: Build Linux sidecar for Cargo checks\n"
+        "        env:\n"
+        "          EOM_EMAIL_WATCHER_BUILD_PROFILE: public\n"
+        "        run: pnpm --dir desktop build:sidecar"
+    )
+    assert linux_cargo_sidecar_profile in workflow
     linux_build_profile = (
         "name: Build Linux DEB\n"
         "        env:\n"
@@ -821,3 +828,19 @@ def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> No
     assert "actions/upload-artifact@v7" in workflow
     assert "gh release" not in workflow
     assert "softprops/action-gh-release" not in workflow
+
+    packaging_test = workflow.index("- run: uv run pytest tests/test_desktop_packaging.py")
+    sidecar_build = workflow.index(linux_cargo_sidecar_profile)
+    cargo_format = workflow.index(
+        "cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check"
+    )
+    cargo_clippy = workflow.index(
+        "cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets"
+    )
+    cargo_test = workflow.index(
+        "cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets"
+    )
+    linux_deb = workflow.index(linux_build_profile)
+
+    assert packaging_test < sidecar_build
+    assert sidecar_build < cargo_format < cargo_clippy < cargo_test < linux_deb

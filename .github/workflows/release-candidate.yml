@@ -99,6 +99,10 @@ jobs:
             echo "EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE=$microsoft_path" >> "$GITHUB_ENV"
           fi
       - run: uv run pytest tests/test_desktop_packaging.py
+      - name: Build Linux sidecar for Cargo checks
+        env:
+          EOM_EMAIL_WATCHER_BUILD_PROFILE: public
+        run: pnpm --dir desktop build:sidecar
       - run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets
