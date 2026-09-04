@@ -7,7 +7,8 @@ synthetic corpus, LM Studio measurements, Ollama compatibility probe, and attach
 boundary are complete. A final recommendation remains blocked by:
 
 - blinded human scoring of the generated summary packet;
-- attributable peak-resident-memory evidence for the LM Studio candidates.
+- attributable peak-resident-memory evidence for the LM Studio candidates; and
+- rerunning advancing email candidates with the current obligation-grounding system prompt.
 
 No runtime, model, or quantization default should be changed from this partial result.
 
@@ -16,8 +17,14 @@ No runtime, model, or quantization default should be changed from this partial r
 - Corpus: 18 synthetic email cases plus 11 deterministic validator cases.
 - Repetitions: 3 per email case, for 54 requests per candidate.
 - Transport: the production OpenAI-compatible `/chat/completions` path.
-- Inference: production prompt, strict JSON schema, validator, temperature `0.1`, maximum 500
-  output tokens, 8,192-token context, and one parallel prediction.
+- Inference: the system prompt active when each result was recorded, strict JSON schema, validator,
+  temperature `0.1`, maximum 500 output tokens, 8,192-token context, and one parallel prediction.
+- Prompt provenance: the email artifacts added by this PR used SHA-256
+  `f00267fe71f3d75ab66893bb40a9d66521ce42fe2b23b53463c1d70d6f705627`. Current `main` uses
+  `8dc792e0ebc8e286c1ebc9fb4dcd31df1ca68ee5b26f2c2e65fe617a93c3f834` after adding
+  obligation-direction and grounding instructions. The recorded scores are historical-prompt
+  evidence, not current-production-prompt results; current candidates require a rerun before final
+  selection.
 - Device: CPU LM Studio candidates use `lms load --gpu off`; LM Studio GPU comparisons use
   `lms load --gpu max`. The Ollama compatibility probe hid GPUs with both visibility variables set
   to `-1`, while the published Ollama email and document runs used the explicitly recorded

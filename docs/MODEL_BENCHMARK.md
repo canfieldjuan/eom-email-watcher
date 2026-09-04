@@ -440,6 +440,7 @@ comparison report.
 The public artifact records:
 
 - strict schema/validator success;
+- SHA-256 provenance for the exact system prompt used by the run;
 - category and priority accuracy, including urgent/high false negatives;
 - action-required precision, recall, and false negatives;
 - suggested-action structural validity;
@@ -474,7 +475,8 @@ text_attachment_summary
 vision_attachment_summary
 ```
 
-`structured_email_analysis` is required for every benchmark candidate and for the current watcher.
+`structured_email_analysis` is required for every email-analysis candidate and for the current
+watcher.
 `text_document_summary` means the model was exercised against bounded extracted document text. It
 does not prove the separate normalized attachment handoff represented by `text_attachment_summary`.
 The optional capabilities are not inferred merely because a model is marketed as multimodal.

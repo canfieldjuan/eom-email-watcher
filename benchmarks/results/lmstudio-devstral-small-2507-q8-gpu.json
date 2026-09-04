@@ -348,6 +348,7 @@
     "runtime_cold_start": 21.36
   },
   "peak_resident_memory_mib": null,
+  "prompt_sha256": "f00267fe71f3d75ab66893bb40a9d66521ce42fe2b23b53463c1d70d6f705627",
   "repetitions": 3,
   "schema_version": 1,
   "transport": "openai-compatible-chat-completions",

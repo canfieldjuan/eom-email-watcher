@@ -134,6 +134,7 @@
     "median": 6617.0,
     "minimum": 863
   },
+  "prompt_sha256": "683736e690b892842979b7d82948669a597697edf91b03c45bac3f4f1bf61ba4",
   "repetitions": 3,
   "schema_version": 1,
   "tiers": {

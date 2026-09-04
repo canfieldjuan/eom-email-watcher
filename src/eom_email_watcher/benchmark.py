@@ -36,6 +36,8 @@ from .gmail import GmailError, GmailGateway, MessageUnavailable
 from .mailbox import DEFAULT_MAIL_PROVIDER, MailboxAccountUnavailable
 from .mime import extract_body
 from .model import (
+    DOCUMENT_SUMMARY_PROMPT,
+    SYSTEM_PROMPT,
     Analysis,
     DocumentSummaryInference,
     LocalModel,
@@ -682,6 +684,7 @@ def run_benchmark(
             "email_cases": len(corpus.email_cases),
         },
         "candidate": candidate.model_dump(mode="json"),
+        "prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
         "transport": "openai-compatible-chat-completions",
         "inference_settings": {
             "temperature": 0.1,
@@ -735,6 +738,7 @@ def run_benchmark(
         "schema_version": 1,
         "local_only": True,
         "candidate": candidate.model_dump(mode="json"),
+        "prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
         "corpus": corpus.model_dump(mode="json"),
         "runs": private_runs,
     }
@@ -827,6 +831,13 @@ def run_document_benchmark(
                 errors[error_type] += 1
                 error_code = _safe_error_code(exc)
                 error_codes[error_code] += 1
+                if case.expected.forbidden_output_substrings:
+                    case_forbidden_checks += 1
+                    case_forbidden_failures += 1
+                    forbidden_checks += 1
+                    forbidden_failures += 1
+                    tier_totals[case.tier]["forbidden_output_checks"] += 1
+                    tier_totals[case.tier]["forbidden_output_failures"] += 1
                 private_runs.append(
                     {
                         "case_id": case.id,
@@ -938,6 +949,7 @@ def run_document_benchmark(
             "document_cases": len(corpus.document_cases),
         },
         "candidate": candidate.model_dump(mode="json"),
+        "prompt_sha256": hashlib.sha256(DOCUMENT_SUMMARY_PROMPT.encode("utf-8")).hexdigest(),
         "transport": "openai-compatible-chat-completions",
         "inference_settings": {
             "temperature": 0.1,
@@ -955,6 +967,7 @@ def run_document_benchmark(
         "schema_version": 1,
         "local_only": True,
         "candidate": candidate.model_dump(mode="json"),
+        "prompt_sha256": hashlib.sha256(DOCUMENT_SUMMARY_PROMPT.encode("utf-8")).hexdigest(),
         "corpus": corpus.model_dump(mode="json"),
         "runs": private_runs,
     }

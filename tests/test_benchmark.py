@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from argparse import Namespace
 from datetime import UTC, datetime
@@ -35,6 +36,8 @@ from eom_email_watcher.benchmark import (
 from eom_email_watcher.config import ConfigError, validate_model_base_url
 from eom_email_watcher.gmail import GmailError, MessageMetadata
 from eom_email_watcher.model import (
+    DOCUMENT_SUMMARY_PROMPT,
+    SYSTEM_PROMPT,
     Analysis,
     DocumentSummary,
     DocumentSummaryInference,
@@ -188,6 +191,9 @@ def test_public_result_omits_email_and_free_form_model_text() -> None:
         "median": 0.5,
         "p95": 0.6,
     }
+    expected_prompt_hash = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    assert public["prompt_sha256"] == expected_prompt_hash
+    assert private["prompt_sha256"] == expected_prompt_hash
 
     encoded_private = json.dumps(private)
     assert "INJECTION_SOURCE_ONLY" in encoded_private
@@ -230,6 +236,9 @@ def test_document_benchmark_scores_facts_and_keeps_text_private() -> None:
         "summary_human_review": "pending",
     }
     assert public["prompt_tokens"] == {"minimum": 321, "median": 321.0, "maximum": 321}
+    expected_prompt_hash = hashlib.sha256(DOCUMENT_SUMMARY_PROMPT.encode("utf-8")).hexdigest()
+    assert public["prompt_sha256"] == expected_prompt_hash
+    assert private["prompt_sha256"] == expected_prompt_hash
     assert public["tiers"]["short"]["schema_valid_rate"] == 1.0
     assert public["tiers"]["long"]["schema_valid_rate"] == 1.0
     assert "Routine background notes" in json.dumps(private)
@@ -259,6 +268,28 @@ def test_document_benchmark_omits_unevaluated_forbidden_output_metric() -> None:
     assert "forbidden_output_failures" not in public["aggregate"]
     assert all("forbidden_output_failures" not in case for case in public["cases"])
     assert all("forbidden_output_failures" not in tier for tier in public["tiers"].values())
+
+
+def test_document_schema_failure_counts_as_a_failed_forbidden_output_check() -> None:
+    candidate_data = _candidate().model_dump(mode="json")
+    candidate_data["capabilities"] = ["text_document_summary"]
+    candidate = BenchmarkCandidate.model_validate(candidate_data)
+
+    def fail(_case: BenchmarkDocumentCase, _document: str) -> DocumentSummaryInference:
+        raise ModelError("invalid document response")
+
+    public, _private = run_document_benchmark(
+        _document_corpus(),
+        candidate,
+        repetitions=1,
+        summarize=fail,
+        timer=iter([0.0, 0.1, 0.2, 0.3]).__next__,
+    )
+
+    assert public["aggregate"]["forbidden_output_checks"] == 2
+    assert public["aggregate"]["forbidden_output_failures"] == 2
+    assert all(case["forbidden_output_failures"] == 1 for case in public["cases"])
+    assert all(tier["forbidden_output_failures"] == 1 for tier in public["tiers"].values())
 
 
 def test_document_expansion_hits_exact_word_target_and_validates_gold_terms() -> None:
@@ -1298,6 +1329,8 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     ]
 
     assert len(results) == 18
+    historical_prompt_hash = "f00267fe71f3d75ab66893bb40a9d66521ce42fe2b23b53463c1d70d6f705627"
+    provenanced_results = 0
     for path, result in results:
         encoded = path.read_text(encoding="utf-8")
         assert result["aggregate"]["runs"] == len(corpus.email_cases) * 3
@@ -1309,6 +1342,10 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
         assert all(case.body not in encoded for case in corpus.email_cases if case.body)
         assert all(case.subject not in encoded for case in corpus.email_cases)
         assert all(case.sender not in encoded for case in corpus.email_cases)
+        if "prompt_sha256" in result:
+            provenanced_results += 1
+            assert result["prompt_sha256"] == historical_prompt_hash
+    assert provenanced_results == 13
 
 
 def test_committed_document_result_matches_corpus_and_omits_free_text() -> None:
@@ -1324,6 +1361,10 @@ def test_committed_document_result_matches_corpus_and_omits_free_text() -> None:
 
     assert result["aggregate"]["runs"] == len(corpus.document_cases) * 3
     assert result["aggregate"]["schema_valid_rate"] == 1.0
+    assert (
+        result["prompt_sha256"]
+        == hashlib.sha256(DOCUMENT_SUMMARY_PROMPT.encode("utf-8")).hexdigest()
+    )
     assert "forbidden_output_failures" not in result["aggregate"]
     assert result["candidate"]["cold_start_seconds"] is None
     assert "text_document_summary" in result["candidate"]["capabilities"]
