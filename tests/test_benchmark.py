@@ -4,6 +4,7 @@ import json
 from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -279,6 +280,12 @@ def test_document_expansion_hits_exact_word_target_and_validates_gold_terms() ->
     with pytest.raises(ValueError):
         DocumentBenchmarkCorpus.model_validate(data)
 
+    data = corpus.model_dump(mode="json")
+    data["document_cases"][0]["target_words"] = 20_000
+    data["document_cases"][0]["filler_text"] = "x" * 101
+    with pytest.raises(ValueError, match="character limit"):
+        DocumentBenchmarkCorpus.model_validate(data)
+
 
 def test_document_benchmark_requires_claimed_text_summary_capability() -> None:
     with pytest.raises(ValueError, match="text_document_summary"):
@@ -312,8 +319,30 @@ def test_scoring_exposes_high_false_negative_and_prompt_injection() -> None:
     case = public["cases"][0]
     assert case["high_or_urgent_false_negatives"] == 1
     assert case["prompt_injection_failures"] == 1
-    assert case["grounding_failures"] == 0
+    assert "grounding_failures" not in case
     assert case["deadline_exact"] == 0
+
+
+def test_email_benchmark_omits_safety_metrics_when_no_markers_are_evaluated() -> None:
+    data = _corpus().model_dump(mode="json")
+    for case in data["email_cases"]:
+        case["expected"]["forbidden_output_substrings"] = []
+    corpus = BenchmarkCorpus.model_validate(data)
+
+    public, _private = run_benchmark(
+        corpus,
+        _candidate(),
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+
+    assert "prompt_injection_failures" not in public["aggregate"]
+    assert "prompt_injection_failure_rate" not in public["aggregate"]
+    assert "grounding_failures" not in public["aggregate"]
+    assert "grounding_failure_rate" not in public["aggregate"]
+    assert all("prompt_injection_failures" not in case for case in public["cases"])
+    assert all("grounding_failures" not in case for case in public["cases"])
 
 
 def test_obligation_corpus_catches_receivable_as_payable_reversal() -> None:
@@ -389,9 +418,9 @@ def test_obligation_grounding_has_separate_public_metric() -> None:
         timer=iter([0.0, 0.1]).__next__,
     )
 
-    assert public["cases"][0]["prompt_injection_failures"] == 0
+    assert "prompt_injection_failures" not in public["cases"][0]
     assert public["cases"][0]["grounding_failures"] == 1
-    assert public["aggregate"]["prompt_injection_failure_rate"] == 0.0
+    assert "prompt_injection_failure_rate" not in public["aggregate"]
     assert public["aggregate"]["grounding_failure_rate"] == 1.0
 
 
@@ -513,8 +542,8 @@ def test_blind_review_hides_candidate_identity_and_keeps_source_local() -> None:
     assert "challenger-model" not in json.dumps(packet)
     assert "INJECTION_SOURCE_ONLY" in json.dumps(packet)
     assert set(key["aliases"].values()) == {
-        "lmstudio:baseline-model:Q4_K_M:cpu:lms-load-gpu-off",
-        "lmstudio:challenger-model:Q4_K_M:cpu:lms-load-gpu-off",
+        "lmstudio:baseline-model:Q4_K_M:context-8192:cpu:lms-load-gpu-off",
+        "lmstudio:challenger-model:Q4_K_M:context-8192:cpu:lms-load-gpu-off",
     }
     assert len(packet["items"]) == 1
     assert [item["alias"] for item in packet["items"][0]["summaries"]] == sorted(
@@ -673,6 +702,111 @@ def test_private_inbox_draft_revalidates_exact_sender_and_inbox_before_body(
             limit=1,
             body_char_limit=20_000,
             current_local_time=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+        )
+
+
+def test_prepare_inbox_uses_the_active_gmail_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = SimpleNamespace(provider="gmail", account_id="gmail-secondary")
+    config = SimpleNamespace(
+        allowlist=frozenset({"customer@example.com"}),
+        body_char_limit=20_000,
+        database_file=tmp_path / "watcher.db",
+        gmail_credentials_file=tmp_path / "credentials.json",
+        zone=UTC,
+    )
+
+    class FakeStore:
+        def __init__(self, path: Path):
+            assert path == config.database_file
+
+        def initialize(self) -> None:
+            pass
+
+        def active_mail_account(self) -> object:
+            return account
+
+    selected: list[tuple[str, str]] = []
+    gateway = object()
+
+    def load_selected(_config: object, _store: object, provider: str, account_id: str) -> object:
+        selected.append((provider, account_id))
+        return SimpleNamespace(gateway=gateway)
+
+    monkeypatch.setattr(benchmark_module, "PRIVATE_OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(benchmark_module, "load_config", lambda _path: config)
+    monkeypatch.setattr(benchmark_module, "secure_runtime_paths", lambda _config: None)
+    monkeypatch.setattr(benchmark_module, "Store", FakeStore)
+    monkeypatch.setattr(benchmark_module, "load_mailbox_account", load_selected)
+    monkeypatch.setattr(benchmark_module, "LocalModel", lambda *args: object())
+    monkeypatch.setattr(benchmark_module, "load_corpus", lambda _path: _corpus())
+    monkeypatch.setattr(
+        benchmark_module,
+        "build_private_inbox_draft",
+        lambda selected_gateway, *args, **kwargs: {
+            "local_only": True,
+            "corpus": {"email_cases": []},
+            "selected_gateway": selected_gateway is gateway,
+        },
+    )
+    output = tmp_path / "draft.local.json"
+
+    code = benchmark_module._prepare_inbox_command(
+        Namespace(
+            config=tmp_path / "config.toml",
+            base_corpus=tmp_path / "base.json",
+            output=output,
+            base_url="http://127.0.0.1:11434/v1",
+            model="local-model",
+            timeout=30,
+            api_token_file=None,
+            require_auth=False,
+            limit=10,
+        )
+    )
+
+    assert code == 0
+    assert selected == [("gmail", "gmail-secondary")]
+    assert json.loads(output.read_text(encoding="utf-8"))["selected_gateway"] is True
+
+
+def test_prepare_inbox_rejects_an_active_non_gmail_account_before_loading_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = SimpleNamespace(provider="microsoft365", account_id="microsoft365-secondary")
+    config = SimpleNamespace(
+        allowlist=frozenset({"customer@example.com"}),
+        database_file=tmp_path / "watcher.db",
+    )
+
+    class FakeStore:
+        def __init__(self, _path: Path):
+            pass
+
+        def initialize(self) -> None:
+            pass
+
+        def active_mail_account(self) -> object:
+            return account
+
+    monkeypatch.setattr(benchmark_module, "PRIVATE_OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(benchmark_module, "load_config", lambda _path: config)
+    monkeypatch.setattr(benchmark_module, "secure_runtime_paths", lambda _config: None)
+    monkeypatch.setattr(benchmark_module, "Store", FakeStore)
+    monkeypatch.setattr(
+        benchmark_module,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("unsupported provider must not be loaded"),
+    )
+
+    with pytest.raises(ValueError, match="active Gmail account only"):
+        benchmark_module._prepare_inbox_command(
+            Namespace(
+                config=tmp_path / "config.toml",
+                base_corpus=tmp_path / "base.json",
+                output=tmp_path / "draft.local.json",
+            )
         )
 
 
@@ -889,8 +1023,34 @@ def test_blind_review_distinguishes_cpu_and_gpu_execution_profiles() -> None:
     _packet, key = build_blind_review([private_cpu, private_gpu], seed="test-seed")
 
     assert set(key["aliases"].values()) == {
-        "lmstudio:same-model:Q4_K_M:cpu:lms-load-gpu-off",
-        "lmstudio:same-model:Q4_K_M:gpu:lms-load-gpu-max",
+        "lmstudio:same-model:Q4_K_M:context-8192:cpu:lms-load-gpu-off",
+        "lmstudio:same-model:Q4_K_M:context-8192:gpu:lms-load-gpu-max",
+    }
+
+
+def test_blind_review_distinguishes_context_length_profiles() -> None:
+    baseline = _candidate("same-model")
+    larger_context = baseline.model_copy(update={"context_length": 32_768})
+    _public_baseline, private_baseline = run_benchmark(
+        _corpus(),
+        baseline,
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+    _public_larger, private_larger = run_benchmark(
+        _corpus(),
+        larger_context,
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+
+    _packet, key = build_blind_review([private_baseline, private_larger], seed="test-seed")
+
+    assert set(key["aliases"].values()) == {
+        "lmstudio:same-model:Q4_K_M:context-8192:cpu:lms-load-gpu-off",
+        "lmstudio:same-model:Q4_K_M:context-32768:cpu:lms-load-gpu-off",
     }
 
 
@@ -1022,6 +1182,37 @@ def test_candidate_from_args_records_runtime_specific_full_gpu_execution(
     assert candidate.gpu_offload_method == gpu_offload_method
 
 
+def test_candidate_from_args_scopes_document_runs_to_document_capability() -> None:
+    candidate = _candidate_from_args(
+        Namespace(
+            runtime="ollama",
+            execution_device="gpu",
+            model="document-model",
+            quantization="Q4_K_S",
+            context_length=32_768,
+            cold_start_seconds=None,
+            capability=[],
+        ),
+        primary_capability="text_document_summary",
+    )
+
+    assert candidate.capabilities == ["text_document_summary"]
+
+
+def test_email_benchmark_requires_structured_email_capability() -> None:
+    data = _candidate().model_dump(mode="json")
+    data["capabilities"] = ["text_document_summary"]
+    document_only = BenchmarkCandidate.model_validate(data)
+
+    with pytest.raises(ValueError, match="structured_email_analysis"):
+        run_benchmark(
+            _corpus(),
+            document_only,
+            repetitions=1,
+            analyze=lambda case: _analysis(),
+        )
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -1052,7 +1243,6 @@ def test_candidate_from_args_records_runtime_specific_full_gpu_execution(
         {"cpu_only_method": "ollama-gpus-hidden"},
         {"runtime": "llama_cpp", "cpu_only_method": "lms-load-gpu-off"},
         {"runtime": "ollama", "cpu_only_method": "prism-llama-cpp-cpu-only"},
-        {"capabilities": ["vision_attachment_summary"]},
         {
             "capabilities": [
                 "structured_email_analysis",
@@ -1113,6 +1303,9 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
         assert result["aggregate"]["runs"] == len(corpus.email_cases) * 3
         assert result["validation_boundary"]["failed"] == 0
         assert len(result["cases"]) == len(corpus.email_cases)
+        assert "grounding_failures" not in result["aggregate"]
+        assert "grounding_failure_rate" not in result["aggregate"]
+        assert all("grounding_failures" not in case for case in result["cases"])
         assert all(case.body not in encoded for case in corpus.email_cases if case.body)
         assert all(case.subject not in encoded for case in corpus.email_cases)
         assert all(case.sender not in encoded for case in corpus.email_cases)
@@ -1134,6 +1327,7 @@ def test_committed_document_result_matches_corpus_and_omits_free_text() -> None:
     assert "forbidden_output_failures" not in result["aggregate"]
     assert result["candidate"]["cold_start_seconds"] is None
     assert "text_document_summary" in result["candidate"]["capabilities"]
+    assert "structured_email_analysis" not in result["candidate"]["capabilities"]
     assert "text_attachment_summary" not in result["candidate"]["capabilities"]
     assert len(result["cases"]) == len(corpus.document_cases)
     for case in corpus.document_cases:

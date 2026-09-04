@@ -1,8 +1,10 @@
 # Local model benchmark
 
-This benchmark measures the production email-analysis prompt and schema against a finite,
-synthetic corpus. It never contacts Gmail, downloads attachments, or sends benchmark content to a
-non-loopback endpoint. It is an operator/developer tool, not part of normal watcher execution.
+The synthetic benchmark path measures the production email-analysis prompt and schema against a
+finite corpus. Synthetic `run` commands never contact Gmail, download attachments, or send
+benchmark content to a non-loopback endpoint. The explicitly separate `prepare-inbox` workflow
+does read selected messages from the active Gmail account to create an owner-private corpus. This is
+an operator/developer tool, not part of normal watcher execution.
 
 The current observed comparison and its unresolved acceptance items are recorded in
 [`MODEL_BENCHMARK_RESULTS.md`](MODEL_BENCHMARK_RESULTS.md).
@@ -44,9 +46,10 @@ review artifacts belong in Git, CI output, issue comments, or PR comments.
 
 The committed synthetic corpus remains the stable regression control. For task-fidelity testing,
 create a second corpus from recent Inbox messages sent by the addresses in the configured watcher
-allowlist. This command uses the existing Gmail read-only token, fetches body text and attachment
-filenames through the production MIME path, and asks an explicitly selected loopback model for
-draft labels. It does not download attachment bytes or print source content.
+allowlist. This command resolves the currently active account through the normal mailbox registry,
+requires that account to be Gmail, and uses its account-specific read-only token. It fetches body
+text and attachment filenames through the production MIME path and asks an explicitly selected
+loopback model for draft labels. It does not download attachment bytes or print source content.
 
 ```bash
 uv run eom-model-benchmark prepare-inbox \
@@ -89,11 +92,19 @@ Start the local Ollama process with a context large enough for the suite and clo
 The command below assumes the selected model is already installed; it does not download a model.
 
 ```bash
+CUDA_VISIBLE_DEVICES=GPU-YOUR-STABLE-UUID \
 OLLAMA_HOST=127.0.0.1:11434 \
 OLLAMA_NO_CLOUD=1 \
 OLLAMA_CONTEXT_LENGTH=32768 \
+OLLAMA_MAX_LOADED_MODELS=1 \
+OLLAMA_NUM_PARALLEL=1 \
 OLLAMA_MODELS=<local-model-store> \
 ollama serve
+
+# In a second terminal, verify the model is local and fully placed on the selected GPU.
+ollama list
+ollama run qwen3-30b-a3b:latest ""
+ollama ps
 
 uv run eom-model-benchmark run-documents \
   --corpus benchmarks/document-summary-v1.json \
@@ -108,6 +119,9 @@ uv run eom-model-benchmark run-documents \
   --private-review-output \
     benchmarks/local/ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.local.json
 ```
+
+Do not publish the run as `ollama-cuda-visible-devices` unless `ollama ps` reports the selected
+model fully on GPU. The stable UUID, not a mutable device index, is the selection mechanism.
 
 The public result records schema validity, exact-term fact recall, word-limit compliance, latency,
 and the API-reported prompt-token counts without source or output text. Cold-start time remains
@@ -441,6 +455,8 @@ untrusted source fields is a prompt-injection canary; a marker absent from those
 unsupported-output grounding marker. The public artifact reports those failure classes separately.
 The grounding-failure aggregate uses all benchmark runs as its denominator so candidate rates stay
 comparable even when individual corpora carry different numbers of grounding markers.
+If a corpus contains no markers for one of those roles, the corresponding case and aggregate metric
+is omitted. Absence means unevaluated; it must not be interpreted as a zero-failure result.
 
 A smaller model may replace the 4B baseline only when it does not materially worsen schema success,
 action recall, deadline exactness/hallucination, priority safety, prompt-injection resistance, or

@@ -31,7 +31,9 @@ from .config import (
     secure_runtime_paths,
     validate_model_base_url,
 )
+from .db import Store
 from .gmail import GmailError, GmailGateway, MessageUnavailable
+from .mailbox import DEFAULT_MAIL_PROVIDER, MailboxAccountUnavailable
 from .mime import extract_body
 from .model import (
     Analysis,
@@ -40,6 +42,7 @@ from .model import (
     ModelError,
     validate_analysis,
 )
+from .runtime import load_mailbox_account
 
 Capability = Literal[
     "structured_email_analysis",
@@ -83,6 +86,8 @@ RESERVED_EMAIL_DOMAINS = frozenset({"example.com", "example.net", "example.org"}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRIVATE_OUTPUT_ROOT = PROJECT_ROOT / "benchmarks" / "local"
 MAX_DOCUMENT_WORDS = 20_000
+MAX_DOCUMENT_SOURCE_CHARS = 200_000
+MAX_DOCUMENT_EXPANDED_CHARS = 2_000_000
 
 
 class BenchmarkExpected(BaseModel):
@@ -212,11 +217,16 @@ class BenchmarkDocumentCase(BaseModel):
     title: str = Field(min_length=1)
     target_words: int = Field(ge=100, le=MAX_DOCUMENT_WORDS)
     filler_text: str = Field(min_length=1)
-    fact_segments: list[str] = Field(min_length=1)
+    fact_segments: list[str] = Field(min_length=1, max_length=100)
     expected: BenchmarkDocumentExpected
 
     @model_validator(mode="after")
     def validate_document_contract(self) -> BenchmarkDocumentCase:
+        source_characters = len(self.filler_text) + sum(
+            len(segment) for segment in self.fact_segments
+        )
+        if source_characters > MAX_DOCUMENT_SOURCE_CHARS:
+            raise ValueError("document benchmark source text is too large")
         document = expand_document(self)
         normalized = document.casefold()
         for group in self.expected.required_fact_terms:
@@ -275,8 +285,6 @@ class BenchmarkCandidate(BaseModel):
                 raise ValueError(
                     f"{self.runtime} GPU requires gpu_offload_method={required_method}"
                 )
-        if "structured_email_analysis" not in self.capabilities:
-            raise ValueError("benchmark candidates must provide structured_email_analysis")
         if len(self.capabilities) != len(set(self.capabilities)):
             raise ValueError("candidate capabilities must be unique")
         return self
@@ -313,6 +321,13 @@ def expand_document(case: BenchmarkDocumentCase) -> str:
     filler_words = case.filler_text.split()
     if not filler_words:
         raise ValueError("filler_text must contain words")
+    expanded_upper_bound = (
+        sum(len(segment) for segment in case.fact_segments)
+        + padding_words * (max(len(word) for word in filler_words) + 1)
+        + (len(case.fact_segments) + 1) * 4
+    )
+    if expanded_upper_bound > MAX_DOCUMENT_EXPANDED_CHARS:
+        raise ValueError("expanded document exceeds the character limit")
     gap_count = len(case.fact_segments) + 1
     base, remainder = divmod(padding_words, gap_count)
     parts: list[str] = []
@@ -546,6 +561,8 @@ def run_benchmark(
 ) -> tuple[dict[str, object], dict[str, object]]:
     if repetitions < 1:
         raise ValueError("repetitions must be at least 1")
+    if "structured_email_analysis" not in candidate.capabilities:
+        raise ValueError("email benchmark requires structured_email_analysis capability")
     if peak_resident_memory_mib is not None and peak_resident_memory_mib < 0:
         raise ValueError("peak resident memory must not be negative")
 
@@ -569,6 +586,10 @@ def run_benchmark(
     latencies: list[float] = []
     public_cases: list[dict[str, object]] = []
     private_runs: list[dict[str, object]] = []
+    prompt_injection_evaluated = any(
+        _forbidden_marker_roles(case)[0] for case in corpus.email_cases
+    )
+    grounding_evaluated = any(_forbidden_marker_roles(case)[1] for case in corpus.email_cases)
 
     for case in corpus.email_cases:
         case_counts = Counter({name: 0 for name in metric_names})
@@ -631,25 +652,26 @@ def run_benchmark(
                 )
             latencies.append(round(latency, 6))
 
-        public_cases.append(
-            {
-                "id": case.id,
-                "runs": repetitions,
-                "schema_valid": repetitions - sum(errors.values()),
-                "error_types": dict(sorted(errors.items())),
-                "error_codes": dict(sorted(error_codes.items())),
-                "category_correct": case_counts["category_correct"],
-                "priority_correct": case_counts["priority_correct"],
-                "high_or_urgent_false_negatives": case_counts["high_or_urgent_false_negative"],
-                "action_required_correct": case_counts["action_required_correct"],
-                "action_required_false_negatives": case_counts["action_required_false_negative"],
-                "suggested_action_valid": case_counts["suggested_action_valid"],
-                "deadline_exact": case_counts["deadline_exact"],
-                "deadline_hallucinations": case_counts["deadline_hallucinated"],
-                "prompt_injection_failures": case_counts["prompt_injection_failure"],
-                "grounding_failures": case_counts["grounding_failure"],
-            }
-        )
+        public_case: dict[str, object] = {
+            "id": case.id,
+            "runs": repetitions,
+            "schema_valid": repetitions - sum(errors.values()),
+            "error_types": dict(sorted(errors.items())),
+            "error_codes": dict(sorted(error_codes.items())),
+            "category_correct": case_counts["category_correct"],
+            "priority_correct": case_counts["priority_correct"],
+            "high_or_urgent_false_negatives": case_counts["high_or_urgent_false_negative"],
+            "action_required_correct": case_counts["action_required_correct"],
+            "action_required_false_negatives": case_counts["action_required_false_negative"],
+            "suggested_action_valid": case_counts["suggested_action_valid"],
+            "deadline_exact": case_counts["deadline_exact"],
+            "deadline_hallucinations": case_counts["deadline_hallucinated"],
+        }
+        if prompt_injection_evaluated:
+            public_case["prompt_injection_failures"] = case_counts["prompt_injection_failure"]
+        if grounding_evaluated:
+            public_case["grounding_failures"] = case_counts["grounding_failure"]
+        public_cases.append(public_case)
 
     public: dict[str, object] = {
         "schema_version": 1,
@@ -685,16 +707,6 @@ def run_benchmark(
             "suggested_action_valid_rate": _rate(totals["suggested_action_valid"], total_runs),
             "deadline_exact_rate": _rate(totals["deadline_exact"], total_runs),
             "deadline_hallucinations": totals["deadline_hallucinated"],
-            "prompt_injection_failures": totals["prompt_injection_failure"],
-            "prompt_injection_failure_rate": _rate(
-                totals["prompt_injection_failure"],
-                sum(repetitions for case in corpus.email_cases if _forbidden_marker_roles(case)[0]),
-            ),
-            "grounding_failures": totals["grounding_failure"],
-            "grounding_failure_rate": _rate(
-                totals["grounding_failure"],
-                total_runs,
-            ),
             "summary_human_review": "pending",
             "suggested_action_human_review": "pending",
         },
@@ -708,6 +720,17 @@ def run_benchmark(
         "validation_boundary": _validation_boundary(corpus.validation_cases),
         "cases": public_cases,
     }
+    aggregate = public["aggregate"]
+    assert isinstance(aggregate, dict)
+    if prompt_injection_evaluated:
+        aggregate["prompt_injection_failures"] = totals["prompt_injection_failure"]
+        aggregate["prompt_injection_failure_rate"] = _rate(
+            totals["prompt_injection_failure"],
+            sum(repetitions for case in corpus.email_cases if _forbidden_marker_roles(case)[0]),
+        )
+    if grounding_evaluated:
+        aggregate["grounding_failures"] = totals["grounding_failure"]
+        aggregate["grounding_failure_rate"] = _rate(totals["grounding_failure"], total_runs)
     private: dict[str, object] = {
         "schema_version": 1,
         "local_only": True,
@@ -964,6 +987,7 @@ def build_blind_review(
                 validated_candidate.runtime,
                 validated_candidate.model,
                 validated_candidate.quantization,
+                f"context-{validated_candidate.context_length}",
                 execution_device,
                 execution_method,
             )
@@ -1113,11 +1137,15 @@ def _write_json(path: Path, value: object, *, private: bool, overwrite: bool = T
         raise
 
 
-def _candidate_from_args(args: argparse.Namespace) -> BenchmarkCandidate:
+def _candidate_from_args(
+    args: argparse.Namespace,
+    *,
+    primary_capability: Capability = "structured_email_analysis",
+) -> BenchmarkCandidate:
     gpu = args.execution_device == "gpu"
     method = None if gpu else CPU_ONLY_METHOD_BY_RUNTIME[args.runtime]
     gpu_method = GPU_OFFLOAD_METHOD_BY_RUNTIME.get(args.runtime) if gpu else None
-    capabilities = ["structured_email_analysis", *(args.capability or [])]
+    capabilities = [primary_capability, *(args.capability or [])]
     return BenchmarkCandidate(
         runtime=args.runtime,
         model=args.model,
@@ -1190,7 +1218,7 @@ def _run_documents_command(args: argparse.Namespace) -> int:
     )
     _require_local_output(args.private_review_output)
     corpus = load_document_corpus(args.corpus)
-    candidate = _candidate_from_args(args)
+    candidate = _candidate_from_args(args, primary_capability="text_document_summary")
     model = LocalModel(
         validate_model_base_url(args.base_url),
         candidate.model,
@@ -1257,7 +1285,14 @@ def _prepare_inbox_command(args: argparse.Namespace) -> int:
     secure_runtime_paths(config)
     if not config.allowlist:
         raise ValueError("private inbox corpus requires at least one configured watched sender")
-    gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
+    store = Store(config.database_file)
+    store.initialize()
+    account = store.active_mail_account()
+    if account is None:
+        raise ValueError("private inbox corpus requires an active email account")
+    if account.provider != DEFAULT_MAIL_PROVIDER:
+        raise ValueError("private inbox corpus currently supports an active Gmail account only")
+    gmail = load_mailbox_account(config, store, account.provider, account.account_id).gateway
     model = LocalModel(
         validate_model_base_url(args.base_url),
         args.model,
@@ -1418,7 +1453,7 @@ def _parser() -> argparse.ArgumentParser:
     run_documents.add_argument("--require-auth", action="store_true")
     run_documents.add_argument("--output", type=Path, required=True)
     run_documents.add_argument("--private-review-output", type=Path, required=True)
-    run_documents.set_defaults(capability=["text_document_summary"], handler=_run_documents_command)
+    run_documents.set_defaults(capability=[], handler=_run_documents_command)
 
     blind = commands.add_parser("blind", help="Create a blinded local summary-review packet")
     blind.add_argument("--input", type=Path, action="append", required=True)
@@ -1442,7 +1477,7 @@ def main(argv: list[str] | None = None) -> None:
     except (GmailError, ModelError):
         print("error: private local operation failed", file=os.sys.stderr)
         code = 2
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, MailboxAccountUnavailable, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=os.sys.stderr)
         code = 2
     raise SystemExit(code)

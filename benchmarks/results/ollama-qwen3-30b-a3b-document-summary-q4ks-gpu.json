@@ -8,7 +8,6 @@
   },
   "candidate": {
     "capabilities": [
-      "structured_email_analysis",
       "text_document_summary"
     ],
     "cold_start_seconds": null,

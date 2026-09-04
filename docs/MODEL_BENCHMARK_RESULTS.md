@@ -24,6 +24,9 @@ No runtime, model, or quantization default should be changed from this partial r
   full-GPU profile. Cloud access remained disabled for Ollama runs.
 - Privacy: public result artifacts contain case IDs and metrics, not source fields or free-form
   output. Private local review artifacts are Git-ignored and mode `600`.
+- Safety coverage: the original synthetic email corpus exercises prompt-injection canaries but has
+  no unsupported-output grounding markers. Its public artifacts therefore omit grounding metrics;
+  absence means unevaluated rather than zero failures.
 
 These are observed task results from one local machine. They are not vendor/general benchmark
 claims and should not be generalized beyond this corpus without more evidence.
