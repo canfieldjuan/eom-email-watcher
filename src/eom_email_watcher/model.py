@@ -305,7 +305,14 @@ class LocalModel:
                 # Reasoning models (e.g. qwen3.5) route the schema-constrained JSON
                 # into the reasoning field and leave content empty.
                 content = message.get("reasoning_content") or message.get("reasoning") or ""
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        except (
+            httpx.HTTPError,
+            AttributeError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
         return validate_analysis(_json_object(str(content)), received_at)
 

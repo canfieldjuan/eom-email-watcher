@@ -152,6 +152,32 @@ def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) ->
     assert result.action_required is True
 
 
+@pytest.mark.parametrize("message", [None, {"content": 7}])
+def test_analysis_converts_malformed_message_envelopes_to_model_error(
+    monkeypatch: pytest.MonkeyPatch, message: object
+) -> None:
+    model = LocalModel("http://127.0.0.1:11434/v1", "qwen3-30b-a3b", 60, None, False)
+
+    class FakeResp:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": message}]}
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", lambda *a, **k: FakeResp())
+
+    with pytest.raises(ModelError, match="Local model request failed"):
+        model.analyze(
+            sender="sender@example.com",
+            subject="Subject",
+            received_at="2026-09-01T14:00:00+00:00",
+            body="Body",
+            attachment_names=(),
+            current_local_time=datetime(2026, 9, 1, tzinfo=UTC),
+        )
+
+
 def test_document_summary_uses_separate_prompt_schema_and_records_usage(monkeypatch) -> None:
     model = LocalModel("http://127.0.0.1:11434/v1", "qwen3-30b-a3b", 60, None, False)
     request_json: dict[str, object] = {}
