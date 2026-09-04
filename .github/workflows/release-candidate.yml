@@ -35,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CONNECT_CONTRACTS_DIR: ${{ github.workspace }}/connect-contracts
-      EOM_EMAIL_WATCHER_BUILD_PROFILE: public
       LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}/connect-contracts/entitlements/v1/release/keyring.json
     steps:
       - uses: actions/checkout@v7
@@ -104,6 +103,8 @@ jobs:
       - run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets
       - name: Build Linux DEB
+        env:
+          EOM_EMAIL_WATCHER_BUILD_PROFILE: public
         run: pnpm --dir desktop tauri build --bundles deb
       - name: Remove private build inputs
         if: always()
@@ -120,7 +121,6 @@ jobs:
     runs-on: windows-latest
     env:
       CONNECT_CONTRACTS_DIR: ${{ github.workspace }}\connect-contracts
-      EOM_EMAIL_WATCHER_BUILD_PROFILE: public
       LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}\connect-contracts\entitlements\v1\release\keyring.json
     steps:
       - uses: actions/checkout@v7
@@ -175,6 +175,8 @@ jobs:
           }
       - run: uv run pytest tests/test_desktop_packaging.py
       - name: Build Windows NSIS installer
+        env:
+          EOM_EMAIL_WATCHER_BUILD_PROFILE: public
         run: pnpm --dir desktop tauri build --bundles nsis
       - name: Verify Windows engine process-tree lifecycle
         run: >-

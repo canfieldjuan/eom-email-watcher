@@ -801,7 +801,18 @@ def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> No
     assert '"refs/heads/main"' in workflow
     assert "EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64" in workflow
     assert "EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64" in workflow
-    assert "EOM_EMAIL_WATCHER_BUILD_PROFILE: public" in workflow
+    assert workflow.count("EOM_EMAIL_WATCHER_BUILD_PROFILE: public") == 2
+    linux_build_profile = (
+        "name: Build Linux DEB\n"
+        "        env:\n"
+        "          EOM_EMAIL_WATCHER_BUILD_PROFILE: public"
+    )
+    assert linux_build_profile in workflow
+    assert (
+        "name: Build Windows NSIS installer\n"
+        "        env:\n"
+        "          EOM_EMAIL_WATCHER_BUILD_PROFILE: public" in workflow
+    )
     assert "3005d82a7be885fba36f8688b5967a5b56a0abea" in workflow
     assert "pnpm --dir desktop tauri build --bundles deb" in workflow
     assert "pnpm --dir desktop tauri build --bundles nsis" in workflow
