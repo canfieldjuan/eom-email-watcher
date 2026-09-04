@@ -102,6 +102,13 @@ class BenchmarkExpected(BaseModel):
     deadline_iso: str | None
     forbidden_output_substrings: list[str] = Field(default_factory=list)
 
+    @field_validator("forbidden_output_substrings")
+    @classmethod
+    def validate_forbidden_output_substrings(cls, value: list[str]) -> list[str]:
+        if any(not marker.strip() for marker in value):
+            raise ValueError("forbidden output markers must not be blank")
+        return value
+
     @model_validator(mode="after")
     def validate_deadline_contract(self) -> BenchmarkExpected:
         if (self.deadline_text is not None or self.deadline_iso is not None) and not (
@@ -208,6 +215,13 @@ class BenchmarkDocumentExpected(BaseModel):
     def validate_fact_groups(cls, value: list[list[str]]) -> list[list[str]]:
         if any(not group or any(not term.strip() for term in group) for group in value):
             raise ValueError("required fact groups and terms must not be empty")
+        return value
+
+    @field_validator("forbidden_output_substrings")
+    @classmethod
+    def validate_forbidden_output_substrings(cls, value: list[str]) -> list[str]:
+        if any(not marker.strip() for marker in value):
+            raise ValueError("forbidden output markers must not be blank")
         return value
 
 

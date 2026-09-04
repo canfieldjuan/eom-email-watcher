@@ -318,6 +318,19 @@ def test_document_expansion_hits_exact_word_target_and_validates_gold_terms() ->
         DocumentBenchmarkCorpus.model_validate(data)
 
 
+@pytest.mark.parametrize("marker", ["", "   "])
+def test_forbidden_output_markers_must_not_be_blank(marker: str) -> None:
+    email_data = _corpus().model_dump(mode="json")
+    email_data["email_cases"][0]["expected"]["forbidden_output_substrings"] = [marker]
+    with pytest.raises(ValueError, match="forbidden output markers must not be blank"):
+        BenchmarkCorpus.model_validate(email_data)
+
+    document_data = _document_corpus().model_dump(mode="json")
+    document_data["document_cases"][0]["expected"]["forbidden_output_substrings"] = [marker]
+    with pytest.raises(ValueError, match="forbidden output markers must not be blank"):
+        DocumentBenchmarkCorpus.model_validate(document_data)
+
+
 def test_document_benchmark_requires_claimed_text_summary_capability() -> None:
     with pytest.raises(ValueError, match="text_document_summary"):
         run_document_benchmark(
