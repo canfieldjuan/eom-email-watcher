@@ -283,6 +283,45 @@ def test_recent_inbox_message_ids_is_watchlist_scoped_and_bounded() -> None:
     ]
 
 
+def test_recent_inbox_message_iterator_pages_until_search_is_exhausted() -> None:
+    class PagedMessages:
+        def __init__(self) -> None:
+            self.list_calls: list[dict[str, object]] = []
+
+        def list(self, **kwargs: object) -> FakeRequest:
+            self.list_calls.append(kwargs)
+            if kwargs["pageToken"] is None:
+                return FakeRequest(
+                    {
+                        "messages": [{"id": "wrong-sender"}, {"id": "left-inbox"}],
+                        "nextPageToken": "page-2",
+                    }
+                )
+            return FakeRequest({"messages": [{"id": "m3"}, {"id": "m4"}]})
+
+    messages = PagedMessages()
+
+    class PagedUsers:
+        def messages(self) -> PagedMessages:
+            return messages
+
+    class PagedService:
+        def users(self) -> PagedUsers:
+            return PagedUsers()
+
+    gateway = GmailGateway(PagedService())
+
+    assert list(
+        gateway.iter_recent_inbox_message_ids(frozenset({"a@example.com"}), page_size=2)
+    ) == [
+        "wrong-sender",
+        "left-inbox",
+        "m3",
+        "m4",
+    ]
+    assert [call["pageToken"] for call in messages.list_calls] == [None, "page-2"]
+
+
 @pytest.mark.parametrize("limit", [0, 501])
 def test_recent_inbox_message_ids_rejects_unsafe_limits(limit: int) -> None:
     with pytest.raises(ValueError, match="between 1 and 500"):

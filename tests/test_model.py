@@ -183,3 +183,22 @@ def test_document_summary_uses_separate_prompt_schema_and_records_usage(monkeypa
     assert request_json["messages"][0]["content"] == DOCUMENT_SUMMARY_PROMPT
     assert request_json["response_format"]["json_schema"]["name"] == "document_summary"
     assert "PRIVATE_DOCUMENT_CANARY" in request_json["messages"][1]["content"]
+
+
+@pytest.mark.parametrize("message", [None, {"content": 7}])
+def test_document_summary_converts_malformed_message_envelopes_to_model_error(
+    monkeypatch: pytest.MonkeyPatch, message: object
+) -> None:
+    model = LocalModel("http://127.0.0.1:11434/v1", "qwen3-30b-a3b", 60, None, False)
+
+    class FakeResp:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": message}]}
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", lambda *a, **k: FakeResp())
+
+    with pytest.raises(ModelError, match="Local model request failed"):
+        model.summarize_document(title="Local document", text="text", max_words=100)

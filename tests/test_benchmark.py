@@ -34,7 +34,7 @@ from eom_email_watcher.benchmark import (
     run_document_benchmark,
 )
 from eom_email_watcher.config import ConfigError, validate_model_base_url
-from eom_email_watcher.gmail import GmailError, MessageMetadata
+from eom_email_watcher.gmail import GmailError, MessageMetadata, MessageUnavailable
 from eom_email_watcher.model import (
     DOCUMENT_SUMMARY_PROMPT,
     SYSTEM_PROMPT,
@@ -636,9 +636,11 @@ def test_private_local_corpus_accepts_real_addresses_without_weakening_public_gu
 
 def test_private_inbox_draft_requires_human_label_review_before_finalizing() -> None:
     class FakeGmail:
-        def recent_inbox_message_ids(self, addresses: frozenset[str], *, limit: int) -> list[str]:
+        def iter_recent_inbox_message_ids(
+            self, addresses: frozenset[str], *, page_size: int
+        ) -> list[str]:
             assert addresses == frozenset({"customer@customer.test"})
-            assert limit == 1
+            assert page_size == 1
             return ["private-gmail-id"]
 
         def metadata(self, message_id: str) -> MessageMetadata:
@@ -701,7 +703,9 @@ def test_private_inbox_draft_revalidates_exact_sender_and_inbox_before_body(
     sender: str, labels: frozenset[str]
 ) -> None:
     class FakeGmail:
-        def recent_inbox_message_ids(self, addresses: frozenset[str], *, limit: int) -> list[str]:
+        def iter_recent_inbox_message_ids(
+            self, addresses: frozenset[str], *, page_size: int
+        ) -> list[str]:
             return ["candidate-message"]
 
         def metadata(self, message_id: str) -> MessageMetadata:
@@ -734,6 +738,55 @@ def test_private_inbox_draft_revalidates_exact_sender_and_inbox_before_body(
             body_char_limit=20_000,
             current_local_time=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
         )
+
+
+def test_private_inbox_draft_pages_past_rejected_search_candidates() -> None:
+    class FakeGmail:
+        def iter_recent_inbox_message_ids(
+            self, addresses: frozenset[str], *, page_size: int
+        ) -> list[str]:
+            assert addresses == frozenset({"customer@example.com"})
+            assert page_size == 1
+            return ["wrong-sender", "left-inbox", "disappeared", "accepted"]
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            return MessageMetadata(
+                message_id=message_id,
+                thread_id=None,
+                sender="other@example.com"
+                if message_id == "wrong-sender"
+                else "customer@example.com",
+                sender_name=None,
+                subject="Accepted subject",
+                received_at="2026-09-01T14:00:00+00:00",
+                labels=frozenset() if message_id == "left-inbox" else frozenset({"INBOX"}),
+            )
+
+        def full_payload(self, message_id: str) -> dict[str, object]:
+            if message_id == "disappeared":
+                raise MessageUnavailable("message disappeared")
+            assert message_id == "accepted"
+            return {"mimeType": "text/plain", "body": {"data": "QUNDRVBURUQ="}}
+
+    class FakeModel:
+        model = "local-draft-model"
+
+        def analyze(self, **kwargs: object) -> Analysis:
+            assert kwargs["body"] == "ACCEPTED"
+            return _analysis()
+
+    draft = build_private_inbox_draft(
+        FakeGmail(),
+        FakeModel(),
+        _corpus(),
+        senders=frozenset({"customer@example.com"}),
+        limit=1,
+        body_char_limit=20_000,
+        current_local_time=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+    )
+
+    assert len(draft["corpus"]["email_cases"]) == 1
+    assert draft["corpus"]["email_cases"][0]["body"] == "ACCEPTED"
 
 
 def test_prepare_inbox_uses_the_active_gmail_account(
@@ -1001,6 +1054,39 @@ def test_blind_review_requires_two_distinct_candidates() -> None:
     )
     with pytest.raises(ValueError, match="at least two"):
         build_blind_review([private], seed="test-seed")
+
+
+@pytest.mark.parametrize(
+    ("prompt_sha256", "message"),
+    [
+        (None, "missing a valid system prompt hash"),
+        ("0" * 64, "identical system prompt"),
+    ],
+)
+def test_blind_review_requires_one_proven_system_prompt(
+    prompt_sha256: str | None, message: str
+) -> None:
+    _public_a, private_a = run_benchmark(
+        _corpus(),
+        _candidate("baseline-model"),
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+    _public_b, private_b = run_benchmark(
+        _corpus(),
+        _candidate("challenger-model"),
+        repetitions=1,
+        analyze=lambda case: _analysis(),
+        timer=iter([0.0, 0.1]).__next__,
+    )
+    if prompt_sha256 is None:
+        private_b.pop("prompt_sha256")
+    else:
+        private_b["prompt_sha256"] = prompt_sha256
+
+    with pytest.raises(ValueError, match=message):
+        build_blind_review([private_a, private_b], seed="test-seed")
 
 
 def test_blind_review_rejects_candidates_without_shared_valid_runs() -> None:
@@ -1345,6 +1431,7 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
         if "prompt_sha256" in result:
             provenanced_results += 1
             assert result["prompt_sha256"] == historical_prompt_hash
+            assert result["aggregate"]["suggested_action_human_review"] == "pending"
     assert provenanced_results == 13
 
 

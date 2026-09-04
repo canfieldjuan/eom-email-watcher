@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -413,14 +414,25 @@ class GmailGateway:
     def recent_inbox_message_ids(self, addresses: frozenset[str], *, limit: int) -> list[str]:
         if not 1 <= limit <= 500:
             raise ValueError("limit must be between 1 and 500")
+        ids: list[str] = []
+        for message_id in self.iter_recent_inbox_message_ids(addresses, page_size=limit):
+            ids.append(message_id)
+            if len(ids) == limit:
+                break
+        return ids
+
+    def iter_recent_inbox_message_ids(
+        self, addresses: frozenset[str], *, page_size: int
+    ) -> Iterator[str]:
+        if not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500")
         if not addresses:
             raise ValueError("at least one watched sender is required")
         sender_terms = " ".join(f"from:{address}" for address in sorted(addresses))
         query = f"in:inbox {{{sender_terms}}}"
-        ids: list[str] = []
         seen: set[str] = set()
         page_token: str | None = None
-        while len(ids) < limit:
+        while True:
             try:
                 response = (
                     self.service.users()
@@ -429,7 +441,7 @@ class GmailGateway:
                         userId="me",
                         q=query,
                         pageToken=page_token,
-                        maxResults=min(500, limit - len(ids)),
+                        maxResults=page_size,
                     )
                     .execute()
                 )
@@ -439,15 +451,13 @@ class GmailGateway:
                 ) from exc
             for item in response.get("messages") or []:
                 message_id = str(item.get("id", ""))
-                if message_id and message_id not in seen:
-                    seen.add(message_id)
-                    ids.append(message_id)
-                    if len(ids) == limit:
-                        return ids
+                if not message_id or message_id in seen:
+                    continue
+                seen.add(message_id)
+                yield message_id
             page_token = response.get("nextPageToken")
             if not page_token:
-                break
-        return ids
+                return
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
         return MailboxChanges(tuple(self.search_since(addresses, since)), self.initial_cursor())

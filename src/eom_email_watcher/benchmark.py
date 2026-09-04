@@ -360,9 +360,8 @@ def build_private_inbox_draft(
 ) -> dict[str, object]:
     if current_local_time.tzinfo is None:
         raise ValueError("current_local_time must include a timezone offset")
-    message_ids = gmail.recent_inbox_message_ids(senders, limit=limit)
     cases: list[dict[str, object]] = []
-    for message_id in message_ids:
+    for message_id in gmail.iter_recent_inbox_message_ids(senders, page_size=limit):
         try:
             metadata = gmail.metadata(message_id)
             if metadata.sender not in senders or "INBOX" not in metadata.labels:
@@ -399,6 +398,8 @@ def build_private_inbox_draft(
                 },
             }
         )
+        if len(cases) == limit:
+            break
     if not cases:
         raise ValueError("no available inbox messages matched the configured watchlist")
     return {
@@ -979,7 +980,18 @@ def build_blind_review(
 ) -> tuple[dict[str, object], dict[str, object]]:
     candidates: dict[str, dict[str, object]] = {}
     expected_actions: dict[str, bool] | None = None
+    prompt_sha256: str | None = None
     for result in private_results:
+        result_prompt_sha256 = result.get("prompt_sha256")
+        if (
+            not isinstance(result_prompt_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", result_prompt_sha256) is None
+        ):
+            raise ValueError("private result is missing a valid system prompt hash")
+        if prompt_sha256 is None:
+            prompt_sha256 = result_prompt_sha256
+        elif result_prompt_sha256 != prompt_sha256:
+            raise ValueError("private results do not use an identical system prompt")
         candidate = result.get("candidate")
         if not isinstance(candidate, dict):
             raise ValueError("private result is missing candidate identity")

@@ -352,7 +352,14 @@ class LocalModel:
             content = message.get("content") or ""
             if not content.strip():
                 content = message.get("reasoning_content") or message.get("reasoning") or ""
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        except (
+            httpx.HTTPError,
+            AttributeError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
         try:
             output = DocumentSummary.model_validate(_json_object(str(content)))
