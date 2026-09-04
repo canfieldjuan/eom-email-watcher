@@ -1,4 +1,5 @@
 import base64
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,49 @@ def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
     assert parsed.sender_name == "Person"
     assert parsed.subject == "Test"
     assert parsed.labels == frozenset({"INBOX", "UNREAD"})
+
+
+def test_parse_metadata_keeps_missing_source_time_invalid() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m1",
+            "internalDate": "not-a-timestamp",
+            "labelIds": ["INBOX"],
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "trusted@example.com"},
+                    {"name": "Date", "value": "not-a-date"},
+                ]
+            },
+        }
+    )
+
+    assert parsed.received_at == ""
+
+
+def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
+    gateway = GmailGateway(None)
+    gateway.history_message_ids = lambda cursor: (["m1", "m2"], "next-cursor")
+    gateway.search_since = lambda addresses, since: ["recovered"]
+    gateway.profile_history_id = lambda: "recovery-cursor"
+    gateway.full_payload = lambda message_id: {
+        "mimeType": "text/plain",
+        "body": {"data": base64.urlsafe_b64encode(b"hello").decode()},
+    }
+
+    changes = gateway.changes_since("cursor")
+    recovered = gateway.recover_since(
+        frozenset({"a@example.com"}), datetime(2026, 9, 1, tzinfo=UTC)
+    )
+    content = gateway.content("m1", 100)
+
+    assert changes.message_ids == ("m1", "m2")
+    assert changes.cursor == "next-cursor"
+    assert recovered.message_ids == ("recovered",)
+    assert recovered.cursor == "recovery-cursor"
+    assert content.body == "hello"
+    assert content.attachment_names == ()
+    assert content.attachments == ()
 
 
 class FakeRequest:
@@ -156,9 +200,7 @@ def test_attachment_bytes_uses_gmail_attachment_identity() -> None:
     gateway = GmailGateway(FakeService(attachments))
 
     assert gateway.attachment_bytes("message-1", "2", "attachment-1") == b"pdf bytes"
-    assert attachments.calls == [
-        {"userId": "me", "messageId": "message-1", "id": "attachment-1"}
-    ]
+    assert attachments.calls == [{"userId": "me", "messageId": "message-1", "id": "attachment-1"}]
 
 
 def test_attachment_bytes_finds_inline_root_part_data() -> None:
@@ -199,6 +241,73 @@ def test_from_token_fails_cleanly_while_another_process_owns_token_lock(
         FileLock(f"{token_file}.lock"),
         pytest.raises(GmailError, match="token is busy"),
     ):
+        GmailGateway.from_token(credentials_file, token_file)
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_from_token_classifies_refresh_failures(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, retryable: bool
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+
+    def refresh(_request) -> None:
+        raise gmail_module.RefreshError("refresh failed", retryable=retryable)
+
+    credentials = SimpleNamespace(
+        valid=False,
+        expired=True,
+        refresh_token="refresh-token",
+        refresh=refresh,
+    )
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        lambda path, scopes: credentials,
+    )
+    monkeypatch.setattr(
+        gmail_module,
+        "build",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("failed refresh must not build a Gmail service")
+        ),
+    )
+
+    with pytest.raises(GmailError) as raised:
+        GmailGateway.from_token(credentials_file, token_file)
+
+    assert isinstance(raised.value, GmailAuthorizationRejected) is not retryable
+    assert token_file.read_text(encoding="utf-8") == "existing token"
+
+
+@pytest.mark.parametrize("stored_token", ["malformed", "unusable"])
+def test_from_token_classifies_unusable_local_authorization_as_rejected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, stored_token: str
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+
+    if stored_token == "malformed":
+
+        def load_credentials(path, scopes):
+            raise ValueError("malformed token")
+
+    else:
+
+        def load_credentials(path, scopes):
+            return SimpleNamespace(valid=False, expired=False, refresh_token=None)
+
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        load_credentials,
+    )
+
+    with pytest.raises(GmailAuthorizationRejected):
         GmailGateway.from_token(credentials_file, token_file)
 
 
@@ -274,6 +383,7 @@ def test_authorize_replaces_an_unusable_existing_token(
             return stored_credentials
 
     else:
+
         def rejected_refresh(request):
             raise gmail_module.RefreshError("revoked token")
 
@@ -316,10 +426,7 @@ def test_authorize_replaces_an_unusable_existing_token(
     assert authorization_changed is True
     assert token_file.read_text(encoding="utf-8") == "replacement token"
     assert browser_calls[0]["authorization_prompt_message"] is None
-    assert (
-        browser_calls[0]["timeout_seconds"]
-        == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
-    )
+    assert browser_calls[0]["timeout_seconds"] == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
 
 
 def test_authorization_timeout_does_not_persist_a_token(
@@ -330,10 +437,7 @@ def test_authorization_timeout_does_not_persist_a_token(
     credentials_file.write_text("{}", encoding="utf-8")
 
     def run_local_server(**kwargs):
-        assert (
-            kwargs["timeout_seconds"]
-            == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
-        )
+        assert kwargs["timeout_seconds"] == gmail_module.GMAIL_AUTHORIZATION_TIMEOUT_SECONDS
         raise gmail_module.WSGITimeoutError("browser flow timed out")
 
     flow = SimpleNamespace(run_local_server=run_local_server)
@@ -362,3 +466,34 @@ def test_profile_history_id_classifies_http_401_as_rejected_authorization() -> N
 
     with pytest.raises(GmailAuthorizationRejected, match="rejected"):
         gateway.profile_history_id()
+
+
+def test_profile_returns_normalized_mailbox_identity_and_cursor() -> None:
+    request = SimpleNamespace(
+        execute=lambda: {"emailAddress": "Owner@Example.COM", "historyId": "12345"}
+    )
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    profile = gateway.profile()
+
+    assert profile.email_address == "owner@example.com"
+    assert profile.history_id == "12345"
+    assert gateway.profile_history_id() == "12345"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"emailAddress": "", "historyId": "12345"},
+        {"emailAddress": "@", "historyId": "12345"},
+        {"emailAddress": "owner@example.com", "historyId": ""},
+    ],
+)
+def test_profile_rejects_incomplete_identity(response: dict[str, str]) -> None:
+    request = SimpleNamespace(execute=lambda: response)
+    users = SimpleNamespace(getProfile=lambda **kwargs: request)
+    gateway = GmailGateway(SimpleNamespace(users=lambda: users))
+
+    with pytest.raises(GmailError, match="profile response"):
+        gateway.profile()

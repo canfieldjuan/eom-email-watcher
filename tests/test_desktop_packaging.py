@@ -22,6 +22,30 @@ def _load_builder() -> ModuleType:
 build_desktop_sidecar = _load_builder()
 
 
+def _load_smoke() -> ModuleType:
+    path = Path(__file__).parents[1] / "scripts" / "smoke_packaged_engine.py"
+    spec = importlib.util.spec_from_file_location("smoke_packaged_engine", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load packaged-engine smoke script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+smoke_packaged_engine = _load_smoke()
+
+
+def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"not executed")
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="authority state is unsupported",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(binary, "ambient")
+
+
 @pytest.mark.parametrize(
     ("target_triple", "suffix"),
     [
@@ -143,17 +167,121 @@ def test_oauth_build_input_rejects_non_desktop_shapes(
         build_desktop_sidecar.validate_oauth_client(path)
 
 
-def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
-    path = tmp_path / "keyring.json"
-    public_key = base64.urlsafe_b64encode(b"k" * 32).rstrip(b"=").decode("ascii")
+def _write_microsoft_oauth_client(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "client_id": "11111111-2222-4333-8444-555555555555",
+                "tenant": "organizations",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_microsoft_oauth_build_input_accepts_public_client_without_secrets(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "microsoft.json"
+    _write_microsoft_oauth_client(path)
+
+    build_desktop_sidecar.validate_microsoft_oauth_client(path)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "client_id": "11111111-2222-4333-8444-555555555555",
+            "tenant": "organizations",
+            "client_secret": "must-not-ship",
+        },
+        {"client_id": "not-a-uuid", "tenant": "organizations"},
+        {"client_id": "11111111-2222-4333-8444-555555555555", "tenant": "common"},
+    ],
+)
+def test_microsoft_oauth_build_input_rejects_secret_or_invalid_shapes(
+    tmp_path: Path,
+    document: object,
+) -> None:
+    path = tmp_path / "microsoft.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError):
+        build_desktop_sidecar.validate_microsoft_oauth_client(path)
+
+
+def test_sidecar_build_stages_microsoft_public_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "microsoft.json"
+    _write_microsoft_oauth_client(source)
+    build_directory = tmp_path / "build"
+    output_directory = tmp_path / "output"
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "determine_target_triple",
+        lambda: "x86_64-unknown-linux-gnu",
+    )
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.delenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", raising=False)
+    monkeypatch.setenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", str(source))
+
+    def run(arguments: list[str], **kwargs):
+        calls.append(arguments)
+        if "PyInstaller" in arguments:
+            built = build_directory / "dist" / build_desktop_sidecar.ENGINE_NAME
+            built.write_bytes(b"engine")
+        return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", run)
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    add_data = [
+        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    ]
+    assert len(add_data) == 1
+    staged_source, destination = add_data[0].rsplit(build_desktop_sidecar.os.pathsep, 1)
+    assert Path(staged_source).name == "microsoft-oauth-client.json"
+    assert destination == "eom_email_watcher_data"
+    assert not Path(staged_source).exists()
+    assert calls[1][-2:] == [
+        "--expected-entitlement-state",
+        "authority_unavailable",
+    ]
+
+
+def _write_entitlement_keyring(
+    path: Path,
+    *,
+    key_id: str = "local-connect-prod-2026-01",
+    public_key: bytes | None = None,
+) -> None:
+    selected_public_key = public_key
+    if selected_public_key is None:
+        selected_public_key = next(
+            key
+            for approved_key_id, key in build_desktop_sidecar.APPROVED_RELEASE_AUTHORITIES
+            if approved_key_id == "local-connect-prod-2026-01"
+        )
+    encoded_public_key = (
+        base64.urlsafe_b64encode(selected_public_key).rstrip(b"=").decode("ascii")
+    )
     path.write_text(
         json.dumps(
             {
                 "keys": [
                     {
                         "algorithm": "Ed25519",
-                        "key_id": "release-1",
-                        "public_key_base64url": public_key,
+                        "key_id": key_id,
+                        "public_key_base64url": encoded_public_key,
                     }
                 ]
             }
@@ -161,35 +289,126 @@ def test_entitlement_build_input_accepts_public_keyring(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    build_desktop_sidecar.validate_entitlement_keyring(path)
+
+def test_entitlement_build_input_accepts_approved_public_keyring(tmp_path: Path) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path)
+    expected = path.read_bytes()
+
+    assert build_desktop_sidecar.validate_entitlement_keyring(path) == expected
+
+
+def test_entitlement_build_input_rejects_unapproved_production_authority(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path, public_key=b"q" * 32)
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="approved production authority",
+    ):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
+
+
+def test_entitlement_build_input_rejects_windows_reparse_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eom_email_watcher import connect_windows
+
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path)
+    monkeypatch.setattr(connect_windows, "_is_reparse", lambda _metadata: True)
+
+    with pytest.raises(build_desktop_sidecar.SidecarBuildError):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
+
+
+def test_entitlement_build_input_rejects_non_production_key_id(tmp_path: Path) -> None:
+    path = tmp_path / "keyring.json"
+    _write_entitlement_keyring(path, key_id="local-connect-test-2026-01")
+
+    with pytest.raises(
+        build_desktop_sidecar.SidecarBuildError,
+        match="non-production key ID",
+    ):
+        build_desktop_sidecar.validate_entitlement_keyring(path)
 
 
 @pytest.mark.parametrize(
     "target_triple",
-    ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"],
+    [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ],
 )
 def test_entitlement_keyring_target_accepts_supported_platforms(target_triple: str) -> None:
     build_desktop_sidecar.validate_entitlement_keyring_target(target_triple)
 
 
-def test_windows_build_rejects_connect_keyring_before_packaging(
+def test_windows_build_stages_connect_keyring_with_platform_separator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", tmp_path / "build")
-    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", tmp_path / "output")
+    source = tmp_path / "keyring.json"
+    _write_entitlement_keyring(source)
+    build_directory = tmp_path / "build"
+    output_directory = tmp_path / "output"
+    calls: list[list[str]] = []
+    staged_keyring: list[bytes] = []
+    validated_keyring = source.read_bytes()
+
+    monkeypatch.setattr(build_desktop_sidecar, "BUILD_DIRECTORY", build_directory)
+    monkeypatch.setattr(build_desktop_sidecar, "OUTPUT_DIRECTORY", output_directory)
     monkeypatch.setattr(
         build_desktop_sidecar,
         "determine_target_triple",
         lambda: "x86_64-pc-windows-msvc",
     )
+    monkeypatch.setattr(build_desktop_sidecar.os, "pathsep", ";")
     monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
-    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(tmp_path / "keyring.json"))
+    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(source))
 
-    with pytest.raises(
-        build_desktop_sidecar.SidecarBuildError,
-        match="activation storage is not supported on Windows",
-    ):
-        build_desktop_sidecar.build_sidecar()
+    validate_keyring = build_desktop_sidecar.validate_entitlement_keyring
+
+    def validate_then_replace(path: Path) -> bytes:
+        content = validate_keyring(path)
+        path.write_bytes(b"substituted after validation")
+        return content
+
+    monkeypatch.setattr(
+        build_desktop_sidecar,
+        "validate_entitlement_keyring",
+        validate_then_replace,
+    )
+
+    def run(arguments: list[str], **kwargs):
+        calls.append(arguments)
+        if "PyInstaller" in arguments:
+            add_data = arguments[arguments.index("--add-data") + 1]
+            staged_source = Path(add_data.rsplit(";", 1)[0])
+            staged_keyring.append(staged_source.read_bytes())
+            built = build_directory / "dist" / f"{build_desktop_sidecar.ENGINE_NAME}.exe"
+            built.write_bytes(b"engine")
+        return build_desktop_sidecar.subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(build_desktop_sidecar.subprocess, "run", run)
+
+    output = build_desktop_sidecar.build_sidecar()
+
+    assert output.read_bytes() == b"engine"
+    add_data = [
+        calls[0][index + 1] for index, argument in enumerate(calls[0]) if argument == "--add-data"
+    ]
+    assert len(add_data) == 1
+    staged_source, destination = add_data[0].rsplit(";", 1)
+    assert Path(staged_source).name == "connect-entitlement-keyring.json"
+    assert destination == "eom_email_watcher_data"
+    assert staged_keyring == [validated_keyring]
+    assert source.read_bytes() == b"substituted after validation"
+    assert not Path(staged_source).exists()
+    assert calls[1][-2:] == ["--expected-entitlement-state", "missing"]
 
 
 @pytest.mark.parametrize("document", [{"keys": []}, {"keys": "not-a-list"}, {}])

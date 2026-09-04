@@ -5,39 +5,59 @@ from datetime import UTC, datetime, timedelta
 
 from .config import Config
 from .db import AnalyzedMessage, PendingMessage, Store
-from .gmail import GmailGateway, MessageUnavailable, StaleHistoryCursor
-from .mime import extract_body
+from .mailbox import (
+    MailboxGateway,
+    MailboxMessageUnavailable,
+    MailboxSession,
+    StaleMailboxCursor,
+    default_mailbox_session,
+    scoped_message_id,
+)
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
 
 
+def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
+    try:
+        received = datetime.fromisoformat(value)
+        if received.tzinfo is None:
+            return None
+        return min(received.astimezone(UTC), observed_at)
+    except (OverflowError, ValueError):
+        return None
+
+
 class Watcher:
-    def __init__(self, config: Config, store: Store, gmail: GmailGateway, model: ModelRuntime):
+    def __init__(
+        self,
+        config: Config,
+        store: Store,
+        mailbox: MailboxGateway | MailboxSession,
+        model: ModelRuntime,
+    ):
         self.config = config
         self.store = store
-        self.gmail = gmail
+        self.mailbox = (
+            mailbox if isinstance(mailbox, MailboxSession) else default_mailbox_session(mailbox)
+        )
+        self.gateway = self.mailbox.gateway
         self.model = model
         self.sender_names = {sender.email: sender.name for sender in config.senders}
 
     def bootstrap(self) -> str:
-        history_id = self.gmail.profile_history_id()
-        self.store.set_state(history_id)
-        return history_id
+        cursor = self.gateway.initial_cursor()
+        self.store.set_state(
+            cursor,
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+        )
+        return cursor
 
     @staticmethod
-    def inactive_result(
-        config: Config, store: Store, *, dry_run: bool
-    ) -> dict[str, int | bool]:
-        purged = (
-            0
-            if dry_run
-            else store.purge(
-                config.retention_days,
-                preserve_notification_intents=config.notifications_enabled,
-            )
-        )
+    def inactive_result(config: Config, store: Store, *, dry_run: bool) -> dict[str, int | bool]:
+        purged = 0 if dry_run else store.purge(config.retention_days)
         return {
             "active": False,
             "discovered": 0,
@@ -52,38 +72,68 @@ class Watcher:
     ) -> dict[str, int | bool]:
         if not self.config.senders:
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
-        state = self.store.state()
+        checked_at = datetime.now(UTC)
+        retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
+        purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
+        state = self.store.state(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+        )
         if not state:
             raise RuntimeError("Watcher is not initialized. Run: eom-mail-watch setup")
         cursor, last_success = state
         recovered = False
         try:
-            message_ids, newest_cursor = self.gmail.history_message_ids(cursor)
-        except StaleHistoryCursor:
+            changes = self.gateway.changes_since(cursor)
+        except StaleMailboxCursor:
             recovered = True
             since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
-            message_ids = self.gmail.search_since(self.config.allowlist, since)
-            newest_cursor = self.gmail.profile_history_id()
+            since = max(since, retention_cutoff)
+            changes = self.gateway.recover_since(self.config.allowlist, since)
 
         added = 0
         dry_run_messages: list[PendingMessage] = []
-        for message_id in message_ids:
-            if self.store.has_message(message_id):
+        for provider_message_id in changes.message_ids:
+            if self.store.has_seen_message(
+                provider_message_id,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+            ):
                 continue
             try:
-                metadata = self.gmail.metadata(message_id)
-            except MessageUnavailable as exc:
-                logger.info("Skipping message %s (gone before fetch): %s", message_id, exc)
+                metadata = self.gateway.metadata(provider_message_id)
+            except MailboxMessageUnavailable as exc:
+                logger.info(
+                    "Skipping message %s (gone before fetch): %s",
+                    provider_message_id,
+                    exc,
+                )
                 continue
+            if metadata.message_id != provider_message_id:
+                raise RuntimeError("Mailbox metadata identity did not match the change record")
             if "INBOX" not in metadata.labels or metadata.sender not in self.config.allowlist:
                 continue
+            received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
+            if received_at is None or received_at < retention_cutoff:
+                logger.info(
+                    "Skipping message %s outside the configured retention window",
+                    provider_message_id,
+                )
+                continue
             values = {
-                "message_id": metadata.message_id,
+                "message_id": scoped_message_id(
+                    self.mailbox.provider,
+                    self.mailbox.account_id,
+                    metadata.message_id,
+                ),
+                "provider": self.mailbox.provider,
+                "account_id": self.mailbox.account_id,
+                "provider_message_id": metadata.message_id,
                 "thread_id": metadata.thread_id,
                 "sender": metadata.sender,
                 "sender_name": metadata.sender_name or self.sender_names.get(metadata.sender),
                 "subject": metadata.subject,
-                "received_at": metadata.received_at,
+                "received_at": received_at.isoformat(),
             }
             if dry_run:
                 dry_run_messages.append(
@@ -101,21 +151,20 @@ class Watcher:
                 added += 1
 
         if not dry_run:
-            self.store.set_state(newest_cursor)
+            self.store.set_state(
+                changes.cursor,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+            )
         summarized, fallback = self._process_pending(
             dry_run=dry_run,
             deliver_notifications=deliver_notifications,
             extra=dry_run_messages,
+            retention_cutoff=retention_cutoff,
+            retention_observed_at=checked_at,
         )
-        preserve_notification_intents = self.config.notifications_enabled
-        purged = (
-            0
-            if dry_run
-            else self.store.purge(
-                self.config.retention_days,
-                preserve_notification_intents=preserve_notification_intents,
-            )
-        )
+        if not dry_run:
+            purged += self.store.purge(self.config.retention_days, now=checked_at)
         return {
             "active": True,
             "discovered": added,
@@ -199,17 +248,33 @@ class Watcher:
         dry_run: bool,
         deliver_notifications: bool,
         extra: list[PendingMessage] | None = None,
+        retention_cutoff: datetime,
+        retention_observed_at: datetime,
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
         for message in self.store.pending_delivery():
+            received_at = _received_at_or_none(
+                message.received_at, observed_at=retention_observed_at
+            )
+            if received_at is None or received_at < retention_cutoff:
+                continue
             if deliver_notifications:
-                fallback += self._deliver_analysis(
-                    message, self._stored_analysis(message), dry_run
-                )
+                fallback += self._deliver_analysis(message, self._stored_analysis(message), dry_run)
             elif not self.config.notifications_enabled and not dry_run:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
-        for message in [*self.store.pending(), *(extra or [])]:
+        for message in [
+            *self.store.pending(
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+            ),
+            *(extra or []),
+        ]:
+            received_at = _received_at_or_none(
+                message.received_at, observed_at=retention_observed_at
+            )
+            if received_at is None or received_at < retention_cutoff:
+                continue
             try:
                 if dry_run:
                     request_id = None
@@ -223,18 +288,15 @@ class Watcher:
                     request_id = request.request_id
                     body_char_limit = request.body_char_limit
                     current_local_time = datetime.fromisoformat(request.context_at)
-                payload = self.gmail.full_payload(message.message_id)
-                body, attachment_names, attachments = extract_body(
-                    payload, body_char_limit
-                )
+                content = self.gateway.content(message.provider_message_id, body_char_limit)
                 if not dry_run:
-                    self.store.replace_attachments(message.message_id, attachments)
+                    self.store.replace_attachments(message.message_id, content.attachments)
                 analysis = self.model.analyze(
                     sender=message.sender,
                     subject=message.subject,
                     received_at=message.received_at,
-                    body=body,
-                    attachment_names=attachment_names,
+                    body=content.body,
+                    attachment_names=content.attachment_names,
                     current_local_time=current_local_time,
                     request_id=request_id,
                 )
@@ -245,7 +307,7 @@ class Watcher:
                     fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
                 elif not self.config.notifications_enabled and not dry_run:
                     self.store.mark_delivery_complete(message.message_id, notified=False)
-            except MessageUnavailable as exc:
+            except MailboxMessageUnavailable as exc:
                 logger.info(
                     "Skipping pending message %s (gone before fetch): %s",
                     message.message_id,

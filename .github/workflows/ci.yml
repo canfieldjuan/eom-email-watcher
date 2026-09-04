@@ -23,8 +23,15 @@ jobs:
 
   windows-operation-lock:
     runs-on: windows-latest
+    env:
+      CONNECT_CONTRACTS_DIR: ${{ github.workspace }}\connect-contracts
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: canfieldjuan/connect-contracts
+          ref: 3005d82a7be885fba36f8688b5967a5b56a0abea
+          path: connect-contracts
       - uses: astral-sh/setup-uv@v8.3.2
         with:
           python-version: "3.13"
@@ -36,11 +43,20 @@ jobs:
           tests/test_config.py::test_packaged_tzdata_supports_default_zone_without_system_database
           tests/test_engine_api.py::test_read_operations_are_versioned_and_do_not_expose_token_paths
           tests/test_engine_api.py::test_check_defers_delivery_until_state_checked_ack
+          tests/test_windows_connect.py
 
   windows-package:
     runs-on: windows-latest
+    env:
+      CONNECT_CONTRACTS_DIR: ${{ github.workspace }}\connect-contracts
+      LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE: ${{ github.workspace }}\connect-contracts\entitlements\v1\release\keyring.json
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: canfieldjuan/connect-contracts
+          ref: 3005d82a7be885fba36f8688b5967a5b56a0abea
+          path: connect-contracts
       - uses: astral-sh/setup-uv@v8.3.2
         with:
           python-version: "3.13"
@@ -70,7 +86,7 @@ jobs:
         shell: pwsh
         run: |
           $triple = (rustc --print host-tuple).Trim()
-          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe"
+          uv run --project . python scripts/smoke_packaged_engine.py "desktop/src-tauri/binaries/eom-mail-engine-$triple.exe" --expected-entitlement-state missing
       - uses: actions/upload-artifact@v7
         with:
           name: email-watcher-windows-nsis

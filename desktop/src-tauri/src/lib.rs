@@ -6,8 +6,8 @@ use delivery::NotificationDelivery;
 use engine::{
     CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
     ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
-    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxItem,
-    WatchedSender,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -20,7 +20,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-const INBOX_LIMIT: u16 = 50;
 const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
 const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(desktop)]
@@ -274,9 +273,39 @@ async fn config_initialize(
 }
 
 #[tauri::command]
-async fn inbox_recent(engine: State<'_, Engine>) -> Result<Vec<InboxItem>, EngineError> {
+async fn inbox_query(
+    engine: State<'_, Engine>,
+    query: InboxQuery,
+) -> Result<InboxPage, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.recent(INBOX_LIMIT))
+    tauri::async_runtime::spawn_blocking(move || engine.query_inbox(query))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_delete(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    message_id: String,
+) -> Result<(), EngineError> {
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_exclusive(|| engine.delete_inbox_item(message_id))
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn inbox_clear(
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+) -> Result<u64, EngineError> {
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delivery.run_exclusive(|| engine.clear_inbox()))
         .await
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
@@ -474,6 +503,65 @@ async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization
 }
 
 #[tauri::command]
+async fn mail_accounts_list(engine: State<'_, Engine>) -> Result<MailAccounts, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.mail_accounts())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_connect(
+    engine: State<'_, Engine>,
+    provider: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.connect_mail_provider(provider))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_reconnect(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.reconnect_mail_account(provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_disconnect(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.disconnect_mail_account(provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn mail_account_activate(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<MailAccountResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.activate_mail_account(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.settings())
@@ -484,6 +572,7 @@ async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, Engin
 #[tauri::command]
 async fn settings_update(
     engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
     poll_interval_minutes: u64,
     retention_days: u64,
     notifications_enabled: bool,
@@ -491,14 +580,17 @@ async fn settings_update(
     model_name: Option<String>,
 ) -> Result<EngineSettings, EngineError> {
     let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        engine.update_settings(
-            poll_interval_minutes,
-            retention_days,
-            notifications_enabled,
-            model_base_url,
-            model_name,
-        )
+        delivery.run_exclusive(|| {
+            engine.update_settings(
+                poll_interval_minutes,
+                retention_days,
+                notifications_enabled,
+                model_base_url,
+                model_name,
+            )
+        })
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -514,15 +606,11 @@ async fn watcher_check(
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let outcome = delivery.check_and_deliver(&app, &engine)?;
-        let remaining_notifications = outcome
-            .check
-            .pending_notifications
-            .saturating_sub(outcome.delivery.delivered);
         Ok(DesktopCheckResult {
             check: outcome.check,
             delivered_notifications: outcome.delivery.delivered,
             failed_notifications: outcome.delivery.failed,
-            remaining_notifications,
+            remaining_notifications: outcome.delivery.remaining,
         })
     })
     .await
@@ -641,8 +729,8 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(move || {
                 match startup_delivery.deliver(&startup_app, &startup_engine) {
                     Ok(outcome) if outcome.failed > 0 => eprintln!(
-                        "{} watcher startup notifications remain queued after delivery errors",
-                        outcome.failed
+                        "{} watcher startup notification deliveries failed; {} remain queued",
+                        outcome.failed, outcome.remaining
                     ),
                     Ok(_) => {}
                     Err(error) => {
@@ -671,7 +759,14 @@ pub fn run() {
             config_status,
             gmail_authorize,
             health_get,
-            inbox_recent,
+            inbox_clear,
+            inbox_delete,
+            inbox_query,
+            mail_account_activate,
+            mail_account_connect,
+            mail_account_disconnect,
+            mail_account_reconnect,
+            mail_accounts_list,
             settings_get,
             settings_update,
             watcher_check,

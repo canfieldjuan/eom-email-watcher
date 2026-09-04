@@ -60,6 +60,7 @@ def seeded_runtime(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     runtime.store.add_message(
         message_id="message-1",
         thread_id=None,

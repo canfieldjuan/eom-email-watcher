@@ -102,7 +102,7 @@ h1 {
 .view-tabs button:focus-visible,
 .remove-button:focus-visible,
 .primary-action:focus-visible,
-.gmail-action:focus-visible,
+.mail-account-actions button:focus-visible,
 .settings-form button:focus-visible {
   outline: 3px solid rgb(46 107 76 / 25%);
   outline-offset: 2px;
@@ -180,9 +180,68 @@ input {
   outline: none;
 }
 
-input:focus {
+select {
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid #c8d1ca;
+  border-radius: 10px;
+  color: #17211b;
+  background: #fff;
+  outline: none;
+}
+
+input:focus,
+select:focus {
   border-color: #2e6b4c;
   box-shadow: 0 0 0 3px rgb(46 107 76 / 14%);
+}
+
+.inbox-filter-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid #d7ded8;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 82%);
+  box-shadow: 0 18px 50px rgb(28 54 38 / 8%);
+}
+
+.inbox-filter-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 9px;
+}
+
+.inbox-filter-actions button,
+.inbox-page-actions button {
+  padding: 10px 15px;
+  border: 0;
+  border-radius: 9px;
+  color: #fff;
+  background: #245c40;
+  font-weight: 800;
+}
+
+.inbox-filter-actions .secondary-action {
+  border: 1px solid #9fb2a5;
+  color: #245c40;
+  background: #f7faf7;
+}
+
+.inbox-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 16px;
+}
+
+.inbox-page-actions .danger-action {
+  margin-left: auto;
+  border: 1px solid #d9aaa7;
+  color: #8f2f2b;
+  background: #fff8f7;
 }
 
 .sender-form button {
@@ -252,6 +311,10 @@ input:focus {
   color: #2e6b4c;
 }
 
+.status[data-kind="warning"] {
+  color: #765a2d;
+}
+
 .sender-list {
   display: grid;
   gap: 10px;
@@ -305,6 +368,28 @@ input:focus {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.message-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.message-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.category-badge {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #4d5b52;
+  background: #e8ede8;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: capitalize;
 }
 
 .message-meta {
@@ -565,7 +650,8 @@ input:focus {
   content: "";
 }
 
-.connect-health-card {
+.connect-health-card,
+.mail-health-card {
   grid-column: 1 / -1;
 }
 
@@ -615,14 +701,65 @@ input:focus {
   font-weight: 400;
 }
 
-.gmail-action,
-.connect-action {
+.connect-action,
+.mail-account-actions button,
+.mail-health-card .health-card-action button {
   padding: 8px 11px;
   border: 1px solid #9fb2a5;
   border-radius: 8px;
   color: #245c40;
   background: #f7faf7;
   font-weight: 800;
+}
+
+.mail-account-list {
+  display: grid;
+  gap: 9px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mail-account-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 11px;
+  border: 1px solid #d7ded8;
+  border-radius: 10px;
+  background: #f8faf8;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+
+.mail-account-item > div:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.mail-account-item strong,
+.mail-account-item span {
+  overflow-wrap: anywhere;
+}
+
+.mail-account-item span {
+  color: #657068;
+  font-size: 0.75rem;
+}
+
+.mail-account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.mail-account-actions .danger-action {
+  border-color: #d9aaa7;
+  color: #8f2f2b;
+  background: #fff8f7;
 }
 
 .health-details {
@@ -660,6 +797,10 @@ input:focus {
     grid-template-columns: 1fr;
   }
 
+  .inbox-filter-form {
+    grid-template-columns: 1fr;
+  }
+
   .settings-form {
     grid-template-columns: 1fr;
   }
@@ -680,6 +821,15 @@ input:focus {
 
   .health-grid {
     grid-template-columns: 1fr;
+  }
+
+  .message-footer {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .message-footer-actions {
+    flex-wrap: wrap;
   }
 
   .health-details div {

@@ -1,8 +1,8 @@
 # Tauri desktop proof
 
-The Linux desktop proof exposes a read-only Inbox backed by the existing SQLite message ledger,
-the useful watchlist path, and a live Health view. Health can inspect Gmail, local AI, database,
-and notification readiness, then run one production-safe `Check now` through the existing
+The Linux desktop proof exposes a local Inbox backed by the existing SQLite message ledger,
+the useful watchlist path, and a live Health view. Health can inspect mail accounts, local AI,
+database, and notification readiness, then run one production-safe `Check now` through the existing
 versioned Python engine contract. The host drains a bounded batch of durable notification intents
 through Tauri's native notification plugin on startup and after `Check now`. On compatible hosts, a
 single-instance process also polls automatically using `poll_interval_minutes` (120 minutes by
@@ -17,12 +17,18 @@ Settings can safely update polling cadence, message retention, and native-notifi
 through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
 exact-loopback inference, the same UI can update the HTTP endpoint and model identifier. A gateway
 endpoint and model are read-only, while gateway trust and authentication credentials remain managed
-externally. A new polling cadence takes effect after the app restarts; model, retention, and
-notification changes are read by later watcher operations.
+externally. A new polling cadence takes effect after the app restarts; model and notification
+changes are read by later watcher operations, while a retention change immediately removes local
+history older than the new source-time cutoff.
+
+Inbox cards can delete one message from local history, and the Inbox can clear all local history,
+only after native confirmation. These operations remove local analysis, notification state,
+attachment metadata, and capability jobs/results. They never call a mail provider or delete source
+email, and they preserve the mailbox sync cursor and the separate EOM outbound-send ledger.
 
 Inbox cards show ordered attachment filenames, media types, and byte sizes from the durable message
-ledger. Open fetches only the selected attachment through the read-only Gmail engine, writes it to a
-mode-0600 file in a process-owned temporary directory, and asks the operating system to open it with
+ledger. Open fetches only the selected attachment through the read-only source-mail adapter, writes it
+to a mode-0600 file in a process-owned temporary directory, and asks the operating system to open it with
 the default application. The host attempts to remove the temporary directory on an orderly app exit.
 Its path is not returned to frontend JavaScript.
 
@@ -30,7 +36,7 @@ For compatible PDF attachments, the same card shows a provider-neutral Summarize
 the paid Connect entitlement is active and exactly one authenticated local `document.summarize`
 v1.0 capability is discoverable. The frontend knows the capability and media type, not a provider
 app ID or license contents. The Python engine rechecks entitlement and discovery before submission,
-fetches only the selected Gmail attachment, persists job state and the verified summary, and never
+fetches only the selected source attachment, persists job state and the verified summary, and never
 sends mail metadata or credentials to the provider. Inbox loading succeeds even when Connect
 discovery fails.
 
@@ -47,11 +53,11 @@ entitlement.
 
 The host acknowledges an intent only after the platform notification API accepts it. Failed or
 interrupted delivery remains queued, does not block later intents in the bounded batch, and may be
-retried by `Check now` even when the Gmail check itself fails. The existing at-least-once duplicate
-window remains between platform acceptance and durable acknowledgement. It does **not** yet own
-public Google OAuth verification. When an OAuth desktop-client identity
-is configured externally or injected into the release build, Health can run the read-only Gmail
-browser authorization flow and initialize the current-mailbox baseline. The existing systemd
+retried by `Check now` even when the mailbox check itself fails. The existing at-least-once duplicate
+window remains between platform acceptance and durable acknowledgement. When a Google or Microsoft
+OAuth desktop-client identity is configured externally or injected into the release build, Health
+can run the provider's read-only browser authorization flow and initialize the current-mailbox
+baseline. The existing systemd
 watcher remains the production polling path while equivalent live behavior is evaluated; the
 production check lock continues to fail closed if both schedulers overlap. Scheduled engine
 processes have a 30-minute upper bound, and wall-clock deadline checks catch up after system resume.
@@ -133,6 +139,20 @@ account grants rather than only the reusable Desktop client identity. A build wi
 remains suitable for development but requires the existing external credentials file before Gmail
 can connect.
 
+An approved Microsoft Entra public desktop-client identity can be embedded independently:
+
+```bash
+EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE=/secure/path/microsoft-public-client.json \
+  pnpm tauri build --bundles deb
+```
+
+The JSON contains only `client_id` and `tenant` (`organizations` or a tenant UUID). The build rejects
+client secrets, account tokens, invalid identifiers, and consumer/common tenant selectors. The Entra
+registration must allow public-client `http://localhost` redirect and delegated Graph `Mail.Read`.
+User grants are created only by the installed app and remain in its private per-account state. A
+build without this variable can still connect Microsoft 365 when the external
+`microsoft_credentials_file` is configured.
+
 An official Connect-enabled sidecar must also embed the production issuer public-key ring:
 
 ```bash
@@ -141,10 +161,19 @@ LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json 
 ```
 
 The key ring contains public verification keys only. Private signing keys must never be supplied
-to the build or committed. A build without this variable remains a healthy standalone Email
-Watcher but Connect capability discovery and invocation fail closed. This variable is consumed by
-the release build script; there is no runtime environment override for issuer trust, and such a
-build reports `authority_unavailable` instead of admitting license installation.
+to the build or committed. The release builder also requires the parsed issuer ID and public key to
+match the authority explicitly approved in the builder; a merely production-shaped replacement is
+rejected even if a filesystem path is raced. A build without this variable remains a healthy
+standalone Email Watcher but Connect capability discovery and invocation fail closed. This variable
+is consumed by the release build script; there is no runtime environment override for issuer trust,
+and such a build reports `authority_unavailable` instead of admitting license installation.
+
+The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
+arguments using the host platform separator, and the Windows package reads the shared entitlement
+from `%LOCALAPPDATA%\LocalConnect\entitlement-v1.json`. Provider registrations are discovered from
+`%LOCALAPPDATA%\LocalConnect\runtime\v1|v2\providers`. The runtime verifies that the root and every
+trusted descendant have no content or mutation grant beyond the user, SYSTEM, or built-in
+Administrators; no XDG variables are required on Windows.
 
 ## Verification
 
@@ -158,7 +187,7 @@ pnpm tauri build --bundles deb
 
 The Rust tests perform real health, inactive-check, add/list/remove, capability-discovery, and
 summary-command contract calls through `eom-mail-engine` using isolated config. The inactive check
-proves the host contract without contacting Gmail. `scripts/connect-local-proof.py` is the explicit
+proves the host contract without contacting a mail provider. `scripts/connect-local-proof.py` is the explicit
 cross-process proof harness: it uses a real Document Summarizer provider process and real Email
 Watcher persistence with synthetic Gmail attachment bytes. Its default mode starts a deterministic
 local fixture model that satisfies the provider's current structured evidence, synthesis, and
@@ -196,19 +225,25 @@ the bounded fixture model so it can pause safely. An authenticated endpoint may 
 Both configured-model fields are required together, and the provider retains final endpoint
 validation. Neither mode claims a live Gmail OAuth or human UI-click test.
 
+When `scripts/smoke_packaged_engine.py` is run independently of the build, pass the authority state
+embedded in that already-built binary explicitly: `--expected-entitlement-state missing` for a
+Connect-enabled package or `--expected-entitlement-state authority_unavailable` for a standalone
+package. The smoke test does not infer package contents from the caller's current environment.
+
 ### Packaged Debian interoperability proof
 
-After building both Debian packages from their current checkouts with the canonical test public key
-ring, exercise the two shipped binaries together. Set `LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
-`connect-contracts/entitlements/v1/fixtures/test-keyring.json` for both builds so the fixture license
-below is accepted; production packages instead require an entitlement signed by their embedded
-production authority.
+After building both Debian packages from their current checkouts with the canonical production
+public-key ring, exercise the two shipped binaries together. Set
+`LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE` to
+`connect-contracts/entitlements/v1/release/keyring.json` for both builds, then supply an acquired
+active entitlement signed by that authority. Fixture/test key IDs are intentionally rejected by the
+release builders; the source-level proof above remains the place for fixture authority.
 
 ```bash
 uv run python scripts/connect-packaged-deb-proof.py \
   --consumer-deb "desktop/src-tauri/target/release/bundle/deb/Email Watcher_0.1.0_amd64.deb" \
   --provider-deb "/path/to/Document Summarizer_0.1.0_amd64.deb" \
-  --active-entitlement "/path/to/connect-contracts/entitlements/v1/fixtures/valid/active.json"
+  --active-entitlement "/secure/path/production-entitlement-v1.json"
 ```
 
 The harness requires `dpkg-deb`, `dbus-run-session`, and `xvfb-run`. It extracts rather than
@@ -223,9 +258,11 @@ provider launch, stop, and restart, the provider's durable instance identity sur
 the packaged consumer Inbox remains readable while the provider is absent. It does not contact
 Gmail or a model, submit a capability job, install either package through the OS package manager, or
 exercise a human UI click. The source-level `connect-local-proof.py` remains the job handoff,
-idempotency, persistence, output, and privacy proof. Native Windows execution remains separate:
-the Windows Email Watcher installer is built and checked by `windows-package`, while a two-app
-Windows proof requires a native Document Summarizer package and an actual Windows test session.
+idempotency, persistence, output, and privacy proof. Native Windows execution remains separate: the
+`windows-package` job embeds the release public key ring, runs native
+placement/activation/discovery probes, builds the Email Watcher installer, and requires the
+packaged engine to report `missing` rather than `authority_unavailable`. The two-app job handoff is
+the remaining release-acceptance step for an actual Windows test session.
 
 The icon is a temporary text-free engineering asset required by Tauri's Unix build. It is not a
 final product-brand decision.

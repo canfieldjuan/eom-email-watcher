@@ -3,6 +3,7 @@ body_char_limit = 20000
 retention_days = 180
 poll_interval_minutes = 120
 gmail_credentials_file = "~/.local/state/eom-email-watcher/credentials.json"
+microsoft_credentials_file = "~/.local/state/eom-email-watcher/microsoft-oauth-client.json"
 gmail_token_file = "~/.local/state/eom-email-watcher/token.json"
 gmail_send_token_file = "~/.local/state/eom-email-watcher/send-token.json"
 monthly_hours_recipient = "billing-contact@example.com"

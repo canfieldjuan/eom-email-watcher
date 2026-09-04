@@ -20,6 +20,15 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from .config import normalize_address
+from .mailbox import (
+    MailboxChanges,
+    MailboxError,
+    MailboxMessageUnavailable,
+    MessageContent,
+    MessageMetadata,
+    StaleMailboxCursor,
+)
+from .mime import extract_body
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
@@ -27,7 +36,7 @@ GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 
 
-class GmailError(RuntimeError):
+class GmailError(MailboxError):
     """Gmail operation failed."""
 
 
@@ -35,14 +44,20 @@ class GmailAuthorizationRejected(GmailError):
     """Gmail rejected credentials that appeared usable locally."""
 
 
-class StaleHistoryCursor(GmailError):
+class StaleHistoryCursor(GmailError, StaleMailboxCursor):
     """The saved Gmail history cursor has expired."""
 
 
-class MessageUnavailable(GmailError):
+class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     """A specific message could not be fetched -- e.g. it was deleted or
     expunged after the history event that referenced it. Recoverable: the
     caller should skip this one message, not fail the whole run."""
+
+
+@dataclass(frozen=True)
+class GmailProfile:
+    email_address: str
+    history_id: str
 
 
 def resolve_gmail_credentials_file(configured_file: Path) -> Path:
@@ -59,17 +74,6 @@ def resolve_gmail_credentials_file(configured_file: Path) -> Path:
 
 def gmail_credentials_configured(configured_file: Path) -> bool:
     return resolve_gmail_credentials_file(configured_file).is_file()
-
-
-@dataclass(frozen=True)
-class MessageMetadata:
-    message_id: str
-    thread_id: str | None
-    sender: str
-    sender_name: str | None
-    subject: str
-    received_at: str
-    labels: frozenset[str]
 
 
 def _headers(payload: dict[str, Any]) -> dict[str, str]:
@@ -92,8 +96,9 @@ def _received_at(message: dict[str, Any], headers: dict[str, str]) -> str:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(UTC).isoformat()
-    except (TypeError, ValueError):
-        return datetime.now(UTC).isoformat()
+    except (OverflowError, TypeError, ValueError):
+        # Keep malformed source time invalid so retention admission rejects it.
+        return ""
 
 
 def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
@@ -118,9 +123,7 @@ def _decode_attachment_data(value: object) -> bytes:
     if not isinstance(value, str):
         raise GmailError("Gmail attachment response did not contain data")
     try:
-        return base64.b64decode(
-            value + "=" * (-len(value) % 4), altchars=b"-_", validate=True
-        )
+        return base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
     except (binascii.Error, ValueError) as exc:
         raise GmailError("Gmail attachment response contained invalid data") from exc
 
@@ -155,26 +158,33 @@ class GmailGateway:
                 credentials: Credentials | None = None
                 if token_file.exists():
                     try:
-                        credentials = Credentials.from_authorized_user_file(
-                            str(token_file), SCOPES
-                        )
+                        credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
                     except (ValueError, json.JSONDecodeError) as exc:
-                        raise GmailError(f"Invalid OAuth token file: {token_file}") from exc
+                        raise GmailAuthorizationRejected(
+                            f"Invalid OAuth token file: {token_file}"
+                        ) from exc
                 if credentials and credentials.expired and credentials.refresh_token:
-                    credentials.refresh(Request())
+                    try:
+                        credentials.refresh(Request())
+                    except RefreshError as exc:
+                        if exc.retryable:
+                            raise GmailError("Gmail authorization refresh failed; retry") from exc
+                        raise GmailAuthorizationRejected(
+                            "Gmail rejected the configured authorization"
+                        ) from exc
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
                 if not credentials or not credentials.valid:
-                    raise GmailError("Gmail is not authorized. Run: eom-mail-watch setup")
+                    raise GmailAuthorizationRejected(
+                        "Gmail is not authorized. Run: eom-mail-watch setup"
+                    )
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry the operation") from exc
         return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
-        gateway, _authorization_changed = cls.authorize_with_status(
-            credentials_file, token_file
-        )
+        gateway, _authorization_changed = cls.authorize_with_status(credentials_file, token_file)
         return gateway
 
     @classmethod
@@ -197,9 +207,7 @@ class GmailGateway:
                 credentials: Credentials | None = None
                 if token_file.exists() and not force_reauthorize:
                     try:
-                        credentials = Credentials.from_authorized_user_file(
-                            str(token_file), SCOPES
-                        )
+                        credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)
                     except (ValueError, json.JSONDecodeError):
                         credentials = None
                     if credentials and credentials.expired and credentials.refresh_token:
@@ -225,9 +233,7 @@ class GmailGateway:
                             timeout_seconds=GMAIL_AUTHORIZATION_TIMEOUT_SECONDS,
                         )
                     except WSGITimeoutError as exc:
-                        raise GmailError(
-                            "Gmail authorization timed out; retry setup"
-                        ) from exc
+                        raise GmailError("Gmail authorization timed out; retry setup") from exc
                     token_file.write_text(credentials.to_json(), encoding="utf-8")
                     token_file.chmod(0o600)
         except FileLockTimeout as exc:
@@ -237,7 +243,7 @@ class GmailGateway:
             authorization_changed,
         )
 
-    def profile_history_id(self) -> str:
+    def profile(self) -> GmailProfile:
         try:
             result = self.service.users().getProfile(userId="me").execute()
         except HttpError as exc:
@@ -246,7 +252,28 @@ class GmailGateway:
                     "Gmail rejected the configured authorization"
                 ) from exc
             raise GmailError(f"Gmail profile request failed (HTTP {exc.resp.status})") from exc
-        return str(result["historyId"])
+        email_address = normalize_address(str(result.get("emailAddress", "")))
+        local, separator, domain = email_address.rpartition("@")
+        if (
+            separator != "@"
+            or not local
+            or not domain
+            or "@" in local
+            or any(
+                character.isspace() or not character.isprintable() for character in email_address
+            )
+        ):
+            raise GmailError("Gmail profile response did not contain an email address")
+        history_id = str(result.get("historyId", "")).strip()
+        if not history_id:
+            raise GmailError("Gmail profile response did not contain a history cursor")
+        return GmailProfile(email_address=email_address, history_id=history_id)
+
+    def profile_history_id(self) -> str:
+        return self.profile().history_id
+
+    def initial_cursor(self) -> str:
+        return self.profile_history_id()
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
         ids: list[str] = []
@@ -283,6 +310,10 @@ class GmailGateway:
                 ) from exc
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
         return list(dict.fromkeys(ids)), newest
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        message_ids, newest = self.history_message_ids(cursor)
+        return MailboxChanges(tuple(message_ids), newest)
 
     def metadata(self, message_id: str) -> MessageMetadata:
         try:
@@ -321,9 +352,13 @@ class GmailGateway:
             raise GmailError(f"Gmail body fetch failed (HTTP {exc.resp.status})") from exc
         return message.get("payload") or {}
 
-    def attachment_bytes(
-        self, message_id: str, part_id: str, attachment_id: str | None
-    ) -> bytes:
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        body, attachment_names, attachments = extract_body(
+            self.full_payload(message_id), body_char_limit
+        )
+        return MessageContent(body, attachment_names, attachments)
+
+    def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if attachment_id:
             try:
                 response = (
@@ -338,9 +373,7 @@ class GmailGateway:
                     raise MessageUnavailable(
                         f"Gmail message {message_id} attachment unavailable (HTTP 404)"
                     ) from exc
-                raise GmailError(
-                    f"Gmail attachment fetch failed (HTTP {exc.resp.status})"
-                ) from exc
+                raise GmailError(f"Gmail attachment fetch failed (HTTP {exc.resp.status})") from exc
             return _decode_attachment_data(response.get("data"))
 
         part = _find_part(self.full_payload(message_id), part_id)
@@ -354,9 +387,7 @@ class GmailGateway:
             return _decode_attachment_data(inline_data)
         current_attachment_id = body.get("attachmentId")
         if isinstance(current_attachment_id, str) and current_attachment_id.strip():
-            return self.attachment_bytes(
-                message_id, part_id, current_attachment_id.strip()
-            )
+            return self.attachment_bytes(message_id, part_id, current_attachment_id.strip())
         raise GmailError("Gmail attachment part did not contain retrievable data")
 
     def search_since(self, addresses: frozenset[str], since: datetime) -> list[str]:
@@ -378,3 +409,6 @@ class GmailGateway:
             page_token = response.get("nextPageToken")
             if not page_token:
                 return list(dict.fromkeys(ids))
+
+    def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
+        return MailboxChanges(tuple(self.search_since(addresses, since)), self.initial_cursor())

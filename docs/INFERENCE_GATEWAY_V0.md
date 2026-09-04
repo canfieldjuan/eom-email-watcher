@@ -1,9 +1,11 @@
 # ADR-001: On-prem inference gateway v0 boundary
 
-**Status:** Proposed
+**Status:** Accepted direction; runtime proof pending
 **Date:** 2026-08-29
+**Updated:** 2026-09-03
 **Decider:** Juan Canfield
 **Scope:** Contract only; no runtime or application behavior changes
+**Implementation tracking:** GitHub issue #72
 
 ## Context
 
@@ -25,10 +27,18 @@ Current code cannot use that shape directly:
   but did not establish users, scoped authorization, fair scheduling, TLS, or appliance lifecycle
   (`docs/LLAMA_CPP_COMPATIBILITY.md:87-104`).
 
-Current direction notes disagree about the selected worker: Email Watcher Issue #13 names
-llama.cpp, while current Document Summarizer notes name Ollama. This is evidence that applications
-must not select a worker or model. Worker promotion remains a measured administrator deployment
-decision behind the gateway.
+Earlier direction notes disagreed about the selected worker: Email Watcher Issue #13 named
+llama.cpp, Document Summarizer selected Ollama, and the previous revision of this ADR selected vLLM
+with an Ollama fallback. Applications must still remain independent of that choice. On 2026-09-03,
+the administrator deployment policy superseded that worker order: Ollama is the primary worker and
+LM Studio's headless `llmster` service is the planned unloaded-model fallback.
+
+Email Watcher, Document Summarizer, and the in-flight Invoice Processor must use one shared
+Qwen3-30B-A3B deployment profile through the gateway. The logical profile is
+`qwen3-30b-a3b`; current development aliases such as `qwen3-30b-a3b:latest` and Ollama's published
+`qwen3:30b-a3b` tag are runtime-specific inputs to qualification, not fields applications send and
+not immutable production identities. Promotion pins the exact upstream checkpoint, quantization,
+model-content digest, runtime configuration, and runtime-specific identifier for both workers.
 
 ## Decision
 
@@ -38,6 +48,7 @@ more model workers.
 ```text
 Email Watcher ---------\
 Document Summarizer ----+-- HTTPS + app credential --> Inference Gateway --> worker(s)
+Invoice Processor ------/                                  |
 Future local apps ------/                                  |
                                                            +-- task policy
                                                            +-- bounded fair queue
@@ -51,6 +62,69 @@ execute this application's model request?”
 
 The first implementation will use direct application-to-gateway HTTPS. It will not add a
 per-desktop loopback proxy unless real client-platform evidence later proves one necessary.
+
+## Worker deployment policy
+
+- Ollama is the primary inference worker. Promotion pins the exact Ollama package or container,
+  dependency set, immutable model manifest and content digests, complete serving configuration,
+  and cloud-disabled environment (`OLLAMA_NO_CLOUD=1`). Each task must pass its task-specific
+  deterministic metrics and validation plus blinded human review for semantic outputs; structural
+  validity alone is not evidence of useful model behavior.
+- LM Studio is the planned fallback worker. Its headless `llmster` daemon and HTTP server may remain
+  running without a loaded model. Just-In-Time loading and eviction may load the approved
+  Qwen3-30B-A3B profile only after fallback admission. Qualification pins the exact LM Studio and
+  inference-runtime versions, dependency set, model-content digest, model identifier, context/GPU/
+  structured-output settings, JIT/eviction configuration, and authentication/network policy.
+  Before policy marks LM Studio eligible for a task, that task must independently pass the same
+  task-specific deterministic metrics and validation plus blinded human review required of the
+  primary. Protocol similarity or a matching display name is not evidence of artifact, semantic,
+  or privacy compatibility.
+- vLLM and standalone llama.cpp are not selected production-worker targets for this v0 deployment.
+  Existing deployment files and compatibility evidence may remain for historical comparison, but
+  no application client should bind directly to them or to either selected worker.
+- The gateway owns worker selection, health, model-profile resolution, and fallback. Email Watcher,
+  Document Summarizer, Invoice Processor, and later applications submit task requirements and never
+  select Ollama, LM Studio, a model artifact, or a fallback order.
+- There is no cloud fallback. If neither approved local worker can serve a task, the gateway returns
+  the existing bounded availability error and the application preserves its standalone behavior.
+- Worker listeners are gateway-private: bind them to gateway-host loopback or a local socket, or
+  enforce equivalent host/network isolation. Client computers must reach only the gateway and must
+  not be able to connect directly to either worker endpoint.
+
+Fallback is fail-closed and identity-preserving:
+
+1. A new request may use LM Studio only when policy marks Ollama unavailable before that work is
+   admitted and LM Studio is healthy and qualified for the same task requirements and model
+   profile.
+2. An ambiguous or in-flight Ollama failure remains unresolved on its original gateway request and
+   worker-attempt identity. The gateway must recover the primary's authoritative result, prove that
+   the primary never accepted the request, or confirm cancellation before LM Studio may execute it.
+   Reusing the request ID alone is not evidence that duplicate work cannot occur.
+3. Authentication, authorization, malformed input, unsupported-task, and application-validation
+   failures do not trigger fallback.
+4. Client health reports task availability or degradation, never the chosen worker name.
+
+Before worker dispatch, the gateway durably reserves the authenticated request ID, immutable
+request expiry, canonical request digest, and selected worker attempt. Exact repeats join active
+work or return the protected result until the application acknowledges durable receipt. A reused ID
+with different content is rejected. After acknowledgement or expiry, the gateway deletes the
+content-bearing result but retains a metadata-only terminal tombstone for a bounded replay-protection
+period beyond the request expiry. The client must never reuse an expired request ID, and the gateway
+rejects any request whose immutable expiry has passed rather than dispatching it again.
+
+The intended single-GPU fallback posture is a running LM Studio daemon/server with no resident
+model. JIT may load the approved model after known pre-admission Ollama unavailability. The gateway
+must not assume that an unhealthy primary released VRAM: it must prove the primary has no admitted
+or ambiguous work and that sufficient capacity is available, explicitly unload/stop the primary
+model under the appliance lifecycle contract, or keep the fallback unavailable. Concurrent primary
+and fallback residency requires separate capacity evidence or separate hardware.
+
+On 2026-09-03, the development machine reported Ollama client 0.24.0 with no running server and no
+installed manifest for the selected profile. LM Studio's `llmster` server was listening on loopback
+with no model loaded, and matching Qwen3-30B-A3B GGUF candidates existed on disk. This is
+installation and cold-standby-shape evidence only, not workload, artifact-equivalence, JIT-load, or
+failover proof. The first proof must create or acquire the selected Ollama mapping and pin both
+workers' exact artifacts and serving configurations before either is called production-ready.
 
 ## Ownership boundaries
 
@@ -138,6 +212,7 @@ Illustrative request:
 {
   "protocol_version": 1,
   "request_id": "018f...uuid",
+  "request_expires_at": "2026-09-08T18:00:00Z",
   "task": {
     "id": "email.analyze",
     "version": 1
@@ -161,16 +236,31 @@ Illustrative request:
 
 Required rules:
 
-- `protocol_version`, `request_id`, task ID/version, requirements, and generation payload are
-  mandatory and bounded.
+- `protocol_version`, `request_id`, `request_expires_at`, task ID/version, requirements, and
+  generation payload are mandatory and bounded. The client chooses and durably records the immutable
+  expiry before first submission; gateway task policy rejects expiries outside its allowed window.
+- `request_id` is the canonical lowercase UUIDv4 text form matching
+  `^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`. Alternate or
+  percent-encoded forms are rejected, so the same value is unambiguous in JSON and a URL segment.
 - The request contains no `model`, worker URL, runtime command, lane name, user role, or routing
   override.
 - The gateway authorizes the task before queueing and rejects requirements unsupported by its
   current policy.
 - The gateway treats prompts and content as opaque untrusted data. Task IDs control policy; prompt
   text cannot select workers or elevate limits.
-- A repeated active `request_id` for the same credential and canonical request joins or reuses that
-  work. Reuse with different content is rejected.
+- Before dispatch, the gateway durably reserves `request_id`, `request_expires_at`, credential
+  identity, a canonical request digest, and worker-attempt identity. An exact repeat joins active
+  work or returns the protected unacknowledged result across gateway restarts. Reuse with different
+  content is rejected.
+- The application acknowledges a result only after it has durably persisted either the validated
+  domain result or a terminal application-validation rejection. Acknowledgement authorizes deletion
+  of the gateway's content-bearing result, not deletion of its metadata tombstone.
+- An expired request is never dispatched. The gateway returns permanent `request_expired`; the
+  client stops automatic retries for that identity and exposes an explicit requeue that creates a
+  new request ID and expiry.
+- Expiry terminalizes the request and any in-flight worker attempt. The gateway requests best-effort
+  cancellation but does not depend on cancellation succeeding: output arriving after expiry is
+  discarded and cannot recreate the result buffer or change the terminal tombstone.
 
 Illustrative success:
 
@@ -193,6 +283,49 @@ Illustrative success:
 The gateway may return opaque deployment provenance for audit and comparison. Applications do not
 branch business behavior on a worker or model name.
 
+### Result acknowledgement operation
+
+After durable application handling, the client calls
+`POST /v1/inference/{request_id}/ack` with the same application credential that owns the reserved
+request:
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "018f...uuid",
+  "disposition": "persisted"
+}
+```
+
+`disposition` is either `persisted` or `application_rejected`. The acknowledgement contains no
+generated output, prompt, validation detail, or other customer content. The path and body request
+IDs must match.
+
+A successful first or exact-repeat acknowledgement returns HTTP 200:
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "018f...uuid",
+  "status": "acknowledged",
+  "disposition": "persisted"
+}
+```
+
+The gateway accepts acknowledgement only from the credential identity that owns the reservation.
+Another valid credential receives `forbidden`; the gateway makes no state change or deletion, and
+the protected result remains available to its owner. The first valid acknowledgement of a terminal,
+unexpired result atomically records its disposition in the metadata tombstone and deletes the
+content-bearing result.
+
+Acknowledgement and expiry use one serialized state transition. If acknowledgement commits first,
+its tombstone disposition takes precedence over later wall-clock expiry: an exact repeat returns the
+same HTTP 200 response while that tombstone exists, even after request expiry, while a conflicting
+disposition fails permanently with `acknowledgement_conflict`. If expiry commits first, the request
+returns `request_expired` and cannot be acknowledged. A nonterminal, unexpired request returns
+`result_not_terminal`. After bounded tombstone cleanup, an unknown ID returns `unknown_request`.
+None of these responses can revive work or retain late output.
+
 ## Failure and scheduling contract
 
 The gateway returns a stable bounded error envelope with `code`, `retryable`, and optional
@@ -213,10 +346,11 @@ The gateway returns a stable bounded error envelope with `code`, `retryable`, an
 
 The client rejects malformed envelopes, mismatched request IDs, non-boolean `retryable` values,
 retry delays outside 1 through 86400 seconds, and retry delays on permanent failures. For Email
-Watcher, one analysis attempt keeps the same request ID, context timestamp, and body-size limit
-across process restarts. The request is reconstructed from Gmail's immutable message payload rather
-than persisting the raw body. An explicit requeue after configuration or contract repair creates a
-new request identity.
+Watcher, one analysis attempt keeps the same request ID, expiry, context timestamp, and body-size
+limit across process restarts. The request is reconstructed from Gmail's immutable message payload
+rather than persisting the raw body. Automatic retries stop at the immutable expiry. An explicit
+requeue after expiry, configuration repair, contract repair, or terminal application-output
+rejection creates a new request identity and expiry.
 
 Minimum classes:
 
@@ -230,6 +364,17 @@ Minimum classes:
 | worker_unavailable | Approved worker is unhealthy | Preserve local work and retry later |
 | inference_timeout | Admitted inference exceeded its deadline | Preserve local work and retry per app policy |
 | invalid_worker_output | Worker response violated the gateway envelope | Do not treat as domain-valid output |
+| request_expired | The immutable request lifetime ended | Stop automatic retries; offer explicit new-identity requeue |
+| unknown_request | No live reservation or retained tombstone identifies the request | Stop acknowledgement/retry for that identity |
+| result_not_terminal | Acknowledgement arrived before a terminal result | Do not delete content; reconcile the request first |
+| acknowledgement_conflict | A different acknowledgement disposition already won | Preserve the first terminal disposition |
+
+Application validation happens after the gateway returns a valid envelope. If the application
+rejects that output, it durably marks the original request terminally rejected and acknowledges
+receipt so the gateway can delete the buffered result. It must not automatically resubmit that
+identity and receive the same retained output forever. Email Watcher's current generic `ModelError`
+path retries such failures, so gateway cutover is blocked until the client maps this case to the
+terminal rejection plus explicit requeue behavior.
 
 v0 scheduling is a bounded fair queue across client credentials, with per-credential in-flight and
 queued limits. It must prevent one document workload from starving small email tasks. Exact queue
@@ -259,9 +404,17 @@ Default logs and metrics may contain:
 - opaque deployment/policy versions.
 
 They must not contain prompts, email/document content, generated output, bearer credentials,
-filenames, sender/subject, attachment bytes, or application database identifiers. Temporary worker
-payloads are memory-only unless an administrator explicitly enables a separately designed and
-audited diagnostic mode.
+filenames, sender/subject, attachment bytes, or application database identifiers. Prompts and
+worker input payloads are memory-only unless an administrator explicitly enables a separately
+designed and audited diagnostic mode.
+
+Generated output awaiting application acknowledgement is a narrow exception: it is encrypted at
+rest in a gateway-owned, credential-scoped result buffer, accessible only to the same authenticated
+credential and canonical request. It is excluded from logs, metrics, diagnostics, and backups and
+is deleted on durable application acknowledgement or immutable request expiry. For a bounded
+replay-protection period beyond expiry, a metadata-only tombstone retains request ID, credential
+hash, canonical digest, terminal status, timestamps, and expiry, but no prompt or generated content.
+Late worker output is discarded before durable storage and cannot resurrect expired content.
 
 ## Availability and standalone behavior
 
@@ -288,7 +441,7 @@ audited diagnostic mode.
 This is the smallest mechanism that provides encrypted multi-user access without exposing workers
 or duplicating a resident bridge on every computer.
 
-### B. Expose llama.cpp/Ollama directly on the LAN — rejected
+### B. Expose worker runtimes directly on the LAN — rejected
 
 It leaks worker/model selection into apps and the network surface. The proven API-key boundary does
 not establish administrator/user roles, per-task scopes, fair scheduling, stable errors, or
@@ -322,9 +475,12 @@ What becomes easier:
 What becomes harder:
 
 - the appliance must provision TLS trust and application credentials;
-- both current apps need additive gateway adapters and health states;
+- Email Watcher and Document Summarizer need additive gateway adapters and health states, while the
+  in-flight Invoice Processor must start on that same client contract rather than add a direct
+  worker binding;
 - the gateway becomes shared infrastructure that requires backup/update/recovery procedures;
-- sustained-load sizing and model-lane promotion need evidence rather than guesses.
+- sustained-load sizing, cold-fallback latency, and model-profile promotion need evidence rather
+  than guesses.
 
 ## Explicit non-goals for v0
 
@@ -334,20 +490,83 @@ What becomes harder:
 - chat UI, streaming tokens, async callbacks, or durable distributed job queues;
 - model download UI, GPU installers, marketplace, billing, licensing, or analytics dashboard;
 - attachment/vision transport before the text proof is accepted;
-- selecting llama.cpp, Ollama, a model, quantization, or lane count in the application contract.
+- selecting Ollama, LM Studio, a model, quantization, fallback order, or lane count in the
+  application contract;
+- defining Invoice Processor's domain task, schema, or product behavior while that application is
+  in flight, or requiring its client adoption in the current two-task proof.
 
 ## First implementation proof after acceptance
 
-Build one gateway process with one text worker and two administrator-allowed task IDs:
-`email.analyze@1` and `document.chunk.summarize@1`. Prove, with synthetic content only:
+Build one gateway process with Ollama primary, unloaded-model LM Studio fallback, the single
+Qwen3-30B-A3B deployment profile, and two administrator-allowed task IDs:
+`email.analyze@1` and `document.chunk.summarize@1`. Proving Invoice Processor adoption is a later
+acceptance gate after its in-flight repository publishes a versioned task; that application must
+then use this same client and deployment-profile boundary rather than introduce a direct worker
+binding. Prove the current two-task slice, with synthetic content only:
 
 1. paired Email Watcher and Document Summarizer clients can authenticate over verified HTTPS;
 2. neither request contains a model ID;
-3. task policy selects the worker deployment;
-4. concurrent mixed requests complete without starvation at the admitted limit;
-5. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
-6. stopping the gateway degrades only model-dependent actions in both applications;
-7. Connect discovery and each application's private persistence remain unchanged.
+3. the exact Ollama package or container, dependency set, immutable model manifest/content digests,
+   cloud-off environment, and serving configuration are pinned and reproducible;
+4. the exact LM Studio/`llmster` and inference-runtime versions, dependency set, model artifact,
+   identifier, JIT/eviction behavior, authentication, and serving configuration are pinned and
+   reproducible;
+5. both workers resolve the single logical profile to the same approved upstream checkpoint and
+   quantization, with runtime-specific immutable digests recorded as deployment provenance;
+6. both worker endpoints are unreachable from a client-network machine while the authenticated
+   gateway remains reachable;
+7. task policy selects Ollama without exposing that choice to either application;
+8. each task independently passes its deterministic acceptance metrics and validators plus blinded
+   human review of semantic output on both Ollama and LM Studio before that worker is eligible;
+9. concurrent mixed requests complete without starvation at the admitted limit;
+10. revoked, wrong-scope, oversized, redirected, proxied, and plaintext requests fail closed;
+11. Ollama runs with `OLLAMA_NO_CLOUD=1`, uses the pinned profile, and passes task acceptance before
+    becoming primary;
+12. LM Studio remains healthy with no model resident, then JIT-loads the pinned profile only after
+    safe fallback admission and unloads it under the configured eviction/TTL policy;
+13. making Ollama unavailable before admission moves an LM-Studio-qualified task to
+   degraded-but-available service, while an unqualified fallback task remains unavailable;
+14. an in-flight or ambiguous primary failure remains unresolved until the primary result is
+    recovered, non-acceptance is proven, or cancellation is confirmed; only then may the same
+    request proceed without duplicate worker execution;
+15. on a single GPU, fallback does not start until every primary attempt has the authoritative
+    disposition required by item 14 and either capacity evidence proves concurrent residency safe,
+    or the primary model is explicitly unloaded and the reclaimed capacity is verified; ambiguous
+    work or VRAM ownership keeps fallback unavailable;
+16. when Ollama recovers, the gateway stops new LM Studio admissions, waits until every fallback
+    attempt has an authoritative disposition, drains and unloads the fallback model, and verifies
+    capacity before readmitting Ollama; only separate concurrent-residency capacity evidence may
+    waive the drain and unload steps;
+17. request IDs accept only canonical URL-segment-safe UUIDv4 text, and mismatched or encoded
+    acknowledgement identifiers fail closed;
+18. a different valid credential cannot acknowledge or delete another credential's result, and the
+    owning credential can still retrieve the protected result afterward;
+19. a lost response returns the protected result to the same credential/request after gateway
+    restart, and the authenticated acknowledgement operation atomically deletes that result content
+    while retaining its metadata tombstone; exact repeats are idempotent, an acknowledged tombstone
+    wins over later expiry, and conflicting dispositions fail closed;
+20. an expired request terminalizes any in-flight attempt, never dispatches again, discards late
+    output without recreating retained content, returns permanent `request_expired`, and permits
+    only an explicit new-identity requeue;
+21. an application-validation rejection becomes terminal for its original identity, is
+    acknowledged to release the protected result, and permits only explicit new-identity requeue;
+22. authentication, authorization, request-contract, and output-validation failures do not trigger
+    fallback;
+23. stopping the gateway degrades only model-dependent actions in both participating applications;
+24. Connect discovery and each application's private persistence remain unchanged.
 
-Do not implement administrator UI, auto-discovery, multiple workers, vision, or production cutover
-in that proof.
+Do not implement administrator UI, auto-discovery, additional runtime families, vision, or
+production cutover in that proof.
+
+## Runtime references
+
+- Ollama OpenAI compatibility and structured outputs:
+  https://docs.ollama.com/api/openai-compatibility and
+  https://docs.ollama.com/capabilities/structured-outputs
+- Ollama Qwen3-30B-A3B published tag and current artifact metadata:
+  https://ollama.com/library/qwen3:30b-a3b
+- LM Studio headless `llmster`, JIT loading, and eviction:
+  https://lmstudio.ai/docs/developer/core/headless_llmster and
+  https://lmstudio.ai/docs/developer/core/server/settings
+- LM Studio CLI model identifiers and load/unload controls:
+  https://lmstudio.ai/docs/cli
