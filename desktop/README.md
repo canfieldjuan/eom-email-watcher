@@ -93,6 +93,12 @@ not from `pnpm tauri dev`, so the operating system does not retain a development
 
 ## Packaged applications
 
+Sidecar builds use `EOM_EMAIL_WATCHER_BUILD_PROFILE=development|public`. The default is
+`development`, which preserves credential-free local and CI builds. A `public` build fails before
+PyInstaller unless at least one validated Google or Microsoft 365 application identity and the
+approved production Connect entitlement key ring are supplied. This is a release-admission guard;
+it does not embed user access or refresh tokens and does not perform provider authorization.
+
 Build the Linux application and bundled engine from the repository root environment:
 
 ```bash
@@ -167,6 +173,21 @@ rejected even if a filesystem path is raced. A build without this variable remai
 standalone Email Watcher but Connect capability discovery and invocation fail closed. This variable
 is consumed by the release build script; there is no runtime environment override for issuer trust,
 and such a build reports `authority_unavailable` instead of admitting license installation.
+
+### Private release candidates
+
+The manually dispatched `Private release candidate` GitHub Actions workflow builds only from
+`main`. Configure at least one base64-encoded repository secret:
+
+- `EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64`
+- `EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64`
+
+The workflow materializes the selected identity only in the hosted runner's temporary directory,
+uses the pinned production Connect public-key ring, builds Linux DEB and Windows NSIS packages, and
+reruns the packaged/native acceptance checks. Its commit-labelled artifacts are private Actions
+artifacts retained for seven days. It does not create a tag, GitHub Release, website download, or
+public unsigned asset. Code signing, notarization, provider-console approval, and public
+distribution remain separate operator-owned release work.
 
 The same build input is supported by the native Windows sidecar. PyInstaller receives data-file
 arguments using the host platform separator, and the Windows package reads the shared entitlement
