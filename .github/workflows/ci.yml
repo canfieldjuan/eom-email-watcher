@@ -134,6 +134,7 @@ jobs:
         with:
           workspaces: desktop/src-tauri -> target
       - run: pnpm install --frozen-lockfile
+      - run: pnpm test
       - run: pnpm build
       - run: ../scripts/build-desktop-sidecar.sh
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check

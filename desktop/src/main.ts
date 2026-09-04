@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { classifyCapabilityDiagnostic } from "./connectAvailability";
 import "./styles.css";
 
 interface WatchedSender {
@@ -576,6 +577,7 @@ let connectInstalling = false;
 let connectStatusRefreshInFlight = false;
 let connectEntitlementActive: boolean | null = null;
 const attachmentCapabilities = new Map<string, ConnectCapability[]>();
+const attachmentCapabilityDiagnostics = new Map<string, string>();
 const attachmentInvocationsInFlight = new Set<string>();
 const attachmentRequestIds = new Map<string, string>();
 const capabilityOutputPresentations = new Map<string, ConnectOutputPresentation>();
@@ -716,6 +718,7 @@ function capabilityOutputKey(
 function clearMessageOwnedUiState(messageId?: string): void {
   const collections = [
     attachmentCapabilities,
+    attachmentCapabilityDiagnostics,
     attachmentInvocationsInFlight,
     attachmentRequestIds,
     capabilityOutputPresentations,
@@ -1132,6 +1135,26 @@ function renderInbox(items: InboxItem[]): void {
       actions.className = "attachment-actions";
       actions.append(openButton);
 
+      const diagnostic = attachmentCapabilityDiagnostics.get(
+        attachmentKey(item.message_id, attachment.part_id),
+      );
+      if (classifyCapabilityDiagnostic(diagnostic ?? null) === "locked") {
+        const locked = document.createElement("span");
+        locked.className = "capability-locked";
+        locked.textContent = "Connect actions locked";
+        locked.title = "Activate Connect to discover compatible actions from local apps.";
+
+        const viewConnect = document.createElement("button");
+        viewConnect.type = "button";
+        viewConnect.textContent = "View Connect";
+        viewConnect.addEventListener("click", () => {
+          showView("health");
+          connectHealth.scrollIntoView({ block: "center" });
+          if (!connectActivate.hidden) connectActivate.focus();
+        });
+        actions.append(locked, viewConnect);
+      }
+
       for (const result of attachment.capability_results ?? []) {
         if (result.protocol_version !== 2 || !result.provider || !result.job_id) continue;
         const key = capabilityInvocationKey(
@@ -1355,7 +1378,11 @@ function renderInbox(items: InboxItem[]): void {
 
 async function loadAttachmentCapabilities(
   items: InboxItem[],
-): Promise<{ capabilities: Map<string, ConnectCapability[]>; unavailable: number }> {
+): Promise<{
+  capabilities: Map<string, ConnectCapability[]>;
+  diagnostics: Map<string, string>;
+  unavailable: number;
+}> {
   const attachments = items.flatMap((item) =>
     item.attachments.map((attachment) => ({
       attachment,
@@ -1363,6 +1390,7 @@ async function loadAttachmentCapabilities(
     })),
   );
   const capabilities = new Map<string, ConnectCapability[]>();
+  const diagnostics = new Map<string, string>();
   const discoveries: PromiseSettledResult<ConnectCapabilities>[] = [];
   const batchSize = 4;
   for (let offset = 0; offset < attachments.length; offset += batchSize) {
@@ -1384,13 +1412,15 @@ async function loadAttachmentCapabilities(
     const key = attachmentKey(target.messageId, target.attachment.part_id);
     if (discovery.status === "fulfilled") {
       capabilities.set(key, discovery.value.items);
-      if (discovery.value.diagnostic) unavailable += 1;
+      const diagnostic = discovery.value.diagnostic?.code ?? null;
+      if (diagnostic !== null) diagnostics.set(key, diagnostic);
+      if (classifyCapabilityDiagnostic(diagnostic) === "unavailable") unavailable += 1;
     } else {
       capabilities.set(key, []);
       unavailable += 1;
     }
   });
-  return { capabilities, unavailable };
+  return { capabilities, diagnostics, unavailable };
 }
 
 function optionalFilterValue(value: string): string | null {
@@ -1586,6 +1616,7 @@ async function loadInbox(append = false): Promise<void> {
 
   if (!append) {
     attachmentCapabilities.clear();
+    attachmentCapabilityDiagnostics.clear();
     inboxCapabilityUnavailableCount = 0;
     inboxItems = page.items;
   } else {
@@ -1602,6 +1633,9 @@ async function loadInbox(append = false): Promise<void> {
     if (generation !== inboxRequestGeneration) return;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
+    }
+    for (const [key, diagnostic] of discovery.diagnostics) {
+      attachmentCapabilityDiagnostics.set(key, diagnostic);
     }
     inboxCapabilityUnavailableCount += discovery.unavailable;
     renderInbox(inboxItems);
