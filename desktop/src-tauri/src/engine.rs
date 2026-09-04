@@ -1,14 +1,39 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Write;
+use std::fs::{File, TryLockError};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_shell::ShellExt;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::INVALID_HANDLE_VALUE,
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        },
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
+        Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        },
+    },
+};
 
 const PROTOCOL_VERSION: u8 = 1;
 
@@ -16,19 +41,238 @@ fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
 }
 
-fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    if let Ok(group_id) = i32::try_from(child.id()) {
-        // The child starts a dedicated process group, so this also terminates
-        // uv-launched Python descendants that would otherwise retain locks.
-        // SAFETY: the negative id targets only the process group created for
-        // this child; it is not derived from frontend or engine input.
-        unsafe {
-            libc::kill(-group_id, libc::SIGKILL);
+#[derive(Debug)]
+struct HostOperationLock {
+    file: File,
+}
+
+impl HostOperationLock {
+    fn acquire(path: &Path) -> Result<Self, EngineError> {
+        let mut options = File::options();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        #[cfg(windows)]
+        // Match Python filelock's read/write sharing while denying deletion so
+        // every contender continues to coordinate through the same pathname.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0x0000_0003);
+        let file = options.open(path).map_err(|_| {
+            EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(TryLockError::WouldBlock) => Err(EngineError::host(
+                "operation_busy",
+                "Another watcher operation is already running",
+            )),
+            Err(TryLockError::Error(_)) => Err(EngineError::host(
+                "operation_lock_unavailable",
+                "Desktop operation locking is unavailable",
+            )),
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+impl Drop for HostOperationLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            eprintln!("desktop operation lock could not be released: {error}");
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn new() -> io::Result<Self> {
+        // SAFETY: null security attributes and name request a private job with
+        // default security. The returned owned handle is closed on every path.
+        let raw_handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: CreateJobObjectW returned a non-null, newly owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        let job = Self { handle };
+        job.set_kill_on_close(true)?;
+        Ok(job)
+    }
+
+    fn set_kill_on_close(&self, enabled: bool) -> io::Result<()> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        if enabled {
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
+        let limits_size = u32::try_from(std::mem::size_of_val(&limits))
+            .expect("Windows job limit structure size fits in u32");
+        // SAFETY: the handle is a live job object and `limits` remains valid for
+        // the duration of this synchronous call.
+        if unsafe {
+            SetInformationJobObject(
+                self.handle.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                limits_size,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn assign(&self, child: &Child) -> io::Result<()> {
+        // SAFETY: both handles remain live for the duration of this call. A
+        // successful assignment causes future descendants to inherit the job.
+        if unsafe { AssignProcessToJobObject(self.handle.as_raw_handle(), child.as_raw_handle()) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        // SAFETY: the owned handle remains live. Closing it later is a second
+        // fail-safe because the job was configured with KILL_ON_JOB_CLOSE.
+        let _ = unsafe { TerminateJobObject(self.handle.as_raw_handle(), 1) };
+    }
+
+    fn release_descendants(&self) -> io::Result<()> {
+        // The request completed normally. Clear KILL_ON_JOB_CLOSE before the
+        // last job handle closes so user-facing descendants such as the OAuth
+        // browser remain open.
+        self.set_kill_on_close(false)
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(process_id: u32) -> io::Result<()> {
+    // SAFETY: this creates an owned system snapshot handle; the process id is
+    // the child returned by Command::spawn and is used only for matching.
+    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw_snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateToolhelp32Snapshot returned a valid, newly owned handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw_snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
+            .expect("Windows thread entry size fits in u32"),
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: `entry` has the required size and remains live for enumeration.
+    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    loop {
+        if entry.th32OwnerProcessID == process_id {
+            // SAFETY: the enumerated thread belongs to our suspended child and
+            // the returned owned handle is closed on every path.
+            let raw_thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if raw_thread.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: OpenThread returned a non-null, newly owned handle.
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw_thread) };
+            // SAFETY: this is the primary thread of the child created with
+            // CREATE_SUSPENDED; u32::MAX is the documented failure sentinel.
+            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            return Ok(());
+        }
+        // SAFETY: `entry` and the snapshot remain valid for enumeration.
+        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "suspended engine primary thread was unavailable",
+            ));
+        }
+    }
+}
+
+struct EngineChild {
+    process: Child,
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl EngineChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        #[cfg(windows)]
+        let job = WindowsJob::new()?;
+        #[cfg(windows)]
+        // CREATE_SUSPENDED closes the spawn-before-assignment race: the engine
+        // cannot create descendants until it belongs to the terminating job.
+        // CREATE_NO_WINDOW preserves the sidecar's piped JSON protocol without
+        // flashing a console window.
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        let process = command.spawn()?;
+        #[cfg(windows)]
+        let process = match job
+            .assign(&process)
+            .and_then(|()| resume_suspended_process(process.id()))
+        {
+            Ok(()) => process,
+            Err(error) => {
+                let mut process = process;
+                job.terminate();
+                let _ = process.kill();
+                let _ = process.wait();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            process,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Ok(group_id) = i32::try_from(self.process.id()) {
+            // The child starts a dedicated process group, so this also terminates
+            // uv-launched Python descendants that would otherwise retain locks.
+            // SAFETY: the negative id targets only the process group created for
+            // this child; it is not derived from frontend or engine input.
+            unsafe {
+                libc::kill(-group_id, libc::SIGKILL);
+            }
+        }
+        #[cfg(windows)]
+        self.job.terminate();
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+
+    fn wait_with_output(self) -> io::Result<Output> {
+        #[cfg(windows)]
+        {
+            let Self { process, job } = self;
+            let output = process.wait_with_output()?;
+            if output.status.success() {
+                job.release_descendants()?;
+            } else {
+                job.terminate();
+            }
+            Ok(output)
+        }
+        #[cfg(not(windows))]
+        {
+            self.process.wait_with_output()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -36,6 +280,7 @@ pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
+    mailbox_operation_gate: Arc<Mutex<()>>,
     request_timeout: Option<Duration>,
 }
 
@@ -52,6 +297,177 @@ pub struct InboxAttachment {
     pub filename: String,
     pub media_type: String,
     pub byte_size: u64,
+    #[serde(default)]
+    pub capability_results: Vec<AttachmentCapabilityResult>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AttachmentCapabilityResult {
+    #[serde(default)]
+    pub job_id: Option<String>,
+    pub capability_id: String,
+    pub capability_version: String,
+    #[serde(default)]
+    pub protocol_version: Option<u32>,
+    #[serde(default)]
+    pub provider: Option<ConnectProviderIdentity>,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, Value>,
+    pub status: String,
+    pub updated_at: String,
+    pub summary: Option<ConnectSummary>,
+    #[serde(default)]
+    pub outputs: Vec<ConnectOutputMetadata>,
+    pub error: Option<EngineError>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectSummary {
+    pub summary_version: String,
+    pub text: String,
+    pub warnings: Vec<ConnectWarning>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectProviderIdentity {
+    pub app_id: String,
+    pub version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectProvider {
+    pub app_id: String,
+    pub name: String,
+    pub version: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilityRef {
+    pub id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectAction {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectAcceptedArtifact {
+    pub media_type: String,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectParameter {
+    pub name: String,
+    pub value_type: String,
+    pub required: bool,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectEffects {
+    pub external: bool,
+    pub confirmation_required: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilityDeclaration {
+    pub id: String,
+    pub version: String,
+    pub action: ConnectAction,
+    pub accepts: Vec<ConnectAcceptedArtifact>,
+    pub produces: Vec<String>,
+    pub parameters: Vec<ConnectParameter>,
+    pub effects: ConnectEffects,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapability {
+    pub protocol_version: u32,
+    pub provider: ConnectProvider,
+    pub capability: ConnectCapabilityDeclaration,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectOutputMetadata {
+    pub artifact_id: String,
+    pub media_type: String,
+    pub display_name: String,
+    pub byte_size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectDiagnostic {
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectCapabilities {
+    pub items: Vec<ConnectCapability>,
+    pub diagnostic: Option<ConnectDiagnostic>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectEntitlementState {
+    Active,
+    AuthorityUnavailable,
+    Missing,
+    Invalid,
+    NotYetValid,
+    Expired,
+    FeatureMissing,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectEntitlementStatus {
+    pub state: ConnectEntitlementState,
+    pub active: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectInvocationResult {
+    pub protocol_version: u32,
+    pub job_id: String,
+    pub provider: ConnectProviderIdentity,
+    pub capability: ConnectCapabilityRef,
+    pub status: String,
+    pub outputs: Vec<ConnectOutputMetadata>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectOutputView {
+    pub job_id: String,
+    pub output: ConnectOutputMetadata,
+    pub presentation: ConnectOutputPresentation,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConnectOutputPresentation {
+    DocumentSummary { summary: ConnectSummary },
+    Text { text: String },
+    Opaque,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct ExportedCapabilityOutput {
+    pub job_id: String,
+    pub output: ConnectOutputMetadata,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -63,12 +479,18 @@ pub struct ExportedAttachment {
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
+    #[serde(default = "default_mail_provider")]
+    pub provider: String,
+    #[serde(default = "default_mail_account_id")]
+    pub account_id: String,
     pub received_at: String,
     pub sender: String,
     pub sender_name: Option<String>,
     pub subject: String,
     pub status: String,
     pub analysis_at: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
     pub priority: Option<String>,
     pub summary: Option<String>,
     pub action_required: Option<i64>,
@@ -78,11 +500,52 @@ pub struct InboxItem {
     pub confidence: Option<f64>,
     pub attempts: i64,
     pub next_retry_at: Option<String>,
+    pub analysis_retryable: Option<bool>,
+    pub analysis_error_code: Option<String>,
+    pub analysis_retry_after_seconds: Option<u64>,
     pub fallback_notified_at: Option<String>,
     pub notified_at: Option<String>,
     pub last_error: Option<String>,
     #[serde(default)]
     pub attachments: Vec<InboxAttachment>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxQuery {
+    pub limit: u16,
+    pub cursor: Option<String>,
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
+    pub sender_query: Option<String>,
+    pub priority: Option<String>,
+    pub category: Option<String>,
+    pub status: Option<String>,
+    pub keyword: Option<String>,
+}
+
+fn default_mail_provider() -> String {
+    "gmail".into()
+}
+
+fn default_mail_account_id() -> String {
+    "gmail-default".into()
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxPage {
+    pub items: Vec<InboxItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxDeletion {
+    deleted: bool,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct InboxClear {
+    deleted: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -91,6 +554,7 @@ pub struct HealthStatus {
     pub gmail: GmailHealth,
     pub last_check: Option<String>,
     pub local_model: LocalModelHealth,
+    pub mail: MailAccounts,
     pub notifications: NotificationHealth,
     pub production_check_supported: bool,
     pub watchlist_count: u64,
@@ -106,6 +570,45 @@ pub struct DatabaseHealth {
 pub struct GmailHealth {
     pub credentials_configured: bool,
     pub connected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailAuthorization {
+    pub baseline_initialized: bool,
+    pub connected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailProviderStatus {
+    pub provider: String,
+    pub display_name: String,
+    pub connection_available: bool,
+    #[serde(default)]
+    pub multiple_accounts: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccountStatus {
+    pub provider: String,
+    pub account_id: String,
+    pub display_name: String,
+    pub address: Option<String>,
+    pub connected: bool,
+    pub active: bool,
+    pub last_check: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccounts {
+    pub providers: Vec<MailProviderStatus>,
+    pub accounts: Vec<MailAccountStatus>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailAccountResult {
+    pub account: MailAccountStatus,
+    #[serde(default)]
+    pub baseline_initialized: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -148,9 +651,26 @@ pub struct NotificationIntent {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalModelSettings {
+    #[serde(default)]
+    pub editable: bool,
+    pub endpoint: String,
+    pub model: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
+    pub local_model: LocalModelSettings,
+    pub notifications_enabled: bool,
     pub poll_interval_minutes: u64,
     pub polling_supported: bool,
+    pub retention_days: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConfigInitialization {
+    pub created: bool,
+    pub settings: EngineSettings,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -187,17 +707,27 @@ struct SenderItem {
 }
 
 #[derive(Deserialize)]
-struct InboxItems {
-    items: Vec<InboxItem>,
-}
-
-#[derive(Deserialize)]
 struct NotificationItems {
     items: Vec<NotificationIntent>,
 }
 
 #[derive(Deserialize)]
+struct NotificationCount {
+    count: u64,
+}
+
+#[derive(Deserialize)]
 struct NotificationAcknowledgement {
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct OperationLockLocation {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct AnalysisRequeue {
     status: String,
 }
 
@@ -231,6 +761,19 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
+                mailbox_operation_gate: Arc::new(Mutex::new(())),
+                request_timeout: None,
+            });
+        }
+
+        let sidecar: Command = app.shell().sidecar("eom-mail-engine")?.into();
+        let packaged_program = sidecar.get_program().to_os_string();
+        if Path::new(&packaged_program).is_file() {
+            return Ok(Self {
+                program: packaged_program,
+                args: sidecar.get_args().map(OsString::from).collect(),
+                config_path,
+                mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
             });
         }
@@ -248,6 +791,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
+            mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         })
     }
@@ -262,6 +806,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
+            mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
         }
     }
@@ -271,9 +816,50 @@ impl Engine {
             .map(|data| data.items)
     }
 
-    pub fn recent(&self, limit: u16) -> Result<Vec<InboxItem>, EngineError> {
-        self.request::<InboxItems>("inbox.recent", json!({"limit": limit}))
-            .map(|data| data.items)
+    pub fn query_inbox(&self, query: InboxQuery) -> Result<InboxPage, EngineError> {
+        self.request(
+            "inbox.query",
+            json!({
+                "limit": query.limit,
+                "cursor": query.cursor,
+                "provider": query.provider,
+                "account_id": query.account_id,
+                "sender_query": query.sender_query,
+                "priority": query.priority,
+                "category": query.category,
+                "status": query.status,
+                "keyword": query.keyword,
+            }),
+        )
+    }
+
+    pub fn delete_inbox_item(&self, message_id: String) -> Result<(), EngineError> {
+        let response = self
+            .request::<InboxDeletion>("inbox.delete", json!({"message_id": message_id.clone()}))?;
+        if response.deleted && response.message_id == message_id {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid inbox deletion result",
+        ))
+    }
+
+    pub fn clear_inbox(&self) -> Result<u64, EngineError> {
+        self.request::<InboxClear>("inbox.clear", json!({}))
+            .map(|response| response.deleted)
+    }
+
+    pub fn requeue_analysis(&self, message_id: String) -> Result<(), EngineError> {
+        let response =
+            self.request::<AnalysisRequeue>("analysis.requeue", json!({"message_id": message_id}))?;
+        if response.status == "requeued" {
+            return Ok(());
+        }
+        Err(EngineError::host(
+            "engine_protocol_error",
+            "Watcher engine returned an invalid analysis requeue result",
+        ))
     }
 
     pub fn export_attachment(
@@ -292,12 +878,223 @@ impl Engine {
         )
     }
 
+    pub fn attachment_capabilities(
+        &self,
+        message_id: String,
+        part_id: String,
+    ) -> Result<ConnectCapabilities, EngineError> {
+        self.request(
+            "connect.attachment.capabilities",
+            json!({"message_id": message_id, "part_id": part_id}),
+        )
+    }
+
+    // These fields mirror the explicit, versioned engine request instead of hiding
+    // provider or effect-confirmation identity in a loosely typed object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_attachment_capability(
+        &self,
+        request_id: String,
+        message_id: String,
+        part_id: String,
+        provider: ConnectProviderIdentity,
+        capability: ConnectCapabilityRef,
+        parameters: BTreeMap<String, Value>,
+        confirmed: bool,
+    ) -> Result<ConnectInvocationResult, EngineError> {
+        self.request(
+            "connect.attachment.invoke",
+            json!({
+                "request_id": request_id,
+                "message_id": message_id,
+                "part_id": part_id,
+                "provider": provider,
+                "capability": capability,
+                "parameters": parameters,
+                "confirmed": confirmed,
+            }),
+        )
+    }
+
+    pub fn present_capability_output(
+        &self,
+        message_id: String,
+        part_id: String,
+        job_id: String,
+        artifact_id: String,
+    ) -> Result<ConnectOutputView, EngineError> {
+        self.request(
+            "connect.output.present",
+            json!({
+                "message_id": message_id,
+                "part_id": part_id,
+                "job_id": job_id,
+                "artifact_id": artifact_id,
+            }),
+        )
+    }
+
+    pub fn export_capability_output(
+        &self,
+        message_id: String,
+        part_id: String,
+        job_id: String,
+        artifact_id: String,
+        destination_dir: PathBuf,
+    ) -> Result<ExportedCapabilityOutput, EngineError> {
+        self.request(
+            "connect.output.export",
+            json!({
+                "message_id": message_id,
+                "part_id": part_id,
+                "job_id": job_id,
+                "artifact_id": artifact_id,
+                "destination_dir": destination_dir,
+            }),
+        )
+    }
+
     pub fn health(&self) -> Result<HealthStatus, EngineError> {
         self.request("health.get", json!({}))
     }
 
+    pub fn connect_entitlement_status(&self) -> Result<ConnectEntitlementStatus, EngineError> {
+        self.request("connect.entitlement.status", json!({}))
+    }
+
+    pub fn install_connect_entitlement(
+        &self,
+        source_path: PathBuf,
+    ) -> Result<ConnectEntitlementStatus, EngineError> {
+        self.request(
+            "connect.entitlement.install",
+            json!({"source_path": source_path}),
+        )
+    }
+
+    pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request("gmail.authorize", json!({}))
+    }
+
+    pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
+        self.request("mail.accounts.list", json!({}))
+    }
+
+    pub fn connect_mail_provider(
+        &self,
+        provider: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request("mail.accounts.connect", json!({"provider": provider}))
+    }
+
+    pub fn reconnect_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.reconnect",
+            json!({"provider": provider, "account_id": account_id}),
+        )
+    }
+
+    pub fn disconnect_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.disconnect",
+            json!({"provider": provider, "account_id": account_id}),
+        )
+    }
+
+    pub fn activate_mail_account(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<MailAccountResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "mail.accounts.activate",
+            json!({"provider": provider, "account_id": account_id}),
+        )
+    }
+
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
         self.request_with_timeout("settings.get", json!({}), timeout)
+    }
+
+    pub fn settings(&self) -> Result<EngineSettings, EngineError> {
+        self.request("settings.get", json!({}))
+    }
+
+    pub fn config_present(&self) -> Result<bool, EngineError> {
+        match std::fs::symlink_metadata(&self.config_path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(EngineError::host(
+                "host_error",
+                "Desktop could not inspect watcher configuration",
+            )),
+        }
+    }
+
+    pub fn initialize_config(
+        &self,
+        timezone: String,
+        model_base_url: String,
+        model_name: String,
+    ) -> Result<ConfigInitialization, EngineError> {
+        self.request(
+            "config.initialize",
+            json!({
+                "model_base_url": model_base_url,
+                "model_name": model_name,
+                "timezone": timezone,
+            }),
+        )
+    }
+
+    pub fn update_settings(
+        &self,
+        poll_interval_minutes: u64,
+        retention_days: u64,
+        notifications_enabled: bool,
+        model_base_url: Option<String>,
+        model_name: Option<String>,
+    ) -> Result<EngineSettings, EngineError> {
+        let mut payload = json!({
+            "notifications_enabled": notifications_enabled,
+            "poll_interval_minutes": poll_interval_minutes,
+            "retention_days": retention_days,
+        });
+        if let Some(value) = model_base_url {
+            payload["model_base_url"] = Value::String(value);
+        }
+        if let Some(value) = model_name {
+            payload["model_name"] = Value::String(value);
+        }
+        self.request("settings.update", payload)
     }
 
     pub fn with_request_timeout(&self, timeout: Duration) -> Self {
@@ -307,15 +1104,45 @@ impl Engine {
     }
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request("watcher.check", json!({"dry_run": false}))
     }
 
+    pub(crate) fn run_with_operation_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let location = self.request::<OperationLockLocation>("host.operation_lock", json!({}))?;
+        let _lock = HostOperationLock::acquire(&location.path)?;
+        operation()
+    }
+
+    #[cfg(test)]
     pub fn pending_notifications(
         &self,
         limit: u16,
     ) -> Result<Vec<NotificationIntent>, EngineError> {
         self.request::<NotificationItems>("notifications.pending", json!({"limit": limit}))
             .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notifications_under_host_lock(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<NotificationIntent>, EngineError> {
+        self.request::<NotificationItems>(
+            "notifications.pending_under_host_lock",
+            json!({"limit": limit}),
+        )
+        .map(|data| data.items)
+    }
+
+    pub(crate) fn pending_notification_count_under_host_lock(&self) -> Result<u64, EngineError> {
+        self.request::<NotificationCount>("notifications.count_under_host_lock", json!({}))
+            .map(|data| data.count)
     }
 
     pub fn acknowledge_notification(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
@@ -393,14 +1220,15 @@ impl Engine {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn().map_err(|_| {
+        let mut child = EngineChild::spawn(&mut command).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
-                "Watcher engine is unavailable; verify uv and the project environment",
+                "Watcher engine is unavailable; reinstall it or inspect desktop logs",
             )
         })?;
 
         let write_result = child
+            .process
             .stdin
             .take()
             .ok_or_else(|| EngineError::host("host_error", "Engine stdin was unavailable"))
@@ -413,27 +1241,27 @@ impl Engine {
                 })
             });
         if let Err(error) = write_result {
-            terminate_child(&mut child);
+            child.terminate();
             return Err(error);
         }
 
         if let Some(timeout) = timeout {
             let started = Instant::now();
             loop {
-                match child.try_wait() {
+                match child.process.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) if started.elapsed() < timeout => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Ok(None) => {
-                        terminate_child(&mut child);
+                        child.terminate();
                         return Err(EngineError::host(
                             "engine_timeout",
                             "Watcher engine did not respond before its timeout",
                         ));
                     }
                     Err(_) => {
-                        terminate_child(&mut child);
+                        child.terminate();
                         return Err(EngineError::host(
                             "engine_unavailable",
                             "Watcher engine status could not be inspected",
@@ -499,6 +1327,43 @@ impl Engine {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    #[cfg(windows)]
+    use windows_sys::Win32::{
+        Foundation::WAIT_TIMEOUT,
+        System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+            WaitForSingleObject,
+        },
+    };
+
+    #[cfg(windows)]
+    // This bounds a hung probe, not product latency. Hosted Windows runners
+    // can spend more than ten seconds starting the nested PowerShell process.
+    const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[cfg(windows)]
+    struct WindowsTestProcess(u32);
+
+    #[cfg(windows)]
+    impl Drop for WindowsTestProcess {
+        fn drop(&mut self) {
+            // SAFETY: the PID came from the test child. If it is still live,
+            // terminate only that disposable probe and wait for handle signal.
+            let raw_handle =
+                unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, self.0) };
+            if raw_handle.is_null() {
+                return;
+            }
+            // SAFETY: OpenProcess returned a non-null, newly owned handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+            // SAFETY: the handle grants PROCESS_TERMINATE for this test probe.
+            let _ = unsafe { TerminateProcess(handle.as_raw_handle(), 1) };
+            // SAFETY: the process handle remains live for this bounded wait.
+            let _ = unsafe { WaitForSingleObject(handle.as_raw_handle(), 5_000) };
+        }
+    }
 
     #[test]
     fn default_config_matches_python_watcher_location() {
@@ -506,6 +1371,19 @@ mod tests {
             default_config_path(Path::new("/home/watcher")),
             PathBuf::from("/home/watcher/.config/eom-email-watcher/config.toml")
         );
+    }
+
+    #[test]
+    fn host_operation_lock_is_exclusive_and_reusable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("watcher.check.lock");
+        let active = HostOperationLock::acquire(&path).expect("first lock acquisition");
+
+        let blocked = HostOperationLock::acquire(&path).expect_err("second lock must contend");
+        assert_eq!(blocked.code, "operation_busy");
+
+        drop(active);
+        HostOperationLock::acquire(&path).expect("released lock is reusable");
     }
 
     #[test]
@@ -522,6 +1400,31 @@ mod tests {
                 message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
             }
         );
+    }
+
+    #[test]
+    fn config_presence_distinguishes_missing_from_existing_paths() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        let engine = Engine::with_command("unused", Vec::new(), config_path.clone());
+
+        assert!(!engine.config_present().expect("inspect missing config"));
+        fs::write(&config_path, "invalid but present").expect("write config marker");
+        assert!(engine.config_present().expect("inspect present config"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_config_symlink_is_present_and_never_treated_as_first_run() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("config.toml");
+        symlink(directory.path().join("missing-target"), &config_path)
+            .expect("create broken config symlink");
+        let engine = Engine::with_command("unused", Vec::new(), config_path);
+
+        assert!(engine.config_present().expect("inspect broken symlink"));
     }
 
     #[test]
@@ -543,6 +1446,9 @@ mod tests {
             "confidence": null,
             "attempts": 0,
             "next_retry_at": null,
+            "analysis_retryable": null,
+            "analysis_error_code": null,
+            "analysis_retry_after_seconds": null,
             "fallback_notified_at": null,
             "notified_at": null,
             "last_error": null
@@ -550,6 +1456,225 @@ mod tests {
         .expect("protocol-v1 inbox row without attachments must remain valid");
 
         assert!(item.attachments.is_empty());
+        assert_eq!(item.category, None);
+        assert_eq!(item.provider, "gmail");
+        assert_eq!(item.account_id, "gmail-default");
+    }
+
+    #[test]
+    fn inbox_query_and_page_contract_are_typed() {
+        let query = InboxQuery {
+            limit: 25,
+            cursor: Some("opaque-cursor".into()),
+            provider: Some("gmail".into()),
+            account_id: Some("gmail-default".into()),
+            sender_query: Some("billing".into()),
+            priority: Some("high".into()),
+            category: Some("invoice".into()),
+            status: Some("analyzed".into()),
+            keyword: Some("overdue".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(query).expect("serialize inbox query"),
+            json!({
+                "limit": 25,
+                "cursor": "opaque-cursor",
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "sender_query": "billing",
+                "priority": "high",
+                "category": "invoice",
+                "status": "analyzed",
+                "keyword": "overdue"
+            })
+        );
+
+        let page: InboxPage = serde_json::from_value(json!({
+            "items": [],
+            "next_cursor": "next-page"
+        }))
+        .expect("deserialize inbox page");
+        assert_eq!(page.items, vec![]);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-page"));
+
+        let deletion: InboxDeletion = serde_json::from_value(json!({
+            "deleted": true,
+            "message_id": "message-1"
+        }))
+        .expect("deserialize inbox deletion");
+        assert!(deletion.deleted);
+        assert_eq!(deletion.message_id, "message-1");
+
+        let cleared: InboxClear =
+            serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
+        assert_eq!(cleared.deleted, 3);
+    }
+
+    #[test]
+    fn protocol_v2_capabilities_and_durable_results_are_typed() {
+        let capabilities: ConnectCapabilities = serde_json::from_value(json!({
+            "items": [{
+                "protocol_version": 2,
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "name": "Document Summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111"
+                },
+                "capability": {
+                    "id": "document.summarize",
+                    "version": "1.0",
+                    "action": {
+                        "label": "Summarize",
+                        "description": "Create a local summary."
+                    },
+                    "accepts": [{"media_type": "application/pdf", "max_bytes": 1024}],
+                    "produces": ["application/vnd.local-connect.document-summary+json"],
+                    "parameters": [],
+                    "effects": {"external": false, "confirmation_required": false}
+                }
+            }],
+            "diagnostic": null
+        }))
+        .expect("deserialize generic capability catalog");
+        assert_eq!(capabilities.items[0].protocol_version, 2);
+        assert_eq!(capabilities.items[0].provider.name, "Document Summarizer");
+
+        let result: AttachmentCapabilityResult = serde_json::from_value(json!({
+            "job_id": "22222222-2222-4222-8222-222222222222",
+            "protocol_version": 2,
+            "capability_id": "document.summarize",
+            "capability_version": "1.0",
+            "provider": {
+                "app_id": "document-summarizer",
+                "version": "0.1.0",
+                "instance_id": "11111111-1111-4111-8111-111111111111"
+            },
+            "parameters": {},
+            "status": "completed",
+            "updated_at": "2026-08-30T12:00:00+00:00",
+            "outputs": [{
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "media_type": "application/vnd.local-connect.document-summary+json",
+                "display_name": "summary.json",
+                "byte_size": 25,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }))
+        .expect("deserialize durable generic result");
+        assert_eq!(
+            result.job_id.as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(result.outputs[0].display_name, "summary.json");
+
+        let view: ConnectOutputView = serde_json::from_value(json!({
+            "job_id": "22222222-2222-4222-8222-222222222222",
+            "output": {
+                "artifact_id": "33333333-3333-4333-8333-333333333333",
+                "media_type": "text/plain",
+                "display_name": "translation.txt",
+                "byte_size": 7,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "presentation": {"kind": "text", "text": "bonjour"}
+        }))
+        .expect("deserialize trusted output presentation");
+        assert_eq!(
+            view.presentation,
+            ConnectOutputPresentation::Text {
+                text: "bonjour".into()
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_v1_gmail_authorization_result_is_typed() {
+        let result: GmailAuthorization = serde_json::from_value(json!({
+            "baseline_initialized": true,
+            "connected": true
+        }))
+        .expect("deserialize Gmail authorization result");
+
+        assert_eq!(
+            result,
+            GmailAuthorization {
+                baseline_initialized: true,
+                connected: true,
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_v1_mail_account_contract_is_typed_and_secret_free() {
+        let accounts: MailAccounts = serde_json::from_value(json!({
+            "providers": [{
+                "provider": "gmail",
+                "display_name": "Gmail",
+                "connection_available": true,
+                "multiple_accounts": true
+            }],
+            "accounts": [{
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "display_name": "Gmail",
+                "address": "owner@example.com",
+                "connected": true,
+                "active": true,
+                "last_check": "2026-09-01T12:00:00+00:00"
+            }]
+        }))
+        .expect("deserialize generic email account catalog");
+
+        assert_eq!(
+            accounts.accounts[0].address.as_deref(),
+            Some("owner@example.com")
+        );
+        assert!(accounts.accounts[0].active);
+        assert_eq!(accounts.providers[0].provider, "gmail");
+
+        let result: MailAccountResult = serde_json::from_value(json!({
+            "account": accounts.accounts[0],
+            "baseline_initialized": false
+        }))
+        .expect("deserialize email account mutation result");
+        assert_eq!(result.baseline_initialized, Some(false));
+        let encoded = serde_json::to_string(&result).expect("serialize account result");
+        assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn protocol_v1_entitlement_status_is_typed_and_claim_free() {
+        let status: ConnectEntitlementStatus = serde_json::from_value(json!({
+            "state": "expired",
+            "active": false
+        }))
+        .expect("deserialize claim-free entitlement status");
+
+        assert_eq!(
+            status,
+            ConnectEntitlementStatus {
+                state: ConnectEntitlementState::Expired,
+                active: false,
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_v1_settings_without_editability_default_to_read_only() {
+        let settings: EngineSettings = serde_json::from_value(json!({
+            "local_model": {
+                "endpoint": "http://127.0.0.1:8080/v1",
+                "model": "local-model"
+            },
+            "notifications_enabled": true,
+            "poll_interval_minutes": 120,
+            "polling_supported": true,
+            "retention_days": 180
+        }))
+        .expect("deserialize settings from an older protocol-v1 engine");
+
+        assert!(!settings.local_model.editable);
     }
 
     #[cfg(unix)]
@@ -608,6 +1733,185 @@ mod tests {
         panic!("timed-out engine descendant {descendant_pid} is still running");
     }
 
+    #[cfg(windows)]
+    fn windows_process_is_running(process_id: u32) -> bool {
+        // SAFETY: OpenProcess receives a PID produced by the test child, and
+        // the returned owned handle is closed before this helper returns.
+        let raw_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, process_id) };
+        if raw_handle.is_null() {
+            return false;
+        }
+        // SAFETY: OpenProcess returned a non-null, newly owned handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+        // SAFETY: the process handle remains live for this nonblocking wait.
+        unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) == WAIT_TIMEOUT }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_terminates_immediate_descendant_on_timeout() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let script_path = directory.path().join("process-tree-probe.ps1");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        fs::write(
+            &script_path,
+            r#"
+$descendant = Start-Process -PassThru -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30")
+Set-Content -LiteralPath $args[0] -Value $descendant.Id
+Wait-Process -Id $descendant.Id
+"#,
+        )
+        .expect("write process-tree probe");
+        let engine = Engine::with_command(
+            "powershell.exe",
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script_path.as_os_str().to_owned(),
+                descendant_pid_file.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
+
+        assert_eq!(
+            engine
+                .check()
+                .expect_err("stalled check must time out")
+                .code,
+            "engine_timeout"
+        );
+        let descendant_pid: u32 = fs::read_to_string(descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        for _ in 0..100 {
+            if !windows_process_is_running(descendant_pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out Windows engine descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_releases_descendant_after_successful_request() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let script_path = directory.path().join("successful-process-tree-probe.ps1");
+        let descendant_pid_file = directory.path().join("descendant.pid");
+        fs::write(
+            &script_path,
+            r#"
+$null = [Console]::In.ReadToEnd()
+$descendant = Start-Process -PassThru -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30")
+Set-Content -LiteralPath $args[0] -Value $descendant.Id
+[Console]::Out.WriteLine('{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":false,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}')
+"#,
+        )
+        .expect("write successful process-tree probe");
+        let engine = Engine::with_command(
+            "powershell.exe",
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-File"),
+                script_path.as_os_str().to_owned(),
+                descendant_pid_file.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(WINDOWS_PROCESS_PROBE_TIMEOUT);
+
+        let result = engine.check().expect("probe request must succeed");
+        assert!(!result.active);
+        let descendant_pid: u32 = fs::read_to_string(descendant_pid_file)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        let _cleanup = WindowsTestProcess(descendant_pid);
+        assert!(
+            windows_process_is_running(descendant_pid),
+            "successful request must not terminate descendant {descendant_pid}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gmail_authorization_serializes_watcher_checks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let authorization_started = directory.path().join("authorization-started");
+        let check_started = directory.path().join("check-started");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *gmail.authorize*)
+    : > "$1"
+    sleep 0.2
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.authorize","data":{"baseline_initialized":true,"connected":true}}'
+    ;;
+  *)
+    : > "$2"
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'
+    ;;
+esac"#,
+                ),
+                OsString::from("engine-gmail-gate-probe"),
+                authorization_started.as_os_str().to_owned(),
+                check_started.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let authorization_engine = engine.clone();
+        let authorization = std::thread::spawn(move || authorization_engine.authorize_gmail());
+        for _ in 0..100 {
+            if authorization_started.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            authorization_started.exists(),
+            "authorization probe did not start"
+        );
+
+        let check_engine = engine.clone();
+        let check = std::thread::spawn(move || check_engine.check());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !check_started.exists(),
+            "watcher check started before authorization completed"
+        );
+
+        assert!(
+            authorization
+                .join()
+                .expect("authorization thread")
+                .expect("authorization result")
+                .connected
+        );
+        assert!(
+            check
+                .join()
+                .expect("check thread")
+                .expect("check result")
+                .active
+        );
+        assert!(check_started.exists());
+    }
+
     fn real_engine(config_path: PathBuf) -> Engine {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -623,6 +1927,50 @@ mod tests {
             ],
             config_path,
         )
+    }
+
+    #[test]
+    fn real_engine_initializes_missing_config_once() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("nested/config.toml");
+        let engine = real_engine(config_path);
+
+        assert!(!engine.config_present().expect("inspect missing config"));
+        assert_eq!(
+            engine
+                .initialize_config(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                )
+                .expect("initialize first-run config"),
+            ConfigInitialization {
+                created: true,
+                settings: EngineSettings {
+                    local_model: LocalModelSettings {
+                        editable: true,
+                        endpoint: "http://127.0.0.1:8080/v1".into(),
+                        model: "local-model".into(),
+                    },
+                    notifications_enabled: true,
+                    poll_interval_minutes: 120,
+                    polling_supported: true,
+                    retention_days: 180,
+                },
+            }
+        );
+        assert!(engine.config_present().expect("inspect created config"));
+        assert_eq!(
+            engine
+                .initialize_config(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                )
+                .expect_err("existing config must not be replaced")
+                .code,
+            "conflict"
+        );
     }
 
     #[test]
@@ -652,6 +2000,16 @@ notifications_enabled = true
         let engine = real_engine(config_path);
 
         let health = engine.health().expect("read engine health");
+        let accounts = engine.mail_accounts().expect("read email accounts");
+        assert_eq!(
+            engine
+                .connect_entitlement_status()
+                .expect("read entitlement status without watcher configuration coupling"),
+            ConnectEntitlementStatus {
+                state: ConnectEntitlementState::AuthorityUnavailable,
+                active: false,
+            }
+        );
         assert_eq!(
             health.database,
             DatabaseHealth {
@@ -661,16 +2019,102 @@ notifications_enabled = true
         );
         assert!(!health.gmail.credentials_configured);
         assert!(!health.gmail.connected);
+        assert_eq!(accounts.accounts.len(), 1);
+        assert_eq!(accounts.accounts[0].provider, "gmail");
+        assert_eq!(accounts.accounts[0].account_id, "gmail-default");
+        assert!(accounts.accounts[0].active);
+        assert!(!accounts.accounts[0].connected);
+        assert_eq!(
+            engine
+                .authorize_gmail()
+                .expect_err("missing credentials must prevent Gmail authorization")
+                .code,
+            "gmail_error"
+        );
         assert_eq!(health.local_model.endpoint, "http://127.0.0.1:9/v1");
         assert_eq!(health.local_model.model, "local-model");
         assert_eq!(health.watchlist_count, 0);
         assert_eq!(
             engine
+                .run_with_operation_lock(|| {
+                    Ok((
+                        engine.pending_notifications_under_host_lock(25)?,
+                        engine.pending_notification_count_under_host_lock()?,
+                    ))
+                })
+                .expect("host lock must permit lock-aware notification reads"),
+            (vec![], 0)
+        );
+        assert_eq!(
+            engine
+                .run_with_operation_lock(|| engine.clear_inbox())
+                .expect_err("Python mutation must contend with the Rust host lock")
+                .code,
+            "runtime_error"
+        );
+        assert_eq!(
+            engine
+                .clear_inbox()
+                .expect("released host lock is reusable"),
+            0
+        );
+        assert_eq!(
+            engine
                 .settings_with_timeout(Duration::from_secs(5))
                 .expect("read engine settings"),
             EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://127.0.0.1:9/v1".into(),
+                    model: "local-model".into(),
+                },
+                notifications_enabled: true,
                 poll_interval_minutes: 120,
                 polling_supported: true,
+                retention_days: 180,
+            }
+        );
+        assert_eq!(
+            engine
+                .update_settings(0, 180, true, None, None)
+                .expect_err("invalid polling cadence must fail")
+                .code,
+            "invalid_request"
+        );
+        assert_eq!(
+            engine
+                .update_settings(
+                    45,
+                    365,
+                    false,
+                    Some("http://localhost:8080/v1/".into()),
+                    Some("replacement-model".into()),
+                )
+                .expect("update safe desktop settings"),
+            EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://localhost:8080/v1".into(),
+                    model: "replacement-model".into(),
+                },
+                notifications_enabled: false,
+                poll_interval_minutes: 45,
+                polling_supported: true,
+                retention_days: 365,
+            }
+        );
+        assert_eq!(
+            engine.settings().expect("read updated desktop settings"),
+            EngineSettings {
+                local_model: LocalModelSettings {
+                    editable: true,
+                    endpoint: "http://localhost:8080/v1".into(),
+                    model: "replacement-model".into(),
+                },
+                notifications_enabled: false,
+                poll_interval_minutes: 45,
+                polling_supported: true,
+                retention_days: 365,
             }
         );
 
@@ -687,7 +2131,92 @@ notifications_enabled = true
             }
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
-        assert_eq!(engine.recent(20).expect("list empty inbox"), vec![]);
+        assert_eq!(
+            engine
+                .query_inbox(InboxQuery {
+                    limit: 20,
+                    cursor: None,
+                    provider: None,
+                    account_id: None,
+                    sender_query: None,
+                    priority: None,
+                    category: None,
+                    status: None,
+                    keyword: None,
+                })
+                .expect("list empty inbox")
+                .items,
+            vec![]
+        );
+        assert_eq!(engine.clear_inbox().expect("clear empty inbox"), 0);
+        assert_eq!(
+            engine
+                .delete_inbox_item("missing-message".into())
+                .expect_err("missing inbox item must not be deleted")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .attachment_capabilities("missing-message".into(), "2".into())
+                .expect_err("missing attachment must not discover capabilities")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .invoke_attachment_capability(
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "missing-message".into(),
+                    "2".into(),
+                    ConnectProviderIdentity {
+                        app_id: "document-summarizer".into(),
+                        version: "0.1.0".into(),
+                        instance_id: "11111111-1111-4111-8111-111111111111".into(),
+                    },
+                    ConnectCapabilityRef {
+                        id: "document.summarize".into(),
+                        version: "1.0".into(),
+                    },
+                    BTreeMap::new(),
+                    false,
+                )
+                .expect_err("missing attachment must not invoke a capability")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .present_capability_output(
+                    "missing-message".into(),
+                    "2".into(),
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "33333333-3333-4333-8333-333333333333".into(),
+                )
+                .expect_err("missing capability output must not be presented")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .export_capability_output(
+                    "missing-message".into(),
+                    "2".into(),
+                    "22222222-2222-4222-8222-222222222222".into(),
+                    "33333333-3333-4333-8333-333333333333".into(),
+                    directory.path().to_path_buf(),
+                )
+                .expect_err("missing capability output must not be exported")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .requeue_analysis("missing-message".into())
+                .expect_err("missing analysis must not be requeued")
+                .code,
+            "not_found"
+        );
         assert_eq!(
             engine
                 .pending_notifications(25)

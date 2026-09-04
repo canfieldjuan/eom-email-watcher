@@ -4,21 +4,38 @@ import os
 import re
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from email.utils import parseaddr
+from ipaddress import ip_address
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 from filelock import FileLock
-from tomlkit import aot, dumps, inline_table, parse, table
+from tomlkit import aot, document, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
 DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 DEFAULT_POLL_INTERVAL_MINUTES = 120
+DEFAULT_RETENTION_DAYS = 180
+MIN_RETENTION_DAYS = 1
+MAX_RETENTION_DAYS = 3650
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+GATEWAY_MODEL_LABEL = "Managed by inference gateway"
+MUTABLE_DESKTOP_SETTINGS = frozenset(
+    {
+        "model_base_url",
+        "model_name",
+        "notifications_enabled",
+        "poll_interval_minutes",
+        "retention_days",
+    }
+)
 
 
 class ConfigError(ValueError):
@@ -37,6 +54,18 @@ class SenderNotFoundError(ConfigError):
     """A requested watchlist sender does not exist."""
 
 
+class InvalidSettingsUpdateError(ConfigError):
+    """A proposed desktop settings update is not valid."""
+
+
+class InvalidConfigInitializationError(ConfigError):
+    """A proposed first-run desktop configuration is not valid."""
+
+
+class ConfigAlreadyExistsError(ConfigError):
+    """First-run initialization cannot replace an existing configuration."""
+
+
 @dataclass(frozen=True)
 class Sender:
     email: str
@@ -51,13 +80,16 @@ class Config:
     retention_days: int
     poll_interval_minutes: int
     gmail_credentials_file: Path
+    microsoft_credentials_file: Path
     gmail_token_file: Path
     gmail_send_token_file: Path
     monthly_hours_recipient: str | None
     database_file: Path
+    model_backend: Literal["loopback", "gateway"]
     model_base_url: str
     model_name: str
     model_api_token_file: Path | None
+    model_ca_file: Path | None
     model_require_auth: bool
     model_timeout_seconds: float
     notifications_enabled: bool
@@ -77,7 +109,7 @@ class Config:
 def _path(value: object, key: str) -> Path:
     if isinstance(value, Path):
         return value.expanduser()
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ConfigError(f"{key} must be a non-empty path")
     return Path(os.path.expandvars(value)).expanduser()
 
@@ -95,6 +127,14 @@ def _valid_domain(domain: str) -> bool:
     return len(ascii_domain) <= 253 and all(
         DOMAIN_LABEL_RE.fullmatch(label) for label in ascii_domain.split(".")
     )
+
+
+def _valid_network_host(host: str) -> bool:
+    try:
+        ip_address(host)
+    except ValueError:
+        return _valid_domain(host)
+    return True
 
 
 def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
@@ -145,6 +185,34 @@ def validate_model_base_url(value: object) -> str:
             "model_base_url must use http with an explicit port on localhost or "
             "127.0.0.1; email bodies may not leave this machine"
         )
+    return base_url
+
+
+def validate_gateway_base_url(value: object) -> str:
+    base_url = str(value).rstrip("/")
+    if any(character.isspace() or not character.isprintable() for character in base_url):
+        raise ConfigError("model_base_url must not contain whitespace or control characters")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+        httpx.URL(base_url)
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise ConfigError("gateway model_base_url must be an HTTPS origin") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or not _valid_network_host(parsed.hostname)
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in base_url
+        or "#" in base_url
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or port is not None
+        and not 1 <= port <= 65_535
+    ):
+        raise ConfigError("gateway model_base_url must be an HTTPS origin")
     return base_url
 
 
@@ -209,31 +277,50 @@ def load_config(path: Path | None = None) -> Config:
         senders.append(sender)
 
     body_limit = _integer_setting(data, "body_char_limit", 20_000)
-    retention = _integer_setting(data, "retention_days", 180)
+    retention = _integer_setting(data, "retention_days", DEFAULT_RETENTION_DAYS)
     poll_interval = _integer_setting(
         data, "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES
     )
     timeout = _float_setting(data, "model_timeout_seconds", 60)
     if not 1_000 <= body_limit <= 100_000:
         raise ConfigError("body_char_limit must be between 1000 and 100000")
-    if not 1 <= retention <= 3650:
-        raise ConfigError("retention_days must be between 1 and 3650")
+    if not MIN_RETENTION_DAYS <= retention <= MAX_RETENTION_DAYS:
+        raise ConfigError(
+            f"retention_days must be between {MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS}"
+        )
     if not 1 <= poll_interval <= 1440:
         raise ConfigError("poll_interval_minutes must be between 1 and 1440")
     if not 1 <= timeout <= 300:
         raise ConfigError("model_timeout_seconds must be between 1 and 300")
 
-    base_url = validate_model_base_url(
-        data.get("model_base_url", "http://127.0.0.1:1234/v1")
+    backend = data.get("model_backend", "loopback")
+    if not isinstance(backend, str) or backend not in {"loopback", "gateway"}:
+        raise ConfigError("model_backend must be loopback or gateway")
+    raw_base_url = data.get("model_base_url", "http://127.0.0.1:1234/v1")
+    base_url = (
+        validate_gateway_base_url(raw_base_url)
+        if backend == "gateway"
+        else validate_model_base_url(raw_base_url)
     )
     model_name = data.get("model_name")
-    if not isinstance(model_name, str) or not model_name.strip():
-        raise ConfigError("model_name must be set")
-    require_auth = bool(data.get("model_require_auth", True))
+    if backend == "loopback":
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ConfigError("model_name must be set")
+        normalized_model_name = model_name.strip()
+    else:
+        normalized_model_name = GATEWAY_MODEL_LABEL
+    raw_require_auth = data.get("model_require_auth", True)
+    require_auth = bool(raw_require_auth)
+    if backend == "gateway" and raw_require_auth is not True:
+        raise ConfigError("gateway model_require_auth must be true")
     raw_token_file = data.get("model_api_token_file")
     token_file = _path(raw_token_file, "model_api_token_file") if raw_token_file else None
     if require_auth and token_file is None:
         raise ConfigError("model_api_token_file is required when model_require_auth is true")
+    raw_ca_file = data.get("model_ca_file")
+    ca_file = _path(raw_ca_file, "model_ca_file") if raw_ca_file else None
+    if backend == "gateway" and ca_file is None:
+        raise ConfigError("model_ca_file is required when model_backend is gateway")
 
     raw_ntfy_topic = data.get("ntfy_topic")
     ntfy_topic = str(raw_ntfy_topic).strip() if raw_ntfy_topic else None
@@ -256,6 +343,13 @@ def load_config(path: Path | None = None) -> Config:
             data.get("gmail_credentials_file", DEFAULT_STATE / "credentials.json"),
             "gmail_credentials_file",
         ),
+        microsoft_credentials_file=_path(
+            data.get(
+                "microsoft_credentials_file",
+                DEFAULT_STATE / "microsoft-oauth-client.json",
+            ),
+            "microsoft_credentials_file",
+        ),
         gmail_token_file=_path(
             data.get("gmail_token_file", DEFAULT_STATE / "token.json"),
             "gmail_token_file",
@@ -273,9 +367,11 @@ def load_config(path: Path | None = None) -> Config:
             data.get("database_file", DEFAULT_STATE / "watcher.sqlite3"),
             "database_file",
         ),
+        model_backend=backend,
         model_base_url=base_url,
-        model_name=model_name.strip(),
+        model_name=normalized_model_name,
         model_api_token_file=token_file,
+        model_ca_file=ca_file,
         model_require_auth=require_auth,
         model_timeout_seconds=timeout,
         notifications_enabled=bool(data.get("notifications_enabled", True)),
@@ -304,6 +400,72 @@ def _atomic_write(path: Path, content: str) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _atomic_create(path: Path, content: str) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ConfigAlreadyExistsError("Configuration already exists") from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def initialize_config(
+    path: Path,
+    *,
+    timezone: str,
+    model_base_url: str,
+    model_name: str,
+) -> Config:
+    normalized_timezone = timezone.strip()
+    if not normalized_timezone:
+        raise InvalidConfigInitializationError("timezone must be a non-empty string")
+    try:
+        ZoneInfo(normalized_timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise InvalidConfigInitializationError(f"Unknown timezone: {normalized_timezone}") from exc
+
+    try:
+        normalized_base_url = validate_model_base_url(model_base_url)
+    except ConfigError as exc:
+        raise InvalidConfigInitializationError(str(exc)) from exc
+    normalized_model_name = model_name.strip()
+    if not normalized_model_name or any(
+        not character.isprintable() for character in normalized_model_name
+    ):
+        raise InvalidConfigInitializationError("model_name must be a non-empty printable string")
+
+    config_path = path.expanduser().resolve()
+    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    initial = document()
+    initial["timezone"] = normalized_timezone
+    initial["poll_interval_minutes"] = DEFAULT_POLL_INTERVAL_MINUTES
+    initial["retention_days"] = DEFAULT_RETENTION_DAYS
+    initial["model_backend"] = "loopback"
+    initial["model_base_url"] = normalized_base_url
+    initial["model_name"] = normalized_model_name
+    initial["model_require_auth"] = False
+    initial["notifications_enabled"] = True
+    with FileLock(f"{config_path}.lock"):
+        _atomic_create(config_path, dumps(initial))
+    return load_config(config_path)
 
 
 def _sender_table(sender: Sender, *, inline: bool):
@@ -357,6 +519,81 @@ def remove_sender(path: Path, email: str) -> Sender:
         del sender_items[index]
         _atomic_write(config_path, dumps(document))
     return removed
+
+
+def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
+    if not updates:
+        raise InvalidSettingsUpdateError("At least one setting must be provided")
+    unknown = set(updates) - MUTABLE_DESKTOP_SETTINGS
+    if unknown:
+        fields = ", ".join(sorted(str(field) for field in unknown))
+        raise InvalidSettingsUpdateError(f"Unsupported settings: {fields}")
+
+    poll_interval = updates.get("poll_interval_minutes")
+    if "poll_interval_minutes" in updates:
+        if type(poll_interval) is not int:
+            raise InvalidSettingsUpdateError("poll_interval_minutes must be an integer")
+        if not 1 <= poll_interval <= 1440:
+            raise InvalidSettingsUpdateError(
+                "poll_interval_minutes must be between 1 and 1440"
+            )
+
+    retention = updates.get("retention_days")
+    if "retention_days" in updates:
+        if type(retention) is not int:
+            raise InvalidSettingsUpdateError("retention_days must be an integer")
+        if not MIN_RETENTION_DAYS <= retention <= MAX_RETENTION_DAYS:
+            raise InvalidSettingsUpdateError(
+                f"retention_days must be between {MIN_RETENTION_DAYS} "
+                f"and {MAX_RETENTION_DAYS}"
+            )
+
+    notifications = updates.get("notifications_enabled")
+    if "notifications_enabled" in updates and type(notifications) is not bool:
+        raise InvalidSettingsUpdateError("notifications_enabled must be a boolean")
+
+    normalized_updates = dict(updates)
+    model_base_url = updates.get("model_base_url")
+    if "model_base_url" in updates:
+        if not isinstance(model_base_url, str):
+            raise InvalidSettingsUpdateError("model_base_url must be a string")
+        try:
+            normalized_updates["model_base_url"] = validate_model_base_url(model_base_url)
+        except ConfigError as exc:
+            raise InvalidSettingsUpdateError(str(exc)) from exc
+
+    model_name = updates.get("model_name")
+    if "model_name" in updates:
+        if not isinstance(model_name, str):
+            raise InvalidSettingsUpdateError("model_name must be a string")
+        normalized_model_name = model_name.strip()
+        if not normalized_model_name or any(
+            not character.isprintable() for character in normalized_model_name
+        ):
+            raise InvalidSettingsUpdateError(
+                "model_name must be a non-empty printable string"
+            )
+        normalized_updates["model_name"] = normalized_model_name
+
+    config_path = path.expanduser().resolve()
+    try:
+        with FileLock(f"{config_path}.lock"):
+            config = load_config(config_path)
+            if (
+                {"model_base_url", "model_name"} & updates.keys()
+                and config.model_backend != "loopback"
+            ):
+                raise InvalidSettingsUpdateError(
+                    "Model endpoint and identifier are managed by the inference gateway"
+                )
+            document = parse(config_path.read_text(encoding="utf-8"))
+            for key, value in normalized_updates.items():
+                document[key] = value
+            _atomic_write(config_path, dumps(document))
+            return load_config(config_path)
+    except FileNotFoundError:
+        load_config(config_path)
+        raise
 
 
 def secure_runtime_paths(config: Config) -> None:

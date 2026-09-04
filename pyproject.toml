@@ -1,25 +1,30 @@
 [project]
 name = "eom-email-watcher"
 version = "0.1.0"
-description = "Private Gmail sender watcher with local-only email summarization"
+description = "Private watched-sender email app with local-only summarization"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "cryptography>=45,<50",
   "filelock>=3.18,<4",
   "google-api-python-client>=2.179,<3",
   "google-auth-oauthlib>=1.2,<2",
   "httpx>=0.28,<1",
+  "msal>=1.38,<2",
   "pydantic>=2.11,<3",
   "tomlkit>=0.13,<1",
+  "tzdata>=2025.2,<2027",
 ]
 
 [project.scripts]
 eom-mail-watch = "eom_email_watcher.cli:main"
 eom-mail-engine = "eom_email_watcher.engine_api:main"
 eom-model-benchmark = "eom_email_watcher.benchmark:main"
+eom-llama-cpp-proof = "eom_email_watcher.llama_cpp_proof:main"
 
 [dependency-groups]
 dev = [
+  "pyinstaller>=6.16,<7",
   "pytest>=8.4,<9",
   "pytest-cov>=6.2,<7",
   "ruff>=0.12,<1",

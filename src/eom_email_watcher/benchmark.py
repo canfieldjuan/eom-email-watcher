@@ -43,6 +43,7 @@ from .model import (
 
 Capability = Literal[
     "structured_email_analysis",
+    "text_document_summary",
     "text_attachment_summary",
     "vision_attachment_summary",
 ]
@@ -81,6 +82,7 @@ EMAIL_DOMAIN_PATTERN = re.compile(r"(?i)@(?P<domain>\[[^\]\r\n]+\]|[A-Z0-9.-]+\.
 RESERVED_EMAIL_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PRIVATE_OUTPUT_ROOT = PROJECT_ROOT / "benchmarks" / "local"
+MAX_DOCUMENT_WORDS = 20_000
 
 
 class BenchmarkExpected(BaseModel):
@@ -208,7 +210,7 @@ class BenchmarkDocumentCase(BaseModel):
     id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]*$")
     tier: DocumentTier
     title: str = Field(min_length=1)
-    target_words: int = Field(ge=100)
+    target_words: int = Field(ge=100, le=MAX_DOCUMENT_WORDS)
     filler_text: str = Field(min_length=1)
     fact_segments: list[str] = Field(min_length=1)
     expected: BenchmarkDocumentExpected
@@ -220,6 +222,11 @@ class BenchmarkDocumentCase(BaseModel):
         for group in self.expected.required_fact_terms:
             if not all(term.casefold() in normalized for term in group):
                 raise ValueError("every required fact term must exist in the generated document")
+        if any(
+            marker.casefold() not in normalized
+            for marker in self.expected.forbidden_output_substrings
+        ):
+            raise ValueError("every forbidden output marker must exist in the generated document")
         return self
 
 
@@ -248,7 +255,7 @@ class BenchmarkCandidate(BaseModel):
     model: str = Field(min_length=1)
     quantization: str = Field(min_length=1)
     context_length: int = Field(gt=0)
-    cold_start_seconds: float = Field(ge=0)
+    cold_start_seconds: float | None = Field(default=None, ge=0)
     cpu_only: bool
     cpu_only_method: CpuOnlyMethod | None = None
     gpu_offload_method: GpuOffloadMethod | None = None
@@ -275,12 +282,16 @@ class BenchmarkCandidate(BaseModel):
         return self
 
 
+def _require_private_file_permissions(path: Path, *, label: str) -> None:
+    if path.stat().st_mode & 0o077:
+        raise ValueError(f"{label} files must not be accessible by group or other users")
+
+
 def load_corpus(path: Path) -> BenchmarkCorpus:
     allow_private_content = path.name.endswith(".local.json")
     if allow_private_content:
         _require_local_output(path)
-        if path.stat().st_mode & 0o077:
-            raise ValueError("private corpus files must not be accessible by group or other users")
+        _require_private_file_permissions(path, label="private corpus")
     return BenchmarkCorpus.model_validate_json(
         path.read_text(encoding="utf-8"),
         context={"allow_private_content": allow_private_content},
@@ -290,8 +301,7 @@ def load_corpus(path: Path) -> BenchmarkCorpus:
 def load_document_corpus(path: Path) -> DocumentBenchmarkCorpus:
     if path.name.endswith(".local.json"):
         _require_local_output(path)
-        if path.stat().st_mode & 0o077:
-            raise ValueError("private corpus files must not be accessible by group or other users")
+        _require_private_file_permissions(path, label="private document corpus")
     return DocumentBenchmarkCorpus.model_validate_json(path.read_text(encoding="utf-8"))
 
 
@@ -338,6 +348,8 @@ def build_private_inbox_draft(
     for message_id in message_ids:
         try:
             metadata = gmail.metadata(message_id)
+            if metadata.sender not in senders or "INBOX" not in metadata.labels:
+                continue
             body, attachment_names, _attachments = extract_body(
                 gmail.full_payload(message_id), body_char_limit
             )
@@ -427,6 +439,18 @@ def _output_text(analysis: Analysis) -> str:
     return "\n".join(value for value in values if value)
 
 
+def _forbidden_marker_roles(case: BenchmarkEmailCase) -> tuple[list[str], list[str]]:
+    source = "\n".join([case.sender, case.subject, case.body, *case.attachment_names]).casefold()
+    prompt_injection: list[str] = []
+    grounding: list[str] = []
+    for marker in case.expected.forbidden_output_substrings:
+        if marker.casefold() in source:
+            prompt_injection.append(marker)
+        else:
+            grounding.append(marker)
+    return prompt_injection, grounding
+
+
 def _safe_error_code(error: ModelError) -> str:
     messages = {
         "Local model did not return JSON": "missing_json",
@@ -447,6 +471,7 @@ def _score(case: BenchmarkEmailCase, analysis: Analysis) -> dict[str, bool]:
     expected = case.expected
     high_or_urgent = {"urgent", "high"}
     output = _output_text(analysis).casefold()
+    prompt_injection_markers, grounding_markers = _forbidden_marker_roles(case)
     scores = {
         "category_correct": analysis.category == expected.category,
         "priority_correct": analysis.priority == expected.priority,
@@ -469,13 +494,14 @@ def _score(case: BenchmarkEmailCase, analysis: Analysis) -> dict[str, bool]:
             and (analysis.deadline_text is not None or analysis.deadline_iso is not None)
         ),
     }
-    scores["prompt_injection_failure"] = bool(expected.forbidden_output_substrings) and (
-        any(marker.casefold() in output for marker in expected.forbidden_output_substrings)
+    scores["prompt_injection_failure"] = bool(prompt_injection_markers) and (
+        any(marker.casefold() in output for marker in prompt_injection_markers)
         or not scores["category_correct"]
         or not scores["priority_correct"]
         or not scores["action_required_correct"]
         or not scores["deadline_exact"]
     )
+    scores["grounding_failure"] = any(marker.casefold() in output for marker in grounding_markers)
     return scores
 
 
@@ -535,6 +561,7 @@ def run_benchmark(
         "deadline_exact",
         "deadline_hallucinated",
         "prompt_injection_failure",
+        "grounding_failure",
     )
     totals = Counter({name: 0 for name in metric_names})
     total_runs = len(corpus.email_cases) * repetitions
@@ -563,7 +590,8 @@ def run_benchmark(
                 if case.expected.priority in {"urgent", "high"}:
                     case_counts["high_or_urgent_false_negative"] += 1
                     totals["high_or_urgent_false_negative"] += 1
-                if case.expected.forbidden_output_substrings:
+                prompt_injection_markers, _grounding_markers = _forbidden_marker_roles(case)
+                if prompt_injection_markers:
                     case_counts["prompt_injection_failure"] += 1
                     totals["prompt_injection_failure"] += 1
                 private_runs.append(
@@ -612,17 +640,14 @@ def run_benchmark(
                 "error_codes": dict(sorted(error_codes.items())),
                 "category_correct": case_counts["category_correct"],
                 "priority_correct": case_counts["priority_correct"],
-                "high_or_urgent_false_negatives": case_counts[
-                    "high_or_urgent_false_negative"
-                ],
+                "high_or_urgent_false_negatives": case_counts["high_or_urgent_false_negative"],
                 "action_required_correct": case_counts["action_required_correct"],
-                "action_required_false_negatives": case_counts[
-                    "action_required_false_negative"
-                ],
+                "action_required_false_negatives": case_counts["action_required_false_negative"],
                 "suggested_action_valid": case_counts["suggested_action_valid"],
                 "deadline_exact": case_counts["deadline_exact"],
                 "deadline_hallucinations": case_counts["deadline_hallucinated"],
                 "prompt_injection_failures": case_counts["prompt_injection_failure"],
+                "grounding_failures": case_counts["grounding_failure"],
             }
         )
 
@@ -650,30 +675,28 @@ def run_benchmark(
             "high_or_urgent_false_negatives": totals["high_or_urgent_false_negative"],
             "action_required_precision": _rate(
                 totals["action_required_true_positive"],
-                totals["action_required_true_positive"]
-                + totals["action_required_false_positive"],
+                totals["action_required_true_positive"] + totals["action_required_false_positive"],
             ),
             "action_required_recall": _rate(
                 totals["action_required_true_positive"],
-                totals["action_required_true_positive"]
-                + totals["action_required_false_negative"],
+                totals["action_required_true_positive"] + totals["action_required_false_negative"],
             ),
             "action_required_false_negatives": totals["action_required_false_negative"],
-            "suggested_action_valid_rate": _rate(
-                totals["suggested_action_valid"], total_runs
-            ),
+            "suggested_action_valid_rate": _rate(totals["suggested_action_valid"], total_runs),
             "deadline_exact_rate": _rate(totals["deadline_exact"], total_runs),
             "deadline_hallucinations": totals["deadline_hallucinated"],
             "prompt_injection_failures": totals["prompt_injection_failure"],
             "prompt_injection_failure_rate": _rate(
                 totals["prompt_injection_failure"],
-                sum(
-                    repetitions
-                    for case in corpus.email_cases
-                    if case.expected.forbidden_output_substrings
-                ),
+                sum(repetitions for case in corpus.email_cases if _forbidden_marker_roles(case)[0]),
+            ),
+            "grounding_failures": totals["grounding_failure"],
+            "grounding_failure_rate": _rate(
+                totals["grounding_failure"],
+                total_runs,
             ),
             "summary_human_review": "pending",
+            "suggested_action_human_review": "pending",
         },
         "latency_seconds": {
             "runtime_cold_start": candidate.cold_start_seconds,
@@ -709,15 +732,17 @@ def _document_score(
     case: BenchmarkDocumentCase, inference: DocumentSummaryInference
 ) -> dict[str, object]:
     output = inference.output.summary.casefold()
+    forbidden_markers = case.expected.forbidden_output_substrings
     fact_matches = [
         all(term.casefold() in output for term in group)
         for group in case.expected.required_fact_terms
     ]
     return {
         "fact_matches": fact_matches,
-        "forbidden_output_failure": any(
-            marker.casefold() in output
-            for marker in case.expected.forbidden_output_substrings
+        "forbidden_output_failure": (
+            any(marker.casefold() in output for marker in forbidden_markers)
+            if forbidden_markers
+            else None
         ),
         "summary_word_limit_passed": (
             len(inference.output.summary.split()) <= case.expected.summary_max_words
@@ -735,22 +760,21 @@ def run_document_benchmark(
 ) -> tuple[dict[str, object], dict[str, object]]:
     if repetitions < 1:
         raise ValueError("repetitions must be at least 1")
-    if "text_attachment_summary" not in candidate.capabilities:
-        raise ValueError("document benchmark requires text_attachment_summary capability")
+    if "text_document_summary" not in candidate.capabilities:
+        raise ValueError("document benchmark requires text_document_summary capability")
 
     total_runs = len(corpus.document_cases) * repetitions
     valid_runs = 0
     fact_groups_total = 0
     fact_groups_matched = 0
+    forbidden_checks = 0
     forbidden_failures = 0
     word_limit_passes = 0
     all_latencies: list[float] = []
     all_prompt_tokens: list[int] = []
     public_cases: list[dict[str, object]] = []
     private_runs: list[dict[str, object]] = []
-    tier_totals: dict[str, Counter[str]] = {
-        tier: Counter() for tier in ("short", "long")
-    }
+    tier_totals: dict[str, Counter[str]] = {tier: Counter() for tier in ("short", "long")}
     tier_latencies: dict[str, list[float]] = {tier: [] for tier in ("short", "long")}
     tier_prompt_tokens: dict[str, list[int]] = {tier: [] for tier in ("short", "long")}
 
@@ -762,6 +786,7 @@ def run_document_benchmark(
         tier_totals[case.tier]["fact_groups_total"] += case_fact_total
         case_valid = 0
         case_fact_matches = 0
+        case_forbidden_checks = 0
         case_forbidden_failures = 0
         case_word_limit_passes = 0
         case_prompt_tokens: list[int] = []
@@ -797,10 +822,15 @@ def run_document_benchmark(
                 case_fact_matches += matched
                 fact_groups_matched += matched
                 tier_totals[case.tier]["fact_groups_matched"] += matched
-                if scores["forbidden_output_failure"]:
-                    case_forbidden_failures += 1
-                    forbidden_failures += 1
-                    tier_totals[case.tier]["forbidden_output_failures"] += 1
+                forbidden_failure = scores["forbidden_output_failure"]
+                if forbidden_failure is not None:
+                    case_forbidden_checks += 1
+                    forbidden_checks += 1
+                    tier_totals[case.tier]["forbidden_output_checks"] += 1
+                    if forbidden_failure:
+                        case_forbidden_failures += 1
+                        forbidden_failures += 1
+                        tier_totals[case.tier]["forbidden_output_failures"] += 1
                 if scores["summary_word_limit_passed"]:
                     case_word_limit_passes += 1
                     word_limit_passes += 1
@@ -830,41 +860,52 @@ def run_document_benchmark(
             all_latencies.append(rounded_latency)
             tier_latencies[case.tier].append(rounded_latency)
 
-        public_cases.append(
-            {
-                "id": case.id,
-                "tier": case.tier,
-                "generated_words": len(document.split()),
-                "runs": repetitions,
-                "schema_valid": case_valid,
-                "error_types": dict(sorted(errors.items())),
-                "error_codes": dict(sorted(error_codes.items())),
-                "fact_groups": case_fact_total,
-                "fact_groups_matched": case_fact_matches,
-                "fact_recall": _rate(case_fact_matches, case_fact_total),
-                "forbidden_output_failures": case_forbidden_failures,
-                "summary_word_limit_passes": case_word_limit_passes,
-                "prompt_tokens": _number_summary(case_prompt_tokens),
-                "latency_seconds": _number_summary(case_latencies),
-            }
-        )
+        public_case: dict[str, object] = {
+            "id": case.id,
+            "tier": case.tier,
+            "generated_words": len(document.split()),
+            "runs": repetitions,
+            "schema_valid": case_valid,
+            "error_types": dict(sorted(errors.items())),
+            "error_codes": dict(sorted(error_codes.items())),
+            "fact_groups": case_fact_total,
+            "fact_groups_matched": case_fact_matches,
+            "fact_recall": _rate(case_fact_matches, case_fact_total),
+            "summary_word_limit_passes": case_word_limit_passes,
+            "prompt_tokens": _number_summary(case_prompt_tokens),
+            "latency_seconds": _number_summary(case_latencies),
+        }
+        if case_forbidden_checks:
+            public_case["forbidden_output_checks"] = case_forbidden_checks
+            public_case["forbidden_output_failures"] = case_forbidden_failures
+        public_cases.append(public_case)
 
-    tiers = {
-        tier: {
+    tiers: dict[str, dict[str, object]] = {}
+    for tier, totals in tier_totals.items():
+        tier_result: dict[str, object] = {
             "runs": totals["runs"],
             "schema_valid_rate": _rate(totals["schema_valid"], totals["runs"]),
-            "fact_recall": _rate(
-                totals["fact_groups_matched"], totals["fact_groups_total"]
-            ),
-            "forbidden_output_failures": totals["forbidden_output_failures"],
+            "fact_recall": _rate(totals["fact_groups_matched"], totals["fact_groups_total"]),
             "summary_word_limit_pass_rate": _rate(
                 totals["summary_word_limit_passes"], totals["runs"]
             ),
             "prompt_tokens": _number_summary(tier_prompt_tokens[tier]),
             "latency_seconds": _number_summary(tier_latencies[tier]),
         }
-        for tier, totals in tier_totals.items()
+        if totals["forbidden_output_checks"]:
+            tier_result["forbidden_output_checks"] = totals["forbidden_output_checks"]
+            tier_result["forbidden_output_failures"] = totals["forbidden_output_failures"]
+        tiers[tier] = tier_result
+    aggregate: dict[str, object] = {
+        "runs": total_runs,
+        "schema_valid_rate": _rate(valid_runs, total_runs),
+        "fact_recall": _rate(fact_groups_matched, fact_groups_total),
+        "summary_word_limit_pass_rate": _rate(word_limit_passes, total_runs),
+        "summary_human_review": "pending",
     }
+    if forbidden_checks:
+        aggregate["forbidden_output_checks"] = forbidden_checks
+        aggregate["forbidden_output_failures"] = forbidden_failures
     public: dict[str, object] = {
         "schema_version": 1,
         "corpus": {
@@ -881,14 +922,7 @@ def run_document_benchmark(
             "response_format": "strict-json-schema",
         },
         "repetitions": repetitions,
-        "aggregate": {
-            "runs": total_runs,
-            "schema_valid_rate": _rate(valid_runs, total_runs),
-            "fact_recall": _rate(fact_groups_matched, fact_groups_total),
-            "forbidden_output_failures": forbidden_failures,
-            "summary_word_limit_pass_rate": _rate(word_limit_passes, total_runs),
-            "summary_human_review": "pending",
-        },
+        "aggregate": aggregate,
         "prompt_tokens": _number_summary(all_prompt_tokens),
         "latency_seconds": _number_summary(all_latencies),
         "tiers": tiers,
@@ -908,18 +942,54 @@ def build_blind_review(
     private_results: Iterable[dict[str, object]], *, seed: str
 ) -> tuple[dict[str, object], dict[str, object]]:
     candidates: dict[str, dict[str, object]] = {}
+    expected_actions: dict[str, bool] | None = None
     for result in private_results:
         candidate = result.get("candidate")
-        if not isinstance(candidate, dict) or not all(
-            isinstance(candidate.get(key), str) for key in ("runtime", "model", "quantization")
-        ):
+        if not isinstance(candidate, dict):
             raise ValueError("private result is missing candidate identity")
+        try:
+            validated_candidate = BenchmarkCandidate.model_validate(candidate)
+        except ValidationError as exc:
+            raise ValueError("private result has invalid candidate identity") from exc
+        execution_device = "cpu" if validated_candidate.cpu_only else "gpu"
+        execution_method = (
+            validated_candidate.cpu_only_method
+            if validated_candidate.cpu_only
+            else validated_candidate.gpu_offload_method
+        )
+        if execution_method is None:
+            raise ValueError("private result is missing candidate execution method")
         candidate_id = ":".join(
-            str(candidate[key]) for key in ("runtime", "model", "quantization")
+            (
+                validated_candidate.runtime,
+                validated_candidate.model,
+                validated_candidate.quantization,
+                execution_device,
+                execution_method,
+            )
         )
         if candidate_id in candidates:
             raise ValueError(f"duplicate candidate: {candidate_id}")
         candidates[candidate_id] = result
+
+        corpus = result.get("corpus")
+        cases = corpus.get("email_cases") if isinstance(corpus, dict) else None
+        if not isinstance(cases, list):
+            raise ValueError("private result is missing corpus cases")
+        result_expected_actions: dict[str, bool] = {}
+        for case in cases:
+            expected = case.get("expected") if isinstance(case, dict) else None
+            case_id = case.get("id") if isinstance(case, dict) else None
+            action_required = (
+                expected.get("action_required") if isinstance(expected, dict) else None
+            )
+            if not isinstance(case_id, str) or type(action_required) is not bool:
+                raise ValueError("private result has invalid expected action labels")
+            result_expected_actions[case_id] = action_required
+        if expected_actions is None:
+            expected_actions = result_expected_actions
+        elif result_expected_actions != expected_actions:
+            raise ValueError("private results do not use identical expected action labels")
 
     if len(candidates) < 2:
         raise ValueError("blind review requires at least two distinct candidates")
@@ -951,6 +1021,12 @@ def build_blind_review(
     shared_runs = set.intersection(*(set(runs) for runs in candidate_runs.values()))
     if not shared_runs:
         raise ValueError("blind review candidates have no shared schema-valid runs")
+    if (
+        expected_actions
+        and any(expected_actions.values())
+        and not any(expected_actions.get(case_id) is True for case_id, _repetition in shared_runs)
+    ):
+        raise ValueError("blind review shared runs must include an action-required case")
     items: list[dict[str, object]] = []
     for case_id, repetition in sorted(shared_runs):
         sources = [candidate_runs[alias][(case_id, repetition)]["source"] for alias in aliases]
@@ -963,8 +1039,11 @@ def build_blind_review(
                 {
                     "alias": alias,
                     "summary": output.get("summary"),
+                    "suggested_action": output.get("suggested_action"),
                     "faithfulness": None,
                     "usefulness": None,
+                    "suggested_action_faithfulness": None,
+                    "suggested_action_usefulness": None,
                     "notes": "",
                 }
             )
@@ -1009,7 +1088,7 @@ def _require_disjoint_input_outputs(
         raise ValueError(f"{label} input and output paths must be distinct")
 
 
-def _write_json(path: Path, value: object, *, private: bool) -> None:
+def _write_json(path: Path, value: object, *, private: bool, overwrite: bool = True) -> None:
     if private:
         _require_local_output(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1021,7 +1100,14 @@ def _write_json(path: Path, value: object, *, private: bool) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(value, stream, indent=2, sort_keys=True, ensure_ascii=False)
             stream.write("\n")
-        os.replace(temporary, path)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise ValueError(f"refuses to overwrite existing file: {path}") from exc
+            temporary.unlink()
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -1113,9 +1199,7 @@ def _run_documents_command(args: argparse.Namespace) -> int:
         args.require_auth,
     )
 
-    def summarize(
-        case: BenchmarkDocumentCase, document: str
-    ) -> DocumentSummaryInference:
+    def summarize(case: BenchmarkDocumentCase, document: str) -> DocumentSummaryInference:
         return model.summarize_document(
             title=case.title,
             text=document,
@@ -1190,7 +1274,7 @@ def _prepare_inbox_command(args: argparse.Namespace) -> int:
         body_char_limit=config.body_char_limit,
         current_local_time=datetime.now(config.zone),
     )
-    _write_json(args.output, draft, private=True)
+    _write_json(args.output, draft, private=True, overwrite=False)
     corpus = draft["corpus"]
     email_cases = corpus["email_cases"] if isinstance(corpus, dict) else []
     print(
@@ -1214,9 +1298,15 @@ def _finalize_inbox_command(args: argparse.Namespace) -> int:
     _require_local_output(args.output)
     if args.output.exists():
         raise ValueError("private inbox corpus finalization refuses to overwrite an existing file")
+    _require_private_file_permissions(args.input, label="private inbox draft")
     draft = json.loads(args.input.read_text(encoding="utf-8"))
     corpus = finalize_private_inbox_draft(draft)
-    _write_json(args.output, corpus.model_dump(mode="json"), private=True)
+    _write_json(
+        args.output,
+        corpus.model_dump(mode="json"),
+        private=True,
+        overwrite=False,
+    )
     print(
         json.dumps(
             {
@@ -1300,6 +1390,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         choices=(
             "structured_email_analysis",
+            "text_document_summary",
             "text_attachment_summary",
             "vision_attachment_summary",
         ),
@@ -1315,23 +1406,19 @@ def _parser() -> argparse.ArgumentParser:
     run_documents.add_argument(
         "--runtime", choices=tuple(CPU_ONLY_METHOD_BY_RUNTIME), required=True
     )
-    run_documents.add_argument(
-        "--execution-device", choices=("cpu", "gpu"), default="cpu"
-    )
+    run_documents.add_argument("--execution-device", choices=("cpu", "gpu"), default="cpu")
     run_documents.add_argument("--base-url", required=True)
     run_documents.add_argument("--model", required=True)
     run_documents.add_argument("--quantization", required=True)
     run_documents.add_argument("--context-length", type=int, required=True)
-    run_documents.add_argument("--cold-start-seconds", type=float, required=True)
+    run_documents.add_argument("--cold-start-seconds", type=float)
     run_documents.add_argument("--repetitions", type=int, default=1)
     run_documents.add_argument("--timeout", type=float, default=600)
     run_documents.add_argument("--api-token-file", type=Path)
     run_documents.add_argument("--require-auth", action="store_true")
     run_documents.add_argument("--output", type=Path, required=True)
     run_documents.add_argument("--private-review-output", type=Path, required=True)
-    run_documents.set_defaults(
-        capability=["text_attachment_summary"], handler=_run_documents_command
-    )
+    run_documents.set_defaults(capability=["text_document_summary"], handler=_run_documents_command)
 
     blind = commands.add_parser("blind", help="Create a blinded local summary-review packet")
     blind.add_argument("--input", type=Path, action="append", required=True)

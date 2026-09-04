@@ -14,12 +14,17 @@ from pathlib import Path
 from . import __version__
 from .config import DEFAULT_CONFIG, ConfigError
 from .db import Store
-from .gmail import GmailError, GmailGateway
 from .locking import operation_lock
-from .model import LocalModel
+from .mailbox import MailboxError
+from .model import ModelRuntime
 from .notifications import NotificationError, send_fallback
 from .outbound import GmailSender, SendError, previous_month_email
-from .runtime import load_runtime
+from .runtime import (
+    configured_mailbox_identity,
+    load_configured_mailbox,
+    load_runtime,
+    mail_account_connected,
+)
 from .service import Watcher
 
 
@@ -38,6 +43,10 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor", help="Check local configuration and dependencies")
     recent = commands.add_parser("recent", help="Show recent watched-message results")
     recent.add_argument("--limit", type=int, default=20)
+    requeue_analysis = commands.add_parser(
+        "requeue-analysis", help="Retry one permanently paused message analysis"
+    )
+    requeue_analysis.add_argument("message_id")
     send_hours = commands.add_parser("send-hours", help="Send the monthly Firefly hours request")
     send_hours.add_argument("--test-to", help="Send a marked test without consuming monthly dedupe")
     send_hours.add_argument("--dry-run", action="store_true")
@@ -55,7 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _runtime(config_path: Path) -> tuple[object, Store, LocalModel]:
+def _runtime(config_path: Path) -> tuple[object, Store, ModelRuntime]:
     runtime = load_runtime(config_path)
     return runtime.config, runtime.store, runtime.model
 
@@ -83,9 +92,19 @@ def _doctor(config_path: Path) -> int:
             "ok": stat.S_IMODE(config.database_file.parent.stat().st_mode) == 0o700,
             "mode": oct(stat.S_IMODE(config.database_file.parent.stat().st_mode)),
         }
-        checks["database"] = {"ok": True, "initialized": store.state() is not None}
+        provider, account_id = configured_mailbox_identity(store)
+        active_account = store.mail_account(provider, account_id)
+        assert active_account is not None
+        checks["database"] = {
+            "ok": True,
+            "initialized": store.state(
+                provider=provider,
+                account_id=account_id,
+            )
+            is not None,
+        }
         checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
-        checks["oauth_token"] = {"ok": config.gmail_token_file.exists()}
+        checks["oauth_token"] = {"ok": mail_account_connected(config, active_account)}
         checks["send_oauth_token"] = {
             "ok": config.gmail_send_token_file.exists() if config.monthly_hours_recipient else True
         }
@@ -108,13 +127,27 @@ def _doctor(config_path: Path) -> int:
 
 
 def _setup(config_path: Path) -> int:
-    config, store, model = _runtime(config_path)
-    if config.gmail_token_file.exists():
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-    else:
-        gmail = GmailGateway.authorize(config.gmail_credentials_file, config.gmail_token_file)
-    watcher = Watcher(config, store, gmail, model)
-    history_id = watcher.bootstrap()
+    from .engine_api import ApiError, dispatch
+
+    config, _store, _model = _runtime(config_path)
+    request = {
+        "protocol": 1,
+        "operation": "gmail.authorize",
+        "config_path": str(config_path),
+        "payload": {},
+    }
+    try:
+        authorization = dispatch(request)
+    except ApiError as exc:
+        if exc.code != "account_identity_unverified":
+            raise
+        authorization = dispatch(
+            {
+                **request,
+                "operation": "mail.accounts.connect",
+                "payload": {"provider": "gmail"},
+            }
+        )
     if config.notifications_enabled:
         try:
             delivery = send_fallback(
@@ -126,25 +159,32 @@ def _setup(config_path: Path) -> int:
             )
             if delivery.failures:
                 print(
-                    f"Warning: notification test partially failed: "
-                    f"{'; '.join(delivery.failures)}",
+                    f"Warning: notification test partially failed: {'; '.join(delivery.failures)}",
                     file=sys.stderr,
                 )
         except NotificationError as exc:
             print(f"Warning: notification test failed: {exc}", file=sys.stderr)
-    print(f"Gmail authorized. Baseline history cursor saved ({history_id}); no old mail imported.")
+    if authorization["baseline_initialized"]:
+        print("Gmail authorized. Baseline initialized; no old mail imported.")
+    else:
+        print("Gmail authorization verified. Existing mailbox position preserved.")
     return 0
 
 
 def _check(config_path: Path, dry_run: bool) -> int:
     config, store, model = _runtime(config_path)
-    if not config.senders:
-        print(json.dumps(Watcher.inactive_result(config, store, dry_run=dry_run), indent=2))
-        return 0
-    lock = nullcontext() if dry_run else _production_check_lock(config.database_file)
-    with lock:
-        gmail = GmailGateway.from_token(config.gmail_credentials_file, config.gmail_token_file)
-        result = Watcher(config, store, gmail, model).check(dry_run=dry_run)
+
+    def run(active_config, active_store, active_model):
+        if not active_config.senders:
+            return Watcher.inactive_result(active_config, active_store, dry_run=dry_run)
+        mailbox = load_configured_mailbox(active_config, active_store)
+        return Watcher(active_config, active_store, mailbox, active_model).check(dry_run=dry_run)
+
+    if dry_run:
+        result = run(config, store, model)
+    else:
+        with _production_check_lock(config.database_file):
+            result = run(*_runtime(config_path))
     print(json.dumps(result, indent=2))
     return 0
 
@@ -256,6 +296,16 @@ def _recent(config_path: Path, limit: int) -> int:
     return 0
 
 
+def _requeue_analysis(config_path: Path, message_id: str) -> int:
+    _config, store, _model = _runtime(config_path)
+    try:
+        status = store.requeue_analysis(message_id)
+    except KeyError as exc:
+        raise RuntimeError("Message was not found") from exc
+    print(json.dumps({"message_id": message_id, "status": status}, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     logging.basicConfig(
@@ -283,9 +333,11 @@ def main(argv: list[str] | None = None) -> None:
                 confirm_sent=args.confirm_sent,
                 confirm_unsent=args.confirm_unsent,
             )
+        elif args.command == "requeue-analysis":
+            code = _requeue_analysis(args.config, args.message_id)
         else:
             code = _recent(args.config, args.limit)
-    except (ConfigError, GmailError, SendError, RuntimeError) as exc:
+    except (ConfigError, MailboxError, SendError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

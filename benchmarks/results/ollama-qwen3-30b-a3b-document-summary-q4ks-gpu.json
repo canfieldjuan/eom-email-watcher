@@ -1,7 +1,6 @@
 {
   "aggregate": {
     "fact_recall": 0.863636,
-    "forbidden_output_failures": 0,
     "runs": 12,
     "schema_valid_rate": 1.0,
     "summary_human_review": "pending",
@@ -10,9 +9,9 @@
   "candidate": {
     "capabilities": [
       "structured_email_analysis",
-      "text_attachment_summary"
+      "text_document_summary"
     ],
-    "cold_start_seconds": 0.0,
+    "cold_start_seconds": null,
     "context_length": 32768,
     "cpu_only": false,
     "cpu_only_method": null,
@@ -28,7 +27,6 @@
       "fact_groups": 12,
       "fact_groups_matched": 12,
       "fact_recall": 1.0,
-      "forbidden_output_failures": 0,
       "generated_words": 650,
       "id": "short-service-brief",
       "latency_seconds": {
@@ -52,7 +50,6 @@
       "fact_groups": 15,
       "fact_groups_matched": 15,
       "fact_recall": 1.0,
-      "forbidden_output_failures": 0,
       "generated_words": 3000,
       "id": "short-access-policy",
       "latency_seconds": {
@@ -76,7 +73,6 @@
       "fact_groups": 21,
       "fact_groups_matched": 15,
       "fact_recall": 0.714286,
-      "forbidden_output_failures": 0,
       "generated_words": 9000,
       "id": "long-service-contract",
       "latency_seconds": {
@@ -100,7 +96,6 @@
       "fact_groups": 18,
       "fact_groups_matched": 15,
       "fact_recall": 0.833333,
-      "forbidden_output_failures": 0,
       "generated_words": 18000,
       "id": "long-operations-manual",
       "latency_seconds": {
@@ -145,7 +140,6 @@
   "tiers": {
     "long": {
       "fact_recall": 0.769231,
-      "forbidden_output_failures": 0,
       "latency_seconds": {
         "maximum": 8.958382,
         "median": 1.891746,
@@ -162,7 +156,6 @@
     },
     "short": {
       "fact_recall": 1.0,
-      "forbidden_output_failures": 0,
       "latency_seconds": {
         "maximum": 2.001323,
         "median": 1.119795,

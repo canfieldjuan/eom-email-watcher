@@ -89,6 +89,15 @@ def test_prompt_treats_email_as_untrusted() -> None:
     assert datetime.now(UTC).tzinfo is UTC
 
 
+def test_prompt_assigns_obligations_from_the_mailbox_owner_perspective() -> None:
+    assert "mailbox owner" in SYSTEM_PROMPT
+    assert "who owes whom" in SYSTEM_PROMPT
+    assert "quoted history" in SYSTEM_PROMPT
+    assert "building-access card" in SYSTEM_PROMPT
+    assert "payment card" in SYSTEM_PROMPT
+    assert "explicitly adopts or assigns" in SYSTEM_PROMPT
+
+
 def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("secret-value\n", encoding="utf-8")
@@ -114,15 +123,29 @@ def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) ->
             pass
 
         def json(self) -> dict:
-            return {"choices": [{"message": {"content": "", "reasoning": (
-                '{"category":"invoice","priority":"normal","summary":"An invoice is due.",'
-                '"action_required":true,"suggested_action":"Pay it","deadline_text":null,'
-                '"deadline_iso":null,"confidence":0.9}')}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning": (
+                                '{"category":"invoice","priority":"normal",'
+                                '"summary":"An invoice is due.","action_required":true,'
+                                '"suggested_action":"Pay it","deadline_text":null,'
+                                '"deadline_iso":null,"confidence":0.9}'
+                            ),
+                        }
+                    }
+                ]
+            }
 
     monkeypatch.setattr("eom_email_watcher.model.httpx.post", lambda *a, **k: FakeResp())
     result = model.analyze(
-        sender="ap@vendor.com", subject="Invoice", received_at="2026-07-18T12:00:00+00:00",
-        body="Please remit payment.", attachment_names=(),
+        sender="ap@vendor.com",
+        subject="Invoice",
+        received_at="2026-07-18T12:00:00+00:00",
+        body="Please remit payment.",
+        attachment_names=(),
         current_local_time=datetime(2026, 7, 18, tzinfo=UTC),
     )
     assert result.category == "invoice"

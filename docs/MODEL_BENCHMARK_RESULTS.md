@@ -18,9 +18,10 @@ No runtime, model, or quantization default should be changed from this partial r
 - Transport: the production OpenAI-compatible `/chat/completions` path.
 - Inference: production prompt, strict JSON schema, validator, temperature `0.1`, maximum 500
   output tokens, 8,192-token context, and one parallel prediction.
-- Device: CPU candidates use LM Studio `lms load --gpu off`; GPU comparisons use explicit
-  `lms load --gpu max`; Ollama uses both GPU visibility variables set to `-1` with cloud access
-  disabled.
+- Device: CPU LM Studio candidates use `lms load --gpu off`; LM Studio GPU comparisons use
+  `lms load --gpu max`. The Ollama compatibility probe hid GPUs with both visibility variables set
+  to `-1`, while the published Ollama email and document runs used the explicitly recorded
+  full-GPU profile. Cloud access remained disabled for Ollama runs.
 - Privacy: public result artifacts contain case IDs and metrics, not source fields or free-form
   output. Private local review artifacts are Git-ignored and mode `600`.
 
@@ -207,10 +208,10 @@ latency and operating footprint: a 4.219328-second median request and an LM Stud
 GiB loaded footprint, compared with E4B at 1.284546 seconds and 5.89 GiB.
 
 Gemma 4 26B-A4B does not advance. Despite the Q6_K artifact and full GPU offload, it regressed from
-E4B on every measured quality dimension, recorded 13 high/urgent misses, and failed all six
-prompt-injection repetitions. It loaded in 18.39 seconds with an LM Studio reported 22.20 GiB
-footprint. These load displays remain operating-profile observations rather than attributable peak
-process RSS measurements.
+E4B on most measured quality dimensions, recorded 13 high/urgent misses, and failed all six
+prompt-injection repetitions. It tied E4B on action precision and deadline hallucinations. It
+loaded in 18.39 seconds with an LM Studio reported 22.20 GiB footprint. These load displays remain
+operating-profile observations rather than attributable peak process RSS measurements.
 
 Gemma 31B joins E4B and Qwen 9B in blinded human review. Deterministic quality favors 31B, while
 latency and GPU footprint favor E4B; no production default changes from these measurements alone.
@@ -364,6 +365,9 @@ The controlled document suite ran three repetitions at each size:
 Across all 12 requests, schema validity and word-limit compliance were 1.0. Short-document fact
 recall was 1.0; long-document fact recall was 0.769231. The machine-readable public artifact is
 [`ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json`](../benchmarks/results/ollama-qwen3-30b-a3b-document-summary-q4ks-gpu.json).
+Cold-start time was not measured and is recorded as `null`. Because this corpus contains no
+controlled unsafe-output canary, the result omits forbidden-output metrics rather than treating an
+empty check set as a successful safety result.
 
 A fresh three-repetition pass over the private 20-email corpus at the same 32K runtime produced 60
 schema-valid responses. Category accuracy was 0.883333, priority accuracy was 0.95, action recall
@@ -378,9 +382,11 @@ summaries remains pending.
 
 ## Human summary review
 
-The local blind-review command produced 9 paired case/repetition items with eighteen anonymous
-summaries per item. The packet and alias key are under `benchmarks/local/`, excluded from Git, and
-mode `600`.
+The existing local blind-review packet is not valid selection evidence: intersecting schema-valid
+runs across every candidate excluded all action-required cases. The blind-packet builder now
+rejects that condition. A new finalists-only packet must include shared action-required cases before
+human scoring; its packet and separate alias key remain under `benchmarks/local/`, excluded from
+Git, and mode `600`.
 
 Until a human records 1-to-5 faithfulness and usefulness ratings, summary quality is
 `could-not-determine`. Deterministic metrics must not be used as a proxy for that judgment.
@@ -398,15 +404,18 @@ Keep these capabilities independent:
 
 ```text
 structured_email_analysis
+text_document_summary
 text_attachment_summary
 vision_attachment_summary
 ```
 
-Only `structured_email_analysis` was tested here. Neither model marketing nor a local model's
-vision flag proves attachment capability. A future attachment slice should negotiate the optional
-capabilities and pass normalized bounded text/image inputs across the generic local-inference
-boundary while preserving ordinary text-only message analysis. The full invariants and normalized
-input shape are documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachment-capability-boundary).
+`structured_email_analysis` and bounded extracted-text `text_document_summary` were tested here.
+The document run did not exercise the normalized attachment handoff, so it does not establish
+`text_attachment_summary`. Neither model marketing nor a local model's vision flag proves
+attachment capability. A future attachment slice should negotiate the optional capabilities and
+pass normalized bounded text/image inputs across the generic local-inference boundary while
+preserving ordinary text-only message analysis. The full invariants and normalized input shape are
+documented in [`MODEL_BENCHMARK.md`](MODEL_BENCHMARK.md#attachment-capability-boundary).
 
 ## Next evidence required
 
