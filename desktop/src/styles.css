@@ -511,6 +511,13 @@ select:focus {
   gap: 7px;
 }
 
+.capability-locked {
+  align-self: center;
+  color: #7a5a13;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
 .attachment-summary,
 .attachment-summary-error {
   grid-column: 1 / -1;

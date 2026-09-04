@@ -7,6 +7,7 @@
     "build:sidecar": "uv run --project .. python ../scripts/build_desktop_sidecar.py",
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
     "tauri": "tauri"
   },
   "dependencies": {
