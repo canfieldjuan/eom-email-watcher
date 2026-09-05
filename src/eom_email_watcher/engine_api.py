@@ -48,6 +48,8 @@ from .imap import (
     ImapError,
     ImapGateway,
     credentials_from_connection,
+    imap_mailbox_identity,
+    load_credentials,
     write_credentials,
 )
 from .locking import operation_lock, operation_lock_supported
@@ -574,6 +576,17 @@ def _connect_imap_account(
             "The mailbox address does not match the selected email account",
         )
 
+    previous_mailbox_identity: str | None = None
+    if account is not None:
+        current_credentials = mail_account_token_file(runtime.config, account)
+        if current_credentials.is_file():
+            try:
+                previous_mailbox_identity = imap_mailbox_identity(
+                    load_credentials(current_credentials)
+                )
+            except ImapError:
+                previous_mailbox_identity = None
+
     authorization_parent = (
         mail_account_token_file(runtime.config, account).parent
         if account is not None
@@ -598,8 +611,21 @@ def _connect_imap_account(
             activate_after_connect = active is None or not mail_account_connected(
                 runtime.config, active
             )
+            if account is not None:
+                current_credentials = mail_account_token_file(runtime.config, account)
+                if current_credentials.is_file():
+                    try:
+                        previous_mailbox_identity = imap_mailbox_identity(
+                            load_credentials(current_credentials)
+                        )
+                    except ImapError:
+                        previous_mailbox_identity = None
+        mailbox_changed = (
+            account is not None and previous_mailbox_identity != imap_mailbox_identity(credentials)
+        )
         initialize_baseline = (
             account is None
+            or mailbox_changed
             or runtime.store.state(
                 provider=account.provider,
                 account_id=account.account_id,
@@ -628,6 +654,17 @@ def _connect_imap_account(
     )
     if activate_after_connect and not account.active:
         account = runtime.store.activate_mail_account(account.provider, account.account_id)
+    if mailbox_changed:
+        assert baseline is not None
+        runtime.store.set_state(
+            baseline,
+            provider=account.provider,
+            account_id=account.account_id,
+        )
+        return {
+            "account": _mail_account_public(runtime, account),
+            "baseline_initialized": True,
+        }
     if initialize_baseline:
         assert baseline is not None
         return _finish_mail_authorization(runtime, account, baseline)

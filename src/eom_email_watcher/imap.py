@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import imaplib
 import json
+import mimetypes
 import re
 import ssl
 from collections.abc import Callable, Iterator
@@ -39,10 +41,12 @@ MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 MAX_UID_SEARCH_SPAN = 10_000
-CURSOR_PREFIX = "eom-imap-v1:"
-MESSAGE_ID_PREFIX = "eom-imap-message-v1:"
+CURSOR_PREFIX = "eom-imap-v2:"
+MESSAGE_ID_PREFIX = "eom-imap-message-v2:"
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _UID = re.compile(r"[1-9][0-9]*\Z")
+_MAILBOX_ID = re.compile(r"[0-9a-f]{64}\Z")
+_SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
 _INTERNAL_DATE = re.compile(rb'INTERNALDATE "([^"]+)"', re.IGNORECASE)
 _RFC822_SIZE = re.compile(rb"RFC822\.SIZE ([0-9]+)", re.IGNORECASE)
 _FETCH_UID = re.compile(rb"(?:^|[ (])UID ([1-9][0-9]*)(?:[ )]|$)", re.IGNORECASE)
@@ -239,34 +243,71 @@ def load_credentials(path: Path) -> ImapCredentials:
     return credentials
 
 
-def _cursor(uid_validity: int, last_uid: int) -> str:
-    return f"{CURSOR_PREFIX}{uid_validity}:{last_uid}"
+def imap_mailbox_identity(credentials: ImapCredentials) -> str:
+    """Return a non-secret stable identity for one configured server mailbox."""
+    value = json.dumps(
+        [
+            credentials.email_address,
+            credentials.host.casefold(),
+            credentials.port,
+            credentials.security,
+            credentials.username,
+        ],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(value).hexdigest()
 
 
-def _message_id(uid_validity: int, uid: int) -> str:
-    return f"{MESSAGE_ID_PREFIX}{uid_validity}:{uid}"
+def _cursor(mailbox_id: str, uid_validity: int, last_uid: int) -> str:
+    return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{last_uid}"
 
 
-def _decode_cursor(value: str) -> tuple[int, int]:
+def _message_id(mailbox_id: str, uid_validity: int, uid: int) -> str:
+    return f"{MESSAGE_ID_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
+
+
+def _decode_cursor(value: str) -> tuple[str, int, int]:
     encoded = value.removeprefix(CURSOR_PREFIX) if value.startswith(CURSOR_PREFIX) else ""
-    validity, separator, uid = encoded.partition(":")
-    if not separator or not validity.isdecimal() or not uid.isdecimal():
+    mailbox_id, separator, remainder = encoded.partition(":")
+    validity, uid_separator, uid = remainder.partition(":")
+    if (
+        not separator
+        or not uid_separator
+        or _MAILBOX_ID.fullmatch(mailbox_id) is None
+        or not validity.isdecimal()
+        or not uid.isdecimal()
+    ):
         raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
-    parsed = int(validity), int(uid)
-    if parsed[0] <= 0 or parsed[1] < 0:
+    parsed = mailbox_id, int(validity), int(uid)
+    if parsed[1] <= 0 or parsed[2] < 0:
         raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
     return parsed
 
 
-def _decode_message_id(value: str) -> tuple[int, int]:
+def _decode_message_id(value: str) -> tuple[str, int, int]:
     encoded = value.removeprefix(MESSAGE_ID_PREFIX) if value.startswith(MESSAGE_ID_PREFIX) else ""
-    validity, separator, uid = encoded.partition(":")
-    if not separator or not validity.isdecimal() or _UID.fullmatch(uid) is None:
+    mailbox_id, separator, remainder = encoded.partition(":")
+    validity, uid_separator, uid = remainder.partition(":")
+    if (
+        not separator
+        or not uid_separator
+        or _MAILBOX_ID.fullmatch(mailbox_id) is None
+        or not validity.isdecimal()
+        or _UID.fullmatch(uid) is None
+    ):
         raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
-    parsed = int(validity), int(uid)
-    if parsed[0] <= 0:
+    parsed = mailbox_id, int(validity), int(uid)
+    if parsed[1] <= 0:
         raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
     return parsed
+
+
+def _synthesized_attachment_name(position: int, media_type: str) -> str:
+    suffix = mimetypes.guess_extension(media_type, strict=False) or ""
+    if _SAFE_ATTACHMENT_SUFFIX.fullmatch(suffix) is None:
+        suffix = ""
+    return f"attachment-{position + 1}{suffix.casefold()}"
 
 
 def _response_number(client: imaplib.IMAP4, name: str) -> int:
@@ -399,16 +440,17 @@ def _content_and_attachment_payloads(
                 )
             filename = part.get_filename()
             attachment_disposition = part.get_content_disposition() == "attachment"
-            if not root and (filename or attachment_disposition):
+            if filename or attachment_disposition:
                 payload = _attachment_payload(part)
                 position = len(attachments)
+                media_type = part.get_content_type().casefold()
                 attachment_payloads.append(payload)
                 attachments.append(
                     AttachmentDescriptor(
                         part_id=f"mime-{position}",
                         attachment_id=None,
-                        filename=filename or f"attachment-{position + 1}",
-                        media_type=part.get_content_type().casefold(),
+                        filename=filename or _synthesized_attachment_name(position, media_type),
+                        media_type=media_type,
                         byte_size=len(payload),
                         position=position,
                     )
@@ -455,6 +497,7 @@ class ImapGateway:
         client_factory: Callable[[ImapCredentials, ssl.SSLContext], imaplib.IMAP4] | None = None,
     ):
         self.credentials = credentials
+        self._mailbox_id = imap_mailbox_identity(credentials)
         self._client_factory = client_factory or self._default_client
         self._active_client: imaplib.IMAP4 | None = None
 
@@ -609,26 +652,30 @@ class ImapGateway:
             raise ImapError("imap_protocol_error", "Mail server UID snapshot failed")
         return uid_validity, int(match.group(1))
 
-    @staticmethod
-    def _checked_uid(client: imaplib.IMAP4, message_id: str) -> str:
-        expected_validity, uid = _decode_message_id(message_id)
-        if _selected_uid_validity(client) != expected_validity:
+    def _checked_uid(self, client: imaplib.IMAP4, message_id: str) -> str:
+        expected_mailbox, expected_validity, uid = _decode_message_id(message_id)
+        if (
+            expected_mailbox != self._mailbox_id
+            or _selected_uid_validity(client) != expected_validity
+        ):
             raise MailboxMessageUnavailable("The mail server message is no longer available")
         return str(uid)
 
     def initial_cursor(self) -> str:
         with self._mailbox() as client:
             uid_validity, last_uid = self._snapshot(client)
-        return _cursor(uid_validity, last_uid)
+        return _cursor(self._mailbox_id, uid_validity, last_uid)
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        saved_validity, saved_uid = _decode_cursor(cursor)
+        saved_mailbox, saved_validity, saved_uid = _decode_cursor(cursor)
+        if saved_mailbox != self._mailbox_id:
+            raise StaleMailboxCursor("The configured mail server mailbox changed")
         with self._mailbox() as client:
             current_validity, snapshot_uid = self._snapshot(client)
             if current_validity != saved_validity:
                 raise StaleMailboxCursor("The mail server reset its INBOX message identifiers")
             if snapshot_uid <= saved_uid:
-                return MailboxChanges((), _cursor(current_validity, snapshot_uid))
+                return MailboxChanges((), _cursor(self._mailbox_id, current_validity, snapshot_uid))
             search_end = min(snapshot_uid, saved_uid + MAX_UID_SEARCH_SPAN)
             status, response = client.uid("SEARCH", None, f"UID {saved_uid + 1}:{search_end}")
             if status != "OK":
@@ -637,8 +684,8 @@ class ImapGateway:
         selected = candidates[:MAX_INCREMENTAL_MESSAGE_IDS]
         next_uid = selected[-1] if len(candidates) > len(selected) else search_end
         return MailboxChanges(
-            tuple(_message_id(current_validity, uid) for uid in selected),
-            _cursor(current_validity, next_uid),
+            tuple(_message_id(self._mailbox_id, current_validity, uid) for uid in selected),
+            _cursor(self._mailbox_id, current_validity, next_uid),
         )
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
@@ -646,7 +693,7 @@ class ImapGateway:
         with self._mailbox() as client:
             uid_validity, snapshot_uid = self._snapshot(client)
             if snapshot_uid == 0:
-                return MailboxChanges((), _cursor(uid_validity, 0))
+                return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, 0))
             search_end = min(snapshot_uid, MAX_UID_SEARCH_SPAN)
             status, response = client.uid(
                 "SEARCH",
@@ -661,8 +708,8 @@ class ImapGateway:
         selected = candidates[:MAX_INCREMENTAL_MESSAGE_IDS]
         next_uid = selected[-1] if len(candidates) > len(selected) else search_end
         return MailboxChanges(
-            tuple(_message_id(uid_validity, uid) for uid in selected),
-            _cursor(uid_validity, next_uid),
+            tuple(_message_id(self._mailbox_id, uid_validity, uid) for uid in selected),
+            _cursor(self._mailbox_id, uid_validity, next_uid),
         )
 
     def metadata(self, message_id: str) -> MessageMetadata:

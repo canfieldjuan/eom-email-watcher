@@ -137,8 +137,11 @@ by the trusted desktop host. Plaintext IMAP is rejected. The engine validates TL
 certificate trust, logs in, opens only `INBOX` with `readonly=True`, and snapshots `UIDVALIDITY` and
 `UIDNEXT` before persisting the account. If a server omits `UIDNEXT`, the adapter obtains the last
 selected message's UID with one bounded sequence fetch rather than materializing the mailbox's UID
-list. Provider message identities include the selected mailbox's `UIDVALIDITY`, so a server reset
-cannot silently reuse an old UID for a different message. A selected private CA is validated and
+list. Cursors and provider message identities include a non-secret digest of the configured server
+mailbox plus its `UIDVALIDITY`, so a server or mailbox reset cannot silently reuse an old UID for a
+different message. Reconnect preserves the cursor only when that mailbox identity is unchanged;
+changing the server, port, security mode, address, or username establishes a new baseline while
+retaining prior local history. A selected private CA is validated and
 copied into the mode-0600 account credential file; the source path is not retained. Passwords,
 server settings, credential paths, and CA contents never enter the response. Polling uses bounded
 UID pages and bounded server-side UID windows with `BODY.PEEK`: it fetches bounded headers before

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from eom_email_watcher.imap import (
+    CURSOR_PREFIX,
     MAX_HEADER_BYTES,
     MAX_INCREMENTAL_MESSAGE_IDS,
     MAX_MESSAGE_BYTES,
@@ -21,7 +22,9 @@ from eom_email_watcher.imap import (
     ImapError,
     ImapGateway,
     _content,
+    _synthesized_attachment_name,
     credentials_from_connection,
+    imap_mailbox_identity,
     load_credentials,
     write_credentials,
 )
@@ -113,8 +116,16 @@ def credentials() -> ImapCredentials:
     )
 
 
-def message_id(uid: int = 7, *, uid_validity: int = 44) -> str:
-    return f"{MESSAGE_ID_PREFIX}{uid_validity}:{uid}"
+def cursor(uid: int = 7, *, uid_validity: int = 44, values: ImapCredentials | None = None) -> str:
+    mailbox_id = imap_mailbox_identity(values or credentials())
+    return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
+
+
+def message_id(
+    uid: int = 7, *, uid_validity: int = 44, values: ImapCredentials | None = None
+) -> str:
+    mailbox_id = imap_mailbox_identity(values or credentials())
+    return f"{MESSAGE_ID_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
 
 
 class FakeImap:
@@ -269,11 +280,11 @@ def test_cursor_is_snapshotted_and_incremental_search_is_bounded() -> None:
         ),
     )
 
-    changes = gateway.changes_since("eom-imap-v1:44:7")
+    changes = gateway.changes_since(cursor())
 
     assert len(changes.message_ids) == MAX_INCREMENTAL_MESSAGE_IDS
     assert changes.message_ids[0] == message_id(8)
-    assert changes.cursor == f"eom-imap-v1:44:{7 + MAX_INCREMENTAL_MESSAGE_IDS}"
+    assert changes.cursor == cursor(7 + MAX_INCREMENTAL_MESSAGE_IDS)
     assert clients[0].readonly is True
     assert ("uid", "SEARCH", None, f"UID 8:{8 + MAX_INCREMENTAL_MESSAGE_IDS}") in clients[0].calls
     assert clients[0].logged_out is True
@@ -283,7 +294,7 @@ def test_uid_validity_change_requires_recovery() -> None:
     gateway = ImapGateway(credentials(), factory([], uid_validity=45))
 
     with pytest.raises(StaleMailboxCursor):
-        gateway.changes_since("eom-imap-v1:44:7")
+        gateway.changes_since(cursor())
 
 
 def test_incremental_search_bounds_the_server_side_uid_window() -> None:
@@ -293,11 +304,11 @@ def test_incremental_search_bounds_the_server_side_uid_window() -> None:
         factory(clients, uid_next=MAX_UID_SEARCH_SPAN + 100, search=b""),
     )
 
-    changes = gateway.changes_since("eom-imap-v1:44:7")
+    changes = gateway.changes_since(cursor())
 
     search_end = 7 + MAX_UID_SEARCH_SPAN
     assert changes.message_ids == ()
-    assert changes.cursor == f"eom-imap-v1:44:{search_end}"
+    assert changes.cursor == cursor(search_end)
     assert ("uid", "SEARCH", None, f"UID 8:{search_end}") in clients[0].calls
 
 
@@ -311,7 +322,7 @@ def test_snapshot_falls_back_to_highest_uid_when_uidnext_is_absent() -> None:
     client = MissingUidNext(search=b"7")
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    assert gateway.initial_cursor() == "eom-imap-v1:44:7"
+    assert gateway.initial_cursor() == cursor()
     assert ("fetch", "1", "(UID)") in client.calls
 
 
@@ -329,7 +340,7 @@ def test_snapshot_uidnext_fallback_handles_empty_mailbox_without_fetch() -> None
     client = EmptyMissingUidNext()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    assert gateway.initial_cursor() == "eom-imap-v1:44:0"
+    assert gateway.initial_cursor() == cursor(0)
     assert not [call for call in client.calls if call[0] == "fetch"]
 
 
@@ -392,7 +403,7 @@ def test_polling_session_reuses_consumed_uidvalidity_response() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     with gateway.polling_session():
-        changes = gateway.changes_since("eom-imap-v1:44:6")
+        changes = gateway.changes_since(cursor(6))
         gateway.metadata(changes.message_ids[0])
         gateway.content(changes.message_ids[0], 1000)
 
@@ -407,6 +418,20 @@ def test_message_identity_rejects_stale_uidvalidity_before_fetch() -> None:
         gateway.metadata(message_id(uid_validity=44))
 
     assert not [call for call in client.calls if call[:2] == ("uid", "FETCH")]
+
+
+def test_mailbox_binding_rejects_old_cursor_and_message_identity() -> None:
+    changed = ImapCredentials(**{**credentials().__dict__, "host": "replacement.example.com"})
+    clients: list[FakeImap] = []
+    gateway = ImapGateway(changed, factory(clients))
+
+    with pytest.raises(StaleMailboxCursor):
+        gateway.changes_since(cursor())
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.metadata(message_id())
+
+    assert len(clients) == 1
+    assert not [call for call in clients[0].calls if call[:2] == ("uid", "FETCH")]
 
 
 def test_attachment_bytes_reuses_stable_mime_position() -> None:
@@ -434,9 +459,25 @@ def test_filename_less_attachment_dispositions_never_join_outer_body() -> None:
     content = gateway.content(message_id(), 1000)
 
     assert content.body == "Outer body only."
-    assert content.attachment_names == ("attachment-1", "attachment-2")
+    assert content.attachment_names == ("attachment-1.eml", "attachment-2.txt")
     assert b"Embedded private body" in gateway.attachment_bytes(message_id(), "mime-0", None)
     assert b"Private text attachment" in gateway.attachment_bytes(message_id(), "mime-1", None)
+
+
+def test_root_attachment_disposition_never_becomes_analysis_body() -> None:
+    message = EmailMessage()
+    message.set_content("Private attachment body")
+    message["Content-Disposition"] = "attachment"
+
+    content = _content(message, 1000)
+
+    assert content.body == ""
+    assert content.attachment_names == ("attachment-1.txt",)
+
+
+def test_synthesized_attachment_names_use_only_safe_known_suffixes() -> None:
+    assert _synthesized_attachment_name(0, "application/pdf") == "attachment-1.pdf"
+    assert _synthesized_attachment_name(0, "application/x-unregistered") == "attachment-1"
 
 
 def _nested_message(depth: int) -> EmailMessage:
@@ -711,7 +752,7 @@ def test_post_login_protocol_error_is_categorized_without_server_detail() -> Non
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     with pytest.raises(ImapError) as raised:
-        gateway.changes_since("eom-imap-v1:44:6")
+        gateway.changes_since(cursor(6))
 
     assert raised.value.code == "imap_protocol_error"
     assert "private protocol detail" not in str(raised.value)
