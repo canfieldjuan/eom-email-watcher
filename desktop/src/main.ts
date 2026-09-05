@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { classifyCapabilityDiagnostic } from "./connectAvailability";
+import {
+  buildMailServerConnection,
+  type MailServerConnection,
+  type MailServerSecurity,
+} from "./mailServerConnection";
 import "./styles.css";
 
 interface WatchedSender {
@@ -411,6 +416,53 @@ app.innerHTML = `
           <dd id="mail-detail" class="health-card-detail"></dd>
           <dd><ul id="mail-account-list" class="mail-account-list" aria-label="Email accounts"></ul></dd>
           <dd id="mail-provider-actions" class="health-card-action"></dd>
+          <dd id="mail-server-panel" class="mail-server-panel" hidden>
+            <form id="mail-server-form" class="mail-server-form">
+              <div class="mail-server-heading">
+                <div>
+                  <h3 id="mail-server-title">Connect another mail server</h3>
+                  <p>Use the read-only IMAP details supplied by your mail administrator.</p>
+                </div>
+                <button id="mail-server-cancel" class="secondary-action" type="button">Cancel</button>
+              </div>
+              <label>
+                <span>Mailbox email address</span>
+                <input id="mail-server-email" name="emailAddress" type="email" maxlength="320" autocomplete="email" required />
+              </label>
+              <label>
+                <span>Incoming mail server</span>
+                <input id="mail-server-host" name="host" maxlength="253" placeholder="mail.example.com" autocomplete="off" required />
+              </label>
+              <div class="mail-server-row">
+                <label>
+                  <span>Security</span>
+                  <select id="mail-server-security" name="security">
+                    <option value="tls" selected>TLS</option>
+                    <option value="starttls">STARTTLS</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Port</span>
+                  <input id="mail-server-port" name="port" type="number" min="1" max="65535" step="1" value="993" required />
+                </label>
+              </div>
+              <label>
+                <span>Username</span>
+                <input id="mail-server-username" name="username" maxlength="320" autocomplete="username" required />
+              </label>
+              <label>
+                <span>Password or app password</span>
+                <input id="mail-server-password" name="password" type="password" maxlength="4096" autocomplete="current-password" required />
+              </label>
+              <div class="mail-server-ca">
+                <button id="mail-server-ca-choose" class="secondary-action" type="button">Choose private CA</button>
+                <button id="mail-server-ca-clear" class="secondary-action" type="button" hidden>Clear CA</button>
+                <span id="mail-server-ca-label">System trust store</span>
+              </div>
+              <p class="mail-server-note">Passwords stay in the local engine credential store. Source email remains unchanged.</p>
+              <button id="mail-server-submit" type="submit">Connect account</button>
+            </form>
+          </dd>
         </div>
         <div class="health-card">
           <dt>Local AI</dt>
@@ -531,6 +583,20 @@ const mailHealth = requiredElement<HTMLElement>("#mail-health");
 const mailDetail = requiredElement<HTMLElement>("#mail-detail");
 const mailAccountList = requiredElement<HTMLUListElement>("#mail-account-list");
 const mailProviderActions = requiredElement<HTMLElement>("#mail-provider-actions");
+const mailServerPanel = requiredElement<HTMLElement>("#mail-server-panel");
+const mailServerForm = requiredElement<HTMLFormElement>("#mail-server-form");
+const mailServerTitle = requiredElement<HTMLElement>("#mail-server-title");
+const mailServerCancel = requiredElement<HTMLButtonElement>("#mail-server-cancel");
+const mailServerEmail = requiredElement<HTMLInputElement>("#mail-server-email");
+const mailServerHost = requiredElement<HTMLInputElement>("#mail-server-host");
+const mailServerSecurity = requiredElement<HTMLSelectElement>("#mail-server-security");
+const mailServerPort = requiredElement<HTMLInputElement>("#mail-server-port");
+const mailServerUsername = requiredElement<HTMLInputElement>("#mail-server-username");
+const mailServerPassword = requiredElement<HTMLInputElement>("#mail-server-password");
+const mailServerCaChoose = requiredElement<HTMLButtonElement>("#mail-server-ca-choose");
+const mailServerCaClear = requiredElement<HTMLButtonElement>("#mail-server-ca-clear");
+const mailServerCaLabel = requiredElement<HTMLElement>("#mail-server-ca-label");
+const mailServerSubmit = requiredElement<HTMLButtonElement>("#mail-server-submit");
 const modelHealth = requiredElement<HTMLElement>("#model-health");
 const modelDetail = requiredElement<HTMLElement>("#model-detail");
 const databaseHealth = requiredElement<HTMLElement>("#database-health");
@@ -571,6 +637,9 @@ let checkSupported = false;
 let mailOperationInFlight = false;
 let mailProviders: MailProviderStatus[] = [];
 let mailAccounts: MailAccountStatus[] = [];
+let mailServerProvider: MailProviderStatus | null = null;
+let mailServerAccount: MailAccountStatus | null = null;
+let mailServerCaFile: string | null = null;
 let healthRequestGeneration = 0;
 let mailAccountsRequestGeneration = 0;
 let mailAccountCatalogRevision = 0;
@@ -1660,6 +1729,71 @@ function providerFor(account: MailAccountStatus): MailProviderStatus | undefined
   return mailProviders.find((provider) => provider.provider === account.provider);
 }
 
+function mailServerCaName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) || "Selected certificate";
+}
+
+function closeMailServerForm(): void {
+  mailServerForm.reset();
+  mailServerPassword.value = "";
+  mailServerProvider = null;
+  mailServerAccount = null;
+  mailServerCaFile = null;
+  mailServerCaLabel.textContent = "System trust store";
+  mailServerCaClear.hidden = true;
+  mailServerPanel.hidden = true;
+}
+
+function showMailServerForm(
+  provider: MailProviderStatus,
+  account: MailAccountStatus | null = null,
+): void {
+  if (mailOperationInFlight) return;
+  closeMailServerForm();
+  mailServerProvider = provider;
+  mailServerAccount = account;
+  const address = account?.address ?? "";
+  mailServerEmail.value = address;
+  mailServerUsername.value = address;
+  mailServerSecurity.value = "tls";
+  mailServerPort.value = "993";
+  mailServerTitle.textContent = account
+    ? `Reconnect ${address || provider.display_name}`
+    : `Connect ${provider.display_name}`;
+  mailServerSubmit.textContent = account ? "Reconnect account" : "Connect account";
+  mailServerPanel.hidden = false;
+  (address ? mailServerHost : mailServerEmail).focus();
+}
+
+async function chooseMailServerCa(): Promise<void> {
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "PEM certificates", extensions: ["pem", "crt", "cer"] }],
+    });
+    if (selected === null || Array.isArray(selected)) return;
+    mailServerCaFile = selected;
+    mailServerCaLabel.textContent = mailServerCaName(selected);
+    mailServerCaClear.hidden = false;
+  } catch (error) {
+    healthStatus.textContent = errorMessage(error);
+    healthStatus.dataset.kind = "error";
+  }
+}
+
+function currentMailServerConnection(): MailServerConnection {
+  return buildMailServerConnection({
+    emailAddress: mailServerEmail.value,
+    host: mailServerHost.value,
+    port: mailServerPort.value,
+    security: mailServerSecurity.value as MailServerSecurity,
+    username: mailServerUsername.value,
+    password: mailServerPassword.value,
+    caFile: mailServerCaFile,
+  });
+}
+
 function renderInboxAccountOptions(): void {
   const previous = inboxAccountSelect.value || "active";
   const active = mailAccounts.find((account) => account.active);
@@ -1732,12 +1866,18 @@ function renderMailAccounts(data: MailAccounts): boolean {
       disconnect.className = "danger-action";
       disconnect.disabled = mailOperationInFlight;
       disconnect.addEventListener("click", () => void disconnectMailAccount(account));
-      if (provider?.connection_method === "browser_oauth") {
+      if (provider) {
         const reconnect = document.createElement("button");
         reconnect.type = "button";
         reconnect.textContent = "Reconnect";
         reconnect.disabled = mailOperationInFlight || !provider.connection_available;
-        reconnect.addEventListener("click", () => void reconnectMailAccount(account));
+        reconnect.addEventListener("click", () => {
+          if (provider.connection_method === "server_credentials") {
+            showMailServerForm(provider, account);
+          } else {
+            void reconnectMailAccount(account);
+          }
+        });
         actions.append(reconnect);
       }
       actions.append(disconnect);
@@ -1749,14 +1889,19 @@ function renderMailAccounts(data: MailAccounts): boolean {
         activate.addEventListener("click", () => void activateMailAccount(account));
         actions.prepend(activate);
       }
-    } else if (provider?.connection_method === "browser_oauth") {
+    } else if (provider) {
       const connect = document.createElement("button");
       connect.type = "button";
       connect.textContent = account.address ? "Reconnect" : "Connect";
-      connect.disabled = mailOperationInFlight || !provider?.connection_available;
+      connect.disabled = mailOperationInFlight || !provider.connection_available;
       connect.addEventListener("click", () => {
-        if (account.address) void reconnectMailAccount(account);
-        else void connectMailProvider(account.provider);
+        if (provider.connection_method === "server_credentials") {
+          showMailServerForm(provider, account);
+        } else if (account.address) {
+          void reconnectMailAccount(account);
+        } else {
+          void connectMailProvider(account.provider);
+        }
       });
       actions.append(connect);
     }
@@ -1765,7 +1910,6 @@ function renderMailAccounts(data: MailAccounts): boolean {
   }
 
   for (const provider of mailProviders) {
-    if (provider.connection_method !== "browser_oauth") continue;
     if (
       !provider.multiple_accounts &&
       mailAccounts.some((account) => account.provider === provider.provider)
@@ -1780,7 +1924,13 @@ function renderMailAccounts(data: MailAccounts): boolean {
       ? `Add ${provider.display_name} account`
       : `Connect ${provider.display_name}`;
     connect.disabled = mailOperationInFlight || !provider.connection_available;
-    connect.addEventListener("click", () => void connectMailProvider(provider.provider));
+    connect.addEventListener("click", () => {
+      if (provider.connection_method === "server_credentials") {
+        showMailServerForm(provider);
+      } else {
+        void connectMailProvider(provider.provider);
+      }
+    });
     mailProviderActions.append(connect);
   }
   return inboxScopeChanged;
@@ -1793,6 +1943,7 @@ async function refreshAfterMailMutation(message: string): Promise<void> {
 
 async function connectMailProvider(provider: string): Promise<void> {
   if (mailOperationInFlight) return;
+  closeMailServerForm();
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   healthStatus.textContent = "Complete email authorization in your browser…";
@@ -1811,8 +1962,51 @@ async function connectMailProvider(provider: string): Promise<void> {
   }
 }
 
+async function submitMailServerConnection(): Promise<void> {
+  if (mailOperationInFlight || !mailServerProvider) return;
+  let connection: MailServerConnection;
+  try {
+    connection = currentMailServerConnection();
+  } catch (error) {
+    healthStatus.textContent = errorMessage(error);
+    healthStatus.dataset.kind = "error";
+    return;
+  }
+  const provider = mailServerProvider;
+  const account = mailServerAccount;
+  closeMailServerForm();
+  mailOperationInFlight = true;
+  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  healthStatus.textContent = account
+    ? "Verifying the replacement mail server credentials…"
+    : "Verifying the mail server credentials…";
+  delete healthStatus.dataset.kind;
+  try {
+    const result = account
+      ? await invoke<MailAccountResult>("mail_account_reconnect", {
+          provider: provider.provider,
+          accountId: account.account_id,
+          connection,
+        })
+      : await invoke<MailAccountResult>("mail_account_connect", {
+          provider: provider.provider,
+          connection,
+        });
+    const message = result.baseline_initialized
+      ? "Mail server connected. Watching begins from its current mailbox state."
+      : "Mail server connected. Its saved mailbox position was preserved.";
+    await refreshAfterMailMutation(message);
+  } catch (error) {
+    await loadHealth(errorMessage(error), "error");
+  } finally {
+    mailOperationInFlight = false;
+    renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+  }
+}
+
 async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
+  closeMailServerForm();
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   healthStatus.textContent = "Complete email authorization in your browser…";
@@ -1837,6 +2031,7 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
     `Disconnect ${account.address || account.display_name}? Local history remains available and source email is not changed.`,
   );
   if (!confirmed) return;
+  closeMailServerForm();
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
@@ -1855,6 +2050,7 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
 
 async function activateMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
+  closeMailServerForm();
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
@@ -2358,6 +2554,27 @@ settingsForm.addEventListener("submit", (event) => {
       setSettingsBusy(false);
     }
   })();
+});
+
+mailServerForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!mailServerForm.reportValidity()) return;
+  void submitMailServerConnection();
+});
+
+mailServerCancel.addEventListener("click", closeMailServerForm);
+mailServerCaChoose.addEventListener("click", () => void chooseMailServerCa());
+mailServerCaClear.addEventListener("click", () => {
+  mailServerCaFile = null;
+  mailServerCaLabel.textContent = "System trust store";
+  mailServerCaClear.hidden = true;
+});
+mailServerSecurity.addEventListener("change", () => {
+  if (mailServerSecurity.value === "starttls" && mailServerPort.value === "993") {
+    mailServerPort.value = "143";
+  } else if (mailServerSecurity.value === "tls" && mailServerPort.value === "143") {
+    mailServerPort.value = "993";
+  }
 });
 
 function setBusy(busy: boolean): void {

@@ -611,6 +611,25 @@ pub struct MailAccounts {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MailServerSecurity {
+    Tls,
+    Starttls,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MailServerConnection {
+    pub email_address: String,
+    pub host: String,
+    pub port: u16,
+    pub security: MailServerSecurity,
+    pub username: String,
+    pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MailAccountResult {
     pub account: MailAccountStatus,
     #[serde(default)]
@@ -993,27 +1012,38 @@ impl Engine {
     pub fn connect_mail_provider(
         &self,
         provider: String,
+        connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
         let _guard = self
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request("mail.accounts.connect", json!({"provider": provider}))
+        let payload = match connection {
+            Some(connection) => json!({"provider": provider, "connection": connection}),
+            None => json!({"provider": provider}),
+        };
+        self.request("mail.accounts.connect", payload)
     }
 
     pub fn reconnect_mail_account(
         &self,
         provider: String,
         account_id: String,
+        connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
         let _guard = self
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request(
-            "mail.accounts.reconnect",
-            json!({"provider": provider, "account_id": account_id}),
-        )
+        let payload = match connection {
+            Some(connection) => json!({
+                "provider": provider,
+                "account_id": account_id,
+                "connection": connection,
+            }),
+            None => json!({"provider": provider, "account_id": account_id}),
+        };
+        self.request("mail.accounts.reconnect", payload)
     }
 
     pub fn disconnect_mail_account(
@@ -1648,6 +1678,68 @@ mod tests {
         assert_eq!(result.baseline_initialized, Some(false));
         let encoded = serde_json::to_string(&result).expect("serialize account result");
         assert!(!encoded.contains("token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mail_server_connection_is_forwarded_through_the_typed_engine_request() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.connect","data":{"account":{"provider":"imap","account_id":"imap-test","display_name":"Other mail server","address":"owner@example.com","connected":true,"active":true,"last_check":null},"baseline_initialized":true}}'"#,
+                ),
+                OsString::from("engine-imap-connection-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let connection = MailServerConnection {
+            email_address: "owner@example.com".into(),
+            host: "mail.example.com".into(),
+            port: 993,
+            security: MailServerSecurity::Tls,
+            username: "owner".into(),
+            password: "private password".into(),
+            ca_file: Some("/private/root.pem".into()),
+        };
+
+        let result = engine
+            .connect_mail_provider("imap".into(), Some(connection))
+            .expect("connect mail server through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert_eq!(result.account.account_id, "imap-test");
+        assert_eq!(
+            request["payload"],
+            json!({
+                "provider": "imap",
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner",
+                    "password": "private password",
+                    "ca_file": "/private/root.pem"
+                }
+            })
+        );
+
+        engine
+            .connect_mail_provider("gmail".into(), None)
+            .expect("connect OAuth provider without server credentials");
+        let oauth_request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured OAuth request"))
+                .expect("decode captured OAuth request");
+        assert_eq!(oauth_request["payload"], json!({"provider": "gmail"}));
     }
 
     #[test]
