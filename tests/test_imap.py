@@ -20,7 +20,6 @@ from eom_email_watcher.imap import (
     MAX_MESSAGE_BYTES,
     MAX_MIME_DEPTH,
     MAX_MIME_PARTS,
-    MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
     ImapCredentials,
     ImapError,
@@ -139,13 +138,15 @@ class FakeImap:
         *,
         uid_validity: int = 44,
         uid_next: int = 8,
-        search: bytes = b"7",
+        search: bytes = b"1",
         raw_message: bytes = RAW_MESSAGE,
+        sequence_uids: list[int] | None = None,
     ) -> None:
         self.uid_validity = uid_validity
         self.uid_next = uid_next
-        self.search = search
+        self.search_response = search
         self.raw_message = raw_message
+        self.sequence_uids = sequence_uids or [7]
         self.calls: list[tuple[Any, ...]] = []
         self.readonly: bool | None = None
         self.logged_out = False
@@ -157,7 +158,7 @@ class FakeImap:
     def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
         self.calls.append(("select", mailbox, readonly))
         self.readonly = readonly
-        return "OK", [b"1"]
+        return "OK", [str(len(self.sequence_uids)).encode("ascii")]
 
     def response(self, name: str) -> tuple[str, list[bytes]]:
         value = self.uid_validity if name == "UIDVALIDITY" else self.uid_next
@@ -166,7 +167,7 @@ class FakeImap:
     def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
         self.calls.append(("uid", command, *args))
         if command == "SEARCH":
-            return "OK", [self.search]
+            return "OK", [self.search_response]
         query = str(args[-1])
         uid = str(args[0])
         if "HEADER.FIELDS" in query:
@@ -182,9 +183,24 @@ class FakeImap:
             return "OK", [(f"{uid} (UID {uid})".encode(), self.raw_message), b")"]
         raise AssertionError(query)
 
+    def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("search", charset, *criteria))
+        return "OK", [self.search_response]
+
     def fetch(self, sequence: str, query: str) -> tuple[str, list[bytes]]:
         self.calls.append(("fetch", sequence, query))
-        return "OK", [f"{sequence} (UID 7)".encode()]
+        selected: list[int] = []
+        for item in sequence.split(","):
+            if ":" in item:
+                start, end = (int(value) for value in item.split(":", 1))
+                selected.extend(range(start, end + 1))
+            else:
+                selected.append(int(item))
+        return "OK", [
+            f"{position} (UID {self.sequence_uids[position - 1]})".encode()
+            for position in selected
+            if 1 <= position <= len(self.sequence_uids)
+        ]
 
     def logout(self) -> tuple[str, list[bytes]]:
         self.logged_out = True
@@ -242,6 +258,18 @@ def test_connection_validation_canonicalizes_idna_hostname() -> None:
     assert result.host == "xn--mil-ela.example"
 
 
+def test_connection_validation_canonicalizes_idna_mailbox_domain() -> None:
+    result = credentials_from_connection(connection(email_address="owner@MÁIL.example"))
+
+    assert result.email_address == "owner@xn--mil-ela.example"
+
+
+def test_connection_validation_preserves_significant_username_whitespace() -> None:
+    result = credentials_from_connection(connection(username=" owner@example.com "))
+
+    assert result.username == " owner@example.com "
+
+
 def test_login_quotes_username_as_an_imap_astring() -> None:
     clients: list[FakeImap] = []
     values = ImapCredentials(**{**credentials().__dict__, "username": 'owner name"\\account'})
@@ -262,6 +290,8 @@ def test_login_quotes_username_as_an_imap_astring() -> None:
         ({"host": "https://mail.example.com"}, "hostname"),
         ({"port": 0}, "between 1 and 65535"),
         ({"security": "plain"}, "TLS or STARTTLS"),
+        ({"security": ["tls"]}, "TLS or STARTTLS"),
+        ({"security": {"mode": "tls"}}, "TLS or STARTTLS"),
         ({"email_address": "not-an-email"}, "valid mailbox"),
         ({"username": "owñer@example.com"}, "valid mail server username"),
         ({"password": "pässword"}, "valid mail server password"),
@@ -293,15 +323,15 @@ def test_private_credentials_round_trip_without_source_ca_path(
     assert "ca_file" not in path.read_text(encoding="utf-8")
 
 
-def test_cursor_is_snapshotted_and_incremental_search_is_bounded() -> None:
+def test_cursor_is_snapshotted_and_incremental_sequence_page_is_bounded() -> None:
     clients: list[FakeImap] = []
-    search = b" ".join(str(uid).encode() for uid in range(8, 8 + MAX_INCREMENTAL_MESSAGE_IDS + 1))
+    new_uids = list(range(8, 8 + MAX_INCREMENTAL_MESSAGE_IDS + 1))
     gateway = ImapGateway(
         credentials(),
         factory(
             clients,
             uid_next=8 + MAX_INCREMENTAL_MESSAGE_IDS + 1,
-            search=search,
+            sequence_uids=[7, *new_uids],
         ),
     )
 
@@ -311,7 +341,10 @@ def test_cursor_is_snapshotted_and_incremental_search_is_bounded() -> None:
     assert changes.message_ids[0] == message_id(8)
     assert changes.cursor == cursor(7 + MAX_INCREMENTAL_MESSAGE_IDS)
     assert clients[0].readonly is True
-    assert ("uid", "SEARCH", None, f"UID 8:{8 + MAX_INCREMENTAL_MESSAGE_IDS}") in clients[0].calls
+    page_calls = [call for call in clients[0].calls if call[0] == "fetch" and "," in call[1]]
+    assert len(page_calls) == 1
+    assert len(page_calls[0][1].split(",")) == MAX_INCREMENTAL_MESSAGE_IDS
+    assert not [call for call in clients[0].calls if call[:2] == ("uid", "SEARCH")]
     assert clients[0].logged_out is True
 
 
@@ -322,19 +355,20 @@ def test_uid_validity_change_requires_recovery() -> None:
         gateway.changes_since(cursor())
 
 
-def test_incremental_search_bounds_the_server_side_uid_window() -> None:
+def test_incremental_page_crosses_large_sparse_uid_gap_in_one_poll() -> None:
     clients: list[FakeImap] = []
+    sparse_uid = 1_000_000_000
     gateway = ImapGateway(
         credentials(),
-        factory(clients, uid_next=MAX_UID_SEARCH_SPAN + 100, search=b""),
+        factory(clients, uid_next=sparse_uid + 1, sequence_uids=[7, sparse_uid]),
     )
 
     changes = gateway.changes_since(cursor())
 
-    search_end = 7 + MAX_UID_SEARCH_SPAN
-    assert changes.message_ids == ()
-    assert changes.cursor == cursor(search_end)
-    assert ("uid", "SEARCH", None, f"UID 8:{search_end}") in clients[0].calls
+    assert changes.message_ids == (message_id(sparse_uid),)
+    assert changes.cursor == cursor(sparse_uid)
+    assert ("fetch", "2", "(UID)") in clients[0].calls
+    assert not [call for call in clients[0].calls if call[:2] == ("uid", "SEARCH")]
 
 
 def test_snapshot_falls_back_to_highest_uid_when_uidnext_is_absent() -> None:
@@ -344,7 +378,7 @@ def test_snapshot_falls_back_to_highest_uid_when_uidnext_is_absent() -> None:
                 return name, []
             return super().response(name)
 
-    client = MissingUidNext(search=b"7")
+    client = MissingUidNext()
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     assert gateway.initial_cursor() == cursor()
@@ -701,7 +735,20 @@ def test_recovery_uses_previous_utc_day_with_protocol_month_name() -> None:
 
     gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
 
-    assert ("uid", "SEARCH", None, "UID 1:7", "SINCE", "03-Sep-2026") in clients[0].calls
+    assert ("search", None, "1:1", "SINCE", "03-Sep-2026") in clients[0].calls
+
+
+def test_recovery_crosses_sparse_uid_gap_by_message_sequence() -> None:
+    sparse_uid = 1_000_000_000
+    gateway = ImapGateway(
+        credentials(),
+        factory([], uid_next=sparse_uid + 1, sequence_uids=[sparse_uid]),
+    )
+
+    changes = gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
+
+    assert changes.message_ids == (message_id(sparse_uid),)
+    assert changes.cursor == cursor(sparse_uid)
 
 
 @pytest.mark.parametrize("status", ["NO", "BAD"])
@@ -882,10 +929,10 @@ def test_greeting_failure_is_categorized_without_server_detail(
 def test_post_login_protocol_error_is_categorized_without_server_detail() -> None:
     client = FakeImap()
 
-    def fail_uid(command: str, *args: object) -> tuple[str, list[Any]]:
+    def fail_fetch(sequence: str, query: str) -> tuple[str, list[bytes]]:
         raise imaplib.IMAP4.error("private protocol detail")
 
-    client.uid = fail_uid  # type: ignore[method-assign]
+    client.fetch = fail_fetch  # type: ignore[method-assign]
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     with pytest.raises(ImapError) as raised:

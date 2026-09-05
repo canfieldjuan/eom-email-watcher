@@ -337,6 +337,33 @@ def test_permanently_invalid_mailbox_content_does_not_retry_forever(tmp_path: Pa
     assert model.calls == 0
 
 
+def test_failed_fallback_for_permanent_content_error_retries_without_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FakeModel()
+    attempts = 0
+
+    def flaky_fallback(*_args, **_kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NotificationError("all channels unavailable")
+
+    monkeypatch.setattr(service_module, "send_fallback", flaky_fallback)
+    watcher = Watcher(cfg, store, InvalidContentGmail(), model)
+
+    assert watcher.check()["fallback_notified"] == 0
+    assert store.notification_intents()[0].kind == "fallback"
+    assert watcher.check()["fallback_notified"] == 1
+    assert store.notification_intents() == []
+    assert attempts == 2
+    assert model.calls == 0
+
+
 def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
     tmp_path: Path,
 ) -> None:

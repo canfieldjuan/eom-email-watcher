@@ -4,7 +4,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from .config import Config
-from .db import AnalyzedMessage, PendingMessage, Store
+from .db import AnalyzedMessage, NotificationIntent, PendingMessage, Store
 from .mailbox import (
     MailboxGateway,
     MailboxMessageInvalid,
@@ -190,7 +190,7 @@ class Watcher:
             "stale_cursor_recovered": recovered,
         }
 
-    def _label(self, message: PendingMessage | AnalyzedMessage) -> str:
+    def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
 
     @staticmethod
@@ -206,8 +206,10 @@ class Watcher:
             confidence=message.confidence,
         )
 
-    def _send_fallback(self, message: PendingMessage | AnalyzedMessage, dry_run: bool) -> int:
-        if not self.config.notifications_enabled or message.fallback_notified_at:
+    def _send_fallback(
+        self, message: PendingMessage | AnalyzedMessage | NotificationIntent, dry_run: bool
+    ) -> int:
+        if not self.config.notifications_enabled or getattr(message, "fallback_notified_at", None):
             return 0
         try:
             send_fallback(
@@ -269,6 +271,10 @@ class Watcher:
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
+        if deliver_notifications:
+            for intent in self.store.notification_intents():
+                if intent.kind == "fallback":
+                    fallback += self._send_fallback(intent, dry_run)
         for message in self.store.pending_delivery():
             received_at = _received_at_or_none(
                 message.received_at, observed_at=retention_observed_at
