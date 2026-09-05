@@ -9,7 +9,7 @@ import re
 import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
@@ -44,6 +44,7 @@ MAX_ATTACHMENT_FILENAME_TOTAL_BYTES = 64 * 1024
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v2:"
+RECOVERY_CURSOR_PREFIX = "eom-imap-recovery-v1:"
 MESSAGE_ID_PREFIX = "eom-imap-message-v2:"
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _UID = re.compile(r"[1-9][0-9]*\Z")
@@ -270,11 +271,26 @@ def imap_mailbox_identity(credentials: ImapCredentials) -> str:
 
 
 def imap_cursor_mailbox_identity(cursor: str) -> str:
+    if cursor.startswith(RECOVERY_CURSOR_PREFIX):
+        return _decode_recovery_cursor(cursor)[0]
     return _decode_cursor(cursor)[0]
 
 
 def _cursor(mailbox_id: str, uid_validity: int, last_uid: int) -> str:
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{last_uid}"
+
+
+def _recovery_cursor(
+    mailbox_id: str,
+    uid_validity: int,
+    upper_uid: int,
+    snapshot_uid: int,
+    search_day: date,
+) -> str:
+    return (
+        f"{RECOVERY_CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{upper_uid}:"
+        f"{snapshot_uid}:{search_day.toordinal()}"
+    )
 
 
 def _message_id(mailbox_id: str, uid_validity: int, uid: int) -> str:
@@ -297,6 +313,32 @@ def _decode_cursor(value: str) -> tuple[str, int, int]:
     if parsed[1] <= 0 or parsed[2] < 0:
         raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
     return parsed
+
+
+def _decode_recovery_cursor(value: str) -> tuple[str, int, int, int, date]:
+    encoded = (
+        value.removeprefix(RECOVERY_CURSOR_PREFIX)
+        if value.startswith(RECOVERY_CURSOR_PREFIX)
+        else ""
+    )
+    fields = encoded.split(":")
+    if (
+        len(fields) != 5
+        or _MAILBOX_ID.fullmatch(fields[0]) is None
+        or any(not field.isdecimal() for field in fields[1:])
+    ):
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
+    mailbox_id, validity_text, upper_text, snapshot_text, ordinal_text = fields
+    validity = int(validity_text)
+    upper_uid = int(upper_text)
+    snapshot_uid = int(snapshot_text)
+    try:
+        search_day = date.fromordinal(int(ordinal_text))
+    except ValueError as exc:
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid") from exc
+    if validity <= 0 or upper_uid <= 0 or snapshot_uid <= 0 or upper_uid > snapshot_uid:
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
+    return mailbox_id, validity, upper_uid, snapshot_uid, search_day
 
 
 def _decode_message_id(value: str) -> tuple[str, int, int]:
@@ -415,6 +457,30 @@ def _first_sequence_after_uid(client: imaplib.IMAP4, message_count: int, saved_u
         else:
             low = middle + 1
     return result
+
+
+def _last_sequence_at_or_before_uid(
+    client: imaplib.IMAP4, message_count: int, upper_uid: int
+) -> int:
+    low = 1
+    high = message_count
+    result = 0
+    while low <= high:
+        middle = (low + high) // 2
+        if _uid_at_sequence(client, middle) <= upper_uid:
+            result = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return result
+
+
+def _reject_recovery_expunge(client: imaplib.IMAP4) -> None:
+    _status, values = client.response("EXPUNGE")
+    if any(value is not None for value in values or []):
+        raise ImapError(
+            "imap_mailbox_changed", "Mail server changed during recovery; retry"
+        )
 
 
 def _literal(response: list[Any] | None) -> tuple[bytes, bytes]:
@@ -570,12 +636,20 @@ def _content(message: EmailMessage, body_char_limit: int) -> MessageContent:
     return _content_and_attachment_payloads(message, body_char_limit)[0]
 
 
-def _recovery_search_date(since: datetime) -> str:
+def _recovery_search_day(since: datetime) -> date:
     normalized = since.replace(tzinfo=UTC) if since.tzinfo is None else since.astimezone(UTC)
     search_date = normalized.date()
     with contextlib.suppress(OverflowError):
         search_date -= timedelta(days=1)
+    return search_date
+
+
+def _format_recovery_search_day(search_date: date) -> str:
     return f"{search_date.day:02d}-{_ENGLISH_MONTHS[search_date.month - 1]}-{search_date.year:04d}"
+
+
+def _recovery_search_date(since: datetime) -> str:
+    return _format_recovery_search_day(_recovery_search_day(since))
 
 
 class ImapGateway:
@@ -774,6 +848,39 @@ class ImapGateway:
         return _cursor(self._mailbox_id, uid_validity, last_uid)
 
     def changes_since(self, cursor: str) -> MailboxChanges:
+        if cursor.startswith(RECOVERY_CURSOR_PREFIX):
+            (
+                saved_mailbox,
+                saved_validity,
+                upper_uid,
+                snapshot_uid,
+                search_day,
+            ) = _decode_recovery_cursor(cursor)
+            if saved_mailbox != self._mailbox_id:
+                raise StaleMailboxCursor("The configured mail server mailbox changed")
+            with self._mailbox() as client:
+                current_validity = _selected_uid_validity(client)
+                if current_validity != saved_validity:
+                    current_validity, current_snapshot_uid = self._snapshot(client)
+                    _reject_recovery_expunge(client)
+                    if current_snapshot_uid == 0:
+                        return MailboxChanges(
+                            (), _cursor(self._mailbox_id, current_validity, 0)
+                        )
+                    return self._recovery_page(
+                        client,
+                        uid_validity=current_validity,
+                        upper_uid=current_snapshot_uid,
+                        snapshot_uid=current_snapshot_uid,
+                        search_day=search_day,
+                    )
+                return self._recovery_page(
+                    client,
+                    uid_validity=saved_validity,
+                    upper_uid=upper_uid,
+                    snapshot_uid=snapshot_uid,
+                    search_day=search_day,
+                )
         saved_mailbox, saved_validity, saved_uid = _decode_cursor(cursor)
         if saved_mailbox != self._mailbox_id:
             raise StaleMailboxCursor("The configured mail server mailbox changed")
@@ -799,50 +906,82 @@ class ImapGateway:
             _cursor(self._mailbox_id, current_validity, next_uid),
         )
 
+    def _recovery_page(
+        self,
+        client: imaplib.IMAP4,
+        *,
+        uid_validity: int,
+        upper_uid: int,
+        snapshot_uid: int,
+        search_day: date,
+    ) -> MailboxChanges:
+        _reject_recovery_expunge(client)
+        message_count = _selected_message_count(client)
+        if message_count == 0:
+            return MailboxChanges(
+                (), _cursor(self._mailbox_id, uid_validity, snapshot_uid)
+            )
+        last_sequence = _last_sequence_at_or_before_uid(client, message_count, upper_uid)
+        _reject_recovery_expunge(client)
+        if last_sequence == 0:
+            return MailboxChanges(
+                (), _cursor(self._mailbox_id, uid_validity, snapshot_uid)
+            )
+        first_sequence = max(1, last_sequence - MAX_UID_SEARCH_SPAN + 1)
+        status, response = client.search(
+            None,
+            f"{first_sequence}:{last_sequence}",
+            "SINCE",
+            _format_recovery_search_day(search_day),
+        )
+        if status != "OK":
+            raise ImapError("imap_protocol_error", "Mail server recovery search failed")
+        _reject_recovery_expunge(client)
+        matching_sequences = [
+            sequence
+            for sequence in _uids(response)
+            if first_sequence <= sequence <= last_sequence
+        ]
+        selected_sequences = matching_sequences[-MAX_INCREMENTAL_MESSAGE_IDS:]
+        candidates = _fetch_sequence_uids(client, selected_sequences)
+        if len(matching_sequences) > len(selected_sequences):
+            next_upper_uid = candidates[0] - 1
+        elif first_sequence == 1:
+            next_upper_uid = 0
+        else:
+            next_upper_uid = _uid_at_sequence(client, first_sequence) - 1
+        _reject_recovery_expunge(client)
+        if any(uid > upper_uid or uid > snapshot_uid for uid in candidates):
+            raise ImapError("imap_protocol_error", "Mail server UID page was invalid")
+        if next_upper_uid <= 0:
+            next_cursor = _cursor(self._mailbox_id, uid_validity, snapshot_uid)
+        else:
+            next_cursor = _recovery_cursor(
+                self._mailbox_id,
+                uid_validity,
+                next_upper_uid,
+                snapshot_uid,
+                search_day,
+            )
+        return MailboxChanges(
+            tuple(_message_id(self._mailbox_id, uid_validity, uid) for uid in candidates),
+            next_cursor,
+        )
+
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
         del addresses
         with self._mailbox() as client:
             uid_validity, snapshot_uid = self._snapshot(client)
+            _reject_recovery_expunge(client)
             if snapshot_uid == 0:
                 return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, 0))
-            message_count = _selected_message_count(client)
-            if message_count == 0:
-                return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
-            selected_sequences: list[int] = []
-            first_sequence = 1
-            search_date = _recovery_search_date(since)
-            while (
-                first_sequence <= message_count
-                and len(selected_sequences) < MAX_INCREMENTAL_MESSAGE_IDS
-            ):
-                last_sequence = min(message_count, first_sequence + MAX_UID_SEARCH_SPAN - 1)
-                status, response = client.search(
-                    None,
-                    f"{first_sequence}:{last_sequence}",
-                    "SINCE",
-                    search_date,
-                )
-                if status != "OK":
-                    raise ImapError("imap_protocol_error", "Mail server recovery search failed")
-                matching_sequences = [
-                    sequence
-                    for sequence in _uids(response)
-                    if first_sequence <= sequence <= last_sequence
-                ]
-                remaining = MAX_INCREMENTAL_MESSAGE_IDS - len(selected_sequences)
-                selected_sequences.extend(matching_sequences[:remaining])
-                first_sequence = last_sequence + 1
-            candidates = _fetch_sequence_uids(client, selected_sequences)
-            if len(selected_sequences) == MAX_INCREMENTAL_MESSAGE_IDS:
-                next_uid = candidates[-1]
-            else:
-                next_uid = snapshot_uid
-            if any(uid > snapshot_uid for uid in candidates) or next_uid > snapshot_uid:
-                raise ImapError("imap_protocol_error", "Mail server UID page was invalid")
-        return MailboxChanges(
-            tuple(_message_id(self._mailbox_id, uid_validity, uid) for uid in candidates),
-            _cursor(self._mailbox_id, uid_validity, next_uid),
-        )
+            return self._recovery_page(
+                client,
+                uid_validity=uid_validity,
+                upper_uid=snapshot_uid,
+                snapshot_uid=snapshot_uid,
+                search_day=_recovery_search_day(since),
+            )
 
     def metadata(self, message_id: str) -> MessageMetadata:
         with self._mailbox() as client:

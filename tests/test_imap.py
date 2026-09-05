@@ -22,6 +22,7 @@ from eom_email_watcher.imap import (
     MAX_MIME_PARTS,
     MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
+    RECOVERY_CURSOR_PREFIX,
     ImapCredentials,
     ImapError,
     ImapGateway,
@@ -29,6 +30,7 @@ from eom_email_watcher.imap import (
     _content_and_attachment_payloads,
     _synthesized_attachment_name,
     credentials_from_connection,
+    imap_cursor_mailbox_identity,
     imap_mailbox_identity,
     load_credentials,
     write_credentials,
@@ -133,6 +135,21 @@ def message_id(
     return f"{MESSAGE_ID_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
 
 
+def recovery_cursor(
+    upper_uid: int,
+    snapshot_uid: int,
+    *,
+    uid_validity: int = 44,
+    values: ImapCredentials | None = None,
+) -> str:
+    mailbox_id = imap_mailbox_identity(values or credentials())
+    search_day = datetime(2026, 9, 3, tzinfo=UTC).date().toordinal()
+    return (
+        f"{RECOVERY_CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{upper_uid}:"
+        f"{snapshot_uid}:{search_day}"
+    )
+
+
 class FakeImap:
     def __init__(
         self,
@@ -162,6 +179,8 @@ class FakeImap:
         return "OK", [str(len(self.sequence_uids)).encode("ascii")]
 
     def response(self, name: str) -> tuple[str, list[bytes]]:
+        if name == "EXPUNGE":
+            return name, []
         value = self.uid_validity if name == "UIDVALIDITY" else self.uid_next
         return name, [str(value).encode("ascii")]
 
@@ -752,13 +771,13 @@ def test_recovery_crosses_sparse_uid_gap_by_message_sequence() -> None:
     assert changes.cursor == cursor(sparse_uid)
 
 
-def test_recovery_keeps_date_filter_across_bounded_sequence_windows() -> None:
+def test_recovery_prioritizes_recent_window_and_persists_bounded_progress() -> None:
     class WindowedRecovery(FakeImap):
         def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
             self.calls.append(("search", charset, *criteria))
-            if criteria[0] == f"1:{MAX_UID_SEARCH_SPAN}":
-                return "OK", [b""]
-            return "OK", [str(MAX_UID_SEARCH_SPAN + 1).encode("ascii")]
+            if criteria[0] == f"2:{MAX_UID_SEARCH_SPAN + 1}":
+                return "OK", [str(MAX_UID_SEARCH_SPAN + 1).encode("ascii")]
+            return "OK", [b""]
 
     final_sequence = MAX_UID_SEARCH_SPAN + 1
     client = WindowedRecovery(
@@ -767,12 +786,100 @@ def test_recovery_keeps_date_filter_across_bounded_sequence_windows() -> None:
     )
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
-    changes = gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
+    first = gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
+    second = gateway.changes_since(first.cursor)
 
-    assert changes.message_ids == (message_id(final_sequence),)
-    assert changes.cursor == cursor(final_sequence)
-    assert ("search", None, "1:10000", "SINCE", "03-Sep-2026") in client.calls
-    assert ("search", None, "10001:10001", "SINCE", "03-Sep-2026") in client.calls
+    assert first.message_ids == (message_id(final_sequence),)
+    assert first.cursor == recovery_cursor(1, final_sequence)
+    assert second.message_ids == ()
+    assert second.cursor == cursor(final_sequence)
+    search_calls = [call for call in client.calls if call[0] == "search"]
+    assert search_calls == [
+        ("search", None, "2:10001", "SINCE", "03-Sep-2026"),
+        ("search", None, "1:1", "SINCE", "03-Sep-2026"),
+    ]
+
+
+def test_recovery_retries_without_advancing_when_expunge_shifts_sequences() -> None:
+    class ExpungedRecovery(FakeImap):
+        expunged = False
+
+        def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
+            result = super().search(charset, *criteria)
+            self.expunged = True
+            return result
+
+        def response(self, name: str) -> tuple[str, list[bytes]]:
+            if name == "EXPUNGE" and self.expunged:
+                self.expunged = False
+                return name, [b"1"]
+            return super().response(name)
+
+    client = ExpungedRecovery(sequence_uids=[7, 8], uid_next=9, search=b"2")
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    with pytest.raises(ImapError) as raised:
+        gateway.recover_since(frozenset(), datetime(2026, 9, 4, tzinfo=UTC))
+
+    assert raised.value.code == "imap_mailbox_changed"
+    assert "EXPUNGE" not in str(raised.value)
+
+
+def test_recovery_pages_newest_matches_without_losing_older_matches() -> None:
+    message_count = MAX_INCREMENTAL_MESSAGE_IDS + 1
+    search_response = " ".join(str(value) for value in range(1, message_count + 1)).encode()
+    client = FakeImap(
+        uid_next=message_count + 1,
+        sequence_uids=list(range(1, message_count + 1)),
+        search=search_response,
+    )
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    first = gateway.recover_since(frozenset(), datetime(2026, 9, 4, tzinfo=UTC))
+    second = gateway.changes_since(first.cursor)
+
+    assert first.message_ids == tuple(
+        message_id(value) for value in range(2, message_count + 1)
+    )
+    assert first.cursor == recovery_cursor(1, message_count)
+    assert second.message_ids == (message_id(1),)
+    assert second.cursor == cursor(message_count)
+    assert len([call for call in client.calls if call[0] == "search"]) == 2
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        f"{RECOVERY_CURSOR_PREFIX}invalid",
+        recovery_cursor(0, 7),
+        recovery_cursor(8, 7),
+        recovery_cursor(7, 7).rsplit(":", 1)[0] + ":0",
+    ],
+)
+def test_recovery_cursor_rejects_invalid_boundaries(value: str) -> None:
+    gateway = ImapGateway(credentials(), factory([]))
+
+    with pytest.raises(ImapError) as raised:
+        gateway.changes_since(value)
+
+    assert raised.value.code == "imap_cursor_invalid"
+
+
+def test_recovery_cursor_preserves_non_secret_mailbox_binding() -> None:
+    value = recovery_cursor(7, 8)
+
+    assert imap_cursor_mailbox_identity(value) == imap_mailbox_identity(credentials())
+
+
+def test_second_uidvalidity_reset_preserves_original_recovery_date() -> None:
+    client = FakeImap(uid_validity=45, uid_next=10, sequence_uids=[9], search=b"1")
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    changes = gateway.changes_since(recovery_cursor(7, 8))
+
+    assert changes.message_ids == (message_id(9, uid_validity=45),)
+    assert changes.cursor == cursor(9, uid_validity=45)
+    assert ("search", None, "1:1", "SINCE", "03-Sep-2026") in client.calls
 
 
 @pytest.mark.parametrize("status", ["NO", "BAD"])
