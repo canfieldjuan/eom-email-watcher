@@ -38,11 +38,14 @@ MAX_HEADER_BYTES = 64 * 1024
 MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
 MAX_INCREMENTAL_MESSAGE_IDS = 200
+MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v1:"
+MESSAGE_ID_PREFIX = "eom-imap-message-v1:"
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _UID = re.compile(r"[1-9][0-9]*\Z")
 _INTERNAL_DATE = re.compile(rb'INTERNALDATE "([^"]+)"', re.IGNORECASE)
 _RFC822_SIZE = re.compile(rb"RFC822\.SIZE ([0-9]+)", re.IGNORECASE)
+_FETCH_UID = re.compile(rb"(?:^|[ (])UID ([1-9][0-9]*)(?:[ )]|$)", re.IGNORECASE)
 _ENGLISH_MONTHS = (
     "Jan",
     "Feb",
@@ -148,6 +151,7 @@ def credentials_from_connection(value: object) -> ImapCredentials:
     if (
         not username
         or len(username) > 320
+        or not username.isascii()
         or any(not character.isprintable() for character in username)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server username")
@@ -157,6 +161,7 @@ def credentials_from_connection(value: object) -> ImapCredentials:
         not isinstance(password, str)
         or not password
         or len(password) > 4096
+        or not password.isascii()
         or any(not character.isprintable() for character in password)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server password")
@@ -238,6 +243,10 @@ def _cursor(uid_validity: int, last_uid: int) -> str:
     return f"{CURSOR_PREFIX}{uid_validity}:{last_uid}"
 
 
+def _message_id(uid_validity: int, uid: int) -> str:
+    return f"{MESSAGE_ID_PREFIX}{uid_validity}:{uid}"
+
+
 def _decode_cursor(value: str) -> tuple[int, int]:
     encoded = value.removeprefix(CURSOR_PREFIX) if value.startswith(CURSOR_PREFIX) else ""
     validity, separator, uid = encoded.partition(":")
@@ -249,11 +258,31 @@ def _decode_cursor(value: str) -> tuple[int, int]:
     return parsed
 
 
+def _decode_message_id(value: str) -> tuple[int, int]:
+    encoded = value.removeprefix(MESSAGE_ID_PREFIX) if value.startswith(MESSAGE_ID_PREFIX) else ""
+    validity, separator, uid = encoded.partition(":")
+    if not separator or not validity.isdecimal() or _UID.fullmatch(uid) is None:
+        raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
+    parsed = int(validity), int(uid)
+    if parsed[0] <= 0:
+        raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
+    return parsed
+
+
 def _response_number(client: imaplib.IMAP4, name: str) -> int:
+    parsed = _optional_response_number(client, name)
+    if parsed is None:
+        raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
+    return parsed
+
+
+def _optional_response_number(client: imaplib.IMAP4, name: str) -> int | None:
     _status, values = client.response(name)
     value = values[0] if values else None
+    if value is None:
+        return None
     try:
-        parsed = int(value) if value is not None else 0
+        parsed = int(value)
     except (TypeError, ValueError) as exc:
         raise ImapError(
             "imap_protocol_error", "Mail server omitted required mailbox state"
@@ -261,6 +290,22 @@ def _response_number(client: imaplib.IMAP4, name: str) -> int:
     if parsed <= 0:
         raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
     return parsed
+
+
+def _selected_uid_validity(client: imaplib.IMAP4) -> int:
+    cached = getattr(client, "_eom_uid_validity", None)
+    if isinstance(cached, int) and cached > 0:
+        return cached
+    value = _response_number(client, "UIDVALIDITY")
+    client._eom_uid_validity = value  # type: ignore[attr-defined]
+    return value
+
+
+def _selected_message_count(client: imaplib.IMAP4) -> int:
+    cached = getattr(client, "_eom_message_count", None)
+    if isinstance(cached, int) and cached >= 0:
+        return cached
+    raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
 
 
 def _uids(response: list[Any] | None) -> list[int]:
@@ -342,40 +387,45 @@ def _content_and_attachment_payloads(
     attachments: list[AttachmentDescriptor] = []
     attachment_payloads: list[bytes] = []
 
-    pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
-    visited = 0
-    while pending:
-        part, depth, root = pending.pop()
-        visited += 1
-        if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH:
-            raise MailboxMessageInvalid(
-                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-            )
-        filename = part.get_filename()
-        if not root and filename:
-            payload = _attachment_payload(part)
-            position = len(attachments)
-            attachment_payloads.append(payload)
-            attachments.append(
-                AttachmentDescriptor(
-                    part_id=f"mime-{position}",
-                    attachment_id=None,
-                    filename=filename,
-                    media_type=part.get_content_type().casefold(),
-                    byte_size=len(payload),
-                    position=position,
+    try:
+        pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
+        visited = 0
+        while pending:
+            part, depth, root = pending.pop()
+            visited += 1
+            if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH:
+                raise MailboxMessageInvalid(
+                    "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
                 )
-            )
-            continue
-        if part.is_multipart():
-            children = part.get_payload()
-            if isinstance(children, list):
-                pending.extend((child, depth + 1, False) for child in reversed(children))
-            continue
-        if part.get_content_type() == "text/plain":
-            plain.append(_part_text(part))
-        elif part.get_content_type() == "text/html":
-            html.append(re.sub(r"<[^>]+>", " ", _part_text(part)))
+            filename = part.get_filename()
+            if not root and filename:
+                payload = _attachment_payload(part)
+                position = len(attachments)
+                attachment_payloads.append(payload)
+                attachments.append(
+                    AttachmentDescriptor(
+                        part_id=f"mime-{position}",
+                        attachment_id=None,
+                        filename=filename,
+                        media_type=part.get_content_type().casefold(),
+                        byte_size=len(payload),
+                        position=position,
+                    )
+                )
+                continue
+            if part.is_multipart():
+                children = part.get_payload()
+                if isinstance(children, list):
+                    pending.extend((child, depth + 1, False) for child in reversed(children))
+                continue
+            if part.get_content_type() == "text/plain":
+                plain.append(_part_text(part))
+            elif part.get_content_type() == "text/html":
+                html.append(re.sub(r"<[^>]+>", " ", _part_text(part)))
+    except RecursionError as exc:
+        raise MailboxMessageInvalid(
+            "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
+        ) from exc
     selected = "\n\n".join(plain if plain else html)
     body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
     names = tuple(dict.fromkeys(item.filename for item in attachments))
@@ -489,9 +539,19 @@ class ImapGateway:
             ) from exc
 
         try:
-            status, _response = client.select("INBOX", readonly=True)
+            status, response = client.select("INBOX", readonly=True)
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server INBOX is unavailable")
+            raw_count = response[0] if response else None
+            try:
+                message_count = int(raw_count) if raw_count is not None else -1
+            except (TypeError, ValueError) as exc:
+                raise ImapError(
+                    "imap_protocol_error", "Mail server omitted required mailbox state"
+                ) from exc
+            if message_count < 0:
+                raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
+            client._eom_message_count = message_count  # type: ignore[attr-defined]
             yield client
         except ImapError:
             raise
@@ -533,9 +593,27 @@ class ImapGateway:
 
     @staticmethod
     def _snapshot(client: imaplib.IMAP4) -> tuple[int, int]:
-        uid_validity = _response_number(client, "UIDVALIDITY")
-        uid_next = _response_number(client, "UIDNEXT")
-        return uid_validity, uid_next - 1
+        uid_validity = _selected_uid_validity(client)
+        uid_next = _optional_response_number(client, "UIDNEXT")
+        if uid_next is not None:
+            return uid_validity, uid_next - 1
+        message_count = _selected_message_count(client)
+        if message_count == 0:
+            return uid_validity, 0
+        status, response = client.fetch(str(message_count), "(UID)")
+        if status != "OK":
+            raise ImapError("imap_protocol_error", "Mail server UID snapshot failed")
+        match = _FETCH_UID.search(_response_metadata(response))
+        if match is None:
+            raise ImapError("imap_protocol_error", "Mail server UID snapshot failed")
+        return uid_validity, int(match.group(1))
+
+    @staticmethod
+    def _checked_uid(client: imaplib.IMAP4, message_id: str) -> str:
+        expected_validity, uid = _decode_message_id(message_id)
+        if _selected_uid_validity(client) != expected_validity:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        return str(uid)
 
     def initial_cursor(self) -> str:
         with self._mailbox() as client:
@@ -550,35 +628,48 @@ class ImapGateway:
                 raise StaleMailboxCursor("The mail server reset its INBOX message identifiers")
             if snapshot_uid <= saved_uid:
                 return MailboxChanges((), _cursor(current_validity, snapshot_uid))
-            status, response = client.uid("SEARCH", None, f"UID {saved_uid + 1}:{snapshot_uid}")
+            search_end = min(snapshot_uid, saved_uid + MAX_UID_SEARCH_SPAN)
+            status, response = client.uid("SEARCH", None, f"UID {saved_uid + 1}:{search_end}")
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server change search failed")
-            candidates = [uid for uid in _uids(response) if uid <= snapshot_uid]
+            candidates = [uid for uid in _uids(response) if uid <= search_end]
         selected = candidates[:MAX_INCREMENTAL_MESSAGE_IDS]
-        next_uid = selected[-1] if len(candidates) > len(selected) else snapshot_uid
+        next_uid = selected[-1] if len(candidates) > len(selected) else search_end
         return MailboxChanges(
-            tuple(str(uid) for uid in selected), _cursor(saved_validity, next_uid)
+            tuple(_message_id(current_validity, uid) for uid in selected),
+            _cursor(current_validity, next_uid),
         )
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
         del addresses
         with self._mailbox() as client:
             uid_validity, snapshot_uid = self._snapshot(client)
-            status, response = client.uid("SEARCH", None, "SINCE", _recovery_search_date(since))
+            if snapshot_uid == 0:
+                return MailboxChanges((), _cursor(uid_validity, 0))
+            search_end = min(snapshot_uid, MAX_UID_SEARCH_SPAN)
+            status, response = client.uid(
+                "SEARCH",
+                None,
+                f"UID 1:{search_end}",
+                "SINCE",
+                _recovery_search_date(since),
+            )
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server recovery search failed")
-            candidates = [uid for uid in _uids(response) if uid <= snapshot_uid]
+            candidates = [uid for uid in _uids(response) if uid <= search_end]
         selected = candidates[:MAX_INCREMENTAL_MESSAGE_IDS]
-        next_uid = selected[-1] if len(candidates) > len(selected) else snapshot_uid
-        return MailboxChanges(tuple(str(uid) for uid in selected), _cursor(uid_validity, next_uid))
+        next_uid = selected[-1] if len(candidates) > len(selected) else search_end
+        return MailboxChanges(
+            tuple(_message_id(uid_validity, uid) for uid in selected),
+            _cursor(uid_validity, next_uid),
+        )
 
     def metadata(self, message_id: str) -> MessageMetadata:
-        if _UID.fullmatch(message_id) is None:
-            raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
         with self._mailbox() as client:
+            uid = self._checked_uid(client, message_id)
             status, response = client.uid(
                 "FETCH",
-                message_id,
+                uid,
                 "(UID INTERNALDATE "
                 f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>)",
             )
@@ -589,13 +680,19 @@ class ImapGateway:
                 raise MailboxMessageInvalid(
                     "imap_headers_too_large", "Message headers exceed the safe size limit"
                 )
-        parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
-        raw_from = str(parsed.get("From", ""))
-        sender_name, _address = parseaddr(raw_from)
-        subject = str(parsed.get("Subject", "")).strip() or "(no subject)"
+        try:
+            parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
+            raw_from = str(parsed.get("From", ""))
+            sender_name, _address = parseaddr(raw_from)
+            subject = str(parsed.get("Subject", "")).strip() or "(no subject)"
+            thread_id = str(parsed.get("Message-ID", "")).strip() or None
+        except RecursionError as exc:
+            raise MailboxMessageInvalid(
+                "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
+            ) from exc
         return MessageMetadata(
             message_id=message_id,
-            thread_id=str(parsed.get("Message-ID", "")).strip() or None,
+            thread_id=thread_id,
             sender=normalize_address(raw_from),
             sender_name=sender_name.strip() or None,
             subject=subject,
@@ -604,10 +701,9 @@ class ImapGateway:
         )
 
     def _raw_message(self, message_id: str) -> EmailMessage:
-        if _UID.fullmatch(message_id) is None:
-            raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
         with self._mailbox() as client:
-            status, size_response = client.uid("FETCH", message_id, "(UID RFC822.SIZE)")
+            uid = self._checked_uid(client, message_id)
+            status, size_response = client.uid("FETCH", uid, "(UID RFC822.SIZE)")
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server size fetch failed; retry")
             size_metadata = _response_metadata(size_response)
@@ -618,7 +714,7 @@ class ImapGateway:
                 raise MailboxMessageInvalid(
                     "imap_message_too_large", "Message exceeds the safe size limit"
                 )
-            status, response = client.uid("FETCH", message_id, "(UID BODY.PEEK[])")
+            status, response = client.uid("FETCH", uid, "(UID BODY.PEEK[])")
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server content fetch failed; retry")
             _metadata, payload = _literal(response)

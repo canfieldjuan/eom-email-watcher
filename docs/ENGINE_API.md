@@ -135,13 +135,17 @@ IMAP connect/reconnect accepts a `connection` object containing `email_address`,
 `security` (`tls` or `starttls`), `username`, `password`, and an optional absolute `ca_file` selected
 by the trusted desktop host. Plaintext IMAP is rejected. The engine validates TLS hostname and
 certificate trust, logs in, opens only `INBOX` with `readonly=True`, and snapshots `UIDVALIDITY` and
-`UIDNEXT` before persisting the account. A selected private CA is validated and copied into the
-mode-0600 account credential file; the source path is not retained. Passwords, server settings,
-credential paths, and CA contents never enter the response. Polling uses bounded UID pages and
-`BODY.PEEK`: it fetches headers before the shared exact-sender gate and fetches a bounded full
-message only after admission. A changed `UIDVALIDITY` enters the shared retention-bounded recovery
-path. Messages larger than 50 MiB are durably paused as nonretryable analysis failures instead of
-being downloaded or retried forever. The adapter never issues IMAP write commands such as
+`UIDNEXT` before persisting the account. If a server omits `UIDNEXT`, the adapter obtains the last
+selected message's UID with one bounded sequence fetch rather than materializing the mailbox's UID
+list. Provider message identities include the selected mailbox's `UIDVALIDITY`, so a server reset
+cannot silently reuse an old UID for a different message. A selected private CA is validated and
+copied into the mode-0600 account credential file; the source path is not retained. Passwords,
+server settings, credential paths, and CA contents never enter the response. Polling uses bounded
+UID pages and bounded server-side UID windows with `BODY.PEEK`: it fetches bounded headers before
+the shared exact-sender gate, and only admitted messages proceed to the 50 MiB size check and
+bounded full-message fetch. A changed `UIDVALIDITY` enters the shared retention-bounded recovery
+path. Admitted messages larger than 50 MiB are durably paused as nonretryable analysis failures
+instead of being downloaded or retried forever. The adapter never issues IMAP write commands such as
 `STORE`, `COPY`, `MOVE`, `DELETE`, or `EXPUNGE`.
 
 `connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than
