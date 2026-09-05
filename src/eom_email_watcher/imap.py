@@ -398,7 +398,8 @@ def _content_and_attachment_payloads(
                     "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
                 )
             filename = part.get_filename()
-            if not root and filename:
+            attachment_disposition = part.get_content_disposition() == "attachment"
+            if not root and (filename or attachment_disposition):
                 payload = _attachment_payload(part)
                 position = len(attachments)
                 attachment_payloads.append(payload)
@@ -406,7 +407,7 @@ def _content_and_attachment_payloads(
                     AttachmentDescriptor(
                         part_id=f"mime-{position}",
                         attachment_id=None,
-                        filename=filename,
+                        filename=filename or f"attachment-{position + 1}",
                         media_type=part.get_content_type().casefold(),
                         byte_size=len(payload),
                         position=position,

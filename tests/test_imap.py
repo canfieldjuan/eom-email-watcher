@@ -74,6 +74,33 @@ Inner body must not join the outer body.\r
 --outer--\r
 """
 
+FILENAMELESS_ATTACHMENTS = b"""From: Sender Name <WATCHED@Example.com>\r
+Subject: Filename-less attachments\r
+Date: Fri, 04 Sep 2026 10:15:00 -0500\r
+Message-ID: <filename-less@example.com>\r
+MIME-Version: 1.0\r
+Content-Type: multipart/mixed; boundary=outer\r
+\r
+--outer\r
+Content-Type: text/plain; charset=utf-8\r
+\r
+Outer body only.\r
+--outer\r
+Content-Type: message/rfc822\r
+Content-Disposition: attachment\r
+\r
+From: Inner Sender <inner@example.com>\r
+Subject: Private forwarded content\r
+\r
+Embedded private body.\r
+--outer\r
+Content-Type: text/plain; charset=utf-8\r
+Content-Disposition: attachment\r
+\r
+Private text attachment.\r
+--outer--\r
+"""
+
 
 def credentials() -> ImapCredentials:
     return ImapCredentials(
@@ -399,6 +426,17 @@ def test_forwarded_message_is_an_attachment_not_outer_body() -> None:
     forwarded = gateway.attachment_bytes(message_id(), "mime-0", None)
     assert b"Private forwarded content" in forwarded
     assert b"Inner body must not join the outer body" in forwarded
+
+
+def test_filename_less_attachment_dispositions_never_join_outer_body() -> None:
+    gateway = ImapGateway(credentials(), factory([], raw_message=FILENAMELESS_ATTACHMENTS))
+
+    content = gateway.content(message_id(), 1000)
+
+    assert content.body == "Outer body only."
+    assert content.attachment_names == ("attachment-1", "attachment-2")
+    assert b"Embedded private body" in gateway.attachment_bytes(message_id(), "mime-0", None)
+    assert b"Private text attachment" in gateway.attachment_bytes(message_id(), "mime-1", None)
 
 
 def _nested_message(depth: int) -> EmailMessage:
