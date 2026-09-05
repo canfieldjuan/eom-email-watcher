@@ -442,6 +442,7 @@ def test_oversized_message_is_a_permanent_message_failure() -> None:
         lambda _credentials, _context: Oversized(),
     )
 
+    assert gateway.metadata("7").sender == "watched@example.com"
     with pytest.raises(MailboxMessageInvalid) as raised:
         gateway.content("7", 1000)
 
@@ -462,6 +463,23 @@ def test_login_rejection_is_categorized_and_connection_is_closed() -> None:
 
     assert raised.value.code == "imap_authentication_failed"
     assert "private server detail" not in str(raised.value)
+    assert client.logged_out is True
+
+
+def test_login_abort_is_a_retryable_connection_failure() -> None:
+    client = FakeImap()
+
+    def abort(_username: str, _password: str) -> tuple[str, list[bytes]]:
+        raise imaplib.IMAP4.abort("private disconnect detail")
+
+    client.login = abort  # type: ignore[method-assign]
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    with pytest.raises(ImapError) as raised:
+        gateway.initial_cursor()
+
+    assert raised.value.code == "imap_connection_failed"
+    assert "private disconnect detail" not in str(raised.value)
     assert client.logged_out is True
 
 

@@ -587,15 +587,6 @@ def _connect_imap_account(
         staged_credentials = Path(directory) / "credentials.json"
         write_credentials(staged_credentials, credentials)
         gateway = ImapGateway.from_credentials_file(staged_credentials)
-        initialize_baseline = (
-            account is None
-            or runtime.store.state(
-                provider=account.provider,
-                account_id=account.account_id,
-            )
-            is None
-        )
-        baseline = gateway.initial_cursor() if initialize_baseline else None
 
         activate_after_connect = False
         if account is None:
@@ -607,6 +598,17 @@ def _connect_imap_account(
             activate_after_connect = active is None or not mail_account_connected(
                 runtime.config, active
             )
+        initialize_baseline = (
+            account is None
+            or runtime.store.state(
+                provider=account.provider,
+                account_id=account.account_id,
+            )
+            is None
+        )
+        verified_cursor = gateway.initial_cursor()
+        baseline = verified_cursor if initialize_baseline else None
+
         if account is None:
             account = runtime.store.register_mail_account(
                 IMAP_PROVIDER,

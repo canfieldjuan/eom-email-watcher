@@ -16,6 +16,7 @@ from eom_email_watcher.gmail import (
     GmailProfile,
     MessageMetadata,
 )
+from eom_email_watcher.imap import ImapError
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -990,6 +991,129 @@ def test_mail_account_reconnect_rejects_a_different_imap_identity_before_write(
 
     assert response["error"]["code"] == "account_identity_mismatch"
     assert not destination.exists()
+
+
+def test_mail_account_reconnect_verifies_imap_and_preserves_existing_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'b' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        "eom-imap-v1:44:7",
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    destination.parent.mkdir(parents=True)
+    destination.write_text("old credentials", encoding="utf-8")
+    probes = 0
+
+    class VerifiedImap:
+        def initial_cursor(self) -> str:
+            nonlocal probes
+            probes += 1
+            return "eom-imap-v1:55:99"
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: VerifiedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "new-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert probes == 1
+    assert "new-password" in destination.read_text(encoding="utf-8")
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        "eom-imap-v1:44:7"
+    )
+
+
+def test_mail_account_reconnect_preserves_imap_credentials_when_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'c' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        "eom-imap-v1:44:7",
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    destination.parent.mkdir(parents=True)
+    destination.write_text("preserved credentials", encoding="utf-8")
+
+    class RejectedImap:
+        def initial_cursor(self) -> str:
+            raise ImapError("imap_authentication_failed", "Mail server rejected the credentials")
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: RejectedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "wrong-password",
+                },
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "imap_authentication_failed"
+    assert destination.read_text(encoding="utf-8") == "preserved credentials"
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        "eom-imap-v1:44:7"
+    )
 
 
 def test_mail_account_reconnect_rejects_different_microsoft_identity_before_cache_replace(

@@ -469,6 +469,12 @@ class ImapGateway:
             with contextlib.suppress(Exception):
                 client.logout()
             raise
+        except imaplib.IMAP4.abort as exc:
+            with contextlib.suppress(Exception):
+                client.logout()
+            raise ImapError(
+                "imap_connection_failed", "Mail server connection failed; retry"
+            ) from exc
         except imaplib.IMAP4.error as exc:
             with contextlib.suppress(Exception):
                 client.logout()
@@ -573,19 +579,12 @@ class ImapGateway:
             status, response = client.uid(
                 "FETCH",
                 message_id,
-                "(UID INTERNALDATE RFC822.SIZE "
+                "(UID INTERNALDATE "
                 f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>)",
             )
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server header fetch failed; retry")
             metadata, payload = _literal(response)
-            size_match = _RFC822_SIZE.search(metadata)
-            if size_match is None:
-                raise ImapError("imap_protocol_error", "Mail server omitted message size")
-            if int(size_match.group(1)) > MAX_MESSAGE_BYTES:
-                raise MailboxMessageInvalid(
-                    "imap_message_too_large", "Message exceeds the safe size limit"
-                )
             if len(payload) >= MAX_HEADER_BYTES:
                 raise MailboxMessageInvalid(
                     "imap_headers_too_large", "Message headers exceed the safe size limit"
