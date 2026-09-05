@@ -101,6 +101,13 @@ def _valid_host(host: str) -> bool:
     return True
 
 
+def _canonical_host(host: str) -> str:
+    try:
+        return str(ip_address(host))
+    except ValueError:
+        return host.encode("idna").decode("ascii").casefold()
+
+
 def _valid_email(value: str) -> str:
     address = normalize_address(value)
     local, separator, domain = address.rpartition("@")
@@ -143,6 +150,7 @@ def credentials_from_connection(value: object) -> ImapCredentials:
         or any(character.isspace() or not character.isprintable() for character in host)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server hostname")
+    host = _canonical_host(host)
 
     port = value.get("port")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
@@ -395,7 +403,10 @@ def _message_date(metadata: bytes, message: Message) -> str:
     match = _INTERNAL_DATE.search(metadata)
     if match is not None:
         try:
-            return parsedate_to_datetime(match.group(1).decode("ascii")).astimezone(UTC).isoformat()
+            parsed = parsedate_to_datetime(match.group(1).decode("ascii"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC).isoformat()
         except (OverflowError, UnicodeError, ValueError):
             pass
     try:
@@ -423,6 +434,8 @@ def _attachment_payload(part: Message) -> bytes:
     nested = part.get_payload()
     if isinstance(nested, list):
         try:
+            if part.get_content_maintype() == "multipart":
+                return part.as_bytes(policy=policy.default)
             return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
         except RecursionError as exc:
             raise MailboxMessageInvalid(

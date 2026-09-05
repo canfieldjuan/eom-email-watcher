@@ -3,7 +3,9 @@ from __future__ import annotations
 import imaplib
 import ssl
 from datetime import UTC, datetime
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ from eom_email_watcher.imap import (
     ImapError,
     ImapGateway,
     _content,
+    _content_and_attachment_payloads,
     _synthesized_attachment_name,
     credentials_from_connection,
     imap_mailbox_identity,
@@ -233,6 +236,12 @@ def test_connection_validation_normalizes_identity_and_copies_ca(
     assert requested_ca == ["test trust root"]
 
 
+def test_connection_validation_canonicalizes_idna_hostname() -> None:
+    result = credentials_from_connection(connection(host="MÁIL.example."))
+
+    assert result.host == "xn--mil-ela.example"
+
+
 def test_login_quotes_username_as_an_imap_astring() -> None:
     clients: list[FakeImap] = []
     values = ImapCredentials(**{**credentials().__dict__, "username": 'owner name"\\account'})
@@ -403,6 +412,20 @@ def test_metadata_uses_headers_only_and_content_uses_peek() -> None:
     assert any(call[-1] == "(UID BODY.PEEK[])" for call in fetches)
 
 
+def test_zone_less_internaldate_is_interpreted_as_utc() -> None:
+    class ZoneLessInternalDate(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            status, response = super().uid(command, *args)
+            if command == "FETCH" and "HEADER.FIELDS" in str(args[-1]):
+                metadata, payload = response[0]
+                response[0] = (metadata.replace(b"-0500", b"-0000"), payload)
+            return status, response
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: ZoneLessInternalDate())
+
+    assert gateway.metadata(message_id()).received_at == "2026-09-04T10:16:00+00:00"
+
+
 def test_polling_session_reuses_consumed_uidvalidity_response() -> None:
     class ConsumingSelectResponses(FakeImap):
         def __init__(self) -> None:
@@ -489,6 +512,24 @@ def test_root_attachment_disposition_never_becomes_analysis_body() -> None:
 
     assert content.body == ""
     assert content.attachment_names == ("attachment-1.txt",)
+
+
+def test_multipart_attachment_export_preserves_wrapper_and_boundaries() -> None:
+    message = EmailMessage()
+    message.make_mixed()
+    attachment = EmailMessage()
+    attachment.set_content("Plain alternative")
+    attachment.add_alternative("<p>HTML alternative</p>", subtype="html")
+    attachment["Content-Disposition"] = "attachment"
+    message.attach(attachment)
+
+    content, payloads = _content_and_attachment_payloads(message, 1000)
+    exported = BytesParser(policy=policy.default).parsebytes(payloads[0])
+
+    assert content.body == ""
+    assert exported.get_content_type() == "multipart/alternative"
+    assert exported.get_boundary()
+    assert len(exported.get_payload()) == 2
 
 
 def test_synthesized_attachment_names_use_only_safe_known_suffixes() -> None:

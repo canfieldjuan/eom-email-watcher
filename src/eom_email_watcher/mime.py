@@ -19,6 +19,7 @@ class _TextExtractor(HTMLParser):
 def html_to_text(value: str) -> str:
     parser = _TextExtractor()
     parser.feed(value)
+    parser.close()
     return html.unescape(" ".join(parser.parts))
 
 
