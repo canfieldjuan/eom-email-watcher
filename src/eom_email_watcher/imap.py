@@ -444,6 +444,21 @@ def _attachment_payload(part: Message) -> bytes:
     return b""
 
 
+def _validate_mime_tree(message: Message) -> None:
+    pending: list[tuple[Message, int]] = [(message, 0)]
+    visited = 0
+    while pending:
+        part, depth = pending.pop()
+        visited += 1
+        if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH:
+            raise MailboxMessageInvalid(
+                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
+            )
+        children = part.get_payload()
+        if isinstance(children, list):
+            pending.extend((child, depth + 1) for child in reversed(children))
+
+
 def _content_and_attachment_payloads(
     message: EmailMessage, body_char_limit: int
 ) -> tuple[MessageContent, tuple[bytes, ...]]:
@@ -454,6 +469,7 @@ def _content_and_attachment_payloads(
     attachment_filename_bytes = 0
 
     try:
+        _validate_mime_tree(message)
         pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
         visited = 0
         while pending:

@@ -532,6 +532,21 @@ def test_multipart_attachment_export_preserves_wrapper_and_boundaries() -> None:
     assert len(exported.get_payload()) == 2
 
 
+def test_attachment_container_descendants_obey_mime_depth_limit() -> None:
+    allowed = _nested_message(MAX_MIME_DEPTH)
+    allowed["Content-Disposition"] = "attachment"
+
+    assert len(_content(allowed, 1000).attachments) == 1
+
+    excessive = _nested_message(MAX_MIME_DEPTH + 1)
+    excessive["Content-Disposition"] = "attachment"
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        _content(excessive, 1000)
+
+    assert raised.value.code == "imap_mime_too_complex"
+
+
 def test_synthesized_attachment_names_use_only_safe_known_suffixes() -> None:
     assert _synthesized_attachment_name(0, "application/pdf") == "attachment-1.pdf"
     assert _synthesized_attachment_name(0, "application/x-unregistered") == "attachment-1"
@@ -610,6 +625,27 @@ def test_mime_part_limit_accepts_maximum_and_rejects_next_part() -> None:
         message.attach(part)
 
     assert _content(message, 1000).body
+    extra = EmailMessage()
+    extra.set_content("One part too many")
+    message.attach(extra)
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        _content(message, 1000)
+
+    assert raised.value.code == "imap_mime_too_complex"
+
+
+def test_attachment_container_descendants_obey_mime_part_limit() -> None:
+    message = EmailMessage()
+    message.make_mixed()
+    message["Content-Disposition"] = "attachment"
+    for _index in range(MAX_MIME_PARTS - 1):
+        part = EmailMessage()
+        part.set_content("Attachment content")
+        message.attach(part)
+
+    assert len(_content(message, 1000).attachments) == 1
+
     extra = EmailMessage()
     extra.set_content("One part too many")
     message.attach(extra)
