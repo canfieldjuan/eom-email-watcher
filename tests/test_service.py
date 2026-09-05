@@ -14,6 +14,7 @@ from eom_email_watcher.gmail import (
 )
 from eom_email_watcher.mailbox import (
     MailboxChanges,
+    MailboxMessageInvalid,
     MailboxSession,
     MessageContent,
     scoped_message_id,
@@ -137,6 +138,11 @@ class FailingCaptureModel(FakeModel):
         raise ModelError("local model unavailable")
 
 
+class InvalidContentGmail(FakeGmail):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        raise MailboxMessageInvalid("message_too_large", "Message exceeds the safe size limit")
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         path=tmp_path / "config.toml",
@@ -251,6 +257,22 @@ def test_attachment_inventory_is_durable_before_model_failure(tmp_path: Path) ->
             "byte_size": 1234,
         }
     ]
+
+
+def test_permanently_invalid_mailbox_content_does_not_retry_forever(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FakeModel()
+    watcher = Watcher(cfg, store, InvalidContentGmail(), model)
+
+    assert watcher.check()["summarized"] == 0
+    failed = store.recent(1)[0]
+    assert failed["analysis_retryable"] is False
+    assert failed["analysis_error_code"] == "message_too_large"
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 0
 
 
 def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(

@@ -7,6 +7,7 @@ from .config import Config
 from .db import AnalyzedMessage, PendingMessage, Store
 from .mailbox import (
     MailboxGateway,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MailboxSession,
     StaleMailboxCursor,
@@ -316,6 +317,18 @@ class Watcher:
                 if not dry_run:
                     self.store.mark_skipped(message.message_id)
                 continue
+            except MailboxMessageInvalid as exc:
+                logger.warning("Message %s cannot be processed: %s", message.message_id, exc)
+                if deliver_notifications:
+                    fallback += self._send_fallback(message, dry_run)
+                if not dry_run:
+                    self.store.record_analysis_failure(
+                        message.message_id,
+                        str(exc),
+                        message.attempts,
+                        retryable=False,
+                        error_code=exc.code,
+                    )
             except GatewayModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
                 if deliver_notifications:

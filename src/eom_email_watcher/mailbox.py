@@ -23,6 +23,14 @@ class MailboxMessageUnavailable(MailboxError):
     """A source message disappeared after it was discovered."""
 
 
+class MailboxMessageInvalid(MailboxError):
+    """A source message cannot be processed and must not retry forever."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 class MailboxAccountUnavailable(MailboxError):
     """The selected local mailbox account cannot currently be opened."""
 

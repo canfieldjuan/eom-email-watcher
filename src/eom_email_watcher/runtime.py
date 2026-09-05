@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import Config, load_config, secure_runtime_paths
 from .db import MailAccount, Store
 from .gmail import GmailGateway, gmail_credentials_configured
+from .imap import IMAP_PROVIDER, ImapGateway
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -30,9 +31,11 @@ class Runtime:
 
 MAIL_PROVIDER_NAMES = {
     DEFAULT_MAIL_PROVIDER: "Gmail",
+    IMAP_PROVIDER: "Other mail server",
     MICROSOFT365_PROVIDER: "Microsoft 365",
 }
 GMAIL_GENERATED_ACCOUNT_ID = re.compile(r"gmail-[0-9a-f]{32}\Z")
+IMAP_GENERATED_ACCOUNT_ID = re.compile(r"imap-[0-9a-f]{32}\Z")
 MICROSOFT_GENERATED_ACCOUNT_ID = re.compile(r"microsoft365-[0-9a-f]{32}\Z")
 
 
@@ -54,6 +57,12 @@ def mail_account_token_file(config: Config, account: MailAccount) -> Path:
         return (
             config.database_file.parent / "mail-accounts" / f"{account.account_id}.msal-cache.json"
         )
+    if account.provider == IMAP_PROVIDER and IMAP_GENERATED_ACCOUNT_ID.fullmatch(
+        account.account_id
+    ):
+        return (
+            config.database_file.parent / "mail-accounts" / f"{account.account_id}.credentials.json"
+        )
     raise MailboxAccountUnavailable("The selected email provider is not available in this build")
 
 
@@ -69,7 +78,7 @@ def mail_provider_connection_available(config: Config, provider: str) -> bool:
         return gmail_credentials_configured(config.gmail_credentials_file)
     if provider == MICROSOFT365_PROVIDER:
         return microsoft_credentials_configured(config.microsoft_credentials_file)
-    return False
+    return provider == IMAP_PROVIDER
 
 
 def configured_mailbox_identity(store: Store) -> tuple[str, str]:
@@ -97,6 +106,8 @@ def load_mailbox_account(
         gateway = GmailGateway.from_token(config.gmail_credentials_file, token_file)
     elif account.provider == MICROSOFT365_PROVIDER:
         gateway = Microsoft365Gateway.from_token(config.microsoft_credentials_file, token_file)
+    elif account.provider == IMAP_PROVIDER:
+        gateway = ImapGateway.from_credentials_file(token_file)
     else:
         raise MailboxAccountUnavailable(
             "The selected email provider is not available in this build"

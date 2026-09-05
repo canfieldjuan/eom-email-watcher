@@ -583,8 +583,14 @@ pub struct MailProviderStatus {
     pub provider: String,
     pub display_name: String,
     pub connection_available: bool,
+    #[serde(default = "browser_oauth_connection_method")]
+    pub connection_method: String,
     #[serde(default)]
     pub multiple_accounts: bool,
+}
+
+fn browser_oauth_connection_method() -> String {
+    "browser_oauth".to_owned()
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1612,6 +1618,7 @@ mod tests {
                 "provider": "gmail",
                 "display_name": "Gmail",
                 "connection_available": true,
+                "connection_method": "browser_oauth",
                 "multiple_accounts": true
             }],
             "accounts": [{

@@ -48,8 +48,8 @@ only to stderr.
 | `config.initialize` | `timezone`, loopback `model_base_url`, `model_name` | Create a private zero-sender first-run config and return safe settings |
 | `health.get` | `{}` | Database, generic mail-account catalog, legacy Gmail status, local-model health, notification mode, watchlist count, last check |
 | `mail.accounts.list` | `{}` | Available mail providers and retained local accounts, without credential values or paths |
-| `mail.accounts.connect` | `provider` | Run that provider's account flow and safely register or reuse the resulting mailbox identity |
-| `mail.accounts.reconnect` | `provider`, `account_id` | Reauthorize exactly one retained account without changing its identity or mailbox cursor |
+| `mail.accounts.connect` | `provider`; IMAP also requires `connection` | Run that provider's account flow and safely register or reuse the resulting mailbox identity |
+| `mail.accounts.reconnect` | `provider`, `account_id`; IMAP also requires `connection` | Reauthorize exactly one retained account without changing its identity or mailbox cursor |
 | `mail.accounts.disconnect` | `provider`, `account_id` | Remove that account's local read token while retaining local history and mailbox state |
 | `mail.accounts.activate` | `provider`, `account_id` | Select one connected account for watcher polling |
 | `gmail.authorize` | `{}` | Compatibility wrapper for the original read-only Gmail setup flow |
@@ -88,12 +88,16 @@ or lock-aware operations to frontend code. Other callers use `notifications.pend
 acquires the lock itself.
 
 The `mail.accounts.*` operations are the provider-neutral desktop account contract. The current
-build advertises Gmail and Microsoft 365 and supports multiple retained identities, with exactly one
-active polling account. Connect and reconnect stage authorization in private temporary storage, verify the
-provider-reported mailbox identity, and only then atomically replace the internally derived token
-file. Reconnect refuses an authorization for a different address. A new account receives its own
-private token path; paths and token contents never enter the response. Disconnect removes only the
-selected read token, leaving its cursor, Inbox rows, and the separate EOM `gmail.send` token intact.
+build advertises Gmail, Microsoft 365, and read-only IMAP under the label `Other mail server`, and
+supports multiple retained identities, with exactly one active polling account. Provider entries
+declare either `browser_oauth` or `server_credentials` as their `connection_method`. Connect and
+reconnect stage authorization in private temporary storage, verify the provider connection, and
+only then atomically replace the internally derived credential file. Browser OAuth adapters derive
+the mailbox identity from the provider; IMAP uses the normalized address explicitly supplied with
+the verified server credentials. Reconnect refuses a different address. A new account receives its
+own private credential path; paths and credential contents never enter the response. Disconnect
+removes only the selected read credential, leaving its cursor, Inbox rows, and the separate EOM
+`gmail.send` token intact.
 Activating an account requires a local read token. Mutations share the production watcher lock, so
 they cannot race a check or one another. Listing and migration perform no provider network access.
 
@@ -126,6 +130,19 @@ Every continuation is restricted to HTTPS on `graph.microsoft.com` and the expec
 delta path before the bearer token is attached. Graph immutable IDs are requested on every call.
 Cursor expiry enters the shared retention-bounded recovery path, and the shared watcher performs
 metadata-only exact-sender admission before body or attachment retrieval.
+
+IMAP connect/reconnect accepts a `connection` object containing `email_address`, `host`, `port`,
+`security` (`tls` or `starttls`), `username`, `password`, and an optional absolute `ca_file` selected
+by the trusted desktop host. Plaintext IMAP is rejected. The engine validates TLS hostname and
+certificate trust, logs in, opens only `INBOX` with `readonly=True`, and snapshots `UIDVALIDITY` and
+`UIDNEXT` before persisting the account. A selected private CA is validated and copied into the
+mode-0600 account credential file; the source path is not retained. Passwords, server settings,
+credential paths, and CA contents never enter the response. Polling uses bounded UID pages and
+`BODY.PEEK`: it fetches headers before the shared exact-sender gate and fetches a bounded full
+message only after admission. A changed `UIDVALIDITY` enters the shared retention-bounded recovery
+path. Messages larger than 50 MiB are durably paused as nonretryable analysis failures instead of
+being downloaded or retried forever. The adapter never issues IMAP write commands such as
+`STORE`, `COPY`, `MOVE`, `DELETE`, or `EXPUNGE`.
 
 `connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than
 Connect wire routes. They do not load watcher configuration or private mailbox state. Status
