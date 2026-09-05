@@ -33,6 +33,7 @@ from .mime import extract_body
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
 GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
+# Each unique history ID requires a metadata request before exact sender gating.
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 
