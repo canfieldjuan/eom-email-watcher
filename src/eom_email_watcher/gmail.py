@@ -35,6 +35,7 @@ TOKEN_LOCK_TIMEOUT_SECONDS = 30
 GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
 # Each unique history ID requires a metadata request before exact sender gating.
 MAX_INCREMENTAL_MESSAGE_IDS = 200
+HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v1:"
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 
 
@@ -54,6 +55,23 @@ class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     """A specific message could not be fetched -- e.g. it was deleted or
     expunged after the history event that referenced it. Recoverable: the
     caller should skip this one message, not fail the whole run."""
+
+
+def _decode_history_cursor(cursor: str) -> tuple[str, int]:
+    if not cursor.startswith(HISTORY_CONTINUATION_PREFIX):
+        return cursor, 0
+    value = cursor.removeprefix(HISTORY_CONTINUATION_PREFIX)
+    start_history_id, separator, offset_text = value.rpartition(":")
+    if not separator or not start_history_id or not offset_text.isdecimal():
+        raise GmailError("Saved Gmail history continuation cursor is invalid")
+    offset = int(offset_text)
+    if offset <= 0:
+        raise GmailError("Saved Gmail history continuation cursor is invalid")
+    return start_history_id, offset
+
+
+def _history_continuation_cursor(start_history_id: str, offset: int) -> str:
+    return f"{HISTORY_CONTINUATION_PREFIX}{start_history_id}:{offset}"
 
 
 @dataclass(frozen=True)
@@ -278,10 +296,12 @@ class GmailGateway:
         return self.profile_history_id()
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
+        request_start_history_id, skip_unique_ids = _decode_history_cursor(start_history_id)
         ids: list[str] = []
         seen_ids: set[str] = set()
         page_token: str | None = None
-        newest = start_history_id
+        newest = request_start_history_id
+        unique_ids_seen = 0
         try:
             while True:
                 request = (
@@ -289,7 +309,7 @@ class GmailGateway:
                     .history()
                     .list(
                         userId="me",
-                        startHistoryId=start_history_id,
+                        startHistoryId=request_start_history_id,
                         historyTypes=["messageAdded"],
                         labelId="INBOX",
                         pageToken=page_token,
@@ -303,13 +323,16 @@ class GmailGateway:
                         message = added.get("message") or {}
                         message_id = str(message.get("id", ""))
                         if message_id and message_id not in seen_ids:
-                            ids.append(message_id)
                             seen_ids.add(message_id)
-                            if len(ids) > MAX_INCREMENTAL_MESSAGE_IDS:
-                                raise StaleHistoryCursor(
-                                    "Saved Gmail history cursor has too many changes "
-                                    "for incremental metadata retrieval"
+                            unique_ids_seen += 1
+                            if unique_ids_seen <= skip_unique_ids:
+                                continue
+                            if len(ids) == MAX_INCREMENTAL_MESSAGE_IDS:
+                                return ids, _history_continuation_cursor(
+                                    request_start_history_id,
+                                    skip_unique_ids + len(ids),
                                 )
+                            ids.append(message_id)
                 page_token = response.get("nextPageToken")
                 if not page_token:
                     break
@@ -319,7 +342,9 @@ class GmailGateway:
                     "Saved Gmail history cursor is no longer available"
                 ) from exc
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
-        return list(dict.fromkeys(ids)), newest
+        if unique_ids_seen < skip_unique_ids:
+            raise GmailError("Saved Gmail history continuation cursor cannot be resumed")
+        return ids, newest
 
     def changes_since(self, cursor: str) -> MailboxChanges:
         message_ids, newest = self.history_message_ids(cursor)
