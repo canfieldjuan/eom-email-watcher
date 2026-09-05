@@ -20,6 +20,7 @@ from eom_email_watcher.imap import (
     MAX_MESSAGE_BYTES,
     MAX_MIME_DEPTH,
     MAX_MIME_PARTS,
+    MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
     ImapCredentials,
     ImapError,
@@ -751,6 +752,29 @@ def test_recovery_crosses_sparse_uid_gap_by_message_sequence() -> None:
     assert changes.cursor == cursor(sparse_uid)
 
 
+def test_recovery_keeps_date_filter_across_bounded_sequence_windows() -> None:
+    class WindowedRecovery(FakeImap):
+        def search(self, charset: str | None, *criteria: str) -> tuple[str, list[bytes]]:
+            self.calls.append(("search", charset, *criteria))
+            if criteria[0] == f"1:{MAX_UID_SEARCH_SPAN}":
+                return "OK", [b""]
+            return "OK", [str(MAX_UID_SEARCH_SPAN + 1).encode("ascii")]
+
+    final_sequence = MAX_UID_SEARCH_SPAN + 1
+    client = WindowedRecovery(
+        uid_next=final_sequence + 1,
+        sequence_uids=list(range(1, final_sequence + 1)),
+    )
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    changes = gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
+
+    assert changes.message_ids == (message_id(final_sequence),)
+    assert changes.cursor == cursor(final_sequence)
+    assert ("search", None, "1:10000", "SINCE", "03-Sep-2026") in client.calls
+    assert ("search", None, "10001:10001", "SINCE", "03-Sep-2026") in client.calls
+
+
 @pytest.mark.parametrize("status", ["NO", "BAD"])
 def test_fetch_rejection_is_retryable_protocol_failure(status: str) -> None:
     class RejectedFetch(FakeImap):
@@ -971,3 +995,50 @@ def test_tls_failure_is_categorized_without_endpoint_detail() -> None:
 
     assert raised.value.code == "imap_tls_failed"
     assert "private endpoint detail" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("exception", "code"),
+    [
+        (imaplib.IMAP4.abort("private STARTTLS abort"), "imap_connection_failed"),
+        (OSError("private STARTTLS disconnect"), "imap_connection_failed"),
+        (TimeoutError("private STARTTLS timeout"), "imap_connection_failed"),
+        (ssl.SSLError("private TLS detail"), "imap_tls_failed"),
+        (imaplib.IMAP4.error("private STARTTLS rejection"), "imap_tls_failed"),
+    ],
+)
+def test_starttls_failures_distinguish_transport_from_tls(
+    exception: Exception,
+    code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_imap = imaplib.IMAP4
+
+    class StartTlsClient:
+        logged_out = False
+
+        def starttls(self, *, ssl_context: ssl.SSLContext) -> None:
+            del ssl_context
+            raise exception
+
+        def logout(self) -> None:
+            self.logged_out = True
+
+    client = StartTlsClient()
+
+    class ImapFactory:
+        abort = original_imap.abort
+        error = original_imap.error
+
+        def __new__(cls, *_args: object, **_kwargs: object) -> StartTlsClient:
+            return client
+
+    monkeypatch.setattr(imaplib, "IMAP4", ImapFactory)
+    values = ImapCredentials(**{**credentials().__dict__, "security": "starttls", "port": 143})
+
+    with pytest.raises(ImapError) as raised:
+        ImapGateway(values).initial_cursor()
+
+    assert raised.value.code == code
+    assert "private" not in str(raised.value)
+    assert client.logged_out is True

@@ -609,7 +609,23 @@ class ImapGateway:
         )
         try:
             status, _response = client.starttls(ssl_context=context)
-        except (imaplib.IMAP4.error, ssl.SSLError, OSError, TimeoutError) as exc:
+        except ssl.SSLError as exc:
+            with contextlib.suppress(Exception):
+                client.logout()
+            raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS") from exc
+        except imaplib.IMAP4.abort as exc:
+            with contextlib.suppress(Exception):
+                client.logout()
+            raise ImapError(
+                "imap_connection_failed", "Mail server connection failed; retry"
+            ) from exc
+        except (OSError, TimeoutError) as exc:
+            with contextlib.suppress(Exception):
+                client.logout()
+            raise ImapError(
+                "imap_connection_failed", "Mail server connection failed; retry"
+            ) from exc
+        except imaplib.IMAP4.error as exc:
             with contextlib.suppress(Exception):
                 client.logout()
             raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS") from exc
@@ -792,21 +808,35 @@ class ImapGateway:
             message_count = _selected_message_count(client)
             if message_count == 0:
                 return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
-            last_sequence = min(message_count, MAX_UID_SEARCH_SPAN)
-            status, response = client.search(
-                None, f"1:{last_sequence}", "SINCE", _recovery_search_date(since)
-            )
-            if status != "OK":
-                raise ImapError("imap_protocol_error", "Mail server recovery search failed")
-            matching_sequences = [
-                sequence for sequence in _uids(response) if sequence <= last_sequence
-            ]
-            selected_sequences = matching_sequences[:MAX_INCREMENTAL_MESSAGE_IDS]
+            selected_sequences: list[int] = []
+            first_sequence = 1
+            search_date = _recovery_search_date(since)
+            while (
+                first_sequence <= message_count
+                and len(selected_sequences) < MAX_INCREMENTAL_MESSAGE_IDS
+            ):
+                last_sequence = min(message_count, first_sequence + MAX_UID_SEARCH_SPAN - 1)
+                status, response = client.search(
+                    None,
+                    f"{first_sequence}:{last_sequence}",
+                    "SINCE",
+                    search_date,
+                )
+                if status != "OK":
+                    raise ImapError("imap_protocol_error", "Mail server recovery search failed")
+                matching_sequences = [
+                    sequence
+                    for sequence in _uids(response)
+                    if first_sequence <= sequence <= last_sequence
+                ]
+                remaining = MAX_INCREMENTAL_MESSAGE_IDS - len(selected_sequences)
+                selected_sequences.extend(matching_sequences[:remaining])
+                first_sequence = last_sequence + 1
             candidates = _fetch_sequence_uids(client, selected_sequences)
-            if len(matching_sequences) > len(selected_sequences):
+            if len(selected_sequences) == MAX_INCREMENTAL_MESSAGE_IDS:
                 next_uid = candidates[-1]
             else:
-                next_uid = _uid_at_sequence(client, last_sequence)
+                next_uid = snapshot_uid
             if any(uid > snapshot_uid for uid in candidates) or next_uid > snapshot_uid:
                 raise ImapError("imap_protocol_error", "Mail server UID page was invalid")
         return MailboxChanges(
