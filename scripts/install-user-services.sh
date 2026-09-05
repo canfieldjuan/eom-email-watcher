@@ -17,7 +17,7 @@ mkdir -p "$unit_dir" "$tool_bin_dir" "$tool_dir"
 uv export --project "$repo_dir" --locked --no-dev --no-emit-project --format requirements.txt \
   --output-file "$constraints_file" >/dev/null
 UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
-  uv tool install --force --constraints "$constraints_file" "$repo_dir"
+  uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"
 test -x "$tool_bin_dir/eom-mail-watch"
 
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"

@@ -10,7 +10,9 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     script = INSTALLER.read_text()
 
     locked_export = 'uv export --project "$repo_dir" --locked --no-dev --no-emit-project'
-    snapshot = 'uv tool install --force --constraints "$constraints_file" "$repo_dir"'
+    snapshot = (
+        'uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"'
+    )
     unit_install = 'install -m 0644 "$repo_dir/systemd/eom-email-watcher.service"'
     assert locked_export in script
     assert snapshot in script
