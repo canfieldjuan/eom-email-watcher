@@ -141,14 +141,18 @@ list. Cursors and provider message identities include a non-secret digest of the
 mailbox plus its `UIDVALIDITY`, so a server or mailbox reset cannot silently reuse an old UID for a
 different message. Reconnect preserves the cursor only when that mailbox identity is unchanged;
 changing the server, port, security mode, address, or username establishes a new baseline while
-retaining prior local history. A selected private CA is validated and
-copied into the mode-0600 account credential file; the source path is not retained. Passwords,
+retaining prior local history. A disconnected account recovers the non-secret binding from that
+retained cursor, so reconnecting the same mailbox still catches up from its previous position. A
+selected private CA is validated and copied into the mode-0600 account credential file; the source
+path is not retained. Passwords,
 server settings, credential paths, and CA contents never enter the response. Polling uses bounded
 UID pages and bounded server-side UID windows with `BODY.PEEK`: it fetches bounded headers before
 the shared exact-sender gate, and only admitted messages proceed to the 50 MiB size check and
 bounded full-message fetch. A changed `UIDVALIDITY` enters the shared retention-bounded recovery
 path. Admitted messages larger than 50 MiB are durably paused as nonretryable analysis failures
-instead of being downloaded or retried forever. The adapter never issues IMAP write commands such as
+instead of being downloaded or retried forever. HTML text uses the shared structured extractor,
+and decoded attachment names have both per-name and cumulative bounds before persistence or model
+input. The adapter never issues IMAP write commands such as
 `STORE`, `COPY`, `MOVE`, `DELETE`, or `EXPUNGE`.
 
 `connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than

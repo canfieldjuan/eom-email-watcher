@@ -28,7 +28,7 @@ from .mailbox import (
     MessageMetadata,
     StaleMailboxCursor,
 )
-from .mime import AttachmentDescriptor
+from .mime import AttachmentDescriptor, html_to_text
 
 IMAP_PROVIDER = "imap"
 IMAP_CONNECTION_METHOD = "server_credentials"
@@ -39,6 +39,8 @@ MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024
 MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
+MAX_ATTACHMENT_FILENAME_BYTES = 1024
+MAX_ATTACHMENT_FILENAME_TOTAL_BYTES = 64 * 1024
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v2:"
@@ -259,6 +261,10 @@ def imap_mailbox_identity(credentials: ImapCredentials) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def imap_cursor_mailbox_identity(cursor: str) -> str:
+    return _decode_cursor(cursor)[0]
+
+
 def _cursor(mailbox_id: str, uid_validity: int, last_uid: int) -> str:
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{last_uid}"
 
@@ -308,6 +314,11 @@ def _synthesized_attachment_name(position: int, media_type: str) -> str:
     if _SAFE_ATTACHMENT_SUFFIX.fullmatch(suffix) is None:
         suffix = ""
     return f"attachment-{position + 1}{suffix.casefold()}"
+
+
+def _quoted_imap_astring(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _response_number(client: imaplib.IMAP4, name: str) -> int:
@@ -427,6 +438,7 @@ def _content_and_attachment_payloads(
     html: list[str] = []
     attachments: list[AttachmentDescriptor] = []
     attachment_payloads: list[bytes] = []
+    attachment_filename_bytes = 0
 
     try:
         pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
@@ -441,15 +453,26 @@ def _content_and_attachment_payloads(
             filename = part.get_filename()
             attachment_disposition = part.get_content_disposition() == "attachment"
             if filename or attachment_disposition:
-                payload = _attachment_payload(part)
                 position = len(attachments)
                 media_type = part.get_content_type().casefold()
+                filename = filename or _synthesized_attachment_name(position, media_type)
+                encoded_filename_bytes = len(filename.encode("utf-8", errors="replace"))
+                attachment_filename_bytes += encoded_filename_bytes
+                if (
+                    encoded_filename_bytes > MAX_ATTACHMENT_FILENAME_BYTES
+                    or attachment_filename_bytes > MAX_ATTACHMENT_FILENAME_TOTAL_BYTES
+                ):
+                    raise MailboxMessageInvalid(
+                        "imap_attachment_metadata_too_large",
+                        "Message attachment metadata exceeds the safe size limit",
+                    )
+                payload = _attachment_payload(part)
                 attachment_payloads.append(payload)
                 attachments.append(
                     AttachmentDescriptor(
                         part_id=f"mime-{position}",
                         attachment_id=None,
-                        filename=filename or _synthesized_attachment_name(position, media_type),
+                        filename=filename,
                         media_type=media_type,
                         byte_size=len(payload),
                         position=position,
@@ -464,7 +487,7 @@ def _content_and_attachment_payloads(
             if part.get_content_type() == "text/plain":
                 plain.append(_part_text(part))
             elif part.get_content_type() == "text/html":
-                html.append(re.sub(r"<[^>]+>", " ", _part_text(part)))
+                html.append(html_to_text(_part_text(part)))
     except RecursionError as exc:
         raise MailboxMessageInvalid(
             "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
@@ -554,7 +577,10 @@ class ImapGateway:
             ) from exc
 
         try:
-            status, _response = client.login(self.credentials.username, self.credentials.password)
+            status, _response = client.login(
+                _quoted_imap_astring(self.credentials.username),
+                self.credentials.password,
+            )
             if status != "OK":
                 raise ImapError(
                     "imap_authentication_failed", "Mail server rejected the credentials"

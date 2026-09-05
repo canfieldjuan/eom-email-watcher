@@ -48,6 +48,7 @@ from .imap import (
     ImapError,
     ImapGateway,
     credentials_from_connection,
+    imap_cursor_mailbox_identity,
     imap_mailbox_identity,
     load_credentials,
     write_credentials,
@@ -586,6 +587,13 @@ def _connect_imap_account(
                 )
             except ImapError:
                 previous_mailbox_identity = None
+        if previous_mailbox_identity is None:
+            state = runtime.store.state(provider=account.provider, account_id=account.account_id)
+            if state is not None:
+                try:
+                    previous_mailbox_identity = imap_cursor_mailbox_identity(state[0])
+                except ImapError:
+                    previous_mailbox_identity = None
 
     authorization_parent = (
         mail_account_token_file(runtime.config, account).parent
@@ -620,6 +628,16 @@ def _connect_imap_account(
                         )
                     except ImapError:
                         previous_mailbox_identity = None
+                if previous_mailbox_identity is None:
+                    state = runtime.store.state(
+                        provider=account.provider,
+                        account_id=account.account_id,
+                    )
+                    if state is not None:
+                        try:
+                            previous_mailbox_identity = imap_cursor_mailbox_identity(state[0])
+                        except ImapError:
+                            previous_mailbox_identity = None
         mailbox_changed = (
             account is not None and previous_mailbox_identity != imap_mailbox_identity(credentials)
         )

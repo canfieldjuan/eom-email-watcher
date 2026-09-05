@@ -16,7 +16,12 @@ from eom_email_watcher.gmail import (
     GmailProfile,
     MessageMetadata,
 )
-from eom_email_watcher.imap import ImapCredentials, ImapError, write_credentials
+from eom_email_watcher.imap import (
+    ImapCredentials,
+    ImapError,
+    imap_mailbox_identity,
+    write_credentials,
+)
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -1129,6 +1134,63 @@ def test_mail_account_reconnect_resets_cursor_when_server_mailbox_changes(
         REPLACEMENT_IMAP_CURSOR
     )
     assert "replacement.example.com" in destination.read_text(encoding="utf-8")
+
+
+def test_mail_account_reconnect_uses_retained_cursor_binding_after_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'e' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    retained_cursor = f"eom-imap-v2:{imap_mailbox_identity(imap_credentials())}:44:7"
+    runtime.store.set_state(
+        retained_cursor,
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+
+    class ReconnectedImap:
+        def initial_cursor(self) -> str:
+            return REPLACEMENT_IMAP_CURSOR
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: ReconnectedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "new-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        retained_cursor
+    )
 
 
 def test_mail_account_reconnect_preserves_imap_credentials_when_probe_fails(

@@ -11,6 +11,8 @@ import pytest
 
 from eom_email_watcher.imap import (
     CURSOR_PREFIX,
+    MAX_ATTACHMENT_FILENAME_BYTES,
+    MAX_ATTACHMENT_FILENAME_TOTAL_BYTES,
     MAX_HEADER_BYTES,
     MAX_INCREMENTAL_MESSAGE_IDS,
     MAX_MESSAGE_BYTES,
@@ -229,6 +231,20 @@ def test_connection_validation_normalizes_identity_and_copies_ca(
     assert result.email_address == "owner@example.com"
     assert result.ca_pem == "test trust root"
     assert requested_ca == ["test trust root"]
+
+
+def test_login_quotes_username_as_an_imap_astring() -> None:
+    clients: list[FakeImap] = []
+    values = ImapCredentials(**{**credentials().__dict__, "username": 'owner name"\\account'})
+    gateway = ImapGateway(values, factory(clients))
+
+    gateway.initial_cursor()
+
+    assert clients[0].calls[0] == (
+        "login",
+        '"owner name\\"\\\\account"',
+        "private-password",
+    )
 
 
 @pytest.mark.parametrize(
@@ -478,6 +494,50 @@ def test_root_attachment_disposition_never_becomes_analysis_body() -> None:
 def test_synthesized_attachment_names_use_only_safe_known_suffixes() -> None:
     assert _synthesized_attachment_name(0, "application/pdf") == "attachment-1.pdf"
     assert _synthesized_attachment_name(0, "application/x-unregistered") == "attachment-1"
+
+
+def test_html_body_uses_structured_text_extraction() -> None:
+    message = EmailMessage()
+    message.set_content('<p title="x > y">Visible x &gt; y</p>', subtype="html")
+
+    assert _content(message, 1000).body == "Visible x > y"
+
+
+def _message_with_attachment_names(names: list[str]) -> EmailMessage:
+    message = EmailMessage()
+    message.make_mixed()
+    for name in names:
+        part = EmailMessage()
+        part.set_content("attachment")
+        part.add_header("Content-Disposition", "attachment", filename=name)
+        message.attach(part)
+    return message
+
+
+def test_attachment_filename_metadata_is_bounded_per_name_and_in_total() -> None:
+    maximum_name = "a" * MAX_ATTACHMENT_FILENAME_BYTES
+    allowed_count = MAX_ATTACHMENT_FILENAME_TOTAL_BYTES // MAX_ATTACHMENT_FILENAME_BYTES
+
+    assert len(_content(_message_with_attachment_names([maximum_name]), 1000).attachments) == 1
+    assert (
+        len(
+            _content(
+                _message_with_attachment_names([maximum_name] * allowed_count),
+                1000,
+            ).attachments
+        )
+        == allowed_count
+    )
+    with pytest.raises(MailboxMessageInvalid) as per_name:
+        _content(_message_with_attachment_names([maximum_name + "b"]), 1000)
+    with pytest.raises(MailboxMessageInvalid) as cumulative:
+        _content(
+            _message_with_attachment_names([maximum_name] * (allowed_count + 1)),
+            1000,
+        )
+
+    assert per_name.value.code == "imap_attachment_metadata_too_large"
+    assert cumulative.value.code == "imap_attachment_metadata_too_large"
 
 
 def _nested_message(depth: int) -> EmailMessage:
