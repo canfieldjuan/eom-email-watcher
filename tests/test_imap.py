@@ -3,6 +3,7 @@ from __future__ import annotations
 import imaplib
 import ssl
 from datetime import UTC, datetime
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +13,12 @@ from eom_email_watcher.imap import (
     MAX_HEADER_BYTES,
     MAX_INCREMENTAL_MESSAGE_IDS,
     MAX_MESSAGE_BYTES,
+    MAX_MIME_DEPTH,
+    MAX_MIME_PARTS,
     ImapCredentials,
     ImapError,
     ImapGateway,
+    _content,
     credentials_from_connection,
     load_credentials,
     write_credentials,
@@ -285,6 +289,65 @@ def test_forwarded_message_is_an_attachment_not_outer_body() -> None:
     forwarded = gateway.attachment_bytes("7", "mime-0", None)
     assert b"Private forwarded content" in forwarded
     assert b"Inner body must not join the outer body" in forwarded
+
+
+def _nested_message(depth: int) -> EmailMessage:
+    message = EmailMessage()
+    message.set_content("Safe body")
+    for _index in range(depth):
+        parent = EmailMessage()
+        parent.make_mixed()
+        parent.attach(message)
+        message = parent
+    return message
+
+
+def test_mime_depth_limit_accepts_maximum_and_rejects_next_level() -> None:
+    assert _content(_nested_message(MAX_MIME_DEPTH), 1000).body == "Safe body"
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        _content(_nested_message(MAX_MIME_DEPTH + 1), 1000)
+
+    assert raised.value.code == "imap_mime_too_complex"
+
+
+def test_mime_part_limit_accepts_maximum_and_rejects_next_part() -> None:
+    message = EmailMessage()
+    message.make_mixed()
+    for _index in range(MAX_MIME_PARTS - 1):
+        part = EmailMessage()
+        part.set_content("Safe body")
+        message.attach(part)
+
+    assert _content(message, 1000).body
+    extra = EmailMessage()
+    extra.set_content("One part too many")
+    message.attach(extra)
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        _content(message, 1000)
+
+    assert raised.value.code == "imap_mime_too_complex"
+
+
+def test_parser_recursion_is_a_nonretryable_message_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecursiveParser:
+        def __init__(self, **_options: object) -> None:
+            pass
+
+        def parsebytes(self, _payload: bytes) -> EmailMessage:
+            raise RecursionError("private parser detail")
+
+    monkeypatch.setattr("eom_email_watcher.imap.BytesParser", RecursiveParser)
+    gateway = ImapGateway(credentials(), factory([]))
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        gateway.content("7", 1000)
+
+    assert raised.value.code == "imap_mime_too_complex"
+    assert "private parser detail" not in str(raised.value)
 
 
 def test_recovery_uses_previous_utc_day_with_protocol_month_name() -> None:

@@ -35,6 +35,8 @@ MAX_CA_FILE_BYTES = 256 * 1024
 MAX_CREDENTIAL_FILE_BYTES = MAX_CA_FILE_BYTES + 16 * 1024
 MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024
+MAX_MIME_DEPTH = 100
+MAX_MIME_PARTS = 1000
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 CURSOR_PREFIX = "eom-imap-v1:"
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -323,7 +325,12 @@ def _attachment_payload(part: Message) -> bytes:
         return decoded
     nested = part.get_payload()
     if isinstance(nested, list):
-        return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
+        try:
+            return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
+        except RecursionError as exc:
+            raise MailboxMessageInvalid(
+                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
+            ) from exc
     return b""
 
 
@@ -335,7 +342,15 @@ def _content_and_attachment_payloads(
     attachments: list[AttachmentDescriptor] = []
     attachment_payloads: list[bytes] = []
 
-    def visit(part: Message, *, root: bool = False) -> None:
+    pending: list[tuple[Message, int, bool]] = [(message, 0, True)]
+    visited = 0
+    while pending:
+        part, depth, root = pending.pop()
+        visited += 1
+        if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH:
+            raise MailboxMessageInvalid(
+                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
+            )
         filename = part.get_filename()
         if not root and filename:
             payload = _attachment_payload(part)
@@ -351,19 +366,16 @@ def _content_and_attachment_payloads(
                     position=position,
                 )
             )
-            return
+            continue
         if part.is_multipart():
             children = part.get_payload()
             if isinstance(children, list):
-                for child in children:
-                    visit(child)
-            return
+                pending.extend((child, depth + 1, False) for child in reversed(children))
+            continue
         if part.get_content_type() == "text/plain":
             plain.append(_part_text(part))
         elif part.get_content_type() == "text/html":
             html.append(re.sub(r"<[^>]+>", " ", _part_text(part)))
-
-    visit(message, root=True)
     selected = "\n\n".join(plain if plain else html)
     body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
     names = tuple(dict.fromkeys(item.filename for item in attachments))
@@ -615,7 +627,12 @@ class ImapGateway:
             raise MailboxMessageInvalid(
                 "imap_message_too_large", "Message exceeds the safe size limit"
             )
-        parsed = BytesParser(policy=policy.default).parsebytes(payload)
+        try:
+            parsed = BytesParser(policy=policy.default).parsebytes(payload)
+        except RecursionError as exc:
+            raise MailboxMessageInvalid(
+                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
+            ) from exc
         if not isinstance(parsed, EmailMessage):
             raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid")
         return parsed
