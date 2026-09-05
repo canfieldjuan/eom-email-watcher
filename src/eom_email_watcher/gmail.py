@@ -33,6 +33,7 @@ from .mime import extract_body
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
 GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
+MAX_INCREMENTAL_MESSAGE_IDS = 200
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 
 
@@ -45,7 +46,7 @@ class GmailAuthorizationRejected(GmailError):
 
 
 class StaleHistoryCursor(GmailError, StaleMailboxCursor):
-    """The saved Gmail history cursor has expired."""
+    """The saved Gmail history cursor requires sender-filtered recovery."""
 
 
 class MessageUnavailable(GmailError, MailboxMessageUnavailable):
@@ -277,6 +278,7 @@ class GmailGateway:
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
         ids: list[str] = []
+        seen_ids: set[str] = set()
         page_token: str | None = None
         newest = start_history_id
         try:
@@ -298,8 +300,15 @@ class GmailGateway:
                 for event in response.get("history") or []:
                     for added in event.get("messagesAdded") or []:
                         message = added.get("message") or {}
-                        if message.get("id"):
-                            ids.append(str(message["id"]))
+                        message_id = str(message.get("id", ""))
+                        if message_id and message_id not in seen_ids:
+                            ids.append(message_id)
+                            seen_ids.add(message_id)
+                            if len(ids) > MAX_INCREMENTAL_MESSAGE_IDS:
+                                raise StaleHistoryCursor(
+                                    "Saved Gmail history cursor has too many changes "
+                                    "for incremental metadata retrieval"
+                                )
                 page_token = response.get("nextPageToken")
                 if not page_token:
                     break
@@ -411,4 +420,5 @@ class GmailGateway:
                 return list(dict.fromkeys(ids))
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
-        return MailboxChanges(tuple(self.search_since(addresses, since)), self.initial_cursor())
+        recovery_cursor = self.initial_cursor()
+        return MailboxChanges(tuple(self.search_since(addresses, since)), recovery_cursor)

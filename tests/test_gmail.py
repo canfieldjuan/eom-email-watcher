@@ -11,6 +11,7 @@ from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
     GmailGateway,
+    StaleHistoryCursor,
     parse_metadata,
     resolve_gmail_credentials_file,
 )
@@ -86,6 +87,94 @@ class FakeRequest:
 
     def execute(self) -> dict[str, object]:
         return self.response
+
+
+class FakeHistory:
+    def __init__(self, response: dict[str, object]):
+        self.response = response
+
+    def list(self, **kwargs: object) -> FakeRequest:
+        return FakeRequest(self.response)
+
+
+class FakeHistoryUsers:
+    def __init__(self, response: dict[str, object]):
+        self._history = FakeHistory(response)
+
+    def history(self) -> FakeHistory:
+        return self._history
+
+
+class FakeHistoryService:
+    def __init__(self, response: dict[str, object]):
+        self._users = FakeHistoryUsers(response)
+
+    def users(self) -> FakeHistoryUsers:
+        return self._users
+
+
+def history_response(message_count: int) -> dict[str, object]:
+    return {
+        "historyId": "next-cursor",
+        "history": [
+            {
+                "messagesAdded": [
+                    {"message": {"id": f"message-{index}"}}
+                    for index in range(message_count)
+                ]
+            }
+        ],
+    }
+
+
+def test_gmail_history_accepts_exact_incremental_metadata_limit() -> None:
+    gateway = GmailGateway(
+        FakeHistoryService(history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS))
+    )
+
+    message_ids, cursor = gateway.history_message_ids("saved-cursor")
+
+    assert len(message_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
+    assert cursor == "next-cursor"
+
+
+def test_gmail_history_routes_limit_plus_one_through_recovery() -> None:
+    gateway = GmailGateway(
+        FakeHistoryService(history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1))
+    )
+
+    with pytest.raises(StaleHistoryCursor, match="too many changes"):
+        gateway.history_message_ids("saved-cursor")
+
+
+def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
+    response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS)
+    history = response["history"]
+    assert isinstance(history, list)
+    first_event = history[0]
+    assert isinstance(first_event, dict)
+    messages = first_event["messagesAdded"]
+    assert isinstance(messages, list)
+    messages.append({"message": {"id": "message-0"}})
+    gateway = GmailGateway(FakeHistoryService(response))
+
+    message_ids, _ = gateway.history_message_ids("saved-cursor")
+
+    assert len(message_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
+
+
+def test_gmail_recovery_captures_cursor_before_search() -> None:
+    gateway = GmailGateway(None)
+    calls: list[str] = []
+    gateway.profile_history_id = lambda: calls.append("cursor") or "recovery-cursor"
+    gateway.search_since = lambda addresses, since: calls.append("search") or ["message-1"]
+
+    recovered = gateway.recover_since(
+        frozenset({"trusted@example.com"}), datetime(2026, 9, 1, tzinfo=UTC)
+    )
+
+    assert calls == ["cursor", "search"]
+    assert recovered == gmail_module.MailboxChanges(("message-1",), "recovery-cursor")
 
 
 class FakeAttachments:
