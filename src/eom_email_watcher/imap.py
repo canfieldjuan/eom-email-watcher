@@ -7,7 +7,7 @@ import re
 import ssl
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
@@ -34,12 +34,27 @@ IMAP_TIMEOUT_SECONDS = 30.0
 MAX_CA_FILE_BYTES = 256 * 1024
 MAX_CREDENTIAL_FILE_BYTES = MAX_CA_FILE_BYTES + 16 * 1024
 MAX_MESSAGE_BYTES = 50 * 1024 * 1024
+MAX_HEADER_BYTES = 64 * 1024
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 CURSOR_PREFIX = "eom-imap-v1:"
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _UID = re.compile(r"[1-9][0-9]*\Z")
 _INTERNAL_DATE = re.compile(rb'INTERNALDATE "([^"]+)"', re.IGNORECASE)
 _RFC822_SIZE = re.compile(rb"RFC822\.SIZE ([0-9]+)", re.IGNORECASE)
+_ENGLISH_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
 
 
 class ImapError(MailboxError):
@@ -111,8 +126,10 @@ def credentials_from_connection(value: object) -> ImapCredentials:
 
     raw_host = value.get("host")
     host = raw_host.strip().rstrip(".") if isinstance(raw_host, str) else ""
-    if not host or not _valid_host(host) or any(
-        character.isspace() or not character.isprintable() for character in host
+    if (
+        not host
+        or not _valid_host(host)
+        or any(character.isspace() or not character.isprintable() for character in host)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server hostname")
 
@@ -126,14 +143,19 @@ def credentials_from_connection(value: object) -> ImapCredentials:
 
     username_value = value.get("username")
     username = username_value.strip() if isinstance(username_value, str) else ""
-    if not username or len(username) > 320 or any(
-        not character.isprintable() for character in username
+    if (
+        not username
+        or len(username) > 320
+        or any(not character.isprintable() for character in username)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server username")
 
     password = value.get("password")
-    if not isinstance(password, str) or not password or len(password) > 4096 or any(
-        not character.isprintable() for character in password
+    if (
+        not isinstance(password, str)
+        or not password
+        or len(password) > 4096
+        or any(not character.isprintable() for character in password)
     ):
         raise ImapError("imap_configuration_error", "Enter a valid mail server password")
 
@@ -295,36 +317,72 @@ def _part_text(part: Message) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _content(message: EmailMessage, body_char_limit: int) -> MessageContent:
+def _attachment_payload(part: Message) -> bytes:
+    decoded = part.get_payload(decode=True)
+    if isinstance(decoded, bytes):
+        return decoded
+    nested = part.get_payload()
+    if isinstance(nested, list):
+        return b"\r\n".join(item.as_bytes(policy=policy.default) for item in nested)
+    return b""
+
+
+def _content_and_attachment_payloads(
+    message: EmailMessage, body_char_limit: int
+) -> tuple[MessageContent, tuple[bytes, ...]]:
     plain: list[str] = []
     html: list[str] = []
     attachments: list[AttachmentDescriptor] = []
-    for part in message.walk():
-        if part.is_multipart():
-            continue
+    attachment_payloads: list[bytes] = []
+
+    def visit(part: Message, *, root: bool = False) -> None:
         filename = part.get_filename()
-        if filename:
-            payload = part.get_payload(decode=True)
-            byte_size = len(payload) if isinstance(payload, bytes) else 0
+        if not root and filename:
+            payload = _attachment_payload(part)
+            position = len(attachments)
+            attachment_payloads.append(payload)
             attachments.append(
                 AttachmentDescriptor(
-                    part_id=f"mime-{len(attachments)}",
+                    part_id=f"mime-{position}",
                     attachment_id=None,
                     filename=filename,
                     media_type=part.get_content_type().casefold(),
-                    byte_size=byte_size,
-                    position=len(attachments),
+                    byte_size=len(payload),
+                    position=position,
                 )
             )
-            continue
+            return
+        if part.is_multipart():
+            children = part.get_payload()
+            if isinstance(children, list):
+                for child in children:
+                    visit(child)
+            return
         if part.get_content_type() == "text/plain":
             plain.append(_part_text(part))
         elif part.get_content_type() == "text/html":
             html.append(re.sub(r"<[^>]+>", " ", _part_text(part)))
+
+    visit(message, root=True)
     selected = "\n\n".join(plain if plain else html)
     body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
     names = tuple(dict.fromkeys(item.filename for item in attachments))
-    return MessageContent(body[:body_char_limit], names, tuple(attachments))
+    return (
+        MessageContent(body[:body_char_limit], names, tuple(attachments)),
+        tuple(attachment_payloads),
+    )
+
+
+def _content(message: EmailMessage, body_char_limit: int) -> MessageContent:
+    return _content_and_attachment_payloads(message, body_char_limit)[0]
+
+
+def _recovery_search_date(since: datetime) -> str:
+    normalized = since.replace(tzinfo=UTC) if since.tzinfo is None else since.astimezone(UTC)
+    search_date = normalized.date()
+    with contextlib.suppress(OverflowError):
+        search_date -= timedelta(days=1)
+    return f"{search_date.day:02d}-{_ENGLISH_MONTHS[search_date.month - 1]}-{search_date.year:04d}"
 
 
 class ImapGateway:
@@ -335,15 +393,14 @@ class ImapGateway:
     ):
         self.credentials = credentials
         self._client_factory = client_factory or self._default_client
+        self._active_client: imaplib.IMAP4 | None = None
 
     @classmethod
     def from_credentials_file(cls, path: Path) -> ImapGateway:
         return cls(load_credentials(path))
 
     @staticmethod
-    def _default_client(
-        credentials: ImapCredentials, context: ssl.SSLContext
-    ) -> imaplib.IMAP4:
+    def _default_client(credentials: ImapCredentials, context: ssl.SSLContext) -> imaplib.IMAP4:
         if credentials.security == "tls":
             return imaplib.IMAP4_SSL(
                 credentials.host,
@@ -369,12 +426,20 @@ class ImapGateway:
         return client
 
     @contextlib.contextmanager
-    def _mailbox(self) -> Iterator[imaplib.IMAP4]:
+    def _connected_mailbox(self) -> Iterator[imaplib.IMAP4]:
         try:
             context = ssl.create_default_context(cadata=self.credentials.ca_pem)
             client = self._client_factory(self.credentials, context)
         except ImapError:
             raise
+        except imaplib.IMAP4.abort as exc:
+            raise ImapError(
+                "imap_connection_failed", "Mail server connection failed; retry"
+            ) from exc
+        except imaplib.IMAP4.error as exc:
+            raise ImapError(
+                "imap_protocol_error", "Mail server greeting was invalid; retry"
+            ) from exc
         except (ssl.SSLError, ssl.CertificateError) as exc:
             raise ImapError("imap_tls_failed", "Mail server TLS verification failed") from exc
         except (OSError, TimeoutError) as exc:
@@ -428,6 +493,26 @@ class ImapGateway:
             with contextlib.suppress(Exception):
                 client.logout()
 
+    @contextlib.contextmanager
+    def polling_session(self) -> Iterator[None]:
+        """Reuse one authenticated read-only session for a complete watcher check."""
+        if self._active_client is not None:
+            raise ImapError("imap_protocol_error", "Mail server polling session is already active")
+        with self._connected_mailbox() as client:
+            self._active_client = client
+            try:
+                yield
+            finally:
+                self._active_client = None
+
+    @contextlib.contextmanager
+    def _mailbox(self) -> Iterator[imaplib.IMAP4]:
+        if self._active_client is not None:
+            yield self._active_client
+            return
+        with self._connected_mailbox() as client:
+            yield client
+
     @staticmethod
     def _snapshot(client: imaplib.IMAP4) -> tuple[int, int]:
         uid_validity = _response_number(client, "UIDVALIDITY")
@@ -461,7 +546,7 @@ class ImapGateway:
         del addresses
         with self._mailbox() as client:
             uid_validity, snapshot_uid = self._snapshot(client)
-            status, response = client.uid("SEARCH", None, "SINCE", since.strftime("%d-%b-%Y"))
+            status, response = client.uid("SEARCH", None, "SINCE", _recovery_search_date(since))
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server recovery search failed")
             candidates = [uid for uid in _uids(response) if uid <= snapshot_uid]
@@ -476,11 +561,23 @@ class ImapGateway:
             status, response = client.uid(
                 "FETCH",
                 message_id,
-                "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)])",
+                "(UID INTERNALDATE RFC822.SIZE "
+                f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>)",
             )
             if status != "OK":
-                raise MailboxMessageUnavailable("The mail server message is no longer available")
+                raise ImapError("imap_protocol_error", "Mail server header fetch failed; retry")
             metadata, payload = _literal(response)
+            size_match = _RFC822_SIZE.search(metadata)
+            if size_match is None:
+                raise ImapError("imap_protocol_error", "Mail server omitted message size")
+            if int(size_match.group(1)) > MAX_MESSAGE_BYTES:
+                raise MailboxMessageInvalid(
+                    "imap_message_too_large", "Message exceeds the safe size limit"
+                )
+            if len(payload) >= MAX_HEADER_BYTES:
+                raise MailboxMessageInvalid(
+                    "imap_headers_too_large", "Message headers exceed the safe size limit"
+                )
         parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
         raw_from = str(parsed.get("From", ""))
         sender_name, _address = parseaddr(raw_from)
@@ -501,7 +598,7 @@ class ImapGateway:
         with self._mailbox() as client:
             status, size_response = client.uid("FETCH", message_id, "(UID RFC822.SIZE)")
             if status != "OK":
-                raise MailboxMessageUnavailable("The mail server message is no longer available")
+                raise ImapError("imap_protocol_error", "Mail server size fetch failed; retry")
             size_metadata = _response_metadata(size_response)
             size_match = _RFC822_SIZE.search(size_metadata)
             if size_match is None:
@@ -512,7 +609,7 @@ class ImapGateway:
                 )
             status, response = client.uid("FETCH", message_id, "(UID BODY.PEEK[])")
             if status != "OK":
-                raise MailboxMessageUnavailable("The mail server message is no longer available")
+                raise ImapError("imap_protocol_error", "Mail server content fetch failed; retry")
             _metadata, payload = _literal(response)
         if len(payload) > MAX_MESSAGE_BYTES:
             raise MailboxMessageInvalid(
@@ -526,9 +623,7 @@ class ImapGateway:
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         return _content(self._raw_message(message_id), body_char_limit)
 
-    def attachment_bytes(
-        self, message_id: str, part_id: str, attachment_id: str | None
-    ) -> bytes:
+    def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if attachment_id is not None or not part_id.startswith("mime-"):
             raise MailboxMessageUnavailable("The mail server attachment identity is invalid")
         try:
@@ -537,12 +632,9 @@ class ImapGateway:
             raise MailboxMessageUnavailable(
                 "The mail server attachment identity is invalid"
             ) from exc
-        attachments: list[bytes] = []
-        for part in self._raw_message(message_id).walk():
-            if part.is_multipart() or not part.get_filename():
-                continue
-            payload = part.get_payload(decode=True)
-            attachments.append(payload if isinstance(payload, bytes) else b"")
+        _message_content, attachments = _content_and_attachment_payloads(
+            self._raw_message(message_id), 0
+        )
         if selected < 0 or selected >= len(attachments):
             raise MailboxMessageUnavailable("The mail server attachment is no longer available")
         return attachments[selected]

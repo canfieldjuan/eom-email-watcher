@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -80,6 +82,14 @@ class MailboxGateway(Protocol):
     def attachment_bytes(
         self, message_id: str, part_id: str, attachment_id: str | None
     ) -> bytes: ...
+
+
+@contextmanager
+def mailbox_polling_session(gateway: MailboxGateway) -> Iterator[None]:
+    """Use a provider's optional poll-scoped transport without imposing it on all adapters."""
+    provider_session = getattr(gateway, "polling_session", None)
+    with provider_session() if callable(provider_session) else nullcontext():
+        yield
 
 
 def default_mailbox_session(gateway: MailboxGateway) -> MailboxSession:

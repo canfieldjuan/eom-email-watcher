@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import imaplib
 import ssl
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from eom_email_watcher.imap import (
+    MAX_HEADER_BYTES,
     MAX_INCREMENTAL_MESSAGE_IDS,
     MAX_MESSAGE_BYTES,
     ImapCredentials,
@@ -17,7 +19,11 @@ from eom_email_watcher.imap import (
     load_credentials,
     write_credentials,
 )
-from eom_email_watcher.mailbox import MailboxMessageInvalid, StaleMailboxCursor
+from eom_email_watcher.mailbox import (
+    MailboxMessageInvalid,
+    MailboxMessageUnavailable,
+    StaleMailboxCursor,
+)
 
 RAW_MESSAGE = b"""From: Sender Name <WATCHED@Example.com>\r
 Subject: Invoice received\r
@@ -37,6 +43,29 @@ Content-Transfer-Encoding: base64\r
 \r
 UERGREFUQQ==\r
 --boundary--\r
+"""
+
+FORWARDED_MESSAGE = b"""From: Sender Name <WATCHED@Example.com>\r
+Subject: Forwarded message\r
+Date: Fri, 04 Sep 2026 10:15:00 -0500\r
+Message-ID: <forwarded@example.com>\r
+MIME-Version: 1.0\r
+Content-Type: multipart/mixed; boundary=outer\r
+\r
+--outer\r
+Content-Type: text/plain; charset=utf-8\r
+\r
+Outer body only.\r
+--outer\r
+Content-Type: message/rfc822\r
+Content-Disposition: attachment; filename=forwarded.eml\r
+\r
+From: Inner Sender <inner@example.com>\r
+Subject: Private forwarded content\r
+Date: Thu, 03 Sep 2026 10:15:00 -0500\r
+\r
+Inner body must not join the outer body.\r
+--outer--\r
 """
 
 
@@ -90,7 +119,8 @@ class FakeImap:
         if "HEADER.FIELDS" in query:
             headers, _separator, _body = self.raw_message.partition(b"\r\n\r\n")
             metadata = (
-                f'{uid} (UID {uid} INTERNALDATE "04-Sep-2026 10:16:00 -0500")'.encode()
+                f"{uid} (UID {uid} RFC822.SIZE {len(self.raw_message)} "
+                'INTERNALDATE "04-Sep-2026 10:16:00 -0500")'.encode()
             )
             return "OK", [(metadata, headers + b"\r\n\r\n"), b")"]
         if "RFC822.SIZE" in query:
@@ -135,6 +165,7 @@ def test_connection_validation_normalizes_identity_and_copies_ca(
     ca_file = tmp_path / "private-ca.pem"
     ca_file.write_text("test trust root", encoding="utf-8")
     requested_ca: list[str | None] = []
+
     def context(*, cadata: str | None = None) -> ssl.SSLContext:
         requested_ca.append(cadata)
         return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -201,9 +232,7 @@ def test_cursor_is_snapshotted_and_incremental_search_is_bounded() -> None:
     assert changes.message_ids[0] == "8"
     assert changes.cursor == f"eom-imap-v1:44:{7 + MAX_INCREMENTAL_MESSAGE_IDS}"
     assert clients[0].readonly is True
-    assert ("uid", "SEARCH", None, f"UID 8:{8 + MAX_INCREMENTAL_MESSAGE_IDS}") in clients[
-        0
-    ].calls
+    assert ("uid", "SEARCH", None, f"UID 8:{8 + MAX_INCREMENTAL_MESSAGE_IDS}") in clients[0].calls
     assert clients[0].logged_out is True
 
 
@@ -218,8 +247,9 @@ def test_metadata_uses_headers_only_and_content_uses_peek() -> None:
     clients: list[FakeImap] = []
     gateway = ImapGateway(credentials(), factory(clients))
 
-    metadata = gateway.metadata("7")
-    content = gateway.content("7", 1000)
+    with gateway.polling_session():
+        metadata = gateway.metadata("7")
+        content = gateway.content("7", 1000)
 
     assert metadata.sender == "watched@example.com"
     assert metadata.sender_name == "Sender Name"
@@ -231,15 +261,108 @@ def test_metadata_uses_headers_only_and_content_uses_peek() -> None:
     assert content.attachments[0].part_id == "mime-0"
     assert content.attachments[0].byte_size == 7
     fetches = [call for client in clients for call in client.calls if call[:2] == ("uid", "FETCH")]
+    assert len(clients) == 1
+    assert clients[0].logged_out is True
     assert any("BODY.PEEK[HEADER.FIELDS" in str(call[-1]) for call in fetches)
+    assert any(f"<0.{MAX_HEADER_BYTES}>" in str(call[-1]) for call in fetches)
     assert any(call[-1] == "(UID BODY.PEEK[])" for call in fetches)
-    assert all("RFC822" not in str(call[-1]) or call[-1] == "(UID RFC822.SIZE)" for call in fetches)
 
 
 def test_attachment_bytes_reuses_stable_mime_position() -> None:
     gateway = ImapGateway(credentials(), factory([]))
 
     assert gateway.attachment_bytes("7", "mime-0", None) == b"PDFDATA"
+
+
+def test_forwarded_message_is_an_attachment_not_outer_body() -> None:
+    gateway = ImapGateway(credentials(), factory([], raw_message=FORWARDED_MESSAGE))
+
+    content = gateway.content("7", 1000)
+
+    assert content.body == "Outer body only."
+    assert content.attachment_names == ("forwarded.eml",)
+    assert content.attachments[0].media_type == "message/rfc822"
+    forwarded = gateway.attachment_bytes("7", "mime-0", None)
+    assert b"Private forwarded content" in forwarded
+    assert b"Inner body must not join the outer body" in forwarded
+
+
+def test_recovery_uses_previous_utc_day_with_protocol_month_name() -> None:
+    clients: list[FakeImap] = []
+    gateway = ImapGateway(credentials(), factory(clients))
+
+    gateway.recover_since(frozenset(), datetime(2026, 9, 4, 0, 5, tzinfo=UTC))
+
+    assert ("uid", "SEARCH", None, "SINCE", "03-Sep-2026") in clients[0].calls
+
+
+@pytest.mark.parametrize("status", ["NO", "BAD"])
+def test_fetch_rejection_is_retryable_protocol_failure(status: str) -> None:
+    class RejectedFetch(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            if command == "FETCH":
+                return status, [b"private server detail"]
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: RejectedFetch())
+
+    with pytest.raises(ImapError) as raised:
+        gateway.metadata("7")
+
+    assert raised.value.code == "imap_protocol_error"
+    assert "private server detail" not in str(raised.value)
+
+
+@pytest.mark.parametrize("rejected_query", ["RFC822.SIZE", "BODY.PEEK[]"])
+def test_content_fetch_rejection_is_retryable_protocol_failure(rejected_query: str) -> None:
+    class RejectedFetch(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            if command == "FETCH" and rejected_query in str(args[-1]):
+                return "NO", [b"private server detail"]
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: RejectedFetch())
+
+    with pytest.raises(ImapError) as raised:
+        gateway.content("7", 1000)
+
+    assert raised.value.code == "imap_protocol_error"
+    assert "private server detail" not in str(raised.value)
+
+
+def test_ok_fetch_without_the_uid_is_message_unavailable() -> None:
+    class MissingFetch(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            if command == "FETCH":
+                return "OK", []
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: MissingFetch())
+
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.metadata("7")
+
+
+def test_bounded_header_fetch_rejects_truncated_admission_headers() -> None:
+    class OversizedHeaders(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            query = str(args[-1])
+            if command == "FETCH" and "HEADER.FIELDS" in query:
+                return "OK", [
+                    (
+                        b'7 (UID 7 RFC822.SIZE 65536 INTERNALDATE "04-Sep-2026 10:16:00 -0500")',
+                        b"X" * MAX_HEADER_BYTES,
+                    ),
+                    b")",
+                ]
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: OversizedHeaders())
+
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        gateway.metadata("7")
+
+    assert raised.value.code == "imap_headers_too_large"
 
 
 def test_oversized_message_is_a_permanent_message_failure() -> None:
@@ -277,6 +400,28 @@ def test_login_rejection_is_categorized_and_connection_is_closed() -> None:
     assert raised.value.code == "imap_authentication_failed"
     assert "private server detail" not in str(raised.value)
     assert client.logged_out is True
+
+
+@pytest.mark.parametrize(
+    ("exception", "code"),
+    [
+        (imaplib.IMAP4.abort("private greeting detail"), "imap_connection_failed"),
+        (imaplib.IMAP4.error("private greeting detail"), "imap_protocol_error"),
+    ],
+)
+def test_greeting_failure_is_categorized_without_server_detail(
+    exception: Exception, code: str
+) -> None:
+    def reject_greeting(_credentials: ImapCredentials, _context: ssl.SSLContext) -> FakeImap:
+        raise exception
+
+    gateway = ImapGateway(credentials(), reject_greeting)
+
+    with pytest.raises(ImapError) as raised:
+        gateway.initial_cursor()
+
+    assert raised.value.code == code
+    assert "private greeting detail" not in str(raised.value)
 
 
 def test_post_login_protocol_error_is_categorized_without_server_detail() -> None:

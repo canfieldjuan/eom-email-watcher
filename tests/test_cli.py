@@ -46,6 +46,51 @@ def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch,
     assert "Baseline initialized" in output.out
 
 
+def test_doctor_uses_the_active_imap_provider_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state_directory = tmp_path / "state"
+    state_directory.mkdir(mode=0o700)
+    account = SimpleNamespace(provider="imap", account_id=f"imap-{'a' * 32}")
+
+    class FakeStore:
+        def mail_account(self, provider: str, account_id: str):
+            assert (provider, account_id) == (account.provider, account.account_id)
+            return account
+
+        def state(self, *, provider: str, account_id: str):
+            assert (provider, account_id) == (account.provider, account.account_id)
+            return ("eom-imap-v1:44:7", "2026-09-05T00:00:00+00:00")
+
+    config = SimpleNamespace(
+        path=tmp_path / "config.toml",
+        senders=("trusted@example.com",),
+        database_file=state_directory / "watcher.sqlite3",
+        gmail_send_token_file=state_directory / "send-token.json",
+        monthly_hours_recipient=None,
+        model_require_auth=False,
+        model_api_token_file=None,
+        model_base_url="http://127.0.0.1:11434/v1",
+    )
+    model = SimpleNamespace(health=lambda: (True, "ready"))
+    monkeypatch.setattr(cli, "_runtime", lambda _path: (config, FakeStore(), model))
+    monkeypatch.setattr(
+        cli,
+        "configured_mailbox_identity",
+        lambda _store: (account.provider, account.account_id),
+    )
+    monkeypatch.setattr(cli, "mail_account_connected", lambda _config, _account: True)
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: "/usr/bin/notify-send")
+
+    assert cli._doctor(config.path) == 0
+
+    checks = json.loads(capsys.readouterr().out)
+    assert checks["mail_provider_connection"] == {"ok": True, "provider": "imap"}
+    assert checks["mail_account_credentials"] == {"ok": True, "provider": "imap"}
+    assert "oauth_credentials" not in checks
+    assert "oauth_token" not in checks
+
+
 def test_setup_connects_a_replacement_for_unidentified_migrated_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

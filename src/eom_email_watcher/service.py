@@ -12,6 +12,7 @@ from .mailbox import (
     MailboxSession,
     StaleMailboxCursor,
     default_mailbox_session,
+    mailbox_polling_session,
     scoped_message_id,
 )
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
@@ -73,6 +74,13 @@ class Watcher:
     ) -> dict[str, int | bool]:
         if not self.config.senders:
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
+        with mailbox_polling_session(self.gateway):
+            return self._check_active(
+                dry_run=dry_run,
+                deliver_notifications=deliver_notifications,
+            )
+
+    def _check_active(self, *, dry_run: bool, deliver_notifications: bool) -> dict[str, int | bool]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
@@ -106,6 +114,13 @@ class Watcher:
             except MailboxMessageUnavailable as exc:
                 logger.info(
                     "Skipping message %s (gone before fetch): %s",
+                    provider_message_id,
+                    exc,
+                )
+                continue
+            except MailboxMessageInvalid as exc:
+                logger.warning(
+                    "Skipping message %s with unsafe metadata: %s",
                     provider_message_id,
                     exc,
                 )

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -143,6 +144,39 @@ class InvalidContentGmail(FakeGmail):
         raise MailboxMessageInvalid("message_too_large", "Message exceeds the safe size limit")
 
 
+class PollScopedGmail(FreshGmail):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_polling_session = False
+        self.polling_sessions = 0
+
+    @contextmanager
+    def polling_session(self):
+        self.polling_sessions += 1
+        self.in_polling_session = True
+        try:
+            yield
+        finally:
+            self.in_polling_session = False
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        assert self.in_polling_session is True
+        return super().changes_since(cursor)
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        assert self.in_polling_session is True
+        return super().metadata(message_id)
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        assert self.in_polling_session is True
+        return super().content(message_id, body_char_limit)
+
+
+class InvalidMetadataGmail(FreshGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise MailboxMessageInvalid("headers_too_large", "Message headers are unsafe")
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         path=tmp_path / "config.toml",
@@ -182,6 +216,34 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+    gateway = PollScopedGmail()
+
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+
+    assert result["discovered"] == 1
+    assert result["summarized"] == 1
+    assert gateway.polling_sessions == 1
+    assert gateway.in_polling_session is False
+
+
+def test_invalid_metadata_is_skipped_without_blocking_the_cursor(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+
+    result = Watcher(cfg, store, InvalidMetadataGmail(), FakeModel()).check()
+
+    assert result["discovered"] == 0
+    assert result["summarized"] == 0
+    assert store.state()[0] == "200"
 
 
 def test_watcher_scopes_sync_and_source_fetch_to_mailbox_session(
