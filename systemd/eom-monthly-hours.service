@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher
-ExecStart="%h/Desktop/01 - Effingham Office Maids/eom-email-watcher/.venv/bin/eom-mail-watch" send-hours
+WorkingDirectory=%h
+ExecStart=%h/.local/bin/eom-mail-watch send-hours
 Environment=PYTHONUNBUFFERED=1
 UMask=0077
 NoNewPrivileges=yes
