@@ -238,13 +238,30 @@ def test_sidecar_build_profile_rejects_unknown_value_before_subprocess(
         build_desktop_sidecar.build_sidecar()
 
 
-def test_public_build_rejects_missing_mail_identity_before_subprocess(
+@pytest.mark.parametrize(
+    ("google_identity", "microsoft_identity", "missing"),
+    [
+        (None, None, "Google, Microsoft 365"),
+        ("google.json", None, "Microsoft 365"),
+        (None, "microsoft.json", "Google"),
+    ],
+)
+def test_public_build_rejects_incomplete_mail_identities_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
+    google_identity: str | None,
+    microsoft_identity: str | None,
+    missing: str,
 ) -> None:
     monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
     monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", "keyring.json")
-    monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
-    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    if google_identity is None:
+        monkeypatch.delenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", raising=False)
+    else:
+        monkeypatch.setenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", google_identity)
+    if microsoft_identity is None:
+        monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    else:
+        monkeypatch.setenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", microsoft_identity)
     monkeypatch.setattr(
         build_desktop_sidecar.subprocess,
         "run",
@@ -253,7 +270,7 @@ def test_public_build_rejects_missing_mail_identity_before_subprocess(
 
     with pytest.raises(
         build_desktop_sidecar.SidecarBuildError,
-        match="at least one Google or Microsoft 365 OAuth client identity",
+        match=f"both Google and Microsoft 365 OAuth client identities; missing {missing}",
     ):
         build_desktop_sidecar.build_sidecar()
 
@@ -263,7 +280,7 @@ def test_public_build_rejects_missing_keyring_before_subprocess(
 ) -> None:
     monkeypatch.setenv(build_desktop_sidecar.BUILD_PROFILE_ENVIRONMENT, "public")
     monkeypatch.setenv("EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE", "google.json")
-    monkeypatch.delenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", raising=False)
+    monkeypatch.setenv("EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE", "microsoft.json")
     monkeypatch.delenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", raising=False)
     monkeypatch.setattr(
         build_desktop_sidecar.subprocess,
@@ -525,20 +542,9 @@ def test_development_build_remains_credential_free(
     ]
 
 
-@pytest.mark.parametrize(
-    ("include_google", "include_microsoft", "expected_providers"),
-    [
-        (True, False, ["gmail"]),
-        (False, True, ["microsoft365"]),
-        (True, True, ["gmail", "microsoft365"]),
-    ],
-)
-def test_public_build_accepts_each_supported_provider_identity_set(
+def test_public_build_accepts_complete_provider_identity_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    include_google: bool,
-    include_microsoft: bool,
-    expected_providers: list[str],
 ) -> None:
     google = tmp_path / "google.json"
     microsoft = tmp_path / "microsoft.json"
@@ -550,8 +556,8 @@ def test_public_build_accepts_each_supported_provider_identity_set(
         tmp_path,
         monkeypatch,
         profile="public",
-        google=google if include_google else None,
-        microsoft=microsoft if include_microsoft else None,
+        google=google,
+        microsoft=microsoft,
         keyring=keyring,
     )
 
@@ -564,11 +570,11 @@ def test_public_build_accepts_each_supported_provider_identity_set(
         for index, argument in enumerate(smoke_arguments)
         if argument == "--expected-mail-provider"
     ]
-    assert declared_providers == expected_providers
+    assert declared_providers == ["gmail", "microsoft365"]
     staged_names = {name for name, _content in staged_files}
     assert "connect-entitlement-keyring.json" in staged_names
-    assert ("google-oauth-client.json" in staged_names) is include_google
-    assert ("microsoft-oauth-client.json" in staged_names) is include_microsoft
+    assert "google-oauth-client.json" in staged_names
+    assert "microsoft-oauth-client.json" in staged_names
     assert not list((tmp_path / "build").glob("oauth-client.*"))
     assert not list((tmp_path / "build").glob("microsoft-oauth-client.*"))
     assert not list((tmp_path / "build").glob("connect-keyring.*"))
@@ -599,8 +605,10 @@ def test_public_build_rejects_token_bearing_google_input_before_pyinstaller(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     google = tmp_path / "google.json"
+    microsoft = tmp_path / "microsoft.json"
     keyring = tmp_path / "keyring.json"
     _write_oauth_client(google)
+    _write_microsoft_oauth_client(microsoft)
     document = json.loads(google.read_text(encoding="utf-8"))
     document["installed"]["refresh_token"] = "account-grant"
     google.write_text(json.dumps(document), encoding="utf-8")
@@ -610,6 +618,7 @@ def test_public_build_rejects_token_bearing_google_input_before_pyinstaller(
         monkeypatch,
         profile="public",
         google=google,
+        microsoft=microsoft,
         keyring=keyring,
     )
 
@@ -801,6 +810,9 @@ def test_release_candidate_workflow_is_private_main_only_and_fail_closed() -> No
     assert '"refs/heads/main"' in workflow
     assert "EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64" in workflow
     assert "EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64" in workflow
+    assert 'if [ -z "$GOOGLE_OAUTH_JSON_B64" ] || [ -z "$MICROSOFT_OAUTH_JSON_B64" ]' in workflow
+    assert workflow.count('--expected-mail-provider\", \"gmail') == 1
+    assert workflow.count('--expected-mail-provider\", \"microsoft365') == 1
     assert workflow.count("EOM_EMAIL_WATCHER_BUILD_PROFILE: public") == 3
     linux_cargo_sidecar_profile = (
         "name: Build Linux sidecar for Cargo checks\n"

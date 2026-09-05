@@ -56,9 +56,18 @@ def validate_build_profile_inputs(
 ) -> None:
     if profile != "public":
         return
-    if not google_oauth_source and not microsoft_oauth_source:
+    missing_mail_identities = [
+        name
+        for name, value in (
+            ("Google", google_oauth_source),
+            ("Microsoft 365", microsoft_oauth_source),
+        )
+        if not value
+    ]
+    if missing_mail_identities:
         raise SidecarBuildError(
-            "Public builds require at least one Google or Microsoft 365 OAuth client identity"
+            "Public builds require both Google and Microsoft 365 OAuth client identities; missing "
+            + ", ".join(missing_mail_identities)
         )
     if not entitlement_keyring_source:
         raise SidecarBuildError(

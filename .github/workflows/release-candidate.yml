@@ -16,7 +16,7 @@ jobs:
   admit:
     runs-on: ubuntu-latest
     steps:
-      - name: Require main and one mail-provider identity
+      - name: Require main and both mail-provider identities
         env:
           GOOGLE_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64 }}
           MICROSOFT_OAUTH_JSON_B64: ${{ secrets.EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64 }}
@@ -25,8 +25,8 @@ jobs:
             echo "Release candidates may only be built from main." >&2
             exit 1
           fi
-          if [ -z "$GOOGLE_OAUTH_JSON_B64" ] && [ -z "$MICROSOFT_OAUTH_JSON_B64" ]; then
-            echo "Configure at least one approved mail-provider identity secret." >&2
+          if [ -z "$GOOGLE_OAUTH_JSON_B64" ] || [ -z "$MICROSOFT_OAUTH_JSON_B64" ]; then
+            echo "Configure both approved Google and Microsoft 365 identity secrets." >&2
             exit 1
           fi
 
@@ -196,12 +196,8 @@ jobs:
             "--expected-entitlement-state",
             "missing"
           )
-          if ($env:EOM_EMAIL_WATCHER_GOOGLE_OAUTH_CLIENT_FILE) {
-            $arguments += @("--expected-mail-provider", "gmail")
-          }
-          if ($env:EOM_EMAIL_WATCHER_MICROSOFT_OAUTH_CLIENT_FILE) {
-            $arguments += @("--expected-mail-provider", "microsoft365")
-          }
+          $arguments += @("--expected-mail-provider", "gmail")
+          $arguments += @("--expected-mail-provider", "microsoft365")
           uv run --project . python @arguments
       - name: Remove private build inputs
         if: always()
