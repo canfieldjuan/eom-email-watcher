@@ -95,7 +95,7 @@ not from `pnpm tauri dev`, so the operating system does not retain a development
 
 Sidecar builds use `EOM_EMAIL_WATCHER_BUILD_PROFILE=development|public`. The default is
 `development`, which preserves credential-free local and CI builds. A `public` build fails before
-PyInstaller unless at least one validated Google or Microsoft 365 application identity and the
+PyInstaller unless validated Google and Microsoft 365 application identities and the
 approved production Connect entitlement key ring are supplied. This is a release-admission guard;
 it does not embed user access or refresh tokens and does not perform provider authorization.
 
@@ -177,7 +177,7 @@ and such a build reports `authority_unavailable` instead of admitting license in
 ### Private release candidates
 
 The manually dispatched `Private release candidate` GitHub Actions workflow builds only from
-`main`. Configure at least one base64-encoded repository secret:
+`main`. Configure both base64-encoded repository secrets:
 
 - `EMAIL_WATCHER_GOOGLE_OAUTH_DESKTOP_JSON_B64`
 - `EMAIL_WATCHER_MICROSOFT_OAUTH_PUBLIC_JSON_B64`
