@@ -42,6 +42,17 @@ from .gmail import (
     GmailGateway,
     gmail_credentials_configured,
 )
+from .imap import (
+    IMAP_CONNECTION_METHOD,
+    IMAP_PROVIDER,
+    ImapError,
+    ImapGateway,
+    credentials_from_connection,
+    imap_cursor_mailbox_identity,
+    imap_mailbox_identity,
+    load_credentials,
+    write_credentials,
+)
 from .locking import operation_lock, operation_lock_supported
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
@@ -272,6 +283,9 @@ def _mail_accounts_public(runtime: Runtime) -> dict[str, object]:
             {
                 "connection_available": mail_provider_connection_available(
                     runtime.config, provider
+                ),
+                "connection_method": (
+                    IMAP_CONNECTION_METHOD if provider == IMAP_PROVIDER else "browser_oauth"
                 ),
                 "display_name": display_name,
                 "multiple_accounts": True,
@@ -551,6 +565,133 @@ def _authorize_microsoft_account(
     }
 
 
+def _connect_imap_account(
+    runtime: Runtime,
+    account: MailAccount | None,
+    connection: object,
+) -> dict[str, object]:
+    credentials = credentials_from_connection(connection)
+    if account is not None and account.address != credentials.email_address:
+        raise ApiError(
+            "account_identity_mismatch",
+            "The mailbox address does not match the selected email account",
+        )
+
+    previous_mailbox_identity: str | None = None
+    if account is not None:
+        current_credentials = mail_account_token_file(runtime.config, account)
+        if current_credentials.is_file():
+            try:
+                previous_mailbox_identity = imap_mailbox_identity(
+                    load_credentials(current_credentials)
+                )
+            except ImapError:
+                previous_mailbox_identity = None
+        if previous_mailbox_identity is None:
+            state = runtime.store.state(provider=account.provider, account_id=account.account_id)
+            if state is not None:
+                try:
+                    previous_mailbox_identity = imap_cursor_mailbox_identity(state[0])
+                except ImapError:
+                    previous_mailbox_identity = None
+
+    authorization_parent = (
+        mail_account_token_file(runtime.config, account).parent
+        if account is not None
+        else runtime.config.database_file.parent
+    )
+    authorization_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(
+        prefix=".imap-authorization-",
+        dir=authorization_parent,
+    ) as directory:
+        staged_credentials = Path(directory) / "credentials.json"
+        write_credentials(staged_credentials, credentials)
+        gateway = ImapGateway.from_credentials_file(staged_credentials)
+
+        activate_after_connect = False
+        if account is None:
+            account = runtime.store.mail_account_by_address(
+                IMAP_PROVIDER,
+                credentials.email_address,
+            )
+            active = runtime.store.active_mail_account()
+            activate_after_connect = active is None or not mail_account_connected(
+                runtime.config, active
+            )
+            if account is not None:
+                current_credentials = mail_account_token_file(runtime.config, account)
+                if current_credentials.is_file():
+                    try:
+                        previous_mailbox_identity = imap_mailbox_identity(
+                            load_credentials(current_credentials)
+                        )
+                    except ImapError:
+                        previous_mailbox_identity = None
+                if previous_mailbox_identity is None:
+                    state = runtime.store.state(
+                        provider=account.provider,
+                        account_id=account.account_id,
+                    )
+                    if state is not None:
+                        try:
+                            previous_mailbox_identity = imap_cursor_mailbox_identity(state[0])
+                        except ImapError:
+                            previous_mailbox_identity = None
+        mailbox_changed = (
+            account is not None and previous_mailbox_identity != imap_mailbox_identity(credentials)
+        )
+        initialize_baseline = (
+            account is None
+            or mailbox_changed
+            or runtime.store.state(
+                provider=account.provider,
+                account_id=account.account_id,
+            )
+            is None
+        )
+        verified_cursor = gateway.initial_cursor()
+        baseline = verified_cursor if initialize_baseline else None
+
+        if account is None:
+            account = runtime.store.register_mail_account(
+                IMAP_PROVIDER,
+                f"imap-{uuid.uuid4().hex}",
+                display_name=MAIL_PROVIDER_NAMES[IMAP_PROVIDER],
+                address=credentials.email_address,
+                active=False,
+            )
+        destination = mail_account_token_file(runtime.config, account)
+        _install_private_token(staged_credentials, destination)
+
+    account = runtime.store.update_mail_account_identity(
+        account.provider,
+        account.account_id,
+        display_name=MAIL_PROVIDER_NAMES[account.provider],
+        address=credentials.email_address,
+    )
+    if activate_after_connect and not account.active:
+        account = runtime.store.activate_mail_account(account.provider, account.account_id)
+    if mailbox_changed:
+        assert baseline is not None
+        runtime.store.set_state(
+            baseline,
+            provider=account.provider,
+            account_id=account.account_id,
+        )
+        return {
+            "account": _mail_account_public(runtime, account),
+            "baseline_initialized": True,
+        }
+    if initialize_baseline:
+        assert baseline is not None
+        return _finish_mail_authorization(runtime, account, baseline)
+    return {
+        "account": _mail_account_public(runtime, account),
+        "baseline_initialized": False,
+    }
+
+
 def _with_mail_account_mutation(
     request: dict[str, object],
     operation: Callable[[Runtime], dict[str, object]],
@@ -642,22 +783,30 @@ def _mail_accounts(request: dict[str, object]) -> dict[str, object]:
 
 
 def _mail_account_connect(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"provider"})
+    payload = _payload(request, {"provider", "connection"})
     provider = _mail_provider(payload.get("provider"))
+    connection = payload.get("connection")
+    if provider != IMAP_PROVIDER and "connection" in payload:
+        raise ApiError("invalid_request", "Browser authorization does not accept connection data")
 
     def connect(runtime: Runtime) -> dict[str, object]:
         if provider == DEFAULT_MAIL_PROVIDER:
             return _authorize_gmail_account(runtime, None, reuse_valid_token=False)
         if provider == MICROSOFT365_PROVIDER:
             return _authorize_microsoft_account(runtime, None)
+        if provider == IMAP_PROVIDER:
+            return _connect_imap_account(runtime, None, connection)
         raise ApiError("unsupported_provider", "That email provider is not available")
 
     return _with_mail_account_mutation(request, connect)
 
 
 def _mail_account_reconnect(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"provider", "account_id"})
+    payload = _payload(request, {"provider", "account_id", "connection"})
     provider, account_id = _mail_account_key(payload)
+    connection = payload.get("connection")
+    if provider != IMAP_PROVIDER and "connection" in payload:
+        raise ApiError("invalid_request", "Browser authorization does not accept connection data")
 
     def reconnect(runtime: Runtime) -> dict[str, object]:
         account = runtime.store.mail_account(provider, account_id)
@@ -667,6 +816,8 @@ def _mail_account_reconnect(request: dict[str, object]) -> dict[str, object]:
             return _authorize_gmail_account(runtime, account, reuse_valid_token=False)
         if provider == MICROSOFT365_PROVIDER:
             return _authorize_microsoft_account(runtime, account)
+        if provider == IMAP_PROVIDER:
+            return _connect_imap_account(runtime, account, connection)
         raise ApiError("unsupported_provider", "That email provider is not available")
 
     return _with_mail_account_mutation(request, reconnect)
@@ -2162,6 +2313,14 @@ def _response(request: object) -> dict[str, object]:
                 "code": "gmail_error",
                 "message": "Gmail operation failed; see stderr for details",
             },
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except ImapError as exc:
+        logger.warning("IMAP operation failed (%s): %s", exc.code, exc)
+        return {
+            "error": {"code": exc.code, "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

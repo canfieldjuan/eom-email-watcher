@@ -16,6 +16,13 @@ class _TextExtractor(HTMLParser):
         self.parts.append(data)
 
 
+def html_to_text(value: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(value)
+    parser.close()
+    return html.unescape(" ".join(parser.parts))
+
+
 @dataclass(frozen=True)
 class AttachmentDescriptor:
     part_id: str
@@ -80,9 +87,7 @@ def extract_body(
             if mime_type == "text/plain":
                 plain.append(decoded)
             elif mime_type == "text/html":
-                parser = _TextExtractor()
-                parser.feed(decoded)
-                rich.append(html.unescape(" ".join(parser.parts)))
+                rich.append(html_to_text(decoded))
         for child in part.get("parts") or []:
             if isinstance(child, dict):
                 walk(child)

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from eom_email_watcher.gmail import (
 )
 from eom_email_watcher.mailbox import (
     MailboxChanges,
+    MailboxMessageInvalid,
     MailboxSession,
     MessageContent,
     scoped_message_id,
@@ -137,6 +139,44 @@ class FailingCaptureModel(FakeModel):
         raise ModelError("local model unavailable")
 
 
+class InvalidContentGmail(FakeGmail):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        raise MailboxMessageInvalid("message_too_large", "Message exceeds the safe size limit")
+
+
+class PollScopedGmail(FreshGmail):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_polling_session = False
+        self.polling_sessions = 0
+
+    @contextmanager
+    def polling_session(self):
+        self.polling_sessions += 1
+        self.in_polling_session = True
+        try:
+            yield
+        finally:
+            self.in_polling_session = False
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        assert self.in_polling_session is True
+        return super().changes_since(cursor)
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        assert self.in_polling_session is True
+        return super().metadata(message_id)
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        assert self.in_polling_session is True
+        return super().content(message_id, body_char_limit)
+
+
+class InvalidMetadataGmail(FreshGmail):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise MailboxMessageInvalid("headers_too_large", "Message headers are unsafe")
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         path=tmp_path / "config.toml",
@@ -176,6 +216,34 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+    gateway = PollScopedGmail()
+
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+
+    assert result["discovered"] == 1
+    assert result["summarized"] == 1
+    assert gateway.polling_sessions == 1
+    assert gateway.in_polling_session is False
+
+
+def test_invalid_metadata_is_skipped_without_blocking_the_cursor(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+
+    result = Watcher(cfg, store, InvalidMetadataGmail(), FakeModel()).check()
+
+    assert result["discovered"] == 0
+    assert result["summarized"] == 0
+    assert store.state()[0] == "200"
 
 
 def test_watcher_scopes_sync_and_source_fetch_to_mailbox_session(
@@ -251,6 +319,49 @@ def test_attachment_inventory_is_durable_before_model_failure(tmp_path: Path) ->
             "byte_size": 1234,
         }
     ]
+
+
+def test_permanently_invalid_mailbox_content_does_not_retry_forever(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FakeModel()
+    watcher = Watcher(cfg, store, InvalidContentGmail(), model)
+
+    assert watcher.check()["summarized"] == 0
+    failed = store.recent(1)[0]
+    assert failed["analysis_retryable"] is False
+    assert failed["analysis_error_code"] == "message_too_large"
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 0
+
+
+def test_failed_fallback_for_permanent_content_error_retries_without_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = FakeModel()
+    attempts = 0
+
+    def flaky_fallback(*_args, **_kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise NotificationError("all channels unavailable")
+
+    monkeypatch.setattr(service_module, "send_fallback", flaky_fallback)
+    watcher = Watcher(cfg, store, InvalidContentGmail(), model)
+
+    assert watcher.check()["fallback_notified"] == 0
+    assert store.notification_intents()[0].kind == "fallback"
+    assert watcher.check()["fallback_notified"] == 1
+    assert store.notification_intents() == []
+    assert attempts == 2
+    assert model.calls == 0
 
 
 def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(

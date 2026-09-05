@@ -182,6 +182,7 @@ interface MailProviderStatus {
   provider: string;
   display_name: string;
   connection_available: boolean;
+  connection_method: "browser_oauth" | "server_credentials";
   multiple_accounts: boolean;
 }
 
@@ -1725,18 +1726,21 @@ function renderMailAccounts(data: MailAccounts): boolean {
     actions.className = "mail-account-actions";
     const provider = providerFor(account);
     if (account.connected) {
-      const reconnect = document.createElement("button");
-      reconnect.type = "button";
-      reconnect.textContent = "Reconnect";
-      reconnect.disabled = mailOperationInFlight || !provider?.connection_available;
-      reconnect.addEventListener("click", () => void reconnectMailAccount(account));
       const disconnect = document.createElement("button");
       disconnect.type = "button";
       disconnect.textContent = "Disconnect";
       disconnect.className = "danger-action";
       disconnect.disabled = mailOperationInFlight;
       disconnect.addEventListener("click", () => void disconnectMailAccount(account));
-      actions.append(reconnect, disconnect);
+      if (provider?.connection_method === "browser_oauth") {
+        const reconnect = document.createElement("button");
+        reconnect.type = "button";
+        reconnect.textContent = "Reconnect";
+        reconnect.disabled = mailOperationInFlight || !provider.connection_available;
+        reconnect.addEventListener("click", () => void reconnectMailAccount(account));
+        actions.append(reconnect);
+      }
+      actions.append(disconnect);
       if (!account.active) {
         const activate = document.createElement("button");
         activate.type = "button";
@@ -1745,7 +1749,7 @@ function renderMailAccounts(data: MailAccounts): boolean {
         activate.addEventListener("click", () => void activateMailAccount(account));
         actions.prepend(activate);
       }
-    } else {
+    } else if (provider?.connection_method === "browser_oauth") {
       const connect = document.createElement("button");
       connect.type = "button";
       connect.textContent = account.address ? "Reconnect" : "Connect";
@@ -1761,6 +1765,7 @@ function renderMailAccounts(data: MailAccounts): boolean {
   }
 
   for (const provider of mailProviders) {
+    if (provider.connection_method !== "browser_oauth") continue;
     if (
       !provider.multiple_accounts &&
       mailAccounts.some((account) => account.provider === provider.provider)

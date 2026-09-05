@@ -4,13 +4,15 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from .config import Config
-from .db import AnalyzedMessage, PendingMessage, Store
+from .db import AnalyzedMessage, NotificationIntent, PendingMessage, Store
 from .mailbox import (
     MailboxGateway,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MailboxSession,
     StaleMailboxCursor,
     default_mailbox_session,
+    mailbox_polling_session,
     scoped_message_id,
 )
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
@@ -72,6 +74,13 @@ class Watcher:
     ) -> dict[str, int | bool]:
         if not self.config.senders:
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
+        with mailbox_polling_session(self.gateway):
+            return self._check_active(
+                dry_run=dry_run,
+                deliver_notifications=deliver_notifications,
+            )
+
+    def _check_active(self, *, dry_run: bool, deliver_notifications: bool) -> dict[str, int | bool]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
@@ -105,6 +114,13 @@ class Watcher:
             except MailboxMessageUnavailable as exc:
                 logger.info(
                     "Skipping message %s (gone before fetch): %s",
+                    provider_message_id,
+                    exc,
+                )
+                continue
+            except MailboxMessageInvalid as exc:
+                logger.warning(
+                    "Skipping message %s with unsafe metadata: %s",
                     provider_message_id,
                     exc,
                 )
@@ -174,7 +190,7 @@ class Watcher:
             "stale_cursor_recovered": recovered,
         }
 
-    def _label(self, message: PendingMessage | AnalyzedMessage) -> str:
+    def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender
 
     @staticmethod
@@ -190,8 +206,10 @@ class Watcher:
             confidence=message.confidence,
         )
 
-    def _send_fallback(self, message: PendingMessage | AnalyzedMessage, dry_run: bool) -> int:
-        if not self.config.notifications_enabled or message.fallback_notified_at:
+    def _send_fallback(
+        self, message: PendingMessage | AnalyzedMessage | NotificationIntent, dry_run: bool
+    ) -> int:
+        if not self.config.notifications_enabled or getattr(message, "fallback_notified_at", None):
             return 0
         try:
             send_fallback(
@@ -253,6 +271,10 @@ class Watcher:
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
+        if deliver_notifications:
+            for intent in self.store.notification_intents():
+                if intent.kind == "fallback":
+                    fallback += self._send_fallback(intent, dry_run)
         for message in self.store.pending_delivery():
             received_at = _received_at_or_none(
                 message.received_at, observed_at=retention_observed_at
@@ -316,6 +338,18 @@ class Watcher:
                 if not dry_run:
                     self.store.mark_skipped(message.message_id)
                 continue
+            except MailboxMessageInvalid as exc:
+                logger.warning("Message %s cannot be processed: %s", message.message_id, exc)
+                if deliver_notifications:
+                    fallback += self._send_fallback(message, dry_run)
+                if not dry_run:
+                    self.store.record_analysis_failure(
+                        message.message_id,
+                        str(exc),
+                        message.attempts,
+                        retryable=False,
+                        error_code=exc.code,
+                    )
             except GatewayModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
                 if deliver_notifications:

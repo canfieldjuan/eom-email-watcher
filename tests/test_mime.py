@@ -1,6 +1,6 @@
 import base64
 
-from eom_email_watcher.mime import AttachmentDescriptor, extract_body
+from eom_email_watcher.mime import AttachmentDescriptor, extract_body, html_to_text
 
 
 def encoded(value: str) -> str:
@@ -44,6 +44,13 @@ def test_html_fallback_is_text_only_and_truncated() -> None:
     assert body == "Hello & "
     assert attachment_names == ()
     assert attachments == ()
+
+
+def test_html_text_flushes_unfinished_reference_and_tag_fragments() -> None:
+    extracted = html_to_text("AT&T and Total <")
+
+    assert "AT&T" in extracted
+    assert extracted.endswith("<")
 
 
 def test_explicit_empty_root_part_id_is_a_valid_attachment_identity() -> None:

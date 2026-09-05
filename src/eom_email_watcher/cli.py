@@ -24,6 +24,7 @@ from .runtime import (
     load_configured_mailbox,
     load_runtime,
     mail_account_connected,
+    mail_provider_connection_available,
 )
 from .service import Watcher
 
@@ -103,8 +104,14 @@ def _doctor(config_path: Path) -> int:
             )
             is not None,
         }
-        checks["oauth_credentials"] = {"ok": config.gmail_credentials_file.exists()}
-        checks["oauth_token"] = {"ok": mail_account_connected(config, active_account)}
+        checks["mail_provider_connection"] = {
+            "ok": mail_provider_connection_available(config, provider),
+            "provider": provider,
+        }
+        checks["mail_account_credentials"] = {
+            "ok": mail_account_connected(config, active_account),
+            "provider": provider,
+        }
         checks["send_oauth_token"] = {
             "ok": config.gmail_send_token_file.exists() if config.monthly_hours_recipient else True
         }

@@ -16,6 +16,12 @@ from eom_email_watcher.gmail import (
     GmailProfile,
     MessageMetadata,
 )
+from eom_email_watcher.imap import (
+    ImapCredentials,
+    ImapError,
+    imap_mailbox_identity,
+    write_credentials,
+)
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -27,6 +33,9 @@ from eom_email_watcher.microsoft365 import Microsoft365Error, Microsoft365Profil
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
+
+IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
+REPLACEMENT_IMAP_CURSOR = f"eom-imap-v2:{'b' * 64}:55:99"
 
 
 def write_config(
@@ -83,6 +92,19 @@ def request(config_path: Path, operation: str, payload: dict[str, object] | None
         "config_path": str(config_path),
         "payload": payload or {},
     }
+
+
+def imap_credentials(
+    *, host: str = "mail.example.com", password: str = "private-password"
+) -> ImapCredentials:
+    return ImapCredentials(
+        email_address="owner@example.com",
+        host=host,
+        port=993,
+        security="tls",
+        username="owner@example.com",
+        password=password,
+    )
 
 
 def test_read_operations_are_versioned_and_do_not_expose_token_paths(
@@ -723,12 +745,21 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
         "providers": [
             {
                 "connection_available": True,
+                "connection_method": "browser_oauth",
                 "display_name": "Gmail",
                 "multiple_accounts": True,
                 "provider": "gmail",
             },
             {
+                "connection_available": True,
+                "connection_method": "server_credentials",
+                "display_name": "Other mail server",
+                "multiple_accounts": True,
+                "provider": "imap",
+            },
+            {
                 "connection_available": False,
+                "connection_method": "browser_oauth",
                 "display_name": "Microsoft 365",
                 "multiple_accounts": True,
                 "provider": "microsoft365",
@@ -812,6 +843,7 @@ def test_mail_account_list_advertises_valid_microsoft_public_client_without_expo
     )
     assert microsoft == {
         "connection_available": True,
+        "connection_method": "browser_oauth",
         "display_name": "Microsoft 365",
         "multiple_accounts": True,
         "provider": "microsoft365",
@@ -877,6 +909,348 @@ def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baselin
     encoded = json.dumps(response)
     assert "private Microsoft cache" not in encoded
     assert "private-delta-cursor" not in encoded
+
+
+def test_mail_account_connect_installs_private_imap_credentials_and_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    opened_credentials: list[Path] = []
+
+    class AuthorizedImap:
+        def initial_cursor(self) -> str:
+            return IMAP_CURSOR
+
+    def from_credentials_file(path: Path) -> AuthorizedImap:
+        opened_credentials.append(path)
+        assert "private-password" in path.read_text(encoding="utf-8")
+        return AuthorizedImap()
+
+    monkeypatch.setattr(engine_api.ImapGateway, "from_credentials_file", from_credentials_file)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.connect",
+            {
+                "provider": "imap",
+                "connection": {
+                    "email_address": "OWNER@Example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "private-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    account_response = response["data"]["account"]
+    assert account_response["provider"] == "imap"
+    assert account_response["address"] == "owner@example.com"
+    assert account_response["active"] is True
+    runtime = load_runtime(config_path)
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.account_id.startswith("imap-")
+    credentials_file = mail_account_token_file(runtime.config, account)
+    assert credentials_file.is_file()
+    assert credentials_file.stat().st_mode & 0o777 == 0o600
+    assert runtime.store.state(provider="imap", account_id=account.account_id)[0] == (IMAP_CURSOR)
+    encoded = json.dumps(response)
+    assert "private-password" not in encoded
+    assert "mail.example.com" not in encoded
+    assert str(tmp_path) not in encoded
+    assert len(opened_credentials) == 1
+
+
+def test_mail_account_reconnect_rejects_a_different_imap_identity_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'a' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: pytest.fail("identity mismatch must fail before opening IMAP"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "different@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "different@example.com",
+                    "password": "private-password",
+                },
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "account_identity_mismatch"
+    assert not destination.exists()
+
+
+def test_mail_account_reconnect_verifies_imap_and_preserves_existing_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'b' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        IMAP_CURSOR,
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    destination.parent.mkdir(parents=True)
+    write_credentials(destination, imap_credentials(password="old-password"))
+    probes = 0
+
+    class VerifiedImap:
+        def initial_cursor(self) -> str:
+            nonlocal probes
+            probes += 1
+            return REPLACEMENT_IMAP_CURSOR
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: VerifiedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "new-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert probes == 1
+    assert "new-password" in destination.read_text(encoding="utf-8")
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        IMAP_CURSOR
+    )
+
+
+def test_mail_account_reconnect_resets_cursor_when_server_mailbox_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'d' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        IMAP_CURSOR,
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    destination.parent.mkdir(parents=True)
+    write_credentials(destination, imap_credentials(host="old.example.com"))
+
+    class ReplacementImap:
+        def initial_cursor(self) -> str:
+            return REPLACEMENT_IMAP_CURSOR
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: ReplacementImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "replacement.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "new-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is True
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        REPLACEMENT_IMAP_CURSOR
+    )
+    assert "replacement.example.com" in destination.read_text(encoding="utf-8")
+
+
+def test_mail_account_reconnect_uses_retained_cursor_binding_after_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'e' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    retained_cursor = f"eom-imap-v2:{imap_mailbox_identity(imap_credentials())}:44:7"
+    runtime.store.set_state(
+        retained_cursor,
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+
+    class ReconnectedImap:
+        def initial_cursor(self) -> str:
+            return REPLACEMENT_IMAP_CURSOR
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: ReconnectedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "new-password",
+                },
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["baseline_initialized"] is False
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        retained_cursor
+    )
+
+
+def test_mail_account_reconnect_preserves_imap_credentials_when_probe_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'c' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        IMAP_CURSOR,
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    destination = mail_account_token_file(runtime.config, account)
+    destination.parent.mkdir(parents=True)
+    write_credentials(destination, imap_credentials(password="preserved-password"))
+    preserved = destination.read_text(encoding="utf-8")
+
+    class RejectedImap:
+        def initial_cursor(self) -> str:
+            raise ImapError("imap_authentication_failed", "Mail server rejected the credentials")
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda _path: RejectedImap(),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {
+                "provider": "imap",
+                "account_id": account.account_id,
+                "connection": {
+                    "email_address": "owner@example.com",
+                    "host": "mail.example.com",
+                    "port": 993,
+                    "security": "tls",
+                    "username": "owner@example.com",
+                    "password": "wrong-password",
+                },
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "imap_authentication_failed"
+    assert destination.read_text(encoding="utf-8") == preserved
+    assert runtime.store.state(provider=account.provider, account_id=account.account_id)[0] == (
+        IMAP_CURSOR
+    )
 
 
 def test_mail_account_reconnect_rejects_different_microsoft_identity_before_cache_replace(
@@ -1199,7 +1573,18 @@ def test_mail_account_activate_switches_one_connected_account_and_preserves_stat
     [
         ("mail.accounts.list", {"unexpected": True}, "invalid_request"),
         ("mail.accounts.connect", {"provider": False}, "invalid_request"),
-        ("mail.accounts.connect", {"provider": "imap"}, "unsupported_provider"),
+        ("mail.accounts.connect", {"provider": "pop3"}, "unsupported_provider"),
+        ("mail.accounts.connect", {"provider": "imap"}, "imap_configuration_error"),
+        (
+            "mail.accounts.connect",
+            {"provider": "gmail", "connection": {}},
+            "invalid_request",
+        ),
+        (
+            "mail.accounts.connect",
+            {"provider": "gmail", "connection": None},
+            "invalid_request",
+        ),
         (
             "mail.accounts.reconnect",
             {"provider": "gmail", "account_id": ""},
