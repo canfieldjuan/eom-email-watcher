@@ -7,7 +7,7 @@ After=eom-email-lmstudio.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h
+WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher
 ExecStart=%h/.local/bin/eom-mail-watch check
 Environment=PYTHONUNBUFFERED=1
 UMask=0077

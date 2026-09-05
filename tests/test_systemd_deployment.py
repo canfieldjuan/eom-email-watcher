@@ -9,7 +9,7 @@ MONTHLY_SERVICE = ROOT / "systemd" / "eom-monthly-hours.service"
 def test_installer_snapshots_cli_before_installing_units() -> None:
     script = INSTALLER.read_text()
 
-    locked_export = "uv export --locked --no-dev --no-emit-project"
+    locked_export = 'uv export --project "$repo_dir" --locked --no-dev --no-emit-project'
     snapshot = 'uv tool install --force --constraints "$constraints_file" "$repo_dir"'
     unit_install = 'install -m 0644 "$repo_dir/systemd/eom-email-watcher.service"'
     assert locked_export in script
@@ -28,5 +28,6 @@ def test_systemd_services_use_stable_cli_snapshot() -> None:
     assert "ExecStart=%h/.local/bin/eom-mail-watch send-hours" in monthly
     assert "/eom-email-watcher/.venv/" not in watcher
     assert "/eom-email-watcher/.venv/" not in monthly
-    assert "WorkingDirectory=%h" in watcher
-    assert "WorkingDirectory=%h" in monthly
+    working_directory = "WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher"
+    assert working_directory in watcher
+    assert working_directory in monthly

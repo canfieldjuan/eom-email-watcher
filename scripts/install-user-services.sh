@@ -14,7 +14,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 mkdir -p "$unit_dir" "$tool_bin_dir" "$tool_dir"
-uv export --locked --no-dev --no-emit-project --format requirements.txt \
+uv export --project "$repo_dir" --locked --no-dev --no-emit-project --format requirements.txt \
   --output-file "$constraints_file" >/dev/null
 UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
   uv tool install --force --constraints "$constraints_file" "$repo_dir"
