@@ -243,7 +243,11 @@ journalctl --user -u eom-email-watcher.service --since today
 The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
 not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
 loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
-watcher when LM Studio is absent or fails.
+watcher when LM Studio is absent or fails. The installer snapshots the current source revision and
+its locked production dependencies into an isolated `uv tool` environment, and both timers execute
+`~/.local/bin/eom-mail-watch`; changing the branch in a development checkout cannot silently
+downgrade the production watcher. Rerun the installer from the intended revision to update that
+service snapshot.
 
 ## Model output and safety
 
