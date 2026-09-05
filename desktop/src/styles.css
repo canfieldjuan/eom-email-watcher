@@ -108,8 +108,8 @@ h1 {
   outline-offset: 2px;
 }
 
-.view[hidden] {
-  display: none;
+[hidden] {
+  display: none !important;
 }
 
 h2 {
