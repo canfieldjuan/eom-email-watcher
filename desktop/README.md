@@ -62,6 +62,13 @@ watcher remains the production polling path while equivalent live behavior is ev
 production check lock continues to fail closed if both schedulers overlap. Scheduled engine
 processes have a 30-minute upper bound, and wall-clock deadline checks catch up after system resume.
 
+Health can also connect any compatible read-only IMAP account through **Other mail server**. The
+native form accepts TLS or STARTTLS, the mailbox address, incoming-server credentials, and an
+optional private CA certificate selected through the operating-system picker. The frontend never
+reads saved credentials back: reconnecting requires the server details and password again, and the
+engine verifies staged credentials before replacing the owner-private local credential file. SMTP
+and source-mail mutation are not supported.
+
 ## Development prerequisites
 
 - the repository's Python 3.13/uv environment (`uv sync --locked --all-groups` at the repo root)

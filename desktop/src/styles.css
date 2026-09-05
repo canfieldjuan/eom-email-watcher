@@ -763,6 +763,104 @@ select:focus {
   gap: 7px;
 }
 
+.health-card .mail-server-panel {
+  margin: 16px 0 0;
+  padding-top: 16px;
+  border-top: 1px solid #d7ded8;
+  font-family: inherit;
+  font-size: 0.88rem;
+  font-weight: 400;
+}
+
+.mail-server-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px 16px;
+}
+
+.mail-server-heading,
+.mail-server-row,
+.mail-server-ca,
+.mail-server-note,
+.mail-server-form > button {
+  grid-column: 1 / -1;
+}
+
+.mail-server-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.mail-server-heading h3,
+.mail-server-heading p,
+.mail-server-note {
+  margin: 0;
+}
+
+.mail-server-heading h3 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.1rem;
+}
+
+.mail-server-heading p,
+.mail-server-note,
+.mail-server-ca span {
+  color: #657068;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.mail-server-form label {
+  display: grid;
+  gap: 6px;
+  color: #354239;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.mail-server-form input,
+.mail-server-form select {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #c8d1ca;
+  border-radius: 8px;
+  color: #17211b;
+  background: #fff;
+}
+
+.mail-server-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.mail-server-ca {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mail-server-form > button[type="submit"] {
+  justify-self: start;
+  padding: 9px 13px;
+  border: 0;
+  border-radius: 8px;
+  color: #fff;
+  background: #245c40;
+  font-weight: 800;
+}
+
+.mail-server-form input:focus-visible,
+.mail-server-form select:focus-visible,
+.mail-server-form button:focus-visible {
+  outline: 3px solid rgb(46 107 76 / 25%);
+  outline-offset: 2px;
+}
+
 .mail-account-actions .danger-action {
   border-color: #d9aaa7;
   color: #8f2f2b;
@@ -810,6 +908,19 @@ select:focus {
 
   .settings-form {
     grid-template-columns: 1fr;
+  }
+
+  .mail-server-form {
+    grid-template-columns: 1fr;
+  }
+
+  .mail-server-row {
+    grid-template-columns: 1fr;
+  }
+
+  .mail-server-heading {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .sender-form button {
