@@ -294,3 +294,33 @@ def test_post_login_protocol_error_is_categorized_without_server_detail() -> Non
     assert raised.value.code == "imap_protocol_error"
     assert "private protocol detail" not in str(raised.value)
     assert client.logged_out is True
+
+
+def test_inbox_selection_error_is_protocol_not_authentication() -> None:
+    client = FakeImap()
+
+    def reject_select(mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
+        raise imaplib.IMAP4.error("private selection detail")
+
+    client.select = reject_select  # type: ignore[method-assign]
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    with pytest.raises(ImapError) as raised:
+        gateway.initial_cursor()
+
+    assert raised.value.code == "imap_protocol_error"
+    assert "private selection detail" not in str(raised.value)
+    assert client.logged_out is True
+
+
+def test_tls_failure_is_categorized_without_endpoint_detail() -> None:
+    def reject_tls(_credentials: ImapCredentials, _context: ssl.SSLContext) -> FakeImap:
+        raise ssl.SSLCertVerificationError("private endpoint detail")
+
+    gateway = ImapGateway(credentials(), reject_tls)
+
+    with pytest.raises(ImapError) as raised:
+        gateway.initial_cursor()
+
+    assert raised.value.code == "imap_tls_failed"
+    assert "private endpoint detail" not in str(raised.value)

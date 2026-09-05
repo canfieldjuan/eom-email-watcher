@@ -356,7 +356,12 @@ class ImapGateway:
             credentials.port,
             timeout=IMAP_TIMEOUT_SECONDS,
         )
-        status, _response = client.starttls(ssl_context=context)
+        try:
+            status, _response = client.starttls(ssl_context=context)
+        except (imaplib.IMAP4.error, ssl.SSLError, OSError, TimeoutError) as exc:
+            with contextlib.suppress(Exception):
+                client.logout()
+            raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS") from exc
         if status != "OK":
             with contextlib.suppress(Exception):
                 client.logout()
@@ -365,44 +370,45 @@ class ImapGateway:
 
     @contextlib.contextmanager
     def _mailbox(self) -> Iterator[imaplib.IMAP4]:
-        client: imaplib.IMAP4 | None = None
         try:
             context = ssl.create_default_context(cadata=self.credentials.ca_pem)
             client = self._client_factory(self.credentials, context)
+        except ImapError:
+            raise
+        except (ssl.SSLError, ssl.CertificateError) as exc:
+            raise ImapError("imap_tls_failed", "Mail server TLS verification failed") from exc
+        except (OSError, TimeoutError) as exc:
+            raise ImapError(
+                "imap_connection_failed", "Mail server connection failed; retry"
+            ) from exc
+
+        try:
             status, _response = client.login(self.credentials.username, self.credentials.password)
             if status != "OK":
                 raise ImapError(
                     "imap_authentication_failed", "Mail server rejected the credentials"
                 )
-            status, _response = client.select("INBOX", readonly=True)
-            if status != "OK":
-                raise ImapError("imap_protocol_error", "Mail server INBOX is unavailable")
         except ImapError:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    client.logout()
+            with contextlib.suppress(Exception):
+                client.logout()
             raise
         except imaplib.IMAP4.error as exc:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    client.logout()
+            with contextlib.suppress(Exception):
+                client.logout()
             raise ImapError(
                 "imap_authentication_failed", "Mail server rejected the credentials"
             ) from exc
-        except (ssl.SSLError, ssl.CertificateError) as exc:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    client.logout()
-            raise ImapError("imap_tls_failed", "Mail server TLS verification failed") from exc
         except (OSError, TimeoutError) as exc:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    client.logout()
+            with contextlib.suppress(Exception):
+                client.logout()
             raise ImapError(
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
-        assert client is not None
+
         try:
+            status, _response = client.select("INBOX", readonly=True)
+            if status != "OK":
+                raise ImapError("imap_protocol_error", "Mail server INBOX is unavailable")
             yield client
         except ImapError:
             raise
