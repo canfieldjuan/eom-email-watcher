@@ -37,6 +37,9 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+  "integration: opt-in tests against ephemeral local services",
+]
 
 [tool.ruff]
 line-length = 100

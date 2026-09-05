@@ -142,6 +142,18 @@ uv run eom-mail-watch requeue-analysis MESSAGE_ID
 `--dry-run` does not advance the active mailbox cursor, add database rows, or send real
 notifications.
 
+Run the opt-in real-IMAP integration proof with Docker and OpenSSL available:
+
+```bash
+bash scripts/test-imap-greenmail.sh
+```
+
+The script starts a pinned GreenMail container on random loopback-only ports, creates a temporary
+TLS certificate, and proves real authentication, baseline cursor setup, new-message polling, MIME
+and PDF attachment reads, and unchanged source message flags. It stops the container and removes
+the temporary certificate material when the test exits. SMTP is used only to seed the isolated
+test mailbox; the application does not expose an SMTP or source-mail write adapter.
+
 Desktop hosts use the versioned one-shot JSON contract documented in
 [`docs/ENGINE_API.md`](docs/ENGINE_API.md). The existing human CLI remains the Linux/systemd entry
 point.
