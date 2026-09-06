@@ -1016,7 +1016,31 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     assert rejected["error"]["code"] == "calendar_entitlement_required"
 
     original = microsoft_principal()
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.parent.mkdir(parents=True, exist_ok=True)
+    calendar_token.write_text("preserved-calendar-cache", encoding="utf-8")
     monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: microsoft_principal(object_id="replacement-object"),
+    )
+
+    stale_binding = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert stale_binding["data"]["state"] == "ready"
+    assert stale_binding["data"]["available"] is False
+
     monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: original)
 
     def consent_pending(*args):
@@ -1031,6 +1055,8 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
 
     assert pending["data"]["state"] == "consent_pending"
     assert pending["data"]["available"] is False
+    assert runtime.store.calendar_grant(account.account_id).state == "consent_pending"
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
 
     runtime.store.set_calendar_grant(
         account.account_id,
@@ -1042,9 +1068,6 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
         object_id=original.object_id,
         email_address=original.email_address,
     )
-    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
-    calendar_token.parent.mkdir(parents=True, exist_ok=True)
-    calendar_token.write_text("preserved-calendar-cache", encoding="utf-8")
 
     class WrongCalendar:
         principal = microsoft_principal(object_id="object-2")

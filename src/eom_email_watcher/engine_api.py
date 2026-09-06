@@ -833,11 +833,24 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
     grant = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
     token_configured = microsoft_calendar_read_token_file(runtime.config, account).is_file()
     state = grant.state if grant is not None else "not_requested"
+    principal_matches = False
     if state == "ready" and not token_configured:
         state = "revoked"
+    elif entitlement_active and state == "ready" and grant is not None:
+        try:
+            mailbox_principal = microsoft_mailbox_principal(
+                runtime.config.microsoft_credentials_file,
+                mail_account_token_file(runtime.config, account),
+            )
+        except Microsoft365Error:
+            pass
+        else:
+            principal_matches = mailbox_principal.key == grant.principal_key
     return {
         "account_id": account.account_id,
-        "available": entitlement_active and state == "ready" and token_configured,
+        "available": (
+            entitlement_active and state == "ready" and token_configured and principal_matches
+        ),
         "entitlement_active": entitlement_active,
         "profile": CALENDAR_READ_PROFILE,
         "scope": "Calendars.Read",
@@ -881,13 +894,12 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     staged_token,
                 )
             except MicrosoftCalendarConsentPending:
-                if previous is None or previous.state != "ready":
-                    runtime.store.set_calendar_grant(
-                        account.account_id,
-                        CALENDAR_READ_PROFILE,
-                        "consent_pending",
-                        **_calendar_grant_identity(previous),
-                    )
+                runtime.store.set_calendar_grant(
+                    account.account_id,
+                    CALENDAR_READ_PROFILE,
+                    "consent_pending",
+                    **_calendar_grant_identity(previous),
+                )
                 return _calendar_read_status_data(runtime, account)
             except MicrosoftAuthorizationRejected as exc:
                 if previous is None or previous.state != "ready":
