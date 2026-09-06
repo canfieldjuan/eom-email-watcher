@@ -264,7 +264,9 @@ One delta round is bounded before persistence by all of the following:
 - at most 64 Graph pages;
 - at most 3,200 event or tombstone entries;
 - at most 2 MiB of response bytes per page and 16 MiB in the complete round; and
-- at most 32 KiB in any accepted continuation URL.
+- at most 32 KiB in any accepted continuation URL; and
+- at most 300 seconds for the complete round, with each HTTP call capped by the
+  smaller of the existing per-request timeout and the remaining round time.
 
 Crossing any bound, receiving redirects, receiving both or neither continuation
 fields, receiving malformed event data, or receiving an unexpected Graph status
@@ -614,7 +616,8 @@ evidence; items 2–5 remain pending:
    2-MiB page passes, one byte over fails before JSON parsing, and a hostile or
    wrong-path continuation cannot reach the HTTP client. A stale-cursor fixture
    proves exactly one initial replacement is attempted while the prior completed
-   projection stays readable if replacement fails.
+   projection stays readable if replacement fails. A simulated clock proves the
+   round deadline stops pagination even when the page-count limit has room.
 9. The live account proves proposal consent and a real `findMeetingTimes` domain
    result; a no-suggestions fixture records the reason, reaches `manual_review`,
    and never creates an empty confirmation.
