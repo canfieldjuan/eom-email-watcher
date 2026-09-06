@@ -402,14 +402,16 @@ automation version.
 Minimum flow:
 
 ```text
-detected -> extracting -> ambiguous | manual_review | source_unavailable
+detected -> extracting -> ambiguous | manual_review
                       \-> proposing -> awaiting_confirmation
                                    \-> manual_review
 awaiting_confirmation -> proposing  # revise or expire and re-propose
 awaiting_confirmation -> declined
 awaiting_confirmation -> write_authorized -> writing -> completed
                                                \------> failed | unresolved
-unresolved -> reconciling -> completed | failed | unresolved
+detected | extracting | proposing | awaiting_confirmation -> source_unavailable
+write_authorized --source removed before submission begins--> source_unavailable
+unresolved -> reconciling -> completed | unresolved
 ```
 
 `detected` and `extracting` are recoverable work states. Each extraction attempt
@@ -420,24 +422,45 @@ the source message is no longer retrievable, the run records a structured
 must not remain indefinitely in `extracting`. Raw content is not added to the
 message or automation tables to provide this recovery.
 
-The run and event history record the source message identity without copying the
-raw body, extraction/result schema versions, proposal content and hash, calendar
-account identity, user decision, decision timestamp, confirmed proposal hash,
-stable Graph `transactionId`, Graph event identity when known, and structured
-failure or unresolved reason.
+Each event uses an immutable non-content envelope. The current run projection
+stores the corresponding non-content fields plus references to separately
+deletable payload rows. An envelope records opaque run/event identifiers,
+ordering and state versions, automation and schema versions, transition kind,
+non-reversible content hashes, calendar account's immutable identity, decision
+and transition timestamps, stable Graph `transactionId`, Graph event identity
+when known, and structured failure or unresolved codes. Subject, attendees,
+location, evidence, proposal content, display labels, and other copied message
+data live only in the payload rows. Appending an envelope, inserting its payload,
+and updating the run projection remain one transaction; deleting a payload later
+neither rewrites nor removes its envelope.
 
 Copied automation payload follows the source message's configured retention and
 local privacy operations. When watcher retention, `inbox.delete`, or
 `inbox.clear` removes the source, the same transaction removes copied subjects,
 attendee addresses, locations, extracted evidence, and proposal content from the
-automation ledger and events. A pre-write run becomes `source_unavailable`,
-emits the human-review notification, and can never write. A run that reached
-`write_authorized`, `writing`, or `unresolved` is not relabeled failed: it keeps
-its truthful state and is compacted to a reconciliation tombstone containing
-only the automation identifier/version, prior state, stable transaction ID,
-target account's immutable principal ID, bounded start/end reconciliation
-window, Graph event ID when known, non-reversible trigger/proposal hashes, and
-timestamps. Terminal runs are compacted to the same non-content form.
+automation payload rows. A run in `detected`, `extracting`, `proposing`, or
+`awaiting_confirmation` becomes `source_unavailable`, emits the human-review
+notification, and can never write.
+
+The write worker and source cleanup take the same operation lock. If cleanup
+wins while a run is `write_authorized` and no first POST has begun, cleanup
+transitions it to `source_unavailable` and permanently cancels the authorization.
+The worker may enter `writing` only while holding that lock, after rechecking the
+source and durable confirmed proposal, and it holds the lock until the bounded
+POST returns and the outcome commits. Therefore ordinary cleanup cannot remove
+the request between authorization and first submission. If a crash makes an
+in-flight write ambiguous, recovery moves it to `unresolved`; it never assumes
+the POST was unsent.
+
+A run in `writing` or `unresolved` is not relabeled failed during cleanup: it
+keeps its truthful state and is compacted to a reconciliation tombstone
+containing only the automation identifier/version, prior state, stable
+transaction ID, target account's immutable principal ID, bounded start/end
+reconciliation window, Graph event ID when known, non-reversible
+trigger/proposal hashes, and timestamps. No new write retry is permitted after
+the separately stored request payload has been removed; only bounded
+reconciliation may continue. Terminal runs are compacted to the same non-content
+form.
 
 The tombstone contains no subject, attendee address, location, evidence,
 message body, raw provider message ID, token, or cache path. It expires no later
@@ -554,10 +577,14 @@ evidence; items 2–5 remain pending:
     grants. Missing, pending, or revoked consent leaves mailbox monitoring
     healthy and truthfully reports calendar unavailability.
 23. Retention and local-delete fixtures prove all copied automation content is
-    removed atomically with its source, pre-write runs become non-writing
-    `source_unavailable`, and an ambiguous write retains only the bounded
-    non-content reconciliation tombstone without being relabeled failed.
-    Boundary fixtures prove expiry purges the tombstone and blocks replay.
+    removed atomically with its source, immutable event envelopes retain no
+    copied content, and every pre-submit state has an explicit non-writing
+    `source_unavailable` transition. A race fixture proves cleanup before the
+    first POST cancels a `write_authorized` run, while submission holding the
+    operation lock commits an outcome before cleanup proceeds. An ambiguous
+    write retains only the bounded non-content reconciliation tombstone without
+    being relabeled failed. Boundary fixtures prove expiry purges the tombstone
+    and blocks replay.
 
 Live evidence must identify the tested application revision and sanitized
 account/tenant class. A mocked Graph response cannot substitute for the required
