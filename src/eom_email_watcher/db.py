@@ -1286,6 +1286,19 @@ class Store:
         assert grant is not None
         return grant
 
+    def revoke_calendar_grant_if_current(self, grant: CalendarGrant) -> bool:
+        """Persist revocation only if validation still describes the stored grant."""
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            cursor = db.execute(
+                """UPDATE microsoft_calendar_grants
+                SET state = 'revoked', updated_at = ?
+                WHERE account_id = ? AND profile = ?
+                    AND state = 'ready' AND updated_at = ?""",
+                (stamp, grant.account_id, grant.profile, grant.updated_at),
+            )
+        return cursor.rowcount == 1
+
     def disconnect_calendar_read(self, account_id: str) -> CalendarGrant:
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:

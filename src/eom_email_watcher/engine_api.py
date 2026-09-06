@@ -880,6 +880,8 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
                     pass
                 else:
                     principal_matches = mailbox_principal.key == grant.principal_key
+    if state == "revoked" and grant is not None:
+        runtime.store.revoke_calendar_grant_if_current(grant)
     return {
         "account_id": account.account_id,
         "available": (
@@ -960,7 +962,14 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     "calendar_principal_mismatch",
                     "The authorized calendar does not match the existing calendar principal",
                 )
-            _install_private_token(staged_token, token_file)
+            try:
+                _install_private_token(staged_token, token_file)
+            except (MailboxAccountUnavailable, OSError) as exc:
+                _restore_calendar_grant(runtime, account.account_id, previous)
+                raise ApiError(
+                    "calendar_error",
+                    "Microsoft calendar authorization could not be saved; retry",
+                ) from exc
             runtime.store.set_calendar_grant(
                 account.account_id,
                 CALENDAR_READ_PROFILE,

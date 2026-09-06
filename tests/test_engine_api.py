@@ -1052,6 +1052,20 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
 
     assert revoked_cache["data"]["state"] == "revoked"
     assert revoked_cache["data"]["available"] is False
+    revoked_grant = runtime.store.calendar_grant(account.account_id)
+    assert revoked_grant.state == "revoked"
+    assert revoked_grant.principal_key == original.key
+
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
 
     monkeypatch.setattr(
         engine_api.MicrosoftCalendarReadAuthorization,
@@ -1123,6 +1137,48 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     assert runtime.store.calendar_grant(account.account_id).state == "ready"
     assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
     assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
+    class AuthorizedCalendar:
+        principal = original
+
+    def authorize_current(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("replacement-calendar-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    def fail_token_install(source: Path, destination: Path) -> None:
+        raise OSError("calendar cache destination is unavailable")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize_current,
+    )
+    monkeypatch.setattr(engine_api, "_install_private_token", fail_token_install)
+    install_failure = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert install_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
+    assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
+    runtime.store.disconnect_calendar_read(account.account_id)
+    first_attempt_failure = engine_api._response(
+        request(config_path, "calendar.read.connect", payload)
+    )
+
+    assert first_attempt_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "not_requested"
+
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
 
     class WrongCalendar:
         principal = microsoft_principal(object_id="object-2")
