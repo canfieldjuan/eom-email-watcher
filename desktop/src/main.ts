@@ -308,70 +308,76 @@ app.innerHTML = `
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
-      <form id="inbox-filter-form" class="inbox-filter-form">
-        <label>
-          <span>Subject or summary</span>
-          <input id="inbox-keyword" name="keyword" maxlength="200" />
-        </label>
-        <label>
-          <span>Sender</span>
-          <input id="inbox-sender" name="sender" maxlength="320" />
-        </label>
-        <label>
-          <span>Email account</span>
-          <select id="inbox-account" name="account">
-            <option value="active">Active account</option>
-            <option value="all">All retained accounts</option>
-          </select>
-        </label>
-        <label>
-          <span>Priority</span>
-          <select id="inbox-priority" name="priority">
-            <option value="">Any priority</option>
-            <option value="urgent">Urgent</option>
-            <option value="high">High</option>
-            <option value="normal">Normal</option>
-            <option value="low">Low</option>
-            <option value="untriaged">Untriaged</option>
-          </select>
-        </label>
-        <label>
-          <span>Topic</span>
-          <select id="inbox-category" name="category">
-            <option value="">Any topic</option>
-            <option value="invoice">Invoice</option>
-            <option value="scheduling">Scheduling</option>
-            <option value="customer_request">Customer request</option>
-            <option value="automated_notice">Automated notice</option>
-            <option value="informational">Informational</option>
-            <option value="other">Other</option>
-            <option value="unclassified">Unclassified</option>
-          </select>
-        </label>
-        <label>
-          <span>Status</span>
-          <select id="inbox-state" name="status">
-            <option value="">Any status</option>
-            <option value="pending">Pending</option>
-            <option value="analyzed">Analyzed</option>
-            <option value="summarized">Notified</option>
-            <option value="skipped">Unavailable</option>
-          </select>
-        </label>
-        <label>
-          <span>Page size</span>
-          <select id="inbox-page-size" name="pageSize">
-            <option value="10">10</option>
-            <option value="25" selected>25</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-        </label>
-        <div class="inbox-filter-actions">
-          <button type="submit">Apply filters</button>
-          <button id="inbox-reset" class="secondary-action" type="button">Reset</button>
-        </div>
-      </form>
+      <details class="inbox-filter-panel" open>
+        <summary>
+          <span>Inbox filters</span>
+          <span class="inbox-filter-summary">Sender, priority, topic and more</span>
+        </summary>
+        <form id="inbox-filter-form" class="inbox-filter-form">
+          <label>
+            <span>Subject or summary</span>
+            <input id="inbox-keyword" name="keyword" maxlength="200" />
+          </label>
+          <label>
+            <span>Sender</span>
+            <input id="inbox-sender" name="sender" maxlength="320" />
+          </label>
+          <label>
+            <span>Email account</span>
+            <select id="inbox-account" name="account">
+              <option value="active">Active account</option>
+              <option value="all">All retained accounts</option>
+            </select>
+          </label>
+          <label>
+            <span>Priority</span>
+            <select id="inbox-priority" name="priority">
+              <option value="">Any priority</option>
+              <option value="urgent">Urgent</option>
+              <option value="high">High</option>
+              <option value="normal">Normal</option>
+              <option value="low">Low</option>
+              <option value="untriaged">Untriaged</option>
+            </select>
+          </label>
+          <label>
+            <span>Topic</span>
+            <select id="inbox-category" name="category">
+              <option value="">Any topic</option>
+              <option value="invoice">Invoice</option>
+              <option value="scheduling">Scheduling</option>
+              <option value="customer_request">Customer request</option>
+              <option value="automated_notice">Automated notice</option>
+              <option value="informational">Informational</option>
+              <option value="other">Other</option>
+              <option value="unclassified">Unclassified</option>
+            </select>
+          </label>
+          <label>
+            <span>Status</span>
+            <select id="inbox-state" name="status">
+              <option value="">Any status</option>
+              <option value="pending">Pending</option>
+              <option value="analyzed">Analyzed</option>
+              <option value="summarized">Notified</option>
+              <option value="skipped">Unavailable</option>
+            </select>
+          </label>
+          <label>
+            <span>Page size</span>
+            <select id="inbox-page-size" name="pageSize">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <div class="inbox-filter-actions">
+            <button type="submit">Apply filters</button>
+            <button id="inbox-reset" class="secondary-action" type="button">Reset</button>
+          </div>
+        </form>
+      </details>
       <p id="inbox-status" class="status" role="status" aria-live="polite">Loading inbox…</p>
       <ul id="inbox-list" class="inbox-list" aria-label="Recent watched messages"></ul>
       <div class="inbox-page-actions">
