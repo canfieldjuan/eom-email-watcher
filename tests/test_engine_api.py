@@ -991,6 +991,22 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
     assert "home_account_id" not in encoded
     assert str(tmp_path) not in encoded
 
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        lambda *args: pytest.fail("Authorization started without a staging directory"),
+    )
+
+    def staging_unavailable(*args, **kwargs):
+        raise OSError("calendar staging directory is unavailable")
+
+    monkeypatch.setattr(engine_api.tempfile, "TemporaryDirectory", staging_unavailable)
+    staging_failure = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert staging_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id) == grant
+    assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
+
 
 def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     tmp_path: Path,

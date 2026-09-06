@@ -919,17 +919,24 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
             raise ApiError("calendar_error", str(exc)) from exc
         token_file = microsoft_calendar_read_token_file(runtime.config, account)
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        runtime.store.set_calendar_grant(
-            account.account_id,
-            CALENDAR_READ_PROFILE,
-            "consent_pending",
-            **_calendar_grant_identity(previous),
-        )
-        with tempfile.TemporaryDirectory(
-            prefix=".calendar-read-authorization-",
-            dir=token_file.parent,
-        ) as directory:
+        try:
+            authorization_directory = tempfile.TemporaryDirectory(
+                prefix=".calendar-read-authorization-",
+                dir=token_file.parent,
+            )
+        except OSError as exc:
+            raise ApiError(
+                "calendar_error",
+                "Microsoft calendar authorization could not be staged; retry",
+            ) from exc
+        with authorization_directory as directory:
             staged_token = Path(directory) / "calendar-read.msal-cache.json"
+            runtime.store.set_calendar_grant(
+                account.account_id,
+                CALENDAR_READ_PROFILE,
+                "consent_pending",
+                **_calendar_grant_identity(previous),
+            )
             try:
                 calendar, _changed = MicrosoftCalendarReadAuthorization.authorize_with_status(
                     runtime.config.microsoft_credentials_file,
