@@ -952,6 +952,7 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
         principal = microsoft_principal()
 
     def authorize(credentials_file: Path, staged_token: Path):
+        assert runtime.store.calendar_grant(account.account_id).state == "consent_pending"
         staged_token.write_text("calendar-read-cache", encoding="utf-8")
         return AuthorizedCalendar(), True
 
@@ -959,6 +960,11 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
         engine_api.MicrosoftCalendarReadAuthorization,
         "authorize_with_status",
         authorize,
+    )
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: AuthorizedCalendar(),
     )
     payload = {"provider": account.provider, "account_id": account.account_id}
 
@@ -1030,6 +1036,40 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     calendar_token.parent.mkdir(parents=True, exist_ok=True)
     calendar_token.write_text("preserved-calendar-cache", encoding="utf-8")
     monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+
+    class CurrentCalendar:
+        principal = original
+
+    def rejected_calendar_cache(*args):
+        raise engine_api.MicrosoftAuthorizationRejected("Calendar cache was revoked")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        rejected_calendar_cache,
+    )
+    revoked_cache = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert revoked_cache["data"]["state"] == "revoked"
+    assert revoked_cache["data"]["available"] is False
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: CurrentCalendar(),
+    )
+
+    def rejected_mailbox_cache(*args):
+        raise engine_api.MicrosoftAuthorizationRejected("Mailbox cache was revoked")
+
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", rejected_mailbox_cache)
+    unavailable_mailbox = engine_api._response(
+        request(config_path, "calendar.read.status", payload)
+    )
+
+    assert unavailable_mailbox["data"]["state"] == "ready"
+    assert unavailable_mailbox["data"]["available"] is False
+
     monkeypatch.setattr(
         engine_api,
         "microsoft_mailbox_principal",
@@ -1087,6 +1127,7 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     assert mismatch["error"]["code"] == "account_identity_mismatch"
     assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
     assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
 
 
 def test_calendar_read_disconnect_preserves_mailbox_authorization(

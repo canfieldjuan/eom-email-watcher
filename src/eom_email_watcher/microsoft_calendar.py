@@ -136,6 +136,41 @@ class MicrosoftCalendarReadAuthorization:
         self.principal = principal
 
     @classmethod
+    def from_token(
+        cls,
+        credentials_file: Path,
+        token_file: Path,
+    ) -> MicrosoftCalendarReadAuthorization:
+        configuration = load_microsoft_public_client(credentials_file)
+        if not token_file.is_file():
+            raise MicrosoftAuthorizationRejected("Microsoft calendar is not authorized")
+        try:
+            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+                cache = _load_cache(token_file)
+                application = _new_public_client(configuration, cache)
+                accounts = application.get_accounts()
+                if not isinstance(accounts, list) or len(accounts) != 1:
+                    raise MicrosoftAuthorizationRejected(
+                        "Microsoft calendar cache does not identify one principal"
+                    )
+                result = _authorization_result(
+                    application.acquire_token_silent_with_error(
+                        list(CALENDAR_READ_SCOPES),
+                        account=accounts[0],
+                    )
+                )
+                principal = _principal(result, accounts[0])
+                if cache.has_state_changed:
+                    _write_private_cache(token_file, cache)
+        except FileLockTimeout as exc:
+            raise Microsoft365Error("Microsoft calendar cache is busy; retry") from exc
+        except Microsoft365Error:
+            raise
+        except Exception as exc:
+            raise Microsoft365Error("Microsoft calendar authorization failed; retry") from exc
+        return cls(principal)
+
+    @classmethod
     def authorize_with_status(
         cls,
         credentials_file: Path,

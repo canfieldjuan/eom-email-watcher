@@ -107,6 +107,52 @@ def test_calendar_authorization_requests_only_read_and_records_immutable_princip
     assert token_file.stat().st_mode & 0o777 == 0o600
 
 
+def test_calendar_cache_validation_requests_only_calendar_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    token_file = tmp_path / "calendar-read-cache.json"
+    write_public_client(credentials)
+    token_file.write_text("private-cache", encoding="utf-8")
+    cache = FakeCache()
+    calls: list[list[str]] = []
+
+    class FakeApplication:
+        def acquire_token_silent_with_error(self, scopes: list[str], *, account: object):
+            calls.append(scopes)
+            return {
+                "access_token": "private-access",
+                "id_token_claims": {
+                    "preferred_username": "owner@example.com",
+                    "tid": TENANT_ID,
+                    "oid": OBJECT_ID,
+                },
+            }
+
+        def get_accounts(self):
+            return [
+                {
+                    "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+                    "local_account_id": OBJECT_ID,
+                    "realm": TENANT_ID,
+                    "username": "owner@example.com",
+                }
+            ]
+
+    monkeypatch.setattr(microsoft_calendar, "_load_cache", lambda path: cache)
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda configuration, selected_cache: FakeApplication(),
+    )
+
+    authorization = MicrosoftCalendarReadAuthorization.from_token(credentials, token_file)
+
+    assert authorization.principal == principal()
+    assert calls == [["Calendars.Read"]]
+
+
 def test_mailbox_principal_lookup_requests_only_mail_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
