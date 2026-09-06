@@ -141,16 +141,19 @@ Microsoft principal selected for the automation. The durable identity uses the
 MSAL home-account identifier together with tenant/object claims when available;
 a normalized email address is display/diagnostic metadata, not an identity key.
 An immutable-principal mismatch is rejected before a cache replaces the previous
-cache. The run binds that same principal before confirmation.
+cache or changes the profile's current consent state. The run binds that same
+principal before confirmation.
 
 ### Consent state
 
 Each calendar profile has an independent public state:
 
 ```text
-not_requested -> consent_pending -> ready
-                            \----> rejected
+not_requested -> consent_pending
+consent_pending -> ready | rejected
 ready -> consent_pending | revoked
+rejected | revoked -> consent_pending
+any state --disconnect--> not_requested
 ```
 
 `consent_pending` is nonterminal and is not an operational failure. It means the
@@ -161,10 +164,12 @@ administrator approval. Mail polling continues in every calendar consent state.
 
 Each calendar profile has its own explicit disconnect action. Disconnect takes
 the existing mailbox operation lock, safely removes only that profile's cache,
-and immediately makes the dependent internal capability unavailable. Disconnecting
-the Microsoft mailbox also disables all email-driven calendar automation even if
-a separately consented calendar cache remains; it does not silently delete those
-separate grants. The user can remove each calendar grant independently.
+resets that profile to `not_requested`, and immediately makes the dependent
+internal capability unavailable. A rejected or revoked profile may begin a new
+explicit consent attempt. Disconnecting the Microsoft mailbox also disables all
+email-driven calendar automation even if a separately consented calendar cache
+remains; it does not silently delete those separate grants. The user can remove
+each calendar grant independently.
 
 ## Microsoft calendar adapter
 
@@ -215,7 +220,10 @@ POST https://graph.microsoft.com/v1.0/me/findMeetingTimes
 
 The proposal operation is read-only even though Graph exposes it as `POST`. It
 may return no suggestions and a reason; that is a valid domain result, not a
-transport failure. It cannot create, update, invite, or cancel an event.
+transport failure. A no-suggestions result records the bounded request and
+Graph reason, transitions the run from `proposing` to `manual_review`, and asks
+the user to revise the scheduling constraints; it never creates an empty
+confirmation. It cannot create, update, invite, or cancel an event.
 
 ### Confirmed writes
 
@@ -349,14 +357,23 @@ automation version.
 Minimum flow:
 
 ```text
-detected -> extracting -> ambiguous
-                      \-> manual_review
+detected -> extracting -> ambiguous | manual_review | source_unavailable
                       \-> proposing -> awaiting_confirmation
+                                   \-> manual_review
+awaiting_confirmation -> proposing  # revise or expire and re-propose
 awaiting_confirmation -> declined
 awaiting_confirmation -> write_authorized -> writing -> completed
                                                \------> failed | unresolved
 unresolved -> reconciling -> completed | failed | unresolved
 ```
+
+`detected` and `extracting` are recoverable work states. Each extraction attempt
+fetches the source message through the mailbox adapter and holds the raw content
+only in process memory. A restart retries either state. If the provider proves
+the source message is no longer retrievable, the run records a structured
+`source_unavailable` terminal outcome and emits a human-review notification; it
+must not remain indefinitely in `extracting`. Raw content is not added to the
+message or automation tables to provide this recovery.
 
 The run and event history record the source message identity without copying the
 raw body, extraction/result schema versions, proposal content and hash, calendar
@@ -378,8 +395,14 @@ invitations to those addresses. The user may confirm that exact version, revise
 it into a new proposal version, or decline it.
 
 Confirmation is single-run, single-proposal, and non-transferable. Changing any
-effect-bearing field invalidates prior confirmation. Repeated clicks and stale UI
-versions cannot create another write. Version 1 has no automatic write mode.
+effect-bearing field invalidates prior confirmation. Each proposal durably
+records its availability-observation time and expires at the earlier of fifteen
+minutes after that observation or the proposed start. Confirmation admission
+must compare the current time with that expiry and require a future start. An
+expired proposal returns to `proposing`, refreshes availability, and requires a
+new proposal version and confirmation; it cannot authorize a write. Repeated
+clicks and stale UI versions cannot create another write. Version 1 has no
+automatic write mode.
 
 ## Acceptance evidence for later implementation
 
@@ -392,30 +415,44 @@ merged code:
    their exact profile scope and write distinct private caches.
 3. Scope-boundary fixtures prove that broader tenant consent or another local
    cache cannot make a call site request a scope outside its exact allowlist.
-4. A live work-or-school Microsoft 365 test account proves calendar-read consent
+4. A cross-principal negative fixture proves a mismatched grant cannot replace
+   the existing cache, change its consent state, or bind to an automation run.
+5. Consent fixtures prove rejected and revoked profiles can restart explicit
+   consent, and disconnect removes only the selected cache and resets that
+   profile to `not_requested`.
+6. A live work-or-school Microsoft 365 test account proves calendar-read consent
    and a complete `/me/calendarView/delta` round with persisted continuation.
-5. An initial-plus-subsequent delta fixture proves unchanged events remain,
+7. An initial-plus-subsequent delta fixture proves unchanged events remain,
    tombstones remove deleted events, and cursor/projection changes roll back
    together at an injected crash point.
-6. The live account proves proposal consent and a real `findMeetingTimes` domain
-   result, including the valid no-suggestions case.
-7. A watched-sender scheduling fixture reaches a durable proposal and native
+8. The live account proves proposal consent and a real `findMeetingTimes` domain
+   result; a no-suggestions fixture records the reason, reaches `manual_review`,
+   and never creates an empty confirmation.
+9. A watched-sender scheduling fixture reaches a durable proposal and native
    confirmation UI without writing an event.
-8. Atomic-admission crash probes prove analysis completion cannot lose or
-   duplicate the one run keyed to the source message and automation version.
-9. Ambiguous, reschedule, and cancellation negative controls record their
+10. Atomic-admission and post-admission crash probes prove analysis completion
+    cannot lose or duplicate the one run keyed to the source message and
+    automation version, and restart can resume `detected` or `extracting`.
+11. A missing-source fixture proves a provider-confirmed deleted or moved source
+    reaches `source_unavailable`, emits human-review notice, stores no raw body,
+    and does not remain stuck in an active extraction state.
+12. Ambiguous, reschedule, and cancellation negative controls record their
    non-writing outcomes, emit the review notification, and produce no proposal
    and no Graph write request.
-10. A live, explicitly confirmed new-meeting proposal creates one event through
+13. A live, explicitly confirmed new-meeting proposal creates one event through
     the separate write grant, visibly warns that attendee invitations will be
     sent, and records its event identity and provenance.
-11. Lost-response and repeated-confirmation probes reuse one transaction ID,
+14. Lost-response and repeated-confirmation probes reuse one transaction ID,
     cannot produce duplicate event work, and prove reconciliation can move an
     unresolved run to `completed` or `failed` only from authoritative evidence.
-12. Separate disconnect fixtures remove each calendar cache, disable its
-    dependent capability, and leave unrelated grants intact; mailbox disconnect
-    disables email-driven automation without silently deleting calendar grants.
-13. An entitlement matrix proves that capability exchange alone exposes
+15. An expired-proposal fixture proves a delayed confirmation performs no write,
+    refreshes availability into a new proposal version, and requires new
+    confirmation; a proposal whose start has passed cannot be confirmed.
+16. Separate disconnect fixtures remove each calendar cache, disable its
+    dependent capability, reset its state to `not_requested`, and leave unrelated
+    grants intact; mailbox disconnect disables email-driven automation without
+    silently deleting calendar grants.
+17. An entitlement matrix proves that capability exchange alone exposes
     calendar setup and, when the corresponding read grant is ready, calendar
     availability; automations alone exposes neither calendar nor automation;
     and both features expose automation subject to the corresponding Microsoft
