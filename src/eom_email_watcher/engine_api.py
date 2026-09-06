@@ -969,6 +969,19 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     "calendar_principal_mismatch",
                     "The authorized calendar does not match the existing calendar principal",
                 )
+            ready_identity = {
+                "principal_key": principal.key,
+                "home_account_id": principal.home_account_id,
+                "tenant_id": principal.tenant_id,
+                "object_id": principal.object_id,
+                "email_address": principal.email_address,
+            }
+            runtime.store.set_calendar_grant(
+                account.account_id,
+                CALENDAR_READ_PROFILE,
+                "ready",
+                **ready_identity,
+            )
             try:
                 _install_private_token(staged_token, token_file)
             except (MailboxAccountUnavailable, OSError) as exc:
@@ -981,11 +994,7 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                 account.account_id,
                 CALENDAR_READ_PROFILE,
                 "ready",
-                principal_key=principal.key,
-                home_account_id=principal.home_account_id,
-                tenant_id=principal.tenant_id,
-                object_id=principal.object_id,
-                email_address=principal.email_address,
+                **ready_identity,
             )
         return _calendar_read_status_data(runtime, account)
 

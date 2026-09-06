@@ -1008,6 +1008,83 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
     assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
 
 
+@pytest.mark.parametrize("existing_ready", [False, True])
+def test_calendar_read_connect_recovers_exit_after_token_install(
+    existing_ready: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'d' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    selected_principal = microsoft_principal()
+    if existing_ready:
+        runtime.store.set_calendar_grant(
+            account.account_id,
+            "read",
+            "ready",
+            principal_key=selected_principal.key,
+            home_account_id=selected_principal.home_account_id,
+            tenant_id=selected_principal.tenant_id,
+            object_id=selected_principal.object_id,
+            email_address=selected_principal.email_address,
+        )
+        calendar_token.write_text("old-calendar-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: selected_principal)
+
+    class AuthorizedCalendar:
+        principal = selected_principal
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("installed-calendar-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    real_install = engine_api._install_private_token
+
+    def install_then_exit(source: Path, destination: Path) -> None:
+        real_install(source, destination)
+        raise SystemExit
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    monkeypatch.setattr(engine_api, "_install_private_token", install_then_exit)
+    payload = {"provider": account.provider, "account_id": account.account_id}
+
+    with pytest.raises(SystemExit):
+        engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    installed_grant = runtime.store.calendar_grant(account.account_id)
+    assert installed_grant is not None
+    assert installed_grant.state == "ready"
+    assert installed_grant.principal_key == selected_principal.key
+    assert calendar_token.read_text(encoding="utf-8") == "installed-calendar-cache"
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: AuthorizedCalendar(),
+    )
+    status = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert status["data"]["state"] == "ready"
+    assert status["data"]["available"] is True
+
+
 def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
