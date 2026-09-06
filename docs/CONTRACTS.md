@@ -242,8 +242,10 @@ offset and no more than six fractional-second digits. The parser rejects a
 missing or malformed offset, `end <= start`, and a range longer than 366 days.
 Accepted boundaries are canonicalized to UTC with microsecond precision; the
 exact canonical pair and immutable principal key form the projection identity.
-Version 1 returns the complete bounded projection for that identity rather than
-accepting pagination state, a caller-supplied Graph cursor, or a Graph URL.
+Version 1 retains only the most recently completed window for each account and
+returns its complete bounded projection rather than accepting pagination state,
+a caller-supplied Graph cursor, or a Graph URL. A successful initial sync for a
+different window atomically replaces the prior window, cursor, and event rows.
 `calendar.read.events` performs no Graph request and refuses an incomplete,
 missing, differently windowed, differently principaled, or unavailable grant.
 
@@ -260,7 +262,7 @@ One delta round is bounded before persistence by all of the following:
 
 - at most 100 returned entries per requested Graph page;
 - at most 64 Graph pages;
-- at most 6,400 event or tombstone entries;
+- at most 3,200 event or tombstone entries;
 - at most 2 MiB of response bytes per page and 16 MiB in the complete round; and
 - at most 32 KiB in any accepted continuation URL.
 
@@ -284,10 +286,12 @@ together.
 The projection stores no raw Graph document, body, attendee list, organizer, or
 token. Each row contains only the immutable event ID, bounded subject, bounded
 start/end date-time and zone strings, all-day flag, and bounded location display
-name. `calendar.read.events` has an 8-MiB encoded-response ceiling; a projection
-that cannot be returned under that ceiling fails closed rather than silently
-dropping events. Read disconnect removes these copied rows and their cursor in the
-same database transaction that resets the grant.
+name. The UTF-8 byte ceilings are 512 each for event ID, subject, and location,
+64 for each date-time, and 128 for each zone. `calendar.read.events` has an 8-MiB
+encoded-response ceiling; its field and entry bounds must keep every valid
+projection representable under that ceiling rather than silently dropping
+events. Read disconnect removes these copied rows and their cursor in the same
+database transaction that resets the grant.
 
 Graph webhooks are excluded. They require a publicly reachable HTTPS callback,
 which conflicts with this local-first deployment.
