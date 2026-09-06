@@ -415,8 +415,9 @@ merged code:
 12. Separate disconnect fixtures remove each calendar cache, disable its
     dependent capability, and leave unrelated grants intact; mailbox disconnect
     disables email-driven automation without silently deleting calendar grants.
-13. An entitlement matrix proves that capability exchange alone exposes only
-    calendar setup, automations alone exposes neither calendar nor automation,
+13. An entitlement matrix proves that capability exchange alone exposes
+    calendar setup and, when the corresponding read grant is ready, calendar
+    availability; automations alone exposes neither calendar nor automation;
     and both features expose automation subject to the corresponding Microsoft
     grants. Missing, pending, or revoked consent leaves mailbox monitoring
     healthy and truthfully reports calendar unavailability.
