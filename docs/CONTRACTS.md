@@ -26,6 +26,8 @@ The contract starts from these current-code facts:
 - Email Watcher and Document Summarizer already validate the same signed Local
   Connect entitlement-v1 envelope and the `connect.capability_exchange` feature.
   The entitlement format already supports multiple feature identifiers.
+- Email Watcher is a Local Connect consumer only. It has no provider listener,
+  manifest route, job endpoint, or provider registration lifecycle.
 - Current email analysis can classify a message as `scheduling`, but it does not
   extract a calendar proposal, candidate times, attendees, or a referenced
   event.
@@ -94,8 +96,8 @@ database, or raw email bodies by implication.
 ## Microsoft authorization profiles
 
 All Microsoft grants use the existing MSAL public client, authority, tenant, and
-selected work-or-school account identity. They are separate consent profiles and
-separate private token-cache files:
+selected work-or-school principal. They are separately initiated consent flows
+and separate private token-cache files:
 
 | Profile | Exact delegated scope | Purpose | Token boundary |
 | --- | --- | --- | --- |
@@ -115,6 +117,14 @@ a narrower setup path. The mailbox **Add account** path requests only
 user actions. Acquiring read or proposal consent must not request
 `Calendars.ReadWrite`.
 
+Because every flow uses one Microsoft public-client registration, cache
+separation is an application routing, audit, and least-requested-scope
+convention—not a cryptographic OAuth isolation boundary. Microsoft consent for a
+user/client can be cumulative. Every acquisition call and Graph operation must
+therefore enforce its exact scope allowlist even when the tenant has previously
+consented to broader scopes. Hard isolation would require separately registered
+client IDs and is deferred as an infrastructure/product decision.
+
 For a generated Microsoft account ID, caches are derived internally beneath the
 existing private `mail-accounts` directory; token paths never come from UI or
 database input:
@@ -126,9 +136,12 @@ database input:
 <account-id>.calendar-write.msal-cache.json     # Calendars.ReadWrite
 ```
 
-Every completed calendar grant must resolve to the same normalized Microsoft
-account identity selected for the automation. An identity mismatch is rejected
-before a cache replaces the previous cache.
+Every completed calendar grant must resolve to the same tenant-scoped immutable
+Microsoft principal selected for the automation. The durable identity uses the
+MSAL home-account identifier together with tenant/object claims when available;
+a normalized email address is display/diagnostic metadata, not an identity key.
+An immutable-principal mismatch is rejected before a cache replaces the previous
+cache. The run binds that same principal before confirmation.
 
 ### Consent state
 
@@ -145,6 +158,13 @@ interactive flow requires a user or tenant administrator to complete consent.
 The default Microsoft delegated permissions above do not require administrator
 consent in every tenant, but a work-or-school tenant's consent policy may require
 administrator approval. Mail polling continues in every calendar consent state.
+
+Each calendar profile has its own explicit disconnect action. Disconnect takes
+the existing mailbox operation lock, safely removes only that profile's cache,
+and immediately makes the dependent internal capability unavailable. Disconnecting
+the Microsoft mailbox also disables all email-driven calendar automation even if
+a separately consented calendar cache remains; it does not silently delete those
+separate grants. The user can remove each calendar grant independently.
 
 ## Microsoft calendar adapter
 
@@ -163,12 +183,19 @@ GET https://graph.microsoft.com/v1.0/me/calendarView/delta
     &endDateTime=<exclusive ISO-8601 boundary>
 ```
 
-The initial request fixes an explicit view window. The adapter then follows and
-persists Graph's complete, opaque `@odata.nextLink` and `@odata.deltaLink` URLs.
-The stored cursor is bound to that window; changing the window starts a new
-initial round. Calendar delta does not support the mailbox delta query shape:
-the implementation must not copy the mail adapter's `$select`, `$filter`, or
-`changeType` parameters.
+The initial request fixes an explicit view window. The adapter maintains a
+durable per-account, per-window event projection. During each delta round it
+applies event upserts and `@removed` tombstones to that projection. The complete,
+opaque `@odata.nextLink` or `@odata.deltaLink`, all projection changes, and the
+round state advance commit in one SQLite transaction; a crash cannot preserve a
+new cursor while losing its event mutations.
+
+The stored cursor and projection are bound to the same window; changing the
+window starts a new initial round and projection. Subsequent delta responses are
+changes, not a complete view, so `calendar.read` is served from the durable
+projection after a completed round. Calendar delta does not support the mailbox
+delta query shape: the implementation must not copy the mail adapter's `$select`,
+`$filter`, or `changeType` parameters.
 
 "Same way mail is polled" means the same safety properties—bounded responses,
 validated Graph-only continuation URLs, opaque cursor persistence, pagination,
@@ -202,7 +229,15 @@ The durable run records a stable `transactionId` before the first POST and reuse
 it for any permitted retry so Microsoft Graph can suppress duplicate event
 creation after a lost response. A timeout after submission is ambiguous, not
 proof of failure; the run remains unresolved until reconciliation establishes an
-authoritative outcome.
+authoritative outcome. Reconciliation searches the bounded relevant calendar
+view for the persisted transaction ID. A matching event completes the original
+run; an authoritative Graph rejection fails it; absence alone is not proof that
+creation failed and leaves the run truthfully unresolved.
+
+Creating an event with attendees causes Microsoft 365 to send meeting
+invitations. The durable proposal and confirmation surface must describe that
+outbound communication as an external effect, not merely label it a calendar
+write. The confirmed attendee set is exactly the invitation recipient set.
 
 A Teams meeting request sets both:
 
@@ -232,31 +267,19 @@ accepted by the mailbox server when required and preserves the IANA source value
 in its own provenance. Daylight-saving resolution happens before confirmation;
 ambiguous or nonexistent local times fail closed to clarification.
 
-## Local Connect v2 calendar capabilities
+## Entitlement and visibility boundary
 
-Email Watcher will be a Connect v2 provider as well as its existing consumer.
-Before implementation advertises either capability, the language-neutral
-schemas and conformance fixtures must be added to the canonical
-`connect-contracts` repository and consumed by both sides. This document does not
-create an Email Watcher-only wire extension.
+The calendar operations in this contract are internal Email Watcher
+capabilities. Calendar setup and automation UI appear only when the existing
+signed entitlement contains `connect.capability_exchange`; every operation also
+requires its corresponding Microsoft grant. Entitlement and consent are
+rechecked immediately before admission.
 
-Proposed v2 declarations:
-
-| Capability | Accepts | Produces | External effect | Confirmation |
-| --- | --- | --- | --- | --- |
-| `calendar.read@1.0` | `application/vnd.local-connect.calendar-query+json` | `application/vnd.local-connect.calendar-events+json` | No | No |
-| `calendar.propose_event@1.0` | `application/vnd.local-connect.meeting-request+json` | `application/vnd.local-connect.meeting-proposal+json` | No | No |
-
-Both declarations use native v2 action labels/descriptions, explicit bounded
-`max_bytes`, bounded parameters, and generic integrity-checked output artifacts.
-Availability requires the corresponding Microsoft grant as well as
-`connect.capability_exchange`. Entitlement and consent are rechecked immediately
-before admission.
-
-`calendar.write` is intentionally **not advertised** in this slice. The first
-automation may call its private confirmed-write boundary only from Email
-Watcher-owned UI after recording confirmation. Exposing a generic write
-capability requires a later contract and threat review.
+Email Watcher remains a Local Connect consumer. It does not publish a manifest,
+open a provider listener, accept Connect jobs, write provider registrations, or
+add calendar schemas to `connect-contracts` under this contract. Advertising
+`calendar.read`, `calendar.propose_event`, or `calendar.write` to other
+applications is a later contract with its own interoperability and threat review.
 
 ## First automation: scheduling email to confirmed event
 
@@ -286,9 +309,16 @@ Deterministic validation rejects invented attendees, times unsupported by source
 evidence, invalid addresses, naive times, impossible ranges, and partial or
 unknown schema members.
 
-An ambiguous extraction creates no meeting proposal and makes no calendar write.
-It records an `ambiguous` outcome and emits only a normal Email Watcher
-notification that a schedule mention needs human review.
+Version 1 admits only a clear new-meeting request to proposal and creation.
+Reschedule and cancellation intents are durable `manual_review` outcomes because
+`POST /me/events` cannot update or cancel the referenced event; they create no
+proposal and make no Graph write. Supporting those intents requires a later
+contract for exact event matching plus confirmed update/delete operations.
+
+An unclear or otherwise ambiguous extraction likewise creates no meeting
+proposal and makes no calendar write. It records an `ambiguous` outcome and emits
+only a normal Email Watcher notification that a schedule mention needs human
+review.
 
 ### Durable run ledger
 
@@ -303,14 +333,24 @@ pattern:
   transaction; and
 - a rejected or stale transition changes nothing and appends no event.
 
+Run admission is atomic with analysis completion. When a watched message becomes
+durably analyzed as scheduling, insertion of the `detected` run and its first
+event occurs in the same SQLite transaction as that analysis state change. A
+unique `(provider, account_id, provider_message_id, automation_id,
+automation_version)` key makes retries idempotent. A crash can neither lose an
+eligible trigger after marking it analyzed nor create two runs for the same
+automation version.
+
 Minimum flow:
 
 ```text
 detected -> extracting -> ambiguous
+                      \-> manual_review
                       \-> proposing -> awaiting_confirmation
 awaiting_confirmation -> declined
 awaiting_confirmation -> write_authorized -> writing -> completed
                                                \------> failed | unresolved
+unresolved -> reconciling -> completed | failed | unresolved
 ```
 
 The run and event history record the source message identity without copying the
@@ -327,9 +367,10 @@ the created event identity and write outcome commit durably.
 ### Confirmation boundary
 
 Email Watcher renders the proposal using its own native UI and shows the exact
-subject, attendees, start, end, IANA zone, location, and Teams-link choice. The
-user may confirm that exact version, revise it into a new proposal version, or
-decline it.
+subject, attendees, start, end, IANA zone, location, and Teams-link choice. When
+attendees are present, it explicitly states that confirmation will send meeting
+invitations to those addresses. The user may confirm that exact version, revise
+it into a new proposal version, or decline it.
 
 Confirmation is single-run, single-proposal, and non-transferable. Changing any
 effect-bearing field invalidates prior confirmation. Repeated clicks and stale UI
@@ -344,23 +385,33 @@ merged code:
    never requests a calendar scope.
 2. Separate fixtures prove calendar read, proposal, and write setup request only
    their exact profile scope and write distinct private caches.
-3. A live work-or-school Microsoft 365 test account proves calendar-read consent
+3. Scope-boundary fixtures prove that broader tenant consent or another local
+   cache cannot make a call site request a scope outside its exact allowlist.
+4. A live work-or-school Microsoft 365 test account proves calendar-read consent
    and a complete `/me/calendarView/delta` round with persisted continuation.
-4. The live account proves proposal consent and a real `findMeetingTimes` domain
+5. An initial-plus-subsequent delta fixture proves unchanged events remain,
+   tombstones remove deleted events, and cursor/projection changes roll back
+   together at an injected crash point.
+6. The live account proves proposal consent and a real `findMeetingTimes` domain
    result, including the valid no-suggestions case.
-5. A watched-sender scheduling fixture reaches a durable proposal and native
+7. A watched-sender scheduling fixture reaches a durable proposal and native
    confirmation UI without writing an event.
-6. An ambiguous-email negative control records `ambiguous`, emits the review
-   notification, and produces no proposal and no Graph write request.
-7. A live, explicitly confirmed proposal creates one event through the separate
-   write grant and records its event identity and provenance.
-8. Lost-response and repeated-confirmation probes reuse one transaction ID and
-   cannot produce duplicate event work.
-9. Missing, pending, revoked, or feature-incomplete consent leaves mailbox
-   monitoring healthy and truthfully reports calendar unavailability.
-10. Connect v2 conformance fixtures prove `calendar.read` and
-    `calendar.propose_event` disappear when either the capability entitlement or
-    corresponding Microsoft grant is unavailable; `calendar.write` never appears.
+8. Atomic-admission crash probes prove analysis completion cannot lose or
+   duplicate the one run keyed to the source message and automation version.
+9. Ambiguous, reschedule, and cancellation negative controls record their
+   non-writing outcomes, emit the review notification, and produce no proposal
+   and no Graph write request.
+10. A live, explicitly confirmed new-meeting proposal creates one event through
+    the separate write grant, visibly warns that attendee invitations will be
+    sent, and records its event identity and provenance.
+11. Lost-response and repeated-confirmation probes reuse one transaction ID,
+    cannot produce duplicate event work, and prove reconciliation can move an
+    unresolved run to `completed` or `failed` only from authoritative evidence.
+12. Separate disconnect fixtures remove each calendar cache, disable its
+    dependent capability, and leave unrelated grants intact; mailbox disconnect
+    disables email-driven automation without silently deleting calendar grants.
+13. Missing, pending, revoked, or feature-incomplete consent leaves mailbox
+    monitoring healthy and truthfully reports calendar unavailability.
 
 Live evidence must identify the tested application revision and sanitized
 account/tenant class. A mocked Graph response cannot substitute for the required
@@ -370,13 +421,11 @@ live consent, read, proposal, and confirmed-write proof.
 
 Later implementation remains split into reviewed vertical slices:
 
-1. canonical `connect-contracts` calendar artifact schemas and fixtures;
-2. feature-aware entitlement lookup using the existing signed file and keyring;
-3. separate Microsoft calendar grants and read adapter;
-4. Connect v2 calendar read/proposal provider surface;
-5. scheduling extraction and immutable automation ledger;
-6. native proposal/confirmation UI and private confirmed-write adapter; and
-7. live acceptance evidence.
+1. feature-aware entitlement lookup using the existing signed file and keyring;
+2. separate Microsoft calendar grants and read adapter;
+3. scheduling extraction and immutable automation ledger;
+4. native proposal/confirmation UI and private confirmed-write adapter; and
+5. live acceptance evidence.
 
 No implementation slice may weaken the existing mailbox read-only path or claim
 completion from mocks alone.
@@ -386,7 +435,8 @@ completion from mocks alone.
 - Gmail Calendar;
 - Microsoft mail sending;
 - automatic or model-confirmed calendar writes;
-- advertising `calendar.write` over Connect;
+- any Email Watcher Connect provider surface, calendar capability advertisement,
+  provider listener, provider registration, job endpoint, or new Connect schema;
 - Graph webhooks or a public callback service;
 - cross-machine or cloud Connect;
 - a workflow builder, generic rules engine, or new automation application;
@@ -397,8 +447,16 @@ completion from mocks alone.
 
 ## Rejected alternatives
 
-- **One broad Microsoft cache:** rejected because it lets read-only setup acquire
-  or reuse write authority and makes revocation/diagnostics ambiguous.
+- **One broad Microsoft cache:** rejected because it obscures call-site scope,
+  consent intent, removal, and diagnostics. Separate caches remain an application
+  convention, not hard OAuth-client isolation.
+- **Combine calendar read and proposal under `Calendars.Read.Shared`:** rejected
+  for version 1 so ordinary calendar viewing still asks only for
+  `Calendars.Read`. The additional prompt is a deliberate consent-friction trade,
+  not a claim of cryptographic isolation.
+- **Separate Microsoft client registrations now:** deferred because they provide
+  stronger scope isolation but require release-time Entra registration and
+  onboarding decisions beyond this automation contract.
 - **Use `Calendars.Read` for `findMeetingTimes`:** rejected because Microsoft does
   not document it as a sufficient delegated permission for that operation.
 - **Copy the mail delta URL builder:** rejected because calendar-view delta has a
