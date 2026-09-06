@@ -69,8 +69,8 @@ The automation feature is additive, not substitutive:
 
 - `connect.automations` never grants Local Connect discovery or invocation;
 - `connect.capability_exchange` never grants automation execution; and
-- a workflow that invokes a Connect capability must pass both gates at the
-  boundary where each applies.
+- a workflow that uses a capability gated by `connect.capability_exchange`
+  must pass both gates at the boundary where each applies.
 
 Calendar is a capability. "A watched email describes a schedule change, propose
 an event, and write it after the user confirms" is an automation.
@@ -270,10 +270,15 @@ ambiguous or nonexistent local times fail closed to clarification.
 ## Entitlement and visibility boundary
 
 The calendar operations in this contract are internal Email Watcher
-capabilities. Calendar setup and automation UI appear only when the existing
-signed entitlement contains `connect.capability_exchange`; every operation also
-requires its corresponding Microsoft grant. Entitlement and consent are
-rechecked immediately before admission.
+capabilities. Calendar setup and calendar availability appear only when the
+existing signed entitlement contains `connect.capability_exchange`. The
+email-driven automation UI appears, and an automation may start or resume, only
+when that same entitlement contains both `connect.capability_exchange` and
+`connect.automations`. An automation-only entitlement cannot expose calendar
+operations, and a capability-exchange-only entitlement cannot expose or run the
+automation. Every operation also requires its corresponding Microsoft grant.
+Both entitlement features and consent are rechecked immediately before
+admission.
 
 Email Watcher remains a Local Connect consumer. It does not publish a manifest,
 open a provider listener, accept Connect jobs, write provider registrations, or
@@ -410,8 +415,11 @@ merged code:
 12. Separate disconnect fixtures remove each calendar cache, disable its
     dependent capability, and leave unrelated grants intact; mailbox disconnect
     disables email-driven automation without silently deleting calendar grants.
-13. Missing, pending, revoked, or feature-incomplete consent leaves mailbox
-    monitoring healthy and truthfully reports calendar unavailability.
+13. An entitlement matrix proves that capability exchange alone exposes only
+    calendar setup, automations alone exposes neither calendar nor automation,
+    and both features expose automation subject to the corresponding Microsoft
+    grants. Missing, pending, or revoked consent leaves mailbox monitoring
+    healthy and truthfully reports calendar unavailability.
 
 Live evidence must identify the tested application revision and sanitized
 account/tenant class. A mocked Graph response cannot substitute for the required
