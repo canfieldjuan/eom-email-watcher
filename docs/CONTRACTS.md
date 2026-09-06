@@ -1,13 +1,16 @@
 # Calendar capability and email automation contract
 
-Status: **proposed; not implemented**
+Status: **partially implemented: landing item 1 of 5 implemented; items 2–5
+pending**
 
 This document freezes the boundary for adding Microsoft 365 calendar operations
 and the first email-driven automation to Email Watcher. It is an implementation
 gate, not a claim that calendar or automation behavior exists today.
 
-The existing mailbox watcher, Local Connect consumer, and monthly Gmail sender
-remain authoritative until later reviewed slices implement this contract.
+Feature-aware entitlement lookup is implemented. The existing mailbox watcher,
+Local Connect consumer, and monthly Gmail sender remain authoritative while the
+calendar grants, adapters, automation, UI, and live acceptance evidence remain
+pending.
 
 ## Verified baseline
 
@@ -225,6 +228,14 @@ Graph reason, transitions the run from `proposing` to `manual_review`, and asks
 the user to revise the scheduling constraints; it never creates an empty
 confirmation. It cannot create, update, invite, or cancel an event.
 
+Version 1 treats every extracted attendee as required. Every
+`findMeetingTimes` request sets `minimumAttendeePercentage` explicitly to `100`;
+it never relies on Graph's lower default. A suggestion may advance to
+confirmation only when the bounded response proves that every required attendee
+is available for the complete proposed interval. Missing, malformed, unknown,
+partial, or conflicting attendee availability cannot become a confirmation and
+instead follows the same durable `manual_review` path as no suggestions.
+
 ### Confirmed writes
 
 After confirmation, creation uses:
@@ -239,8 +250,14 @@ creation after a lost response. A timeout after submission is ambiguous, not
 proof of failure; the run remains unresolved until reconciliation establishes an
 authoritative outcome. Reconciliation searches the bounded relevant calendar
 view for the persisted transaction ID. A matching event completes the original
-run; an authoritative Graph rejection fails it; absence alone is not proof that
-creation failed and leaves the run truthfully unresolved.
+run. A retry or reconciliation request that is rejected, including an
+authentication, authorization, transport, or request error, does not prove that
+the earlier ambiguous POST failed and leaves the original run unresolved. A
+duplicate-suppression response or retry that identifies the event already
+created with the stable transaction ID completes the original run rather than
+failing it. Only a definitive response to the original first submission that
+proves no event was accepted may fail the run directly; absence from a later
+search is likewise not proof of failure.
 
 Creating an event with attendees causes Microsoft 365 to send meeting
 invitations. The durable proposal and confirmation surface must describe that
@@ -275,18 +292,37 @@ accepted by the mailbox server when required and preserves the IANA source value
 in its own provenance. Daylight-saving resolution happens before confirmation;
 ambiguous or nonexistent local times fail closed to clarification.
 
+For a local date-time, the application resolves the canonical IANA zone through
+the installed time-zone database and requires the supplied UTC offset to equal
+that zone's offset at that exact local date-time. A mismatched pair—for example,
+`-05:00` with `Europe/Berlin` when Berlin is not at that offset—is rejected
+before proposal or confirmation; neither value silently overrides the other.
+The resulting resolved instant is authoritative for the proposal hash,
+confirmation, ledger, availability request, and write. Adapter conversion to a
+server-supported zone must preserve that instant and the displayed local time.
+
 ## Entitlement and visibility boundary
 
 The calendar operations in this contract are internal Email Watcher
-capabilities. Calendar setup and calendar availability appear only when the
-existing signed entitlement contains `connect.capability_exchange`. The
-email-driven automation UI appears, and an automation may start or resume, only
-when that same entitlement contains both `connect.capability_exchange` and
+capabilities. Calendar setup, re-consent, and calendar availability appear only
+when the existing signed entitlement contains `connect.capability_exchange`.
+The email-driven automation UI appears, and an automation may start or resume,
+only when that same entitlement contains both `connect.capability_exchange` and
 `connect.automations`. An automation-only entitlement cannot expose calendar
 operations, and a capability-exchange-only entitlement cannot expose or run the
 automation. Every operation also requires its corresponding Microsoft grant.
 Both entitlement features and consent are rechecked immediately before
 admission.
+
+Entitlement gates new capability use, not revocation of credentials already
+granted. If an entitlement is missing, expired, or revoked, each existing
+calendar profile's non-secret status and **Disconnect** control remain visible
+and callable. Disconnect remains an idempotent local operation that takes the
+mailbox operation lock, removes only that profile's private cache, and resets its
+state to `not_requested`; it performs no Graph call and cannot restart consent.
+The UI and result never expose cache paths, tokens, or calendar data. All setup,
+re-consent, read, proposal, write, and automation actions remain unavailable
+without their required entitlement.
 
 Email Watcher remains a Local Connect consumer. It does not publish a manifest,
 open a provider listener, accept Connect jobs, write provider registrations, or
@@ -321,6 +357,15 @@ The extraction schema contains only:
 Deterministic validation rejects invented attendees, times unsupported by source
 evidence, invalid addresses, naive times, impossible ranges, and partial or
 unknown schema members.
+
+A deterministically rejected extraction receives exactly one bounded retry with
+typed validation violations and the same admitted source. The run durably
+records the attempt number, schema version, validation codes, and bounded result
+without storing raw message content. If the second attempt is also rejected, the
+run atomically transitions to `manual_review` with a structured
+`validation_rejected` reason, emits the ordinary human-review notification, and
+creates no proposal or Graph request. Restart reads the persisted attempt count;
+it cannot reset the counter or loop indefinitely.
 
 Version 1 admits only a clear new-meeting request to proposal and creation.
 Reschedule and cancellation intents are durable `manual_review` outcomes because
@@ -381,6 +426,27 @@ account identity, user decision, decision timestamp, confirmed proposal hash,
 stable Graph `transactionId`, Graph event identity when known, and structured
 failure or unresolved reason.
 
+Copied automation payload follows the source message's configured retention and
+local privacy operations. When watcher retention, `inbox.delete`, or
+`inbox.clear` removes the source, the same transaction removes copied subjects,
+attendee addresses, locations, extracted evidence, and proposal content from the
+automation ledger and events. A pre-write run becomes `source_unavailable`,
+emits the human-review notification, and can never write. A run that reached
+`write_authorized`, `writing`, or `unresolved` is not relabeled failed: it keeps
+its truthful state and is compacted to a reconciliation tombstone containing
+only the automation identifier/version, prior state, stable transaction ID,
+target account's immutable principal ID, bounded start/end reconciliation
+window, Graph event ID when known, non-reversible trigger/proposal hashes, and
+timestamps. Terminal runs are compacted to the same non-content form.
+
+The tombstone contains no subject, attendee address, location, evidence,
+message body, raw provider message ID, token, or cache path. It expires no later
+than the existing maximum supported retention window measured from source
+observation. Once expired, it is purged and the source is permanently ineligible
+for replay or write retry. Compaction, state transition, event append, and source
+deletion commit atomically so privacy cleanup cannot erase the idempotency record
+while leaving a write eligible.
+
 No state may claim `awaiting_confirmation` before the proposal is durable. No
 state may claim `write_authorized` unless the confirmation event identifies the
 exact durable proposal version and hash. No state may claim `completed` before
@@ -389,10 +455,16 @@ the created event identity and write outcome commit durably.
 ### Confirmation boundary
 
 Email Watcher renders the proposal using its own native UI and shows the exact
-subject, attendees, start, end, IANA zone, location, and Teams-link choice. When
-attendees are present, it explicitly states that confirmation will send meeting
-invitations to those addresses. The user may confirm that exact version, revise
-it into a new proposal version, or decline it.
+subject, attendees, start, end, IANA zone, location, Teams-link choice, and target
+Microsoft calendar principal. The target display includes the organizer/account
+label and address plus stable tenant/account identity sufficient to distinguish
+configured accounts; it never exposes tokens or cache paths. The proposal
+version and hash bind the target immutable principal and target calendar ID, so
+changing either invalidates prior confirmation. The confirmation states that
+this principal will own the event. When attendees are present, it explicitly
+states that confirmation will send meeting invitations from that organizer to
+those addresses. The user may confirm that exact version, revise it into a new
+proposal version, or decline it.
 
 Confirmation is single-run, single-proposal, and non-transferable. Changing any
 effect-bearing field invalidates prior confirmation. Each proposal durably
@@ -406,8 +478,9 @@ automatic write mode.
 
 ## Acceptance evidence for later implementation
 
-Implementation is not complete until all of the following pass against current
-merged code:
+Calendar and automation implementation is not complete until all of the
+following pass against current merged code. Landing item 1 has its own merged
+evidence; items 2–5 remain pending:
 
 1. A fixture proves Microsoft mailbox setup requests exactly `Mail.Read` and
    never requests a calendar scope.
@@ -420,44 +493,71 @@ merged code:
 5. Consent fixtures prove rejected and revoked profiles can restart explicit
    consent, and disconnect removes only the selected cache and resets that
    profile to `not_requested`.
-6. A live work-or-school Microsoft 365 test account proves calendar-read consent
+6. An entitlement-loss fixture proves existing profile status and disconnect
+   remain available after entitlement becomes missing, expired, or revoked;
+   disconnect removes the selected cache without a Graph call, while setup,
+   re-consent, calendar operations, and automation stay unavailable.
+7. A live work-or-school Microsoft 365 test account proves calendar-read consent
    and a complete `/me/calendarView/delta` round with persisted continuation.
-7. An initial-plus-subsequent delta fixture proves unchanged events remain,
+8. An initial-plus-subsequent delta fixture proves unchanged events remain,
    tombstones remove deleted events, and cursor/projection changes roll back
    together at an injected crash point.
-8. The live account proves proposal consent and a real `findMeetingTimes` domain
+9. The live account proves proposal consent and a real `findMeetingTimes` domain
    result; a no-suggestions fixture records the reason, reaches `manual_review`,
    and never creates an empty confirmation.
-9. A watched-sender scheduling fixture reaches a durable proposal and native
+10. Required-attendee boundary fixtures prove the request explicitly sends
+    `minimumAttendeePercentage: 100`, a fully available set may advance, and a
+    response with one conflicting, partial, missing, unknown, or malformed
+    attendee cannot reach confirmation.
+11. A watched-sender scheduling fixture reaches a durable proposal and native
    confirmation UI without writing an event.
-10. Atomic-admission and post-admission crash probes prove analysis completion
+12. Atomic-admission and post-admission crash probes prove analysis completion
     cannot lose or duplicate the one run keyed to the source message and
     automation version, and restart can resume `detected` or `extracting`.
-11. A missing-source fixture proves a provider-confirmed deleted or moved source
+13. A missing-source fixture proves a provider-confirmed deleted or moved source
     reaches `source_unavailable`, emits human-review notice, stores no raw body,
     and does not remain stuck in an active extraction state.
-12. Ambiguous, reschedule, and cancellation negative controls record their
-   non-writing outcomes, emit the review notification, and produce no proposal
-   and no Graph write request.
-13. A live, explicitly confirmed new-meeting proposal creates one event through
+14. Extraction boundary fixtures prove one deterministic rejection receives
+    exactly one feedback-bearing retry, a second rejection durably reaches
+    `manual_review` with `validation_rejected`, and restart cannot obtain a third
+    attempt, proposal, or Graph call.
+15. Ambiguous, reschedule, and cancellation negative controls record their
+    non-writing outcomes, emit the review notification, and produce no proposal
+    and no Graph write request.
+16. A matching-offset fixture and a `-05:00`/`Europe/Berlin` mismatch fixture
+    prove time-zone resolution accepts only a consistent offset/zone pair,
+    rejects ambiguous and nonexistent local times, and preserves the one
+    resolved instant through proposal, confirmation, ledger, and adapter.
+17. A multi-account fixture proves confirmation identifies the target principal
+    and organizer, binds its immutable identity and calendar to the proposal
+    hash, and invalidates confirmation when either target changes.
+18. A live, explicitly confirmed new-meeting proposal creates one event through
     the separate write grant, visibly warns that attendee invitations will be
     sent, and records its event identity and provenance.
-14. Lost-response and repeated-confirmation probes reuse one transaction ID,
+19. Lost-response and repeated-confirmation probes reuse one transaction ID,
     cannot produce duplicate event work, and prove reconciliation can move an
-    unresolved run to `completed` or `failed` only from authoritative evidence.
-15. An expired-proposal fixture proves a delayed confirmation performs no write,
+    unresolved run to `completed` only when it finds or receives the matching
+    event. A later retry or reconciliation rejection leaves the original run
+    unresolved, while a definitive rejection of the first submission may fail
+    it.
+20. An expired-proposal fixture proves a delayed confirmation performs no write,
     refreshes availability into a new proposal version, and requires new
     confirmation; a proposal whose start has passed cannot be confirmed.
-16. Separate disconnect fixtures remove each calendar cache, disable its
+21. Separate disconnect fixtures remove each calendar cache, disable its
     dependent capability, reset its state to `not_requested`, and leave unrelated
     grants intact; mailbox disconnect disables email-driven automation without
     silently deleting calendar grants.
-17. An entitlement matrix proves that capability exchange alone exposes
+22. An entitlement matrix proves that capability exchange alone exposes
     calendar setup and, when the corresponding read grant is ready, calendar
     availability; automations alone exposes neither calendar nor automation;
     and both features expose automation subject to the corresponding Microsoft
     grants. Missing, pending, or revoked consent leaves mailbox monitoring
     healthy and truthfully reports calendar unavailability.
+23. Retention and local-delete fixtures prove all copied automation content is
+    removed atomically with its source, pre-write runs become non-writing
+    `source_unavailable`, and an ambiguous write retains only the bounded
+    non-content reconciliation tombstone without being relabeled failed.
+    Boundary fixtures prove expiry purges the tombstone and blocks replay.
 
 Live evidence must identify the tested application revision and sanitized
 account/tenant class. A mocked Graph response cannot substitute for the required
@@ -465,13 +565,15 @@ live consent, read, proposal, and confirmed-write proof.
 
 ## Landing order
 
-Later implementation remains split into reviewed vertical slices:
+Implementation remains split into reviewed vertical slices:
 
-1. feature-aware entitlement lookup using the existing signed file and keyring;
-2. separate Microsoft calendar grants and read adapter;
-3. scheduling extraction and immutable automation ledger;
-4. native proposal/confirmation UI and private confirmed-write adapter; and
-5. live acceptance evidence.
+1. **Implemented:** feature-aware entitlement lookup using the existing signed
+   file and keyring;
+2. **Pending:** separate Microsoft calendar grants and read adapter;
+3. **Pending:** scheduling extraction and immutable automation ledger;
+4. **Pending:** native proposal/confirmation UI and private confirmed-write
+   adapter; and
+5. **Pending:** live acceptance evidence.
 
 No implementation slice may weaken the existing mailbox read-only path or claim
 completion from mocks alone.
