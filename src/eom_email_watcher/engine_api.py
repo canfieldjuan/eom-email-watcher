@@ -890,7 +890,9 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
         "entitlement_active": entitlement_active,
         "profile": CALENDAR_READ_PROFILE,
         "scope": "Calendars.Read",
-        "state": state if entitlement_active else "locked",
+        # Revoking an existing grant must remain possible after entitlement loss.
+        # Keep the non-secret consent state visible while `available` stays false.
+        "state": state,
     }
 
 
@@ -976,12 +978,26 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                 "object_id": principal.object_id,
                 "email_address": principal.email_address,
             }
-            runtime.store.set_calendar_grant(
-                account.account_id,
-                CALENDAR_READ_PROFILE,
-                "ready",
-                **ready_identity,
-            )
+            try:
+                runtime.store.set_calendar_grant(
+                    account.account_id,
+                    CALENDAR_READ_PROFILE,
+                    "ready",
+                    **ready_identity,
+                )
+            except sqlite3.Error as exc:
+                try:
+                    _restore_calendar_grant(runtime, account.account_id, previous)
+                except sqlite3.Error as restore_exc:
+                    raise ApiError(
+                        "calendar_state_error",
+                        "Microsoft calendar consent state could not be restored; "
+                        "disconnect and retry",
+                    ) from restore_exc
+                raise ApiError(
+                    "calendar_error",
+                    "Microsoft calendar authorization could not be recorded; retry",
+                ) from exc
             try:
                 _install_private_token(staged_token, token_file)
             except (MailboxAccountUnavailable, OSError) as exc:
