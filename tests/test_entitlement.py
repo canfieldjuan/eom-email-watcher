@@ -104,9 +104,7 @@ def test_signature_feature_and_exact_time_boundaries(tmp_path: Path) -> None:
     assert decision("2025-12-31T23:59:59Z") is entitlement.EntitlementDecision.NOT_YET_VALID
     assert decision("2027-01-01T00:00:00Z") is entitlement.EntitlementDecision.EXPIRED
 
-    path.write_bytes(
-        signed_license(key, claims(features=["document.local_processing"]))
-    )
+    path.write_bytes(signed_license(key, claims(features=["document.local_processing"])))
     path.chmod(0o600)
     assert decision("2026-08-31T00:00:00Z") is entitlement.EntitlementDecision.FEATURE_MISSING
 
@@ -115,6 +113,85 @@ def test_signature_feature_and_exact_time_boundaries(tmp_path: Path) -> None:
     path.write_text(json.dumps(tampered), encoding="utf-8")
     path.chmod(0o600)
     assert decision("2026-08-31T00:00:00Z") is entitlement.EntitlementDecision.INVALID
+
+
+def test_gate_evaluates_each_requested_feature_without_changing_connect_default(
+    tmp_path: Path,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    path = private_entitlement_path(
+        tmp_path,
+        signed_license(
+            key,
+            claims(
+                features=[
+                    entitlement.FEATURE_ID,
+                    entitlement.AUTOMATIONS_FEATURE_ID,
+                ]
+            ),
+        ),
+    )
+    gate = entitlement.EntitlementGate.for_test(
+        path,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    assert gate.decision() is entitlement.EntitlementDecision.ACTIVE
+    assert (
+        gate.decision(entitlement.AUTOMATIONS_FEATURE_ID) is entitlement.EntitlementDecision.ACTIVE
+    )
+    assert gate.status(entitlement.AUTOMATIONS_FEATURE_ID).public_dict() == {
+        "state": "active",
+        "active": True,
+    }
+
+    path.write_bytes(signed_license(key, claims()))
+    path.chmod(0o600)
+    assert gate.decision() is entitlement.EntitlementDecision.ACTIVE
+    assert (
+        gate.decision(entitlement.AUTOMATIONS_FEATURE_ID)
+        is entitlement.EntitlementDecision.FEATURE_MISSING
+    )
+
+
+@pytest.mark.parametrize(
+    "feature_id",
+    ["", "Connect.Automations", "connect.", "a" * 101, 0, False, None],
+)
+def test_requested_feature_id_is_strictly_validated(
+    tmp_path: Path,
+    feature_id: object,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    path = private_entitlement_path(tmp_path, signed_license(key, claims()))
+    gate = entitlement.EntitlementGate.for_test(
+        path,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValueError, match="feature ID is invalid"):
+        gate.decision(feature_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("feature_id", ["a", "a" * 100])
+def test_requested_feature_id_accepts_length_boundaries(
+    tmp_path: Path,
+    feature_id: str,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    path = private_entitlement_path(
+        tmp_path,
+        signed_license(key, claims(features=[feature_id])),
+    )
+    gate = entitlement.EntitlementGate.for_test(
+        path,
+        keyring(key),
+        datetime(2026, 8, 31, tzinfo=UTC),
+    )
+
+    assert gate.decision(feature_id) is entitlement.EntitlementDecision.ACTIVE
 
 
 def test_duplicate_claim_members_are_rejected_before_authorization(tmp_path: Path) -> None:
@@ -173,7 +250,7 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
     bundled_keyring.parent.mkdir(parents=True)
     bundled_keyring.write_bytes(keyring(issuer))
     configured = tmp_path / "config"
-    private_entitlement_path(configured, signed_license(issuer, claims()))
+    installed = private_entitlement_path(configured, signed_license(issuer, claims()))
     attacker_keyring = tmp_path / "attacker-keyring.json"
     attacker_keyring.write_bytes(keyring(attacker))
 
@@ -181,6 +258,26 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(configured))
     monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(attacker_keyring))
     assert entitlement.connect_entitlement_decision() is entitlement.EntitlementDecision.ACTIVE
+    assert (
+        entitlement.feature_entitlement_decision(entitlement.AUTOMATIONS_FEATURE_ID)
+        is entitlement.EntitlementDecision.FEATURE_MISSING
+    )
+
+    installed.write_bytes(
+        signed_license(
+            issuer,
+            claims(
+                features=[
+                    entitlement.CONNECT_FEATURE_ID,
+                    entitlement.AUTOMATIONS_FEATURE_ID,
+                ]
+            ),
+        )
+    )
+    installed.chmod(0o600)
+    assert entitlement.feature_entitlement_status(
+        entitlement.AUTOMATIONS_FEATURE_ID
+    ).public_dict() == {"state": "active", "active": True}
 
     monkeypatch.setattr(entitlement.sys, "_MEIPASS", str(tmp_path / "missing-bundle"))
     assert (
@@ -716,9 +813,7 @@ def test_installer_sets_exact_modes_under_restrictive_umask(tmp_path: Path) -> N
 
 
 def test_public_status_and_install_failure_codes_are_stable_and_claim_free() -> None:
-    status = entitlement.EntitlementStatus.from_decision(
-        entitlement.EntitlementDecision.EXPIRED
-    )
+    status = entitlement.EntitlementStatus.from_decision(entitlement.EntitlementDecision.EXPIRED)
     assert status.public_dict() == {"state": "expired", "active": False}
     assert set(status.public_dict()) == {"state", "active"}
     assert set(entitlement._INSTALL_ERROR_MESSAGES) == {

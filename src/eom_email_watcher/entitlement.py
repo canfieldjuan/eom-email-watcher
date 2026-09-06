@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, TypeAdapter, ValidationError
 
 from .connect_windows import (
     WindowsFileLock,
@@ -31,7 +31,10 @@ from .connect_windows import (
     unlink_regular_file,
 )
 
-FEATURE_ID = "connect.capability_exchange"
+CONNECT_FEATURE_ID = "connect.capability_exchange"
+AUTOMATIONS_FEATURE_ID = "connect.automations"
+# Backward-compatible name for existing Connect-only callers and fixtures.
+FEATURE_ID = CONNECT_FEATURE_ID
 ENTITLEMENT_FILE_NAME = "entitlement-v1.json"
 ENTITLEMENT_LOCK_FILE_NAME = ".entitlement-v1.lock"
 BUNDLED_KEYRING = Path("eom_email_watcher_data/connect-entitlement-keyring.json")
@@ -51,6 +54,7 @@ KeyId = Annotated[StrictStr, Field(pattern=KEY_ID_PATTERN, max_length=100)]
 FeatureId = Annotated[StrictStr, Field(pattern=FEATURE_PATTERN, max_length=100)]
 UuidV4 = Annotated[StrictStr, Field(pattern=UUID_V4_PATTERN)]
 UtcTimestamp = Annotated[StrictStr, Field(pattern=UTC_TIMESTAMP_PATTERN)]
+_FEATURE_ID_ADAPTER = TypeAdapter(FeatureId)
 
 
 class EntitlementDecision(StrEnum):
@@ -171,7 +175,8 @@ class EntitlementGate:
     ) -> EntitlementGate:
         return cls(path=path, keys=_parse_keyring(keyring_document), now=now)
 
-    def decision(self) -> EntitlementDecision:
+    def decision(self, feature_id: str = CONNECT_FEATURE_ID) -> EntitlementDecision:
+        requested_feature = _validate_feature_id(feature_id)
         if not self.keys:
             return EntitlementDecision.AUTHORITY_UNAVAILABLE
         if self.path is None:
@@ -179,10 +184,15 @@ class EntitlementGate:
         content = _read_private_entitlement(self.path)
         if content is None:
             return EntitlementDecision.MISSING
-        return _evaluate_entitlement(content, self.keys, self._current_time())
+        return _evaluate_entitlement(
+            content,
+            self.keys,
+            self._current_time(),
+            requested_feature,
+        )
 
-    def status(self) -> EntitlementStatus:
-        return EntitlementStatus.from_decision(self.decision())
+    def status(self, feature_id: str = CONNECT_FEATURE_ID) -> EntitlementStatus:
+        return EntitlementStatus.from_decision(self.decision(feature_id))
 
     def install(self, source: Path) -> EntitlementStatus:
         if not self.keys:
@@ -225,11 +235,19 @@ class EntitlementGate:
 
 
 def connect_entitlement_decision() -> EntitlementDecision:
-    return EntitlementGate.from_installation().decision()
+    return feature_entitlement_decision(CONNECT_FEATURE_ID)
 
 
 def connect_entitlement_status() -> EntitlementStatus:
-    return EntitlementGate.from_installation().status()
+    return feature_entitlement_status(CONNECT_FEATURE_ID)
+
+
+def feature_entitlement_decision(feature_id: str) -> EntitlementDecision:
+    return EntitlementGate.from_installation().decision(feature_id)
+
+
+def feature_entitlement_status(feature_id: str) -> EntitlementStatus:
+    return EntitlementGate.from_installation().status(feature_id)
 
 
 def install_connect_entitlement(source: Path) -> EntitlementStatus:
@@ -323,11 +341,20 @@ def _parse_utc(value: str) -> datetime:
     return parsed
 
 
+def _validate_feature_id(feature_id: str) -> str:
+    try:
+        return _FEATURE_ID_ADAPTER.validate_python(feature_id)
+    except ValidationError as exc:
+        raise ValueError("entitlement feature ID is invalid") from exc
+
+
 def _evaluate_entitlement(
     content: bytes,
     keys: MappingProxyType[str, bytes],
     now: datetime,
+    feature_id: str = CONNECT_FEATURE_ID,
 ) -> EntitlementDecision:
+    requested_feature = _validate_feature_id(feature_id)
     if not content or len(content) > MAX_ENTITLEMENT_BYTES or now.tzinfo is None:
         return EntitlementDecision.INVALID
     try:
@@ -358,7 +385,7 @@ def _evaluate_entitlement(
         return EntitlementDecision.NOT_YET_VALID
     if current >= expires_at:
         return EntitlementDecision.EXPIRED
-    if FEATURE_ID not in claims.features:
+    if requested_feature not in claims.features:
         return EntitlementDecision.FEATURE_MISSING
     return EntitlementDecision.ACTIVE
 
@@ -733,9 +760,7 @@ def _activation_lock(parent: Path) -> Iterator[None]:
 
 def _create_temporary_entitlement(parent: Path) -> tuple[int, Path]:
     for _ in range(64):
-        path = parent / (
-            f".{ENTITLEMENT_FILE_NAME}.tmp.{os.getpid()}.{next(_TEMP_SEQUENCE)}"
-        )
+        path = parent / (f".{ENTITLEMENT_FILE_NAME}.tmp.{os.getpid()}.{next(_TEMP_SEQUENCE)}")
         try:
             descriptor = os.open(
                 path,
