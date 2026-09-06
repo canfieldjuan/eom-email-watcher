@@ -1109,6 +1109,21 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
         email_address=original.email_address,
     )
 
+    def transient_calendar_error(*args):
+        raise Microsoft365Error("Microsoft authorization service is temporarily unavailable")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        transient_calendar_error,
+    )
+    transient = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert transient["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
+    assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
     class WrongCalendar:
         principal = microsoft_principal(object_id="object-2")
 

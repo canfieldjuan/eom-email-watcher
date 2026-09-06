@@ -944,6 +944,7 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                 )
                 raise ApiError("calendar_authorization_rejected", str(exc)) from exc
             except Microsoft365Error as exc:
+                _restore_calendar_grant(runtime, account.account_id, previous)
                 raise ApiError("calendar_error", str(exc)) from exc
 
             principal = calendar.principal

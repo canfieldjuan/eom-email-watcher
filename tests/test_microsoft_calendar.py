@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher import microsoft_calendar
+from eom_email_watcher.microsoft365 import MicrosoftAuthorizationRejected
 from eom_email_watcher.microsoft_calendar import (
     CALENDAR_READ_SCOPES,
     MicrosoftCalendarConsentPending,
@@ -222,6 +223,84 @@ def test_calendar_authorization_reports_consent_pending(
     )
 
     with pytest.raises(MicrosoftCalendarConsentPending):
+        MicrosoftCalendarReadAuthorization.authorize_with_status(
+            credentials,
+            tmp_path / "calendar-read-cache.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "error": "access_denied",
+            "error_description": "AADSTS65001: User or administrator consent is missing.",
+        },
+        {
+            "error": "access_denied",
+            "error_description": "AADSTS90094: Administrator consent is required.",
+        },
+        {"error": "access_denied", "error_codes": [90095]},
+    ],
+)
+def test_calendar_authorization_reports_documented_consent_codes_as_pending(
+    result: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    write_public_client(credentials)
+
+    class PendingApplication:
+        def acquire_token_interactive(self, scopes: list[str], **kwargs):
+            return result
+
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda configuration, cache: PendingApplication(),
+    )
+
+    with pytest.raises(MicrosoftCalendarConsentPending):
+        MicrosoftCalendarReadAuthorization.authorize_with_status(
+            credentials,
+            tmp_path / "calendar-read-cache.json",
+        )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "error": "access_denied",
+            "error_description": "AADSTS65004: The user declined consent.",
+            "error_codes": [65004],
+        },
+        {
+            "error": "access_denied",
+            "error_description": "AADSTS99999: An unrecognized failure.",
+        },
+    ],
+)
+def test_calendar_authorization_does_not_treat_other_codes_as_pending(
+    result: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    write_public_client(credentials)
+
+    class RejectedApplication:
+        def acquire_token_interactive(self, scopes: list[str], **kwargs):
+            return result
+
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda configuration, cache: RejectedApplication(),
+    )
+
+    with pytest.raises(MicrosoftAuthorizationRejected):
         MicrosoftCalendarReadAuthorization.authorize_with_status(
             credentials,
             tmp_path / "calendar-read-cache.json",

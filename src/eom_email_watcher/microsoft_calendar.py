@@ -27,10 +27,29 @@ from .microsoft365 import (
 
 CALENDAR_READ_PROFILE = "read"
 CALENDAR_READ_SCOPES = ("Calendars.Read",)
+_CONSENT_PENDING_ERROR_CODES = frozenset({65001, 90094, 90095})
 
 
 class MicrosoftCalendarConsentPending(Microsoft365Error):
     """The user or tenant administrator must finish calendar consent."""
+
+
+def _entra_error_codes(result: dict[str, Any]) -> set[int]:
+    codes: set[int] = set()
+    raw_codes = result.get("error_codes")
+    if isinstance(raw_codes, list):
+        codes.update(
+            code for code in raw_codes if isinstance(code, int) and not isinstance(code, bool)
+        )
+
+    description = result.get("error_description")
+    if isinstance(description, str):
+        prefix = description.partition(":")[0].strip().casefold()
+        if prefix.startswith("aadsts"):
+            numeric_code = prefix.removeprefix("aadsts")
+            if numeric_code.isascii() and numeric_code.isdigit():
+                codes.add(int(numeric_code))
+    return codes
 
 
 @dataclass(frozen=True)
@@ -89,7 +108,11 @@ def _calendar_authorization_result(result: object) -> dict[str, Any]:
             "consent_required",
             "interaction_required",
         }
-        if error in pending_errors or suberror in pending_errors:
+        if (
+            error in pending_errors
+            or suberror in pending_errors
+            or _entra_error_codes(result) & _CONSENT_PENDING_ERROR_CODES
+        ):
             raise MicrosoftCalendarConsentPending(
                 "Microsoft calendar consent requires user or administrator approval"
             )
