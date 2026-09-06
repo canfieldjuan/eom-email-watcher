@@ -17,7 +17,7 @@ from .config import MAX_RETENTION_DAYS
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -227,6 +227,19 @@ class AnalysisRequest:
     request_id: str
     context_at: str
     body_char_limit: int
+
+
+@dataclass(frozen=True)
+class CalendarGrant:
+    account_id: str
+    profile: str
+    state: str
+    principal_key: str | None
+    home_account_id: str | None
+    tenant_id: str | None
+    object_id: str | None
+    email_address: str | None
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -907,6 +920,33 @@ class Store:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_accounts_one_active
                     ON mail_accounts(active) WHERE active = 1;
+                CREATE TABLE IF NOT EXISTS microsoft_calendar_grants (
+                    account_id TEXT NOT NULL CHECK (account_id <> ''),
+                    profile TEXT NOT NULL CHECK (profile IN ('read', 'proposal', 'write')),
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'not_requested', 'consent_pending', 'ready', 'rejected', 'revoked'
+                        )
+                    ),
+                    principal_key TEXT CHECK (
+                        principal_key IS NULL OR length(principal_key) = 64
+                    ),
+                    home_account_id TEXT,
+                    tenant_id TEXT,
+                    object_id TEXT,
+                    email_address TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (account_id, profile),
+                    CHECK (
+                        state <> 'ready' OR (
+                            principal_key IS NOT NULL
+                            AND home_account_id IS NOT NULL
+                            AND tenant_id IS NOT NULL
+                            AND object_id IS NOT NULL
+                            AND email_address IS NOT NULL
+                        )
+                    )
+                );
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -1188,6 +1228,95 @@ class Store:
         account = self.mail_account(provider, account_id)
         assert account is not None
         return account
+
+    def calendar_grant(
+        self,
+        account_id: str,
+        profile: str = "read",
+    ) -> CalendarGrant | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT account_id, profile, state, principal_key,
+                    home_account_id, tenant_id, object_id, email_address, updated_at
+                FROM microsoft_calendar_grants
+                WHERE account_id = ? AND profile = ?""",
+                (account_id, profile),
+            ).fetchone()
+        return CalendarGrant(**dict(row)) if row is not None else None
+
+    def set_calendar_grant(
+        self,
+        account_id: str,
+        profile: str,
+        state: str,
+        *,
+        principal_key: str | None = None,
+        home_account_id: str | None = None,
+        tenant_id: str | None = None,
+        object_id: str | None = None,
+        email_address: str | None = None,
+    ) -> CalendarGrant:
+        if profile not in {"read", "proposal", "write"}:
+            raise ValueError("calendar grant profile is invalid")
+        if state not in {"not_requested", "consent_pending", "ready", "rejected", "revoked"}:
+            raise ValueError("calendar grant state is invalid")
+        identity = (principal_key, home_account_id, tenant_id, object_id, email_address)
+        if state == "ready" and any(value is None for value in identity):
+            raise ValueError("a ready calendar grant requires an immutable principal")
+        if state == "not_requested":
+            identity = (None, None, None, None, None)
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute(
+                """INSERT INTO microsoft_calendar_grants(
+                    account_id, profile, state, principal_key, home_account_id,
+                    tenant_id, object_id, email_address, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, profile) DO UPDATE SET
+                    state=excluded.state,
+                    principal_key=excluded.principal_key,
+                    home_account_id=excluded.home_account_id,
+                    tenant_id=excluded.tenant_id,
+                    object_id=excluded.object_id,
+                    email_address=excluded.email_address,
+                    updated_at=excluded.updated_at""",
+                (account_id, profile, state, *identity, stamp),
+            )
+        grant = self.calendar_grant(account_id, profile)
+        assert grant is not None
+        return grant
+
+    def revoke_calendar_grant_if_current(self, grant: CalendarGrant) -> bool:
+        """Persist revocation only if validation still describes the stored grant."""
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            cursor = db.execute(
+                """UPDATE microsoft_calendar_grants
+                SET state = 'revoked', updated_at = ?
+                WHERE account_id = ? AND profile = ?
+                    AND state = 'ready' AND updated_at = ?""",
+                (stamp, grant.account_id, grant.profile, grant.updated_at),
+            )
+        return cursor.rowcount == 1
+
+    def disconnect_calendar_read(self, account_id: str) -> CalendarGrant:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """INSERT INTO microsoft_calendar_grants(
+                    account_id, profile, state, principal_key, home_account_id,
+                    tenant_id, object_id, email_address, updated_at
+                ) VALUES (?, 'read', 'not_requested', NULL, NULL, NULL, NULL, NULL, ?)
+                ON CONFLICT(account_id, profile) DO UPDATE SET
+                    state='not_requested', principal_key=NULL, home_account_id=NULL,
+                    tenant_id=NULL, object_id=NULL, email_address=NULL,
+                    updated_at=excluded.updated_at""",
+                (account_id, stamp),
+            )
+        grant = self.calendar_grant(account_id)
+        assert grant is not None
+        return grant
 
     def state(
         self,

@@ -167,6 +167,53 @@ def test_mail_account_registry_rejects_duplicate_provider_identity(tmp_path: Pat
     ]
 
 
+def test_calendar_disconnect_clears_only_selected_read_state(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    account_id = "microsoft365-" + "c" * 32
+    identity = {
+        "principal_key": "d" * 64,
+        "home_account_id": "home.tenant",
+        "tenant_id": "tenant",
+        "object_id": "object",
+        "email_address": "owner@example.com",
+    }
+    store.set_calendar_grant(account_id, "read", "ready", **identity)
+    store.set_calendar_grant(account_id, "proposal", "ready", **identity)
+
+    disconnected = store.disconnect_calendar_read(account_id)
+
+    assert disconnected.state == "not_requested"
+    assert disconnected.principal_key is None
+    assert store.calendar_grant(account_id, "proposal").state == "ready"
+
+
+def test_calendar_revocation_compare_and_set_preserves_newer_state(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    account_id = "microsoft365-" + "e" * 32
+    identity = {
+        "principal_key": "f" * 64,
+        "home_account_id": "home.tenant",
+        "tenant_id": "tenant",
+        "object_id": "object",
+        "email_address": "owner@example.com",
+    }
+    ready = store.set_calendar_grant(account_id, "read", "ready", **identity)
+
+    assert store.revoke_calendar_grant_if_current(ready) is True
+    revoked = store.calendar_grant(account_id)
+    assert revoked is not None
+    assert revoked.state == "revoked"
+    assert revoked.principal_key == identity["principal_key"]
+
+    stale = store.set_calendar_grant(account_id, "read", "ready", **identity)
+    store.set_calendar_grant(account_id, "read", "consent_pending", **identity)
+
+    assert store.revoke_calendar_grant_if_current(stale) is False
+    assert store.calendar_grant(account_id).state == "consent_pending"
+
+
 def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     tmp_path: Path,
 ) -> None:

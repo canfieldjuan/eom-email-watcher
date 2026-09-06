@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,9 +31,15 @@ from eom_email_watcher.mailbox import (
     scoped_message_id,
 )
 from eom_email_watcher.microsoft365 import Microsoft365Error, Microsoft365Profile
+from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
-from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
+from eom_email_watcher.runtime import (
+    Runtime,
+    load_runtime,
+    mail_account_token_file,
+    microsoft_calendar_read_token_file,
+)
 
 IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
 REPLACEMENT_IMAP_CURSOR = f"eom-imap-v2:{'b' * 64}:55:99"
@@ -92,6 +99,15 @@ def request(config_path: Path, operation: str, payload: dict[str, object] | None
         "config_path": str(config_path),
         "payload": payload or {},
     }
+
+
+def microsoft_principal(*, object_id: str = "object-1") -> MicrosoftPrincipal:
+    return MicrosoftPrincipal(
+        home_account_id=f"{object_id}.tenant-1",
+        tenant_id="tenant-1",
+        object_id=object_id,
+        email_address="owner@example.com",
+    )
 
 
 def imap_credentials(
@@ -909,6 +925,512 @@ def test_mail_account_connect_authorizes_microsoft_and_initializes_delta_baselin
     encoded = json.dumps(response)
     assert "private Microsoft cache" not in encoded
     assert "private-delta-cursor" not in encoded
+
+
+def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'a' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api, "microsoft_mailbox_principal", lambda *args: microsoft_principal()
+    )
+
+    class AuthorizedCalendar:
+        principal = microsoft_principal()
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        assert runtime.store.calendar_grant(account.account_id).state == "consent_pending"
+        staged_token.write_text("calendar-read-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: AuthorizedCalendar(),
+    )
+    payload = {"provider": account.provider, "account_id": account.account_id}
+
+    response = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "account_id": account.account_id,
+        "available": True,
+        "entitlement_active": True,
+        "profile": "read",
+        "scope": "Calendars.Read",
+        "state": "ready",
+    }
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
+    assert calendar_token.stat().st_mode & 0o777 == 0o600
+    assert mail_token.read_text(encoding="utf-8") == "mail-read-cache"
+    grant = runtime.store.calendar_grant(account.account_id)
+    assert grant is not None
+    assert grant.principal_key == microsoft_principal().key
+    encoded = json.dumps(response)
+    assert "calendar-read-cache" not in encoded
+    assert "home_account_id" not in encoded
+    assert str(tmp_path) not in encoded
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        lambda *args: pytest.fail("Authorization started without a staging directory"),
+    )
+
+    def staging_unavailable(*args, **kwargs):
+        raise OSError("calendar staging directory is unavailable")
+
+    monkeypatch.setattr(engine_api.tempfile, "TemporaryDirectory", staging_unavailable)
+    staging_failure = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert staging_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id) == grant
+    assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
+
+
+@pytest.mark.parametrize("existing_ready", [False, True])
+def test_calendar_read_connect_recovers_exit_after_token_install(
+    existing_ready: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'d' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    selected_principal = microsoft_principal()
+    if existing_ready:
+        runtime.store.set_calendar_grant(
+            account.account_id,
+            "read",
+            "ready",
+            principal_key=selected_principal.key,
+            home_account_id=selected_principal.home_account_id,
+            tenant_id=selected_principal.tenant_id,
+            object_id=selected_principal.object_id,
+            email_address=selected_principal.email_address,
+        )
+        calendar_token.write_text("old-calendar-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: selected_principal)
+
+    class AuthorizedCalendar:
+        principal = selected_principal
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("installed-calendar-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    real_install = engine_api._install_private_token
+
+    def install_then_exit(source: Path, destination: Path) -> None:
+        real_install(source, destination)
+        raise SystemExit
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    monkeypatch.setattr(engine_api, "_install_private_token", install_then_exit)
+    payload = {"provider": account.provider, "account_id": account.account_id}
+
+    with pytest.raises(SystemExit):
+        engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    installed_grant = runtime.store.calendar_grant(account.account_id)
+    assert installed_grant is not None
+    assert installed_grant.state == "ready"
+    assert installed_grant.principal_key == selected_principal.key
+    assert calendar_token.read_text(encoding="utf-8") == "installed-calendar-cache"
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: AuthorizedCalendar(),
+    )
+    status = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert status["data"]["state"] == "ready"
+    assert status["data"]["available"] is True
+
+
+@pytest.mark.parametrize("existing_ready", [False, True])
+def test_calendar_read_connect_restores_grant_when_ready_transition_fails(
+    existing_ready: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'e' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    principal = microsoft_principal()
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    if existing_ready:
+        runtime.store.set_calendar_grant(
+            account.account_id,
+            "read",
+            "ready",
+            principal_key=principal.key,
+            home_account_id=principal.home_account_id,
+            tenant_id=principal.tenant_id,
+            object_id=principal.object_id,
+            email_address=principal.email_address,
+        )
+        calendar_token.write_text("old-calendar-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: principal)
+
+    class AuthorizedCalendar:
+        principal = microsoft_principal()
+
+    staged_paths: list[Path] = []
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_paths.append(staged_token)
+        staged_token.write_text("new-calendar-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    real_set = engine_api.Store.set_calendar_grant
+    failed = False
+
+    def fail_first_ready(self, account_id: str, profile: str, state: str, **identity):
+        nonlocal failed
+        if state == "ready" and not failed:
+            failed = True
+            raise sqlite3.OperationalError("database is temporarily busy")
+        return real_set(self, account_id, profile, state, **identity)
+
+    monkeypatch.setattr(engine_api.Store, "set_calendar_grant", fail_first_ready)
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.connect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["error"]["code"] == "calendar_error"
+    restored = runtime.store.calendar_grant(account.account_id)
+    assert restored is not None
+    assert restored.state == ("ready" if existing_ready else "not_requested")
+    assert restored.principal_key == (principal.key if existing_ready else None)
+    assert calendar_token.exists() is existing_ready
+    if existing_ready:
+        assert calendar_token.read_text(encoding="utf-8") == "old-calendar-cache"
+    assert staged_paths and not staged_paths[0].exists()
+
+
+def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'b' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    payload = {"provider": account.provider, "account_id": account.account_id}
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: False)
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        lambda *args: pytest.fail("Locked calendar setup reached Microsoft authorization"),
+    )
+
+    locked = engine_api._response(request(config_path, "calendar.read.status", payload))
+    rejected = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert locked["data"]["state"] == "not_requested"
+    assert locked["data"]["available"] is False
+    assert rejected["error"]["code"] == "calendar_entitlement_required"
+
+    original = microsoft_principal()
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.parent.mkdir(parents=True, exist_ok=True)
+    calendar_token.write_text("preserved-calendar-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+
+    class CurrentCalendar:
+        principal = original
+
+    def rejected_calendar_cache(*args):
+        raise engine_api.MicrosoftAuthorizationRejected("Calendar cache was revoked")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        rejected_calendar_cache,
+    )
+    revoked_cache = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert revoked_cache["data"]["state"] == "revoked"
+    assert revoked_cache["data"]["available"] is False
+    revoked_grant = runtime.store.calendar_grant(account.account_id)
+    assert revoked_grant.state == "revoked"
+    assert revoked_grant.principal_key == original.key
+
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: CurrentCalendar(),
+    )
+
+    def rejected_mailbox_cache(*args):
+        raise engine_api.MicrosoftAuthorizationRejected("Mailbox cache was revoked")
+
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", rejected_mailbox_cache)
+    unavailable_mailbox = engine_api._response(
+        request(config_path, "calendar.read.status", payload)
+    )
+
+    assert unavailable_mailbox["data"]["state"] == "ready"
+    assert unavailable_mailbox["data"]["available"] is False
+
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: microsoft_principal(object_id="replacement-object"),
+    )
+
+    stale_binding = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert stale_binding["data"]["state"] == "ready"
+    assert stale_binding["data"]["available"] is False
+
+    monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: original)
+
+    def consent_pending(*args):
+        raise engine_api.MicrosoftCalendarConsentPending("Administrator approval is pending")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        consent_pending,
+    )
+    pending = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert pending["data"]["state"] == "consent_pending"
+    assert pending["data"]["available"] is False
+    assert runtime.store.calendar_grant(account.account_id).state == "consent_pending"
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+
+    def transient_calendar_error(*args):
+        raise Microsoft365Error("Microsoft authorization service is temporarily unavailable")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        transient_calendar_error,
+    )
+    transient = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert transient["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
+    assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
+    class AuthorizedCalendar:
+        principal = original
+
+    def authorize_current(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("replacement-calendar-cache", encoding="utf-8")
+        return AuthorizedCalendar(), True
+
+    def fail_token_install(source: Path, destination: Path) -> None:
+        raise OSError("calendar cache destination is unavailable")
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize_current,
+    )
+    monkeypatch.setattr(engine_api, "_install_private_token", fail_token_install)
+    install_failure = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert install_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
+    assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+
+    runtime.store.disconnect_calendar_read(account.account_id)
+    first_attempt_failure = engine_api._response(
+        request(config_path, "calendar.read.connect", payload)
+    )
+
+    assert first_attempt_failure["error"]["code"] == "calendar_error"
+    assert runtime.store.calendar_grant(account.account_id).state == "not_requested"
+
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+
+    class WrongCalendar:
+        principal = microsoft_principal(object_id="object-2")
+
+    def authorize_wrong(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("wrong-calendar-cache", encoding="utf-8")
+        return WrongCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize_wrong,
+    )
+
+    mismatch = engine_api._response(request(config_path, "calendar.read.connect", payload))
+
+    assert mismatch["error"]["code"] == "account_identity_mismatch"
+    assert calendar_token.read_text(encoding="utf-8") == "preserved-calendar-cache"
+    assert runtime.store.calendar_grant(account.account_id).principal_key == original.key
+    assert runtime.store.calendar_grant(account.account_id).state == "ready"
+
+
+def test_calendar_read_disconnect_preserves_mailbox_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'c' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    selected_principal = microsoft_principal()
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=selected_principal.key,
+        home_account_id=selected_principal.home_account_id,
+        tenant_id=selected_principal.tenant_id,
+        object_id=selected_principal.object_id,
+        email_address=selected_principal.email_address,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.write_text("calendar-read-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: False)
+
+    locked_status = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.status",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+    assert locked_status["data"]["state"] == "ready"
+    assert locked_status["data"]["available"] is False
+    assert locked_status["data"]["entitlement_active"] is False
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.disconnect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["data"]["state"] == "not_requested"
+    assert not calendar_token.exists()
+    assert mail_token.read_text(encoding="utf-8") == "mail-read-cache"
+    assert runtime.store.calendar_grant(account.account_id).state == "not_requested"
 
 
 def test_mail_account_connect_installs_private_imap_credentials_and_baseline(
