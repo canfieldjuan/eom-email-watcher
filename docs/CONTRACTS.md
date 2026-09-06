@@ -287,11 +287,12 @@ The projection stores no raw Graph document, body, attendee list, organizer, or
 token. Each row contains only the immutable event ID, bounded subject, bounded
 start/end date-time and zone strings, all-day flag, and bounded location display
 name. The UTF-8 byte ceilings are 512 each for event ID, subject, and location,
-64 for each date-time, and 128 for each zone. `calendar.read.events` has an 8-MiB
-encoded-response ceiling; its field and entry bounds must keep every valid
-projection representable under that ceiling rather than silently dropping
-events. Read disconnect removes these copied rows and their cursor in the same
-database transaction that resets the grant.
+64 for each date-time, and 128 for each zone. `calendar.read.events` has a 16-MiB
+encoded-response ceiling. The engine emits UTF-8 JSON without ASCII escaping;
+its field and entry bounds keep every valid projection representable under that
+ceiling even when every string character requires JSON escaping. It fails rather
+than silently dropping events. Read disconnect removes these copied rows and
+their cursor in the same database transaction that resets the grant.
 
 Graph webhooks are excluded. They require a publicly reachable HTTPS callback,
 which conflicts with this local-first deployment.
