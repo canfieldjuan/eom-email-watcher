@@ -230,6 +230,11 @@ resets only that grant, and, for the read profile, deletes its locally copied
 calendar projection and cursor. It does not remove the mailbox or either other
 calendar profile.
 
+Status may remain temporarily unavailable when a principal cannot be checked,
+but a definitive mismatch between the durable grant and either locally
+authorized principal transitions that profile to `revoked`; it never reports a
+mismatched profile as `ready` with only `available=false` carrying the error.
+
 Calendar reads use two engine operations:
 
 ```text
@@ -246,8 +251,15 @@ Version 1 retains only the most recently completed window for each account and
 returns its complete bounded projection rather than accepting pagination state,
 a caller-supplied Graph cursor, or a Graph URL. A successful initial sync for a
 different window atomically replaces the prior window, cursor, and event rows.
-`calendar.read.events` performs no Graph request and refuses an incomplete,
-missing, differently windowed, differently principaled, or unavailable grant.
+`calendar.read.events` is an offline projection read: it performs no Graph or
+token-endpoint request and does not acquire the global mailbox mutation lock.
+It validates the entitlement, selected account, durable ready grant, local
+mailbox and calendar cache presence, and projection identity using local state
+only. It reads the completed window and all of its events from one SQLite read
+snapshot, so a concurrent sync continues to expose the previous complete
+projection until the replacement transaction commits. It refuses an
+incomplete, missing, differently windowed, differently principaled, or
+unavailable grant.
 
 The initial delta request contains only the canonical `startDateTime` and
 `endDateTime` query parameters and sends `Prefer: odata.maxpagesize=100` plus the
@@ -266,7 +278,8 @@ One delta round is bounded before persistence by all of the following:
 - at most 2 MiB of response bytes per page and 16 MiB in the complete round; and
 - at most 32 KiB in any accepted continuation URL; and
 - at most 300 seconds for the complete round, with each HTTP call capped by the
-  smaller of the existing per-request timeout and the remaining round time.
+  smaller of the existing per-request timeout and the remaining round time and
+  the absolute deadline rechecked while every response body is streamed.
 
 Crossing any bound, receiving redirects, receiving both or neither continuation
 fields, receiving malformed event data, or receiving an unexpected Graph status
