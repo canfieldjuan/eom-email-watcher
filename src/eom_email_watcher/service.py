@@ -125,6 +125,7 @@ class AutomationProcessing:
     processed: int
     review_required: int
     attempted_run_ids: frozenset[str]
+    purged: int
 
 
 def _utc_now() -> datetime:
@@ -190,9 +191,9 @@ def process_scheduling_automations(
     now: datetime | None = None,
 ) -> AutomationProcessing:
     observed_at = (now or _utc_now()).astimezone(UTC)
-    store.purge(config.retention_days, now=observed_at)
-    processed = 0
-    review_required = 0
+    purge_outcome = store.purge_with_outcome(config.retention_days, now=observed_at)
+    processed = purge_outcome.automation_review_required
+    review_required = purge_outcome.automation_review_required
     attempted: set[str] = set()
     capacity_used = 0
     cursor: tuple[str, str] | None = None
@@ -394,7 +395,12 @@ def process_scheduling_automations(
                 if current.state in {"ambiguous", "manual_review", "source_unavailable"}:
                     review_required += 1
                 break
-    return AutomationProcessing(processed, review_required, frozenset(attempted))
+    return AutomationProcessing(
+        processed,
+        review_required,
+        frozenset(attempted),
+        purge_outcome.messages,
+    )
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
@@ -859,6 +865,7 @@ def run_watcher_check(
             )
     return {
         **result,
+        "purged": int(result["purged"]) + before.purged + after.purged,
         "automation_processed": before.processed + after.processed,
         "automation_review_required": before.review_required + after.review_required,
     }

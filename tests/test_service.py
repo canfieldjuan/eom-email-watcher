@@ -1161,8 +1161,37 @@ def test_recovery_purges_expired_source_before_fetch_or_inference(
         "source_unavailable",
         "source_unavailable",
     )
-    assert result.processed == 0
+    assert result.processed == 1
+    assert result.review_required == 1
+    assert result.purged == 1
     assert model.extraction_calls == []
+
+
+def test_canonical_check_reports_recovery_purge_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(
+        config(tmp_path),
+        senders=(),
+        retention_days=1,
+        notifications_enabled=False,
+    )
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(
+        store,
+        received_at="2026-01-01T12:00:00+00:00",
+    )
+    monkeypatch.setattr(service_module, "_utc_now", lambda: datetime(2026, 9, 7, 13, tzinfo=UTC))
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "source_unavailable"
+    assert result["purged"] == 1
+    assert result["automation_processed"] == 1
+    assert result["automation_review_required"] == 1
 
 
 def test_unauthorized_oldest_page_does_not_starve_newer_runnable_work(

@@ -435,6 +435,12 @@ class CalendarEventMutation:
 
 
 @dataclass(frozen=True)
+class PurgeOutcome:
+    messages: int
+    automation_review_required: int
+
+
+@dataclass(frozen=True)
 class AutomationRun:
     run_id: str
     provider: str
@@ -633,9 +639,10 @@ def _mark_automation_sources_unavailable(
     message_ids: Sequence[str],
     *,
     updated_at: str,
-) -> None:
+) -> int:
     if not message_ids:
-        return
+        return 0
+    transitioned = 0
     for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
         chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
         placeholders = ", ".join("?" for _ in chunk)
@@ -680,6 +687,7 @@ def _mark_automation_sources_unavailable(
             )
             if changed.rowcount != 1:
                 raise RuntimeError("Automation source cleanup lost its expected-state race")
+            transitioned += 1
             _append_automation_event(
                 db,
                 run_id=run_id,
@@ -705,6 +713,7 @@ def _mark_automation_sources_unavailable(
                     else None
                 ),
             )
+    return transitioned
 
 
 def _purge_expired_automation_tombstones(
@@ -3974,7 +3983,12 @@ class Store:
             item["attachments"] = attachments_by_message[str(item["message_id"])]
         return items
 
-    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+    def purge_with_outcome(
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+    ) -> PurgeOutcome:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         cutoff = stamp - timedelta(days=retention_days)
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
@@ -4006,7 +4020,7 @@ class Store:
                 f"SELECT message_id FROM messages WHERE {expiry_predicate}",
                 expiry_parameters,
             ).fetchall()
-            _mark_automation_sources_unavailable(
+            automation_review_required = _mark_automation_sources_unavailable(
                 db,
                 [str(row["message_id"]) for row in expired],
                 updated_at=stamp.isoformat(),
@@ -4025,7 +4039,10 @@ class Store:
                    OR julianday(expires_at) < julianday(?)""",
                 (stamp.isoformat(),),
             )
-        return cursor.rowcount
+        return PurgeOutcome(cursor.rowcount, automation_review_required)
+
+    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+        return self.purge_with_outcome(retention_days, now=now).messages
 
     def outbound_status(self, dedupe_key: str) -> str | None:
         with self.connection() as db:

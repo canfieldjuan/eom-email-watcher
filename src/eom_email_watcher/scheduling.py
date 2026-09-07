@@ -353,18 +353,19 @@ def _date_has_source_support(
             (local.month, local.day) < (context_date.month, context_date.day)
         )
         return local.year == expected_year
-    if "day after tomorrow" in text:
+    if re.search(r"\bday\s+after\s+tomorrow\b", text):
         return local.date().toordinal() == context_date.toordinal() + 2
     weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
     for weekday_index, weekday in enumerate(weekdays):
         if re.search(rf"\bnext\s+{weekday}\b", text):
             days_ahead = (weekday_index - context_date.weekday()) % 7 or 7
             return local.date().toordinal() == context_date.toordinal() + days_ahead
-    if weekdays[local.weekday()] in text:
+    if re.search(rf"\b{weekdays[local.weekday()]}\b", text):
         days_ahead = (local.weekday() - context_date.weekday()) % 7
         return local.date().toordinal() == context_date.toordinal() + days_ahead
-    return ("today" in text and local.date() == context_date) or (
-        "tomorrow" in text and local.date().toordinal() == context_date.toordinal() + 1
+    return (re.search(r"\btoday\b", text) is not None and local.date() == context_date) or (
+        re.search(r"\btomorrow\b", text) is not None
+        and local.date().toordinal() == context_date.toordinal() + 1
     )
 
 
@@ -375,7 +376,9 @@ def _time_patterns(value: datetime, *, zone: ZoneInfo) -> tuple[str, ...]:
         precision += f":{local.second:02d}"
     if local.microsecond:
         precision += f".{local.microsecond:06d}".rstrip("0")
-    patterns = [rf"(?<!\d)0?{local.hour}{re.escape(precision)}(?!\d)"]
+    patterns = [
+        rf"(?<!\d)0?{local.hour}{re.escape(precision)}(?!\d|\s*(?:am|pm)\b)"
+    ]
     meridiem = "am" if local.hour < 12 else "pm"
     hour = local.hour % 12 or 12
     minute = re.escape(precision)
@@ -409,7 +412,11 @@ def _range_has_source_support(
     source: SchedulingSource,
 ) -> bool:
     option_delimiters = tuple(
-        re.finditer(r"(?:\bor\b|;|\n)", evidence_text, re.IGNORECASE)
+        re.finditer(
+            r"(?:\bor\b|;|\n|,\s*(?=(?:[A-Za-z]+\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            evidence_text,
+            re.IGNORECASE,
+        )
     )
     for start_match in _time_source_matches(start, evidence_text, zone=zone):
         for end_match in _time_source_matches(end, evidence_text, zone=zone):
@@ -500,6 +507,12 @@ def _explicit_timezones(
         r"\b(?:eastern|central|mountain|pacific)(?:\s+[A-Za-z]+){0,3}\s+time\b",
         evidence_text,
         re.IGNORECASE,
+    ):
+        if " ".join(phrase.casefold().split()) not in _ZONE_LABELS:
+            unsupported_label = True
+    for phrase in re.findall(
+        r"\b(?:[A-Z][A-Za-z]*\s+){1,3}Time\b",
+        evidence_text,
     ):
         if " ".join(phrase.casefold().split()) not in _ZONE_LABELS:
             unsupported_label = True
