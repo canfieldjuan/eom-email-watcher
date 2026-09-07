@@ -17,7 +17,7 @@ from .config import MAX_RETENTION_DAYS
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -253,6 +253,21 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     )),
     state_version INTEGER NOT NULL CHECK (state_version >= 1),
     failure_code TEXT,
+    source_content_sha256 TEXT CHECK (
+        source_content_sha256 IS NULL OR length(source_content_sha256) = 64
+    ),
+    extraction_context_at TEXT,
+    extraction_timezone TEXT,
+    extraction_body_char_limit INTEGER CHECK (
+        extraction_body_char_limit IS NULL OR extraction_body_char_limit > 0
+    ),
+    current_payload_id TEXT CHECK (
+        current_payload_id IS NULL OR length(current_payload_id) = 36
+    ),
+    current_payload_sha256 TEXT CHECK (
+        current_payload_sha256 IS NULL OR length(current_payload_sha256) = 64
+    ),
+    review_notified_at TEXT,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -292,6 +307,8 @@ CREATE TABLE IF NOT EXISTS automation_events (
         'completed', 'failed', 'unresolved', 'source_unavailable', 'reconciling'
     )),
     failure_code TEXT,
+    payload_id TEXT CHECK (payload_id IS NULL OR length(payload_id) = 36),
+    payload_sha256 TEXT CHECK (payload_sha256 IS NULL OR length(payload_sha256) = 64),
     created_at TEXT NOT NULL,
     UNIQUE (run_id, sequence_no),
     UNIQUE (run_id, state_version),
@@ -315,6 +332,47 @@ BEFORE DELETE ON automation_events
 WHEN EXISTS (SELECT 1 FROM automation_runs WHERE run_id = OLD.run_id)
 BEGIN
     SELECT RAISE(ABORT, 'automation_events are immutable');
+END;
+CREATE TABLE IF NOT EXISTS automation_extraction_payloads (
+    payload_id TEXT PRIMARY KEY CHECK (length(payload_id) = 36),
+    run_id TEXT NOT NULL CHECK (run_id <> ''),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no IN (1, 2)),
+    request_id TEXT NOT NULL UNIQUE CHECK (length(request_id) = 36),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'accepted', 'rejected')),
+    source_content_sha256 TEXT NOT NULL CHECK (length(source_content_sha256) = 64),
+    context_at TEXT NOT NULL CHECK (context_at <> ''),
+    timezone TEXT NOT NULL CHECK (timezone <> ''),
+    body_char_limit INTEGER NOT NULL CHECK (body_char_limit > 0),
+    result_sha256 TEXT CHECK (result_sha256 IS NULL OR length(result_sha256) = 64),
+    result_json BLOB CHECK (
+        result_json IS NULL OR (
+            typeof(result_json) = 'blob' AND length(result_json) BETWEEN 1 AND 32768
+        )
+    ),
+    violations_json BLOB CHECK (
+        violations_json IS NULL OR (
+            typeof(violations_json) = 'blob' AND length(violations_json) BETWEEN 2 AND 8192
+        )
+    ),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE (run_id, attempt_no),
+    CHECK (
+        (status = 'reserved' AND result_sha256 IS NULL AND result_json IS NULL
+            AND violations_json IS NULL AND completed_at IS NULL)
+        OR (status = 'accepted' AND result_sha256 IS NOT NULL AND result_json IS NOT NULL
+            AND violations_json = X'5B5D' AND completed_at IS NOT NULL)
+        OR (status = 'rejected' AND result_sha256 IS NOT NULL AND result_json IS NOT NULL
+            AND violations_json IS NOT NULL AND violations_json <> X'5B5D'
+            AND completed_at IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_automation_extraction_payloads_run
+    ON automation_extraction_payloads(run_id, attempt_no);
+CREATE TRIGGER IF NOT EXISTS automation_runs_delete_extraction_payloads
+AFTER DELETE ON automation_runs
+BEGIN
+    DELETE FROM automation_extraction_payloads WHERE run_id = OLD.run_id;
 END;
 """
 
@@ -380,6 +438,13 @@ class AutomationRun:
     state: str
     state_version: int
     failure_code: str | None
+    source_content_sha256: str | None
+    extraction_context_at: str | None
+    extraction_timezone: str | None
+    extraction_body_char_limit: int | None
+    current_payload_id: str | None
+    current_payload_sha256: str | None
+    review_notified_at: str | None
     expires_at: str
     created_at: str
     updated_at: str
@@ -399,7 +464,43 @@ class AutomationEvent:
     calendar_principal_key: str
     transition_kind: str
     failure_code: str | None
+    payload_id: str | None
+    payload_sha256: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class AutomationExtractionPayload:
+    payload_id: str
+    run_id: str
+    attempt_no: int
+    request_id: str
+    status: str
+    source_content_sha256: str
+    context_at: str
+    timezone: str
+    body_char_limit: int
+    result_sha256: str | None
+    result_json: bytes | None
+    violations_json: bytes | None
+    created_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True)
+class AutomationWork:
+    run: AutomationRun
+    message_id: str
+    provider_message_id: str
+    sender: str
+    sender_name: str | None
+    subject: str
+    received_at: str
+    organizer_address: str
+
+
+class AutomationSourceChanged(RuntimeError):
+    """A recoverable automation source no longer matches its first extraction input."""
 
 
 def _automation_run(row: sqlite3.Row) -> AutomationRun:
@@ -408,6 +509,10 @@ def _automation_run(row: sqlite3.Row) -> AutomationRun:
 
 def _automation_event(row: sqlite3.Row) -> AutomationEvent:
     return AutomationEvent(**dict(row))
+
+
+def _automation_extraction_payload(row: sqlite3.Row) -> AutomationExtractionPayload:
+    return AutomationExtractionPayload(**dict(row))
 
 
 def _append_automation_event(
@@ -425,13 +530,16 @@ def _append_automation_event(
     transition_kind: str,
     failure_code: str | None,
     created_at: str,
+    payload_id: str | None = None,
+    payload_sha256: str | None = None,
 ) -> None:
     db.execute(
         """INSERT INTO automation_events(
             event_id, run_id, sequence_no, previous_state, next_state, state_version,
             automation_id, automation_version, extraction_schema_version,
-            calendar_principal_key, transition_kind, failure_code, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            calendar_principal_key, transition_kind, failure_code, payload_id,
+            payload_sha256, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             str(uuid.uuid4()),
             run_id,
@@ -445,6 +553,8 @@ def _append_automation_event(
             calendar_principal_key,
             transition_kind,
             failure_code,
+            payload_id,
+            payload_sha256,
             created_at,
         ),
     )
@@ -517,7 +627,8 @@ def _mark_automation_sources_unavailable(
         placeholders = ", ".join("?" for _ in chunk)
         runs = db.execute(
             f"""SELECT r.run_id, r.automation_id, r.automation_version,
-                r.extraction_schema_version, r.calendar_principal_key
+                r.extraction_schema_version, r.calendar_principal_key, r.state,
+                r.state_version, r.current_payload_id, r.current_payload_sha256
             FROM automation_runs AS r
             JOIN messages AS m
               ON m.provider = r.provider
@@ -525,29 +636,43 @@ def _mark_automation_sources_unavailable(
              AND message_source_key(
                     m.provider, m.account_id, m.provider_message_id
                  ) = r.source_message_key
-            WHERE r.state = 'detected' AND r.state_version = 1
-              AND m.message_id IN ({placeholders})
+            WHERE m.message_id IN ({placeholders})
             ORDER BY r.run_id""",
             tuple(chunk),
         ).fetchall()
         for row in runs:
             run_id = str(row["run_id"])
+            db.execute(
+                "DELETE FROM automation_extraction_payloads WHERE run_id = ?",
+                (run_id,),
+            )
+            previous_state = str(row["state"])
+            if previous_state not in {
+                "detected",
+                "extracting",
+                "proposing",
+                "awaiting_confirmation",
+            }:
+                continue
+            previous_version = int(row["state_version"])
+            next_version = previous_version + 1
             changed = db.execute(
                 """UPDATE automation_runs SET
-                    state = 'source_unavailable', state_version = 2,
-                    failure_code = 'source_unavailable', updated_at = ?
-                WHERE run_id = ? AND state = 'detected' AND state_version = 1""",
-                (updated_at, run_id),
+                    state = 'source_unavailable', state_version = ?,
+                    failure_code = 'source_unavailable', review_notified_at = NULL,
+                    updated_at = ?
+                WHERE run_id = ? AND state = ? AND state_version = ?""",
+                (next_version, updated_at, run_id, previous_state, previous_version),
             )
             if changed.rowcount != 1:
                 raise RuntimeError("Automation source cleanup lost its expected-state race")
             _append_automation_event(
                 db,
                 run_id=run_id,
-                sequence_no=1,
-                previous_state="detected",
+                sequence_no=next_version - 1,
+                previous_state=previous_state,
                 next_state="source_unavailable",
-                state_version=2,
+                state_version=next_version,
                 automation_id=str(row["automation_id"]),
                 automation_version=int(row["automation_version"]),
                 extraction_schema_version=int(row["extraction_schema_version"]),
@@ -555,6 +680,16 @@ def _mark_automation_sources_unavailable(
                 transition_kind="source_unavailable",
                 failure_code="source_unavailable",
                 created_at=updated_at,
+                payload_id=(
+                    str(row["current_payload_id"])
+                    if row["current_payload_id"] is not None
+                    else None
+                ),
+                payload_sha256=(
+                    str(row["current_payload_sha256"])
+                    if row["current_payload_sha256"] is not None
+                    else None
+                ),
             )
 
 
@@ -565,7 +700,7 @@ def _purge_expired_automation_tombstones(
 ) -> None:
     rows = db.execute(
         """SELECT run_id FROM automation_runs
-        WHERE state = 'source_unavailable' AND expires_at <= ?
+        WHERE state NOT IN ('writing', 'unresolved', 'reconciling') AND expires_at <= ?
         ORDER BY run_id""",
         (now,),
     ).fetchall()
@@ -575,7 +710,8 @@ def _purge_expired_automation_tombstones(
         placeholders = ", ".join("?" for _ in chunk)
         db.execute(
             f"""DELETE FROM automation_runs
-            WHERE state = 'source_unavailable' AND run_id IN ({placeholders})""",
+            WHERE state NOT IN ('writing', 'unresolved', 'reconciling')
+              AND run_id IN ({placeholders})""",
             tuple(chunk),
         )
         db.execute(
@@ -623,6 +759,9 @@ class AnalyzedMessage:
 
 @dataclass(frozen=True)
 class NotificationIntent:
+    subject_type: str
+    subject_id: str
+    revision: str
     message_id: str
     kind: str
     sender: str
@@ -1417,6 +1556,29 @@ class Store:
             )
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
+            automation_run_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(automation_runs)").fetchall()
+            }
+            automation_run_migrations = {
+                "source_content_sha256": "TEXT",
+                "extraction_context_at": "TEXT",
+                "extraction_timezone": "TEXT",
+                "extraction_body_char_limit": "INTEGER",
+                "current_payload_id": "TEXT",
+                "current_payload_sha256": "TEXT",
+                "review_notified_at": "TEXT",
+            }
+            for column, definition in automation_run_migrations.items():
+                if column not in automation_run_columns:
+                    db.execute(f"ALTER TABLE automation_runs ADD COLUMN {column} {definition}")
+            automation_event_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(automation_events)").fetchall()
+            }
+            for column in ("payload_id", "payload_sha256"):
+                if column not in automation_event_columns:
+                    db.execute(f"ALTER TABLE automation_events ADD COLUMN {column} TEXT")
             stamp = datetime.now(UTC).isoformat()
             db.execute(
                 """INSERT INTO mail_accounts(
@@ -2616,6 +2778,398 @@ class Store:
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
 
+    def recoverable_automation_runs(self, limit: int = 25) -> list[AutomationWork]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT r.*, m.message_id AS work_message_id,
+                    m.provider_message_id AS work_provider_message_id,
+                    m.sender AS work_sender, m.sender_name AS work_sender_name,
+                    m.subject AS work_subject, m.received_at AS work_received_at,
+                    a.address AS organizer_address
+                FROM automation_runs AS r
+                JOIN messages AS m
+                  ON m.provider = r.provider
+                 AND m.account_id = r.account_id
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key
+                JOIN mail_accounts AS a
+                  ON a.provider = r.provider AND a.account_id = r.account_id
+                WHERE r.state IN ('detected', 'extracting')
+                  AND a.address IS NOT NULL
+                ORDER BY r.created_at, r.run_id
+                LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        names = AutomationRun.__dataclass_fields__
+        return [
+            AutomationWork(
+                run=AutomationRun(**{name: row[name] for name in names}),
+                message_id=str(row["work_message_id"]),
+                provider_message_id=str(row["work_provider_message_id"]),
+                sender=str(row["work_sender"]),
+                sender_name=(
+                    str(row["work_sender_name"])
+                    if row["work_sender_name"] is not None
+                    else None
+                ),
+                subject=str(row["work_subject"]),
+                received_at=str(row["work_received_at"]),
+                organizer_address=str(row["organizer_address"]),
+            )
+            for row in rows
+        ]
+
+    def automation_extraction_payloads(self, run_id: str) -> list[AutomationExtractionPayload]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM automation_extraction_payloads
+                WHERE run_id = ? ORDER BY attempt_no""",
+                (run_id,),
+            ).fetchall()
+        return [_automation_extraction_payload(row) for row in rows]
+
+    def reserve_automation_extraction(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        source_content_sha256: str,
+        context_at: str,
+        timezone: str,
+        body_char_limit: int,
+        now: datetime | None = None,
+    ) -> AutomationExtractionPayload:
+        if len(source_content_sha256) != 64:
+            raise ValueError("source_content_sha256 must be a SHA-256 digest")
+        if not context_at or not timezone or body_char_limit < 1:
+            raise ValueError("extraction context must be complete")
+        stamp = (now or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            if str(row["state"]) not in {"detected", "extracting"} or int(
+                row["state_version"]
+            ) != expected_state_version:
+                raise RuntimeError("Automation extraction lost its expected-state race")
+            previous_source_hash = row["source_content_sha256"]
+            if previous_source_hash is not None and previous_source_hash != source_content_sha256:
+                raise AutomationSourceChanged("Automation source content changed after admission")
+            payload_rows = db.execute(
+                """SELECT * FROM automation_extraction_payloads
+                WHERE run_id = ? ORDER BY attempt_no""",
+                (run_id,),
+            ).fetchall()
+            if payload_rows and str(payload_rows[-1]["status"]) == "reserved":
+                reserved = payload_rows[-1]
+                if (
+                    reserved["source_content_sha256"] != source_content_sha256
+                    or reserved["context_at"] != context_at
+                    or reserved["timezone"] != timezone
+                    or int(reserved["body_char_limit"]) != body_char_limit
+                ):
+                    raise AutomationSourceChanged(
+                        "Automation source or extraction context changed after reservation"
+                    )
+                return _automation_extraction_payload(reserved)
+            if payload_rows and str(payload_rows[-1]["status"]) != "rejected":
+                raise RuntimeError("Automation extraction already has a terminal result")
+            attempt_no = len(payload_rows) + 1
+            if attempt_no not in {1, 2}:
+                raise RuntimeError("Automation extraction retry budget is exhausted")
+            if row["extraction_context_at"] is not None and (
+                row["extraction_context_at"] != context_at
+                or row["extraction_timezone"] != timezone
+                or int(row["extraction_body_char_limit"]) != body_char_limit
+            ):
+                raise AutomationSourceChanged(
+                    "Automation extraction context changed after admission"
+                )
+            payload_id = str(uuid.uuid4())
+            request_id = str(uuid.uuid4())
+            db.execute(
+                """INSERT INTO automation_extraction_payloads(
+                    payload_id, run_id, attempt_no, request_id, status,
+                    source_content_sha256, context_at, timezone, body_char_limit,
+                    result_sha256, result_json, violations_json, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL)""",
+                (
+                    payload_id,
+                    run_id,
+                    attempt_no,
+                    request_id,
+                    source_content_sha256,
+                    context_at,
+                    timezone,
+                    body_char_limit,
+                    stamp,
+                ),
+            )
+            previous_state = str(row["state"])
+            next_version = expected_state_version + 1
+            changed = db.execute(
+                """UPDATE automation_runs SET state = 'extracting', state_version = ?,
+                    failure_code = NULL, source_content_sha256 = ?, extraction_context_at = ?,
+                    extraction_timezone = ?, extraction_body_char_limit = ?,
+                    current_payload_id = ?, current_payload_sha256 = NULL, updated_at = ?
+                WHERE run_id = ? AND state = ? AND state_version = ?""",
+                (
+                    next_version,
+                    source_content_sha256,
+                    context_at,
+                    timezone,
+                    body_char_limit,
+                    payload_id,
+                    stamp,
+                    run_id,
+                    previous_state,
+                    expected_state_version,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation extraction lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state=previous_state,
+                next_state="extracting",
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind="extracting",
+                failure_code=None,
+                created_at=stamp,
+                payload_id=payload_id,
+            )
+            reserved = db.execute(
+                "SELECT * FROM automation_extraction_payloads WHERE payload_id = ?",
+                (payload_id,),
+            ).fetchone()
+        if reserved is None:
+            raise RuntimeError("Automation extraction reservation was not readable")
+        return _automation_extraction_payload(reserved)
+
+    @staticmethod
+    def _encoded_automation_violations(
+        violations: Sequence[dict[str, str]],
+    ) -> bytes:
+        document = [
+            {"code": str(item.get("code", ""))[:64], "path": str(item.get("path", ""))[:256]}
+            for item in violations[:32]
+        ]
+        encoded = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        if not 2 <= len(encoded) <= 8192:
+            raise ValueError("automation extraction violations are not bounded")
+        return encoded
+
+    def record_automation_extraction(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        payload_id: str,
+        result_sha256: str,
+        result_json: bytes,
+        violations: Sequence[dict[str, str]],
+        accepted_state: str | None = None,
+        accepted_code: str | None = None,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        if (
+            len(result_sha256) != 64
+            or hashlib.sha256(result_json).hexdigest() != result_sha256
+            or not 1 <= len(result_json) <= 32768
+        ):
+            raise ValueError("automation extraction result is not bounded")
+        violations_json = self._encoded_automation_violations(violations)
+        accepted = not violations
+        if accepted != (accepted_state is not None):
+            raise ValueError("accepted extraction state does not match validation outcome")
+        if accepted_state not in {None, "proposing", "manual_review", "ambiguous"}:
+            raise ValueError("accepted extraction state is not supported")
+        stamp = (now or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            payload = db.execute(
+                "SELECT * FROM automation_extraction_payloads WHERE payload_id = ?",
+                (payload_id,),
+            ).fetchone()
+            if row is None or payload is None:
+                raise KeyError(run_id)
+            if (
+                str(row["state"]) != "extracting"
+                or int(row["state_version"]) != expected_state_version
+                or row["current_payload_id"] != payload_id
+                or payload["run_id"] != run_id
+                or payload["status"] != "reserved"
+            ):
+                raise RuntimeError("Automation extraction completion lost its expected-state race")
+            attempt_no = int(payload["attempt_no"])
+            if accepted:
+                next_state = str(accepted_state)
+                failure_code = accepted_code
+                payload_status = "accepted"
+            elif attempt_no == 1:
+                next_state = "extracting"
+                failure_code = "validation_rejected_once"
+                payload_status = "rejected"
+            else:
+                next_state = "manual_review"
+                failure_code = "validation_rejected"
+                payload_status = "rejected"
+            finalized = db.execute(
+                """UPDATE automation_extraction_payloads SET
+                    status = ?, result_sha256 = ?, result_json = ?, violations_json = ?,
+                    completed_at = ?
+                WHERE payload_id = ? AND run_id = ? AND status = 'reserved'""",
+                (
+                    payload_status,
+                    result_sha256,
+                    sqlite3.Binary(result_json),
+                    sqlite3.Binary(violations_json),
+                    stamp,
+                    payload_id,
+                    run_id,
+                ),
+            )
+            if finalized.rowcount != 1:
+                raise RuntimeError("Automation extraction payload was not reserved")
+            next_version = expected_state_version + 1
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?, failure_code = ?,
+                    current_payload_sha256 = ?, review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'extracting' AND state_version = ?
+                  AND current_payload_id = ?""",
+                (
+                    next_state,
+                    next_version,
+                    failure_code,
+                    result_sha256,
+                    stamp,
+                    run_id,
+                    expected_state_version,
+                    payload_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation extraction completion lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state="extracting",
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=failure_code,
+                created_at=stamp,
+                payload_id=payload_id,
+                payload_sha256=result_sha256,
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation extraction result was not readable")
+        return _automation_run(updated)
+
+    def transition_automation_to_review(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        next_state: str,
+        failure_code: str,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        if next_state not in {"manual_review", "source_unavailable"}:
+            raise ValueError("automation review transition is not supported")
+        stamp = (now or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            previous_state = str(row["state"])
+            if previous_state not in {"detected", "extracting"} or int(
+                row["state_version"]
+            ) != expected_state_version:
+                raise RuntimeError("Automation review transition lost its expected-state race")
+            if next_state == "source_unavailable":
+                db.execute(
+                    "DELETE FROM automation_extraction_payloads WHERE run_id = ?",
+                    (run_id,),
+                )
+            next_version = expected_state_version + 1
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?, failure_code = ?,
+                    review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = ? AND state_version = ?""",
+                (
+                    next_state,
+                    next_version,
+                    failure_code,
+                    stamp,
+                    run_id,
+                    previous_state,
+                    expected_state_version,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation review transition lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state=previous_state,
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=failure_code,
+                created_at=stamp,
+                payload_id=(
+                    str(row["current_payload_id"])
+                    if row["current_payload_id"] is not None
+                    else None
+                ),
+                payload_sha256=(
+                    str(row["current_payload_sha256"])
+                    if row["current_payload_sha256"] is not None
+                    else None
+                ),
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation review transition was not readable")
+        return _automation_run(updated)
+
     def automation_run_for_message(self, message_id: str) -> AutomationRun | None:
         with self.connection() as db:
             row = db.execute(
@@ -2866,15 +3420,55 @@ class Store:
     def notification_intents(self, limit: int = 25) -> list[NotificationIntent]:
         with self.connection() as db:
             rows = db.execute(
-                """SELECT message_id,
+                """SELECT subject_type, subject_id, revision, message_id, kind,
+                    sender, sender_name, subject, analysis_at, priority, summary,
+                    suggested_action, deadline_iso, last_error
+                FROM (
+                SELECT 'message' AS subject_type, message_id AS subject_id,
+                COALESCE(analysis_at, 'fallback') AS revision, message_id,
                 CASE WHEN status = 'analyzed' THEN 'analysis' ELSE 'fallback' END AS kind,
                 sender, sender_name, subject, analysis_at, priority, summary,
-                suggested_action, deadline_iso, last_error
+                suggested_action, deadline_iso, last_error, received_at AS sort_at
                 FROM messages
                 WHERE (status = 'analyzed' AND notified_at IS NULL)
                    OR (status = 'pending' AND last_error IS NOT NULL
                        AND fallback_notified_at IS NULL)
-                ORDER BY received_at LIMIT ?""",
+                UNION ALL
+                SELECT 'automation_run' AS subject_type, r.run_id AS subject_id,
+                    CAST(r.state_version AS TEXT) AS revision, r.run_id AS message_id,
+                    'automation_review' AS kind,
+                    COALESCE(m.sender, 'Email Watcher') AS sender,
+                    m.sender_name,
+                    COALESCE(m.subject, 'Scheduling request') AS subject,
+                    r.updated_at AS analysis_at, 'normal' AS priority,
+                    CASE r.failure_code
+                        WHEN 'validation_rejected' THEN
+                            'A scheduling mention could not be validated safely.'
+                        WHEN 'reschedule_not_supported' THEN
+                            'A reschedule request needs manual review.'
+                        WHEN 'cancellation_not_supported' THEN
+                            'A cancellation request needs manual review.'
+                        WHEN 'source_unavailable' THEN
+                            'The scheduling source is no longer available for review.'
+                        WHEN 'source_changed' THEN
+                            'The scheduling source changed before extraction completed.'
+                        WHEN 'source_invalid' THEN
+                            'The scheduling source could not be processed safely.'
+                        ELSE 'A scheduling mention needs manual review.'
+                    END AS summary,
+                    NULL AS suggested_action, NULL AS deadline_iso,
+                    r.failure_code AS last_error, r.updated_at AS sort_at
+                FROM automation_runs AS r
+                LEFT JOIN messages AS m
+                  ON m.provider = r.provider
+                 AND m.account_id = r.account_id
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key
+                WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
+                  AND r.review_notified_at IS NULL
+                )
+                ORDER BY sort_at LIMIT ?""",
                 (limit,),
             ).fetchall()
         return [NotificationIntent(**dict(row)) for row in rows]
@@ -2882,10 +3476,15 @@ class Store:
     def notification_intent_count(self) -> int:
         with self.connection() as db:
             row = db.execute(
-                """SELECT COUNT(*) AS count FROM messages
-                WHERE (status = 'analyzed' AND notified_at IS NULL)
-                   OR (status = 'pending' AND last_error IS NOT NULL
-                       AND fallback_notified_at IS NULL)"""
+                """SELECT
+                    (SELECT COUNT(*) FROM messages
+                     WHERE (status = 'analyzed' AND notified_at IS NULL)
+                        OR (status = 'pending' AND last_error IS NOT NULL
+                            AND fallback_notified_at IS NULL))
+                    +
+                    (SELECT COUNT(*) FROM automation_runs
+                     WHERE state IN ('ambiguous', 'manual_review', 'source_unavailable')
+                       AND review_notified_at IS NULL) AS count"""
             ).fetchone()
         return int(row["count"])
 
@@ -2895,9 +3494,52 @@ class Store:
         message_id: str,
         kind: str,
         analysis_at: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        revision: str | None = None,
     ) -> str:
-        if kind not in {"analysis", "fallback"}:
-            raise ValueError("Notification kind must be analysis or fallback")
+        if kind not in {"analysis", "fallback", "automation_review"}:
+            raise ValueError("Notification kind is not supported")
+        if subject_type is not None or subject_id is not None or revision is not None:
+            if not subject_type or not subject_id or revision is None:
+                raise ValueError("Notification subject identity must be complete")
+            if message_id != subject_id:
+                raise ValueError("Notification compatibility identity does not match its subject")
+        if kind == "automation_review":
+            if subject_type not in {None, "automation_run"}:
+                raise ValueError("Automation notification subject is invalid")
+            run_id = subject_id or message_id
+            state_version_text = revision or analysis_at
+            try:
+                state_version = int(state_version_text or "")
+            except ValueError as exc:
+                raise ValueError("Automation notification revision is invalid") from exc
+            stamp = datetime.now(UTC).isoformat()
+            with self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    """SELECT state, state_version, review_notified_at
+                    FROM automation_runs WHERE run_id = ?""",
+                    (run_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(run_id)
+                if int(row["state_version"]) != state_version or str(row["state"]) not in {
+                    "ambiguous",
+                    "manual_review",
+                    "source_unavailable",
+                }:
+                    raise RuntimeError("Automation notification intent is no longer current")
+                if row["review_notified_at"] is not None:
+                    return "already_acknowledged"
+                changed = db.execute(
+                    """UPDATE automation_runs SET review_notified_at = ?
+                    WHERE run_id = ? AND state_version = ? AND review_notified_at IS NULL""",
+                    (stamp, run_id, state_version),
+                )
+                if changed.rowcount != 1:
+                    raise RuntimeError("Automation notification acknowledgement lost its race")
+            return "acknowledged"
         if kind == "analysis" and not analysis_at:
             raise ValueError("analysis_at is required for an analysis notification")
 

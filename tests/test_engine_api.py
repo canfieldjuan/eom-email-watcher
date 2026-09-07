@@ -4001,6 +4001,8 @@ def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
 
     assert response["data"] == {
         "active": False,
+        "automation_processed": 0,
+        "automation_review_required": 0,
         "discovered": 0,
         "fallback_notified": 0,
         "pending_notifications": 1,
@@ -4139,6 +4141,103 @@ def test_check_defers_delivery_until_state_checked_ack(
             },
         )
     )
+    assert duplicate["data"]["status"] == "already_acknowledged"
+
+
+def test_host_notification_contract_delivers_and_state_checks_automation_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account_id = f"microsoft365-{'e' * 32}"
+    runtime.store.register_mail_account(
+        "microsoft365",
+        account_id,
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=False,
+    )
+    message_id = scoped_message_id("microsoft365", account_id, "schedule-1")
+    runtime.store.add_message(
+        message_id=message_id,
+        provider="microsoft365",
+        account_id=account_id,
+        provider_message_id="schedule-1",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name="Trusted A",
+        subject="Meeting request",
+        received_at=datetime.now(UTC).isoformat(),
+    )
+    runtime.store.mark_analyzed(
+        message_id,
+        {
+            "category": "scheduling",
+            "priority": "normal",
+            "summary": "A meeting was requested.",
+            "action_required": True,
+            "suggested_action": "Review the request.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        scheduling_automation_principal_key="a" * 64,
+    )
+    runtime.store.mark_delivery_complete(message_id, notified=True)
+    run = runtime.store.automation_run_for_message(message_id)
+    assert run is not None
+    current = runtime.store.transition_automation_to_review(
+        run.run_id,
+        run.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+
+    pending = engine_api._response(request(config_path, "notifications.pending"))
+    intent = pending["data"]["items"][0]
+
+    assert intent == {
+        "analysis_at": current.updated_at,
+        "body": "The scheduling source could not be processed safely.",
+        "kind": "automation_review",
+        "message_id": run.run_id,
+        "priority": "normal",
+        "revision": str(current.state_version),
+        "subject_id": run.run_id,
+        "subject_type": "automation_run",
+        "title": "Trusted A: Meeting request",
+    }
+
+    acknowledgement_payload = {
+        key: intent[key]
+        for key in (
+            "analysis_at",
+            "kind",
+            "message_id",
+            "revision",
+            "subject_id",
+            "subject_type",
+        )
+    }
+    stale = engine_api._response(
+        request(
+            config_path,
+            "notifications.ack",
+            {**acknowledgement_payload, "revision": str(current.state_version + 1)},
+        )
+    )
+    assert stale["error"]["code"] == "stale_notification"
+
+    acknowledged = engine_api._response(
+        request(config_path, "notifications.ack", acknowledgement_payload)
+    )
+    duplicate = engine_api._response(
+        request(config_path, "notifications.ack", acknowledgement_payload)
+    )
+
+    assert acknowledged["data"]["status"] == "acknowledged"
     assert duplicate["data"]["status"] == "already_acknowledged"
 
 

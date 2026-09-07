@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from .config import Config
-from .db import AnalyzedMessage, NotificationIntent, PendingMessage, Store
+from .config import Config, normalize_validated_address
+from .db import (
+    AnalyzedMessage,
+    AutomationExtractionPayload,
+    AutomationSourceChanged,
+    AutomationWork,
+    NotificationIntent,
+    PendingMessage,
+    Store,
+)
 from .entitlement import (
     AUTOMATIONS_FEATURE_ID,
     CONNECT_FEATURE_ID,
@@ -28,29 +38,42 @@ from .microsoft365 import (
 )
 from .microsoft_calendar import MicrosoftCalendarProposalAuthorization
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
-from .notifications import NotificationError, send_analysis, send_fallback
-from .runtime import mail_account_token_file, microsoft_calendar_token_file
+from .notifications import NotificationError, send_analysis, send_fallback, send_review
+from .runtime import (
+    load_configured_mailbox,
+    load_mailbox_account,
+    mail_account_token_file,
+    microsoft_calendar_token_file,
+)
+from .scheduling import SchedulingSource, SchedulingViolation, scheduling_source_sha256
 
 logger = logging.getLogger(__name__)
 
 
-def _scheduling_automation_principal(
+def _scheduling_authorization_principal(
     config: Config,
     store: Store,
-    message: PendingMessage,
+    *,
+    provider: str,
+    account_id: str,
+    expected_principal_key: str | None = None,
 ) -> str | None:
-    if message.provider != MICROSOFT365_PROVIDER:
+    if provider != MICROSOFT365_PROVIDER:
         return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
         return None
-    account = store.mail_account(message.provider, message.account_id)
+    account = store.mail_account(provider, account_id)
     if account is None or account.address is None:
         return None
-    proposal_grant = store.calendar_grant(message.account_id, "proposal")
+    proposal_grant = store.calendar_grant(account_id, "proposal")
     if (
         proposal_grant is None
         or proposal_grant.state != "ready"
         or proposal_grant.principal_key is None
+        or (
+            expected_principal_key is not None
+            and proposal_grant.principal_key != expected_principal_key
+        )
     ):
         return None
     try:
@@ -67,7 +90,231 @@ def _scheduling_automation_principal(
         return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
         return None
-    return authorization.principal.key
+    principal_key = authorization.principal.key
+    if expected_principal_key is not None and principal_key != expected_principal_key:
+        return None
+    return principal_key
+
+
+def _scheduling_automation_principal(
+    config: Config,
+    store: Store,
+    message: PendingMessage,
+) -> str | None:
+    return _scheduling_authorization_principal(
+        config,
+        store,
+        provider=message.provider,
+        account_id=message.account_id,
+    )
+
+
+@dataclass(frozen=True)
+class AutomationProcessing:
+    processed: int
+    review_required: int
+    attempted_run_ids: frozenset[str]
+
+
+def _retry_feedback(payloads: list[AutomationExtractionPayload]) -> tuple[SchedulingViolation, ...]:
+    rejected = next(
+        (payload for payload in reversed(payloads) if payload.status == "rejected"),
+        None,
+    )
+    if rejected is None or rejected.violations_json is None:
+        return ()
+    try:
+        values = json.loads(rejected.violations_json)
+    except (UnicodeDecodeError, ValueError):
+        logger.error("Stored scheduling validation feedback is unreadable")
+        return ()
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        SchedulingViolation(str(value.get("code", "")), str(value.get("path", "")))
+        for value in values
+        if isinstance(value, dict)
+    )
+
+
+def _accepted_extraction_outcome(intent: str) -> tuple[str, str | None]:
+    if intent == "new_meeting":
+        return "proposing", None
+    if intent == "reschedule":
+        return "manual_review", "reschedule_not_supported"
+    if intent == "cancellation":
+        return "manual_review", "cancellation_not_supported"
+    return "ambiguous", "ambiguous_extraction"
+
+
+def _transition_source_problem(
+    store: Store,
+    work: AutomationWork,
+    *,
+    next_state: str,
+    failure_code: str,
+) -> None:
+    current = store.automation_run(work.run.run_id)
+    if current is None or current.state not in {"detected", "extracting"}:
+        return
+    store.transition_automation_to_review(
+        current.run_id,
+        current.state_version,
+        next_state=next_state,
+        failure_code=failure_code,
+    )
+
+
+def process_scheduling_automations(
+    config: Config,
+    store: Store,
+    model: ModelRuntime,
+    *,
+    exclude_run_ids: frozenset[str] = frozenset(),
+    limit: int = 25,
+) -> AutomationProcessing:
+    processed = 0
+    review_required = 0
+    attempted: set[str] = set()
+    for work in store.recoverable_automation_runs(limit):
+        run = work.run
+        if run.run_id in exclude_run_ids:
+            continue
+        attempted.add(run.run_id)
+        if (
+            _scheduling_authorization_principal(
+                config,
+                store,
+                provider=run.provider,
+                account_id=run.account_id,
+                expected_principal_key=run.calendar_principal_key,
+            )
+            is None
+        ):
+            continue
+        try:
+            mailbox = load_mailbox_account(config, store, run.provider, run.account_id)
+        except MailboxAccountUnavailable as exc:
+            logger.info("Scheduling run %s mailbox unavailable: %s", run.run_id, exc)
+            continue
+
+        body_char_limit = run.extraction_body_char_limit or config.body_char_limit
+        context_at = (
+            datetime.fromisoformat(run.extraction_context_at)
+            if run.extraction_context_at is not None
+            else datetime.now(config.zone)
+        )
+        timezone = run.extraction_timezone or config.timezone
+        try:
+            with mailbox_polling_session(mailbox.gateway):
+                content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
+        except MailboxMessageUnavailable as exc:
+            logger.info("Scheduling run %s source unavailable: %s", run.run_id, exc)
+            _transition_source_problem(
+                store,
+                work,
+                next_state="source_unavailable",
+                failure_code="source_unavailable",
+            )
+            processed += 1
+            review_required += 1
+            continue
+        except MailboxMessageInvalid as exc:
+            logger.warning("Scheduling run %s source invalid: %s", run.run_id, exc)
+            _transition_source_problem(
+                store,
+                work,
+                next_state="manual_review",
+                failure_code="source_invalid",
+            )
+            processed += 1
+            review_required += 1
+            continue
+
+        try:
+            organizer_address = normalize_validated_address(work.organizer_address)
+        except ValueError:
+            _transition_source_problem(
+                store,
+                work,
+                next_state="manual_review",
+                failure_code="source_invalid",
+            )
+            processed += 1
+            review_required += 1
+            continue
+        source = SchedulingSource(
+            sender=work.sender,
+            subject=work.subject,
+            received_at=work.received_at,
+            body=content.body,
+            attachment_names=content.attachment_names,
+            organizer_address=organizer_address,
+            configured_timezone=timezone,
+            context_at=context_at,
+        )
+        source_sha256 = scheduling_source_sha256(source)
+        current = run
+        while current.state in {"detected", "extracting"}:
+            try:
+                reservation = store.reserve_automation_extraction(
+                    current.run_id,
+                    current.state_version,
+                    source_content_sha256=source_sha256,
+                    context_at=context_at.isoformat(),
+                    timezone=timezone,
+                    body_char_limit=body_char_limit,
+                )
+            except AutomationSourceChanged:
+                _transition_source_problem(
+                    store,
+                    work,
+                    next_state="manual_review",
+                    failure_code="source_changed",
+                )
+                processed += 1
+                review_required += 1
+                break
+            reserved_run = store.automation_run(current.run_id)
+            if reserved_run is None or reserved_run.current_payload_id != reservation.payload_id:
+                raise RuntimeError("Scheduling extraction reservation was not current")
+            feedback = _retry_feedback(store.automation_extraction_payloads(current.run_id))
+            try:
+                result = model.extract_scheduling(
+                    source=source,
+                    feedback=feedback,
+                    request_id=reservation.request_id,
+                )
+            except (GatewayModelError, ModelError) as exc:
+                logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
+                break
+            accepted_state: str | None = None
+            accepted_code: str | None = None
+            if result.accepted:
+                assert result.extraction is not None
+                accepted_state, accepted_code = _accepted_extraction_outcome(
+                    result.extraction.intent
+                )
+            current = store.record_automation_extraction(
+                current.run_id,
+                reserved_run.state_version,
+                payload_id=reservation.payload_id,
+                result_sha256=result.result_sha256,
+                result_json=result.result_json,
+                violations=[
+                    {"code": violation.code, "path": violation.path}
+                    for violation in result.violations
+                ],
+                accepted_state=accepted_state,
+                accepted_code=accepted_code,
+            )
+            if current.state == "extracting":
+                continue
+            processed += 1
+            if current.state in {"ambiguous", "manual_review", "source_unavailable"}:
+                review_required += 1
+            break
+    return AutomationProcessing(processed, review_required, frozenset(attempted))
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
@@ -78,6 +325,41 @@ def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | Non
         return min(received.astimezone(UTC), observed_at)
     except (OverflowError, ValueError):
         return None
+
+
+def _deliver_automation_review_intent(
+    config: Config,
+    store: Store,
+    intent: NotificationIntent,
+    sender_names: dict[str, str | None],
+    *,
+    dry_run: bool,
+) -> bool:
+    if not config.notifications_enabled:
+        return False
+    label = sender_names.get(intent.sender) or intent.sender_name or intent.sender
+    try:
+        send_review(
+            label,
+            intent.subject,
+            intent.summary or "A scheduling mention needs manual review.",
+            ntfy_topic=config.ntfy_topic,
+            ntfy_url=config.ntfy_url,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            store.acknowledge_notification(
+                message_id=intent.message_id,
+                kind=intent.kind,
+                analysis_at=intent.analysis_at,
+                subject_type=intent.subject_type,
+                subject_id=intent.subject_id,
+                revision=intent.revision,
+            )
+        return True
+    except NotificationError as exc:
+        logger.warning("Automation review notification unavailable: %s", exc)
+        return False
 
 
 class Watcher:
@@ -275,6 +557,17 @@ class Watcher:
             logger.warning("Fallback notification unavailable: %s", exc)
             return 0
 
+    def _deliver_automation_review(self, intent: NotificationIntent, dry_run: bool) -> int:
+        return int(
+            _deliver_automation_review_intent(
+                self.config,
+                self.store,
+                intent,
+                self.sender_names,
+                dry_run=dry_run,
+            )
+        )
+
     def _deliver_analysis(
         self,
         message: PendingMessage | AnalyzedMessage,
@@ -324,6 +617,8 @@ class Watcher:
             for intent in self.store.notification_intents():
                 if intent.kind == "fallback":
                     fallback += self._send_fallback(intent, dry_run)
+                elif intent.kind == "automation_review":
+                    self._deliver_automation_review(intent, dry_run)
         for message in self.store.pending_delivery():
             received_at = _received_at_or_none(
                 message.received_at, observed_at=retention_observed_at
@@ -433,3 +728,60 @@ class Watcher:
                         retryable=True,
                     )
         return summarized, fallback
+
+
+def run_watcher_check(
+    config: Config,
+    store: Store,
+    model: ModelRuntime,
+    *,
+    dry_run: bool = False,
+    deliver_notifications: bool = True,
+) -> dict[str, int | bool]:
+    if dry_run:
+        if not config.senders:
+            result = Watcher.inactive_result(config, store, dry_run=True)
+        else:
+            mailbox = load_configured_mailbox(config, store)
+            result = Watcher(config, store, mailbox, model).check(
+                dry_run=True,
+                deliver_notifications=deliver_notifications,
+            )
+        return {
+            **result,
+            "automation_processed": 0,
+            "automation_review_required": 0,
+        }
+
+    before = process_scheduling_automations(config, store, model)
+    if config.senders:
+        mailbox = load_configured_mailbox(config, store)
+        result = Watcher(config, store, mailbox, model).check(
+            dry_run=False,
+            deliver_notifications=deliver_notifications,
+        )
+    else:
+        result = Watcher.inactive_result(config, store, dry_run=False)
+    after = process_scheduling_automations(
+        config,
+        store,
+        model,
+        exclude_run_ids=before.attempted_run_ids,
+    )
+    if deliver_notifications and config.notifications_enabled:
+        sender_names = {sender.email: sender.name for sender in config.senders}
+        for intent in store.notification_intents():
+            if intent.kind != "automation_review":
+                continue
+            _deliver_automation_review_intent(
+                config,
+                store,
+                intent,
+                sender_names,
+                dry_run=False,
+            )
+    return {
+        **result,
+        "automation_processed": before.processed + after.processed,
+        "automation_review_required": before.review_required + after.review_required,
+    }

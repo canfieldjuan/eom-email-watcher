@@ -202,6 +202,8 @@ mod tests {
                 purged: 0,
                 stale_cursor_recovered: false,
                 pending_notifications: self.check_pending,
+                automation_processed: 0,
+                automation_review_required: 0,
             })
         }
 
@@ -252,6 +254,9 @@ mod tests {
             kind: "analysis".into(),
             message_id: message_id.into(),
             priority: "high".into(),
+            revision: Some("2026-08-28T12:00:00+00:00".into()),
+            subject_id: Some(message_id.into()),
+            subject_type: Some("message".into()),
             title: "Watched sender: Action needed".into(),
         }
     }

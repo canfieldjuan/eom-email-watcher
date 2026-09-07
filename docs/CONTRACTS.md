@@ -1,16 +1,17 @@
 # Calendar capability and email automation contract
 
-Status: **partially implemented: landing item 1 of 5 implemented; items 2–5
+Status: **partially implemented: landing items 1–3 of 5 implemented; items 4–5
 pending**
 
 This document freezes the boundary for adding Microsoft 365 calendar operations
 and the first email-driven automation to Email Watcher. It is an implementation
 gate, not a claim that calendar or automation behavior exists today.
 
-Feature-aware entitlement lookup is implemented. The existing mailbox watcher,
-Local Connect consumer, and monthly Gmail sender remain authoritative while the
-calendar grants, adapters, automation, UI, and live acceptance evidence remain
-pending.
+Feature-aware entitlement lookup, isolated calendar grants, calendar-read
+projection, strict scheduling extraction, and the recoverable automation ledger
+are implemented. The existing mailbox watcher, Local Connect consumer, and
+monthly Gmail sender remain authoritative while meeting proposal/write behavior,
+confirmation UI, and live acceptance evidence remain pending.
 
 ## Verified baseline
 
@@ -31,12 +32,12 @@ The contract starts from these current-code facts:
   The entitlement format already supports multiple feature identifiers.
 - Email Watcher is a Local Connect consumer only. It has no provider listener,
   manifest route, job endpoint, or provider registration lifecycle.
-- Current email analysis can classify a message as `scheduling`, but it does not
-  extract a calendar proposal, candidate times, attendees, or a referenced
-  event.
-- The repository has no calendar-provider adapter and no automation run ledger.
-  A systemd `OnCalendar` timer and validation of a calendar date are unrelated
-  uses of the word "calendar."
+- Email analysis classifies a message as `scheduling`; a separately versioned,
+  strict extraction now validates candidate times, attendees, intent, and source
+  evidence before the automation can reach `proposing`.
+- The Microsoft calendar-read adapter and immutable automation run ledger exist.
+  Meeting proposal, confirmation, and write adapters remain pending. A systemd
+  `OnCalendar` timer remains an unrelated use of the word "calendar."
 
 ## Definitions
 
@@ -702,8 +703,8 @@ Implementation remains split into reviewed vertical slices:
 
 1. **Implemented:** feature-aware entitlement lookup using the existing signed
    file and keyring;
-2. **Pending:** separate Microsoft calendar grants and read adapter;
-3. **Pending:** scheduling extraction and immutable automation ledger;
+2. **Implemented:** separate Microsoft calendar grants and read adapter;
+3. **Implemented:** scheduling extraction and immutable automation ledger;
 4. **Pending:** native proposal/confirmation UI and private confirmed-write
    adapter; and
 5. **Pending:** live acceptance evidence.

@@ -119,6 +119,24 @@ def normalize_address(value: str) -> str:
     return address.strip().casefold()
 
 
+def normalize_validated_address(value: str) -> str:
+    email = normalize_address(value)
+    local, separator, domain = email.rpartition("@")
+    if (
+        separator != "@"
+        or not local
+        or not domain
+        or "@" in local
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+        or not _valid_domain(domain)
+        or any(character.isspace() or not character.isprintable() for character in email)
+    ):
+        raise ValueError("email address is invalid")
+    return email
+
+
 def _valid_domain(domain: str) -> bool:
     try:
         ascii_domain = domain.encode("idna").decode("ascii")
@@ -138,20 +156,10 @@ def _valid_network_host(host: str) -> bool:
 
 
 def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
-    email = normalize_address(email_value)
-    local, separator, domain = email.rpartition("@")
-    if (
-        separator != "@"
-        or not local
-        or not domain
-        or "@" in local
-        or local.startswith(".")
-        or local.endswith(".")
-        or ".." in local
-        or not _valid_domain(domain)
-        or any(character.isspace() or not character.isprintable() for character in email)
-    ):
-        raise InvalidSenderError(invalid_message)
+    try:
+        email = normalize_validated_address(email_value)
+    except ValueError as exc:
+        raise InvalidSenderError(invalid_message) from exc
     if name_value is not None and any(
         character in "\r\n" or not character.isprintable() for character in name_value
     ):

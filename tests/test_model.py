@@ -1,9 +1,11 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from eom_email_watcher.model import SYSTEM_PROMPT, LocalModel, ModelError, validate_analysis
+from eom_email_watcher.scheduling import SchedulingSource, SchedulingViolation
 
 
 def valid_result() -> dict[str, object]:
@@ -16,6 +18,51 @@ def valid_result() -> dict[str, object]:
         "deadline_text": "by July 20",
         "deadline_iso": "2026-07-20",
         "confidence": 0.91,
+    }
+
+
+def scheduling_source() -> SchedulingSource:
+    return SchedulingSource(
+        sender="trusted@example.com",
+        subject="Meeting request",
+        received_at="2026-09-07T12:00:00+00:00",
+        body="Meet jane@example.com on September 8, 2026 from 10:00 to 10:30 AM.",
+        attachment_names=(),
+        organizer_address="owner@example.com",
+        configured_timezone="America/Chicago",
+        context_at=datetime(2026, 9, 7, 9, 0, tzinfo=UTC),
+    )
+
+
+def scheduling_result() -> dict[str, object]:
+    return {
+        "intent": "new_meeting",
+        "intent_evidence": {
+            "source": "body",
+            "quote": "Meet jane@example.com",
+        },
+        "proposed_times": [
+            {
+                "start": "2026-09-08T10:00:00-05:00",
+                "end": "2026-09-08T10:30:00-05:00",
+                "timezone": "America/Chicago",
+                "evidence": [
+                    {
+                        "source": "body",
+                        "quote": "September 8, 2026 from 10:00 to 10:30 AM",
+                    }
+                ],
+            }
+        ],
+        "attendees": [
+            {
+                "email": "jane@example.com",
+                "evidence": {"source": "body", "quote": "jane@example.com"},
+            }
+        ],
+        "referenced_event": None,
+        "confidence": 0.95,
+        "ambiguity_reasons": [],
     }
 
 
@@ -131,3 +178,44 @@ def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) ->
     )
     assert result.category == "invoice"
     assert result.action_required is True
+
+
+def test_local_model_uses_strict_scheduling_schema_and_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text("k", encoding="utf-8")
+    model = LocalModel("http://127.0.0.1:1234/v1", "model", 60, token_file, True)
+    requests: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {"message": {"content": json.dumps(scheduling_result())}}
+                ]
+            }
+
+    def post(*_args, **kwargs):
+        requests.append(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr("eom_email_watcher.model.httpx.post", post)
+
+    result = model.extract_scheduling(
+        source=scheduling_source(),
+        feedback=(SchedulingViolation("time_naive", "proposed_times.0"),),
+        request_id="reserved-request-id",
+    )
+
+    assert result.accepted is True
+    assert requests[0]["max_tokens"] == 1_500
+    assert requests[0]["response_format"]["json_schema"]["name"] == (
+        "scheduling_extraction_v1"
+    )
+    messages = requests[0]["messages"]
+    assert "UNTRUSTED DATA" in messages[0]["content"]
+    assert "time_naive" in messages[1]["content"]

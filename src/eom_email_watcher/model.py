@@ -13,6 +13,16 @@ from typing import Literal, Protocol, TextIO
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .scheduling import (
+    SCHEDULING_SYSTEM_PROMPT,
+    SchedulingAttemptResult,
+    SchedulingExtraction,
+    SchedulingSource,
+    SchedulingViolation,
+    scheduling_prompt,
+    validate_scheduling_output,
+)
+
 
 class ModelError(RuntimeError):
     """Local model request or response failed."""
@@ -166,6 +176,14 @@ class ModelRuntime(Protocol):
         request_id: str | None = None,
     ) -> Analysis: ...
 
+    def extract_scheduling(
+        self,
+        *,
+        source: SchedulingSource,
+        feedback: tuple[SchedulingViolation, ...],
+        request_id: str,
+    ) -> SchedulingAttemptResult: ...
+
 
 def _email_prompt(
     *,
@@ -225,6 +243,50 @@ class LocalModel:
         except (httpx.HTTPError, ModelError) as exc:
             return False, type(exc).__name__
 
+    def _completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema_name: str,
+        schema: dict[str, object],
+        max_tokens: int,
+    ) -> str:
+        try:
+            response = httpx.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._headers(),
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+            content = message.get("content") or ""
+            if not content.strip():
+                # Reasoning models may route schema-constrained JSON into a
+                # reasoning field while leaving content empty.
+                content = message.get("reasoning_content") or message.get("reasoning") or ""
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
+        return str(content)
+
     def analyze(
         self,
         *,
@@ -244,40 +306,31 @@ class LocalModel:
             attachment_names=attachment_names,
             current_local_time=current_local_time,
         )
-        try:
-            response = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(),
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 500,
-                    "stream": False,
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "email_analysis",
-                            "strict": True,
-                            "schema": Analysis.model_json_schema(),
-                        },
-                    },
-                },
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            message = response.json()["choices"][0]["message"]
-            content = message.get("content") or ""
-            if not content.strip():
-                # Reasoning models (e.g. qwen3.5) route the schema-constrained JSON
-                # into the reasoning field and leave content empty.
-                content = message.get("reasoning_content") or message.get("reasoning") or ""
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
-            raise ModelError(f"Local model request failed: {type(exc).__name__}") from exc
-        return validate_analysis(_json_object(str(content)), received_at)
+        content = self._completion(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            schema_name="email_analysis",
+            schema=Analysis.model_json_schema(),
+            max_tokens=500,
+        )
+        return validate_analysis(_json_object(content), received_at)
+
+    def extract_scheduling(
+        self,
+        *,
+        source: SchedulingSource,
+        feedback: tuple[SchedulingViolation, ...],
+        request_id: str,
+    ) -> SchedulingAttemptResult:
+        del request_id
+        content = self._completion(
+            system_prompt=SCHEDULING_SYSTEM_PROMPT,
+            user_prompt=scheduling_prompt(source, feedback),
+            schema_name="scheduling_extraction_v1",
+            schema=SchedulingExtraction.model_json_schema(),
+            max_tokens=1_500,
+        )
+        return validate_scheduling_output(content, source)
 
 
 class GatewayModel:
@@ -542,6 +595,34 @@ class GatewayModel:
         request_id: str | None = None,
     ) -> Analysis:
         request_id = request_id or str(uuid.uuid4())
+        content = self._inference(
+            request_id=request_id,
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=_email_prompt(
+                sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
+                subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
+                received_at=received_at,
+                body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
+                attachment_names=tuple(
+                    _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
+                    for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
+                ),
+                current_local_time=current_local_time,
+            ),
+            schema=Analysis.model_json_schema(),
+            max_output_tokens=500,
+        )
+        return validate_analysis(_json_object(content), received_at)
+
+    def _inference(
+        self,
+        *,
+        request_id: str,
+        system_prompt: str,
+        user_prompt: str,
+        schema: dict[str, object],
+        max_output_tokens: int,
+    ) -> str:
         payload = {
             "protocol_version": 1,
             "request_id": request_id,
@@ -550,28 +631,15 @@ class GatewayModel:
                 "input_modalities": ["text"],
                 "output_media_type": "application/json",
                 "structured_output": True,
-                "max_output_tokens": 500,
+                "max_output_tokens": max_output_tokens,
             },
             "generation": {
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": _email_prompt(
-                            sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
-                            subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
-                            received_at=received_at,
-                            body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
-                            attachment_names=tuple(
-                                _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
-                                for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
-                            ),
-                            current_local_time=current_local_time,
-                        ),
-                    },
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.1,
-                "response_schema": Analysis.model_json_schema(),
+                "response_schema": schema,
             },
         }
         response = self._request("POST", "/v1/inference", payload)
@@ -585,4 +653,20 @@ class GatewayModel:
             or not isinstance(output.get("content"), str)
         ):
             raise ModelError("Inference gateway response did not match the required envelope")
-        return validate_analysis(_json_object(output["content"]), received_at)
+        return output["content"]
+
+    def extract_scheduling(
+        self,
+        *,
+        source: SchedulingSource,
+        feedback: tuple[SchedulingViolation, ...],
+        request_id: str,
+    ) -> SchedulingAttemptResult:
+        content = self._inference(
+            request_id=request_id,
+            system_prompt=SCHEDULING_SYSTEM_PROMPT,
+            user_prompt=scheduling_prompt(source, feedback),
+            schema=SchedulingExtraction.model_json_schema(),
+            max_output_tokens=1_500,
+        )
+        return validate_scheduling_output(content, source)

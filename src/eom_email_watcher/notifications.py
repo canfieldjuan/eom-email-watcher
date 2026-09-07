@@ -166,3 +166,23 @@ def send_fallback(
         ntfy_priority=3,
         dry_run=dry_run,
     )
+
+
+def send_review(
+    sender_label: str,
+    subject: str,
+    body: str,
+    *,
+    ntfy_topic: str | None = None,
+    ntfy_url: str = "https://ntfy.sh",
+    dry_run: bool = False,
+) -> DeliveryResult:
+    return _deliver(
+        f"{sender_label}: {subject}",
+        body,
+        "normal",
+        ntfy_topic=ntfy_topic,
+        ntfy_url=ntfy_url,
+        ntfy_priority=3,
+        dry_run=dry_run,
+    )

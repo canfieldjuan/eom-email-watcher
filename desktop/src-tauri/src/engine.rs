@@ -663,6 +663,10 @@ pub struct CheckResult {
     pub purged: u64,
     pub stale_cursor_recovered: bool,
     pub pending_notifications: u64,
+    #[serde(default)]
+    pub automation_processed: u64,
+    #[serde(default)]
+    pub automation_review_required: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -672,6 +676,12 @@ pub struct NotificationIntent {
     pub kind: String,
     pub message_id: String,
     pub priority: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub subject_id: Option<String>,
+    #[serde(default)]
+    pub subject_type: Option<String>,
     pub title: String,
 }
 
@@ -1188,6 +1198,9 @@ impl Engine {
                 "analysis_at": &intent.analysis_at,
                 "kind": &intent.kind,
                 "message_id": &intent.message_id,
+                "revision": &intent.revision,
+                "subject_id": &intent.subject_id,
+                "subject_type": &intent.subject_type,
             }),
         )?;
         if matches!(
@@ -2239,6 +2252,8 @@ notifications_enabled = true
                 purged: 0,
                 stale_cursor_recovered: false,
                 pending_notifications: 0,
+                automation_processed: 0,
+                automation_review_required: 0,
             }
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
@@ -2340,6 +2355,9 @@ notifications_enabled = true
             kind: "analysis".into(),
             message_id: "missing-message".into(),
             priority: "normal".into(),
+            revision: Some("2026-08-28T12:00:00+00:00".into()),
+            subject_id: Some("missing-message".into()),
+            subject_type: Some("message".into()),
             title: "Missing notification".into(),
         };
         assert_eq!(
