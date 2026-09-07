@@ -151,6 +151,11 @@ class MissingAutomationSource(AutomationGateway):
         raise MessageUnavailable("deleted")
 
 
+class FailingAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        raise Microsoft365Error("temporarily unavailable")
+
+
 class ExtractionModel(FakeModel):
     def __init__(self, outputs: list[str | Exception]):
         super().__init__()
@@ -955,6 +960,31 @@ def test_recovery_rechecks_authorization_before_fetch_or_model(
     assert current.state == "detected"
     assert result.processed == 0
     assert model.extraction_calls == []
+
+
+def test_recovery_provider_failure_does_not_abort_active_mailbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", provider="gmail", account_id="gmail-default")
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, FailingAutomationProvider())
+    healthy_mailbox = FreshGmail()
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: MailboxSession("gmail", "gmail-default", healthy_mailbox),
+    )
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert result["active"] is True
+    assert current is not None
+    assert current.state == "detected"
+    assert healthy_mailbox.full_payload_calls == 1
 
 
 def test_recovery_purges_expired_source_before_fetch_or_inference(

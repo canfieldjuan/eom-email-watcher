@@ -232,6 +232,104 @@ def test_hour_only_evidence_cannot_support_invented_nonzero_minutes() -> None:
     )
 
 
+def test_seconds_require_exact_source_evidence() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {"start": "2026-09-08T10:00:59-05:00"}
+    )
+
+    assert SchedulingViolation("time_value_unsupported", "proposed_times.0.start") in (
+        validate(value).violations
+    )
+
+
+def test_range_endpoints_cannot_borrow_from_separate_alternatives() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-09T15:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": (
+                        "September 8, 2026 from 10:00 to 11:00, "
+                        "or September 9, 2026 from 14:00 to 15:00"
+                    ),
+                }
+            ],
+        }
+    )
+    scheduling_source = source(
+        body=(
+            "September 8, 2026 from 10:00 to 11:00, "
+            "or September 9, 2026 from 14:00 to 15:00"
+        )
+    )
+
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    split_evidence = valid_result()
+    split_evidence["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-09T10:30:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "September 8, 2026 from 10:00 to 10:30",
+                },
+                {"source": "body", "quote": "September 9, 2026"},
+            ],
+        }
+    )
+    split_source = source(
+        body=(
+            "September 8, 2026 from 10:00 to 10:30. "
+            "A separate option is September 9, 2026."
+        )
+    )
+    assert "time_range_unsupported" in codes(
+        validate(split_evidence, scheduling_source=split_source)
+    )
+
+
+def test_explicit_source_zone_overrides_configured_default() -> None:
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "September 8, 2026 from 10:00 to 10:30 UTC",
+        }
+    ]
+    scheduling_source = source(body="September 8, 2026 from 10:00 to 10:30 UTC")
+
+    assert "timezone_unsupported" in codes(validate(value, scheduling_source=scheduling_source))
+
+
+def test_source_backed_offset_selects_a_dst_fold() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-11-01T01:15:00-05:00",
+            "end": "2026-11-01T01:45:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "November 1, 2026 from 1:15 AM to 1:45 AM -05:00",
+                }
+            ],
+        }
+    )
+    scheduling_source = source(
+        body="Please meet November 1, 2026 from 1:15 AM to 1:45 AM -05:00."
+    )
+
+    assert "timezone_ambiguous" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
 def test_end_date_must_independently_match_source_evidence() -> None:
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
@@ -328,6 +426,16 @@ def test_large_or_malformed_results_are_bounded_without_raw_source_storage() -> 
     assert validate_scheduling_output("not json", source()).violations == (
         SchedulingViolation("invalid_json", "$"),
     )
+
+
+def test_malformed_unicode_is_a_bounded_validation_rejection() -> None:
+    value = valid_result()
+    value["intent_evidence"]["quote"] = "\ud800"  # type: ignore[index]
+
+    result = validate_scheduling_output(json.dumps(value), source())
+
+    assert result.result_json == b"{}"
+    assert result.violations == (SchedulingViolation("result_invalid_unicode", "$"),)
 
 
 def test_retry_prompt_contains_only_typed_feedback_and_the_same_source() -> None:

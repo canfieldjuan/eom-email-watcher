@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import getaddresses
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -362,21 +362,118 @@ def _date_has_source_support(
     )
 
 
-def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneInfo) -> bool:
+def _time_patterns(value: datetime, *, zone: ZoneInfo) -> tuple[str, ...]:
     local = value.astimezone(zone)
-    text = evidence_text.casefold()
-    if re.search(rf"(?<!\d){local.hour:02d}:{local.minute:02d}(?!\d)", text):
-        return True
-    if local.hour < 10 and re.search(rf"(?<!\d){local.hour}:{local.minute:02d}(?!\d)", text):
-        return True
+    precision = f":{local.minute:02d}"
+    if local.second or local.microsecond:
+        precision += f":{local.second:02d}"
+    if local.microsecond:
+        precision += f".{local.microsecond:06d}".rstrip("0")
+    patterns = [rf"(?<!\d)0?{local.hour}{re.escape(precision)}(?!\d)"]
     meridiem = "am" if local.hour < 12 else "pm"
     hour = local.hour % 12 or 12
-    minute = rf"(?::{local.minute:02d})?" if local.minute == 0 else f":{local.minute:02d}"
-    return bool(
-        re.search(
-            rf"(?<!\d){hour}{minute}\s*{meridiem}\b",
-            text,
+    minute = re.escape(precision)
+    if local.minute == 0 and local.second == 0 and local.microsecond == 0:
+        minute = rf"(?:{minute})?"
+    patterns.append(rf"(?<!\d){hour}{minute}\s*{meridiem}\b")
+    return tuple(patterns)
+
+
+def _time_source_matches(
+    value: datetime,
+    evidence_text: str,
+    *,
+    zone: ZoneInfo,
+) -> tuple[re.Match[str], ...]:
+    text = evidence_text.casefold()
+    pattern = "|".join(f"(?:{item})" for item in _time_patterns(value, zone=zone))
+    return tuple(re.finditer(pattern, text))
+
+
+def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneInfo) -> bool:
+    return bool(_time_source_matches(value, evidence_text, zone=zone))
+
+
+def _range_has_source_support(
+    start: datetime,
+    end: datetime,
+    evidence_text: str,
+    *,
+    zone: ZoneInfo,
+    source: SchedulingSource,
+) -> bool:
+    if not all(
+        _date_has_source_support(
+            value,
+            evidence_text,
+            zone=zone,
+            context_at=source.context_at,
         )
+        for value in (start, end)
+    ):
+        return False
+    for start_match in _time_source_matches(start, evidence_text, zone=zone):
+        for end_match in _time_source_matches(end, evidence_text, zone=zone):
+            if end_match.start() < start_match.end():
+                continue
+            separator = evidence_text[start_match.end() : end_match.start()]
+            if re.fullmatch(r"\s*(?:-|–|—|to|until|through)\s*", separator, re.IGNORECASE):
+                return True
+    return False
+
+
+_ZONE_OFFSETS = {
+    "utc": timedelta(0),
+    "gmt": timedelta(0),
+    "est": timedelta(hours=-5),
+    "edt": timedelta(hours=-4),
+    "cst": timedelta(hours=-6),
+    "cdt": timedelta(hours=-5),
+    "mst": timedelta(hours=-7),
+    "mdt": timedelta(hours=-6),
+    "pst": timedelta(hours=-8),
+    "pdt": timedelta(hours=-7),
+}
+
+
+def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[timedelta]]:
+    names: set[str] = set()
+    for match in re.findall(r"\b[A-Za-z_+-]+(?:/[A-Za-z0-9_+-]+)+\b", evidence_text):
+        try:
+            ZoneInfo(match)
+        except (ValueError, ZoneInfoNotFoundError):
+            continue
+        names.add(match.casefold())
+    offsets = {
+        _ZONE_OFFSETS[match.casefold()]
+        for match in re.findall(
+            r"(?<![A-Za-z])(?:UTC|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT)(?![A-Za-z])",
+            evidence_text,
+            re.IGNORECASE,
+        )
+    }
+    for sign, hours, minutes in re.findall(
+        r"(?<![\d:])([+-])(\d{2}):?(\d{2})(?!\d)",
+        evidence_text,
+    ):
+        offset = timedelta(hours=int(hours), minutes=int(minutes))
+        offsets.add(offset if sign == "+" else -offset)
+    return frozenset(names), frozenset(offsets)
+
+
+def _timezone_has_source_support(
+    timezone: str,
+    evidence_text: str,
+    *,
+    source: SchedulingSource,
+    start: datetime,
+    end: datetime,
+) -> bool:
+    names, offsets = _explicit_timezones(evidence_text)
+    if not names and not offsets:
+        return timezone == source.configured_timezone
+    return (not names or timezone.casefold() in names) and (
+        not offsets or all(value.utcoffset() in offsets for value in (start, end))
     )
 
 
@@ -399,28 +496,42 @@ def _time_violations(
         zone = ZoneInfo(item.timezone)
     except (ValueError, ZoneInfoNotFoundError):
         return [SchedulingViolation("timezone_unknown", f"{path}.timezone")]
+    evidence_texts = tuple(evidence.quote for evidence in item.evidence)
+    evidence_text = "\n".join(evidence_texts)
     for label, value in (("start", start), ("end", end)):
         offsets = _wall_time_offsets(value, zone)
         if not offsets:
             violations.append(SchedulingViolation("timezone_nonexistent", f"{path}.{label}"))
-        elif len(offsets) > 1:
-            violations.append(SchedulingViolation("timezone_ambiguous", f"{path}.{label}"))
         elif value.utcoffset() not in offsets:
             violations.append(SchedulingViolation("timezone_offset_mismatch", f"{path}.{label}"))
-    evidence_text = "\n".join(evidence.quote for evidence in item.evidence)
+        elif len(offsets) > 1 and not any(
+            value.utcoffset() in _explicit_timezones(text)[1] for text in evidence_texts
+        ):
+            violations.append(SchedulingViolation("timezone_ambiguous", f"{path}.{label}"))
     for label, value in (("start", start), ("end", end)):
-        if not _date_has_source_support(
-            value,
-            evidence_text,
-            zone=zone,
-            context_at=source.context_at,
+        if not any(
+            _date_has_source_support(
+                value,
+                text,
+                zone=zone,
+                context_at=source.context_at,
+            )
+            for text in evidence_texts
         ):
             violations.append(SchedulingViolation("time_date_unsupported", f"{path}.{label}"))
-        if not _time_has_source_support(value, evidence_text, zone=zone):
+        if not any(_time_has_source_support(value, text, zone=zone) for text in evidence_texts):
             violations.append(SchedulingViolation("time_value_unsupported", f"{path}.{label}"))
-    if (
-        item.timezone != source.configured_timezone
-        and item.timezone.casefold() not in evidence_text.casefold()
+    if not any(
+        _range_has_source_support(start, end, text, zone=zone, source=source)
+        for text in evidence_texts
+    ):
+        violations.append(SchedulingViolation("time_range_unsupported", path))
+    if not _timezone_has_source_support(
+        item.timezone,
+        evidence_text,
+        source=source,
+        start=start,
+        end=end,
     ):
         violations.append(SchedulingViolation("timezone_unsupported", f"{path}.timezone"))
     if start.astimezone(UTC) >= end.astimezone(UTC):
@@ -443,12 +554,16 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         else:
             violations = []
     bounded = _bounded_result(raw)
-    result_json = json.dumps(
-        bounded,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    try:
+        result_json = json.dumps(
+            bounded,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except UnicodeEncodeError:
+        result_json = b"{}"
+        violations.append(SchedulingViolation("result_invalid_unicode", "$"))
     if len(result_json) > MAX_SCHEDULING_RESULT_BYTES:
         result_json = b"{}"
         violations.append(SchedulingViolation("result_too_large", "$"))

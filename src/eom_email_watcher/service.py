@@ -22,6 +22,7 @@ from .entitlement import (
 )
 from .mailbox import (
     MailboxAccountUnavailable,
+    MailboxError,
     MailboxGateway,
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
@@ -264,6 +265,13 @@ def process_scheduling_automations(
                 )
                 processed += 1
                 review_required += 1
+                continue
+            except MailboxError as exc:
+                logger.warning(
+                    "Scheduling run %s source temporarily unavailable: %s",
+                    run.run_id,
+                    exc,
+                )
                 continue
 
             source = SchedulingSource(
