@@ -241,6 +241,7 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     run_id TEXT PRIMARY KEY CHECK (length(run_id) = 36),
     provider TEXT NOT NULL CHECK (provider <> ''),
     account_id TEXT NOT NULL CHECK (account_id <> ''),
+    calendar_principal_key TEXT NOT NULL CHECK (length(calendar_principal_key) = 64),
     source_message_key TEXT NOT NULL CHECK (length(source_message_key) = 64),
     automation_id TEXT NOT NULL CHECK (automation_id <> ''),
     automation_version INTEGER NOT NULL CHECK (automation_version > 0),
@@ -284,6 +285,7 @@ CREATE TABLE IF NOT EXISTS automation_events (
     automation_id TEXT NOT NULL CHECK (automation_id <> ''),
     automation_version INTEGER NOT NULL CHECK (automation_version > 0),
     extraction_schema_version INTEGER NOT NULL CHECK (extraction_schema_version > 0),
+    calendar_principal_key TEXT NOT NULL CHECK (length(calendar_principal_key) = 64),
     transition_kind TEXT NOT NULL CHECK (transition_kind IN (
         'detected', 'extracting', 'ambiguous', 'manual_review', 'proposing',
         'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
@@ -370,6 +372,7 @@ class AutomationRun:
     run_id: str
     provider: str
     account_id: str
+    calendar_principal_key: str
     source_message_key: str
     automation_id: str
     automation_version: int
@@ -393,6 +396,7 @@ class AutomationEvent:
     automation_id: str
     automation_version: int
     extraction_schema_version: int
+    calendar_principal_key: str
     transition_kind: str
     failure_code: str | None
     created_at: str
@@ -417,6 +421,7 @@ def _append_automation_event(
     automation_id: str,
     automation_version: int,
     extraction_schema_version: int,
+    calendar_principal_key: str,
     transition_kind: str,
     failure_code: str | None,
     created_at: str,
@@ -425,8 +430,8 @@ def _append_automation_event(
         """INSERT INTO automation_events(
             event_id, run_id, sequence_no, previous_state, next_state, state_version,
             automation_id, automation_version, extraction_schema_version,
-            transition_kind, failure_code, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            calendar_principal_key, transition_kind, failure_code, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             str(uuid.uuid4()),
             run_id,
@@ -437,6 +442,7 @@ def _append_automation_event(
             automation_id,
             automation_version,
             extraction_schema_version,
+            calendar_principal_key,
             transition_kind,
             failure_code,
             created_at,
@@ -449,6 +455,7 @@ def _admit_scheduling_automation(
     *,
     provider: str,
     account_id: str,
+    calendar_principal_key: str,
     provider_message_id: str,
     created_at: str,
     expires_at: str,
@@ -457,10 +464,10 @@ def _admit_scheduling_automation(
     run_id = str(uuid.uuid4())
     inserted = db.execute(
         """INSERT INTO automation_runs(
-            run_id, provider, account_id, source_message_key,
+            run_id, provider, account_id, calendar_principal_key, source_message_key,
             automation_id, automation_version, extraction_schema_version,
             state, state_version, failure_code, expires_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'detected', 1, NULL, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'detected', 1, NULL, ?, ?, ?)
         ON CONFLICT(
             provider, account_id, source_message_key, automation_id, automation_version
         ) DO NOTHING""",
@@ -468,6 +475,7 @@ def _admit_scheduling_automation(
             run_id,
             provider,
             account_id,
+            calendar_principal_key,
             source_message_key,
             SCHEDULING_AUTOMATION_ID,
             SCHEDULING_AUTOMATION_VERSION,
@@ -489,6 +497,7 @@ def _admit_scheduling_automation(
         automation_id=SCHEDULING_AUTOMATION_ID,
         automation_version=SCHEDULING_AUTOMATION_VERSION,
         extraction_schema_version=SCHEDULING_EXTRACTION_SCHEMA_VERSION,
+        calendar_principal_key=calendar_principal_key,
         transition_kind="detected",
         failure_code=None,
         created_at=created_at,
@@ -508,7 +517,7 @@ def _mark_automation_sources_unavailable(
         placeholders = ", ".join("?" for _ in chunk)
         runs = db.execute(
             f"""SELECT r.run_id, r.automation_id, r.automation_version,
-                r.extraction_schema_version
+                r.extraction_schema_version, r.calendar_principal_key
             FROM automation_runs AS r
             JOIN messages AS m
               ON m.provider = r.provider
@@ -542,6 +551,7 @@ def _mark_automation_sources_unavailable(
                 automation_id=str(row["automation_id"]),
                 automation_version=int(row["automation_version"]),
                 extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
                 transition_kind="source_unavailable",
                 failure_code="source_unavailable",
                 created_at=updated_at,
@@ -1201,6 +1211,7 @@ class Store:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA recursive_triggers = ON")
         connection.row_factory = sqlite3.Row
         connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
         connection.create_function(
@@ -2783,11 +2794,14 @@ class Store:
         message_id: str,
         result: dict[str, object],
         *,
-        admit_scheduling_automation: bool = False,
+        scheduling_automation_principal_key: str | None = None,
         now: datetime | None = None,
     ) -> None:
-        if not isinstance(admit_scheduling_automation, bool):
-            raise ValueError("admit_scheduling_automation must be a boolean")
+        if scheduling_automation_principal_key is not None and (
+            not isinstance(scheduling_automation_principal_key, str)
+            or len(scheduling_automation_principal_key) != 64
+        ):
+            raise ValueError("scheduling automation principal key must be a 64-character string")
         admitted_at = (now or datetime.now(UTC)).astimezone(UTC)
         stamp = admitted_at.isoformat()
         with self.connection() as db:
@@ -2825,11 +2839,15 @@ class Store:
             )
             if updated.rowcount != 1:
                 raise RuntimeError("Analysis completion lost its expected-state race")
-            if admit_scheduling_automation and result["category"] == "scheduling":
+            if (
+                scheduling_automation_principal_key is not None
+                and result["category"] == "scheduling"
+            ):
                 _admit_scheduling_automation(
                     db,
                     provider=str(source["provider"]),
                     account_id=str(source["account_id"]),
+                    calendar_principal_key=scheduling_automation_principal_key,
                     provider_message_id=str(source["provider_message_id"]),
                     created_at=stamp,
                     expires_at=_automation_expiry(str(source["discovered_at"]), admitted_at),

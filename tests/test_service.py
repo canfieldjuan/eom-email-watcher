@@ -20,7 +20,11 @@ from eom_email_watcher.mailbox import (
     MessageContent,
     scoped_message_id,
 )
-from eom_email_watcher.microsoft365 import MICROSOFT365_PROVIDER
+from eom_email_watcher.microsoft365 import (
+    MICROSOFT365_PROVIDER,
+    Microsoft365Error,
+    MicrosoftAuthorizationRejected,
+)
 from eom_email_watcher.mime import extract_body
 from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
 from eom_email_watcher.notifications import NotificationError
@@ -235,13 +239,15 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "features_active", "grant_state", "expected"),
+    ("provider", "features_active", "grant_state", "authorization", "expected"),
     [
-        (MICROSOFT365_PROVIDER, False, "ready", False),
-        (MICROSOFT365_PROVIDER, True, None, False),
-        (MICROSOFT365_PROVIDER, True, "consent_pending", False),
-        (MICROSOFT365_PROVIDER, True, "ready", True),
-        ("gmail", True, "ready", False),
+        (MICROSOFT365_PROVIDER, False, "ready", "valid", False),
+        (MICROSOFT365_PROVIDER, True, None, "valid", False),
+        (MICROSOFT365_PROVIDER, True, "consent_pending", "valid", False),
+        (MICROSOFT365_PROVIDER, True, "ready", "valid", True),
+        (MICROSOFT365_PROVIDER, True, "ready", "rejected", False),
+        (MICROSOFT365_PROVIDER, True, "ready", "transient", False),
+        ("gmail", True, "ready", "valid", False),
     ],
 )
 def test_watcher_requires_full_scheduling_automation_authorization(
@@ -250,12 +256,23 @@ def test_watcher_requires_full_scheduling_automation_authorization(
     provider: str,
     features_active: bool,
     grant_state: str | None,
+    authorization: str,
     expected: bool,
 ) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    account_id = "account-2" if provider == MICROSOFT365_PROVIDER else "gmail-default"
+    account_id = (
+        f"microsoft365-{'a' * 32}" if provider == MICROSOFT365_PROVIDER else "gmail-default"
+    )
+    if provider == MICROSOFT365_PROVIDER:
+        store.register_mail_account(
+            provider,
+            account_id,
+            display_name="Microsoft 365",
+            address="user@example.com",
+            active=True,
+        )
     store.set_state("100", provider=provider, account_id=account_id)
     if grant_state is not None:
         identity = {
@@ -277,6 +294,34 @@ def test_watcher_requires_full_scheduling_automation_authorization(
         "feature_entitlements_active",
         check_features,
     )
+    authorization_checks: list[tuple[Path, Path, Path, str]] = []
+
+    class AuthorizedCalendar:
+        class Principal:
+            key = "a" * 64
+
+        principal = Principal()
+
+    def validate_authorization(
+        credentials_file: Path,
+        token_file: Path,
+        mailbox_token_file: Path,
+        expected_principal_key: str,
+    ) -> AuthorizedCalendar:
+        authorization_checks.append(
+            (credentials_file, token_file, mailbox_token_file, expected_principal_key)
+        )
+        if authorization == "rejected":
+            raise MicrosoftAuthorizationRejected("revoked")
+        if authorization == "transient":
+            raise Microsoft365Error("temporarily unavailable")
+        return AuthorizedCalendar()
+
+    monkeypatch.setattr(
+        service_module.MicrosoftCalendarProposalAuthorization,
+        "from_matching_tokens",
+        validate_authorization,
+    )
 
     session = MailboxSession(provider, account_id, FreshGmail())
     result = Watcher(cfg, store, session, SchedulingModel()).check()
@@ -292,9 +337,21 @@ def test_watcher_requires_full_scheduling_automation_authorization(
     )
     if run is not None:
         assert (run.state, run.state_version) == ("detected", 1)
+        assert run.calendar_principal_key == "a" * 64
         assert [event.transition_kind for event in store.automation_events(run.run_id)] == [
             "detected"
         ]
+    should_validate = (
+        provider == MICROSOFT365_PROVIDER and features_active and grant_state == "ready"
+    )
+    assert bool(authorization_checks) is should_validate
+    grant = store.calendar_grant(account_id, "proposal")
+    if authorization == "rejected" and should_validate:
+        assert grant is not None
+        assert grant.state == "revoked"
+    elif authorization == "transient" and should_validate:
+        assert grant is not None
+        assert grant.state == "ready"
 
 
 def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:

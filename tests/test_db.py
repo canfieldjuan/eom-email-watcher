@@ -22,6 +22,8 @@ from eom_email_watcher.db import (
 from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
 
+CALENDAR_PRINCIPAL_KEY = "a" * 64
+
 
 def scheduling_analysis() -> dict[str, object]:
     return {
@@ -96,7 +98,7 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
     store.mark_analyzed(
         "local-1",
         scheduling_analysis(),
-        admit_scheduling_automation=True,
+        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
         now=committed_at,
     )
 
@@ -117,7 +119,9 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
         committed_at.isoformat(),
         committed_at.isoformat(),
     )
+    assert run.calendar_principal_key == CALENDAR_PRINCIPAL_KEY
     events = store.automation_events(run.run_id)
+    assert [event.calendar_principal_key for event in events] == [CALENDAR_PRINCIPAL_KEY]
     assert [
         (
             event.sequence_no,
@@ -132,7 +136,7 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
         db.execute(
             """INSERT INTO automation_runs
                 SELECT '11111111-1111-4111-8111-111111111111', provider,
-                    account_id, source_message_key, automation_id,
+                    account_id, calendar_principal_key, source_message_key, automation_id,
                     automation_version, extraction_schema_version, state,
                     state_version, failure_code, expires_at, created_at, updated_at
                 FROM automation_runs WHERE run_id = ?""",
@@ -166,7 +170,7 @@ def test_scheduling_admission_rolls_back_analysis_when_event_append_fails(
         store.mark_analyzed(
             "m1",
             scheduling_analysis(),
-            admit_scheduling_automation=True,
+            scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
         )
 
     assert [message.message_id for message in store.pending()] == ["m1"]
@@ -204,7 +208,7 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(
     store.mark_analyzed(
         raw_gmail_id,
         scheduling_analysis(),
-        admit_scheduling_automation=True,
+        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
         now=datetime(2026, 9, 7, 12, 1, tzinfo=UTC),
     )
     detected = store.automation_run_for_message(raw_gmail_id)
@@ -222,6 +226,12 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(
             db.execute("UPDATE automation_events SET transition_kind = 'source_unavailable'")
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             db.execute("DELETE FROM automation_events")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                "INSERT OR REPLACE INTO automation_events SELECT * FROM automation_events "
+                "WHERE event_id = ?",
+                (store.automation_events(detected.run_id)[0].event_id,),
+            )
 
     removed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
     assert store.delete_message(raw_gmail_id, now=removed_at)
@@ -237,6 +247,10 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(
     assert [(event.automation_version, event.extraction_schema_version) for event in events] == [
         (7, 3),
         (7, 3),
+    ]
+    assert [event.calendar_principal_key for event in events] == [
+        CALENDAR_PRINCIPAL_KEY,
+        CALENDAR_PRINCIPAL_KEY,
     ]
     with store.connection() as db:
         durable_automation = " ".join(
@@ -274,12 +288,39 @@ def test_non_scheduling_or_unentitled_analysis_creates_no_automation_run(
     store.mark_analyzed(
         "informational",
         informational,
-        admit_scheduling_automation=True,
+        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
     )
 
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM automation_events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("principal_key", ["", "a" * 63, "a" * 65])
+def test_scheduling_admission_rejects_invalid_calendar_principal_before_analysis(
+    tmp_path: Path,
+    principal_key: str,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="principal key"):
+        store.mark_analyzed(
+            "m1",
+            scheduling_analysis(),
+            scheduling_automation_principal_key=principal_key,
+        )
+
+    assert [message.message_id for message in store.pending()] == ["m1"]
+    assert store.automation_run_for_message("m1") is None
 
 
 @pytest.mark.parametrize("cleanup", ["clear", "purge"])
@@ -304,7 +345,7 @@ def test_bulk_cleanup_makes_detected_automation_source_unavailable(
         store.mark_analyzed(
             message_id,
             scheduling_analysis(),
-            admit_scheduling_automation=True,
+            scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
         )
         detected = store.automation_run_for_message(message_id)
         assert detected is not None

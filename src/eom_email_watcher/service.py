@@ -11,6 +11,7 @@ from .entitlement import (
     feature_entitlements_active,
 )
 from .mailbox import (
+    MailboxAccountUnavailable,
     MailboxGateway,
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
@@ -20,20 +21,51 @@ from .mailbox import (
     mailbox_polling_session,
     scoped_message_id,
 )
-from .microsoft365 import MICROSOFT365_PROVIDER
+from .microsoft365 import (
+    MICROSOFT365_PROVIDER,
+    Microsoft365Error,
+    MicrosoftAuthorizationRejected,
+)
+from .microsoft_calendar import MicrosoftCalendarProposalAuthorization
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
+from .runtime import mail_account_token_file, microsoft_calendar_token_file
 
 logger = logging.getLogger(__name__)
 
 
-def _scheduling_automation_admission_allowed(store: Store, message: PendingMessage) -> bool:
+def _scheduling_automation_principal(
+    config: Config,
+    store: Store,
+    message: PendingMessage,
+) -> str | None:
     if message.provider != MICROSOFT365_PROVIDER:
-        return False
+        return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
-        return False
+        return None
+    account = store.mail_account(message.provider, message.account_id)
+    if account is None or account.address is None:
+        return None
     proposal_grant = store.calendar_grant(message.account_id, "proposal")
-    return proposal_grant is not None and proposal_grant.state == "ready"
+    if (
+        proposal_grant is None
+        or proposal_grant.state != "ready"
+        or proposal_grant.principal_key is None
+    ):
+        return None
+    try:
+        authorization = MicrosoftCalendarProposalAuthorization.from_matching_tokens(
+            config.microsoft_credentials_file,
+            microsoft_calendar_token_file(config, account, "proposal"),
+            mail_account_token_file(config, account),
+            proposal_grant.principal_key,
+        )
+    except MicrosoftAuthorizationRejected:
+        store.revoke_calendar_grant_if_current(proposal_grant)
+        return None
+    except (MailboxAccountUnavailable, Microsoft365Error):
+        return None
+    return authorization.principal.key
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
@@ -341,7 +373,8 @@ class Watcher:
                     self.store.mark_analyzed(
                         message.message_id,
                         analysis.model_dump(),
-                        admit_scheduling_automation=_scheduling_automation_admission_allowed(
+                        scheduling_automation_principal_key=_scheduling_automation_principal(
+                            self.config,
                             self.store,
                             message,
                         ),

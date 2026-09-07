@@ -224,6 +224,66 @@ def test_mailbox_principal_lookup_requests_only_mail_read(
     assert calls == [["Mail.Read"]]
 
 
+@pytest.mark.parametrize(
+    ("calendar_object_id", "mailbox_object_id", "accepted"),
+    [
+        (OBJECT_ID, OBJECT_ID, True),
+        ("cccccccc-dddd-4eee-8fff-000000000000", OBJECT_ID, False),
+        (OBJECT_ID, "cccccccc-dddd-4eee-8fff-000000000000", False),
+    ],
+)
+def test_calendar_authorization_requires_matching_grant_and_mailbox_principals(
+    calendar_object_id: str,
+    mailbox_object_id: str,
+    accepted: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    calendar_token = tmp_path / "calendar-cache.json"
+    mailbox_token = tmp_path / "mailbox-cache.json"
+
+    def selected_principal(object_id: str) -> MicrosoftPrincipal:
+        return MicrosoftPrincipal(
+            home_account_id=f"{object_id}.{TENANT_ID}",
+            tenant_id=TENANT_ID,
+            object_id=object_id,
+            email_address="owner@example.com",
+        )
+
+    calendar_authorization = MicrosoftCalendarProposalAuthorization(
+        selected_principal(calendar_object_id),
+        "private-access-token",
+    )
+    monkeypatch.setattr(
+        MicrosoftCalendarProposalAuthorization,
+        "from_token",
+        classmethod(lambda cls, credentials_file, token_file: calendar_authorization),
+    )
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "microsoft_mailbox_principal",
+        lambda credentials_file, token_file: selected_principal(mailbox_object_id),
+    )
+
+    if accepted:
+        authorization = MicrosoftCalendarProposalAuthorization.from_matching_tokens(
+            credentials,
+            calendar_token,
+            mailbox_token,
+            principal().key,
+        )
+        assert authorization is calendar_authorization
+    else:
+        with pytest.raises(MicrosoftAuthorizationRejected, match="principal"):
+            MicrosoftCalendarProposalAuthorization.from_matching_tokens(
+                credentials,
+                calendar_token,
+                mailbox_token,
+                principal().key,
+            )
+
+
 def test_cached_mailbox_principal_lookup_does_not_construct_a_token_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

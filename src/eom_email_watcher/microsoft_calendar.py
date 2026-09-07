@@ -338,6 +338,26 @@ class MicrosoftCalendarAuthorization:
         return cls(principal, str(result["access_token"]))
 
     @classmethod
+    def from_matching_tokens(
+        cls,
+        credentials_file: Path,
+        token_file: Path,
+        mailbox_token_file: Path,
+        expected_principal_key: str,
+    ) -> Self:
+        authorization = cls.from_token(credentials_file, token_file)
+        if authorization.principal.key != expected_principal_key:
+            raise MicrosoftAuthorizationRejected(
+                "Microsoft calendar grant does not match its authorized principal"
+            )
+        mailbox_principal = microsoft_mailbox_principal(credentials_file, mailbox_token_file)
+        if mailbox_principal.key != expected_principal_key:
+            raise MicrosoftAuthorizationRejected(
+                "Microsoft calendar grant does not match the mailbox principal"
+            )
+        return authorization
+
+    @classmethod
     def authorize_with_status(
         cls,
         credentials_file: Path,
