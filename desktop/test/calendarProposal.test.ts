@@ -8,6 +8,7 @@ const styles = await readFile(new URL("../src/styles.css", import.meta.url), "ut
 test("calendar proposals render as native non-writing inbox content", () => {
   assert.match(source, /if \(item\.calendar_proposal\)/);
   assert.match(source, /textContent = "Calendar proposal"/);
+  assert.match(source, /subject\.textContent = `Event title: \$\{proposal\.subject\}`/);
   assert.match(source, /textContent = "No calendar event has been created\."/);
   assert.match(source, /proposal\.empty_reason \|\| "No meeting time satisfied the request\."/);
   assert.match(

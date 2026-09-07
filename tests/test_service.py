@@ -905,6 +905,40 @@ def test_scheduling_proposal_rechecks_time_after_graph_response(
     assert (result.processed, result.review_required) == (1, 1)
 
 
+def test_canonical_check_keeps_both_proposal_passes_on_live_clocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    proposal_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        service_module,
+        "process_scheduling_automations",
+        lambda *args, **kwargs: service_module.AutomationProcessing(
+            0,
+            0,
+            frozenset(),
+            0,
+        ),
+    )
+
+    def proposals(*args, **kwargs):
+        proposal_calls.append(kwargs)
+        attempted = frozenset({"run-1"}) if len(proposal_calls) == 1 else frozenset()
+        return service_module.AutomationProcessing(0, 0, attempted, 0)
+
+    monkeypatch.setattr(service_module, "process_scheduling_proposals", proposals)
+
+    run_watcher_check(cfg, store, FakeModel(), deliver_notifications=False)
+
+    assert proposal_calls == [
+        {},
+        {"exclude_run_ids": frozenset({"run-1"}), "limit": 25},
+    ]
+
+
 def test_scheduling_proposal_definitive_rejection_becomes_reviewable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

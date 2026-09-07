@@ -701,7 +701,7 @@ def test_find_meeting_time_fails_closed_on_unproven_suggestions(
         )
 
 
-@pytest.mark.parametrize("status", [400, 401, 408, 429, 503])
+@pytest.mark.parametrize("status", [400, 401, 403, 408, 429, 503])
 def test_find_meeting_time_classifies_status_before_parsing(status: int) -> None:
     authorization = MicrosoftCalendarProposalAuthorization(
         principal(),
@@ -715,7 +715,7 @@ def test_find_meeting_time_classifies_status_before_parsing(status: int) -> None
 
     expected = (
         MicrosoftAuthorizationRejected
-        if status == 401
+        if status in {401, 403}
         else MicrosoftCalendarProposalRejected
         if status == 400
         else Microsoft365Error
@@ -726,6 +726,40 @@ def test_find_meeting_time_classifies_status_before_parsing(status: int) -> None
             ("invitee@example.com",),
             proposal_candidates(),
         )
+
+
+def test_find_meeting_time_preserves_fractional_candidate_instants() -> None:
+    document = proposal_document()
+    suggestion = document["meetingTimeSuggestions"][0]  # type: ignore[index]
+    slot = suggestion["meetingTimeSlot"]  # type: ignore[index]
+    slot["start"]["dateTime"] = "2026-09-08T15:00:00.500000"  # type: ignore[index]
+    slot["end"]["dateTime"] = "2026-09-08T15:30:00.500000"  # type: ignore[index]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=document)
+
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    candidates = (
+        CalendarProposalCandidate(
+            start="2026-09-08T10:00:00.500000-05:00",
+            end="2026-09-08T10:30:00.500000-05:00",
+            timezone="America/Chicago",
+        ),
+    )
+
+    result = find_meeting_time(authorization, ("invitee@example.com",), candidates)
+
+    assert result.proposal is not None
+    request = json.loads(requests[0].content)
+    slot = request["timeConstraint"]["timeSlots"][0]
+    assert slot["start"]["dateTime"] == "2026-09-08T15:00:00.500000"
+    assert slot["end"]["dateTime"] == "2026-09-08T15:30:00.500000"
 
 
 def test_find_meeting_time_rejects_mismatched_durations_before_http() -> None:

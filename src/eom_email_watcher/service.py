@@ -1136,7 +1136,6 @@ def run_watcher_check(
         store,
         exclude_run_ids=before_proposals.attempted_run_ids,
         limit=25,
-        now=_utc_now(),
     )
     if deliver_notifications and config.notifications_enabled:
         sender_names = {sender.email: sender.name for sender in config.senders}

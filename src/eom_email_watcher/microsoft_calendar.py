@@ -493,7 +493,7 @@ def _proposal_request(
 
     def graph_time(value: datetime) -> dict[str, str]:
         return {
-            "dateTime": value.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="seconds"),
+            "dateTime": value.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="auto"),
             "timeZone": "UTC",
         }
 
@@ -661,7 +661,7 @@ async def _find_meeting_time(
                     _calendar_round_time_remaining(deadline),
                 ),
             ) as response:
-                if response.status_code == 401:
+                if response.status_code in {401, 403}:
                     raise MicrosoftAuthorizationRejected(
                         "Microsoft rejected the calendar proposal authorization"
                     )

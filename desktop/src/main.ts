@@ -1209,6 +1209,8 @@ function renderInbox(items: InboxItem[]): void {
       state.textContent = !hasSuggestion ? "Needs review" : expired ? "Expired" : "Not confirmed";
       state.dataset.expired = String(expired);
       heading.append(title, state);
+      const subject = document.createElement("p");
+      subject.textContent = `Event title: ${proposal.subject}`;
       const timing = document.createElement("p");
       if (!hasSuggestion) {
         timing.textContent = proposal.empty_reason || "No meeting time satisfied the request.";
@@ -1239,7 +1241,7 @@ function renderInbox(items: InboxItem[]): void {
       const note = document.createElement("p");
       note.className = "calendar-proposal-note";
       note.textContent = "No calendar event has been created.";
-      calendarProposal.append(heading, timing, attendees, calendar, note);
+      calendarProposal.append(heading, subject, timing, attendees, calendar, note);
     }
 
     const attachments = document.createElement("ul");
