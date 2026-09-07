@@ -898,9 +898,12 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
 
 def _calendar_read_status(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id"})
-    runtime = _runtime(request)
-    account = _calendar_account(runtime, payload, require_address=False)
-    return _calendar_read_status_data(runtime, account)
+
+    def status(runtime: Runtime) -> dict[str, object]:
+        account = _calendar_account(runtime, payload, require_address=False)
+        return _calendar_read_status_data(runtime, account)
+
+    return _with_mail_account_mutation(request, status)
 
 
 def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
@@ -947,12 +950,26 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
             except MicrosoftCalendarConsentPending:
                 return _calendar_read_status_data(runtime, account)
             except MicrosoftAuthorizationRejected as exc:
-                runtime.store.set_calendar_grant(
-                    account.account_id,
-                    CALENDAR_READ_PROFILE,
-                    "rejected",
-                    **_calendar_grant_identity(previous),
-                )
+                try:
+                    runtime.store.set_calendar_grant(
+                        account.account_id,
+                        CALENDAR_READ_PROFILE,
+                        "rejected",
+                        **_calendar_grant_identity(previous),
+                    )
+                except sqlite3.Error as state_exc:
+                    try:
+                        _restore_calendar_grant(runtime, account.account_id, previous)
+                    except sqlite3.Error as restore_exc:
+                        raise ApiError(
+                            "calendar_state_error",
+                            "Microsoft calendar consent state could not be restored; "
+                            "disconnect and retry",
+                        ) from restore_exc
+                    raise ApiError(
+                        "calendar_error",
+                        "Microsoft calendar rejection could not be recorded; retry",
+                    ) from state_exc
                 raise ApiError("calendar_authorization_rejected", str(exc)) from exc
             except Microsoft365Error as exc:
                 _restore_calendar_grant(runtime, account.account_id, previous)
