@@ -307,6 +307,65 @@ def test_explicit_source_zone_overrides_configured_default() -> None:
     assert "timezone_unsupported" in codes(validate(value, scheduling_source=scheduling_source))
 
 
+def test_spelled_source_zone_overrides_configured_default() -> None:
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "September 8, 2026 from 10:00 to 10:30 Eastern Time",
+        }
+    ]
+    scheduling_source = source(
+        body="September 8, 2026 from 10:00 to 10:30 Eastern Time"
+    )
+
+    assert "timezone_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    value["proposed_times"][0]["timezone"] = "America/New_York"  # type: ignore[index]
+    value["proposed_times"][0]["start"] = "2026-09-08T10:00:00-04:00"  # type: ignore[index]
+    value["proposed_times"][0]["end"] = "2026-09-08T10:30:00-04:00"  # type: ignore[index]
+    assert "timezone_unsupported" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
+def test_day_after_tomorrow_is_not_treated_as_tomorrow() -> None:
+    value = valid_result()
+    proposed = value["proposed_times"][0]  # type: ignore[index]
+    proposed["evidence"] = [
+        {
+            "source": "body",
+            "quote": "day after tomorrow from 10:00 to 10:30",
+        }
+    ]
+    scheduling_source = source(body="Please meet day after tomorrow from 10:00 to 10:30.")
+
+    assert "time_date_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    proposed["start"] = "2026-09-09T10:00:00-05:00"
+    proposed["end"] = "2026-09-09T10:30:00-05:00"
+    assert "time_date_unsupported" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
+def test_zone_conversion_overflow_is_a_typed_validation_rejection() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "9999-12-31T22:00:00-12:00",
+            "end": "9999-12-31T23:00:00-12:00",
+            "timezone": "Pacific/Kiritimati",
+        }
+    )
+
+    assert "time_invalid" in codes(validate(value))
+
+
 def test_source_backed_offset_selects_a_dst_fold() -> None:
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]

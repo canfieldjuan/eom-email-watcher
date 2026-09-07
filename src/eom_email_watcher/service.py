@@ -38,7 +38,13 @@ from .microsoft365 import (
     MicrosoftAuthorizationRejected,
 )
 from .microsoft_calendar import MicrosoftCalendarProposalAuthorization
-from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
+from .model import (
+    Analysis,
+    GatewayModelError,
+    ModelError,
+    ModelRuntime,
+    bounded_gateway_attachment_names,
+)
 from .notifications import NotificationError, send_analysis, send_fallback, send_review
 from .runtime import (
     load_configured_mailbox,
@@ -184,8 +190,9 @@ def process_scheduling_automations(
     processed = 0
     review_required = 0
     attempted: set[str] = set()
+    capacity_used = 0
     cursor: tuple[str, str] | None = None
-    while len(attempted) < limit:
+    while capacity_used < limit:
         page = store.recoverable_automation_runs(limit, after=cursor, now=observed_at)
         if not page:
             break
@@ -194,7 +201,7 @@ def process_scheduling_automations(
             cursor = (run.created_at, run.run_id)
             if run.run_id in exclude_run_ids:
                 continue
-            if len(attempted) >= limit:
+            if capacity_used >= limit:
                 break
             if (
                 _scheduling_authorization_principal(
@@ -207,12 +214,19 @@ def process_scheduling_automations(
                 is None
             ):
                 continue
+            attempted.add(run.run_id)
             try:
                 mailbox = load_mailbox_account(config, store, run.provider, run.account_id)
             except MailboxAccountUnavailable as exc:
                 logger.info("Scheduling run %s mailbox unavailable: %s", run.run_id, exc)
                 continue
-            attempted.add(run.run_id)
+            except MailboxError as exc:
+                logger.warning(
+                    "Scheduling run %s mailbox temporarily unavailable: %s",
+                    run.run_id,
+                    exc,
+                )
+                continue
 
             body_char_limit = run.extraction_body_char_limit or config.body_char_limit
             timezone = run.extraction_timezone or config.timezone
@@ -232,6 +246,7 @@ def process_scheduling_automations(
                     work.extraction_organizer_address or work.organizer_address
                 )
             except (OverflowError, ValueError):
+                capacity_used += 1
                 _transition_source_problem(
                     store,
                     work,
@@ -245,6 +260,7 @@ def process_scheduling_automations(
                 with mailbox_polling_session(mailbox.gateway):
                     content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
             except MailboxMessageUnavailable as exc:
+                capacity_used += 1
                 logger.info("Scheduling run %s source unavailable: %s", run.run_id, exc)
                 _transition_source_problem(
                     store,
@@ -256,6 +272,7 @@ def process_scheduling_automations(
                 review_required += 1
                 continue
             except MailboxMessageInvalid as exc:
+                capacity_used += 1
                 logger.warning("Scheduling run %s source invalid: %s", run.run_id, exc)
                 _transition_source_problem(
                     store,
@@ -274,12 +291,13 @@ def process_scheduling_automations(
                 )
                 continue
 
+            capacity_used += 1
             source = SchedulingSource(
                 sender=work.sender,
                 subject=work.subject,
                 received_at=work.received_at,
                 body=content.body,
-                attachment_names=content.attachment_names,
+                attachment_names=bounded_gateway_attachment_names(content.attachment_names),
                 organizer_address=organizer_address,
                 configured_timezone=timezone,
                 context_at=context_at,

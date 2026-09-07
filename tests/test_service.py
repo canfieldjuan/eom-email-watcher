@@ -27,9 +27,19 @@ from eom_email_watcher.microsoft365 import (
     MicrosoftAuthorizationRejected,
 )
 from eom_email_watcher.mime import extract_body
-from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
+from eom_email_watcher.model import (
+    MAX_GATEWAY_ATTACHMENT_COUNT,
+    MAX_GATEWAY_ATTACHMENT_NAME_CHARS,
+    Analysis,
+    GatewayModelError,
+    ModelError,
+)
 from eom_email_watcher.notifications import NotificationError
-from eom_email_watcher.scheduling import SchedulingSource, validate_scheduling_output
+from eom_email_watcher.scheduling import (
+    SchedulingSource,
+    scheduling_source_sha256,
+    validate_scheduling_output,
+)
 from eom_email_watcher.service import Watcher, process_scheduling_automations, run_watcher_check
 
 
@@ -154,6 +164,22 @@ class MissingAutomationSource(AutomationGateway):
 class FailingAutomationProvider(AutomationGateway):
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         raise Microsoft365Error("temporarily unavailable")
+
+
+class FailingOlderAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        if message_id == "older-failure":
+            raise Microsoft365Error("temporarily unavailable")
+        return MessageContent(self.body[:body_char_limit], (), ())
+
+
+class MetadataHeavyAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        names = tuple(
+            f"attachment-{index}-{'x' * MAX_GATEWAY_ATTACHMENT_NAME_CHARS}.pdf"
+            for index in range(MAX_GATEWAY_ATTACHMENT_COUNT + 1)
+        )
+        return MessageContent(self.body[:body_char_limit], names, ())
 
 
 class ExtractionModel(FakeModel):
@@ -985,6 +1011,93 @@ def test_recovery_provider_failure_does_not_abort_active_mailbox_check(
     assert current is not None
     assert current.state == "detected"
     assert healthy_mailbox.full_payload_calls == 1
+
+
+def test_recovery_session_failure_does_not_abort_active_mailbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", provider="gmail", account_id="gmail-default")
+    _account_id, admitted = admit_scheduling_run(store)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda *args: (_ for _ in ()).throw(Microsoft365Error("temporarily unavailable")),
+    )
+    healthy_mailbox = FreshGmail()
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: MailboxSession("gmail", "gmail-default", healthy_mailbox),
+    )
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert result["active"] is True
+    assert current is not None
+    assert current.state == "detected"
+    assert healthy_mailbox.full_payload_calls == 1
+
+
+def test_transient_source_failure_does_not_starve_newer_runnable_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, failed = admit_scheduling_run(
+        store,
+        provider_message_id="older-failure",
+    )
+    _account_id, runnable = admit_scheduling_run(
+        store,
+        provider_message_id="runnable",
+    )
+    allow_automation_processing(monkeypatch, FailingOlderAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model, limit=1)
+
+    failed_current = store.automation_run(failed.run_id)
+    runnable_current = store.automation_run(runnable.run_id)
+    assert failed_current is not None
+    assert failed_current.state == "detected"
+    assert runnable_current is not None
+    assert runnable_current.state == "proposing"
+    assert result.processed == 1
+    assert result.attempted_run_ids == frozenset({failed.run_id, runnable.run_id})
+
+
+def test_scheduling_source_bounds_attachment_metadata_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MetadataHeavyAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    bounded_source = model.extraction_sources[0]
+    assert result.processed == 1
+    assert len(bounded_source.attachment_names) == MAX_GATEWAY_ATTACHMENT_COUNT
+    assert all(
+        len(name) <= MAX_GATEWAY_ATTACHMENT_NAME_CHARS
+        for name in bounded_source.attachment_names
+    )
+    assert current is not None
+    assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
 
 
 def test_recovery_purges_expired_source_before_fetch_or_inference(

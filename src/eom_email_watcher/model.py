@@ -211,6 +211,14 @@ def _utf8_safe(value: str) -> str:
     return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
+def bounded_gateway_attachment_names(attachment_names: tuple[str, ...]) -> tuple[str, ...]:
+    """Return stable attachment metadata within the inference gateway contract."""
+    return tuple(
+        _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
+        for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
+    )
+
+
 class LocalModel:
     def __init__(
         self,
@@ -603,10 +611,7 @@ class GatewayModel:
                 subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
                 received_at=received_at,
                 body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
-                attachment_names=tuple(
-                    _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
-                    for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
-                ),
+                attachment_names=bounded_gateway_attachment_names(attachment_names),
                 current_local_time=current_local_time,
             ),
             schema=Analysis.model_json_schema(),

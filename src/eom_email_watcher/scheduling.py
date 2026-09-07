@@ -353,6 +353,8 @@ def _date_has_source_support(
             (local.month, local.day) < (context_date.month, context_date.day)
         )
         return local.year == expected_year
+    if "day after tomorrow" in text:
+        return local.date().toordinal() == context_date.toordinal() + 2
     weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
     if weekdays[local.weekday()] in text:
         days_ahead = (local.weekday() - context_date.weekday()) % 7
@@ -435,6 +437,25 @@ _ZONE_OFFSETS = {
     "pdt": timedelta(hours=-7),
 }
 
+_ZONE_LABELS: dict[str, tuple[str, timedelta | None]] = {
+    "eastern": ("America/New_York", None),
+    "eastern time": ("America/New_York", None),
+    "eastern standard time": ("America/New_York", timedelta(hours=-5)),
+    "eastern daylight time": ("America/New_York", timedelta(hours=-4)),
+    "central": ("America/Chicago", None),
+    "central time": ("America/Chicago", None),
+    "central standard time": ("America/Chicago", timedelta(hours=-6)),
+    "central daylight time": ("America/Chicago", timedelta(hours=-5)),
+    "mountain": ("America/Denver", None),
+    "mountain time": ("America/Denver", None),
+    "mountain standard time": ("America/Denver", timedelta(hours=-7)),
+    "mountain daylight time": ("America/Denver", timedelta(hours=-6)),
+    "pacific": ("America/Los_Angeles", None),
+    "pacific time": ("America/Los_Angeles", None),
+    "pacific standard time": ("America/Los_Angeles", timedelta(hours=-8)),
+    "pacific daylight time": ("America/Los_Angeles", timedelta(hours=-7)),
+}
+
 
 def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[timedelta]]:
     names: set[str] = set()
@@ -444,7 +465,7 @@ def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[t
         except (ValueError, ZoneInfoNotFoundError):
             continue
         names.add(match.casefold())
-    offsets = {
+    offsets: set[timedelta] = {
         _ZONE_OFFSETS[match.casefold()]
         for match in re.findall(
             r"(?<![A-Za-z])(?:UTC|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT)(?![A-Za-z])",
@@ -452,6 +473,11 @@ def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[t
             re.IGNORECASE,
         )
     }
+    for label, (name, offset) in _ZONE_LABELS.items():
+        if re.search(rf"\b{re.escape(label)}\b", evidence_text, re.IGNORECASE):
+            names.add(name.casefold())
+            if offset is not None:
+                offsets.add(offset)
     for sign, hours, minutes in re.findall(
         r"(?<![\d:])([+-])(\d{2}):?(\d{2})(?!\d)",
         evidence_text,
@@ -609,14 +635,17 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         seen_attendees.add(normalized)
     for index, proposed in enumerate(extraction.proposed_times):
         path = f"proposed_times.{index}"
-        semantic.extend(
-            _time_violations(
-                proposed,
-                path,
-                source,
-                require_future=extraction.intent == "new_meeting",
+        try:
+            semantic.extend(
+                _time_violations(
+                    proposed,
+                    path,
+                    source,
+                    require_future=extraction.intent == "new_meeting",
+                )
             )
-        )
+        except (OverflowError, ValueError):
+            semantic.append(SchedulingViolation("time_invalid", path))
         for evidence_index, evidence in enumerate(proposed.evidence):
             if not _evidence_supported(evidence, source):
                 semantic.append(
