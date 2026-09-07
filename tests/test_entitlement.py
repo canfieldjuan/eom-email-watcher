@@ -145,6 +145,9 @@ def test_gate_evaluates_each_requested_feature_without_changing_connect_default(
         "state": "active",
         "active": True,
     }
+    assert gate.features_active(
+        [entitlement.CONNECT_FEATURE_ID, entitlement.AUTOMATIONS_FEATURE_ID]
+    )
 
     path.write_bytes(signed_license(key, claims()))
     path.chmod(0o600)
@@ -153,6 +156,11 @@ def test_gate_evaluates_each_requested_feature_without_changing_connect_default(
         gate.decision(entitlement.AUTOMATIONS_FEATURE_ID)
         is entitlement.EntitlementDecision.FEATURE_MISSING
     )
+    assert not gate.features_active(
+        [entitlement.CONNECT_FEATURE_ID, entitlement.AUTOMATIONS_FEATURE_ID]
+    )
+    with pytest.raises(ValueError, match="at least one"):
+        gate.features_active([])
 
 
 @pytest.mark.parametrize(

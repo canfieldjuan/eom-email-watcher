@@ -17,11 +17,15 @@ from .config import MAX_RETENTION_DAYS
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
 MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
+AUTOMATION_CLEANUP_CHUNK_SIZE = 500
+SCHEDULING_AUTOMATION_ID = "email.schedule_event"
+SCHEDULING_AUTOMATION_VERSION = 1
+SCHEDULING_EXTRACTION_SCHEMA_VERSION = 1
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -60,6 +64,17 @@ def _suppression_expiry(received_at: str, now: datetime) -> str:
         received = now
     # A future-dated source message must not create an effectively unbounded marker.
     return (min(received, now) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
+
+
+def _automation_expiry(observed_at: str, admitted_at: datetime) -> str:
+    try:
+        observed = datetime.fromisoformat(observed_at)
+        if observed.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        observed = observed.astimezone(UTC)
+    except (OverflowError, ValueError):
+        observed = admitted_at
+    return (min(observed, admitted_at) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
 
 
 _CONNECT_JOBS_TABLE_SQL = """
@@ -221,6 +236,88 @@ BEGIN
 END
 """
 
+_AUTOMATION_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS automation_runs (
+    run_id TEXT PRIMARY KEY CHECK (length(run_id) = 36),
+    provider TEXT NOT NULL CHECK (provider <> ''),
+    account_id TEXT NOT NULL CHECK (account_id <> ''),
+    calendar_principal_key TEXT NOT NULL CHECK (length(calendar_principal_key) = 64),
+    source_message_key TEXT NOT NULL CHECK (length(source_message_key) = 64),
+    automation_id TEXT NOT NULL CHECK (automation_id <> ''),
+    automation_version INTEGER NOT NULL CHECK (automation_version > 0),
+    extraction_schema_version INTEGER NOT NULL CHECK (extraction_schema_version > 0),
+    state TEXT NOT NULL CHECK (state IN (
+        'detected', 'extracting', 'ambiguous', 'manual_review', 'proposing',
+        'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
+        'completed', 'failed', 'unresolved', 'source_unavailable', 'reconciling'
+    )),
+    state_version INTEGER NOT NULL CHECK (state_version >= 1),
+    failure_code TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (
+        provider, account_id, source_message_key, automation_id, automation_version
+    ),
+    CHECK (state <> 'detected' OR failure_code IS NULL),
+    CHECK (
+        state <> 'source_unavailable'
+        OR failure_code = 'source_unavailable'
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_automation_runs_recovery
+    ON automation_runs(state, updated_at);
+CREATE TABLE IF NOT EXISTS automation_events (
+    event_id TEXT PRIMARY KEY CHECK (length(event_id) = 36),
+    run_id TEXT NOT NULL CHECK (run_id <> ''),
+    sequence_no INTEGER NOT NULL CHECK (sequence_no >= 0),
+    previous_state TEXT CHECK (previous_state IS NULL OR previous_state IN (
+        'detected', 'extracting', 'ambiguous', 'manual_review', 'proposing',
+        'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
+        'completed', 'failed', 'unresolved', 'source_unavailable', 'reconciling'
+    )),
+    next_state TEXT NOT NULL CHECK (next_state IN (
+        'detected', 'extracting', 'ambiguous', 'manual_review', 'proposing',
+        'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
+        'completed', 'failed', 'unresolved', 'source_unavailable', 'reconciling'
+    )),
+    state_version INTEGER NOT NULL CHECK (state_version >= 1),
+    automation_id TEXT NOT NULL CHECK (automation_id <> ''),
+    automation_version INTEGER NOT NULL CHECK (automation_version > 0),
+    extraction_schema_version INTEGER NOT NULL CHECK (extraction_schema_version > 0),
+    calendar_principal_key TEXT NOT NULL CHECK (length(calendar_principal_key) = 64),
+    transition_kind TEXT NOT NULL CHECK (transition_kind IN (
+        'detected', 'extracting', 'ambiguous', 'manual_review', 'proposing',
+        'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
+        'completed', 'failed', 'unresolved', 'source_unavailable', 'reconciling'
+    )),
+    failure_code TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, sequence_no),
+    UNIQUE (run_id, state_version),
+    CHECK (
+        (next_state = 'detected' AND previous_state IS NULL
+            AND sequence_no = 0 AND state_version = 1
+            AND transition_kind = 'detected' AND failure_code IS NULL)
+        OR (next_state <> 'detected' AND previous_state IS NOT NULL
+            AND sequence_no >= 1 AND state_version = sequence_no + 1)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_automation_events_run
+    ON automation_events(run_id, sequence_no);
+CREATE TRIGGER IF NOT EXISTS automation_events_no_update
+BEFORE UPDATE ON automation_events
+BEGIN
+    SELECT RAISE(ABORT, 'automation_events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS automation_events_no_delete
+BEFORE DELETE ON automation_events
+WHEN EXISTS (SELECT 1 FROM automation_runs WHERE run_id = OLD.run_id)
+BEGIN
+    SELECT RAISE(ABORT, 'automation_events are immutable');
+END;
+"""
+
 
 @dataclass(frozen=True)
 class AnalysisRequest:
@@ -268,6 +365,223 @@ class CalendarEventProjection:
 class CalendarEventMutation:
     event_id: str
     event: CalendarEventProjection | None
+
+
+@dataclass(frozen=True)
+class AutomationRun:
+    run_id: str
+    provider: str
+    account_id: str
+    calendar_principal_key: str
+    source_message_key: str
+    automation_id: str
+    automation_version: int
+    extraction_schema_version: int
+    state: str
+    state_version: int
+    failure_code: str | None
+    expires_at: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AutomationEvent:
+    event_id: str
+    run_id: str
+    sequence_no: int
+    previous_state: str | None
+    next_state: str
+    state_version: int
+    automation_id: str
+    automation_version: int
+    extraction_schema_version: int
+    calendar_principal_key: str
+    transition_kind: str
+    failure_code: str | None
+    created_at: str
+
+
+def _automation_run(row: sqlite3.Row) -> AutomationRun:
+    return AutomationRun(**dict(row))
+
+
+def _automation_event(row: sqlite3.Row) -> AutomationEvent:
+    return AutomationEvent(**dict(row))
+
+
+def _append_automation_event(
+    db: sqlite3.Connection,
+    *,
+    run_id: str,
+    sequence_no: int,
+    previous_state: str | None,
+    next_state: str,
+    state_version: int,
+    automation_id: str,
+    automation_version: int,
+    extraction_schema_version: int,
+    calendar_principal_key: str,
+    transition_kind: str,
+    failure_code: str | None,
+    created_at: str,
+) -> None:
+    db.execute(
+        """INSERT INTO automation_events(
+            event_id, run_id, sequence_no, previous_state, next_state, state_version,
+            automation_id, automation_version, extraction_schema_version,
+            calendar_principal_key, transition_kind, failure_code, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(uuid.uuid4()),
+            run_id,
+            sequence_no,
+            previous_state,
+            next_state,
+            state_version,
+            automation_id,
+            automation_version,
+            extraction_schema_version,
+            calendar_principal_key,
+            transition_kind,
+            failure_code,
+            created_at,
+        ),
+    )
+
+
+def _admit_scheduling_automation(
+    db: sqlite3.Connection,
+    *,
+    provider: str,
+    account_id: str,
+    calendar_principal_key: str,
+    provider_message_id: str,
+    created_at: str,
+    expires_at: str,
+) -> None:
+    source_message_key = _message_suppression_key(provider, account_id, provider_message_id)
+    run_id = str(uuid.uuid4())
+    inserted = db.execute(
+        """INSERT INTO automation_runs(
+            run_id, provider, account_id, calendar_principal_key, source_message_key,
+            automation_id, automation_version, extraction_schema_version,
+            state, state_version, failure_code, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'detected', 1, NULL, ?, ?, ?)
+        ON CONFLICT(
+            provider, account_id, source_message_key, automation_id, automation_version
+        ) DO NOTHING""",
+        (
+            run_id,
+            provider,
+            account_id,
+            calendar_principal_key,
+            source_message_key,
+            SCHEDULING_AUTOMATION_ID,
+            SCHEDULING_AUTOMATION_VERSION,
+            SCHEDULING_EXTRACTION_SCHEMA_VERSION,
+            expires_at,
+            created_at,
+            created_at,
+        ),
+    )
+    if inserted.rowcount != 1:
+        return
+    _append_automation_event(
+        db,
+        run_id=run_id,
+        sequence_no=0,
+        previous_state=None,
+        next_state="detected",
+        state_version=1,
+        automation_id=SCHEDULING_AUTOMATION_ID,
+        automation_version=SCHEDULING_AUTOMATION_VERSION,
+        extraction_schema_version=SCHEDULING_EXTRACTION_SCHEMA_VERSION,
+        calendar_principal_key=calendar_principal_key,
+        transition_kind="detected",
+        failure_code=None,
+        created_at=created_at,
+    )
+
+
+def _mark_automation_sources_unavailable(
+    db: sqlite3.Connection,
+    message_ids: Sequence[str],
+    *,
+    updated_at: str,
+) -> None:
+    if not message_ids:
+        return
+    for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
+        chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        runs = db.execute(
+            f"""SELECT r.run_id, r.automation_id, r.automation_version,
+                r.extraction_schema_version, r.calendar_principal_key
+            FROM automation_runs AS r
+            JOIN messages AS m
+              ON m.provider = r.provider
+             AND m.account_id = r.account_id
+             AND message_source_key(
+                    m.provider, m.account_id, m.provider_message_id
+                 ) = r.source_message_key
+            WHERE r.state = 'detected' AND r.state_version = 1
+              AND m.message_id IN ({placeholders})
+            ORDER BY r.run_id""",
+            tuple(chunk),
+        ).fetchall()
+        for row in runs:
+            run_id = str(row["run_id"])
+            changed = db.execute(
+                """UPDATE automation_runs SET
+                    state = 'source_unavailable', state_version = 2,
+                    failure_code = 'source_unavailable', updated_at = ?
+                WHERE run_id = ? AND state = 'detected' AND state_version = 1""",
+                (updated_at, run_id),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation source cleanup lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=1,
+                previous_state="detected",
+                next_state="source_unavailable",
+                state_version=2,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind="source_unavailable",
+                failure_code="source_unavailable",
+                created_at=updated_at,
+            )
+
+
+def _purge_expired_automation_tombstones(
+    db: sqlite3.Connection,
+    *,
+    now: str,
+) -> None:
+    rows = db.execute(
+        """SELECT run_id FROM automation_runs
+        WHERE state = 'source_unavailable' AND expires_at <= ?
+        ORDER BY run_id""",
+        (now,),
+    ).fetchall()
+    run_ids = [str(row["run_id"]) for row in rows]
+    for offset in range(0, len(run_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
+        chunk = run_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+        placeholders = ", ".join("?" for _ in chunk)
+        db.execute(
+            f"""DELETE FROM automation_runs
+            WHERE state = 'source_unavailable' AND run_id IN ({placeholders})""",
+            tuple(chunk),
+        )
+        db.execute(
+            f"DELETE FROM automation_events WHERE run_id IN ({placeholders})",
+            tuple(chunk),
+        )
 
 
 @dataclass(frozen=True)
@@ -897,12 +1211,19 @@ class Store:
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA recursive_triggers = ON")
         connection.row_factory = sqlite3.Row
         connection.create_function("casefold", 1, _sqlite_casefold, deterministic=True)
         connection.create_function(
             "aware_iso_epoch",
             1,
             _sqlite_aware_iso_epoch,
+            deterministic=True,
+        )
+        connection.create_function(
+            "message_source_key",
+            3,
+            _message_suppression_key,
             deterministic=True,
         )
         try:
@@ -1092,6 +1413,7 @@ class Store:
                     last_error TEXT
                 );
                 """
+                + _AUTOMATION_TABLES_SQL
             )
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
@@ -1706,7 +2028,13 @@ class Store:
                     _suppression_expiry(str(row["received_at"]), stamp),
                 ),
             )
+            _mark_automation_sources_unavailable(
+                db,
+                [message_id],
+                updated_at=stamp.isoformat(),
+            )
             cursor = db.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
+            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
         return cursor.rowcount == 1
 
     def clear_messages(self, *, now: datetime | None = None) -> int:
@@ -1714,7 +2042,7 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                """SELECT provider, account_id, provider_message_id, received_at
+                """SELECT message_id, provider, account_id, provider_message_id, received_at
                 FROM messages"""
             ).fetchall()
             db.executemany(
@@ -1737,7 +2065,13 @@ class Store:
                     for row in rows
                 ],
             )
+            _mark_automation_sources_unavailable(
+                db,
+                [str(row["message_id"]) for row in rows],
+                updated_at=stamp.isoformat(),
+            )
             cursor = db.execute("DELETE FROM messages")
+            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
         return cursor.rowcount
 
     def replace_attachments(
@@ -2282,6 +2616,38 @@ class Store:
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
 
+    def automation_run_for_message(self, message_id: str) -> AutomationRun | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT r.* FROM automation_runs AS r
+                JOIN messages AS m
+                  ON m.provider = r.provider
+                 AND m.account_id = r.account_id
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key
+                WHERE m.message_id = ?""",
+                (message_id,),
+            ).fetchone()
+        return _automation_run(row) if row is not None else None
+
+    def automation_run(self, run_id: str) -> AutomationRun | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return _automation_run(row) if row is not None else None
+
+    def automation_events(self, run_id: str) -> list[AutomationEvent]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM automation_events
+                WHERE run_id = ? ORDER BY sequence_no""",
+                (run_id,),
+            ).fetchall()
+        return [_automation_event(row) for row in rows]
+
     def reserve_analysis_request(
         self,
         message_id: str,
@@ -2425,18 +2791,43 @@ class Store:
                 (message_id,),
             )
 
-    def mark_analyzed(self, message_id: str, result: dict[str, object]) -> None:
+    def mark_analyzed(
+        self,
+        message_id: str,
+        result: dict[str, object],
+        *,
+        scheduling_automation_principal_key: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        if scheduling_automation_principal_key is not None and (
+            not isinstance(scheduling_automation_principal_key, str)
+            or len(scheduling_automation_principal_key) != 64
+        ):
+            raise ValueError("scheduling automation principal key must be a 64-character string")
+        admitted_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = admitted_at.isoformat()
         with self.connection() as db:
-            db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            source = db.execute(
+                """SELECT status, provider, account_id, provider_message_id, discovered_at
+                FROM messages WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(message_id)
+            if source["status"] != "pending":
+                raise RuntimeError("Analysis can only complete for a pending message")
+            updated = db.execute(
                 """UPDATE messages SET status='analyzed', analysis_at=?, attempts=0,
                 next_retry_at=NULL, last_error=NULL, analysis_request_id=NULL,
                 analysis_context_at=NULL, analysis_body_char_limit=NULL,
                 analysis_retryable=NULL, analysis_error_code=NULL,
                 analysis_retry_after_seconds=NULL,
                 category=?, priority=?, summary=?, action_required=?, suggested_action=?,
-                deadline_text=?, deadline_iso=?, confidence=? WHERE message_id=?""",
+                deadline_text=?, deadline_iso=?, confidence=?
+                WHERE message_id=? AND status='pending'""",
                 (
-                    datetime.now(UTC).isoformat(),
+                    stamp,
                     result["category"],
                     result["priority"],
                     result["summary"],
@@ -2448,6 +2839,21 @@ class Store:
                     message_id,
                 ),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError("Analysis completion lost its expected-state race")
+            if (
+                scheduling_automation_principal_key is not None
+                and result["category"] == "scheduling"
+            ):
+                _admit_scheduling_automation(
+                    db,
+                    provider=str(source["provider"]),
+                    account_id=str(source["account_id"]),
+                    calendar_principal_key=scheduling_automation_principal_key,
+                    provider_message_id=str(source["provider_message_id"]),
+                    created_at=stamp,
+                    expires_at=_automation_expiry(str(source["discovered_at"]), admitted_at),
+                )
 
     def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
         with self.connection() as db:
@@ -2735,11 +3141,7 @@ class Store:
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
         cutoff_epoch = (cutoff - epoch).total_seconds()
-        with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            cursor = db.execute(
-                """DELETE FROM messages
-                WHERE aware_iso_epoch(received_at) IS NULL
+        expiry_predicate = """aware_iso_epoch(received_at) IS NULL
                    OR (
                        aware_iso_epoch(received_at) > ?
                        AND (
@@ -2751,14 +3153,32 @@ class Store:
                    OR (
                        aware_iso_epoch(received_at) <= ?
                        AND aware_iso_epoch(received_at) < ?
-                   )""",
-                (
-                    stamp_epoch,
-                    cutoff_epoch,
-                    stamp_epoch,
-                    stamp_epoch,
-                    cutoff_epoch,
-                ),
+                   )"""
+        expiry_parameters = (
+            stamp_epoch,
+            cutoff_epoch,
+            stamp_epoch,
+            stamp_epoch,
+            cutoff_epoch,
+        )
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            expired = db.execute(
+                f"SELECT message_id FROM messages WHERE {expiry_predicate}",
+                expiry_parameters,
+            ).fetchall()
+            _mark_automation_sources_unavailable(
+                db,
+                [str(row["message_id"]) for row in expired],
+                updated_at=stamp.isoformat(),
+            )
+            cursor = db.execute(
+                f"DELETE FROM messages WHERE {expiry_predicate}",
+                expiry_parameters,
+            )
+            _purge_expired_automation_tombstones(
+                db,
+                now=stamp.isoformat(),
             )
             db.execute(
                 """DELETE FROM suppressed_messages
