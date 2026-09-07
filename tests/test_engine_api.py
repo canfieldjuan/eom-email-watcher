@@ -1283,6 +1283,23 @@ def test_calendar_read_status_cannot_race_a_calendar_mutation(
     assert response["error"]["code"] == "runtime_error"
     assert "Another mailbox operation is already running" in response["error"]["message"]
 
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: False)
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: SimpleNamespace(principal=principal),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: principal,
+    )
+
+    fallback = engine_api._response(request(config_path, "calendar.read.status", payload))
+
+    assert fallback["data"]["state"] == "ready"
+    assert fallback["data"]["available"] is True
+
 
 def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
     tmp_path: Path,
