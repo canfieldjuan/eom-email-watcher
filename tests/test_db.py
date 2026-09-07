@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from eom_email_watcher import db as db_module
 from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import (
     MAX_CONNECT_REQUEST_BYTES,
@@ -130,8 +131,8 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
     with store.connection() as db, pytest.raises(sqlite3.IntegrityError):
         db.execute(
             """INSERT INTO automation_runs
-                SELECT '11111111-1111-4111-8111-111111111111', message_id,
-                    provider, account_id, source_message_key, automation_id,
+                SELECT '11111111-1111-4111-8111-111111111111', provider,
+                    account_id, source_message_key, automation_id,
                     automation_version, extraction_schema_version, state,
                     state_version, failure_code, created_at, updated_at
                 FROM automation_runs WHERE run_id = ?""",
@@ -174,27 +175,35 @@ def test_scheduling_admission_rolls_back_analysis_when_event_append_fails(
         assert db.execute("SELECT COUNT(*) FROM automation_events").fetchone()[0] == 0
 
 
-def test_automation_events_are_immutable_and_source_delete_is_atomic(tmp_path: Path) -> None:
+def test_automation_events_are_immutable_and_source_delete_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
+    raw_gmail_id = "raw-provider-message-id"
     assert store.add_message(
-        message_id="m1",
+        message_id=raw_gmail_id,
         provider="gmail",
         account_id="gmail-default",
-        provider_message_id="raw-provider-message-id",
+        provider_message_id=raw_gmail_id,
         thread_id=None,
         sender="trusted@example.com",
         sender_name=None,
         subject="Meeting",
         received_at="2026-09-07T12:00:00+00:00",
     )
+    monkeypatch.setattr(db_module, "SCHEDULING_AUTOMATION_VERSION", 7)
+    monkeypatch.setattr(db_module, "SCHEDULING_EXTRACTION_SCHEMA_VERSION", 3)
     store.mark_analyzed(
-        "m1",
+        raw_gmail_id,
         scheduling_analysis(),
         admit_scheduling_automation=True,
     )
-    detected = store.automation_run_for_message("m1")
+    detected = store.automation_run_for_message(raw_gmail_id)
     assert detected is not None
+    monkeypatch.setattr(db_module, "SCHEDULING_AUTOMATION_VERSION", 8)
+    monkeypatch.setattr(db_module, "SCHEDULING_EXTRACTION_SCHEMA_VERSION", 4)
 
     with store.connection() as db:
         with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
@@ -207,18 +216,19 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(tmp_path: P
             db.execute("DELETE FROM automation_events")
 
     removed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
-    assert store.delete_message("m1", now=removed_at)
+    assert store.delete_message(raw_gmail_id, now=removed_at)
     tombstone = store.automation_run(detected.run_id)
     assert tombstone is not None
-    assert (tombstone.message_id, tombstone.state, tombstone.state_version) == (
-        None,
-        "source_unavailable",
-        2,
-    )
+    assert (tombstone.state, tombstone.state_version) == ("source_unavailable", 2)
     assert tombstone.failure_code == "source_unavailable"
-    assert [event.next_state for event in store.automation_events(detected.run_id)] == [
+    events = store.automation_events(detected.run_id)
+    assert [event.next_state for event in events] == [
         "detected",
         "source_unavailable",
+    ]
+    assert [(event.automation_version, event.extraction_schema_version) for event in events] == [
+        (7, 3),
+        (7, 3),
     ]
     with store.connection() as db:
         durable_automation = " ".join(
@@ -230,7 +240,10 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(tmp_path: P
             for row in db.execute("SELECT * FROM automation_events").fetchall()
             for value in row
         )
-    assert "raw-provider-message-id" not in durable_automation
+    assert raw_gmail_id not in durable_automation
+    assert store.purge(30, now=datetime(2026, 10, 8, 13, tzinfo=UTC)) == 0
+    assert store.automation_run(detected.run_id) is None
+    assert store.automation_events(detected.run_id) == []
 
 
 def test_non_scheduling_or_unentitled_analysis_creates_no_automation_run(
@@ -264,43 +277,46 @@ def test_non_scheduling_or_unentitled_analysis_creates_no_automation_run(
 @pytest.mark.parametrize("cleanup", ["clear", "purge"])
 def test_bulk_cleanup_makes_detected_automation_source_unavailable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     cleanup: str,
 ) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
-    assert store.add_message(
-        message_id="m1",
-        thread_id=None,
-        sender="trusted@example.com",
-        sender_name=None,
-        subject="Meeting",
-        received_at="2026-01-01T12:00:00+00:00",
-    )
-    store.mark_analyzed(
-        "m1",
-        scheduling_analysis(),
-        admit_scheduling_automation=True,
-    )
-    detected = store.automation_run_for_message("m1")
-    assert detected is not None
+    run_ids: list[str] = []
+    for sequence in range(3):
+        message_id = f"m{sequence}"
+        assert store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="trusted@example.com",
+            sender_name=None,
+            subject="Meeting",
+            received_at="2026-01-01T12:00:00+00:00",
+        )
+        store.mark_analyzed(
+            message_id,
+            scheduling_analysis(),
+            admit_scheduling_automation=True,
+        )
+        detected = store.automation_run_for_message(message_id)
+        assert detected is not None
+        run_ids.append(detected.run_id)
+    monkeypatch.setattr(db_module, "AUTOMATION_CLEANUP_CHUNK_SIZE", 1)
 
     cleanup_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
     if cleanup == "clear":
-        assert store.clear_messages(now=cleanup_at) == 1
+        assert store.clear_messages(now=cleanup_at) == 3
     else:
-        assert store.purge(30, now=cleanup_at) == 1
+        assert store.purge(30, now=cleanup_at) == 3
 
-    tombstone = store.automation_run(detected.run_id)
-    assert tombstone is not None
-    assert (tombstone.message_id, tombstone.state, tombstone.state_version) == (
-        None,
-        "source_unavailable",
-        2,
-    )
-    assert [event.transition_kind for event in store.automation_events(detected.run_id)] == [
-        "detected",
-        "source_unavailable",
-    ]
+    for run_id in run_ids:
+        tombstone = store.automation_run(run_id)
+        assert tombstone is not None
+        assert (tombstone.state, tombstone.state_version) == ("source_unavailable", 2)
+        assert [event.transition_kind for event in store.automation_events(run_id)] == [
+            "detected",
+            "source_unavailable",
+        ]
 
 
 def test_mailbox_state_identity_and_suppression_are_account_scoped(
