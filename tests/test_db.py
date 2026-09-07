@@ -33,13 +33,14 @@ def admitted_scheduling_run(
     provider_message_id: str = "provider-scheduling",
 ):
     account_id = f"microsoft365-{'a' * 32}"
-    store.register_mail_account(
-        "microsoft365",
-        account_id,
-        display_name="Microsoft 365",
-        address="owner@example.com",
-        active=True,
-    )
+    if store.mail_account("microsoft365", account_id) is None:
+        store.register_mail_account(
+            "microsoft365",
+            account_id,
+            display_name="Microsoft 365",
+            address="owner@example.com",
+            active=True,
+        )
     assert store.add_message(
         message_id=message_id,
         provider="microsoft365",
@@ -75,8 +76,17 @@ def scheduling_analysis() -> dict[str, object]:
     }
 
 
-def proposing_scheduling_run(store: Store):
-    detected = admitted_scheduling_run(store)
+def proposing_scheduling_run(
+    store: Store,
+    *,
+    message_id: str = "local-scheduling",
+    provider_message_id: str = "provider-scheduling",
+):
+    detected = admitted_scheduling_run(
+        store,
+        message_id=message_id,
+        provider_message_id=provider_message_id,
+    )
     payload = store.reserve_automation_extraction(
         detected.run_id,
         detected.state_version,
@@ -112,6 +122,31 @@ def proposing_scheduling_run(store: Store):
         accepted_state="proposing",
     )
     return proposing, payload
+
+
+def test_proposable_automation_runs_page_after_stable_cursor(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing_scheduling_run(
+        store,
+        message_id="local-scheduling-1",
+        provider_message_id="provider-scheduling-1",
+    )
+    proposing_scheduling_run(
+        store,
+        message_id="local-scheduling-2",
+        provider_message_id="provider-scheduling-2",
+    )
+
+    ordered = store.proposable_automation_runs(2)
+    assert len(ordered) == 2
+    first = ordered[0].run
+
+    remaining = store.proposable_automation_runs(
+        2,
+        after=(first.created_at, first.run_id),
+    )
+    assert [item.run.run_id for item in remaining] == [ordered[1].run.run_id]
 
 
 def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
@@ -638,6 +673,7 @@ def test_calendar_proposal_is_durable_and_atomically_awaits_confirmation(
         "state_version": awaiting.state_version,
         "proposal_version": 1,
         "proposal_sha256": proposal.proposal_sha256,
+        "status": "accepted",
         "provider": "microsoft365",
         "account_id": f"microsoft365-{'a' * 32}",
         "account_display_name": "Microsoft 365",
@@ -648,6 +684,7 @@ def test_calendar_proposal_is_durable_and_atomically_awaits_confirmation(
         "end": "2026-09-08T10:30:00-05:00",
         "timezone": "America/Chicago",
         "suggestion_reason": "All attendees are available.",
+        "empty_reason": None,
         "observed_at": "2026-09-07T13:00:00+00:00",
         "expires_at": "2026-09-07T13:15:00+00:00",
     }
@@ -688,6 +725,13 @@ def test_no_calendar_suggestion_becomes_durable_review_outcome(tmp_path: Path) -
     assert proposal is not None
     assert proposal.status == "no_suggestions"
     assert proposal.empty_reason == "No times satisfy every attendee."
+    preview = store.recent(1)[0]["calendar_proposal"]
+    assert preview is not None
+    assert preview["state"] == "manual_review"
+    assert preview["status"] == "no_suggestions"
+    assert preview["empty_reason"] == "No times satisfy every attendee."
+    assert preview["start"] is None
+    assert preview["expires_at"] is None
     assert any(
         intent.kind == "automation_review" and intent.subject_id == proposing.run_id
         for intent in store.notification_intents()

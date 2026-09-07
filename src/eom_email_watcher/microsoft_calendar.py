@@ -665,7 +665,7 @@ async def _find_meeting_time(
                     raise MicrosoftAuthorizationRejected(
                         "Microsoft rejected the calendar proposal authorization"
                     )
-                if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code in {408, 429} or response.status_code >= 500:
                     raise Microsoft365Error(
                         "Microsoft Graph calendar proposal is temporarily unavailable; retry"
                     )

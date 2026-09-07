@@ -555,101 +555,123 @@ def process_scheduling_proposals(
     selected_now = now or _utc_now()
     if selected_now.tzinfo is None:
         raise ValueError("Calendar proposal processing time must be timezone-aware")
-    observed_at = selected_now.astimezone(UTC)
+    fixed_now = selected_now.astimezone(UTC) if now is not None else None
+
+    def current_time() -> datetime:
+        return fixed_now or _utc_now().astimezone(UTC)
+
     processed = 0
     review_required = 0
     attempted: set[str] = set()
-    for work in store.proposable_automation_runs(limit):
-        if work.run.run_id in exclude_run_ids:
-            continue
-        access = _scheduling_proposal_authorization(
-            config,
-            store,
-            provider=work.run.provider,
-            account_id=work.run.account_id,
-            expected_principal_key=work.run.calendar_principal_key,
-        )
-        if access is None:
-            continue
-        attempted.add(work.run.run_id)
-        try:
-            extraction = _proposal_extraction(work)
-            attendees = tuple(item.email for item in extraction.attendees)
-            candidates = _proposal_candidates(extraction, observed_at=observed_at)
-            request_sha256 = _proposal_request_sha256(attendees, candidates)
-            result = find_meeting_time(access.authorization, attendees, candidates)
-        except MicrosoftAuthorizationRejected as exc:
-            logger.info(
-                "Scheduling run %s proposal authorization rejected: %s",
-                work.run.run_id,
-                exc,
-            )
-            store.revoke_calendar_grant_if_current(access.grant)
-            continue
-        except MicrosoftCalendarProposalRejected as exc:
-            logger.warning(
-                "Scheduling run %s proposal rejected: %s",
-                work.run.run_id,
-                exc,
-            )
-            if _transition_proposal_to_review(store, work, observed_at=observed_at):
-                processed += 1
-                review_required += 1
-            continue
-        except Microsoft365Error as exc:
-            logger.warning(
-                "Scheduling run %s proposal unavailable: %s",
-                work.run.run_id,
-                exc,
-            )
-            continue
-        except ValueError as exc:
-            logger.warning(
-                "Scheduling run %s proposal input invalid: %s",
-                work.run.run_id,
-                exc,
-            )
-            if _transition_proposal_to_review(store, work, observed_at=observed_at):
-                processed += 1
-                review_required += 1
-            continue
-
-        proposal = result.proposal
-        try:
-            store.record_automation_proposal(
-                work.run.run_id,
-                work.run.state_version,
-                extraction_payload_id=work.extraction_payload.payload_id,
-                request_sha256=request_sha256,
-                subject=_proposal_subject(work.subject),
-                attendees=attendees,
-                start=proposal.start if proposal is not None else None,
-                end=proposal.end if proposal is not None else None,
-                timezone=proposal.timezone if proposal is not None else None,
-                suggestion_reason=(
-                    proposal.suggestion_reason if proposal is not None else None
-                ),
-                empty_reason=result.empty_reason,
-                observed_at=observed_at,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "Scheduling run %s proposal could not be persisted safely: %s",
-                work.run.run_id,
-                exc,
-            )
-            if _transition_proposal_to_review(store, work, observed_at=observed_at):
-                processed += 1
-                review_required += 1
-            continue
-        except RuntimeError:
-            latest = store.automation_run(work.run.run_id)
-            if latest is None or latest.state_version != work.run.state_version:
+    capacity_used = 0
+    cursor: tuple[str, str] | None = None
+    while capacity_used < limit:
+        page = store.proposable_automation_runs(limit, after=cursor)
+        if not page:
+            break
+        for work in page:
+            cursor = (work.run.created_at, work.run.run_id)
+            if work.run.run_id in exclude_run_ids:
                 continue
-            raise
-        processed += 1
-        if proposal is None:
-            review_required += 1
+            if capacity_used >= limit:
+                break
+            access = _scheduling_proposal_authorization(
+                config,
+                store,
+                provider=work.run.provider,
+                account_id=work.run.account_id,
+                expected_principal_key=work.run.calendar_principal_key,
+            )
+            if access is None:
+                continue
+            capacity_used += 1
+            attempted.add(work.run.run_id)
+            attempt_time = current_time()
+            try:
+                extraction = _proposal_extraction(work)
+                attendees = tuple(item.email for item in extraction.attendees)
+                candidates = _proposal_candidates(extraction, observed_at=attempt_time)
+                request_sha256 = _proposal_request_sha256(attendees, candidates)
+                result = find_meeting_time(access.authorization, attendees, candidates)
+            except MicrosoftAuthorizationRejected as exc:
+                logger.info(
+                    "Scheduling run %s proposal authorization rejected: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                store.revoke_calendar_grant_if_current(access.grant)
+                continue
+            except MicrosoftCalendarProposalRejected as exc:
+                logger.warning(
+                    "Scheduling run %s proposal rejected: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=current_time()
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+            except Microsoft365Error as exc:
+                logger.warning(
+                    "Scheduling run %s proposal unavailable: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                continue
+            except ValueError as exc:
+                logger.warning(
+                    "Scheduling run %s proposal input invalid: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=current_time()
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+
+            proposal = result.proposal
+            result_time = current_time()
+            try:
+                store.record_automation_proposal(
+                    work.run.run_id,
+                    work.run.state_version,
+                    extraction_payload_id=work.extraction_payload.payload_id,
+                    request_sha256=request_sha256,
+                    subject=_proposal_subject(work.subject),
+                    attendees=attendees,
+                    start=proposal.start if proposal is not None else None,
+                    end=proposal.end if proposal is not None else None,
+                    timezone=proposal.timezone if proposal is not None else None,
+                    suggestion_reason=(
+                        proposal.suggestion_reason if proposal is not None else None
+                    ),
+                    empty_reason=result.empty_reason,
+                    observed_at=result_time,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Scheduling run %s proposal could not be persisted safely: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=result_time
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+            except RuntimeError:
+                latest = store.automation_run(work.run.run_id)
+                if latest is None or latest.state_version != work.run.state_version:
+                    continue
+                raise
+            processed += 1
+            if proposal is None:
+                review_required += 1
     return AutomationProcessing(
         processed,
         review_required,

@@ -2982,12 +2982,23 @@ class Store:
             ).fetchall()
         return [_automation_extraction_payload(row) for row in rows]
 
-    def proposable_automation_runs(self, limit: int = 25) -> list[AutomationProposalWork]:
+    def proposable_automation_runs(
+        self,
+        limit: int = 25,
+        *,
+        after: tuple[str, str] | None = None,
+    ) -> list[AutomationProposalWork]:
         if limit < 1:
             raise ValueError("limit must be positive")
+        page = ""
+        parameters: list[object] = []
+        if after is not None:
+            page = " AND (r.created_at > ? OR (r.created_at = ? AND r.run_id > ?))"
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit)
         with self.connection() as db:
             rows = db.execute(
-                """SELECT r.*, m.message_id AS work_message_id,
+                f"""SELECT r.*, m.message_id AS work_message_id,
                     m.subject AS work_subject, a.address AS organizer_address,
                     p.payload_id AS extraction_payload_id,
                     p.run_id AS extraction_run_id, p.attempt_no, p.request_id,
@@ -3012,9 +3023,10 @@ class Store:
                   ON proposed.run_id = r.run_id
                 WHERE r.state = 'proposing' AND p.status = 'accepted'
                   AND a.address IS NOT NULL AND proposed.run_id IS NULL
+                  {page}
                 ORDER BY r.created_at, r.run_id
                 LIMIT ?""",
-                (limit,),
+                parameters,
             ).fetchall()
         run_fields = AutomationRun.__dataclass_fields__
         return [
@@ -4326,7 +4338,7 @@ class Store:
             message_ids,
         ).fetchall()
         proposal_rows = db.execute(
-            f"""SELECT p.*, r.state_version, r.provider, r.account_id,
+            f"""SELECT p.*, r.state AS run_state, r.state_version, r.provider, r.account_id,
                 a.display_name AS account_display_name,
                 a.address AS account_address, m.message_id
             FROM automation_proposal_payloads AS p
@@ -4340,7 +4352,10 @@ class Store:
             JOIN mail_accounts AS a
               ON a.provider = r.provider AND a.account_id = r.account_id
             WHERE m.message_id IN ({placeholders})
-              AND r.state = 'awaiting_confirmation' AND p.status = 'accepted'""",
+              AND (
+                  (r.state = 'awaiting_confirmation' AND p.status = 'accepted')
+                  OR (r.state = 'manual_review' AND p.status = 'no_suggestions')
+              )""",
             message_ids,
         ).fetchall()
         attachments_by_message: dict[str, list[dict[str, object]]] = {
@@ -4407,10 +4422,11 @@ class Store:
             )
             proposal_by_message[str(row["message_id"])] = {
                 "run_id": proposal.run_id,
-                "state": "awaiting_confirmation",
+                "state": str(row["run_state"]),
                 "state_version": int(row["state_version"]),
                 "proposal_version": proposal.proposal_version,
                 "proposal_sha256": proposal.proposal_sha256,
+                "status": proposal.status,
                 "provider": str(row["provider"]),
                 "account_id": str(row["account_id"]),
                 "account_display_name": str(row["account_display_name"]),
@@ -4425,6 +4441,7 @@ class Store:
                 "end": proposal.end,
                 "timezone": proposal.timezone,
                 "suggestion_reason": proposal.suggestion_reason,
+                "empty_reason": proposal.empty_reason,
                 "observed_at": proposal.observed_at,
                 "expires_at": proposal.expires_at,
             }

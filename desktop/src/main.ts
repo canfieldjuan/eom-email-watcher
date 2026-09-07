@@ -151,22 +151,24 @@ interface InboxItem {
 
 interface CalendarProposalPreview {
   run_id: string;
-  state: "awaiting_confirmation";
+  state: "awaiting_confirmation" | "manual_review";
   state_version: number;
   proposal_version: number;
   proposal_sha256: string;
+  status: "accepted" | "no_suggestions";
   provider: string;
   account_id: string;
   account_display_name: string;
   account_address: string | null;
   subject: string;
   attendees: string[];
-  start: string;
-  end: string;
-  timezone: string;
-  suggestion_reason: string;
+  start: string | null;
+  end: string | null;
+  timezone: string | null;
+  suggestion_reason: string | null;
+  empty_reason: string | null;
   observed_at: string;
-  expires_at: string;
+  expires_at: string | null;
 }
 
 interface InboxQuery {
@@ -1200,24 +1202,33 @@ function renderInbox(items: InboxItem[]): void {
       const title = document.createElement("strong");
       title.textContent = "Calendar proposal";
       const state = document.createElement("span");
-      const expired = Date.parse(proposal.expires_at) <= Date.now();
-      state.textContent = expired ? "Expired" : "Not confirmed";
+      const hasSuggestion = proposal.status === "accepted";
+      const expired = Boolean(
+        hasSuggestion && proposal.expires_at && Date.parse(proposal.expires_at) <= Date.now(),
+      );
+      state.textContent = !hasSuggestion ? "Needs review" : expired ? "Expired" : "Not confirmed";
       state.dataset.expired = String(expired);
       heading.append(title, state);
       const timing = document.createElement("p");
-      try {
-        const formatter = new Intl.DateTimeFormat(undefined, {
-          weekday: "short",
-          month: "short",
-          day: "numeric",
-          hour: "numeric",
-          minute: "2-digit",
-          timeZone: proposal.timezone,
-          timeZoneName: "short",
-        });
-        timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))}`;
-      } catch {
-        timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
+      if (!hasSuggestion) {
+        timing.textContent = proposal.empty_reason || "No meeting time satisfied the request.";
+      } else if (proposal.start && proposal.end && proposal.timezone) {
+        try {
+          const formatter = new Intl.DateTimeFormat(undefined, {
+            weekday: "short",
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+            timeZone: proposal.timezone,
+            timeZoneName: "short",
+          });
+          timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone})`;
+        } catch {
+          timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
+        }
+      } else {
+        timing.textContent = "The calendar proposal is incomplete and needs review.";
       }
       const attendees = document.createElement("p");
       attendees.textContent = proposal.attendees.length

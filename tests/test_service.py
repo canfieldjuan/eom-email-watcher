@@ -432,12 +432,17 @@ def proposing_automation_run(
     cfg: Config,
     store: Store,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_message_id: str = "schedule-1",
+    principal_key: str = "a" * 64,
 ):
     account_id, admitted = admit_scheduling_run(
         store,
+        provider_message_id=provider_message_id,
         received_at="2026-09-07T12:00:00+00:00",
+        principal_key=principal_key,
     )
-    allow_automation_processing(monkeypatch, AutomationGateway())
+    allow_automation_processing(monkeypatch, AnyAutomationGateway())
     result = process_scheduling_automations(
         cfg,
         store,
@@ -784,6 +789,119 @@ def test_scheduling_proposal_without_common_time_becomes_reviewable(
         "manual_review",
         "proposal_no_suggestions",
     )
+    assert (result.processed, result.review_required) == (1, 1)
+
+
+@pytest.mark.parametrize("blocked_mode", ["unauthorized", "excluded"])
+def test_scheduling_proposal_pages_past_unattempted_oldest_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_mode: str
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, blocked = proposing_automation_run(
+        cfg,
+        store,
+        monkeypatch,
+        provider_message_id="schedule-blocked",
+        principal_key="b" * 64,
+    )
+    _account_id, eligible = proposing_automation_run(
+        cfg,
+        store,
+        monkeypatch,
+        provider_message_id="schedule-eligible",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET created_at = ? WHERE run_id = ?",
+            ("2026-09-07T12:00:00+00:00", blocked.run_id),
+        )
+        db.execute(
+            "UPDATE automation_runs SET created_at = ? WHERE run_id = ?",
+            ("2026-09-07T12:01:00+00:00", eligible.run_id),
+        )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: (
+            None
+            if blocked_mode == "unauthorized"
+            and kwargs["expected_principal_key"] == "b" * 64
+            else ProposalAuthorization()
+        ),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        ),
+    )
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        exclude_run_ids=(
+            frozenset({blocked.run_id}) if blocked_mode == "excluded" else frozenset()
+        ),
+        limit=1,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert result.attempted_run_ids == frozenset({eligible.run_id})
+    blocked_after = store.automation_run(blocked.run_id)
+    eligible_after = store.automation_run(eligible.run_id)
+    assert blocked_after is not None and blocked_after.state == "proposing"
+    assert eligible_after is not None and eligible_after.state == "awaiting_confirmation"
+
+
+def test_scheduling_proposal_rechecks_time_after_graph_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    clock = iter(
+        (
+            datetime(2026, 9, 8, 14, 59, tzinfo=UTC),
+            datetime(2026, 9, 8, 14, 59, 30, tzinfo=UTC),
+            datetime(2026, 9, 8, 15, 0, 1, tzinfo=UTC),
+        )
+    )
+    monkeypatch.setattr(service_module, "_utc_now", lambda: next(clock))
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        ),
+    )
+
+    result = process_scheduling_proposals(cfg, store)
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == ("manual_review", "proposal_invalid")
+    assert store.automation_proposal(proposing.run_id) is None
     assert (result.processed, result.review_required) == (1, 1)
 
 

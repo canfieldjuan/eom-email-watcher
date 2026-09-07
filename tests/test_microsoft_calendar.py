@@ -701,7 +701,7 @@ def test_find_meeting_time_fails_closed_on_unproven_suggestions(
         )
 
 
-@pytest.mark.parametrize("status", [400, 401, 429, 503])
+@pytest.mark.parametrize("status", [400, 401, 408, 429, 503])
 def test_find_meeting_time_classifies_status_before_parsing(status: int) -> None:
     authorization = MicrosoftCalendarProposalAuthorization(
         principal(),

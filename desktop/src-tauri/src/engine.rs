@@ -483,18 +483,20 @@ pub struct CalendarProposalPreview {
     pub state_version: i64,
     pub proposal_version: i64,
     pub proposal_sha256: String,
+    pub status: String,
     pub provider: String,
     pub account_id: String,
     pub account_display_name: String,
     pub account_address: Option<String>,
     pub subject: String,
     pub attendees: Vec<String>,
-    pub start: String,
-    pub end: String,
-    pub timezone: String,
-    pub suggestion_reason: String,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub timezone: Option<String>,
+    pub suggestion_reason: Option<String>,
+    pub empty_reason: Option<String>,
     pub observed_at: String,
-    pub expires_at: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -1569,6 +1571,7 @@ mod tests {
                 "state_version": 4,
                 "proposal_version": 1,
                 "proposal_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "status": "accepted",
                 "provider": "microsoft365",
                 "account_id": "microsoft365-account",
                 "account_display_name": "Microsoft 365",
@@ -1579,6 +1582,7 @@ mod tests {
                 "end": "2026-09-08T10:30:00-05:00",
                 "timezone": "America/Chicago",
                 "suggestion_reason": "All attendees are available.",
+                "empty_reason": null,
                 "observed_at": "2026-09-07T13:00:00+00:00",
                 "expires_at": "2026-09-07T13:15:00+00:00"
             }
@@ -1587,11 +1591,45 @@ mod tests {
 
         let proposal = item.calendar_proposal.expect("calendar proposal");
         assert_eq!(proposal.state, "awaiting_confirmation");
+        assert_eq!(proposal.status, "accepted");
         assert_eq!(proposal.attendees, vec!["jane@example.com"]);
+        assert_eq!(proposal.timezone.as_deref(), Some("America/Chicago"));
         assert_eq!(
             proposal.account_address.as_deref(),
             Some("owner@example.com")
         );
+    }
+
+    #[test]
+    fn inbox_calendar_no_suggestions_contract_is_typed() {
+        let proposal: CalendarProposalPreview = serde_json::from_str(
+            r#"{
+            "run_id": "run-1",
+            "state": "manual_review",
+            "state_version": 5,
+            "proposal_version": 1,
+            "proposal_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "no_suggestions",
+            "provider": "microsoft365",
+            "account_id": "microsoft365-account",
+            "account_display_name": "Microsoft 365",
+            "account_address": "owner@example.com",
+            "subject": "Meeting request",
+            "attendees": ["jane@example.com"],
+            "start": null,
+            "end": null,
+            "timezone": null,
+            "suggestion_reason": null,
+            "empty_reason": "No common time.",
+            "observed_at": "2026-09-07T13:00:00+00:00",
+            "expires_at": null
+        }"#,
+        )
+        .expect("no-suggestions review must cross the typed desktop boundary");
+
+        assert_eq!(proposal.state, "manual_review");
+        assert_eq!(proposal.empty_reason.as_deref(), Some("No common time."));
+        assert_eq!(proposal.start, None);
     }
 
     #[test]
