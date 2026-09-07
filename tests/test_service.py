@@ -111,6 +111,21 @@ class FakeModel:
         )
 
 
+class SchedulingModel(FakeModel):
+    def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
+        return Analysis(
+            category="scheduling",
+            priority="normal",
+            summary="The sender requested a meeting.",
+            action_required=True,
+            suggested_action="Review the meeting request.",
+            deadline_text=None,
+            deadline_iso=None,
+            confidence=0.9,
+        )
+
+
 class AttachmentGmail(FakeGmail):
     def full_payload(self, message_id: str):
         self.full_payload_calls += 1
@@ -216,6 +231,34 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+@pytest.mark.parametrize("entitled", [False, True])
+def test_watcher_admits_scheduling_run_only_with_automation_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entitled: bool,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100")
+    monkeypatch.setattr(
+        service_module,
+        "_automations_entitlement_active",
+        lambda: entitled,
+    )
+
+    result = Watcher(cfg, store, FreshGmail(), SchedulingModel()).check()
+
+    assert result["summarized"] == 1
+    run = store.automation_run_for_message("allowed")
+    assert (run is not None) is entitled
+    if run is not None:
+        assert (run.state, run.state_version) == ("detected", 1)
+        assert [event.transition_kind for event in store.automation_events(run.run_id)] == [
+            "detected"
+        ]
 
 
 def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:

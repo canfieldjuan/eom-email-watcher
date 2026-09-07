@@ -10,6 +10,9 @@ import pytest
 from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import (
     MAX_CONNECT_REQUEST_BYTES,
+    SCHEDULING_AUTOMATION_ID,
+    SCHEDULING_AUTOMATION_VERSION,
+    SCHEDULING_EXTRACTION_SCHEMA_VERSION,
     SCHEMA_VERSION,
     CalendarEventMutation,
     CalendarEventProjection,
@@ -17,6 +20,19 @@ from eom_email_watcher.db import (
 )
 from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
+
+
+def scheduling_analysis() -> dict[str, object]:
+    return {
+        "category": "scheduling",
+        "priority": "normal",
+        "summary": "A meeting was requested.",
+        "action_required": True,
+        "suggested_action": "Review the requested meeting.",
+        "deadline_text": None,
+        "deadline_iso": None,
+        "confidence": 0.9,
+    }
 
 
 def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
@@ -58,6 +74,233 @@ def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
     assert recent["attachments"] == []
     assert "deadline_text" in recent
     assert recent["notified_at"] is not None
+
+
+def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="local-1",
+        provider="microsoft365",
+        account_id="account-1",
+        provider_message_id="provider-message-1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Can we meet?",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+
+    committed_at = datetime(2026, 9, 7, 12, 1, tzinfo=UTC)
+    store.mark_analyzed(
+        "local-1",
+        scheduling_analysis(),
+        admit_scheduling_automation=True,
+        now=committed_at,
+    )
+
+    run = store.automation_run_for_message("local-1")
+    assert run is not None
+    assert (
+        run.source_message_key
+        == hashlib.sha256(b"microsoft365\0account-1\0provider-message-1").hexdigest()
+    )
+    assert (run.automation_id, run.automation_version, run.extraction_schema_version) == (
+        SCHEDULING_AUTOMATION_ID,
+        SCHEDULING_AUTOMATION_VERSION,
+        SCHEDULING_EXTRACTION_SCHEMA_VERSION,
+    )
+    assert (run.state, run.state_version, run.created_at, run.updated_at) == (
+        "detected",
+        1,
+        committed_at.isoformat(),
+        committed_at.isoformat(),
+    )
+    events = store.automation_events(run.run_id)
+    assert [
+        (
+            event.sequence_no,
+            event.previous_state,
+            event.next_state,
+            event.state_version,
+            event.transition_kind,
+        )
+        for event in events
+    ] == [(0, None, "detected", 1, "detected")]
+    with store.connection() as db, pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """INSERT INTO automation_runs
+                SELECT '11111111-1111-4111-8111-111111111111', message_id,
+                    provider, account_id, source_message_key, automation_id,
+                    automation_version, extraction_schema_version, state,
+                    state_version, failure_code, created_at, updated_at
+                FROM automation_runs WHERE run_id = ?""",
+            (run.run_id,),
+        )
+
+
+def test_scheduling_admission_rolls_back_analysis_when_event_append_fails(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            """CREATE TRIGGER reject_detected_event
+            BEFORE INSERT ON automation_events
+            BEGIN
+                SELECT RAISE(ABORT, 'injected event failure');
+            END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected event failure"):
+        store.mark_analyzed(
+            "m1",
+            scheduling_analysis(),
+            admit_scheduling_automation=True,
+        )
+
+    assert [message.message_id for message in store.pending()] == ["m1"]
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM automation_events").fetchone()[0] == 0
+
+
+def test_automation_events_are_immutable_and_source_delete_is_atomic(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="m1",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="raw-provider-message-id",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    store.mark_analyzed(
+        "m1",
+        scheduling_analysis(),
+        admit_scheduling_automation=True,
+    )
+    detected = store.automation_run_for_message("m1")
+    assert detected is not None
+
+    with store.connection() as db:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            db.execute(
+                "UPDATE automation_runs SET state = 'invented' WHERE run_id = ?", (detected.run_id,)
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("UPDATE automation_events SET transition_kind = 'source_unavailable'")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute("DELETE FROM automation_events")
+
+    removed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    assert store.delete_message("m1", now=removed_at)
+    tombstone = store.automation_run(detected.run_id)
+    assert tombstone is not None
+    assert (tombstone.message_id, tombstone.state, tombstone.state_version) == (
+        None,
+        "source_unavailable",
+        2,
+    )
+    assert tombstone.failure_code == "source_unavailable"
+    assert [event.next_state for event in store.automation_events(detected.run_id)] == [
+        "detected",
+        "source_unavailable",
+    ]
+    with store.connection() as db:
+        durable_automation = " ".join(
+            str(value)
+            for row in db.execute("SELECT * FROM automation_runs").fetchall()
+            for value in row
+        ) + " ".join(
+            str(value)
+            for row in db.execute("SELECT * FROM automation_events").fetchall()
+            for value in row
+        )
+    assert "raw-provider-message-id" not in durable_automation
+
+
+def test_non_scheduling_or_unentitled_analysis_creates_no_automation_run(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    for message_id in ("unentitled", "informational"):
+        assert store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="trusted@example.com",
+            sender_name=None,
+            subject=message_id,
+            received_at="2026-09-07T12:00:00+00:00",
+        )
+    store.mark_analyzed("unentitled", scheduling_analysis())
+    informational = scheduling_analysis()
+    informational["category"] = "informational"
+    store.mark_analyzed(
+        "informational",
+        informational,
+        admit_scheduling_automation=True,
+    )
+
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM automation_events").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("cleanup", ["clear", "purge"])
+def test_bulk_cleanup_makes_detected_automation_source_unavailable(
+    tmp_path: Path,
+    cleanup: str,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-01-01T12:00:00+00:00",
+    )
+    store.mark_analyzed(
+        "m1",
+        scheduling_analysis(),
+        admit_scheduling_automation=True,
+    )
+    detected = store.automation_run_for_message("m1")
+    assert detected is not None
+
+    cleanup_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    if cleanup == "clear":
+        assert store.clear_messages(now=cleanup_at) == 1
+    else:
+        assert store.purge(30, now=cleanup_at) == 1
+
+    tombstone = store.automation_run(detected.run_id)
+    assert tombstone is not None
+    assert (tombstone.message_id, tombstone.state, tombstone.state_version) == (
+        None,
+        "source_unavailable",
+        2,
+    )
+    assert [event.transition_kind for event in store.automation_events(detected.run_id)] == [
+        "detected",
+        "source_unavailable",
+    ]
 
 
 def test_mailbox_state_identity_and_suppression_are_account_scoped(
@@ -1033,6 +1276,11 @@ def test_initialize_migrates_current_schema_without_losing_messages(
         connect_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connect_attachment_jobs'"
         ).fetchone()
+        automation_tables = db.execute(
+            """SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN ('automation_runs', 'automation_events')
+            ORDER BY name"""
+        ).fetchall()
         suppression_table = db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='suppressed_messages'"
         ).fetchone()
@@ -1051,6 +1299,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(
     assert state == [("gmail", "gmail-default", "legacy-cursor")]
     assert attachment_table == (1,)
     assert connect_table == (1,)
+    assert automation_tables == [("automation_events",), ("automation_runs",)]
     assert suppression_table == (1,)
     assert account == ("gmail", "gmail-default", "Gmail", None, 1)
     migrated = Store(database)

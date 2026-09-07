@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from .config import Config
 from .db import AnalyzedMessage, NotificationIntent, PendingMessage, Store
+from .entitlement import AUTOMATIONS_FEATURE_ID, feature_entitlement_decision
 from .mailbox import (
     MailboxGateway,
     MailboxMessageInvalid,
@@ -19,6 +20,10 @@ from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
+
+
+def _automations_entitlement_active() -> bool:
+    return feature_entitlement_decision(AUTOMATIONS_FEATURE_ID).is_active
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
@@ -323,7 +328,11 @@ class Watcher:
                     request_id=request_id,
                 )
                 if not dry_run:
-                    self.store.mark_analyzed(message.message_id, analysis.model_dump())
+                    self.store.mark_analyzed(
+                        message.message_id,
+                        analysis.model_dump(),
+                        admit_scheduling_automation=_automations_entitlement_active(),
+                    )
                 summarized += 1
                 if deliver_notifications:
                     fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
