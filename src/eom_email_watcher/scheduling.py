@@ -356,6 +356,10 @@ def _date_has_source_support(
     if "day after tomorrow" in text:
         return local.date().toordinal() == context_date.toordinal() + 2
     weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    for weekday_index, weekday in enumerate(weekdays):
+        if re.search(rf"\bnext\s+{weekday}\b", text):
+            days_ahead = (weekday_index - context_date.weekday()) % 7 or 7
+            return local.date().toordinal() == context_date.toordinal() + days_ahead
     if weekdays[local.weekday()] in text:
         days_ahead = (local.weekday() - context_date.weekday()) % 7
         return local.date().toordinal() == context_date.toordinal() + days_ahead
@@ -404,22 +408,38 @@ def _range_has_source_support(
     zone: ZoneInfo,
     source: SchedulingSource,
 ) -> bool:
-    if not all(
-        _date_has_source_support(
-            value,
-            evidence_text,
-            zone=zone,
-            context_at=source.context_at,
-        )
-        for value in (start, end)
-    ):
-        return False
+    option_delimiters = tuple(
+        re.finditer(r"(?:\bor\b|;|\n)", evidence_text, re.IGNORECASE)
+    )
     for start_match in _time_source_matches(start, evidence_text, zone=zone):
         for end_match in _time_source_matches(end, evidence_text, zone=zone):
             if end_match.start() < start_match.end():
                 continue
             separator = evidence_text[start_match.end() : end_match.start()]
-            if re.fullmatch(r"\s*(?:-|–|—|to|until|through)\s*", separator, re.IGNORECASE):
+            if not re.fullmatch(
+                r"\s*(?:-|–|—|to|until|through)\s*",
+                separator,
+                re.IGNORECASE,
+            ):
+                continue
+            option_start = max(
+                (match.end() for match in option_delimiters if match.end() <= start_match.start()),
+                default=0,
+            )
+            option_end = min(
+                (match.start() for match in option_delimiters if match.start() >= end_match.end()),
+                default=len(evidence_text),
+            )
+            option_text = evidence_text[option_start:option_end]
+            if all(
+                _date_has_source_support(
+                    value,
+                    option_text,
+                    zone=zone,
+                    context_at=source.context_at,
+                )
+                for value in (start, end)
+            ):
                 return True
     return False
 
@@ -457,8 +477,11 @@ _ZONE_LABELS: dict[str, tuple[str, timedelta | None]] = {
 }
 
 
-def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[timedelta]]:
+def _explicit_timezones(
+    evidence_text: str,
+) -> tuple[frozenset[str], frozenset[timedelta], bool]:
     names: set[str] = set()
+    unsupported_label = False
     for match in re.findall(r"\b[A-Za-z_+-]+(?:/[A-Za-z0-9_+-]+)+\b", evidence_text):
         try:
             ZoneInfo(match)
@@ -473,8 +496,16 @@ def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[t
             re.IGNORECASE,
         )
     }
+    for phrase in re.findall(
+        r"\b(?:eastern|central|mountain|pacific)(?:\s+[A-Za-z]+){0,3}\s+time\b",
+        evidence_text,
+        re.IGNORECASE,
+    ):
+        if " ".join(phrase.casefold().split()) not in _ZONE_LABELS:
+            unsupported_label = True
     for label, (name, offset) in _ZONE_LABELS.items():
-        if re.search(rf"\b{re.escape(label)}\b", evidence_text, re.IGNORECASE):
+        suffix = r"(?!\s+[A-Za-z])" if " " not in label else r"\b"
+        if re.search(rf"\b{re.escape(label)}{suffix}", evidence_text, re.IGNORECASE):
             names.add(name.casefold())
             if offset is not None:
                 offsets.add(offset)
@@ -484,7 +515,7 @@ def _explicit_timezones(evidence_text: str) -> tuple[frozenset[str], frozenset[t
     ):
         offset = timedelta(hours=int(hours), minutes=int(minutes))
         offsets.add(offset if sign == "+" else -offset)
-    return frozenset(names), frozenset(offsets)
+    return frozenset(names), frozenset(offsets), unsupported_label
 
 
 def _timezone_has_source_support(
@@ -495,7 +526,9 @@ def _timezone_has_source_support(
     start: datetime,
     end: datetime,
 ) -> bool:
-    names, offsets = _explicit_timezones(evidence_text)
+    names, offsets, unsupported_label = _explicit_timezones(evidence_text)
+    if unsupported_label:
+        return False
     if not names and not offsets:
         return timezone == source.configured_timezone
     return (not names or timezone.casefold() in names) and (

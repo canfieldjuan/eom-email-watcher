@@ -207,14 +207,15 @@ def _email_prompt(
     )
 
 
-def _utf8_safe(value: str) -> str:
-    return value.encode("utf-8", errors="replace").decode("utf-8")
+def bounded_gateway_text(value: str, max_chars: int) -> str:
+    """Return stable UTF-8 text within one gateway field's character limit."""
+    return value[:max_chars].encode("utf-8", errors="replace").decode("utf-8")
 
 
 def bounded_gateway_attachment_names(attachment_names: tuple[str, ...]) -> tuple[str, ...]:
     """Return stable attachment metadata within the inference gateway contract."""
     return tuple(
-        _utf8_safe(name[:MAX_GATEWAY_ATTACHMENT_NAME_CHARS])
+        bounded_gateway_text(name, MAX_GATEWAY_ATTACHMENT_NAME_CHARS)
         for name in attachment_names[:MAX_GATEWAY_ATTACHMENT_COUNT]
     )
 
@@ -607,10 +608,10 @@ class GatewayModel:
             request_id=request_id,
             system_prompt=SYSTEM_PROMPT,
             user_prompt=_email_prompt(
-                sender=_utf8_safe(sender[:MAX_GATEWAY_SENDER_CHARS]),
-                subject=_utf8_safe(subject[:MAX_GATEWAY_SUBJECT_CHARS]),
+                sender=bounded_gateway_text(sender, MAX_GATEWAY_SENDER_CHARS),
+                subject=bounded_gateway_text(subject, MAX_GATEWAY_SUBJECT_CHARS),
                 received_at=received_at,
-                body=_utf8_safe(body[:MAX_GATEWAY_BODY_CHARS]),
+                body=bounded_gateway_text(body, MAX_GATEWAY_BODY_CHARS),
                 attachment_names=bounded_gateway_attachment_names(attachment_names),
                 current_local_time=current_local_time,
             ),

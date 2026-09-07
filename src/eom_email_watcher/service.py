@@ -39,11 +39,15 @@ from .microsoft365 import (
 )
 from .microsoft_calendar import MicrosoftCalendarProposalAuthorization
 from .model import (
+    MAX_GATEWAY_BODY_CHARS,
+    MAX_GATEWAY_SENDER_CHARS,
+    MAX_GATEWAY_SUBJECT_CHARS,
     Analysis,
     GatewayModelError,
     ModelError,
     ModelRuntime,
     bounded_gateway_attachment_names,
+    bounded_gateway_text,
 )
 from .notifications import NotificationError, send_analysis, send_fallback, send_review
 from .runtime import (
@@ -293,10 +297,10 @@ def process_scheduling_automations(
 
             capacity_used += 1
             source = SchedulingSource(
-                sender=work.sender,
-                subject=work.subject,
+                sender=bounded_gateway_text(work.sender, MAX_GATEWAY_SENDER_CHARS),
+                subject=bounded_gateway_text(work.subject, MAX_GATEWAY_SUBJECT_CHARS),
                 received_at=work.received_at,
-                body=content.body,
+                body=bounded_gateway_text(content.body, MAX_GATEWAY_BODY_CHARS),
                 attachment_names=bounded_gateway_attachment_names(content.attachment_names),
                 organizer_address=organizer_address,
                 configured_timezone=timezone,

@@ -182,6 +182,11 @@ class MetadataHeavyAutomationProvider(AutomationGateway):
         return MessageContent(self.body[:body_char_limit], names, ())
 
 
+class MalformedUnicodeAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        return MessageContent(f"{self.body}\ud800"[:body_char_limit], (), ())
+
+
 class ExtractionModel(FakeModel):
     def __init__(self, outputs: list[str | Exception]):
         super().__init__()
@@ -1096,6 +1101,27 @@ def test_scheduling_source_bounds_attachment_metadata_before_reservation(
         len(name) <= MAX_GATEWAY_ATTACHMENT_NAME_CHARS
         for name in bounded_source.attachment_names
     )
+    assert current is not None
+    assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
+
+
+def test_scheduling_source_sanitizes_unicode_before_hash_and_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MalformedUnicodeAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    bounded_source = model.extraction_sources[0]
+    assert result.processed == 1
+    assert "\ud800" not in bounded_source.body
+    assert bounded_source.body.encode("utf-8").endswith(b"?")
     assert current is not None
     assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
 
