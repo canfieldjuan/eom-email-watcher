@@ -978,11 +978,27 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
         "from_token",
         lambda *args: AuthorizedCalendar(),
     )
+    grant_states: list[str] = []
+    set_calendar_grant = engine_api.Store.set_calendar_grant
+
+    def record_calendar_grant(
+        store: engine_api.Store,
+        account_id: str,
+        profile: str,
+        state: str,
+        **identity,
+    ):
+        if account_id == account.account_id:
+            grant_states.append(state)
+        return set_calendar_grant(store, account_id, profile, state, **identity)
+
+    monkeypatch.setattr(engine_api.Store, "set_calendar_grant", record_calendar_grant)
     payload = {"provider": account.provider, "account_id": account.account_id}
 
     response = engine_api._response(request(config_path, "calendar.read.connect", payload))
 
     assert response["ok"] is True
+    assert grant_states == ["consent_pending", "ready"]
     assert response["data"] == {
         "account_id": account.account_id,
         "available": True,
@@ -1283,6 +1299,7 @@ def test_calendar_read_status_cannot_race_a_calendar_mutation(
     )
     payload = {"provider": account.provider, "account_id": account.account_id}
     lock_path = engine_api._production_check_lock_path(runtime.config)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: False)
 
     with engine_api.operation_lock(lock_path, "test lock"):
         response = engine_api._response(request(config_path, "calendar.read.status", payload))
@@ -1290,7 +1307,7 @@ def test_calendar_read_status_cannot_race_a_calendar_mutation(
     assert response["error"]["code"] == "runtime_error"
     assert "Another mailbox operation is already running" in response["error"]["message"]
 
-    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: False)
+    monkeypatch.setattr(engine_api, "operation_lock_uses_soft_fallback", lambda path: True)
     monkeypatch.setattr(
         engine_api.MicrosoftCalendarReadAuthorization,
         "from_token",
@@ -1306,6 +1323,64 @@ def test_calendar_read_status_cannot_race_a_calendar_mutation(
 
     assert fallback["data"]["state"] == "ready"
     assert fallback["data"]["available"] is True
+
+
+def test_calendar_read_connect_restores_grant_if_entitlement_expires_during_consent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'a' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    principal = microsoft_principal()
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    entitlement = iter((True, False))
+    monkeypatch.setattr(
+        engine_api,
+        "_calendar_entitlement_active",
+        lambda: next(entitlement),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: principal,
+    )
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("new-calendar-cache", encoding="utf-8")
+        return SimpleNamespace(principal=principal), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "_install_private_token",
+        lambda *args: pytest.fail("Expired consent installed a calendar token"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.connect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["error"]["code"] == "calendar_entitlement_required"
+    assert runtime.store.calendar_grant(account.account_id).state == "not_requested"
+    assert not microsoft_calendar_read_token_file(runtime.config, account).exists()
 
 
 def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(

@@ -9,8 +9,20 @@ from filelock import FileLock, SoftFileLock
 from filelock import Timeout as FileLockTimeout
 
 
-def operation_lock_supported(lock_path: Path) -> bool:
+def operation_lock_uses_soft_fallback(lock_path: Path) -> bool:
+    """Detect only a selected soft backend without probing the filesystem."""
     if FileLock is SoftFileLock:
+        return True
+    try:
+        lock = FileLock(lock_path, timeout=0, mode=0o600)
+    except (OSError, TypeError):
+        # Constructor failures must not create an unlocked read path.
+        return False
+    return isinstance(lock, SoftFileLock)
+
+
+def operation_lock_supported(lock_path: Path) -> bool:
+    if operation_lock_uses_soft_fallback(lock_path):
         return False
 
     probe_parent = lock_path.parent
