@@ -20,6 +20,7 @@ from eom_email_watcher.mailbox import (
     MessageContent,
     scoped_message_id,
 )
+from eom_email_watcher.microsoft365 import MICROSOFT365_PROVIDER
 from eom_email_watcher.mime import extract_body
 from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
 from eom_email_watcher.notifications import NotificationError
@@ -233,27 +234,62 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert watcher.check()["discovered"] == 0
 
 
-@pytest.mark.parametrize("entitled", [False, True])
-def test_watcher_admits_scheduling_run_only_with_automation_entitlement(
+@pytest.mark.parametrize(
+    ("provider", "features_active", "grant_state", "expected"),
+    [
+        (MICROSOFT365_PROVIDER, False, "ready", False),
+        (MICROSOFT365_PROVIDER, True, None, False),
+        (MICROSOFT365_PROVIDER, True, "consent_pending", False),
+        (MICROSOFT365_PROVIDER, True, "ready", True),
+        ("gmail", True, "ready", False),
+    ],
+)
+def test_watcher_requires_full_scheduling_automation_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    entitled: bool,
+    provider: str,
+    features_active: bool,
+    grant_state: str | None,
+    expected: bool,
 ) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    store.set_state("100")
+    account_id = "account-2" if provider == MICROSOFT365_PROVIDER else "gmail-default"
+    store.set_state("100", provider=provider, account_id=account_id)
+    if grant_state is not None:
+        identity = {
+            "principal_key": "a" * 64,
+            "home_account_id": "home-account",
+            "tenant_id": "tenant",
+            "object_id": "object",
+            "email_address": "user@example.com",
+        }
+        store.set_calendar_grant(account_id, "proposal", grant_state, **identity)
+    entitlement_checks: list[tuple[str, ...]] = []
+
+    def check_features(*feature_ids: str) -> bool:
+        entitlement_checks.append(feature_ids)
+        return features_active
+
     monkeypatch.setattr(
         service_module,
-        "_automations_entitlement_active",
-        lambda: entitled,
+        "feature_entitlements_active",
+        check_features,
     )
 
-    result = Watcher(cfg, store, FreshGmail(), SchedulingModel()).check()
+    session = MailboxSession(provider, account_id, FreshGmail())
+    result = Watcher(cfg, store, session, SchedulingModel()).check()
 
     assert result["summarized"] == 1
-    run = store.automation_run_for_message("allowed")
-    assert (run is not None) is entitled
+    message_id = scoped_message_id(provider, account_id, "allowed")
+    run = store.automation_run_for_message(message_id)
+    assert (run is not None) is expected
+    assert entitlement_checks == (
+        [(service_module.CONNECT_FEATURE_ID, service_module.AUTOMATIONS_FEATURE_ID)]
+        if provider == MICROSOFT365_PROVIDER
+        else []
+    )
     if run is not None:
         assert (run.state, run.state_version) == ("detected", 1)
         assert [event.transition_kind for event in store.automation_events(run.run_id)] == [

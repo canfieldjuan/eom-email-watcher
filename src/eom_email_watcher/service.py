@@ -5,7 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 from .config import Config
 from .db import AnalyzedMessage, NotificationIntent, PendingMessage, Store
-from .entitlement import AUTOMATIONS_FEATURE_ID, feature_entitlement_decision
+from .entitlement import (
+    AUTOMATIONS_FEATURE_ID,
+    CONNECT_FEATURE_ID,
+    feature_entitlements_active,
+)
 from .mailbox import (
     MailboxGateway,
     MailboxMessageInvalid,
@@ -16,14 +20,20 @@ from .mailbox import (
     mailbox_polling_session,
     scoped_message_id,
 )
+from .microsoft365 import MICROSOFT365_PROVIDER
 from .model import Analysis, GatewayModelError, ModelError, ModelRuntime
 from .notifications import NotificationError, send_analysis, send_fallback
 
 logger = logging.getLogger(__name__)
 
 
-def _automations_entitlement_active() -> bool:
-    return feature_entitlement_decision(AUTOMATIONS_FEATURE_ID).is_active
+def _scheduling_automation_admission_allowed(store: Store, message: PendingMessage) -> bool:
+    if message.provider != MICROSOFT365_PROVIDER:
+        return False
+    if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
+        return False
+    proposal_grant = store.calendar_grant(message.account_id, "proposal")
+    return proposal_grant is not None and proposal_grant.state == "ready"
 
 
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
@@ -331,7 +341,10 @@ class Watcher:
                     self.store.mark_analyzed(
                         message.message_id,
                         analysis.model_dump(),
-                        admit_scheduling_automation=_automations_entitlement_active(),
+                        admit_scheduling_automation=_scheduling_automation_admission_allowed(
+                            self.store,
+                            message,
+                        ),
                     )
                 summarized += 1
                 if deliver_notifications:

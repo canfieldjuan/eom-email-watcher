@@ -66,6 +66,17 @@ def _suppression_expiry(received_at: str, now: datetime) -> str:
     return (min(received, now) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
 
 
+def _automation_expiry(observed_at: str, admitted_at: datetime) -> str:
+    try:
+        observed = datetime.fromisoformat(observed_at)
+        if observed.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        observed = observed.astimezone(UTC)
+    except (OverflowError, ValueError):
+        observed = admitted_at
+    return (min(observed, admitted_at) + timedelta(days=MAX_RETENTION_DAYS)).isoformat()
+
+
 _CONNECT_JOBS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS connect_attachment_jobs (
     job_id TEXT PRIMARY KEY,
@@ -241,6 +252,7 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     )),
     state_version INTEGER NOT NULL CHECK (state_version >= 1),
     failure_code TEXT,
+    expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (
@@ -365,6 +377,7 @@ class AutomationRun:
     state: str
     state_version: int
     failure_code: str | None
+    expires_at: str
     created_at: str
     updated_at: str
 
@@ -438,6 +451,7 @@ def _admit_scheduling_automation(
     account_id: str,
     provider_message_id: str,
     created_at: str,
+    expires_at: str,
 ) -> None:
     source_message_key = _message_suppression_key(provider, account_id, provider_message_id)
     run_id = str(uuid.uuid4())
@@ -445,8 +459,8 @@ def _admit_scheduling_automation(
         """INSERT INTO automation_runs(
             run_id, provider, account_id, source_message_key,
             automation_id, automation_version, extraction_schema_version,
-            state, state_version, failure_code, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'detected', 1, NULL, ?, ?)
+            state, state_version, failure_code, expires_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'detected', 1, NULL, ?, ?, ?)
         ON CONFLICT(
             provider, account_id, source_message_key, automation_id, automation_version
         ) DO NOTHING""",
@@ -458,6 +472,7 @@ def _admit_scheduling_automation(
             SCHEDULING_AUTOMATION_ID,
             SCHEDULING_AUTOMATION_VERSION,
             SCHEDULING_EXTRACTION_SCHEMA_VERSION,
+            expires_at,
             created_at,
             created_at,
         ),
@@ -536,13 +551,13 @@ def _mark_automation_sources_unavailable(
 def _purge_expired_automation_tombstones(
     db: sqlite3.Connection,
     *,
-    cutoff: str,
+    now: str,
 ) -> None:
     rows = db.execute(
         """SELECT run_id FROM automation_runs
-        WHERE state = 'source_unavailable' AND updated_at <= ?
+        WHERE state = 'source_unavailable' AND expires_at <= ?
         ORDER BY run_id""",
-        (cutoff,),
+        (now,),
     ).fetchall()
     run_ids = [str(row["run_id"]) for row in rows]
     for offset in range(0, len(run_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
@@ -2773,11 +2788,12 @@ class Store:
     ) -> None:
         if not isinstance(admit_scheduling_automation, bool):
             raise ValueError("admit_scheduling_automation must be a boolean")
-        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        admitted_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = admitted_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             source = db.execute(
-                """SELECT status, provider, account_id, provider_message_id
+                """SELECT status, provider, account_id, provider_message_id, discovered_at
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -2816,6 +2832,7 @@ class Store:
                     account_id=str(source["account_id"]),
                     provider_message_id=str(source["provider_message_id"]),
                     created_at=stamp,
+                    expires_at=_automation_expiry(str(source["discovered_at"]), admitted_at),
                 )
 
     def mark_delivery_complete(self, message_id: str, notified: bool) -> None:
@@ -3141,7 +3158,7 @@ class Store:
             )
             _purge_expired_automation_tombstones(
                 db,
-                cutoff=cutoff.isoformat(),
+                now=stamp.isoformat(),
             )
             db.execute(
                 """DELETE FROM suppressed_messages

@@ -8,7 +8,7 @@ import json
 import os
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -194,6 +194,21 @@ class EntitlementGate:
     def status(self, feature_id: str = CONNECT_FEATURE_ID) -> EntitlementStatus:
         return EntitlementStatus.from_decision(self.decision(feature_id))
 
+    def features_active(self, feature_ids: Iterable[str]) -> bool:
+        requested_features = tuple(_validate_feature_id(value) for value in feature_ids)
+        if not requested_features:
+            raise ValueError("at least one entitlement feature is required")
+        if not self.keys or self.path is None:
+            return False
+        content = _read_private_entitlement(self.path)
+        if content is None:
+            return False
+        observed_at = self._current_time()
+        return all(
+            _evaluate_entitlement(content, self.keys, observed_at, feature).is_active
+            for feature in requested_features
+        )
+
     def install(self, source: Path) -> EntitlementStatus:
         if not self.keys:
             raise _install_error(AUTHORITY_UNAVAILABLE)
@@ -244,6 +259,10 @@ def connect_entitlement_status() -> EntitlementStatus:
 
 def feature_entitlement_decision(feature_id: str) -> EntitlementDecision:
     return EntitlementGate.from_installation().decision(feature_id)
+
+
+def feature_entitlements_active(*feature_ids: str) -> bool:
+    return EntitlementGate.from_installation().features_active(feature_ids)
 
 
 def feature_entitlement_status(feature_id: str) -> EntitlementStatus:

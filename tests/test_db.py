@@ -134,7 +134,7 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
                 SELECT '11111111-1111-4111-8111-111111111111', provider,
                     account_id, source_message_key, automation_id,
                     automation_version, extraction_schema_version, state,
-                    state_version, failure_code, created_at, updated_at
+                    state_version, failure_code, expires_at, created_at, updated_at
                 FROM automation_runs WHERE run_id = ?""",
             (run.run_id,),
         )
@@ -193,15 +193,23 @@ def test_automation_events_are_immutable_and_source_delete_is_atomic(
         subject="Meeting",
         received_at="2026-09-07T12:00:00+00:00",
     )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ? WHERE message_id = ?",
+            ("2026-09-07T12:00:00+00:00", raw_gmail_id),
+        )
+    monkeypatch.setattr(db_module, "MAX_RETENTION_DAYS", 30)
     monkeypatch.setattr(db_module, "SCHEDULING_AUTOMATION_VERSION", 7)
     monkeypatch.setattr(db_module, "SCHEDULING_EXTRACTION_SCHEMA_VERSION", 3)
     store.mark_analyzed(
         raw_gmail_id,
         scheduling_analysis(),
         admit_scheduling_automation=True,
+        now=datetime(2026, 9, 7, 12, 1, tzinfo=UTC),
     )
     detected = store.automation_run_for_message(raw_gmail_id)
     assert detected is not None
+    assert detected.expires_at == "2026-10-07T12:00:00+00:00"
     monkeypatch.setattr(db_module, "SCHEDULING_AUTOMATION_VERSION", 8)
     monkeypatch.setattr(db_module, "SCHEDULING_EXTRACTION_SCHEMA_VERSION", 4)
 
