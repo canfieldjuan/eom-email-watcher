@@ -510,7 +510,7 @@ def _calendar_graph_page_before_deadline(
                     raise Microsoft365Error(
                         f"Microsoft Graph calendar request failed (HTTP {response.status_code})"
                     )
-                outcome.put((document, None))
+            outcome.put((document, None))
         except BaseException as exc:
             outcome.put((None, exc))
 
