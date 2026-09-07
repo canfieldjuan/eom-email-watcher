@@ -512,6 +512,33 @@ def _finish_mail_authorization(
     }
 
 
+def _revoke_calendar_grants_for_replacement_principal(
+    runtime: Runtime,
+    account: MailAccount,
+    staged_mail_token: Path,
+) -> None:
+    ready_grants = tuple(
+        grant
+        for profile in CALENDAR_AUTHORIZATION_PROFILES
+        if (grant := runtime.store.calendar_grant(account.account_id, profile)) is not None
+        and grant.state == "ready"
+    )
+    if not ready_grants:
+        return
+    replacement = microsoft_mailbox_principal(
+        runtime.config.microsoft_credentials_file,
+        staged_mail_token,
+    )
+    for grant in ready_grants:
+        if grant.principal_key == replacement.key:
+            continue
+        if not runtime.store.revoke_calendar_grant_if_current(grant):
+            raise ApiError(
+                "calendar_state_changed",
+                "The calendar authorization changed during mailbox reconnection; retry",
+            )
+
+
 def _authorize_microsoft_account(
     runtime: Runtime,
     account: MailAccount | None,
@@ -554,6 +581,13 @@ def _authorize_microsoft_account(
             raise ApiError(
                 "account_identity_mismatch",
                 "The authorized mailbox does not match the selected email account",
+            )
+
+        if account is not None:
+            _revoke_calendar_grants_for_replacement_principal(
+                runtime,
+                account,
+                staged_token,
             )
 
         initialize_baseline = (

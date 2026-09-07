@@ -2411,6 +2411,109 @@ def test_mail_account_reconnect_rejects_different_microsoft_identity_before_cach
     assert list(tmp_path.glob(".microsoft365-authorization-*")) == []
 
 
+@pytest.mark.parametrize(
+    ("replacement_object_id", "expected_grant_state", "expected_read_error"),
+    [
+        ("object-1", "ready", "calendar_sync_required"),
+        ("replacement-object", "revoked", "calendar_authorization_required"),
+    ],
+)
+def test_mail_account_reconnect_binds_offline_calendar_reads_to_immutable_principal(
+    replacement_object_id: str,
+    expected_grant_state: str,
+    expected_read_error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'d' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.set_state(
+        "preserved cursor",
+        provider=account.provider,
+        account_id=account.account_id,
+    )
+    original = microsoft_principal()
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("preserved cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.write_text("calendar cache", encoding="utf-8")
+
+    class AuthorizedMicrosoft:
+        def profile(self) -> Microsoft365Profile:
+            return Microsoft365Profile("owner@example.com")
+
+        def initial_cursor(self) -> str:
+            pytest.fail("An existing mailbox must preserve its cursor")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        staged_token: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedMicrosoft, bool]:
+        staged_token.write_text("replacement cache", encoding="utf-8")
+        return AuthorizedMicrosoft(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.Microsoft365Gateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: microsoft_principal(object_id=replacement_object_id),
+    )
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["ok"] is True
+    assert mail_token.read_text(encoding="utf-8") == "replacement cache"
+    grant = runtime.store.calendar_grant(account.account_id)
+    assert grant is not None
+    assert grant.state == expected_grant_state
+
+    read = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.events",
+            {
+                "provider": account.provider,
+                "account_id": account.account_id,
+                "window_start": "2026-09-01T00:00:00Z",
+                "window_end": "2026-10-01T00:00:00Z",
+            },
+        )
+    )
+    assert read["error"]["code"] == expected_read_error
+
+
 def test_mail_account_connect_reuses_and_activates_known_disconnected_microsoft_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

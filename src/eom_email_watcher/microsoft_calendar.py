@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -422,6 +424,44 @@ def _bounded_graph_document(
     return document, len(content)
 
 
+def _bounded_graph_document_before_deadline(
+    response: httpx.Response,
+    deadline: float,
+    remaining_round_bytes: int,
+) -> tuple[dict[str, Any], int]:
+    """Read one streamed page without letting a fixed socket timeout overrun the round."""
+    outcome: queue.Queue[tuple[tuple[dict[str, Any], int] | None, BaseException | None]] = (
+        queue.Queue(maxsize=1)
+    )
+
+    def read_document() -> None:
+        try:
+            outcome.put(
+                (
+                    _bounded_graph_document(response, deadline, remaining_round_bytes),
+                    None,
+                )
+            )
+        except BaseException as exc:
+            outcome.put((None, exc))
+
+    reader = threading.Thread(
+        target=read_document,
+        name="microsoft-calendar-page-reader",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        document, error = outcome.get(timeout=_calendar_round_time_remaining(deadline))
+    except queue.Empty as exc:
+        raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit") from exc
+    _calendar_round_time_remaining(deadline)
+    if error is not None:
+        raise error
+    assert document is not None
+    return document
+
+
 def _calendar_error_code(document: dict[str, Any]) -> str:
     error = document.get("error")
     return str(error.get("code", "")).casefold() if isinstance(error, dict) else ""
@@ -594,7 +634,7 @@ def calendar_delta_round(
                             f"Microsoft Graph calendar is temporarily unavailable "
                             f"(HTTP {response.status_code}); retry"
                         )
-                    document, response_bytes = _bounded_graph_document(
+                    document, response_bytes = _bounded_graph_document_before_deadline(
                         response,
                         deadline,
                         MAX_CALENDAR_ROUND_BYTES - total_bytes,

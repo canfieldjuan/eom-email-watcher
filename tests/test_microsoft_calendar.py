@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -677,6 +679,35 @@ def test_calendar_page_stream_enforces_remaining_round_byte_limit() -> None:
             float("inf"),
             len(b'{"value":[]') - 1,
         )
+
+
+def test_calendar_page_stream_deadline_interrupts_wait_for_next_chunk() -> None:
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingResponse:
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def iter_bytes():
+            yield b'{"value":'
+            release.wait()
+            finished.set()
+            yield b"[]}"
+
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
+            microsoft_calendar._bounded_graph_document_before_deadline(  # type: ignore[arg-type]
+                BlockingResponse(),
+                started_at + 0.05,
+                microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+            )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started_at < 1.0
+    assert finished.wait(1.0)
 
 
 def test_calendar_delta_page_limit_accepts_64_and_rejects_page_65() -> None:
