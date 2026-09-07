@@ -284,6 +284,16 @@ def test_trailing_meridiem_cannot_change_only_the_range_end() -> None:
         validate(value, scheduling_source=scheduling_source)
     )
 
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T22:00:00-05:00",
+            "end": "2026-09-08T23:00:00-05:00",
+        }
+    )
+    corrected_codes = codes(validate(value, scheduling_source=scheduling_source))
+    assert "time_range_unsupported" not in corrected_codes
+    assert "time_value_unsupported" not in corrected_codes
+
 
 def test_range_endpoints_cannot_borrow_from_separate_alternatives() -> None:
     value = valid_result()
@@ -530,6 +540,29 @@ def test_timezone_must_come_from_the_matching_time_option() -> None:
     )
 
 
+def test_competing_timezones_in_one_option_fail_closed() -> None:
+    value = valid_result()
+    quote = (
+        "September 8 from 10:00 to 10:30 "
+        "America/Chicago (America/New_York)"
+    )
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": quote}
+    ]
+
+    assert "timezone_unsupported" in codes(
+        validate(value, scheduling_source=source(body=quote))
+    )
+
+    single_zone_quote = "September 8 from 10:00 to 10:30 America/Chicago"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": single_zone_quote}
+    ]
+    assert "timezone_unsupported" not in codes(
+        validate(value, scheduling_source=source(body=single_zone_quote))
+    )
+
+
 def test_unsupported_composite_zone_is_not_treated_as_us_central() -> None:
     value = valid_result()
     value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
@@ -560,7 +593,7 @@ def test_unsupported_explicit_zone_labels_fail_closed(zone_label: str) -> None:
     )
 
 
-@pytest.mark.parametrize("zone_label", ["JST", "BST", "CET"])
+@pytest.mark.parametrize("zone_label", ["JST", "BST", "CET", "(JST)"])
 def test_unsupported_explicit_zone_abbreviations_fail_closed(zone_label: str) -> None:
     value = valid_result()
     quote = f"September 8, 2026 from 10:00 to 10:30 {zone_label}"
@@ -570,6 +603,26 @@ def test_unsupported_explicit_zone_abbreviations_fail_closed(zone_label: str) ->
 
     assert "timezone_unsupported" in codes(
         validate(value, scheduling_source=source(body=quote))
+    )
+
+
+def test_conflicting_weekday_and_calendar_date_fail_closed() -> None:
+    value = valid_result()
+    conflicting = "Monday, September 8, 2026 from 10:00 to 10:30"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": conflicting}
+    ]
+
+    assert "time_date_unsupported" in codes(
+        validate(value, scheduling_source=source(body=conflicting))
+    )
+
+    consistent = "Tuesday, September 8, 2026 from 10:00 to 10:30"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": consistent}
+    ]
+    assert "time_date_unsupported" not in codes(
+        validate(value, scheduling_source=source(body=consistent))
     )
 
 
@@ -670,6 +723,33 @@ def test_source_backed_offset_selects_a_dst_fold() -> None:
     )
 
     assert "timezone_ambiguous" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
+def test_dst_fold_offset_must_share_the_matching_range_evidence() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-11-01T01:15:00-05:00",
+            "end": "2026-11-01T01:45:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "November 1, 2026 from 1:15 AM to 1:45 AM",
+                },
+                {"source": "body", "quote": "footer offset -05:00"},
+            ],
+        }
+    )
+    scheduling_source = source(
+        body=(
+            "November 1, 2026 from 1:15 AM to 1:45 AM. "
+            "Unrelated footer offset -05:00."
+        )
+    )
+
+    assert "timezone_ambiguous" in codes(
         validate(value, scheduling_source=scheduling_source)
     )
 

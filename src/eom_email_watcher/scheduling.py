@@ -312,13 +312,32 @@ def _date_has_source_support(
     local = value.astimezone(zone)
     text = evidence_text.casefold()
     context_date = context_at.astimezone(zone).date()
-    if local.date().isoformat() in text:
-        return True
+    weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+    def weekday_is_consistent(match: re.Match[str]) -> bool:
+        weekday_pattern = "|".join(weekdays)
+        prefix = text[: match.start()]
+        suffix = text[match.end() :]
+        adjacent = [
+            item.group(1)
+            for item in (
+                re.search(rf"\b({weekday_pattern})\b\s*,?\s*$", prefix),
+                re.match(rf"^\s*,?\s*\b({weekday_pattern})\b", suffix),
+            )
+            if item is not None
+        ]
+        return not adjacent or all(item == weekdays[local.weekday()] for item in adjacent)
+
+    iso = re.search(rf"\b{re.escape(local.date().isoformat())}\b", text)
+    if iso:
+        return weekday_is_consistent(iso)
     numeric = re.search(
         rf"(?<!\d)0?{local.month}[/-]0?{local.day}(?:[/-](\d{{2}}|\d{{4}}))?(?!\d)",
         text,
     )
     if numeric:
+        if not weekday_is_consistent(numeric):
+            return False
         year_text = numeric.group(1)
         if year_text is not None:
             year = int(year_text) + (2000 if len(year_text) == 2 else 0)
@@ -347,6 +366,8 @@ def _date_has_source_support(
         text,
     )
     if named:
+        if not weekday_is_consistent(named):
+            return False
         if named.group(1) is not None:
             return local.year == int(named.group(1))
         expected_year = context_date.year + int(
@@ -355,7 +376,6 @@ def _date_has_source_support(
         return local.year == expected_year
     if re.search(r"\bday\s+after\s+tomorrow\b", text):
         return local.date().toordinal() == context_date.toordinal() + 2
-    weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
     for weekday_index, weekday in enumerate(weekdays):
         if re.search(rf"\bnext\s+{weekday}\b", text):
             days_ahead = (weekday_index - context_date.weekday()) % 7 or 7
@@ -398,6 +418,27 @@ def _time_source_matches(
     return tuple(re.finditer(pattern, evidence_text, re.IGNORECASE))
 
 
+def _unqualified_12_hour_source_matches(
+    value: datetime,
+    evidence_text: str,
+    *,
+    zone: ZoneInfo,
+) -> tuple[re.Match[str], ...]:
+    local = value.astimezone(zone)
+    precision = f":{local.minute:02d}"
+    if local.second or local.microsecond:
+        precision += f":{local.second:02d}"
+    if local.microsecond:
+        precision += f".{local.microsecond:06d}".rstrip("0")
+    if local.minute == 0 and local.second == 0 and local.microsecond == 0:
+        precision = rf"(?:{re.escape(precision)})?"
+    else:
+        precision = re.escape(precision)
+    hour = local.hour % 12 or 12
+    pattern = rf"(?<!\d){hour}{precision}(?!\d|\s*(?:am|pm)\b)"
+    return tuple(re.finditer(pattern, evidence_text, re.IGNORECASE))
+
+
 def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneInfo) -> bool:
     return bool(_time_source_matches(value, evidence_text, zone=zone))
 
@@ -418,7 +459,11 @@ def _range_source_options(
         )
     )
     supported_options: list[str] = []
-    for start_match in _time_source_matches(start, evidence_text, zone=zone):
+    start_matches = (
+        *_time_source_matches(start, evidence_text, zone=zone),
+        *_unqualified_12_hour_source_matches(start, evidence_text, zone=zone),
+    )
+    for start_match in start_matches:
         for end_match in _time_source_matches(end, evidence_text, zone=zone):
             if end_match.start() < start_match.end():
                 continue
@@ -509,7 +554,7 @@ def _explicit_timezones(
         )
     }
     for abbreviation in re.findall(
-        r"(?<!\d)\d{1,2}(?::\d{2})?(?:\s*(?:AM|PM))?\s+([A-Z]{2,5})(?![A-Za-z])",
+        r"(?<!\d)\d{1,2}(?::\d{2})?(?:\s*(?:AM|PM))?\s*(?:\(\s*)?([A-Z]{3,5})(?:\s*\))?(?![A-Za-z])",
         evidence_text,
     ):
         if abbreviation.casefold() not in _ZONE_OFFSETS and abbreviation not in {"AM", "PM"}:
@@ -555,9 +600,10 @@ def _timezone_has_source_support(
         return False
     if not names and not offsets:
         return timezone == source.configured_timezone
-    return (not names or timezone.casefold() in names) and (
-        not offsets or all(value.utcoffset() in offsets for value in (start, end))
-    )
+    if len(names) > 1 or names and timezone.casefold() not in names:
+        return False
+    actual_offsets = frozenset(value.utcoffset() for value in (start, end))
+    return not offsets or offsets == actual_offsets
 
 
 def _time_violations(
@@ -580,6 +626,11 @@ def _time_violations(
     except (ValueError, ZoneInfoNotFoundError):
         return [SchedulingViolation("timezone_unknown", f"{path}.timezone")]
     evidence_texts = tuple(evidence.quote for evidence in item.evidence)
+    matching_options = tuple(
+        option
+        for text in evidence_texts
+        for option in _range_source_options(start, end, text, zone=zone, source=source)
+    )
     for label, value in (("start", start), ("end", end)):
         offsets = _wall_time_offsets(value, zone)
         if not offsets:
@@ -587,7 +638,8 @@ def _time_violations(
         elif value.utcoffset() not in offsets:
             violations.append(SchedulingViolation("timezone_offset_mismatch", f"{path}.{label}"))
         elif len(offsets) > 1 and not any(
-            value.utcoffset() in _explicit_timezones(text)[1] for text in evidence_texts
+            value.utcoffset() in _explicit_timezones(option)[1]
+            for option in matching_options
         ):
             violations.append(SchedulingViolation("timezone_ambiguous", f"{path}.{label}"))
     for label, value in (("start", start), ("end", end)):
@@ -601,13 +653,10 @@ def _time_violations(
             for text in evidence_texts
         ):
             violations.append(SchedulingViolation("time_date_unsupported", f"{path}.{label}"))
-        if not any(_time_has_source_support(value, text, zone=zone) for text in evidence_texts):
+        if not matching_options and not any(
+            _time_has_source_support(value, text, zone=zone) for text in evidence_texts
+        ):
             violations.append(SchedulingViolation("time_value_unsupported", f"{path}.{label}"))
-    matching_options = tuple(
-        option
-        for text in evidence_texts
-        for option in _range_source_options(start, end, text, zone=zone, source=source)
-    )
     if not matching_options:
         violations.append(SchedulingViolation("time_range_unsupported", path))
     elif not any(
