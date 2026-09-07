@@ -627,9 +627,30 @@ def test_calendar_page_byte_limit_checks_exact_boundary_before_json() -> None:
     over_limit = httpx.Response(200, content=b" " * (MAX_CALENDAR_PAGE_BYTES + 1))
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="not valid JSON"):
-        microsoft_calendar._bounded_graph_document(at_limit)
+        microsoft_calendar._bounded_graph_document(at_limit, float("inf"))
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="exceeded its byte limit"):
-        microsoft_calendar._bounded_graph_document(over_limit)
+        microsoft_calendar._bounded_graph_document(over_limit, float("inf"))
+
+
+def test_calendar_page_stream_enforces_absolute_round_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowResponse:
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def iter_bytes():
+            yield b'{"value":'
+            yield b"[]}"
+
+    clock = iter((0.0, microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS + 1.0))
+    monkeypatch.setattr(microsoft_calendar.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
+        microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
+            SlowResponse(),
+            microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS,
+        )
 
 
 def test_calendar_delta_page_limit_accepts_64_and_rejects_page_65() -> None:
@@ -754,7 +775,8 @@ def test_calendar_round_byte_limit_accepts_16_mib_and_rejects_one_page_more(
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, content=b"{}")
 
-        def bounded(response: httpx.Response):
+        def bounded(response: httpx.Response, deadline: float):
+            del deadline
             nonlocal calls
             calls += 1
             continuation = (
@@ -813,7 +835,15 @@ def test_calendar_round_deadline_stops_pagination_before_another_request(
             },
         )
 
-    clock = iter((0.0, 0.0, microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS + 1.0))
+    clock = iter(
+        (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS + 1.0,
+        )
+    )
     monkeypatch.setattr(microsoft_calendar.time, "monotonic", lambda: next(clock))
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),

@@ -916,6 +916,8 @@ def _calendar_status_data(
                     pass
                 else:
                     principal_matches = mailbox_principal.key == grant.principal_key
+                    if not principal_matches:
+                        state = "revoked"
     if state == "revoked" and grant is not None:
         runtime.store.revoke_calendar_grant_if_current(grant)
     return {
@@ -1200,6 +1202,28 @@ def _ready_calendar_read(
     return authorization, grant
 
 
+def _ready_local_calendar_read(runtime: Runtime, account: MailAccount) -> CalendarGrant:
+    """Validate an offline projection read without refreshing either token cache."""
+    _require_calendar_entitlement()
+    grant = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
+    if grant is None or grant.state != "ready":
+        raise ApiError(
+            "calendar_authorization_required",
+            "Authorize calendar read access before using the calendar",
+        )
+    if not microsoft_calendar_read_token_file(runtime.config, account).is_file():
+        raise ApiError(
+            "calendar_authorization_required",
+            "Authorize calendar read access before using the calendar",
+        )
+    if not mail_account_token_file(runtime.config, account).is_file():
+        raise ApiError(
+            "mailbox_authorization_required",
+            "Reconnect the Microsoft 365 mailbox before reading its calendar",
+        )
+    return grant
+
+
 def _calendar_mutations(delta: CalendarDeltaRound) -> tuple[CalendarEventMutation, ...]:
     return tuple(
         CalendarEventMutation(
@@ -1305,49 +1329,43 @@ def _calendar_event_data(event: CalendarEventProjection) -> dict[str, object]:
 def _calendar_read_events(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id", "window_start", "window_end"})
     window_start, window_end = _calendar_window_payload(payload)
-
-    def read(runtime: Runtime) -> dict[str, object]:
-        account = _calendar_account(runtime, payload)
-        _authorization, grant = _ready_calendar_read(runtime, account)
-        completed = runtime.store.calendar_window(account.account_id)
-        if (
-            completed is None
-            or completed.principal_key != grant.principal_key
-            or completed.window_start != window_start
-            or completed.window_end != window_end
-        ):
-            raise ApiError(
-                "calendar_sync_required",
-                "Synchronize this calendar window before reading its events",
-            )
-        data: dict[str, object] = {
-            "account_id": account.account_id,
-            "events": [
-                _calendar_event_data(event)
-                for event in runtime.store.calendar_events(account.account_id)
-            ],
-            "window_end": window_end,
-            "window_start": window_start,
-        }
-        encoded = json.dumps(
-            {
-                "data": data,
-                "ok": True,
-                "operation": "calendar.read.events",
-                "protocol": PROTOCOL_VERSION,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        if len(encoded) + 1 > MAX_CALENDAR_EVENTS_RESPONSE_BYTES:
-            raise ApiError(
-                "calendar_result_too_large",
-                "The calendar projection exceeds the engine response limit",
-            )
-        return data
-
-    return _with_calendar_observation(request, read)
+    runtime = _runtime(request)
+    account = _calendar_account(runtime, payload)
+    grant = _ready_local_calendar_read(runtime, account)
+    completed, events = runtime.store.calendar_projection(account.account_id)
+    if (
+        completed is None
+        or completed.principal_key != grant.principal_key
+        or completed.window_start != window_start
+        or completed.window_end != window_end
+    ):
+        raise ApiError(
+            "calendar_sync_required",
+            "Synchronize this calendar window before reading its events",
+        )
+    data: dict[str, object] = {
+        "account_id": account.account_id,
+        "events": [_calendar_event_data(event) for event in events],
+        "window_end": window_end,
+        "window_start": window_start,
+    }
+    encoded = json.dumps(
+        {
+            "data": data,
+            "ok": True,
+            "operation": "calendar.read.events",
+            "protocol": PROTOCOL_VERSION,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) + 1 > MAX_CALENDAR_EVENTS_RESPONSE_BYTES:
+        raise ApiError(
+            "calendar_result_too_large",
+            "The calendar projection exceeds the engine response limit",
+        )
+    return data
 
 
 def _mail_accounts(request: dict[str, object]) -> dict[str, object]:

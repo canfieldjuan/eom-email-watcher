@@ -260,6 +260,9 @@ def test_calendar_round_commits_projection_cursor_and_ordered_replays_atomically
         "event-1",
         "event-2",
     ]
+    projected_window, projected_events = store.calendar_projection(account_id)
+    assert projected_window == initial
+    assert [event.event_id for event in projected_events] == ["event-1", "event-2"]
 
     updated = store.commit_calendar_round(
         account_id=account_id,

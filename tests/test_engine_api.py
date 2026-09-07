@@ -1483,8 +1483,9 @@ def test_calendar_read_entitlement_and_principal_mismatch_fail_closed(
 
     stale_binding = engine_api._response(request(config_path, "calendar.read.status", payload))
 
-    assert stale_binding["data"]["state"] == "ready"
+    assert stale_binding["data"]["state"] == "revoked"
     assert stale_binding["data"]["available"] is False
+    assert runtime.store.calendar_grant(account.account_id).state == "revoked"
 
     monkeypatch.setattr(engine_api, "microsoft_mailbox_principal", lambda *args: original)
 
@@ -1712,6 +1713,15 @@ def test_calendar_profile_lifecycles_use_distinct_private_caches(
     assert profile_token.read_text(encoding="utf-8") == f"{profile}-private-cache"
     for other in {"read", "proposal", "write"} - {profile}:
         assert not microsoft_calendar_token_file(runtime.config, account, other).exists()
+
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: microsoft_principal(object_id="replacement-object"),
+    )
+    mismatched = engine_api._response(request(config_path, f"calendar.{profile}.status", payload))
+    assert mismatched["data"]["state"] == "revoked"
+    assert mismatched["data"]["available"] is False
 
     disconnected = engine_api._response(
         request(config_path, f"calendar.{profile}.disconnect", payload)
@@ -1967,18 +1977,35 @@ def test_calendar_events_response_limit_accepts_exact_utf8_size_and_rejects_one_
     monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size)
     assert engine_api._response(calendar_request)["ok"] is True
 
-    monkeypatch.setattr(engine_api, "operation_lock_uses_soft_fallback", lambda path: True)
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: pytest.fail("Offline calendar read refreshed its calendar token"),
+    )
     monkeypatch.setattr(
         engine_api,
-        "operation_lock",
-        lambda *args: pytest.fail("Soft-backend calendar read attempted native locking"),
+        "microsoft_mailbox_principal",
+        lambda *args: pytest.fail("Offline calendar read refreshed its mailbox token"),
     )
-    assert engine_api._response(calendar_request)["ok"] is True
+    lock_path = engine_api._production_check_lock_path(runtime.config)
+    with engine_api.operation_lock(lock_path, "test sync in progress"):
+        assert engine_api._response(calendar_request)["ok"] is True
 
     monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size - 1)
     rejected = engine_api._response(calendar_request)
     assert rejected["ok"] is False
     assert rejected["error"]["code"] == "calendar_result_too_large"
+
+    monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size)
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.unlink()
+    missing_calendar_cache = engine_api._response(calendar_request)
+    assert missing_calendar_cache["error"]["code"] == "calendar_authorization_required"
+
+    calendar_token.write_text("calendar-read-cache", encoding="utf-8")
+    mail_account_token_file(runtime.config, account).unlink()
+    missing_mailbox_cache = engine_api._response(calendar_request)
+    assert missing_mailbox_cache["error"]["code"] == "mailbox_authorization_required"
 
 
 def test_mail_account_connect_installs_private_imap_credentials_and_baseline(

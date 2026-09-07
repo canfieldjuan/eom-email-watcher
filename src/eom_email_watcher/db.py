@@ -1406,16 +1406,8 @@ class Store:
             ).fetchone()
         return CalendarWindow(**dict(row)) if row is not None else None
 
-    def calendar_events(self, account_id: str) -> list[CalendarEventProjection]:
-        with self.connection() as db:
-            rows = db.execute(
-                """SELECT event_id, subject, start_date_time, start_time_zone,
-                    end_date_time, end_time_zone, is_all_day, location
-                FROM microsoft_calendar_events
-                WHERE account_id = ?
-                ORDER BY start_date_time, event_id""",
-                (account_id,),
-            ).fetchall()
+    @staticmethod
+    def _calendar_event_rows(rows: Iterable[sqlite3.Row]) -> list[CalendarEventProjection]:
         return [
             CalendarEventProjection(
                 event_id=str(row["event_id"]),
@@ -1429,6 +1421,42 @@ class Store:
             )
             for row in rows
         ]
+
+    def calendar_events(self, account_id: str) -> list[CalendarEventProjection]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT event_id, subject, start_date_time, start_time_zone,
+                    end_date_time, end_time_zone, is_all_day, location
+                FROM microsoft_calendar_events
+                WHERE account_id = ?
+                ORDER BY start_date_time, event_id""",
+                (account_id,),
+            ).fetchall()
+        return self._calendar_event_rows(rows)
+
+    def calendar_projection(
+        self,
+        account_id: str,
+    ) -> tuple[CalendarWindow | None, list[CalendarEventProjection]]:
+        """Read one completed calendar window and its events from one snapshot."""
+        with self.connection() as db:
+            db.execute("BEGIN")
+            window_row = db.execute(
+                """SELECT account_id, principal_key, window_start, window_end,
+                    cursor, updated_at
+                FROM microsoft_calendar_windows WHERE account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            event_rows = db.execute(
+                """SELECT event_id, subject, start_date_time, start_time_zone,
+                    end_date_time, end_time_zone, is_all_day, location
+                FROM microsoft_calendar_events
+                WHERE account_id = ?
+                ORDER BY start_date_time, event_id""",
+                (account_id,),
+            ).fetchall()
+        window = CalendarWindow(**dict(window_row)) if window_row is not None else None
+        return window, self._calendar_event_rows(event_rows)
 
     def commit_calendar_round(
         self,

@@ -380,7 +380,17 @@ def _safe_calendar_continuation(url: object, token_name: str) -> str:
     return url
 
 
-def _bounded_graph_document(response: httpx.Response) -> tuple[dict[str, Any], int]:
+def _calendar_round_time_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit")
+    return remaining
+
+
+def _bounded_graph_document(
+    response: httpx.Response,
+    deadline: float,
+) -> tuple[dict[str, Any], int]:
     declared_length = response.headers.get("content-length")
     if declared_length is not None:
         try:
@@ -391,9 +401,11 @@ def _bounded_graph_document(response: httpx.Response) -> tuple[dict[str, Any], i
             raise Microsoft365Error("Microsoft Graph calendar response exceeded its byte limit")
     content = bytearray()
     for chunk in response.iter_bytes():
+        _calendar_round_time_remaining(deadline)
         if len(content) + len(chunk) > MAX_CALENDAR_PAGE_BYTES:
             raise Microsoft365Error("Microsoft Graph calendar response exceeded its byte limit")
         content.extend(chunk)
+    _calendar_round_time_remaining(deadline)
     try:
         document = json.loads(content)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -551,9 +563,7 @@ def calendar_delta_round(
             if pages >= MAX_CALENDAR_DELTA_PAGES:
                 raise Microsoft365Error("Microsoft Graph calendar round exceeded its page limit")
             pages += 1
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit")
+            remaining_seconds = _calendar_round_time_remaining(deadline)
             try:
                 with client.stream(
                     "GET",
@@ -577,7 +587,7 @@ def calendar_delta_round(
                             f"Microsoft Graph calendar is temporarily unavailable "
                             f"(HTTP {response.status_code}); retry"
                         )
-                    document, response_bytes = _bounded_graph_document(response)
+                    document, response_bytes = _bounded_graph_document(response, deadline)
             except httpx.RequestError as exc:
                 raise Microsoft365Error("Microsoft Graph calendar request failed; retry") from exc
             total_bytes += response_bytes
