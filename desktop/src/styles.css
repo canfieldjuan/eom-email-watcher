@@ -499,6 +499,49 @@ select:focus {
   font-weight: 800;
 }
 
+.calendar-proposal {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 13px 14px;
+  border: 1px solid #b9cec0;
+  border-radius: 10px;
+  color: #31483a;
+  background: #edf5ef;
+}
+
+.calendar-proposal-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.calendar-proposal-heading span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #765a2d;
+  background: #f4e9ce;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.calendar-proposal-heading span[data-expired="true"] {
+  color: #8a352f;
+  background: #f5dfdc;
+}
+
+.calendar-proposal p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.84rem;
+}
+
+.calendar-proposal-note {
+  color: #6d5740;
+  font-weight: 700;
+}
+
 .attachment-list {
   display: grid;
   gap: 7px;

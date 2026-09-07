@@ -12,18 +12,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import MAX_RETENTION_DAYS
+from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
 MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 AUTOMATION_CLEANUP_CHUNK_SIZE = 500
 AUTOMATION_RETRY_DELAYS_SECONDS = (60, 300, 900, 3600)
+MAX_AUTOMATION_PROPOSAL_ATTENDEES = 64
 SCHEDULING_AUTOMATION_ID = "email.schedule_event"
 SCHEDULING_AUTOMATION_VERSION = 1
 SCHEDULING_EXTRACTION_SCHEMA_VERSION = 1
@@ -383,6 +385,44 @@ AFTER DELETE ON automation_runs
 BEGIN
     DELETE FROM automation_extraction_payloads WHERE run_id = OLD.run_id;
 END;
+CREATE TABLE IF NOT EXISTS automation_proposal_payloads (
+    payload_id TEXT PRIMARY KEY CHECK (length(payload_id) = 36),
+    run_id TEXT NOT NULL UNIQUE CHECK (run_id <> ''),
+    proposal_version INTEGER NOT NULL CHECK (proposal_version = 1),
+    status TEXT NOT NULL CHECK (status IN ('accepted', 'no_suggestions')),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    proposal_sha256 TEXT NOT NULL CHECK (length(proposal_sha256) = 64),
+    subject TEXT NOT NULL CHECK (length(CAST(subject AS BLOB)) <= 512),
+    attendees_json BLOB NOT NULL CHECK (
+        typeof(attendees_json) = 'blob'
+        AND length(attendees_json) BETWEEN 2 AND 32768
+    ),
+    start TEXT CHECK (start IS NULL OR length(CAST(start AS BLOB)) <= 64),
+    end TEXT CHECK (end IS NULL OR length(CAST(end AS BLOB)) <= 64),
+    timezone TEXT CHECK (timezone IS NULL OR length(CAST(timezone AS BLOB)) <= 128),
+    suggestion_reason TEXT CHECK (
+        suggestion_reason IS NULL OR length(CAST(suggestion_reason AS BLOB)) <= 512
+    ),
+    empty_reason TEXT CHECK (
+        empty_reason IS NULL OR length(CAST(empty_reason AS BLOB)) <= 512
+    ),
+    observed_at TEXT NOT NULL CHECK (observed_at <> ''),
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    CHECK (
+        (status = 'accepted' AND start IS NOT NULL AND end IS NOT NULL
+            AND timezone IS NOT NULL AND suggestion_reason IS NOT NULL
+            AND empty_reason IS NULL AND expires_at IS NOT NULL)
+        OR (status = 'no_suggestions' AND start IS NULL AND end IS NULL
+            AND timezone IS NULL AND suggestion_reason IS NULL
+            AND empty_reason IS NOT NULL AND expires_at IS NULL)
+    )
+);
+CREATE TRIGGER IF NOT EXISTS automation_runs_delete_proposal_payloads
+AFTER DELETE ON automation_runs
+BEGIN
+    DELETE FROM automation_proposal_payloads WHERE run_id = OLD.run_id;
+END;
 """
 
 
@@ -507,6 +547,33 @@ class AutomationExtractionPayload:
 
 
 @dataclass(frozen=True)
+class AutomationProposalPayload:
+    payload_id: str
+    run_id: str
+    proposal_version: int
+    status: str
+    request_sha256: str
+    proposal_sha256: str
+    subject: str
+    attendees_json: bytes
+    start: str | None
+    end: str | None
+    timezone: str | None
+    suggestion_reason: str | None
+    empty_reason: str | None
+    observed_at: str
+    expires_at: str | None
+    created_at: str
+
+    @property
+    def attendees(self) -> tuple[str, ...]:
+        value = json.loads(self.attendees_json)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise RuntimeError("Stored automation proposal attendees are invalid")
+        return tuple(value)
+
+
+@dataclass(frozen=True)
 class AutomationWork:
     run: AutomationRun
     message_id: str
@@ -517,6 +584,15 @@ class AutomationWork:
     received_at: str
     organizer_address: str
     extraction_organizer_address: str | None
+
+
+@dataclass(frozen=True)
+class AutomationProposalWork:
+    run: AutomationRun
+    message_id: str
+    subject: str
+    organizer_address: str
+    extraction_payload: AutomationExtractionPayload
 
 
 class AutomationSourceChanged(RuntimeError):
@@ -533,6 +609,10 @@ def _automation_event(row: sqlite3.Row) -> AutomationEvent:
 
 def _automation_extraction_payload(row: sqlite3.Row) -> AutomationExtractionPayload:
     return AutomationExtractionPayload(**dict(row))
+
+
+def _automation_proposal_payload(row: sqlite3.Row) -> AutomationProposalPayload:
+    return AutomationProposalPayload(**dict(row))
 
 
 def _append_automation_event(
@@ -665,6 +745,10 @@ def _mark_automation_sources_unavailable(
             run_id = str(row["run_id"])
             db.execute(
                 "DELETE FROM automation_extraction_payloads WHERE run_id = ?",
+                (run_id,),
+            )
+            db.execute(
+                "DELETE FROM automation_proposal_payloads WHERE run_id = ?",
                 (run_id,),
             )
             previous_state = str(row["state"])
@@ -2898,6 +2982,331 @@ class Store:
             ).fetchall()
         return [_automation_extraction_payload(row) for row in rows]
 
+    def proposable_automation_runs(self, limit: int = 25) -> list[AutomationProposalWork]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT r.*, m.message_id AS work_message_id,
+                    m.subject AS work_subject, a.address AS organizer_address,
+                    p.payload_id AS extraction_payload_id,
+                    p.run_id AS extraction_run_id, p.attempt_no, p.request_id,
+                    p.status AS extraction_status, p.source_content_sha256,
+                    p.context_at, p.timezone AS extraction_payload_timezone,
+                    p.body_char_limit, p.organizer_address AS extraction_organizer_address,
+                    p.failure_count, p.next_retry_at, p.last_error_code,
+                    p.result_sha256, p.result_json, p.violations_json,
+                    p.created_at AS extraction_created_at, p.completed_at
+                FROM automation_runs AS r
+                JOIN messages AS m
+                  ON m.provider = r.provider
+                 AND m.account_id = r.account_id
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key
+                JOIN mail_accounts AS a
+                  ON a.provider = r.provider AND a.account_id = r.account_id
+                JOIN automation_extraction_payloads AS p
+                  ON p.payload_id = r.current_payload_id
+                LEFT JOIN automation_proposal_payloads AS proposed
+                  ON proposed.run_id = r.run_id
+                WHERE r.state = 'proposing' AND p.status = 'accepted'
+                  AND a.address IS NOT NULL AND proposed.run_id IS NULL
+                ORDER BY r.created_at, r.run_id
+                LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        run_fields = AutomationRun.__dataclass_fields__
+        return [
+            AutomationProposalWork(
+                run=AutomationRun(**{name: row[name] for name in run_fields}),
+                message_id=str(row["work_message_id"]),
+                subject=str(row["work_subject"]),
+                organizer_address=str(row["organizer_address"]),
+                extraction_payload=AutomationExtractionPayload(
+                    payload_id=str(row["extraction_payload_id"]),
+                    run_id=str(row["extraction_run_id"]),
+                    attempt_no=int(row["attempt_no"]),
+                    request_id=str(row["request_id"]),
+                    status=str(row["extraction_status"]),
+                    source_content_sha256=str(row["source_content_sha256"]),
+                    context_at=str(row["context_at"]),
+                    timezone=str(row["extraction_payload_timezone"]),
+                    body_char_limit=int(row["body_char_limit"]),
+                    organizer_address=(
+                        str(row["extraction_organizer_address"])
+                        if row["extraction_organizer_address"] is not None
+                        else None
+                    ),
+                    failure_count=int(row["failure_count"]),
+                    next_retry_at=(
+                        str(row["next_retry_at"])
+                        if row["next_retry_at"] is not None
+                        else None
+                    ),
+                    last_error_code=(
+                        str(row["last_error_code"])
+                        if row["last_error_code"] is not None
+                        else None
+                    ),
+                    result_sha256=(
+                        str(row["result_sha256"])
+                        if row["result_sha256"] is not None
+                        else None
+                    ),
+                    result_json=(
+                        bytes(row["result_json"])
+                        if row["result_json"] is not None
+                        else None
+                    ),
+                    violations_json=(
+                        bytes(row["violations_json"])
+                        if row["violations_json"] is not None
+                        else None
+                    ),
+                    created_at=str(row["extraction_created_at"]),
+                    completed_at=(
+                        str(row["completed_at"])
+                        if row["completed_at"] is not None
+                        else None
+                    ),
+                ),
+            )
+            for row in rows
+        ]
+
+    def automation_proposal(self, run_id: str) -> AutomationProposalPayload | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM automation_proposal_payloads WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return _automation_proposal_payload(row) if row is not None else None
+
+    def automation_proposal_for_message(
+        self, message_id: str
+    ) -> AutomationProposalPayload | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT p.* FROM automation_proposal_payloads AS p
+                JOIN automation_runs AS r ON r.run_id = p.run_id
+                JOIN messages AS m
+                  ON m.provider = r.provider
+                 AND m.account_id = r.account_id
+                 AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id
+                     ) = r.source_message_key
+                WHERE m.message_id = ?""",
+                (message_id,),
+            ).fetchone()
+        return _automation_proposal_payload(row) if row is not None else None
+
+    def record_automation_proposal(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        extraction_payload_id: str,
+        request_sha256: str,
+        subject: str,
+        attendees: Sequence[str],
+        start: str | None,
+        end: str | None,
+        timezone: str | None,
+        suggestion_reason: str | None,
+        empty_reason: str | None,
+        observed_at: datetime,
+    ) -> AutomationRun:
+        try:
+            valid_request_hash = (
+                len(request_sha256) == 64 and len(bytes.fromhex(request_sha256)) == 32
+            )
+        except (TypeError, ValueError):
+            valid_request_hash = False
+        if not valid_request_hash:
+            raise ValueError("proposal request hash must be a SHA-256 digest")
+        try:
+            subject_bytes = subject.encode("utf-8")
+            normalized_attendees = tuple(
+                normalize_validated_address(attendee) for attendee in attendees
+            )
+            attendees_json = json.dumps(
+                list(normalized_attendees), ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        except (AttributeError, TypeError, UnicodeEncodeError, ValueError) as exc:
+            raise ValueError("automation proposal content is invalid") from exc
+        if (
+            len(subject_bytes) > 512
+            or len(normalized_attendees) > MAX_AUTOMATION_PROPOSAL_ATTENDEES
+            or len(set(normalized_attendees)) != len(normalized_attendees)
+            or not 2 <= len(attendees_json) <= 32768
+        ):
+            raise ValueError("automation proposal content is not bounded")
+        for value, byte_limit in (
+            (start, 64),
+            (end, 64),
+            (timezone, 128),
+            (suggestion_reason, 512),
+            (empty_reason, 512),
+        ):
+            if value is not None:
+                try:
+                    if len(value.encode("utf-8")) > byte_limit:
+                        raise ValueError("automation proposal content is not bounded")
+                except (AttributeError, UnicodeEncodeError) as exc:
+                    raise ValueError("automation proposal content is invalid") from exc
+        accepted = all(
+            value is not None for value in (start, end, timezone, suggestion_reason)
+        ) and bool(suggestion_reason) and empty_reason is None
+        no_suggestions = (
+            all(value is None for value in (start, end, timezone, suggestion_reason))
+            and isinstance(empty_reason, str)
+            and bool(empty_reason)
+        )
+        if accepted == no_suggestions:
+            raise ValueError("automation proposal outcome is incomplete")
+        if observed_at.tzinfo is None:
+            raise ValueError("automation proposal observation time must be timezone-aware")
+        stamp = observed_at.astimezone(UTC)
+        expires_at: str | None = None
+        status = "accepted" if accepted else "no_suggestions"
+        next_state = "awaiting_confirmation" if accepted else "manual_review"
+        failure_code = None if accepted else "proposal_no_suggestions"
+        if accepted:
+            assert start is not None and end is not None and timezone is not None
+            try:
+                parsed_start = datetime.fromisoformat(start)
+                parsed_end = datetime.fromisoformat(end)
+                zone = ZoneInfo(timezone)
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                raise ValueError("automation proposal time is invalid") from exc
+            if (
+                parsed_start.tzinfo is None
+                or parsed_end.tzinfo is None
+                or parsed_start.astimezone(UTC) <= stamp
+                or parsed_end.astimezone(UTC) <= parsed_start.astimezone(UTC)
+                or parsed_start.astimezone(zone).replace(tzinfo=None)
+                != parsed_start.replace(tzinfo=None)
+                or parsed_end.astimezone(zone).replace(tzinfo=None)
+                != parsed_end.replace(tzinfo=None)
+                or parsed_start.astimezone(zone).utcoffset() != parsed_start.utcoffset()
+                or parsed_end.astimezone(zone).utcoffset() != parsed_end.utcoffset()
+            ):
+                raise ValueError("automation proposal time is invalid")
+            expires_at = min(
+                stamp + timedelta(minutes=15), parsed_start.astimezone(UTC)
+            ).isoformat()
+        proposal_document = {
+            "attendees": list(normalized_attendees),
+            "calendar": "primary",
+            "empty_reason": empty_reason,
+            "end": end,
+            "online_meeting": False,
+            "principal_key": None,
+            "start": start,
+            "subject": subject,
+            "suggestion_reason": suggestion_reason,
+            "timezone": timezone,
+            "version": 1,
+        }
+        payload_id = str(uuid.uuid4())
+        created_at = stamp.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            extraction = db.execute(
+                """SELECT status FROM automation_extraction_payloads
+                WHERE payload_id = ? AND run_id = ?""",
+                (extraction_payload_id, run_id),
+            ).fetchone()
+            if row is None or extraction is None:
+                raise KeyError(run_id)
+            if (
+                row["state"] != "proposing"
+                or int(row["state_version"]) != expected_state_version
+                or row["current_payload_id"] != extraction_payload_id
+                or extraction["status"] != "accepted"
+            ):
+                raise RuntimeError("Automation proposal lost its expected-state race")
+            proposal_document["principal_key"] = str(row["calendar_principal_key"])
+            proposal_json = json.dumps(
+                proposal_document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            proposal_sha256 = hashlib.sha256(proposal_json).hexdigest()
+            db.execute(
+                """INSERT INTO automation_proposal_payloads(
+                    payload_id, run_id, proposal_version, status, request_sha256,
+                    proposal_sha256, subject, attendees_json, start, end, timezone,
+                    suggestion_reason, empty_reason, observed_at, expires_at, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    payload_id,
+                    run_id,
+                    status,
+                    request_sha256,
+                    proposal_sha256,
+                    subject,
+                    sqlite3.Binary(attendees_json),
+                    start,
+                    end,
+                    timezone,
+                    suggestion_reason,
+                    empty_reason,
+                    created_at,
+                    expires_at,
+                    created_at,
+                ),
+            )
+            next_version = expected_state_version + 1
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?,
+                    failure_code = ?, current_payload_id = ?, current_payload_sha256 = ?,
+                    review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'proposing' AND state_version = ?
+                  AND current_payload_id = ?""",
+                (
+                    next_state,
+                    next_version,
+                    failure_code,
+                    payload_id,
+                    proposal_sha256,
+                    created_at,
+                    run_id,
+                    expected_state_version,
+                    extraction_payload_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation proposal lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state="proposing",
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=failure_code,
+                created_at=created_at,
+                payload_id=payload_id,
+                payload_sha256=proposal_sha256,
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation proposal was not readable")
+        return _automation_run(updated)
+
     def reserve_automation_extraction(
         self,
         run_id: str,
@@ -3311,7 +3720,7 @@ class Store:
                 raise KeyError(run_id)
             previous_state = str(row["state"])
             if (
-                previous_state not in {"detected", "extracting"}
+                previous_state not in {"detected", "extracting", "proposing"}
                 or int(row["state_version"]) != expected_state_version
             ):
                 raise RuntimeError("Automation review transition lost its expected-state race")
@@ -3916,6 +4325,24 @@ class Store:
             ORDER BY created_at DESC""",
             message_ids,
         ).fetchall()
+        proposal_rows = db.execute(
+            f"""SELECT p.*, r.state_version, r.provider, r.account_id,
+                a.display_name AS account_display_name,
+                a.address AS account_address, m.message_id
+            FROM automation_proposal_payloads AS p
+            JOIN automation_runs AS r ON r.run_id = p.run_id
+            JOIN messages AS m
+              ON m.provider = r.provider
+             AND m.account_id = r.account_id
+             AND message_source_key(
+                    m.provider, m.account_id, m.provider_message_id
+                 ) = r.source_message_key
+            JOIN mail_accounts AS a
+              ON a.provider = r.provider AND a.account_id = r.account_id
+            WHERE m.message_id IN ({placeholders})
+              AND r.state = 'awaiting_confirmation' AND p.status = 'accepted'""",
+            message_ids,
+        ).fetchall()
         attachments_by_message: dict[str, list[dict[str, object]]] = {
             message_id: [] for message_id in message_ids
         }
@@ -3972,6 +4399,35 @@ class Store:
                     "retryable": bool(row["error_retryable"]),
                 }
             connect_by_attachment.setdefault((key[0], key[1]), []).append(item)
+        proposal_by_message: dict[str, dict[str, object]] = {}
+        proposal_fields = AutomationProposalPayload.__dataclass_fields__
+        for row in proposal_rows:
+            proposal = AutomationProposalPayload(
+                **{name: row[name] for name in proposal_fields}
+            )
+            proposal_by_message[str(row["message_id"])] = {
+                "run_id": proposal.run_id,
+                "state": "awaiting_confirmation",
+                "state_version": int(row["state_version"]),
+                "proposal_version": proposal.proposal_version,
+                "proposal_sha256": proposal.proposal_sha256,
+                "provider": str(row["provider"]),
+                "account_id": str(row["account_id"]),
+                "account_display_name": str(row["account_display_name"]),
+                "account_address": (
+                    str(row["account_address"])
+                    if row["account_address"] is not None
+                    else None
+                ),
+                "subject": proposal.subject,
+                "attendees": list(proposal.attendees),
+                "start": proposal.start,
+                "end": proposal.end,
+                "timezone": proposal.timezone,
+                "suggestion_reason": proposal.suggestion_reason,
+                "observed_at": proposal.observed_at,
+                "expires_at": proposal.expires_at,
+            }
         for message_id, attachments in attachments_by_message.items():
             for attachment in attachments:
                 capability_results = connect_by_attachment.get(
@@ -3980,7 +4436,9 @@ class Store:
                 if capability_results:
                     attachment["capability_results"] = capability_results
         for item in items:
-            item["attachments"] = attachments_by_message[str(item["message_id"])]
+            message_id = str(item["message_id"])
+            item["attachments"] = attachments_by_message[message_id]
+            item["calendar_proposal"] = proposal_by_message.get(message_id)
         return items
 
     def purge_with_outcome(

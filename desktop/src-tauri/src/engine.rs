@@ -477,6 +477,27 @@ pub struct ExportedAttachment {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct CalendarProposalPreview {
+    pub run_id: String,
+    pub state: String,
+    pub state_version: i64,
+    pub proposal_version: i64,
+    pub proposal_sha256: String,
+    pub provider: String,
+    pub account_id: String,
+    pub account_display_name: String,
+    pub account_address: Option<String>,
+    pub subject: String,
+    pub attendees: Vec<String>,
+    pub start: String,
+    pub end: String,
+    pub timezone: String,
+    pub suggestion_reason: String,
+    pub observed_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
     #[serde(default = "default_mail_provider")]
@@ -508,6 +529,8 @@ pub struct InboxItem {
     pub last_error: Option<String>,
     #[serde(default)]
     pub attachments: Vec<InboxAttachment>,
+    #[serde(default)]
+    pub calendar_proposal: Option<CalendarProposalPreview>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1505,9 +1528,70 @@ mod tests {
         .expect("protocol-v1 inbox row without attachments must remain valid");
 
         assert!(item.attachments.is_empty());
+        assert_eq!(item.calendar_proposal, None);
         assert_eq!(item.category, None);
         assert_eq!(item.provider, "gmail");
         assert_eq!(item.account_id, "gmail-default");
+    }
+
+    #[test]
+    fn inbox_calendar_proposal_contract_is_typed_without_private_identity() {
+        let item: InboxItem = serde_json::from_str(r#"{
+            "message_id": "message-1",
+            "provider": "microsoft365",
+            "account_id": "microsoft365-account",
+            "received_at": "2026-09-07T12:00:00+00:00",
+            "sender": "sender@example.com",
+            "sender_name": "Sender",
+            "subject": "Meeting request",
+            "status": "analyzed",
+            "analysis_at": "2026-09-07T12:01:00+00:00",
+            "category": "scheduling",
+            "priority": "normal",
+            "summary": "A meeting was requested.",
+            "action_required": 1,
+            "suggested_action": "Review the meeting proposal.",
+            "deadline_text": null,
+            "deadline_iso": null,
+            "confidence": 0.9,
+            "attempts": 0,
+            "next_retry_at": null,
+            "analysis_retryable": null,
+            "analysis_error_code": null,
+            "analysis_retry_after_seconds": null,
+            "fallback_notified_at": null,
+            "notified_at": null,
+            "last_error": null,
+            "attachments": [],
+            "calendar_proposal": {
+                "run_id": "run-1",
+                "state": "awaiting_confirmation",
+                "state_version": 4,
+                "proposal_version": 1,
+                "proposal_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provider": "microsoft365",
+                "account_id": "microsoft365-account",
+                "account_display_name": "Microsoft 365",
+                "account_address": "owner@example.com",
+                "subject": "Meeting request",
+                "attendees": ["jane@example.com"],
+                "start": "2026-09-08T10:00:00-05:00",
+                "end": "2026-09-08T10:30:00-05:00",
+                "timezone": "America/Chicago",
+                "suggestion_reason": "All attendees are available.",
+                "observed_at": "2026-09-07T13:00:00+00:00",
+                "expires_at": "2026-09-07T13:15:00+00:00"
+            }
+        }"#)
+        .expect("calendar proposal preview must cross the typed desktop boundary");
+
+        let proposal = item.calendar_proposal.expect("calendar proposal");
+        assert_eq!(proposal.state, "awaiting_confirmation");
+        assert_eq!(proposal.attendees, vec!["jane@example.com"]);
+        assert_eq!(
+            proposal.account_address.as_deref(),
+            Some("owner@example.com")
+        );
     }
 
     #[test]

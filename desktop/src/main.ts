@@ -146,6 +146,27 @@ interface InboxItem {
   analysis_error_code: string | null;
   analysis_retry_after_seconds: number | null;
   attachments: InboxAttachment[];
+  calendar_proposal: CalendarProposalPreview | null;
+}
+
+interface CalendarProposalPreview {
+  run_id: string;
+  state: "awaiting_confirmation";
+  state_version: number;
+  proposal_version: number;
+  proposal_sha256: string;
+  provider: string;
+  account_id: string;
+  account_display_name: string;
+  account_address: string | null;
+  subject: string;
+  attendees: string[];
+  start: string;
+  end: string;
+  timezone: string;
+  suggestion_reason: string;
+  observed_at: string;
+  expires_at: string;
 }
 
 interface InboxQuery {
@@ -1168,6 +1189,48 @@ function renderInbox(items: InboxItem[]): void {
       details.append(deadline);
     }
 
+    let calendarProposal: HTMLElement | null = null;
+    if (item.calendar_proposal) {
+      const proposal = item.calendar_proposal;
+      calendarProposal = document.createElement("section");
+      calendarProposal.className = "calendar-proposal";
+      calendarProposal.setAttribute("aria-label", "Calendar proposal");
+      const heading = document.createElement("div");
+      heading.className = "calendar-proposal-heading";
+      const title = document.createElement("strong");
+      title.textContent = "Calendar proposal";
+      const state = document.createElement("span");
+      const expired = Date.parse(proposal.expires_at) <= Date.now();
+      state.textContent = expired ? "Expired" : "Not confirmed";
+      state.dataset.expired = String(expired);
+      heading.append(title, state);
+      const timing = document.createElement("p");
+      try {
+        const formatter = new Intl.DateTimeFormat(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZone: proposal.timezone,
+          timeZoneName: "short",
+        });
+        timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))}`;
+      } catch {
+        timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
+      }
+      const attendees = document.createElement("p");
+      attendees.textContent = proposal.attendees.length
+        ? `Attendees: ${proposal.attendees.join(", ")}`
+        : "No additional attendees";
+      const calendar = document.createElement("p");
+      calendar.textContent = `Calendar: ${proposal.account_address || proposal.account_display_name}`;
+      const note = document.createElement("p");
+      note.className = "calendar-proposal-note";
+      note.textContent = "No calendar event has been created.";
+      calendarProposal.append(heading, timing, attendees, calendar, note);
+    }
+
     const attachments = document.createElement("ul");
     attachments.className = "attachment-list";
     for (const attachment of item.attachments) {
@@ -1443,6 +1506,7 @@ function renderInbox(items: InboxItem[]): void {
 
     card.append(meta, subject, summary);
     if (details.childElementCount) card.append(details);
+    if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
     inboxList.append(card);

@@ -1,7 +1,7 @@
 # Calendar capability and email automation contract
 
-Status: **partially implemented: landing items 1–3 of 5 implemented; items 4–5
-pending**
+Status: **partially implemented: landing items 1–3 and the read-only proposal
+stage of item 4 implemented; confirmation, write, and item 5 remain pending**
 
 This document freezes the boundary for adding Microsoft 365 calendar operations
 and the first email-driven automation to Email Watcher. It is an implementation
@@ -9,9 +9,11 @@ gate, not a claim that calendar or automation behavior exists today.
 
 Feature-aware entitlement lookup, isolated calendar grants, calendar-read
 projection, strict scheduling extraction, and the recoverable automation ledger
-are implemented. The existing mailbox watcher, Local Connect consumer, and
-monthly Gmail sender remain authoritative while meeting proposal/write behavior,
-confirmation UI, and live acceptance evidence remain pending.
+are implemented. Accepted new-meeting extraction can call `findMeetingTimes`,
+persist a bounded proposal, and render a native non-writing preview. The existing
+mailbox watcher, Local Connect consumer, and monthly Gmail sender remain
+authoritative while confirmation, calendar writes, and live acceptance evidence
+remain pending.
 
 ## Verified baseline
 
@@ -36,8 +38,9 @@ The contract starts from these current-code facts:
   strict extraction now validates candidate times, attendees, intent, and source
   evidence before the automation can reach `proposing`.
 - The Microsoft calendar-read adapter and immutable automation run ledger exist.
-  Meeting proposal, confirmation, and write adapters remain pending. A systemd
-  `OnCalendar` timer remains an unrelated use of the word "calendar."
+  Read-only meeting proposal and native preview exist; confirmation and write
+  remain pending. A systemd `OnCalendar` timer remains an unrelated use of the
+  word "calendar."
 
 ## Definitions
 
@@ -705,8 +708,9 @@ Implementation remains split into reviewed vertical slices:
    file and keyring;
 2. **Implemented:** separate Microsoft calendar grants and read adapter;
 3. **Implemented:** scheduling extraction and immutable automation ledger;
-4. **Pending:** native proposal/confirmation UI and private confirmed-write
-   adapter; and
+4. **Partially implemented:** read-only proposal adapter and native preview are
+   implemented; confirmation UI and the private confirmed-write adapter remain
+   pending; and
 5. **Pending:** live acceptance evidence.
 
 No implementation slice may weaken the existing mailbox read-only path or claim

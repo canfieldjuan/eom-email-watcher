@@ -12,12 +12,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 from urllib.parse import parse_qs, urlencode, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import msal
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
+from .config import normalize_validated_address
 from .microsoft365 import (
     AUTHORIZATION_TIMEOUT_SECONDS,
     GRAPH_ROOT,
@@ -54,6 +56,11 @@ MAX_CALENDAR_SUBJECT_BYTES = 512
 MAX_CALENDAR_LOCATION_BYTES = 512
 MAX_CALENDAR_DATETIME_BYTES = 64
 MAX_CALENDAR_ZONE_BYTES = 128
+MAX_CALENDAR_PROPOSAL_RESPONSE_BYTES = 512 * 1024
+MAX_CALENDAR_PROPOSAL_SECONDS = 60.0
+MAX_CALENDAR_PROPOSAL_REASON_BYTES = 512
+MAX_CALENDAR_PROPOSAL_CANDIDATES = 8
+MAX_CALENDAR_PROPOSAL_ATTENDEES = 64
 _CONSENT_PENDING_ERROR_CODES = frozenset({65001, 90094, 90095})
 _RFC3339_INSTANT = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z"
@@ -71,6 +78,10 @@ class MicrosoftCalendarConsentPending(Microsoft365Error):
 
 class StaleCalendarCursor(Microsoft365Error):
     """Microsoft can no longer continue the saved calendar delta round."""
+
+
+class MicrosoftCalendarProposalRejected(Microsoft365Error):
+    """Microsoft definitively rejected or invalidated a meeting proposal."""
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,27 @@ class CalendarDeltaChange:
 class CalendarDeltaRound:
     changes: tuple[CalendarDeltaChange, ...]
     cursor: str
+
+
+@dataclass(frozen=True)
+class CalendarProposalCandidate:
+    start: str
+    end: str
+    timezone: str
+
+
+@dataclass(frozen=True)
+class CalendarMeetingProposal:
+    start: str
+    end: str
+    timezone: str
+    suggestion_reason: str
+
+
+@dataclass(frozen=True)
+class CalendarProposalResult:
+    proposal: CalendarMeetingProposal | None
+    empty_reason: str | None
 
 
 def canonical_calendar_window(window_start: object, window_end: object) -> tuple[str, str]:
@@ -406,6 +438,278 @@ class MicrosoftCalendarProposalAuthorization(MicrosoftCalendarAuthorization):
 
 class MicrosoftCalendarWriteAuthorization(MicrosoftCalendarAuthorization):
     profile = CALENDAR_AUTHORIZATION_PROFILES[CALENDAR_WRITE_PROFILE]
+
+
+def _proposal_candidate_interval(
+    candidate: CalendarProposalCandidate,
+) -> tuple[datetime, datetime, ZoneInfo]:
+    try:
+        start = datetime.fromisoformat(candidate.start)
+        end = datetime.fromisoformat(candidate.end)
+        zone = ZoneInfo(candidate.timezone)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("calendar proposal candidate is invalid") from exc
+    if start.tzinfo is None or end.tzinfo is None or end <= start:
+        raise ValueError("calendar proposal candidate is invalid")
+    for value in (start, end):
+        local = value.astimezone(zone)
+        if local.replace(tzinfo=None) != value.replace(tzinfo=None):
+            raise ValueError("calendar proposal candidate offset does not match its time zone")
+        if local.utcoffset() != value.utcoffset():
+            raise ValueError("calendar proposal candidate offset does not match its time zone")
+    return start, end, zone
+
+
+def _proposal_duration(duration: timedelta) -> str:
+    total_seconds = duration.total_seconds()
+    if total_seconds <= 0 or total_seconds > 24 * 60 * 60 or total_seconds % 60:
+        raise ValueError("calendar proposal duration must be whole minutes up to 24 hours")
+    minutes = int(total_seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    value = "PT"
+    if hours:
+        value += f"{hours}H"
+    if minutes:
+        value += f"{minutes}M"
+    return value
+
+
+def _proposal_request(
+    attendees: tuple[str, ...],
+    candidates: tuple[CalendarProposalCandidate, ...],
+) -> tuple[dict[str, object], tuple[str, ...], tuple[tuple[datetime, datetime], ...]]:
+    if not 1 <= len(candidates) <= MAX_CALENDAR_PROPOSAL_CANDIDATES:
+        raise ValueError("calendar proposal requires one to eight candidate ranges")
+    if len(attendees) > MAX_CALENDAR_PROPOSAL_ATTENDEES:
+        raise ValueError("calendar proposal has too many attendees")
+    normalized_attendees = tuple(normalize_validated_address(value) for value in attendees)
+    if len(set(normalized_attendees)) != len(normalized_attendees):
+        raise ValueError("calendar proposal attendees must be unique")
+    intervals = tuple(_proposal_candidate_interval(candidate)[:2] for candidate in candidates)
+    durations = {end.astimezone(UTC) - start.astimezone(UTC) for start, end in intervals}
+    if len(durations) != 1:
+        raise ValueError("calendar proposal candidate durations must match")
+    duration = _proposal_duration(next(iter(durations)))
+
+    def graph_time(value: datetime) -> dict[str, str]:
+        return {
+            "dateTime": value.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="seconds"),
+            "timeZone": "UTC",
+        }
+
+    request: dict[str, object] = {
+        "attendees": [
+            {
+                "type": "required",
+                "emailAddress": {"address": address},
+            }
+            for address in normalized_attendees
+        ],
+        "timeConstraint": {
+            "activityDomain": "unrestricted",
+            "timeSlots": [
+                {"start": graph_time(start), "end": graph_time(end)}
+                for start, end in intervals
+            ],
+        },
+        "isOrganizerOptional": False,
+        "meetingDuration": duration,
+        "returnSuggestionReasons": True,
+        "minimumAttendeePercentage": 100,
+        "maxCandidates": len(candidates),
+    }
+    return request, normalized_attendees, intervals
+
+
+def _proposal_response_time(value: object, name: str) -> datetime:
+    if not isinstance(value, dict) or set(value) < {"dateTime", "timeZone"}:
+        raise Microsoft365Error(f"Microsoft Graph proposal omitted its {name}")
+    if value.get("timeZone") != "UTC":
+        raise Microsoft365Error(f"Microsoft Graph proposal returned a non-UTC {name}")
+    date_time = _calendar_date_time(value.get("dateTime"), f"proposal {name}")
+    return datetime.fromisoformat(date_time).replace(tzinfo=UTC)
+
+
+def _proposal_attendees_available(
+    value: object,
+    required_attendees: tuple[str, ...],
+) -> None:
+    if not isinstance(value, list) or len(value) != len(required_attendees):
+        raise Microsoft365Error("Microsoft Graph proposal omitted required attendee availability")
+    observed: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or item.get("availability") != "free":
+            raise Microsoft365Error("Microsoft Graph proposal did not prove every attendee free")
+        attendee = item.get("attendee")
+        email_address = attendee.get("emailAddress") if isinstance(attendee, dict) else None
+        address = email_address.get("address") if isinstance(email_address, dict) else None
+        try:
+            normalized = normalize_validated_address(address) if isinstance(address, str) else ""
+        except ValueError as exc:
+            raise Microsoft365Error(
+                "Microsoft Graph proposal returned an invalid attendee"
+            ) from exc
+        if not normalized or normalized in observed:
+            raise Microsoft365Error("Microsoft Graph proposal returned an invalid attendee set")
+        observed.add(normalized)
+    if observed != set(required_attendees):
+        raise Microsoft365Error("Microsoft Graph proposal returned an unknown attendee set")
+
+
+def _calendar_proposal_result(
+    document: dict[str, Any],
+    attendees: tuple[str, ...],
+    candidates: tuple[CalendarProposalCandidate, ...],
+    intervals: tuple[tuple[datetime, datetime], ...],
+) -> CalendarProposalResult:
+    suggestions = document.get("meetingTimeSuggestions")
+    if not isinstance(suggestions, list) or len(suggestions) > len(candidates):
+        raise Microsoft365Error("Microsoft Graph returned an invalid proposal list")
+    empty_reason_value = document.get("emptySuggestionsReason")
+    empty_reason = _bounded_graph_text(
+        empty_reason_value,
+        "proposal empty reason",
+        MAX_CALENDAR_PROPOSAL_REASON_BYTES,
+        allow_empty=bool(suggestions),
+    )
+    if not suggestions:
+        return CalendarProposalResult(None, empty_reason)
+
+    parsed: list[tuple[int, CalendarMeetingProposal]] = []
+    seen_orders: set[int] = set()
+    for item in suggestions:
+        if not isinstance(item, dict):
+            raise Microsoft365Error("Microsoft Graph returned an invalid proposal")
+        order = item.get("order")
+        confidence = item.get("confidence")
+        if (
+            not isinstance(order, int)
+            or isinstance(order, bool)
+            or order < 1
+            or order in seen_orders
+            or not isinstance(confidence, int | float)
+            or isinstance(confidence, bool)
+            or confidence != 100
+            or item.get("organizerAvailability") != "free"
+        ):
+            raise Microsoft365Error("Microsoft Graph proposal did not prove full availability")
+        seen_orders.add(order)
+        _proposal_attendees_available(item.get("attendeeAvailability"), attendees)
+        time_slot = item.get("meetingTimeSlot")
+        if not isinstance(time_slot, dict):
+            raise Microsoft365Error("Microsoft Graph proposal omitted its time slot")
+        start = _proposal_response_time(time_slot.get("start"), "start")
+        end = _proposal_response_time(time_slot.get("end"), "end")
+        candidate_index = next(
+            (
+                index
+                for index, (candidate_start, candidate_end) in enumerate(intervals)
+                if start == candidate_start.astimezone(UTC)
+                and end == candidate_end.astimezone(UTC)
+            ),
+            None,
+        )
+        if candidate_index is None:
+            raise Microsoft365Error("Microsoft Graph proposal escaped the requested candidates")
+        reason = _bounded_graph_text(
+            item.get("suggestionReason"),
+            "proposal reason",
+            MAX_CALENDAR_PROPOSAL_REASON_BYTES,
+            allow_empty=False,
+        )
+        candidate = candidates[candidate_index]
+        parsed.append(
+            (
+                order,
+                CalendarMeetingProposal(
+                    start=candidate.start,
+                    end=candidate.end,
+                    timezone=candidate.timezone,
+                    suggestion_reason=reason,
+                ),
+            )
+        )
+    parsed.sort(key=lambda item: item[0])
+    return CalendarProposalResult(parsed[0][1], None)
+
+
+async def _find_meeting_time(
+    authorization: MicrosoftCalendarProposalAuthorization,
+    attendees: tuple[str, ...],
+    candidates: tuple[CalendarProposalCandidate, ...],
+) -> CalendarProposalResult:
+    request, normalized_attendees, intervals = _proposal_request(attendees, candidates)
+    owned_client = authorization._http_client is None
+    client = authorization._http_client or httpx.AsyncClient(timeout=GRAPH_TIMEOUT_SECONDS)
+    deadline = _calendar_monotonic() + MAX_CALENDAR_PROPOSAL_SECONDS
+    try:
+        try:
+            async with client.stream(
+                "POST",
+                f"{GRAPH_ROOT}/me/findMeetingTimes",
+                json=request,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {authorization._access_token}",
+                    "Content-Type": "application/json",
+                    "Prefer": 'outlook.timezone="UTC"',
+                },
+                follow_redirects=False,
+                timeout=min(
+                    GRAPH_TIMEOUT_SECONDS,
+                    _calendar_round_time_remaining(deadline),
+                ),
+            ) as response:
+                if response.status_code == 401:
+                    raise MicrosoftAuthorizationRejected(
+                        "Microsoft rejected the calendar proposal authorization"
+                    )
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise Microsoft365Error(
+                        "Microsoft Graph calendar proposal is temporarily unavailable; retry"
+                    )
+                if not response.is_success:
+                    raise MicrosoftCalendarProposalRejected(
+                        f"Microsoft Graph calendar proposal failed (HTTP {response.status_code})"
+                    )
+                document, _response_bytes = await _bounded_graph_document(
+                    response,
+                    deadline,
+                    MAX_CALENDAR_PROPOSAL_RESPONSE_BYTES,
+                )
+        except httpx.RequestError as exc:
+            raise Microsoft365Error("Microsoft Graph calendar proposal failed; retry") from exc
+        try:
+            return _calendar_proposal_result(
+                document,
+                normalized_attendees,
+                candidates,
+                intervals,
+            )
+        except Microsoft365Error as exc:
+            raise MicrosoftCalendarProposalRejected(str(exc)) from exc
+    finally:
+        if owned_client:
+            await client.aclose()
+
+
+def find_meeting_time(
+    authorization: MicrosoftCalendarProposalAuthorization,
+    attendees: tuple[str, ...],
+    candidates: tuple[CalendarProposalCandidate, ...],
+) -> CalendarProposalResult:
+    try:
+        return asyncio.run(
+            asyncio.wait_for(
+                _find_meeting_time(authorization, attendees, candidates),
+                timeout=MAX_CALENDAR_PROPOSAL_SECONDS,
+            )
+        )
+    except TimeoutError as exc:
+        raise Microsoft365Error(
+            "Microsoft Graph calendar proposal exceeded its time limit"
+        ) from exc
 
 
 def _calendar_delta_url(window_start: str, window_end: str) -> str:

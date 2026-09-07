@@ -872,6 +872,13 @@ def _calendar_entitlement_active() -> bool:
     return entitlement.feature_entitlement_decision(entitlement.CONNECT_FEATURE_ID).is_active
 
 
+def _automation_entitlement_active() -> bool:
+    return entitlement.feature_entitlements_active(
+        entitlement.CONNECT_FEATURE_ID,
+        entitlement.AUTOMATIONS_FEATURE_ID,
+    )
+
+
 def _require_calendar_entitlement() -> None:
     if not _calendar_entitlement_active():
         raise ApiError(
@@ -1555,10 +1562,18 @@ def _check(request: dict[str, object]) -> dict[str, object]:
         return run(_runtime(request))
 
 
+def _hide_locked_automation_previews(rows: list[dict[str, object]]) -> None:
+    if _automation_entitlement_active():
+        return
+    for row in rows:
+        row["calendar_proposal"] = None
+
+
 def _recent(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"limit"})
     limit = _bounded_limit(payload, default=20)
     rows = _runtime(request).store.recent(limit)
+    _hide_locked_automation_previews(rows)
     return {"items": rows}
 
 
@@ -1597,6 +1612,7 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
         provider=provider,
         account_id=account_id,
     )
+    _hide_locked_automation_previews(rows)
     return {"items": rows, "next_cursor": _encode_inbox_cursor(next_cursor)}
 
 
