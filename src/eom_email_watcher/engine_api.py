@@ -2991,7 +2991,14 @@ def main() -> None:
             }
         else:
             response = _response(request)
-    print(json.dumps(response, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+    encoded = json.dumps(
+        response,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
     raise SystemExit(0 if response["ok"] else 2)
 
 

@@ -390,6 +390,7 @@ def _calendar_round_time_remaining(deadline: float) -> float:
 def _bounded_graph_document(
     response: httpx.Response,
     deadline: float,
+    remaining_round_bytes: int,
 ) -> tuple[dict[str, Any], int]:
     declared_length = response.headers.get("content-length")
     if declared_length is not None:
@@ -397,13 +398,19 @@ def _bounded_graph_document(
             parsed_length = int(declared_length)
         except ValueError as exc:
             raise Microsoft365Error("Microsoft Graph returned an invalid Content-Length") from exc
-        if parsed_length < 0 or parsed_length > MAX_CALENDAR_PAGE_BYTES:
+        if parsed_length < 0:
+            raise Microsoft365Error("Microsoft Graph returned an invalid Content-Length")
+        if parsed_length > MAX_CALENDAR_PAGE_BYTES:
             raise Microsoft365Error("Microsoft Graph calendar response exceeded its byte limit")
+        if parsed_length > remaining_round_bytes:
+            raise Microsoft365Error("Microsoft Graph calendar round exceeded its byte limit")
     content = bytearray()
     for chunk in response.iter_bytes():
         _calendar_round_time_remaining(deadline)
         if len(content) + len(chunk) > MAX_CALENDAR_PAGE_BYTES:
             raise Microsoft365Error("Microsoft Graph calendar response exceeded its byte limit")
+        if len(content) + len(chunk) > remaining_round_bytes:
+            raise Microsoft365Error("Microsoft Graph calendar round exceeded its byte limit")
         content.extend(chunk)
     _calendar_round_time_remaining(deadline)
     try:
@@ -587,7 +594,11 @@ def calendar_delta_round(
                             f"Microsoft Graph calendar is temporarily unavailable "
                             f"(HTTP {response.status_code}); retry"
                         )
-                    document, response_bytes = _bounded_graph_document(response, deadline)
+                    document, response_bytes = _bounded_graph_document(
+                        response,
+                        deadline,
+                        MAX_CALENDAR_ROUND_BYTES - total_bytes,
+                    )
             except httpx.RequestError as exc:
                 raise Microsoft365Error("Microsoft Graph calendar request failed; retry") from exc
             total_bytes += response_bytes

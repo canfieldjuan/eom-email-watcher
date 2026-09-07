@@ -4136,6 +4136,40 @@ def test_main_emits_one_json_error_for_invalid_input(monkeypatch, capsys) -> Non
     }
 
 
+def test_main_writes_one_utf8_envelope_without_text_encoding_or_newline_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacyStdout:
+        encoding = "cp1252"
+        buffer = io.BytesIO()
+
+        @staticmethod
+        def write(value: str) -> int:
+            pytest.fail(f"Engine response used text stdout: {value!r}")
+
+    stdout = LegacyStdout()
+    response = {
+        "data": {"subject": "Planning 🗓️"},
+        "ok": True,
+        "operation": "calendar.read.events",
+        "protocol": 1,
+    }
+    monkeypatch.setattr(engine_api.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}")))
+    monkeypatch.setattr(engine_api.sys, "stdout", stdout)
+    monkeypatch.setattr(engine_api, "_response", lambda request: response)
+
+    with pytest.raises(SystemExit) as exit_info:
+        engine_api.main()
+
+    assert exit_info.value.code == 0
+    assert stdout.buffer.getvalue() == (
+        json.dumps(response, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )
+
+
 @pytest.mark.parametrize("parse_error", [ValueError("integer too long"), RecursionError()])
 def test_main_converts_bounded_json_parse_failures_to_one_error(
     monkeypatch: pytest.MonkeyPatch,

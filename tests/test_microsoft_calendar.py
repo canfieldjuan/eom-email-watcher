@@ -627,9 +627,17 @@ def test_calendar_page_byte_limit_checks_exact_boundary_before_json() -> None:
     over_limit = httpx.Response(200, content=b" " * (MAX_CALENDAR_PAGE_BYTES + 1))
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="not valid JSON"):
-        microsoft_calendar._bounded_graph_document(at_limit, float("inf"))
+        microsoft_calendar._bounded_graph_document(
+            at_limit,
+            float("inf"),
+            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        )
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="exceeded its byte limit"):
-        microsoft_calendar._bounded_graph_document(over_limit, float("inf"))
+        microsoft_calendar._bounded_graph_document(
+            over_limit,
+            float("inf"),
+            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        )
 
 
 def test_calendar_page_stream_enforces_absolute_round_deadline(
@@ -650,6 +658,24 @@ def test_calendar_page_stream_enforces_absolute_round_deadline(
         microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
             SlowResponse(),
             microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS,
+            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        )
+
+
+def test_calendar_page_stream_enforces_remaining_round_byte_limit() -> None:
+    class StreamingResponse:
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def iter_bytes():
+            yield b'{"value":'
+            yield b"[]}"
+
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="round exceeded its byte"):
+        microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
+            StreamingResponse(),
+            float("inf"),
+            len(b'{"value":[]') - 1,
         )
 
 
@@ -775,10 +801,14 @@ def test_calendar_round_byte_limit_accepts_16_mib_and_rejects_one_page_more(
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, content=b"{}")
 
-        def bounded(response: httpx.Response, deadline: float):
-            del deadline
+        def bounded(response: httpx.Response, deadline: float, remaining_round_bytes: int):
+            del deadline, response
             nonlocal calls
             calls += 1
+            if remaining_round_bytes < MAX_CALENDAR_PAGE_BYTES:
+                raise microsoft_calendar.Microsoft365Error(
+                    "Microsoft Graph calendar round exceeded its byte limit"
+                )
             continuation = (
                 {
                     "@odata.deltaLink": (
