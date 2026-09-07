@@ -35,6 +35,8 @@ from .config import (
     update_settings,
 )
 from .db import (
+    CalendarEventMutation,
+    CalendarEventProjection,
     CalendarGrant,
     ConnectJob,
     ConnectOutput,
@@ -80,9 +82,20 @@ from .microsoft365 import (
     MicrosoftAuthorizationRejected,
 )
 from .microsoft_calendar import (
+    CALENDAR_AUTHORIZATION_PROFILES,
+    CALENDAR_PROPOSAL_PROFILE,
     CALENDAR_READ_PROFILE,
+    CALENDAR_WRITE_PROFILE,
+    CalendarDeltaRound,
+    MicrosoftCalendarAuthorization,
     MicrosoftCalendarConsentPending,
+    MicrosoftCalendarProposalAuthorization,
     MicrosoftCalendarReadAuthorization,
+    MicrosoftCalendarWriteAuthorization,
+    StaleCalendarCursor,
+    calendar_delta_round,
+    canonical_calendar_window,
+    microsoft_cached_mailbox_principal,
     microsoft_mailbox_principal,
 )
 from .runtime import (
@@ -95,6 +108,7 @@ from .runtime import (
     mail_account_token_file,
     mail_provider_connection_available,
     microsoft_calendar_read_token_file,
+    microsoft_calendar_token_file,
 )
 from .service import Watcher
 
@@ -102,6 +116,7 @@ PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 MAX_INBOX_CURSOR_BYTES = 1024
+MAX_CALENDAR_EVENTS_RESPONSE_BYTES = 16 * 1024 * 1024
 INBOX_PRIORITIES = frozenset({"urgent", "high", "normal", "low", "untriaged"})
 INBOX_CATEGORIES = frozenset(
     {
@@ -498,6 +513,26 @@ def _finish_mail_authorization(
     }
 
 
+def _mismatched_calendar_grants_for_replacement_principal(
+    runtime: Runtime,
+    account: MailAccount,
+    staged_mail_token: Path,
+) -> tuple[CalendarGrant, ...]:
+    ready_grants = tuple(
+        grant
+        for profile in CALENDAR_AUTHORIZATION_PROFILES
+        if (grant := runtime.store.calendar_grant(account.account_id, profile)) is not None
+        and grant.state == "ready"
+    )
+    if not ready_grants:
+        return ()
+    replacement = microsoft_mailbox_principal(
+        runtime.config.microsoft_credentials_file,
+        staged_mail_token,
+    )
+    return tuple(grant for grant in ready_grants if grant.principal_key != replacement.key)
+
+
 def _authorize_microsoft_account(
     runtime: Runtime,
     account: MailAccount | None,
@@ -542,6 +577,16 @@ def _authorize_microsoft_account(
                 "The authorized mailbox does not match the selected email account",
             )
 
+        mismatched_calendar_grants = (
+            _mismatched_calendar_grants_for_replacement_principal(
+                runtime,
+                account,
+                staged_token,
+            )
+            if account is not None
+            else ()
+        )
+
         initialize_baseline = (
             account is None
             or runtime.store.state(
@@ -568,6 +613,12 @@ def _authorize_microsoft_account(
             )
         token_file = mail_account_token_file(runtime.config, account)
         _install_private_token(staged_token, token_file)
+        for grant in mismatched_calendar_grants:
+            if not runtime.store.revoke_calendar_grant_if_current(grant):
+                raise ApiError(
+                    "calendar_state_changed",
+                    "The calendar authorization changed during mailbox reconnection; retry",
+                )
 
     account = runtime.store.update_mail_account_identity(
         account.provider,
@@ -843,29 +894,47 @@ def _calendar_grant_identity(grant: CalendarGrant | None) -> dict[str, str | Non
 def _restore_calendar_grant(
     runtime: Runtime,
     account_id: str,
+    profile: str,
     previous: CalendarGrant | None,
 ) -> None:
     runtime.store.set_calendar_grant(
         account_id,
-        CALENDAR_READ_PROFILE,
+        profile,
         previous.state if previous is not None else "not_requested",
         **_calendar_grant_identity(previous),
     )
 
 
-def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[str, object]:
+def _calendar_authorization_type(
+    profile: str,
+) -> type[MicrosoftCalendarAuthorization]:
+    if profile == CALENDAR_READ_PROFILE:
+        return MicrosoftCalendarReadAuthorization
+    if profile == CALENDAR_PROPOSAL_PROFILE:
+        return MicrosoftCalendarProposalAuthorization
+    if profile == CALENDAR_WRITE_PROFILE:
+        return MicrosoftCalendarWriteAuthorization
+    raise ValueError("calendar authorization profile is invalid")
+
+
+def _calendar_status_data(
+    runtime: Runtime,
+    account: MailAccount,
+    profile: str,
+) -> dict[str, object]:
     entitlement_active = _calendar_entitlement_active()
-    grant = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
-    token_configured = microsoft_calendar_read_token_file(runtime.config, account).is_file()
+    grant = runtime.store.calendar_grant(account.account_id, profile)
+    token_file = microsoft_calendar_token_file(runtime.config, account, profile)
+    token_configured = token_file.is_file()
     state = grant.state if grant is not None else "not_requested"
     principal_matches = False
     if state == "ready" and not token_configured:
         state = "revoked"
     elif entitlement_active and state == "ready" and grant is not None:
         try:
-            calendar_authorization = MicrosoftCalendarReadAuthorization.from_token(
+            calendar_authorization = _calendar_authorization_type(profile).from_token(
                 runtime.config.microsoft_credentials_file,
-                microsoft_calendar_read_token_file(runtime.config, account),
+                token_file,
             )
         except MicrosoftAuthorizationRejected:
             state = "revoked"
@@ -884,6 +953,8 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
                     pass
                 else:
                     principal_matches = mailbox_principal.key == grant.principal_key
+                    if not principal_matches:
+                        state = "revoked"
     if state == "revoked" and grant is not None:
         runtime.store.revoke_calendar_grant_if_current(grant)
     return {
@@ -892,37 +963,44 @@ def _calendar_read_status_data(runtime: Runtime, account: MailAccount) -> dict[s
             entitlement_active and state == "ready" and token_configured and principal_matches
         ),
         "entitlement_active": entitlement_active,
-        "profile": CALENDAR_READ_PROFILE,
-        "scope": "Calendars.Read",
+        "profile": profile,
+        "scope": CALENDAR_AUTHORIZATION_PROFILES[profile].scopes[0],
         # Revoking an existing grant must remain possible after entitlement loss.
         # Keep the non-secret consent state visible while `available` stays false.
         "state": state,
     }
 
 
-def _calendar_read_status(request: dict[str, object]) -> dict[str, object]:
+def _with_calendar_observation(
+    request: dict[str, object],
+    operation: Callable[[Runtime], dict[str, object]],
+) -> dict[str, object]:
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if operation_lock_uses_soft_fallback(lock_path):
+        # Calendar mutations fail closed on this platform, so this read cannot race one.
+        return operation(runtime)
+    with operation_lock(lock_path, "Another mailbox operation is already running"):
+        return operation(_runtime(request))
+
+
+def _calendar_status(request: dict[str, object], profile: str) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id"})
 
     def status(runtime: Runtime) -> dict[str, object]:
         account = _calendar_account(runtime, payload, require_address=False)
-        return _calendar_read_status_data(runtime, account)
+        return _calendar_status_data(runtime, account, profile)
 
-    runtime = _runtime(request)
-    lock_path = _production_check_lock_path(runtime.config)
-    if operation_lock_uses_soft_fallback(lock_path):
-        # Mutations fail closed on this platform, so the read cannot race one.
-        return status(runtime)
-    with operation_lock(lock_path, "Another mailbox operation is already running"):
-        return status(_runtime(request))
+    return _with_calendar_observation(request, status)
 
 
-def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
+def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id"})
 
     def connect(runtime: Runtime) -> dict[str, object]:
         _require_calendar_entitlement()
         account = _calendar_account(runtime, payload)
-        previous = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
+        previous = runtime.store.calendar_grant(account.account_id, profile)
         try:
             mailbox_principal = microsoft_mailbox_principal(
                 runtime.config.microsoft_credentials_file,
@@ -932,11 +1010,11 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
             raise ApiError("mailbox_authorization_required", str(exc)) from exc
         except Microsoft365Error as exc:
             raise ApiError("calendar_error", str(exc)) from exc
-        token_file = microsoft_calendar_read_token_file(runtime.config, account)
+        token_file = microsoft_calendar_token_file(runtime.config, account, profile)
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             authorization_directory = tempfile.TemporaryDirectory(
-                prefix=".calendar-read-authorization-",
+                prefix=f".calendar-{profile}-authorization-",
                 dir=token_file.parent,
             )
         except OSError as exc:
@@ -945,31 +1023,36 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                 "Microsoft calendar authorization could not be staged; retry",
             ) from exc
         with authorization_directory as directory:
-            staged_token = Path(directory) / "calendar-read.msal-cache.json"
+            staged_token = Path(directory) / f"calendar-{profile}.msal-cache.json"
             runtime.store.set_calendar_grant(
                 account.account_id,
-                CALENDAR_READ_PROFILE,
+                profile,
                 "consent_pending",
                 **_calendar_grant_identity(previous),
             )
             try:
-                calendar, _changed = MicrosoftCalendarReadAuthorization.authorize_with_status(
+                calendar, _changed = _calendar_authorization_type(profile).authorize_with_status(
                     runtime.config.microsoft_credentials_file,
                     staged_token,
                 )
             except MicrosoftCalendarConsentPending:
-                return _calendar_read_status_data(runtime, account)
+                return _calendar_status_data(runtime, account, profile)
             except MicrosoftAuthorizationRejected as exc:
                 try:
                     runtime.store.set_calendar_grant(
                         account.account_id,
-                        CALENDAR_READ_PROFILE,
+                        profile,
                         "rejected",
                         **_calendar_grant_identity(previous),
                     )
                 except sqlite3.Error as state_exc:
                     try:
-                        _restore_calendar_grant(runtime, account.account_id, previous)
+                        _restore_calendar_grant(
+                            runtime,
+                            account.account_id,
+                            profile,
+                            previous,
+                        )
                     except sqlite3.Error as restore_exc:
                         raise ApiError(
                             "calendar_state_error",
@@ -982,24 +1065,28 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     ) from state_exc
                 raise ApiError("calendar_authorization_rejected", str(exc)) from exc
             except Microsoft365Error as exc:
-                _restore_calendar_grant(runtime, account.account_id, previous)
+                _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError("calendar_error", str(exc)) from exc
 
             principal = calendar.principal
             if principal.key != mailbox_principal.key:
-                _restore_calendar_grant(runtime, account.account_id, previous)
+                _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError(
                     "account_identity_mismatch",
                     "The authorized calendar does not match the selected Microsoft principal",
                 )
-            if previous is not None and previous.principal_key not in {None, principal.key}:
-                _restore_calendar_grant(runtime, account.account_id, previous)
+            if (
+                previous is not None
+                and previous.state == "ready"
+                and previous.principal_key not in {None, principal.key}
+            ):
+                _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError(
                     "calendar_principal_mismatch",
                     "The authorized calendar does not match the existing calendar principal",
                 )
             if not _calendar_entitlement_active():
-                _restore_calendar_grant(runtime, account.account_id, previous)
+                _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError(
                     "calendar_entitlement_required",
                     "Calendar setup requires an active capability-exchange entitlement",
@@ -1014,13 +1101,13 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
             try:
                 runtime.store.set_calendar_grant(
                     account.account_id,
-                    CALENDAR_READ_PROFILE,
+                    profile,
                     "ready",
                     **ready_identity,
                 )
             except sqlite3.Error as exc:
                 try:
-                    _restore_calendar_grant(runtime, account.account_id, previous)
+                    _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 except sqlite3.Error as restore_exc:
                     raise ApiError(
                         "calendar_state_error",
@@ -1034,38 +1121,305 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
             try:
                 _install_private_token(staged_token, token_file)
             except (MailboxAccountUnavailable, OSError) as exc:
-                _restore_calendar_grant(runtime, account.account_id, previous)
+                _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError(
                     "calendar_error",
                     "Microsoft calendar authorization could not be saved; retry",
                 ) from exc
-        return _calendar_read_status_data(runtime, account)
+        return _calendar_status_data(runtime, account, profile)
 
     return _with_mail_account_mutation(request, connect)
 
 
-def _calendar_read_disconnect(request: dict[str, object]) -> dict[str, object]:
+def _calendar_disconnect(request: dict[str, object], profile: str) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id"})
 
     def disconnect(runtime: Runtime) -> dict[str, object]:
         account = _calendar_account(runtime, payload, require_address=False)
-        token_file = microsoft_calendar_read_token_file(runtime.config, account)
+        token_file = microsoft_calendar_token_file(runtime.config, account, profile)
         try:
             with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
                 token_file.unlink(missing_ok=True)
         except FileLockTimeout as exc:
             raise ApiError("calendar_busy", "The calendar authorization is busy; retry") from exc
-        runtime.store.disconnect_calendar_read(account.account_id)
+        runtime.store.disconnect_calendar_grant(account.account_id, profile)
         return {
             "account_id": account.account_id,
             "available": False,
             "entitlement_active": _calendar_entitlement_active(),
-            "profile": CALENDAR_READ_PROFILE,
-            "scope": "Calendars.Read",
+            "profile": profile,
+            "scope": CALENDAR_AUTHORIZATION_PROFILES[profile].scopes[0],
             "state": "not_requested",
         }
 
     return _with_mail_account_mutation(request, disconnect)
+
+
+def _calendar_read_status(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_status(request, CALENDAR_READ_PROFILE)
+
+
+def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_connect(request, CALENDAR_READ_PROFILE)
+
+
+def _calendar_read_disconnect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_disconnect(request, CALENDAR_READ_PROFILE)
+
+
+def _calendar_proposal_status(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_status(request, CALENDAR_PROPOSAL_PROFILE)
+
+
+def _calendar_proposal_connect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_connect(request, CALENDAR_PROPOSAL_PROFILE)
+
+
+def _calendar_proposal_disconnect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_disconnect(request, CALENDAR_PROPOSAL_PROFILE)
+
+
+def _calendar_write_status(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_status(request, CALENDAR_WRITE_PROFILE)
+
+
+def _calendar_write_connect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_connect(request, CALENDAR_WRITE_PROFILE)
+
+
+def _calendar_write_disconnect(request: dict[str, object]) -> dict[str, object]:
+    return _calendar_disconnect(request, CALENDAR_WRITE_PROFILE)
+
+
+def _calendar_window_payload(payload: dict[str, object]) -> tuple[str, str]:
+    try:
+        return canonical_calendar_window(
+            payload.get("window_start"),
+            payload.get("window_end"),
+        )
+    except ValueError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+
+
+def _ready_calendar_read(
+    runtime: Runtime,
+    account: MailAccount,
+) -> tuple[MicrosoftCalendarReadAuthorization, CalendarGrant]:
+    _require_calendar_entitlement()
+    grant = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
+    if grant is None or grant.state != "ready":
+        raise ApiError(
+            "calendar_authorization_required",
+            "Authorize calendar read access before using the calendar",
+        )
+    try:
+        authorization = MicrosoftCalendarReadAuthorization.from_token(
+            runtime.config.microsoft_credentials_file,
+            microsoft_calendar_read_token_file(runtime.config, account),
+        )
+    except MicrosoftAuthorizationRejected as exc:
+        runtime.store.revoke_calendar_grant_if_current(grant)
+        raise ApiError("calendar_authorization_revoked", str(exc)) from exc
+    except Microsoft365Error as exc:
+        raise ApiError("calendar_error", str(exc)) from exc
+    try:
+        mailbox_principal = microsoft_mailbox_principal(
+            runtime.config.microsoft_credentials_file,
+            mail_account_token_file(runtime.config, account),
+        )
+    except MicrosoftAuthorizationRejected as exc:
+        raise ApiError("mailbox_authorization_required", str(exc)) from exc
+    except Microsoft365Error as exc:
+        raise ApiError("calendar_error", str(exc)) from exc
+    if (
+        authorization.principal.key != grant.principal_key
+        or mailbox_principal.key != grant.principal_key
+    ):
+        runtime.store.revoke_calendar_grant_if_current(grant)
+        raise ApiError(
+            "calendar_principal_mismatch",
+            "The calendar grant does not match the selected Microsoft principal",
+        )
+    return authorization, grant
+
+
+def _ready_local_calendar_read(runtime: Runtime, account: MailAccount) -> CalendarGrant:
+    """Validate an offline projection read without refreshing either token cache."""
+    _require_calendar_entitlement()
+    grant = runtime.store.calendar_grant(account.account_id, CALENDAR_READ_PROFILE)
+    if grant is None or grant.state != "ready":
+        raise ApiError(
+            "calendar_authorization_required",
+            "Authorize calendar read access before using the calendar",
+        )
+    if not microsoft_calendar_read_token_file(runtime.config, account).is_file():
+        raise ApiError(
+            "calendar_authorization_required",
+            "Authorize calendar read access before using the calendar",
+        )
+    if not mail_account_token_file(runtime.config, account).is_file():
+        raise ApiError(
+            "mailbox_authorization_required",
+            "Reconnect the Microsoft 365 mailbox before reading its calendar",
+        )
+    try:
+        mailbox_principal = microsoft_cached_mailbox_principal(
+            mail_account_token_file(runtime.config, account)
+        )
+    except MicrosoftAuthorizationRejected as exc:
+        raise ApiError("mailbox_authorization_required", str(exc)) from exc
+    except Microsoft365Error as exc:
+        raise ApiError("calendar_error", str(exc)) from exc
+    if mailbox_principal.key != grant.principal_key:
+        raise ApiError(
+            "calendar_principal_mismatch",
+            "The calendar grant does not match the selected Microsoft principal",
+        )
+    return grant
+
+
+def _calendar_mutations(delta: CalendarDeltaRound) -> tuple[CalendarEventMutation, ...]:
+    return tuple(
+        CalendarEventMutation(
+            event_id=change.event_id,
+            event=(
+                None
+                if change.event is None
+                else CalendarEventProjection(
+                    event_id=change.event.event_id,
+                    subject=change.event.subject,
+                    start_date_time=change.event.start_date_time,
+                    start_time_zone=change.event.start_time_zone,
+                    end_date_time=change.event.end_date_time,
+                    end_time_zone=change.event.end_time_zone,
+                    is_all_day=change.event.is_all_day,
+                    location=change.event.location,
+                )
+            ),
+        )
+        for change in delta.changes
+    )
+
+
+def _calendar_read_sync(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id", "window_start", "window_end"})
+    window_start, window_end = _calendar_window_payload(payload)
+
+    def sync(runtime: Runtime) -> dict[str, object]:
+        account = _calendar_account(runtime, payload)
+        authorization, grant = _ready_calendar_read(runtime, account)
+        completed = runtime.store.calendar_window(account.account_id)
+        same_projection = (
+            completed is not None
+            and completed.principal_key == grant.principal_key
+            and completed.window_start == window_start
+            and completed.window_end == window_end
+        )
+        cursor = completed.cursor if same_projection else None
+        recovered = False
+        try:
+            delta = calendar_delta_round(
+                authorization,
+                window_start,
+                window_end,
+                cursor=cursor,
+            )
+        except StaleCalendarCursor:
+            recovered = True
+            try:
+                delta = calendar_delta_round(
+                    authorization,
+                    window_start,
+                    window_end,
+                )
+            except MicrosoftAuthorizationRejected as exc:
+                runtime.store.revoke_calendar_grant_if_current(grant)
+                raise ApiError("calendar_authorization_revoked", str(exc)) from exc
+            except Microsoft365Error as exc:
+                raise ApiError("calendar_error", str(exc)) from exc
+        except MicrosoftAuthorizationRejected as exc:
+            runtime.store.revoke_calendar_grant_if_current(grant)
+            raise ApiError("calendar_authorization_revoked", str(exc)) from exc
+        except Microsoft365Error as exc:
+            raise ApiError("calendar_error", str(exc)) from exc
+        try:
+            runtime.store.commit_calendar_round(
+                account_id=account.account_id,
+                principal_key=grant.principal_key or "",
+                window_start=window_start,
+                window_end=window_end,
+                cursor=delta.cursor,
+                changes=_calendar_mutations(delta),
+                replace=not same_projection or recovered,
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            raise ApiError(
+                "calendar_state_error",
+                "The completed calendar round could not be saved; retry",
+            ) from exc
+        return {
+            "account_id": account.account_id,
+            "change_count": len(delta.changes),
+            "event_count": len(runtime.store.calendar_events(account.account_id)),
+            "recovered_stale_cursor": recovered,
+            "window_end": window_end,
+            "window_start": window_start,
+        }
+
+    return _with_mail_account_mutation(request, sync)
+
+
+def _calendar_event_data(event: CalendarEventProjection) -> dict[str, object]:
+    return {
+        "end": {"date_time": event.end_date_time, "time_zone": event.end_time_zone},
+        "event_id": event.event_id,
+        "is_all_day": event.is_all_day,
+        "location": event.location,
+        "start": {"date_time": event.start_date_time, "time_zone": event.start_time_zone},
+        "subject": event.subject,
+    }
+
+
+def _calendar_read_events(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id", "window_start", "window_end"})
+    window_start, window_end = _calendar_window_payload(payload)
+    runtime = _runtime(request)
+    account = _calendar_account(runtime, payload)
+    grant = _ready_local_calendar_read(runtime, account)
+    completed, events = runtime.store.calendar_projection(account.account_id)
+    if (
+        completed is None
+        or completed.principal_key != grant.principal_key
+        or completed.window_start != window_start
+        or completed.window_end != window_end
+    ):
+        raise ApiError(
+            "calendar_sync_required",
+            "Synchronize this calendar window before reading its events",
+        )
+    data: dict[str, object] = {
+        "account_id": account.account_id,
+        "events": [_calendar_event_data(event) for event in events],
+        "window_end": window_end,
+        "window_start": window_start,
+    }
+    encoded = json.dumps(
+        {
+            "data": data,
+            "ok": True,
+            "operation": "calendar.read.events",
+            "protocol": PROTOCOL_VERSION,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) + 1 > MAX_CALENDAR_EVENTS_RESPONSE_BYTES:
+        raise ApiError(
+            "calendar_result_too_large",
+            "The calendar projection exceeds the engine response limit",
+        )
+    return data
 
 
 def _mail_accounts(request: dict[str, object]) -> dict[str, object]:
@@ -2517,7 +2871,15 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "attachment.export": _attachment_export,
     "calendar.read.connect": _calendar_read_connect,
     "calendar.read.disconnect": _calendar_read_disconnect,
+    "calendar.read.events": _calendar_read_events,
     "calendar.read.status": _calendar_read_status,
+    "calendar.read.sync": _calendar_read_sync,
+    "calendar.proposal.connect": _calendar_proposal_connect,
+    "calendar.proposal.disconnect": _calendar_proposal_disconnect,
+    "calendar.proposal.status": _calendar_proposal_status,
+    "calendar.write.connect": _calendar_write_connect,
+    "calendar.write.disconnect": _calendar_write_disconnect,
+    "calendar.write.status": _calendar_write_status,
     "config.initialize": _config_initialize,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,
@@ -2683,7 +3045,14 @@ def main() -> None:
             }
         else:
             response = _response(request)
-    print(json.dumps(response, separators=(",", ":"), sort_keys=True))
+    encoded = json.dumps(
+        response,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
     raise SystemExit(0 if response["ok"] else 2)
 
 

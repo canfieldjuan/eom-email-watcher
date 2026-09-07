@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher.config import MAX_RETENTION_DAYS
-from eom_email_watcher.db import MAX_CONNECT_REQUEST_BYTES, SCHEMA_VERSION, Store
+from eom_email_watcher.db import (
+    MAX_CONNECT_REQUEST_BYTES,
+    SCHEMA_VERSION,
+    CalendarEventMutation,
+    CalendarEventProjection,
+    Store,
+)
 from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
 
@@ -212,6 +218,115 @@ def test_calendar_revocation_compare_and_set_preserves_newer_state(tmp_path: Pat
 
     assert store.revoke_calendar_grant_if_current(stale) is False
     assert store.calendar_grant(account_id).state == "consent_pending"
+
+
+def projected_event(event_id: str, subject: str = "Planning") -> CalendarEventProjection:
+    return CalendarEventProjection(
+        event_id=event_id,
+        subject=subject,
+        start_date_time="2026-09-07T09:00:00.0000000",
+        start_time_zone="UTC",
+        end_date_time="2026-09-07T10:00:00.0000000",
+        end_time_zone="UTC",
+        is_all_day=False,
+        location="Office",
+    )
+
+
+def test_calendar_round_commits_projection_cursor_and_ordered_replays_atomically(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    account_id = "microsoft365-" + "a" * 32
+    principal_key = "b" * 64
+    start = "2026-09-01T00:00:00.000000Z"
+    end = "2026-10-01T00:00:00.000000Z"
+
+    initial = store.commit_calendar_round(
+        account_id=account_id,
+        principal_key=principal_key,
+        window_start=start,
+        window_end=end,
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=one",
+        changes=(
+            CalendarEventMutation("event-1", projected_event("event-1")),
+            CalendarEventMutation("event-2", projected_event("event-2")),
+        ),
+        replace=True,
+    )
+    assert initial.cursor.endswith("one")
+    assert [event.event_id for event in store.calendar_events(account_id)] == [
+        "event-1",
+        "event-2",
+    ]
+    projected_window, projected_events = store.calendar_projection(account_id)
+    assert projected_window == initial
+    assert [event.event_id for event in projected_events] == ["event-1", "event-2"]
+
+    updated = store.commit_calendar_round(
+        account_id=account_id,
+        principal_key=principal_key,
+        window_start=start,
+        window_end=end,
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=two",
+        changes=(
+            CalendarEventMutation("event-1", projected_event("event-1", "Updated")),
+            CalendarEventMutation("event-2", None),
+            CalendarEventMutation("event-1", projected_event("event-1", "Final")),
+        ),
+        replace=False,
+    )
+
+    assert updated.cursor.endswith("two")
+    assert [(event.event_id, event.subject) for event in store.calendar_events(account_id)] == [
+        ("event-1", "Final")
+    ]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.commit_calendar_round(
+            account_id=account_id,
+            principal_key=principal_key,
+            window_start=start,
+            window_end=end,
+            cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=bad",
+            changes=(
+                CalendarEventMutation(
+                    "event-3",
+                    projected_event("event-3", "x" * 513),
+                ),
+            ),
+            replace=False,
+        )
+
+    assert store.calendar_window(account_id).cursor.endswith("two")  # type: ignore[union-attr]
+    assert [(event.event_id, event.subject) for event in store.calendar_events(account_id)] == [
+        ("event-1", "Final")
+    ]
+
+
+def test_calendar_disconnect_removes_only_read_projection(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    account_id = "microsoft365-" + "b" * 32
+    principal_key = "c" * 64
+    store.commit_calendar_round(
+        account_id=account_id,
+        principal_key=principal_key,
+        window_start="2026-09-01T00:00:00.000000Z",
+        window_end="2026-10-01T00:00:00.000000Z",
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=one",
+        changes=(CalendarEventMutation("event-1", projected_event("event-1")),),
+        replace=True,
+    )
+
+    store.disconnect_calendar_grant(account_id, "proposal")
+    assert store.calendar_window(account_id) is not None
+    assert len(store.calendar_events(account_id)) == 1
+
+    store.disconnect_calendar_grant(account_id, "read")
+    assert store.calendar_window(account_id) is None
+    assert store.calendar_events(account_id) == []
 
 
 def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(

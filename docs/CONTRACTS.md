@@ -210,6 +210,105 @@ validated Graph-only continuation URLs, opaque cursor persistence, pagination,
 stale-cursor recovery, and atomic state advancement—not the same endpoint or
 query parameters.
 
+### Landing-item 2 executable boundary
+
+Landing item 2 exposes three independent consent lifecycles through the engine:
+
+```text
+calendar.read.status | calendar.read.connect | calendar.read.disconnect
+calendar.proposal.status | calendar.proposal.connect | calendar.proposal.disconnect
+calendar.write.status | calendar.write.connect | calendar.write.disconnect
+```
+
+Each operation accepts only the selected Microsoft provider and generated account
+ID. Setup and use require the capability-exchange entitlement, but status and
+disconnect remain available after entitlement loss. A profile operation acquires
+only its exact scope from the authorization table, writes only its own private
+cache, and may not report `ready` unless its immutable principal matches both the
+durable grant and the selected mailbox principal. Disconnect removes that cache,
+resets only that grant, and, for the read profile, deletes its locally copied
+calendar projection and cursor. It does not remove the mailbox or either other
+calendar profile.
+
+Status may remain temporarily unavailable when a principal cannot be checked,
+but a definitive mismatch between the durable grant and either locally
+authorized principal transitions that profile to `revoked`; it never reports a
+mismatched profile as `ready` with only `available=false` carrying the error.
+
+Calendar reads use two engine operations:
+
+```text
+calendar.read.sync(provider, account_id, window_start, window_end)
+calendar.read.events(provider, account_id, window_start, window_end)
+```
+
+Both window boundaries are RFC 3339 instants with an explicit `Z` or `±HH:MM`
+offset and no more than six fractional-second digits. The parser rejects a
+missing or malformed offset, `end <= start`, and a range longer than 366 days.
+Accepted boundaries are canonicalized to UTC with microsecond precision; the
+exact canonical pair and immutable principal key form the projection identity.
+Version 1 retains only the most recently completed window for each account and
+returns its complete bounded projection rather than accepting pagination state,
+a caller-supplied Graph cursor, or a Graph URL. A successful initial sync for a
+different window atomically replaces the prior window, cursor, and event rows.
+`calendar.read.events` is an offline projection read: it performs no Graph or
+token-endpoint request and does not acquire the global mailbox mutation lock.
+It validates the entitlement, selected account, durable ready grant, local
+mailbox and calendar cache presence, and projection identity using local state
+only. It reads the completed window and all of its events from one SQLite read
+snapshot, so a concurrent sync continues to expose the previous complete
+projection until the replacement transaction commits. It refuses an
+incomplete, missing, differently windowed, differently principaled, or
+unavailable grant.
+
+The initial delta request contains only the canonical `startDateTime` and
+`endDateTime` query parameters and sends `Prefer: odata.maxpagesize=100` plus the
+immutable-ID preference. Continuations are the complete opaque URL returned by
+Graph. A continuation is admitted only when it is HTTPS, has no user information,
+explicit port, or fragment, names exactly `graph.microsoft.com`, has the exact
+case-insensitive `/v1.0/me/calendarView/delta` path, and carries exactly one
+non-empty `$skiptoken` or `$deltatoken` appropriate to the call. Application code
+must not reconstruct, decode, log, or return the token.
+
+One delta round is bounded before persistence by all of the following:
+
+- at most 100 returned entries per requested Graph page;
+- at most 64 Graph pages;
+- at most 3,200 event or tombstone entries;
+- at most 2 MiB of response bytes per page and 16 MiB in the complete round; and
+- at most 32 KiB in any accepted continuation URL; and
+- at most 300 seconds for the complete round, with each HTTP call capped by the
+  smaller of the existing per-request timeout and the remaining round time and
+  the absolute deadline rechecked while every response body is streamed.
+
+Crossing any bound, receiving redirects, receiving both or neither continuation
+fields, receiving malformed event data, or receiving an unexpected Graph status
+fails the sync without changing the last completed projection or cursor. HTTP 401
+revokes the read grant. HTTP 429 and 5xx remain retryable failures. A stale delta
+token (`410 Gone`, `syncStateNotFound`, or `ErrorSyncStateNotFound`) triggers at
+most one full initial round for the same window; the old completed projection
+remains readable until that replacement commits successfully.
+
+The adapter buffers one bounded round and commits it in one SQLite transaction.
+For an initial or stale-token recovery round, the transaction replaces that
+window's projection. For an incremental round, it applies response entries in
+order, with an event upserting its bounded projection and `@removed` deleting the
+same event ID, then advances to the returned `@odata.deltaLink`. Replayed entries
+are idempotent. A crash, parser failure, or injected database failure before commit
+preserves the prior events and cursor together; a completed commit exposes both
+together.
+
+The projection stores no raw Graph document, body, attendee list, organizer, or
+token. Each row contains only the immutable event ID, bounded subject, bounded
+start/end date-time and zone strings, all-day flag, and bounded location display
+name. The UTF-8 byte ceilings are 512 each for event ID, subject, and location,
+64 for each date-time, and 128 for each zone. `calendar.read.events` has a 16-MiB
+encoded-response ceiling. The engine emits UTF-8 JSON without ASCII escaping;
+its field and entry bounds keep every valid projection representable under that
+ceiling even when every string character requires JSON escaping. It fails rather
+than silently dropping events. Read disconnect removes these copied rows and
+their cursor in the same database transaction that resets the grant.
+
 Graph webhooks are excluded. They require a publicly reachable HTTPS callback,
 which conflicts with this local-first deployment.
 
@@ -525,6 +624,13 @@ evidence; items 2–5 remain pending:
 8. An initial-plus-subsequent delta fixture proves unchanged events remain,
    tombstones remove deleted events, and cursor/projection changes roll back
    together at an injected crash point.
+   Boundary fixtures also prove an exact-366-day window passes, one microsecond
+   over fails, a 64-page round passes, page 65 fails without persistence, a
+   2-MiB page passes, one byte over fails before JSON parsing, and a hostile or
+   wrong-path continuation cannot reach the HTTP client. A stale-cursor fixture
+   proves exactly one initial replacement is attempted while the prior completed
+   projection stays readable if replacement fails. A simulated clock proves the
+   round deadline stops pagination even when the page-count limit has room.
 9. The live account proves proposal consent and a real `findMeetingTimes` domain
    result; a no-suggestions fixture records the reason, reaches `manual_review`,
    and never creates an empty confirmation.

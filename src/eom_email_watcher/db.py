@@ -7,7 +7,7 @@ import json
 import math
 import sqlite3
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -17,7 +17,7 @@ from .config import MAX_RETENTION_DAYS
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -240,6 +240,34 @@ class CalendarGrant:
     object_id: str | None
     email_address: str | None
     updated_at: str
+
+
+@dataclass(frozen=True)
+class CalendarWindow:
+    account_id: str
+    principal_key: str
+    window_start: str
+    window_end: str
+    cursor: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class CalendarEventProjection:
+    event_id: str
+    subject: str
+    start_date_time: str
+    start_time_zone: str
+    end_date_time: str
+    end_time_zone: str
+    is_all_day: bool
+    location: str
+
+
+@dataclass(frozen=True)
+class CalendarEventMutation:
+    event_id: str
+    event: CalendarEventProjection | None
 
 
 @dataclass(frozen=True)
@@ -947,6 +975,42 @@ class Store:
                         )
                     )
                 );
+                CREATE TABLE IF NOT EXISTS microsoft_calendar_windows (
+                    account_id TEXT PRIMARY KEY CHECK (account_id <> ''),
+                    principal_key TEXT NOT NULL CHECK (length(principal_key) = 64),
+                    window_start TEXT NOT NULL CHECK (window_start <> ''),
+                    window_end TEXT NOT NULL CHECK (window_end <> ''),
+                    cursor TEXT NOT NULL CHECK (
+                        cursor <> '' AND length(CAST(cursor AS BLOB)) <= 32768
+                    ),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS microsoft_calendar_events (
+                    account_id TEXT NOT NULL CHECK (account_id <> ''),
+                    event_id TEXT NOT NULL CHECK (
+                        event_id <> '' AND length(CAST(event_id AS BLOB)) <= 512
+                    ),
+                    subject TEXT NOT NULL CHECK (length(CAST(subject AS BLOB)) <= 512),
+                    start_date_time TEXT NOT NULL CHECK (
+                        start_date_time <> ''
+                        AND length(CAST(start_date_time AS BLOB)) <= 64
+                    ),
+                    start_time_zone TEXT NOT NULL CHECK (
+                        start_time_zone <> ''
+                        AND length(CAST(start_time_zone AS BLOB)) <= 128
+                    ),
+                    end_date_time TEXT NOT NULL CHECK (
+                        end_date_time <> ''
+                        AND length(CAST(end_date_time AS BLOB)) <= 64
+                    ),
+                    end_time_zone TEXT NOT NULL CHECK (
+                        end_time_zone <> ''
+                        AND length(CAST(end_time_zone AS BLOB)) <= 128
+                    ),
+                    is_all_day INTEGER NOT NULL CHECK (is_all_day IN (0, 1)),
+                    location TEXT NOT NULL CHECK (length(CAST(location AS BLOB)) <= 512),
+                    PRIMARY KEY (account_id, event_id)
+                );
                 CREATE TABLE IF NOT EXISTS messages (
                     message_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL,
@@ -1299,7 +1363,9 @@ class Store:
             )
         return cursor.rowcount == 1
 
-    def disconnect_calendar_read(self, account_id: str) -> CalendarGrant:
+    def disconnect_calendar_grant(self, account_id: str, profile: str) -> CalendarGrant:
+        if profile not in {"read", "proposal", "write"}:
+            raise ValueError("calendar grant profile is invalid")
         stamp = datetime.now(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1307,16 +1373,183 @@ class Store:
                 """INSERT INTO microsoft_calendar_grants(
                     account_id, profile, state, principal_key, home_account_id,
                     tenant_id, object_id, email_address, updated_at
-                ) VALUES (?, 'read', 'not_requested', NULL, NULL, NULL, NULL, NULL, ?)
+                ) VALUES (?, ?, 'not_requested', NULL, NULL, NULL, NULL, NULL, ?)
                 ON CONFLICT(account_id, profile) DO UPDATE SET
                     state='not_requested', principal_key=NULL, home_account_id=NULL,
                     tenant_id=NULL, object_id=NULL, email_address=NULL,
                     updated_at=excluded.updated_at""",
-                (account_id, stamp),
+                (account_id, profile, stamp),
             )
-        grant = self.calendar_grant(account_id)
+            if profile == "read":
+                db.execute(
+                    "DELETE FROM microsoft_calendar_events WHERE account_id = ?",
+                    (account_id,),
+                )
+                db.execute(
+                    "DELETE FROM microsoft_calendar_windows WHERE account_id = ?",
+                    (account_id,),
+                )
+        grant = self.calendar_grant(account_id, profile)
         assert grant is not None
         return grant
+
+    def disconnect_calendar_read(self, account_id: str) -> CalendarGrant:
+        return self.disconnect_calendar_grant(account_id, "read")
+
+    def calendar_window(self, account_id: str) -> CalendarWindow | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT account_id, principal_key, window_start, window_end,
+                    cursor, updated_at
+                FROM microsoft_calendar_windows WHERE account_id = ?""",
+                (account_id,),
+            ).fetchone()
+        return CalendarWindow(**dict(row)) if row is not None else None
+
+    @staticmethod
+    def _calendar_event_rows(rows: Iterable[sqlite3.Row]) -> list[CalendarEventProjection]:
+        return [
+            CalendarEventProjection(
+                event_id=str(row["event_id"]),
+                subject=str(row["subject"]),
+                start_date_time=str(row["start_date_time"]),
+                start_time_zone=str(row["start_time_zone"]),
+                end_date_time=str(row["end_date_time"]),
+                end_time_zone=str(row["end_time_zone"]),
+                is_all_day=bool(row["is_all_day"]),
+                location=str(row["location"]),
+            )
+            for row in rows
+        ]
+
+    def calendar_events(self, account_id: str) -> list[CalendarEventProjection]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT event_id, subject, start_date_time, start_time_zone,
+                    end_date_time, end_time_zone, is_all_day, location
+                FROM microsoft_calendar_events
+                WHERE account_id = ?
+                ORDER BY start_date_time, event_id""",
+                (account_id,),
+            ).fetchall()
+        return self._calendar_event_rows(rows)
+
+    def calendar_projection(
+        self,
+        account_id: str,
+    ) -> tuple[CalendarWindow | None, list[CalendarEventProjection]]:
+        """Read one completed calendar window and its events from one snapshot."""
+        with self.connection() as db:
+            db.execute("BEGIN")
+            window_row = db.execute(
+                """SELECT account_id, principal_key, window_start, window_end,
+                    cursor, updated_at
+                FROM microsoft_calendar_windows WHERE account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            event_rows = db.execute(
+                """SELECT event_id, subject, start_date_time, start_time_zone,
+                    end_date_time, end_time_zone, is_all_day, location
+                FROM microsoft_calendar_events
+                WHERE account_id = ?
+                ORDER BY start_date_time, event_id""",
+                (account_id,),
+            ).fetchall()
+        window = CalendarWindow(**dict(window_row)) if window_row is not None else None
+        return window, self._calendar_event_rows(event_rows)
+
+    def commit_calendar_round(
+        self,
+        *,
+        account_id: str,
+        principal_key: str,
+        window_start: str,
+        window_end: str,
+        cursor: str,
+        changes: Sequence[CalendarEventMutation],
+        replace: bool,
+    ) -> CalendarWindow:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                """SELECT principal_key, window_start, window_end
+                FROM microsoft_calendar_windows WHERE account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            if not replace and (
+                previous is None
+                or str(previous["principal_key"]) != principal_key
+                or str(previous["window_start"]) != window_start
+                or str(previous["window_end"]) != window_end
+            ):
+                raise ValueError("calendar delta does not match the completed projection")
+            if replace:
+                db.execute(
+                    "DELETE FROM microsoft_calendar_events WHERE account_id = ?",
+                    (account_id,),
+                )
+            for change in changes:
+                if change.event is None:
+                    db.execute(
+                        """DELETE FROM microsoft_calendar_events
+                        WHERE account_id = ? AND event_id = ?""",
+                        (account_id, change.event_id),
+                    )
+                    continue
+                event = change.event
+                if event.event_id != change.event_id:
+                    raise ValueError("calendar mutation identity is inconsistent")
+                db.execute(
+                    """INSERT INTO microsoft_calendar_events(
+                        account_id, event_id, subject, start_date_time,
+                        start_time_zone, end_date_time, end_time_zone,
+                        is_all_day, location
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, event_id) DO UPDATE SET
+                        subject=excluded.subject,
+                        start_date_time=excluded.start_date_time,
+                        start_time_zone=excluded.start_time_zone,
+                        end_date_time=excluded.end_date_time,
+                        end_time_zone=excluded.end_time_zone,
+                        is_all_day=excluded.is_all_day,
+                        location=excluded.location""",
+                    (
+                        account_id,
+                        event.event_id,
+                        event.subject,
+                        event.start_date_time,
+                        event.start_time_zone,
+                        event.end_date_time,
+                        event.end_time_zone,
+                        int(event.is_all_day),
+                        event.location,
+                    ),
+                )
+            event_count = int(
+                db.execute(
+                    """SELECT COUNT(*) FROM microsoft_calendar_events
+                    WHERE account_id = ?""",
+                    (account_id,),
+                ).fetchone()[0]
+            )
+            if event_count > 3_200:
+                raise ValueError("calendar projection exceeded its event limit")
+            db.execute(
+                """INSERT INTO microsoft_calendar_windows(
+                    account_id, principal_key, window_start, window_end, cursor, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    principal_key=excluded.principal_key,
+                    window_start=excluded.window_start,
+                    window_end=excluded.window_end,
+                    cursor=excluded.cursor,
+                    updated_at=excluded.updated_at""",
+                (account_id, principal_key, window_start, window_end, cursor, stamp),
+            )
+        window = self.calendar_window(account_id)
+        assert window is not None
+        return window
 
     def state(
         self,

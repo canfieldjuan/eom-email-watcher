@@ -53,6 +53,11 @@ only to stderr.
 | `mail.accounts.disconnect` | `provider`, `account_id` | Remove that account's local read token while retaining local history and mailbox state |
 | `mail.accounts.activate` | `provider`, `account_id` | Select one connected account for watcher polling |
 | `gmail.authorize` | `{}` | Compatibility wrapper for the original read-only Gmail setup flow |
+| `calendar.read.status`, `calendar.proposal.status`, `calendar.write.status` | `provider`, `account_id` | Selected profile consent state and availability without credential values or paths |
+| `calendar.read.connect`, `calendar.proposal.connect`, `calendar.write.connect` | `provider`, `account_id` | Explicitly acquire that profile's exact delegated scope into its private cache |
+| `calendar.read.disconnect`, `calendar.proposal.disconnect`, `calendar.write.disconnect` | `provider`, `account_id` | Remove only that profile's private cache and reset its grant; read also removes its copied projection |
+| `calendar.read.sync` | `provider`, `account_id`, RFC 3339 `window_start`, `window_end` | Complete one bounded Graph calendar-view delta round and atomically commit its local projection and cursor |
+| `calendar.read.events` | `provider`, `account_id`, RFC 3339 `window_start`, `window_end` | Return the matching completed local event projection without a Graph request |
 | `watcher.check` | optional `dry_run` boolean | Poll the active mail account with native delivery deferred to the host and the exact pending-intent count |
 | `inbox.query` | optional bounded `limit`, opaque `cursor`, mail `provider`/`account_id`, sender/priority/category/status/keyword filters | Stable keyset page of matching local SQLite inbox rows plus `next_cursor` |
 | `inbox.recent` | optional `limit` | Existing SQLite inbox rows with ordered attachment metadata; no raw bodies or attachment bytes |
@@ -130,6 +135,20 @@ Every continuation is restricted to HTTPS on `graph.microsoft.com` and the expec
 delta path before the bearer token is attached. Graph immutable IDs are requested on every call.
 Cursor expiry enters the shared retention-bounded recovery path, and the shared watcher performs
 metadata-only exact-sender admission before body or attachment retrieval.
+
+Calendar authorization is separate from mailbox authorization. Read, proposal, and write each use
+their own private cache and request only `Calendars.Read`, `Calendars.Read.Shared`, or
+`Calendars.ReadWrite`, respectively. Status remains visible and disconnect remains usable after
+entitlement loss; setup and calendar use require an active capability-exchange entitlement. Every
+ready grant must match the selected mailbox's immutable Microsoft principal.
+
+`calendar.read.sync` accepts one explicit UTC-offset window of at most 366 days. It follows only
+validated Graph calendar-view delta continuations and bounds each page, the complete round, entry
+count, page count, and wall time before committing. Event mutations and the opaque delta cursor are
+one SQLite transaction; a failed or stale-token replacement leaves the previous projection
+readable. `calendar.read.events` serves only the exact completed principal/window projection,
+performs no network request, and emits at most 16 MiB of UTF-8 JSON. Cursor URLs, access tokens, and
+raw Graph documents are never returned.
 
 IMAP connect/reconnect accepts a `connection` object containing `email_address`, `host`, `port`,
 `security` (`tls` or `starttls`), `username`, `password`, and an optional absolute `ca_file` selected
