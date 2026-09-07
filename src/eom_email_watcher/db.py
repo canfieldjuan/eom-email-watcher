@@ -3608,7 +3608,12 @@ class Store:
                 (datetime.now(UTC).isoformat() if notified else None, message_id),
             )
 
-    def notification_intents(self, limit: int = 25) -> list[NotificationIntent]:
+    def notification_intents(
+        self,
+        limit: int = 25,
+        *,
+        kind: str | None = None,
+    ) -> list[NotificationIntent]:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT subject_type, subject_id, revision, message_id, kind,
@@ -3658,9 +3663,10 @@ class Store:
                      ) = r.source_message_key
                 WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                   AND r.review_notified_at IS NULL
-                )
+                ) AS intents
+                WHERE (? IS NULL OR kind = ?)
                 ORDER BY sort_at LIMIT ?""",
-                (limit,),
+                (kind, kind, limit),
             ).fetchall()
         return [NotificationIntent(**dict(row)) for row in rows]
 

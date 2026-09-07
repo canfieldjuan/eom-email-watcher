@@ -371,9 +371,10 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
         return True
     meridiem = "am" if local.hour < 12 else "pm"
     hour = local.hour % 12 or 12
+    minute = rf"(?::{local.minute:02d})?" if local.minute == 0 else f":{local.minute:02d}"
     return bool(
         re.search(
-            rf"(?<!\d){hour}(?::{local.minute:02d})?\s*{meridiem}\b",
+            rf"(?<!\d){hour}{minute}\s*{meridiem}\b",
             text,
         )
     )
@@ -521,6 +522,8 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         semantic.append(SchedulingViolation("new_meeting_missing_time", "proposed_times"))
     if extraction.intent == "new_meeting" and extraction.confidence < 0.8:
         semantic.append(SchedulingViolation("new_meeting_low_confidence", "confidence"))
+    if extraction.intent == "new_meeting" and extraction.ambiguity_reasons:
+        semantic.append(SchedulingViolation("new_meeting_ambiguous", "ambiguity_reasons"))
     if extraction.intent == "new_meeting" and extraction.referenced_event is not None:
         semantic.append(SchedulingViolation("new_meeting_has_reference", "referenced_event"))
     if extraction.intent == "unclear" and not extraction.ambiguity_reasons:

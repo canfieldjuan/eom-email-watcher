@@ -116,6 +116,10 @@ class AutomationProcessing:
     attempted_run_ids: frozenset[str]
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _retry_feedback(payloads: list[AutomationExtractionPayload]) -> tuple[SchedulingViolation, ...]:
     rejected = next(
         (payload for payload in reversed(payloads) if payload.status == "rejected"),
@@ -174,7 +178,7 @@ def process_scheduling_automations(
     limit: int = 25,
     now: datetime | None = None,
 ) -> AutomationProcessing:
-    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+    observed_at = (now or _utc_now()).astimezone(UTC)
     store.purge(config.retention_days, now=observed_at)
     processed = 0
     review_required = 0
@@ -317,7 +321,7 @@ def process_scheduling_automations(
                         error_code=exc.code,
                         retryable=exc.retryable,
                         retry_after_seconds=exc.retry_after_seconds,
-                        now=observed_at,
+                        now=_utc_now(),
                     )
                     if failed.state == "manual_review":
                         processed += 1
@@ -331,7 +335,7 @@ def process_scheduling_automations(
                         payload_id=reservation.payload_id,
                         error_code="model_unavailable",
                         retryable=True,
-                        now=observed_at,
+                        now=_utc_now(),
                     )
                     break
                 accepted_state: str | None = None
@@ -660,11 +664,10 @@ class Watcher:
         summarized = 0
         fallback = 0
         if deliver_notifications:
-            for intent in self.store.notification_intents():
-                if intent.kind == "fallback":
-                    fallback += self._send_fallback(intent, dry_run)
-                elif intent.kind == "automation_review":
-                    self._deliver_automation_review(intent, dry_run)
+            for intent in self.store.notification_intents(kind="fallback"):
+                fallback += self._send_fallback(intent, dry_run)
+            for intent in self.store.notification_intents(kind="automation_review"):
+                self._deliver_automation_review(intent, dry_run)
         for message in self.store.pending_delivery():
             received_at = _received_at_or_none(
                 message.received_at, observed_at=retention_observed_at
@@ -816,9 +819,7 @@ def run_watcher_check(
     )
     if deliver_notifications and config.notifications_enabled:
         sender_names = {sender.email: sender.name for sender in config.senders}
-        for intent in store.notification_intents():
-            if intent.kind != "automation_review":
-                continue
+        for intent in store.notification_intents(kind="automation_review"):
             _deliver_automation_review_intent(
                 config,
                 store,

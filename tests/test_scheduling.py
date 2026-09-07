@@ -209,6 +209,29 @@ def test_proposed_date_and_clock_values_must_match_source_evidence() -> None:
     assert "time_value_unsupported" in codes(validate(wrong_time))
 
 
+def test_hour_only_evidence_cannot_support_invented_nonzero_minutes() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T10:30:00-05:00",
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "Tuesday, September 8 from 10 AM to 11 AM",
+                }
+            ],
+        }
+    )
+    scheduling_source = source(body="Please meet Tuesday, September 8 from 10 AM to 11 AM.")
+
+    result = validate(value, scheduling_source=scheduling_source)
+
+    assert SchedulingViolation("time_value_unsupported", "proposed_times.0.start") in (
+        result.violations
+    )
+
+
 def test_end_date_must_independently_match_source_evidence() -> None:
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
@@ -266,6 +289,13 @@ def test_new_meeting_requires_high_confidence_and_no_existing_event_reference() 
     violations = codes(validate(value))
     assert "new_meeting_low_confidence" in violations
     assert "new_meeting_has_reference" in violations
+
+
+def test_new_meeting_with_explicit_ambiguity_is_rejected() -> None:
+    value = valid_result()
+    value["ambiguity_reasons"] = ["The requested date could mean two different Tuesdays."]
+
+    assert "new_meeting_ambiguous" in codes(validate(value))
 
 
 def test_unclear_requires_a_reason_and_new_meeting_requires_a_time() -> None:

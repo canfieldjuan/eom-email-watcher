@@ -628,6 +628,7 @@ def test_scheduling_transport_retry_reuses_reserved_request_identity(
         ]
     )
     first_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: first_at)
 
     first = process_scheduling_automations(cfg, store, model, now=first_at)
     after_failure = store.automation_run(admitted.run_id)
@@ -655,6 +656,30 @@ def test_scheduling_transport_retry_reuses_reserved_request_identity(
     payloads = store.automation_extraction_payloads(admitted.run_id)
     assert len(payloads) == 1
     assert payloads[0].status == "accepted"
+
+
+def test_scheduling_transport_retry_delay_starts_when_request_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel(
+        [GatewayModelError("worker_unavailable", retryable=True, retry_after_seconds=30)]
+    )
+    started_at = datetime.now(UTC)
+    failed_at = started_at + timedelta(minutes=2)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: failed_at)
+
+    process_scheduling_automations(cfg, store, model, now=started_at)
+
+    current = store.automation_run(admitted.run_id)
+    payload = store.automation_extraction_payloads(admitted.run_id)[0]
+    assert current is not None
+    assert current.updated_at == failed_at.isoformat()
+    assert payload.next_retry_at == (failed_at + timedelta(seconds=30)).isoformat()
 
 
 def test_permanent_gateway_extraction_failure_becomes_reviewable(
@@ -731,6 +756,7 @@ def test_retry_uses_the_organizer_pinned_before_account_identity_changes(
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel([ModelError("offline"), valid_scheduling_output()])
     first_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: first_at)
 
     process_scheduling_automations(cfg, store, model, now=first_at)
     store.update_mail_account_identity(
@@ -860,6 +886,47 @@ def test_canonical_check_resumes_nonactive_account_with_empty_watchlist(
     assert result["active"] is False
     assert result["automation_processed"] == 1
     assert result["automation_review_required"] == 0
+
+
+def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    reviewed = store.transition_automation_to_review(
+        admitted.run_id,
+        admitted.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    older = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    with store.connection() as db:
+        db.executemany(
+            """INSERT INTO messages (
+                    message_id, provider, account_id, provider_message_id,
+                    sender, subject, received_at, discovered_at, status, last_error
+                ) VALUES (
+                    ?1, 'gmail', 'gmail-default', ?1,
+                    'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable'
+                )""",
+            [(f"backlog-{index}", older) for index in range(25)],
+        )
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        service_module,
+        "send_review",
+        lambda *args, **kwargs: delivered.append(args[1]),
+    )
+
+    run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=True)
+
+    current = store.automation_run(admitted.run_id)
+    assert delivered == ["Meeting request"]
+    assert current is not None
+    assert current.review_notified_at is not None
+    assert current.state_version == reviewed.state_version
 
 
 def test_recovery_rechecks_authorization_before_fetch_or_model(
