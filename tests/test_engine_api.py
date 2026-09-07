@@ -35,7 +35,13 @@ from eom_email_watcher.microsoft365 import (
     Microsoft365Profile,
     MicrosoftAuthorizationRejected,
 )
-from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
+from eom_email_watcher.microsoft_calendar import (
+    CalendarDeltaChange,
+    CalendarDeltaRound,
+    CalendarEvent,
+    MicrosoftPrincipal,
+    StaleCalendarCursor,
+)
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.runtime import (
@@ -43,6 +49,7 @@ from eom_email_watcher.runtime import (
     load_runtime,
     mail_account_token_file,
     microsoft_calendar_read_token_file,
+    microsoft_calendar_token_file,
 )
 
 IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
@@ -1548,6 +1555,329 @@ def test_calendar_read_disconnect_preserves_mailbox_authorization(
     assert not calendar_token.exists()
     assert mail_token.read_text(encoding="utf-8") == "mail-read-cache"
     assert runtime.store.calendar_grant(account.account_id).state == "not_requested"
+
+
+@pytest.mark.parametrize(
+    ("profile", "authorization_name", "scope"),
+    [
+        ("read", "MicrosoftCalendarReadAuthorization", "Calendars.Read"),
+        ("proposal", "MicrosoftCalendarProposalAuthorization", "Calendars.Read.Shared"),
+        ("write", "MicrosoftCalendarWriteAuthorization", "Calendars.ReadWrite"),
+    ],
+)
+def test_calendar_profile_lifecycles_use_distinct_private_caches(
+    profile: str,
+    authorization_name: str,
+    scope: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'f' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    selected_principal = microsoft_principal()
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: selected_principal,
+    )
+
+    class AuthorizedCalendar:
+        principal = selected_principal
+
+    class Authorization:
+        @classmethod
+        def authorize_with_status(cls, credentials_file: Path, token_file: Path):
+            token_file.write_text(f"{profile}-private-cache", encoding="utf-8")
+            return AuthorizedCalendar(), True
+
+        @classmethod
+        def from_token(cls, credentials_file: Path, token_file: Path):
+            assert token_file.read_text(encoding="utf-8") == f"{profile}-private-cache"
+            return AuthorizedCalendar()
+
+    monkeypatch.setattr(engine_api, authorization_name, Authorization)
+    payload = {"provider": account.provider, "account_id": account.account_id}
+
+    connected = engine_api._response(request(config_path, f"calendar.{profile}.connect", payload))
+    status = engine_api._response(request(config_path, f"calendar.{profile}.status", payload))
+
+    assert connected["data"]["state"] == "ready"
+    assert status["data"]["available"] is True
+    assert status["data"]["scope"] == scope
+    profile_token = microsoft_calendar_token_file(runtime.config, account, profile)
+    assert profile_token.read_text(encoding="utf-8") == f"{profile}-private-cache"
+    for other in {"read", "proposal", "write"} - {profile}:
+        assert not microsoft_calendar_token_file(runtime.config, account, other).exists()
+
+    disconnected = engine_api._response(
+        request(config_path, f"calendar.{profile}.disconnect", payload)
+    )
+
+    assert disconnected["data"]["state"] == "not_requested"
+    assert not profile_token.exists()
+    assert mail_token.read_text(encoding="utf-8") == "mail-read-cache"
+
+
+def engine_calendar_event(event_id: str, subject: str) -> CalendarEvent:
+    return CalendarEvent(
+        event_id=event_id,
+        subject=subject,
+        start_date_time="2026-09-07T09:00:00.0000000",
+        start_time_zone="UTC",
+        end_date_time="2026-09-07T10:00:00.0000000",
+        end_time_zone="UTC",
+        is_all_day=False,
+        location="Office",
+    )
+
+
+def ready_calendar_runtime(
+    config_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Runtime, object, MicrosoftPrincipal]:
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'9' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    selected_principal = microsoft_principal()
+    identity = {
+        "principal_key": selected_principal.key,
+        "home_account_id": selected_principal.home_account_id,
+        "tenant_id": selected_principal.tenant_id,
+        "object_id": selected_principal.object_id,
+        "email_address": selected_principal.email_address,
+    }
+    runtime.store.set_calendar_grant(account.account_id, "read", "ready", **identity)
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    microsoft_calendar_read_token_file(runtime.config, account).write_text(
+        "calendar-read-cache",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: selected_principal,
+    )
+
+    class Authorization:
+        principal = selected_principal
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "from_token",
+        lambda *args: Authorization(),
+    )
+    return runtime, account, selected_principal
+
+
+def test_calendar_sync_and_offline_read_apply_incremental_tombstones(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    runtime, account, _principal = ready_calendar_runtime(config_path, monkeypatch)
+    start = "2026-09-01T00:00:00Z"
+    end = "2026-10-01T00:00:00Z"
+    cursors: list[str | None] = []
+
+    def delta(authorization, window_start: str, window_end: str, *, cursor=None):
+        cursors.append(cursor)
+        if cursor is None:
+            return CalendarDeltaRound(
+                (
+                    CalendarDeltaChange(
+                        "event-1",
+                        engine_calendar_event("event-1", "Planning"),
+                    ),
+                ),
+                "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=one",
+            )
+        return CalendarDeltaRound(
+            (
+                CalendarDeltaChange("event-1", None),
+                CalendarDeltaChange("event-2", engine_calendar_event("event-2", "Review")),
+            ),
+            "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=two",
+        )
+
+    monkeypatch.setattr(engine_api, "calendar_delta_round", delta)
+    payload = {
+        "provider": account.provider,
+        "account_id": account.account_id,
+        "window_start": start,
+        "window_end": end,
+    }
+
+    first = engine_api._response(request(config_path, "calendar.read.sync", payload))
+    first_read = engine_api._response(request(config_path, "calendar.read.events", payload))
+    second = engine_api._response(request(config_path, "calendar.read.sync", payload))
+    second_read = engine_api._response(request(config_path, "calendar.read.events", payload))
+
+    assert first["data"]["event_count"] == 1
+    assert first_read["data"]["events"][0]["subject"] == "Planning"
+    assert second["data"]["event_count"] == 1
+    assert second_read["data"]["events"][0]["event_id"] == "event-2"
+    assert cursors == [None, cursors[1]]
+    assert cursors[1] is not None and cursors[1].endswith("one")
+    assert runtime.store.calendar_window(account.account_id).cursor.endswith("two")  # type: ignore[union-attr]
+
+
+def test_calendar_sync_persists_revoked_grant_after_graph_rejects_read_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    runtime, account, _principal = ready_calendar_runtime(config_path, monkeypatch)
+    monkeypatch.setattr(
+        engine_api,
+        "calendar_delta_round",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MicrosoftAuthorizationRejected("Microsoft rejected the calendar read authorization")
+        ),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.sync",
+            {
+                "provider": account.provider,
+                "account_id": account.account_id,
+                "window_start": "2026-09-01T00:00:00Z",
+                "window_end": "2026-10-01T00:00:00Z",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "calendar_authorization_revoked"
+    assert runtime.store.calendar_grant(account.account_id).state == "revoked"
+
+
+def test_calendar_stale_replacement_failure_preserves_completed_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    runtime, account, selected_principal = ready_calendar_runtime(config_path, monkeypatch)
+    start = "2026-09-01T00:00:00.000000Z"
+    end = "2026-10-01T00:00:00.000000Z"
+    runtime.store.commit_calendar_round(
+        account_id=account.account_id,
+        principal_key=selected_principal.key,
+        window_start=start,
+        window_end=end,
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=old",
+        changes=(
+            engine_api.CalendarEventMutation(
+                "event-1",
+                engine_api.CalendarEventProjection(
+                    event_id="event-1",
+                    subject="Preserved",
+                    start_date_time="2026-09-07T09:00:00.0000000",
+                    start_time_zone="UTC",
+                    end_date_time="2026-09-07T10:00:00.0000000",
+                    end_time_zone="UTC",
+                    is_all_day=False,
+                    location="Office",
+                ),
+            ),
+        ),
+        replace=True,
+    )
+    calls: list[str | None] = []
+
+    def delta(authorization, window_start: str, window_end: str, *, cursor=None):
+        calls.append(cursor)
+        if cursor is not None:
+            raise StaleCalendarCursor("expired")
+        raise Microsoft365Error("replacement unavailable")
+
+    monkeypatch.setattr(engine_api, "calendar_delta_round", delta)
+    payload = {
+        "provider": account.provider,
+        "account_id": account.account_id,
+        "window_start": start,
+        "window_end": end,
+    }
+
+    response = engine_api._response(request(config_path, "calendar.read.sync", payload))
+
+    assert response["error"]["code"] == "calendar_error"
+    assert len(calls) == 2 and calls[0] is not None and calls[1] is None
+    assert runtime.store.calendar_window(account.account_id).cursor.endswith("old")  # type: ignore[union-attr]
+    assert runtime.store.calendar_events(account.account_id)[0].subject == "Preserved"
+
+
+def test_calendar_events_response_limit_accepts_exact_utf8_size_and_rejects_one_less(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    runtime, account, selected_principal = ready_calendar_runtime(config_path, monkeypatch)
+    start = "2026-09-01T00:00:00.000000Z"
+    end = "2026-10-01T00:00:00.000000Z"
+    runtime.store.commit_calendar_round(
+        account_id=account.account_id,
+        principal_key=selected_principal.key,
+        window_start=start,
+        window_end=end,
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=one",
+        changes=(
+            engine_api.CalendarEventMutation(
+                "event-1",
+                engine_calendar_event("event-1", "Plan 🗓️"),
+            ),
+        ),
+        replace=True,
+    )
+    calendar_request = request(
+        config_path,
+        "calendar.read.events",
+        {
+            "provider": account.provider,
+            "account_id": account.account_id,
+            "window_start": start,
+            "window_end": end,
+        },
+    )
+    response = engine_api._response(calendar_request)
+    encoded_size = len(
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+    monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size)
+    assert engine_api._response(calendar_request)["ok"] is True
+
+    monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size - 1)
+    rejected = engine_api._response(calendar_request)
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "calendar_result_too_large"
 
 
 def test_mail_account_connect_installs_private_imap_credentials_and_baseline(
