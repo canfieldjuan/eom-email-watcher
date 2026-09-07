@@ -61,7 +61,11 @@ from .imap import (
     load_credentials,
     write_credentials,
 )
-from .locking import operation_lock, operation_lock_supported
+from .locking import (
+    operation_lock,
+    operation_lock_supported,
+    operation_lock_uses_soft_fallback,
+)
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -905,7 +909,7 @@ def _calendar_read_status(request: dict[str, object]) -> dict[str, object]:
 
     runtime = _runtime(request)
     lock_path = _production_check_lock_path(runtime.config)
-    if not operation_lock_supported(lock_path):
+    if operation_lock_uses_soft_fallback(lock_path):
         # Mutations fail closed on this platform, so the read cannot race one.
         return status(runtime)
     with operation_lock(lock_path, "Another mailbox operation is already running"):
@@ -994,6 +998,12 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     "calendar_principal_mismatch",
                     "The authorized calendar does not match the existing calendar principal",
                 )
+            if not _calendar_entitlement_active():
+                _restore_calendar_grant(runtime, account.account_id, previous)
+                raise ApiError(
+                    "calendar_entitlement_required",
+                    "Calendar setup requires an active capability-exchange entitlement",
+                )
             ready_identity = {
                 "principal_key": principal.key,
                 "home_account_id": principal.home_account_id,
@@ -1029,12 +1039,6 @@ def _calendar_read_connect(request: dict[str, object]) -> dict[str, object]:
                     "calendar_error",
                     "Microsoft calendar authorization could not be saved; retry",
                 ) from exc
-            runtime.store.set_calendar_grant(
-                account.account_id,
-                CALENDAR_READ_PROFILE,
-                "ready",
-                **ready_identity,
-            )
         return _calendar_read_status_data(runtime, account)
 
     return _with_mail_account_mutation(request, connect)
