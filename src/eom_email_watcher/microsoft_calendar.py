@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
-import queue
 import re
-import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -60,6 +59,10 @@ _RFC3339_INSTANT = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z"
 )
 _GRAPH_LOCAL_DATETIME = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?\Z")
+
+
+def _calendar_monotonic() -> float:
+    return time.monotonic()
 
 
 class MicrosoftCalendarConsentPending(Microsoft365Error):
@@ -290,7 +293,7 @@ class MicrosoftCalendarAuthorization:
         principal: MicrosoftPrincipal,
         access_token: str,
         *,
-        http_client: httpx.Client | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ):
         # httpx logs full request URLs at INFO; calendar delta URLs contain opaque tokens.
         logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -410,13 +413,13 @@ def _safe_calendar_continuation(url: object, token_name: str) -> str:
 
 
 def _calendar_round_time_remaining(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
+    remaining = deadline - _calendar_monotonic()
     if remaining <= 0:
         raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit")
     return remaining
 
 
-def _bounded_graph_document(
+async def _bounded_graph_document(
     response: httpx.Response,
     deadline: float,
     remaining_round_bytes: int,
@@ -440,7 +443,7 @@ def _bounded_graph_document(
         if parsed_length > remaining_round_bytes:
             raise Microsoft365Error("Microsoft Graph calendar round exceeded its byte limit")
     content = bytearray()
-    for chunk in response.iter_bytes():
+    async for chunk in response.aiter_bytes():
         _calendar_round_time_remaining(deadline)
         if len(content) + len(chunk) > MAX_CALENDAR_PAGE_BYTES:
             raise Microsoft365Error("Microsoft Graph calendar response exceeded its byte limit")
@@ -457,77 +460,53 @@ def _bounded_graph_document(
     return document, len(content)
 
 
-def _calendar_graph_page_before_deadline(
-    client: httpx.Client,
+async def _calendar_graph_page_before_deadline(
+    client: httpx.AsyncClient,
     authorization: MicrosoftCalendarReadAuthorization,
     url: str,
     cursor_request: bool,
     deadline: float,
     remaining_round_bytes: int,
 ) -> tuple[dict[str, Any], int]:
-    """Open and consume one page behind the absolute round deadline."""
-    outcome: queue.Queue[tuple[tuple[dict[str, Any], int] | None, BaseException | None]] = (
-        queue.Queue(maxsize=1)
-    )
-
-    def read_page() -> None:
-        try:
-            with client.stream(
-                "GET",
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "identity",
-                    "Authorization": f"Bearer {authorization._access_token}",
-                    "Prefer": f'IdType="ImmutableId", odata.maxpagesize={CALENDAR_PAGE_SIZE}',
-                },
-                follow_redirects=False,
-                timeout=min(GRAPH_TIMEOUT_SECONDS, _calendar_round_time_remaining(deadline)),
-            ) as response:
-                if response.status_code == 401:
-                    raise MicrosoftAuthorizationRejected(
-                        "Microsoft rejected the calendar read authorization"
-                    )
-                if cursor_request and response.status_code == 410:
-                    raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
-                if response.status_code == 429 or response.status_code >= 500:
-                    raise Microsoft365Error(
-                        f"Microsoft Graph calendar is temporarily unavailable "
-                        f"(HTTP {response.status_code}); retry"
-                    )
-                document = _bounded_graph_document(
-                    response,
-                    deadline,
-                    remaining_round_bytes,
-                )
-                error_code = _calendar_error_code(document[0])
-                if cursor_request and error_code in {
-                    "syncstatenotfound",
-                    "errorsyncstatenotfound",
-                }:
-                    raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
-                if not response.is_success:
-                    raise Microsoft365Error(
-                        f"Microsoft Graph calendar request failed (HTTP {response.status_code})"
-                    )
-            outcome.put((document, None))
-        except BaseException as exc:
-            outcome.put((None, exc))
-
-    reader = threading.Thread(
-        target=read_page,
-        name="microsoft-calendar-page-reader",
-        daemon=True,
-    )
-    reader.start()
-    try:
-        document, error = outcome.get(timeout=_calendar_round_time_remaining(deadline))
-    except queue.Empty as exc:
-        raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit") from exc
-    _calendar_round_time_remaining(deadline)
-    if error is not None:
-        raise error
-    assert document is not None
+    """Open and consume one page on the cancellable round task."""
+    async with client.stream(
+        "GET",
+        url,
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Authorization": f"Bearer {authorization._access_token}",
+            "Prefer": f'IdType="ImmutableId", odata.maxpagesize={CALENDAR_PAGE_SIZE}',
+        },
+        follow_redirects=False,
+        timeout=min(GRAPH_TIMEOUT_SECONDS, _calendar_round_time_remaining(deadline)),
+    ) as response:
+        if response.status_code == 401:
+            raise MicrosoftAuthorizationRejected(
+                "Microsoft rejected the calendar read authorization"
+            )
+        if cursor_request and response.status_code == 410:
+            raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
+        if response.status_code == 429 or response.status_code >= 500:
+            raise Microsoft365Error(
+                f"Microsoft Graph calendar is temporarily unavailable "
+                f"(HTTP {response.status_code}); retry"
+            )
+        document = await _bounded_graph_document(
+            response,
+            deadline,
+            remaining_round_bytes,
+        )
+        error_code = _calendar_error_code(document[0])
+        if cursor_request and error_code in {
+            "syncstatenotfound",
+            "errorsyncstatenotfound",
+        }:
+            raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
+        if not response.is_success:
+            raise Microsoft365Error(
+                f"Microsoft Graph calendar request failed (HTTP {response.status_code})"
+            )
     return document
 
 
@@ -659,7 +638,7 @@ def _calendar_change(value: object) -> CalendarDeltaChange:
     return CalendarDeltaChange(event_id, _calendar_event(value, event_id))
 
 
-def calendar_delta_round(
+async def _calendar_delta_round(
     authorization: MicrosoftCalendarReadAuthorization,
     window_start: str,
     window_end: str,
@@ -672,19 +651,19 @@ def calendar_delta_round(
         else _calendar_delta_url(window_start, window_end)
     )
     owned_client = authorization._http_client is None
-    client = authorization._http_client or httpx.Client(timeout=GRAPH_TIMEOUT_SECONDS)
+    client = authorization._http_client or httpx.AsyncClient(timeout=GRAPH_TIMEOUT_SECONDS)
     changes: list[CalendarDeltaChange] = []
     total_bytes = 0
     pages = 0
     cursor_request = cursor is not None
-    deadline = time.monotonic() + MAX_CALENDAR_ROUND_SECONDS
+    deadline = _calendar_monotonic() + MAX_CALENDAR_ROUND_SECONDS
     try:
         while True:
             if pages >= MAX_CALENDAR_DELTA_PAGES:
                 raise Microsoft365Error("Microsoft Graph calendar round exceeded its page limit")
             pages += 1
             try:
-                document, response_bytes = _calendar_graph_page_before_deadline(
+                document, response_bytes = await _calendar_graph_page_before_deadline(
                     client,
                     authorization,
                     current,
@@ -725,4 +704,27 @@ def calendar_delta_round(
             )
     finally:
         if owned_client:
-            client.close()
+            await client.aclose()
+
+
+def calendar_delta_round(
+    authorization: MicrosoftCalendarReadAuthorization,
+    window_start: str,
+    window_end: str,
+    *,
+    cursor: str | None = None,
+) -> CalendarDeltaRound:
+    try:
+        return asyncio.run(
+            asyncio.wait_for(
+                _calendar_delta_round(
+                    authorization,
+                    window_start,
+                    window_end,
+                    cursor=cursor,
+                ),
+                timeout=MAX_CALENDAR_ROUND_SECONDS,
+            )
+        )
+    except TimeoutError as exc:
+        raise Microsoft365Error("Microsoft Graph calendar round exceeded its time limit") from exc

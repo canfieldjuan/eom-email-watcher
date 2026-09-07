@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -472,7 +473,7 @@ def test_calendar_delta_round_paginates_and_preserves_ordered_changes() -> None:
             json={"value": [calendar_event("event-1")], "@odata.nextLink": next_link},
         )
 
-    client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),
         "private-access",
@@ -514,7 +515,7 @@ def test_calendar_delta_rejects_malformed_event_projection_fields(
 ) -> None:
     event = calendar_event("event-1")
     event[field] = value
-    client = httpx.Client(
+    client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
                 200,
@@ -576,7 +577,7 @@ def test_calendar_text_accepts_unicode_formatting_and_rejects_unsafe_controls() 
     ],
 )
 def test_calendar_delta_rejects_hostile_cursor_before_http(cursor: str) -> None:
-    client = httpx.Client(
+    client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: pytest.fail("HTTP request was reached"))
     )
     authorization = MicrosoftCalendarReadAuthorization(
@@ -596,7 +597,7 @@ def test_calendar_delta_rejects_hostile_cursor_before_http(cursor: str) -> None:
 
 def test_calendar_delta_reports_stale_cursor() -> None:
     cursor = f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView/delta?%24deltatoken=old"
-    client = httpx.Client(
+    client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(
                 410,
@@ -634,7 +635,7 @@ def test_calendar_delta_classifies_bounded_error_status_before_json(
     message: str,
 ) -> None:
     cursor = f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView/delta?%24deltatoken=old"
-    client = httpx.Client(
+    client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(status, content=b"not-json"))
     )
     authorization = MicrosoftCalendarReadAuthorization(
@@ -668,7 +669,7 @@ def test_calendar_delta_classifies_bounded_error_status_before_json(
 def test_calendar_delta_requires_exactly_one_well_typed_continuation(
     document: dict[str, object],
 ) -> None:
-    client = httpx.Client(
+    client = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=document))
     )
     authorization = MicrosoftCalendarReadAuthorization(
@@ -690,16 +691,20 @@ def test_calendar_page_byte_limit_checks_exact_boundary_before_json() -> None:
     over_limit = httpx.Response(200, content=b" " * (MAX_CALENDAR_PAGE_BYTES + 1))
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="not valid JSON"):
-        microsoft_calendar._bounded_graph_document(
-            at_limit,
-            float("inf"),
-            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        asyncio.run(
+            microsoft_calendar._bounded_graph_document(
+                at_limit,
+                float("inf"),
+                microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+            )
         )
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="exceeded its byte limit"):
-        microsoft_calendar._bounded_graph_document(
-            over_limit,
-            float("inf"),
-            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        asyncio.run(
+            microsoft_calendar._bounded_graph_document(
+                over_limit,
+                float("inf"),
+                microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+            )
         )
 
 
@@ -710,18 +715,20 @@ def test_calendar_page_stream_enforces_absolute_round_deadline(
         headers: dict[str, str] = {}
 
         @staticmethod
-        def iter_bytes():
+        async def aiter_bytes():
             yield b'{"value":'
             yield b"[]}"
 
     clock = iter((0.0, microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS + 1.0))
-    monkeypatch.setattr(microsoft_calendar.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(microsoft_calendar, "_calendar_monotonic", lambda: next(clock))
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
-        microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
-            SlowResponse(),
-            microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS,
-            microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+        asyncio.run(
+            microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
+                SlowResponse(),
+                microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS,
+                microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+            )
         )
 
 
@@ -730,96 +737,81 @@ def test_calendar_page_stream_enforces_remaining_round_byte_limit() -> None:
         headers: dict[str, str] = {}
 
         @staticmethod
-        def iter_bytes():
+        async def aiter_bytes():
             yield b'{"value":'
             yield b"[]}"
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="round exceeded its byte"):
-        microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
-            StreamingResponse(),
-            float("inf"),
-            len(b'{"value":[]') - 1,
+        asyncio.run(
+            microsoft_calendar._bounded_graph_document(  # type: ignore[arg-type]
+                StreamingResponse(),
+                float("inf"),
+                len(b'{"value":[]') - 1,
+            )
         )
 
 
 def test_calendar_round_deadline_interrupts_wait_for_response_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release = threading.Event()
-    finished = threading.Event()
+    cancelled = threading.Event()
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        release.wait()
-        finished.set()
-        return httpx.Response(
-            200,
-            json={
-                "value": [],
-                "@odata.deltaLink": (
-                    f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView/delta?%24deltatoken=done"
-                ),
-            },
-        )
+    async def handler(request: httpx.Request) -> httpx.Response:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
 
     monkeypatch.setattr(microsoft_calendar, "MAX_CALENDAR_ROUND_SECONDS", 0.05)
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),
         "private-access",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     started_at = time.monotonic()
-    try:
-        with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
-            calendar_delta_round(
-                authorization,
-                "2026-09-01T00:00:00.000000Z",
-                "2026-10-01T00:00:00.000000Z",
-            )
-    finally:
-        release.set()
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
+        calendar_delta_round(
+            authorization,
+            "2026-09-01T00:00:00.000000Z",
+            "2026-10-01T00:00:00.000000Z",
+        )
 
     assert time.monotonic() - started_at < 1.0
-    assert finished.wait(1.0)
+    assert cancelled.is_set()
 
 
 def test_calendar_round_deadline_interrupts_wait_for_next_body_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release = threading.Event()
-    finished = threading.Event()
+    cancelled = threading.Event()
 
-    class BlockingBody(httpx.SyncByteStream):
-        def __iter__(self):
+    class BlockingBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
             yield b'{"value":'
-            release.wait()
-            finished.set()
-            yield (
-                b'[],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/'
-                b'me/calendarView/delta?%24deltatoken=done"}'
-            )
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=BlockingBody())
 
     monkeypatch.setattr(microsoft_calendar, "MAX_CALENDAR_ROUND_SECONDS", 0.05)
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),
         "private-access",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     started_at = time.monotonic()
-    try:
-        with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
-            calendar_delta_round(
-                authorization,
-                "2026-09-01T00:00:00.000000Z",
-                "2026-10-01T00:00:00.000000Z",
-            )
-    finally:
-        release.set()
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
+        calendar_delta_round(
+            authorization,
+            "2026-09-01T00:00:00.000000Z",
+            "2026-10-01T00:00:00.000000Z",
+        )
 
     assert time.monotonic() - started_at < 1.0
-    assert finished.wait(1.0)
+    assert cancelled.is_set()
 
 
 def test_calendar_delta_disables_and_rejects_response_compression() -> None:
@@ -836,7 +828,7 @@ def test_calendar_delta_disables_and_rejects_response_compression() -> None:
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),
         "private-access",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="compressed calendar response"):
@@ -878,7 +870,7 @@ def test_calendar_delta_page_limit_accepts_64_and_rejects_page_65() -> None:
                 },
             )
 
-        client = httpx.Client(transport=httpx.MockTransport(handler))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         authorization = MicrosoftCalendarReadAuthorization(
             principal(),
             "private-access",
@@ -931,7 +923,7 @@ def test_calendar_delta_entry_limit_accepts_3200_and_rejects_3201() -> None:
             values = [calendar_event(f"event-{calls}-{index}") for index in range(entry_count)]
             return httpx.Response(200, json={"value": values, **continuation})
 
-        client = httpx.Client(transport=httpx.MockTransport(handler))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         return MicrosoftCalendarReadAuthorization(
             principal(),
             "private-access",
@@ -971,7 +963,11 @@ def test_calendar_round_byte_limit_accepts_16_mib_and_rejects_one_page_more(
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, content=b"{}")
 
-        def bounded(response: httpx.Response, deadline: float, remaining_round_bytes: int):
+        async def bounded(
+            response: httpx.Response,
+            deadline: float,
+            remaining_round_bytes: int,
+        ):
             del deadline, response
             nonlocal calls
             calls += 1
@@ -999,7 +995,7 @@ def test_calendar_round_byte_limit_accepts_16_mib_and_rejects_one_page_more(
         return MicrosoftCalendarReadAuthorization(
             principal(),
             "private-access",
-            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
 
     accepted = calendar_delta_round(
@@ -1044,11 +1040,11 @@ def test_calendar_round_deadline_stops_pagination_before_another_request(
             microsoft_calendar.MAX_CALENDAR_ROUND_SECONDS + 1.0,
         )
     )
-    monkeypatch.setattr(microsoft_calendar.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(microsoft_calendar, "_calendar_monotonic", lambda: next(clock))
     authorization = MicrosoftCalendarReadAuthorization(
         principal(),
         "private-access",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
 
     with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
