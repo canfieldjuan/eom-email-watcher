@@ -354,6 +354,40 @@ def test_watcher_requires_full_scheduling_automation_authorization(
         assert grant.state == "ready"
 
 
+def test_watcher_skips_calendar_authorization_for_non_scheduling_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = f"microsoft365-{'b' * 32}"
+    store.register_mail_account(
+        MICROSOFT365_PROVIDER,
+        account_id,
+        display_name="Microsoft 365",
+        address="user@example.com",
+        active=True,
+    )
+    store.set_state("100", provider=MICROSOFT365_PROVIDER, account_id=account_id)
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *args: pytest.fail("Informational analysis reached automation authorization"),
+    )
+
+    result = Watcher(
+        cfg,
+        store,
+        MailboxSession(MICROSOFT365_PROVIDER, account_id, FreshGmail()),
+        FakeModel(),
+    ).check()
+
+    assert result["summarized"] == 1
+    message_id = scoped_message_id(MICROSOFT365_PROVIDER, account_id, "allowed")
+    assert store.automation_run_for_message(message_id) is None
+
+
 def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)

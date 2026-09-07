@@ -350,7 +350,12 @@ class MicrosoftCalendarAuthorization:
             raise MicrosoftAuthorizationRejected(
                 "Microsoft calendar grant does not match its authorized principal"
             )
-        mailbox_principal = microsoft_mailbox_principal(credentials_file, mailbox_token_file)
+        try:
+            mailbox_principal = microsoft_mailbox_principal(credentials_file, mailbox_token_file)
+        except MicrosoftAuthorizationRejected as exc:
+            raise Microsoft365Error(
+                "Microsoft mailbox authorization is unavailable; retry"
+            ) from exc
         if mailbox_principal.key != expected_principal_key:
             raise MicrosoftAuthorizationRejected(
                 "Microsoft calendar grant does not match the mailbox principal"

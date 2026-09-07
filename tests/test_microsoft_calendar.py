@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from eom_email_watcher import microsoft_calendar
-from eom_email_watcher.microsoft365 import MicrosoftAuthorizationRejected
+from eom_email_watcher.microsoft365 import Microsoft365Error, MicrosoftAuthorizationRejected
 from eom_email_watcher.microsoft_calendar import (
     CALENDAR_PAGE_SIZE,
     CALENDAR_READ_SCOPES,
@@ -282,6 +282,36 @@ def test_calendar_authorization_requires_matching_grant_and_mailbox_principals(
                 mailbox_token,
                 principal().key,
             )
+
+
+def test_calendar_authorization_preserves_proposal_grant_on_mailbox_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access-token",
+    )
+    monkeypatch.setattr(
+        MicrosoftCalendarProposalAuthorization,
+        "from_token",
+        classmethod(lambda cls, credentials_file, token_file: authorization),
+    )
+
+    def reject_mailbox(credentials_file: Path, token_file: Path) -> MicrosoftPrincipal:
+        raise MicrosoftAuthorizationRejected("Mailbox cache was revoked")
+
+    monkeypatch.setattr(microsoft_calendar, "microsoft_mailbox_principal", reject_mailbox)
+
+    with pytest.raises(Microsoft365Error) as raised:
+        MicrosoftCalendarProposalAuthorization.from_matching_tokens(
+            tmp_path / "microsoft.json",
+            tmp_path / "proposal-cache.json",
+            tmp_path / "mailbox-cache.json",
+            principal().key,
+        )
+
+    assert not isinstance(raised.value, MicrosoftAuthorizationRejected)
 
 
 def test_cached_mailbox_principal_lookup_does_not_construct_a_token_client(

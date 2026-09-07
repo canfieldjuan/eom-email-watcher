@@ -370,14 +370,15 @@ class Watcher:
                     request_id=request_id,
                 )
                 if not dry_run:
+                    scheduling_principal_key = (
+                        _scheduling_automation_principal(self.config, self.store, message)
+                        if analysis.category == "scheduling"
+                        else None
+                    )
                     self.store.mark_analyzed(
                         message.message_id,
                         analysis.model_dump(),
-                        scheduling_automation_principal_key=_scheduling_automation_principal(
-                            self.config,
-                            self.store,
-                            message,
-                        ),
+                        scheduling_automation_principal_key=scheduling_principal_key,
                     )
                 summarized += 1
                 if deliver_notifications:
