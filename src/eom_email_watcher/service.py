@@ -263,6 +263,14 @@ def process_scheduling_automations(
                 continue
             try:
                 with mailbox_polling_session(mailbox.gateway):
+                    metadata = mailbox.gateway.metadata(work.provider_message_id)
+                    if (
+                        metadata.message_id != work.provider_message_id
+                        or "INBOX" not in metadata.labels
+                    ):
+                        raise MailboxMessageUnavailable(
+                            "Scheduling source is no longer in the inbox"
+                        )
                     content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
             except MailboxMessageUnavailable as exc:
                 capacity_used += 1

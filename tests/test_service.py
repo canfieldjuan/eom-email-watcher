@@ -146,6 +146,17 @@ class SchedulingModel(FakeModel):
 class AutomationGateway:
     body = "Meet jane@example.com on September 8, 2026 from 10:00 to 10:30 AM."
 
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return MessageMetadata(
+            message_id,
+            None,
+            "trusted@example.com",
+            "Trusted",
+            "Meeting request",
+            datetime.now(UTC).isoformat(),
+            frozenset({"INBOX"}),
+        )
+
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         assert message_id == "schedule-1"
         return MessageContent(self.body[:body_char_limit], (), ())
@@ -159,6 +170,14 @@ class AnyAutomationGateway(AutomationGateway):
 class MissingAutomationSource(AutomationGateway):
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         raise MessageUnavailable("deleted")
+
+
+class MovedAutomationSource(AutomationGateway):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise MessageUnavailable("no longer in inbox")
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        pytest.fail("A source outside the inbox must not be fetched")
 
 
 class FailingAutomationProvider(AutomationGateway):
@@ -897,6 +916,28 @@ def test_missing_scheduling_source_becomes_reviewable_terminal_outcome(
     assert result.review_required == 1
     assert model.extraction_calls == []
     assert any(intent.kind == "automation_review" for intent in store.notification_intents())
+
+
+def test_scheduling_source_moved_out_of_inbox_becomes_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MovedAutomationSource())
+    model = ExtractionModel([])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert result.review_required == 1
+    assert model.extraction_calls == []
 
 
 def test_canonical_check_resumes_nonactive_account_with_empty_watchlist(

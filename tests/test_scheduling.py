@@ -264,6 +264,27 @@ def test_meridiem_qualified_clocks_do_not_match_24_hour_values() -> None:
     )
 
 
+def test_trailing_meridiem_cannot_change_only_the_range_end() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T10:00:00-05:00",
+            "end": "2026-09-08T23:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "September 8 from 10:00 to 11:00 PM",
+                }
+            ],
+        }
+    )
+    scheduling_source = source(body="September 8 from 10:00 to 11:00 PM")
+
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
 def test_range_endpoints_cannot_borrow_from_separate_alternatives() -> None:
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
@@ -387,6 +408,60 @@ def test_comma_separated_options_keep_dates_bound_to_their_time_pairs() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "quote",
+        "unsupported_start",
+        "unsupported_end",
+        "supported_start",
+        "supported_end",
+    ),
+    [
+        (
+            "tomorrow from 10:00 to 11:00, 2026-09-09 from 14:00 to 15:00",
+            "2026-09-08T14:00:00-05:00",
+            "2026-09-08T15:00:00-05:00",
+            "2026-09-09T14:00:00-05:00",
+            "2026-09-09T15:00:00-05:00",
+        ),
+        (
+            "2026-09-09 from 14:00 to 15:00, tomorrow from 10:00 to 11:00",
+            "2026-09-09T10:00:00-05:00",
+            "2026-09-09T11:00:00-05:00",
+            "2026-09-08T10:00:00-05:00",
+            "2026-09-08T11:00:00-05:00",
+        ),
+    ],
+)
+def test_relative_and_iso_comma_options_keep_dates_bound_to_their_time_pairs(
+    quote: str,
+    unsupported_start: str,
+    unsupported_end: str,
+    supported_start: str,
+    supported_end: str,
+) -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": unsupported_start,
+            "end": unsupported_end,
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    scheduling_source = source(body=quote)
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {"start": supported_start, "end": supported_end}
+    )
+    assert "time_range_unsupported" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
 def test_explicit_source_zone_overrides_configured_default() -> None:
     value = valid_result()
     value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
@@ -424,6 +499,37 @@ def test_spelled_source_zone_overrides_configured_default() -> None:
     )
 
 
+def test_timezone_must_come_from_the_matching_time_option() -> None:
+    quote = (
+        "September 8 from 10:00 to 10:30 Central, or "
+        "September 9 from 10:00 to 10:30 Eastern"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T10:00:00-04:00",
+            "end": "2026-09-08T10:30:00-04:00",
+            "timezone": "America/New_York",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    assert "timezone_unsupported" in codes(
+        validate(value, scheduling_source=source(body=quote))
+    )
+
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T10:00:00-05:00",
+            "end": "2026-09-08T10:30:00-05:00",
+            "timezone": "America/Chicago",
+        }
+    )
+    assert "timezone_unsupported" not in codes(
+        validate(value, scheduling_source=source(body=quote))
+    )
+
+
 def test_unsupported_composite_zone_is_not_treated_as_us_central() -> None:
     value = valid_result()
     value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
@@ -443,6 +549,19 @@ def test_unsupported_composite_zone_is_not_treated_as_us_central() -> None:
 
 @pytest.mark.parametrize("zone_label", ["Japan Standard Time", "British Summer Time"])
 def test_unsupported_explicit_zone_labels_fail_closed(zone_label: str) -> None:
+    value = valid_result()
+    quote = f"September 8, 2026 from 10:00 to 10:30 {zone_label}"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": quote}
+    ]
+
+    assert "timezone_unsupported" in codes(
+        validate(value, scheduling_source=source(body=quote))
+    )
+
+
+@pytest.mark.parametrize("zone_label", ["JST", "BST", "CET"])
+def test_unsupported_explicit_zone_abbreviations_fail_closed(zone_label: str) -> None:
     value = valid_result()
     quote = f"September 8, 2026 from 10:00 to 10:30 {zone_label}"
     value["proposed_times"][0]["evidence"] = [  # type: ignore[index]

@@ -394,30 +394,30 @@ def _time_source_matches(
     *,
     zone: ZoneInfo,
 ) -> tuple[re.Match[str], ...]:
-    text = evidence_text.casefold()
     pattern = "|".join(f"(?:{item})" for item in _time_patterns(value, zone=zone))
-    return tuple(re.finditer(pattern, text))
+    return tuple(re.finditer(pattern, evidence_text, re.IGNORECASE))
 
 
 def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneInfo) -> bool:
     return bool(_time_source_matches(value, evidence_text, zone=zone))
 
 
-def _range_has_source_support(
+def _range_source_options(
     start: datetime,
     end: datetime,
     evidence_text: str,
     *,
     zone: ZoneInfo,
     source: SchedulingSource,
-) -> bool:
+) -> tuple[str, ...]:
     option_delimiters = tuple(
         re.finditer(
-            r"(?:\bor\b|;|\n|,\s*(?=(?:[A-Za-z]+\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            r"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{4}-\d{2}-\d{2}|[A-Za-z]+\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
             evidence_text,
             re.IGNORECASE,
         )
     )
+    supported_options: list[str] = []
     for start_match in _time_source_matches(start, evidence_text, zone=zone):
         for end_match in _time_source_matches(end, evidence_text, zone=zone):
             if end_match.start() < start_match.end():
@@ -429,6 +429,11 @@ def _range_has_source_support(
                 re.IGNORECASE,
             ):
                 continue
+            end_meridiem = re.search(r"\b(am|pm)\b", end_match.group(), re.IGNORECASE)
+            if end_meridiem and not re.search(r"\b(?:am|pm)\b", start_match.group(), re.IGNORECASE):
+                expected = "am" if start.astimezone(zone).hour < 12 else "pm"
+                if end_meridiem.group(1).casefold() != expected:
+                    continue
             option_start = max(
                 (match.end() for match in option_delimiters if match.end() <= start_match.start()),
                 default=0,
@@ -447,8 +452,8 @@ def _range_has_source_support(
                 )
                 for value in (start, end)
             ):
-                return True
-    return False
+                supported_options.append(option_text)
+    return tuple(supported_options)
 
 
 _ZONE_OFFSETS = {
@@ -503,6 +508,12 @@ def _explicit_timezones(
             re.IGNORECASE,
         )
     }
+    for abbreviation in re.findall(
+        r"(?<!\d)\d{1,2}(?::\d{2})?(?:\s*(?:AM|PM))?\s+([A-Z]{2,5})(?![A-Za-z])",
+        evidence_text,
+    ):
+        if abbreviation.casefold() not in _ZONE_OFFSETS and abbreviation not in {"AM", "PM"}:
+            unsupported_label = True
     for phrase in re.findall(
         r"\b(?:eastern|central|mountain|pacific)(?:\s+[A-Za-z]+){0,3}\s+time\b",
         evidence_text,
@@ -569,7 +580,6 @@ def _time_violations(
     except (ValueError, ZoneInfoNotFoundError):
         return [SchedulingViolation("timezone_unknown", f"{path}.timezone")]
     evidence_texts = tuple(evidence.quote for evidence in item.evidence)
-    evidence_text = "\n".join(evidence_texts)
     for label, value in (("start", start), ("end", end)):
         offsets = _wall_time_offsets(value, zone)
         if not offsets:
@@ -593,17 +603,22 @@ def _time_violations(
             violations.append(SchedulingViolation("time_date_unsupported", f"{path}.{label}"))
         if not any(_time_has_source_support(value, text, zone=zone) for text in evidence_texts):
             violations.append(SchedulingViolation("time_value_unsupported", f"{path}.{label}"))
-    if not any(
-        _range_has_source_support(start, end, text, zone=zone, source=source)
+    matching_options = tuple(
+        option
         for text in evidence_texts
-    ):
+        for option in _range_source_options(start, end, text, zone=zone, source=source)
+    )
+    if not matching_options:
         violations.append(SchedulingViolation("time_range_unsupported", path))
-    if not _timezone_has_source_support(
-        item.timezone,
-        evidence_text,
-        source=source,
-        start=start,
-        end=end,
+    elif not any(
+        _timezone_has_source_support(
+            item.timezone,
+            option,
+            source=source,
+            start=start,
+            end=end,
+        )
+        for option in matching_options
     ):
         violations.append(SchedulingViolation("timezone_unsupported", f"{path}.timezone"))
     if start.astimezone(UTC) >= end.astimezone(UTC):

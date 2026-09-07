@@ -410,8 +410,11 @@ def test_gateway_rejects_mismatched_response_envelope(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="required envelope"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 @pytest.mark.parametrize("http_status", [200, 429])
@@ -510,8 +513,11 @@ def test_gateway_rejects_boolean_protocol_version(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="required envelope"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_request_and_response_size_limits_fail_closed(
@@ -525,8 +531,11 @@ def test_gateway_request_and_response_size_limits_fail_closed(
     with pytest.raises(ModelError, match="request exceeded"):
         model._request("POST", "/v1/inference", {"value": "x" * 1_000_000})
 
-    with pytest.raises(ModelError, match="response exceeded"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model, "short")
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_request_accepts_maximum_configured_multibyte_body(
@@ -650,8 +659,11 @@ def test_gateway_rejects_encoded_response_before_decompression(
         ),
     )
 
-    with pytest.raises(ModelError, match="content encoding is unsupported"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_converts_deeply_nested_json_to_model_error(
@@ -664,8 +676,11 @@ def test_gateway_converts_deeply_nested_json_to_model_error(
         lambda request: httpx.Response(200, content=deeply_nested),
     )
 
-    with pytest.raises(ModelError, match="returned invalid JSON"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_converts_deeply_nested_output_content_to_model_error(

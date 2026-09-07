@@ -397,7 +397,7 @@ class GatewayModel:
             or len(token) > MAX_GATEWAY_TOKEN_BYTES
             or not token.isascii()
             or any(
-            character.isspace() or not character.isprintable() for character in token
+                character.isspace() or not character.isprintable() for character in token
             )
         ):
             raise ModelError("Inference gateway credential is invalid")
@@ -502,15 +502,19 @@ class GatewayModel:
                                 "invalid_error_envelope",
                                 retryable=response.status_code >= 500,
                             ) from exc
-                        raise
+                        raise GatewayModelError(
+                            "invalid_success_envelope",
+                            retryable=False,
+                        ) from exc
                     if (
                         response.status_code >= 400
                         or response_payload.get("status") == "failed"
                     ):
                         raise self._gateway_error(response_payload, expected_request_id)
                     if response.status_code >= 300:
-                        raise ModelError(
-                            f"Inference gateway rejected request: HTTP {response.status_code}"
+                        raise GatewayModelError(
+                            "request_rejected",
+                            retryable=False,
                         )
                     return response_payload
                 if response.status_code >= 300:
@@ -658,7 +662,7 @@ class GatewayModel:
             or output.get("media_type") != "application/json"
             or not isinstance(output.get("content"), str)
         ):
-            raise ModelError("Inference gateway response did not match the required envelope")
+            raise GatewayModelError("invalid_success_envelope", retryable=False)
         return output["content"]
 
     def extract_scheduling(
