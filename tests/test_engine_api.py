@@ -1961,9 +1961,18 @@ def test_calendar_events_response_limit_accepts_exact_utf8_size_and_rejects_one_
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+        + b"\n"
     )
 
     monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size)
+    assert engine_api._response(calendar_request)["ok"] is True
+
+    monkeypatch.setattr(engine_api, "operation_lock_uses_soft_fallback", lambda path: True)
+    monkeypatch.setattr(
+        engine_api,
+        "operation_lock",
+        lambda *args: pytest.fail("Soft-backend calendar read attempted native locking"),
+    )
     assert engine_api._response(calendar_request)["ok"] is True
 
     monkeypatch.setattr(engine_api, "MAX_CALENDAR_EVENTS_RESPONSE_BYTES", encoded_size - 1)

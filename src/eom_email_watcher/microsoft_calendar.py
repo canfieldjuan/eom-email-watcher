@@ -56,6 +56,7 @@ _CONSENT_PENDING_ERROR_CODES = frozenset({65001, 90094, 90095})
 _RFC3339_INSTANT = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z"
 )
+_GRAPH_LOCAL_DATETIME = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?\Z")
 
 
 class MicrosoftCalendarConsentPending(Microsoft365Error):
@@ -418,7 +419,7 @@ def _bounded_graph_text(
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
     if len(value.encode("utf-8")) > byte_limit:
         raise Microsoft365Error(f"Microsoft Graph returned an oversized calendar {name}")
-    if any(not character.isprintable() and not character.isspace() for character in value):
+    if any(not character.isprintable() for character in value):
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
     return value
 
@@ -433,6 +434,22 @@ def _calendar_event_id(value: object) -> str:
     if any(character.isspace() for character in event_id):
         raise Microsoft365Error("Microsoft Graph returned an invalid calendar event id")
     return event_id
+
+
+def _calendar_date_time(value: object, name: str) -> str:
+    date_time = _bounded_graph_text(
+        value,
+        name,
+        MAX_CALENDAR_DATETIME_BYTES,
+        allow_empty=False,
+    )
+    if _GRAPH_LOCAL_DATETIME.fullmatch(date_time) is None:
+        raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
+    try:
+        datetime.fromisoformat(date_time)
+    except ValueError as exc:
+        raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}") from exc
+    return date_time
 
 
 def _calendar_event(item: dict[str, Any], event_id: str) -> CalendarEvent:
@@ -474,11 +491,9 @@ def _calendar_event(item: dict[str, Any], event_id: str) -> CalendarEvent:
     return CalendarEvent(
         event_id=event_id,
         subject=subject,
-        start_date_time=_bounded_graph_text(
+        start_date_time=_calendar_date_time(
             start.get("dateTime"),
             "start date-time",
-            MAX_CALENDAR_DATETIME_BYTES,
-            allow_empty=False,
         ),
         start_time_zone=_bounded_graph_text(
             start.get("timeZone"),
@@ -486,11 +501,9 @@ def _calendar_event(item: dict[str, Any], event_id: str) -> CalendarEvent:
             MAX_CALENDAR_ZONE_BYTES,
             allow_empty=False,
         ),
-        end_date_time=_bounded_graph_text(
+        end_date_time=_calendar_date_time(
             end.get("dateTime"),
             "end date-time",
-            MAX_CALENDAR_DATETIME_BYTES,
-            allow_empty=False,
         ),
         end_time_zone=_bounded_graph_text(
             end.get("timeZone"),

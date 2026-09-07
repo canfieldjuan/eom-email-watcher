@@ -460,6 +460,47 @@ def test_calendar_delta_round_paginates_and_preserves_ordered_changes() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("subject", "Planning\nsecret"),
+        ("start", {"dateTime": "2026-02-30T09:00:00", "timeZone": "UTC"}),
+        ("end", {"dateTime": "not-a-date", "timeZone": "UTC"}),
+    ],
+)
+def test_calendar_delta_rejects_malformed_event_projection_fields(
+    field: str,
+    value: object,
+) -> None:
+    event = calendar_event("event-1")
+    event[field] = value
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "value": [event],
+                    "@odata.deltaLink": (
+                        f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView/delta?%24deltatoken=done"
+                    ),
+                },
+            )
+        )
+    )
+    authorization = MicrosoftCalendarReadAuthorization(
+        principal(),
+        "private-access",
+        http_client=client,
+    )
+
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="invalid calendar"):
+        calendar_delta_round(
+            authorization,
+            "2026-09-01T00:00:00.000000Z",
+            "2026-10-01T00:00:00.000000Z",
+        )
+
+
+@pytest.mark.parametrize(
     "cursor",
     [
         "http://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=x",

@@ -932,6 +932,19 @@ def _calendar_status_data(
     }
 
 
+def _with_calendar_observation(
+    request: dict[str, object],
+    operation: Callable[[Runtime], dict[str, object]],
+) -> dict[str, object]:
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if operation_lock_uses_soft_fallback(lock_path):
+        # Calendar mutations fail closed on this platform, so this read cannot race one.
+        return operation(runtime)
+    with operation_lock(lock_path, "Another mailbox operation is already running"):
+        return operation(_runtime(request))
+
+
 def _calendar_status(request: dict[str, object], profile: str) -> dict[str, object]:
     payload = _payload(request, {"provider", "account_id"})
 
@@ -939,13 +952,7 @@ def _calendar_status(request: dict[str, object], profile: str) -> dict[str, obje
         account = _calendar_account(runtime, payload, require_address=False)
         return _calendar_status_data(runtime, account, profile)
 
-    runtime = _runtime(request)
-    lock_path = _production_check_lock_path(runtime.config)
-    if operation_lock_uses_soft_fallback(lock_path):
-        # Mutations fail closed on this platform, so the read cannot race one.
-        return status(runtime)
-    with operation_lock(lock_path, "Another mailbox operation is already running"):
-        return status(_runtime(request))
+    return _with_calendar_observation(request, status)
 
 
 def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, object]:
@@ -1333,14 +1340,14 @@ def _calendar_read_events(request: dict[str, object]) -> dict[str, object]:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        if len(encoded) > MAX_CALENDAR_EVENTS_RESPONSE_BYTES:
+        if len(encoded) + 1 > MAX_CALENDAR_EVENTS_RESPONSE_BYTES:
             raise ApiError(
                 "calendar_result_too_large",
                 "The calendar projection exceeds the engine response limit",
             )
         return data
 
-    return _with_mail_account_mutation(request, read)
+    return _with_calendar_observation(request, read)
 
 
 def _mail_accounts(request: dict[str, object]) -> dict[str, object]:
