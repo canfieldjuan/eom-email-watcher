@@ -1780,6 +1780,11 @@ def ready_calendar_runtime(
         "microsoft_mailbox_principal",
         lambda *args: selected_principal,
     )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_cached_mailbox_principal",
+        lambda *args: selected_principal,
+    )
 
     class Authorization:
         principal = selected_principal
@@ -1842,6 +1847,37 @@ def test_calendar_sync_and_offline_read_apply_incremental_tombstones(
     assert cursors == [None, cursors[1]]
     assert cursors[1] is not None and cursors[1].endswith("one")
     assert runtime.store.calendar_window(account.account_id).cursor.endswith("two")  # type: ignore[union-attr]
+
+
+def test_calendar_offline_read_rejects_locally_cached_mailbox_principal_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    runtime, account, _principal = ready_calendar_runtime(config_path, monkeypatch)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_cached_mailbox_principal",
+        lambda *args: microsoft_principal(object_id="replacement-object"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.events",
+            {
+                "provider": account.provider,
+                "account_id": account.account_id,
+                "window_start": "2026-09-01T00:00:00Z",
+                "window_end": "2026-10-01T00:00:00Z",
+            },
+        )
+    )
+
+    assert response["error"]["code"] == "calendar_principal_mismatch"
+    grant = runtime.store.calendar_grant(account.account_id)
+    assert grant is not None
+    assert grant.state == "ready"
 
 
 def test_calendar_sync_persists_revoked_grant_after_graph_rejects_read_token(
@@ -2483,6 +2519,11 @@ def test_mail_account_reconnect_binds_offline_calendar_reads_to_immutable_princi
         "microsoft_mailbox_principal",
         lambda *args: microsoft_principal(object_id=replacement_object_id),
     )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_cached_mailbox_principal",
+        lambda *args: microsoft_principal(object_id=replacement_object_id),
+    )
     monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
 
     response = engine_api._response(
@@ -2512,6 +2553,77 @@ def test_mail_account_reconnect_binds_offline_calendar_reads_to_immutable_princi
         )
     )
     assert read["error"]["code"] == expected_read_error
+
+
+def test_mail_account_reconnect_preserves_calendar_grant_until_replacement_installs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'e' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    original = microsoft_principal()
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("preserved cache", encoding="utf-8")
+
+    class AuthorizedMicrosoft:
+        def profile(self) -> Microsoft365Profile:
+            return Microsoft365Profile("owner@example.com")
+
+        def initial_cursor(self) -> str:
+            raise Microsoft365Error("baseline unavailable")
+
+    def authorize_with_status(
+        credentials_file: Path,
+        staged_token: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[AuthorizedMicrosoft, bool]:
+        staged_token.write_text("replacement cache", encoding="utf-8")
+        return AuthorizedMicrosoft(), force_reauthorize
+
+    monkeypatch.setattr(
+        engine_api.Microsoft365Gateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: microsoft_principal(object_id="replacement-object"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["error"]["code"] == "mailbox_error"
+    assert mail_token.read_text(encoding="utf-8") == "preserved cache"
+    grant = runtime.store.calendar_grant(account.account_id)
+    assert grant is not None
+    assert grant.state == "ready"
 
 
 def test_mail_account_connect_reuses_and_activates_known_disconnected_microsoft_identity(

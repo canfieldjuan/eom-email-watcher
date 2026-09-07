@@ -24,6 +24,7 @@ from eom_email_watcher.microsoft_calendar import (
     StaleCalendarCursor,
     calendar_delta_round,
     canonical_calendar_window,
+    microsoft_cached_mailbox_principal,
     microsoft_mailbox_principal,
 )
 
@@ -222,6 +223,39 @@ def test_mailbox_principal_lookup_requests_only_mail_read(
     assert calls == [["Mail.Read"]]
 
 
+def test_cached_mailbox_principal_lookup_does_not_construct_a_token_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_file = tmp_path / "mail-read-cache.json"
+    token_file.write_text("private-cache", encoding="utf-8")
+    searches: list[str] = []
+
+    class LocalCache:
+        def search(self, credential_type: str):
+            searches.append(credential_type)
+            return [
+                {
+                    "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+                    "local_account_id": OBJECT_ID,
+                    "realm": TENANT_ID,
+                    "username": "owner@example.com",
+                }
+            ]
+
+    monkeypatch.setattr(microsoft_calendar, "_load_cache", lambda path: LocalCache())
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda *args: pytest.fail("Offline principal lookup constructed a token client"),
+    )
+
+    selected = microsoft_cached_mailbox_principal(token_file)
+
+    assert selected == principal()
+    assert searches == ["Account"]
+
+
 @pytest.mark.parametrize(
     "error",
     ["authorization_pending", "consent_required", "interaction_required"],
@@ -398,6 +432,10 @@ def test_calendar_window_validation_pins_both_sides_of_duration_and_offsets() ->
         canonical_calendar_window(start.isoformat(), start.isoformat())
     with pytest.raises(ValueError, match="offset-bearing"):
         canonical_calendar_window("2026-01-01T00:00:00.1234567Z", exact_end.isoformat())
+    with pytest.raises(ValueError, match="offset-bearing"):
+        canonical_calendar_window("0001-01-01T00:00:00+14:00", exact_end.isoformat())
+    with pytest.raises(ValueError, match="offset-bearing"):
+        canonical_calendar_window(start.isoformat(), "9999-12-31T23:59:59-14:00")
 
 
 def calendar_event(event_id: str, subject: str = "Planning") -> dict[str, object]:

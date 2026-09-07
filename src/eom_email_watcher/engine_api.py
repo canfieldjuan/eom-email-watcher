@@ -95,6 +95,7 @@ from .microsoft_calendar import (
     StaleCalendarCursor,
     calendar_delta_round,
     canonical_calendar_window,
+    microsoft_cached_mailbox_principal,
     microsoft_mailbox_principal,
 )
 from .runtime import (
@@ -512,11 +513,11 @@ def _finish_mail_authorization(
     }
 
 
-def _revoke_calendar_grants_for_replacement_principal(
+def _mismatched_calendar_grants_for_replacement_principal(
     runtime: Runtime,
     account: MailAccount,
     staged_mail_token: Path,
-) -> None:
+) -> tuple[CalendarGrant, ...]:
     ready_grants = tuple(
         grant
         for profile in CALENDAR_AUTHORIZATION_PROFILES
@@ -524,19 +525,12 @@ def _revoke_calendar_grants_for_replacement_principal(
         and grant.state == "ready"
     )
     if not ready_grants:
-        return
+        return ()
     replacement = microsoft_mailbox_principal(
         runtime.config.microsoft_credentials_file,
         staged_mail_token,
     )
-    for grant in ready_grants:
-        if grant.principal_key == replacement.key:
-            continue
-        if not runtime.store.revoke_calendar_grant_if_current(grant):
-            raise ApiError(
-                "calendar_state_changed",
-                "The calendar authorization changed during mailbox reconnection; retry",
-            )
+    return tuple(grant for grant in ready_grants if grant.principal_key != replacement.key)
 
 
 def _authorize_microsoft_account(
@@ -583,12 +577,15 @@ def _authorize_microsoft_account(
                 "The authorized mailbox does not match the selected email account",
             )
 
-        if account is not None:
-            _revoke_calendar_grants_for_replacement_principal(
+        mismatched_calendar_grants = (
+            _mismatched_calendar_grants_for_replacement_principal(
                 runtime,
                 account,
                 staged_token,
             )
+            if account is not None
+            else ()
+        )
 
         initialize_baseline = (
             account is None
@@ -616,6 +613,12 @@ def _authorize_microsoft_account(
             )
         token_file = mail_account_token_file(runtime.config, account)
         _install_private_token(staged_token, token_file)
+        for grant in mismatched_calendar_grants:
+            if not runtime.store.revoke_calendar_grant_if_current(grant):
+                raise ApiError(
+                    "calendar_state_changed",
+                    "The calendar authorization changed during mailbox reconnection; retry",
+                )
 
     account = runtime.store.update_mail_account_identity(
         account.provider,
@@ -1254,6 +1257,19 @@ def _ready_local_calendar_read(runtime: Runtime, account: MailAccount) -> Calend
         raise ApiError(
             "mailbox_authorization_required",
             "Reconnect the Microsoft 365 mailbox before reading its calendar",
+        )
+    try:
+        mailbox_principal = microsoft_cached_mailbox_principal(
+            mail_account_token_file(runtime.config, account)
+        )
+    except MicrosoftAuthorizationRejected as exc:
+        raise ApiError("mailbox_authorization_required", str(exc)) from exc
+    except Microsoft365Error as exc:
+        raise ApiError("calendar_error", str(exc)) from exc
+    if mailbox_principal.key != grant.principal_key:
+        raise ApiError(
+            "calendar_principal_mismatch",
+            "The calendar grant does not match the selected Microsoft principal",
         )
     return grant
 

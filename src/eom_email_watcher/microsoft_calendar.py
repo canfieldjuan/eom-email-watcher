@@ -123,7 +123,12 @@ def canonical_calendar_window(window_start: object, window_end: object) -> tuple
             ) from exc
         if parsed.utcoffset() is None:
             raise ValueError("calendar window boundaries must include an offset")
-        canonical.append(parsed.astimezone(UTC))
+        try:
+            canonical.append(parsed.astimezone(UTC))
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                "calendar window boundaries must be offset-bearing RFC 3339 instants"
+            ) from exc
     start, end = canonical
     if end <= start:
         raise ValueError("calendar window end must be after its start")
@@ -253,6 +258,27 @@ def microsoft_mailbox_principal(
     except Exception as exc:
         raise Microsoft365Error("Microsoft mailbox authorization failed; retry") from exc
     return principal
+
+
+def microsoft_cached_mailbox_principal(token_file: Path) -> MicrosoftPrincipal:
+    """Read the immutable mailbox principal from the cache without token acquisition."""
+    if not token_file.is_file():
+        raise MicrosoftAuthorizationRejected("Microsoft mailbox is not authorized")
+    try:
+        with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            cache = _load_cache(token_file)
+            accounts = tuple(cache.search(msal.TokenCache.CredentialType.ACCOUNT))
+            if len(accounts) != 1:
+                raise MicrosoftAuthorizationRejected(
+                    "Microsoft mailbox cache does not identify one principal"
+                )
+            return _principal({}, accounts[0])
+    except FileLockTimeout as exc:
+        raise Microsoft365Error("Microsoft mailbox cache is busy; retry") from exc
+    except Microsoft365Error:
+        raise
+    except Exception as exc:
+        raise Microsoft365Error("Microsoft mailbox cache inspection failed; retry") from exc
 
 
 class MicrosoftCalendarAuthorization:
