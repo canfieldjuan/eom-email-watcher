@@ -495,6 +495,7 @@ def test_calendar_delta_round_paginates_and_preserves_ordered_changes() -> None:
     assert requests[0].headers["prefer"] == (
         f'IdType="ImmutableId", odata.maxpagesize={CALENDAR_PAGE_SIZE}'
     )
+    assert requests[0].headers["accept-encoding"] == "identity"
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
 
@@ -741,33 +742,111 @@ def test_calendar_page_stream_enforces_remaining_round_byte_limit() -> None:
         )
 
 
-def test_calendar_page_stream_deadline_interrupts_wait_for_next_chunk() -> None:
+def test_calendar_round_deadline_interrupts_wait_for_response_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     release = threading.Event()
     finished = threading.Event()
 
-    class BlockingResponse:
-        headers: dict[str, str] = {}
+    def handler(request: httpx.Request) -> httpx.Response:
+        release.wait()
+        finished.set()
+        return httpx.Response(
+            200,
+            json={
+                "value": [],
+                "@odata.deltaLink": (
+                    f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView/delta?%24deltatoken=done"
+                ),
+            },
+        )
 
-        @staticmethod
-        def iter_bytes():
-            yield b'{"value":'
-            release.wait()
-            finished.set()
-            yield b"[]}"
-
+    monkeypatch.setattr(microsoft_calendar, "MAX_CALENDAR_ROUND_SECONDS", 0.05)
+    authorization = MicrosoftCalendarReadAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
     started_at = time.monotonic()
     try:
         with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
-            microsoft_calendar._bounded_graph_document_before_deadline(  # type: ignore[arg-type]
-                BlockingResponse(),
-                started_at + 0.05,
-                microsoft_calendar.MAX_CALENDAR_ROUND_BYTES,
+            calendar_delta_round(
+                authorization,
+                "2026-09-01T00:00:00.000000Z",
+                "2026-10-01T00:00:00.000000Z",
             )
     finally:
         release.set()
 
     assert time.monotonic() - started_at < 1.0
     assert finished.wait(1.0)
+
+
+def test_calendar_round_deadline_interrupts_wait_for_next_body_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingBody(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"value":'
+            release.wait()
+            finished.set()
+            yield (
+                b'[],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/'
+                b'me/calendarView/delta?%24deltatoken=done"}'
+            )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BlockingBody())
+
+    monkeypatch.setattr(microsoft_calendar, "MAX_CALENDAR_ROUND_SECONDS", 0.05)
+    authorization = MicrosoftCalendarReadAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(microsoft_calendar.Microsoft365Error, match="time limit"):
+            calendar_delta_round(
+                authorization,
+                "2026-09-01T00:00:00.000000Z",
+                "2026-10-01T00:00:00.000000Z",
+            )
+    finally:
+        release.set()
+
+    assert time.monotonic() - started_at < 1.0
+    assert finished.wait(1.0)
+
+
+def test_calendar_delta_disables_and_rejects_response_compression() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip"},
+            stream=httpx.ByteStream(b"compressed-body-is-not-materialized"),
+        )
+
+    authorization = MicrosoftCalendarReadAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(microsoft_calendar.Microsoft365Error, match="compressed calendar response"):
+        calendar_delta_round(
+            authorization,
+            "2026-09-01T00:00:00.000000Z",
+            "2026-10-01T00:00:00.000000Z",
+        )
+
+    assert requests[0].headers["accept-encoding"] == "identity"
 
 
 def test_calendar_delta_page_limit_accepts_64_and_rejects_page_65() -> None:

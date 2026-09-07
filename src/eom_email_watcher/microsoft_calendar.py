@@ -421,6 +421,12 @@ def _bounded_graph_document(
     deadline: float,
     remaining_round_bytes: int,
 ) -> tuple[dict[str, Any], int]:
+    content_encoding = response.headers.get("content-encoding")
+    if content_encoding is not None and content_encoding.strip().casefold() not in {
+        "",
+        "identity",
+    }:
+        raise Microsoft365Error("Microsoft Graph returned a compressed calendar response")
     declared_length = response.headers.get("content-length")
     if declared_length is not None:
         try:
@@ -451,29 +457,65 @@ def _bounded_graph_document(
     return document, len(content)
 
 
-def _bounded_graph_document_before_deadline(
-    response: httpx.Response,
+def _calendar_graph_page_before_deadline(
+    client: httpx.Client,
+    authorization: MicrosoftCalendarReadAuthorization,
+    url: str,
+    cursor_request: bool,
     deadline: float,
     remaining_round_bytes: int,
 ) -> tuple[dict[str, Any], int]:
-    """Read one streamed page without letting a fixed socket timeout overrun the round."""
+    """Open and consume one page behind the absolute round deadline."""
     outcome: queue.Queue[tuple[tuple[dict[str, Any], int] | None, BaseException | None]] = (
         queue.Queue(maxsize=1)
     )
 
-    def read_document() -> None:
+    def read_page() -> None:
         try:
-            outcome.put(
-                (
-                    _bounded_graph_document(response, deadline, remaining_round_bytes),
-                    None,
+            with client.stream(
+                "GET",
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {authorization._access_token}",
+                    "Prefer": f'IdType="ImmutableId", odata.maxpagesize={CALENDAR_PAGE_SIZE}',
+                },
+                follow_redirects=False,
+                timeout=min(GRAPH_TIMEOUT_SECONDS, _calendar_round_time_remaining(deadline)),
+            ) as response:
+                if response.status_code == 401:
+                    raise MicrosoftAuthorizationRejected(
+                        "Microsoft rejected the calendar read authorization"
+                    )
+                if cursor_request and response.status_code == 410:
+                    raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise Microsoft365Error(
+                        f"Microsoft Graph calendar is temporarily unavailable "
+                        f"(HTTP {response.status_code}); retry"
+                    )
+                document = _bounded_graph_document(
+                    response,
+                    deadline,
+                    remaining_round_bytes,
                 )
-            )
+                error_code = _calendar_error_code(document[0])
+                if cursor_request and error_code in {
+                    "syncstatenotfound",
+                    "errorsyncstatenotfound",
+                }:
+                    raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
+                if not response.is_success:
+                    raise Microsoft365Error(
+                        f"Microsoft Graph calendar request failed (HTTP {response.status_code})"
+                    )
+                outcome.put((document, None))
         except BaseException as exc:
             outcome.put((None, exc))
 
     reader = threading.Thread(
-        target=read_document,
+        target=read_page,
         name="microsoft-calendar-page-reader",
         daemon=True,
     )
@@ -641,47 +683,20 @@ def calendar_delta_round(
             if pages >= MAX_CALENDAR_DELTA_PAGES:
                 raise Microsoft365Error("Microsoft Graph calendar round exceeded its page limit")
             pages += 1
-            remaining_seconds = _calendar_round_time_remaining(deadline)
             try:
-                with client.stream(
-                    "GET",
+                document, response_bytes = _calendar_graph_page_before_deadline(
+                    client,
+                    authorization,
                     current,
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {authorization._access_token}",
-                        "Prefer": f'IdType="ImmutableId", odata.maxpagesize={CALENDAR_PAGE_SIZE}',
-                    },
-                    follow_redirects=False,
-                    timeout=min(GRAPH_TIMEOUT_SECONDS, remaining_seconds),
-                ) as response:
-                    if response.status_code == 401:
-                        raise MicrosoftAuthorizationRejected(
-                            "Microsoft rejected the calendar read authorization"
-                        )
-                    if cursor_request and response.status_code == 410:
-                        raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
-                    if response.status_code == 429 or response.status_code >= 500:
-                        raise Microsoft365Error(
-                            f"Microsoft Graph calendar is temporarily unavailable "
-                            f"(HTTP {response.status_code}); retry"
-                        )
-                    document, response_bytes = _bounded_graph_document_before_deadline(
-                        response,
-                        deadline,
-                        MAX_CALENDAR_ROUND_BYTES - total_bytes,
-                    )
+                    cursor_request,
+                    deadline,
+                    MAX_CALENDAR_ROUND_BYTES - total_bytes,
+                )
             except httpx.RequestError as exc:
                 raise Microsoft365Error("Microsoft Graph calendar request failed; retry") from exc
             total_bytes += response_bytes
             if total_bytes > MAX_CALENDAR_ROUND_BYTES:
                 raise Microsoft365Error("Microsoft Graph calendar round exceeded its byte limit")
-            error_code = _calendar_error_code(document)
-            if cursor_request and (error_code in {"syncstatenotfound", "errorsyncstatenotfound"}):
-                raise StaleCalendarCursor("Saved Microsoft calendar cursor is unavailable")
-            if not response.is_success:
-                raise Microsoft365Error(
-                    f"Microsoft Graph calendar request failed (HTTP {response.status_code})"
-                )
             values = document.get("value")
             if not isinstance(values, list) or len(values) > CALENDAR_PAGE_SIZE:
                 raise Microsoft365Error("Microsoft Graph calendar page exceeded its entry limit")
