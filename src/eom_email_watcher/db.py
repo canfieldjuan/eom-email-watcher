@@ -2034,6 +2034,7 @@ class Store:
                 updated_at=stamp.isoformat(),
             )
             cursor = db.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
+            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
         return cursor.rowcount == 1
 
     def clear_messages(self, *, now: datetime | None = None) -> int:
@@ -2070,6 +2071,7 @@ class Store:
                 updated_at=stamp.isoformat(),
             )
             cursor = db.execute("DELETE FROM messages")
+            _purge_expired_automation_tombstones(db, now=stamp.isoformat())
         return cursor.rowcount
 
     def replace_attachments(

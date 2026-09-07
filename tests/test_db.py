@@ -368,6 +368,47 @@ def test_bulk_cleanup_makes_detected_automation_source_unavailable(
         ]
 
 
+@pytest.mark.parametrize("cleanup", ["delete", "clear"])
+def test_manual_cleanup_purges_automation_after_source_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup: str,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="m1",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Meeting",
+        received_at="2026-01-01T12:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET discovered_at = ? WHERE message_id = ?",
+            ("2026-01-01T12:00:00+00:00", "m1"),
+        )
+    monkeypatch.setattr(db_module, "MAX_RETENTION_DAYS", 30)
+    store.mark_analyzed(
+        "m1",
+        scheduling_analysis(),
+        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
+        now=datetime(2026, 1, 1, 12, 1, tzinfo=UTC),
+    )
+    run = store.automation_run_for_message("m1")
+    assert run is not None
+
+    cleanup_at = datetime(2026, 3, 1, 12, tzinfo=UTC)
+    if cleanup == "delete":
+        assert store.delete_message("m1", now=cleanup_at)
+    else:
+        assert store.clear_messages(now=cleanup_at) == 1
+
+    assert store.automation_run(run.run_id) is None
+    assert store.automation_events(run.run_id) == []
+
+
 def test_mailbox_state_identity_and_suppression_are_account_scoped(
     tmp_path: Path,
 ) -> None:

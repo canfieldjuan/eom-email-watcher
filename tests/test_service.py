@@ -330,11 +330,6 @@ def test_watcher_requires_full_scheduling_automation_authorization(
     message_id = scoped_message_id(provider, account_id, "allowed")
     run = store.automation_run_for_message(message_id)
     assert (run is not None) is expected
-    assert entitlement_checks == (
-        [(service_module.CONNECT_FEATURE_ID, service_module.AUTOMATIONS_FEATURE_ID)]
-        if provider == MICROSOFT365_PROVIDER
-        else []
-    )
     if run is not None:
         assert (run.state, run.state_version) == ("detected", 1)
         assert run.calendar_principal_key == "a" * 64
@@ -345,6 +340,14 @@ def test_watcher_requires_full_scheduling_automation_authorization(
         provider == MICROSOFT365_PROVIDER and features_active and grant_state == "ready"
     )
     assert bool(authorization_checks) is should_validate
+    entitlement_check_count = int(provider == MICROSOFT365_PROVIDER)
+    if should_validate and authorization == "valid":
+        entitlement_check_count += 1
+    assert (
+        entitlement_checks
+        == [(service_module.CONNECT_FEATURE_ID, service_module.AUTOMATIONS_FEATURE_ID)]
+        * entitlement_check_count
+    )
     grant = store.calendar_grant(account_id, "proposal")
     if authorization == "rejected" and should_validate:
         assert grant is not None
@@ -381,6 +384,61 @@ def test_watcher_skips_calendar_authorization_for_non_scheduling_analysis(
         store,
         MailboxSession(MICROSOFT365_PROVIDER, account_id, FreshGmail()),
         FakeModel(),
+    ).check()
+
+    assert result["summarized"] == 1
+    message_id = scoped_message_id(MICROSOFT365_PROVIDER, account_id, "allowed")
+    assert store.automation_run_for_message(message_id) is None
+
+
+def test_watcher_rechecks_entitlements_after_live_calendar_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = f"microsoft365-{'c' * 32}"
+    store.register_mail_account(
+        MICROSOFT365_PROVIDER,
+        account_id,
+        display_name="Microsoft 365",
+        address="user@example.com",
+        active=True,
+    )
+    store.set_state("100", provider=MICROSOFT365_PROVIDER, account_id=account_id)
+    identity = {
+        "principal_key": "a" * 64,
+        "home_account_id": "home-account",
+        "tenant_id": "tenant",
+        "object_id": "object",
+        "email_address": "user@example.com",
+    }
+    store.set_calendar_grant(account_id, "proposal", "ready", **identity)
+    entitlement_decisions = iter((True, False))
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *args: next(entitlement_decisions),
+    )
+
+    class AuthorizedCalendar:
+        class Principal:
+            key = "a" * 64
+
+        principal = Principal()
+
+    monkeypatch.setattr(
+        service_module.MicrosoftCalendarProposalAuthorization,
+        "from_matching_tokens",
+        lambda *args: AuthorizedCalendar(),
+    )
+
+    result = Watcher(
+        cfg,
+        store,
+        MailboxSession(MICROSOFT365_PROVIDER, account_id, FreshGmail()),
+        SchedulingModel(),
     ).check()
 
     assert result["summarized"] == 1

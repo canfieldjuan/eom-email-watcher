@@ -65,6 +65,8 @@ def _scheduling_automation_principal(
         return None
     except (MailboxAccountUnavailable, Microsoft365Error):
         return None
+    if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
+        return None
     return authorization.principal.key
 
 
