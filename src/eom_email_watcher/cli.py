@@ -21,12 +21,11 @@ from .notifications import NotificationError, send_fallback
 from .outbound import GmailSender, SendError, previous_month_email
 from .runtime import (
     configured_mailbox_identity,
-    load_configured_mailbox,
     load_runtime,
     mail_account_connected,
     mail_provider_connection_available,
 )
-from .service import Watcher
+from .service import run_watcher_check
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -182,10 +181,12 @@ def _check(config_path: Path, dry_run: bool) -> int:
     config, store, model = _runtime(config_path)
 
     def run(active_config, active_store, active_model):
-        if not active_config.senders:
-            return Watcher.inactive_result(active_config, active_store, dry_run=dry_run)
-        mailbox = load_configured_mailbox(active_config, active_store)
-        return Watcher(active_config, active_store, mailbox, active_model).check(dry_run=dry_run)
+        return run_watcher_check(
+            active_config,
+            active_store,
+            active_model,
+            dry_run=dry_run,
+        )
 
     if dry_run:
         result = run(config, store, model)

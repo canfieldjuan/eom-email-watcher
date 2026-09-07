@@ -137,8 +137,8 @@ def test_second_production_check_stops_before_gmail(
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
     monkeypatch.setattr(
         cli,
-        "load_configured_mailbox",
-        lambda *args: pytest.fail("blocked check must not access mail"),
+        "run_watcher_check",
+        lambda *args, **kwargs: pytest.fail("blocked check must not run the watcher"),
     )
 
     with (
@@ -180,28 +180,12 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 
-    def gmail_from_token(credentials_file: Path, token_file: Path):
-        assert credentials_file == fresh_config.gmail_credentials_file
-        assert token_file == fresh_config.gmail_token_file
-        return object()
+    def run_watcher_check(config, store, model, *, dry_run: bool):
+        assert config is fresh_config
+        assert dry_run is False
+        return {"retention_days": fresh_config.retention_days}
 
-    monkeypatch.setattr(
-        cli,
-        "load_configured_mailbox",
-        lambda config, store: gmail_from_token(
-            config.gmail_credentials_file, config.gmail_token_file
-        ),
-    )
-
-    class FakeWatcher:
-        def __init__(self, config, store, gmail, model):
-            assert config is fresh_config
-
-        def check(self, *, dry_run: bool):
-            assert dry_run is False
-            return {"retention_days": fresh_config.retention_days}
-
-    monkeypatch.setattr(cli, "Watcher", FakeWatcher)
+    monkeypatch.setattr(cli, "run_watcher_check", run_watcher_check)
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
 
@@ -211,17 +195,11 @@ def test_dry_run_does_not_take_production_lock(
 ) -> None:
     config = _check_config(tmp_path)
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
-    monkeypatch.setattr(cli, "load_configured_mailbox", lambda config, store: object())
-
-    class FakeWatcher:
-        def __init__(self, *args):
-            pass
-
-        def check(self, *, dry_run: bool):
-            assert dry_run is True
-            return {"dry_run": True}
-
-    monkeypatch.setattr(cli, "Watcher", FakeWatcher)
+    monkeypatch.setattr(
+        cli,
+        "run_watcher_check",
+        lambda config, store, model, *, dry_run: {"dry_run": dry_run},
+    )
 
     with cli._production_check_lock(config.database_file):
         assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
@@ -264,15 +242,27 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
         yield
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
-    monkeypatch.setattr(
-        cli,
-        "load_configured_mailbox",
-        lambda *args: pytest.fail("inactive check must not access mail"),
-    )
+    def run_watcher_check(config, store, model, *, dry_run: bool):
+        assert config is fresh_config
+        assert dry_run is False
+        return {
+            "active": False,
+            "automation_processed": 0,
+            "automation_review_required": 0,
+            "discovered": 0,
+            "fallback_notified": 0,
+            "purged": store.purge(config.retention_days),
+            "stale_cursor_recovered": False,
+            "summarized": 0,
+        }
+
+    monkeypatch.setattr(cli, "run_watcher_check", run_watcher_check)
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
     assert json.loads(capsys.readouterr().out) == {
         "active": False,
+        "automation_processed": 0,
+        "automation_review_required": 0,
         "discovered": 0,
         "fallback_notified": 0,
         "purged": 2,

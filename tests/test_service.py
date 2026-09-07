@@ -1,6 +1,7 @@
+import json
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,9 +27,20 @@ from eom_email_watcher.microsoft365 import (
     MicrosoftAuthorizationRejected,
 )
 from eom_email_watcher.mime import extract_body
-from eom_email_watcher.model import Analysis, GatewayModelError, ModelError
+from eom_email_watcher.model import (
+    MAX_GATEWAY_ATTACHMENT_COUNT,
+    MAX_GATEWAY_ATTACHMENT_NAME_CHARS,
+    Analysis,
+    GatewayModelError,
+    ModelError,
+)
 from eom_email_watcher.notifications import NotificationError
-from eom_email_watcher.service import Watcher
+from eom_email_watcher.scheduling import (
+    SchedulingSource,
+    scheduling_source_sha256,
+    validate_scheduling_output,
+)
+from eom_email_watcher.service import Watcher, process_scheduling_automations, run_watcher_check
 
 
 class FakeGmail:
@@ -131,6 +143,91 @@ class SchedulingModel(FakeModel):
         )
 
 
+class AutomationGateway:
+    body = "Meet jane@example.com on September 8, 2026 from 10:00 to 10:30 AM."
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return MessageMetadata(
+            message_id,
+            None,
+            "trusted@example.com",
+            "Trusted",
+            "Meeting request",
+            datetime.now(UTC).isoformat(),
+            frozenset({"INBOX"}),
+        )
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        assert message_id == "schedule-1"
+        return MessageContent(self.body[:body_char_limit], (), ())
+
+
+class AnyAutomationGateway(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        return MessageContent(self.body[:body_char_limit], (), ())
+
+
+class MissingAutomationSource(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        raise MessageUnavailable("deleted")
+
+
+class MovedAutomationSource(AutomationGateway):
+    def metadata(self, message_id: str) -> MessageMetadata:
+        raise MessageUnavailable("no longer in inbox")
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        pytest.fail("A source outside the inbox must not be fetched")
+
+
+class FailingAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        raise Microsoft365Error("temporarily unavailable")
+
+
+class FailingOlderAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        if message_id == "older-failure":
+            raise Microsoft365Error("temporarily unavailable")
+        return MessageContent(self.body[:body_char_limit], (), ())
+
+
+class MetadataHeavyAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        names = tuple(
+            f"attachment-{index}-{'x' * MAX_GATEWAY_ATTACHMENT_NAME_CHARS}.pdf"
+            for index in range(MAX_GATEWAY_ATTACHMENT_COUNT + 1)
+        )
+        return MessageContent(self.body[:body_char_limit], names, ())
+
+
+class MalformedUnicodeAutomationProvider(AutomationGateway):
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        return MessageContent(f"{self.body}\ud800"[:body_char_limit], (), ())
+
+
+class ExtractionModel(FakeModel):
+    def __init__(self, outputs: list[str | Exception]):
+        super().__init__()
+        self.outputs = outputs
+        self.extraction_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.extraction_sources: list[SchedulingSource] = []
+
+    def extract_scheduling(
+        self,
+        *,
+        source: SchedulingSource,
+        feedback,
+        request_id: str,
+    ):
+        self.extraction_sources.append(source)
+        self.extraction_calls.append((request_id, tuple(violation.code for violation in feedback)))
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return validate_scheduling_output(output, source)
+
+
 class AttachmentGmail(FakeGmail):
     def full_payload(self, message_id: str):
         self.full_payload_calls += 1
@@ -221,6 +318,103 @@ def config(tmp_path: Path) -> Config:
         ntfy_topic=None,
         ntfy_url="https://ntfy.sh",
         senders=(Sender("trusted@example.com", "Trusted"),),
+    )
+
+
+def valid_scheduling_output(intent: str = "new_meeting") -> str:
+    return json.dumps(
+        {
+            "intent": intent,
+            "intent_evidence": {
+                "source": "body",
+                "quote": "Meet jane@example.com",
+            },
+            "proposed_times": [
+                {
+                    "start": "2026-09-08T10:00:00-05:00",
+                    "end": "2026-09-08T10:30:00-05:00",
+                    "timezone": "America/Chicago",
+                    "evidence": [
+                        {
+                            "source": "body",
+                            "quote": "September 8, 2026 from 10:00 to 10:30 AM",
+                        }
+                    ],
+                }
+            ],
+            "attendees": [
+                {
+                    "email": "jane@example.com",
+                    "evidence": {"source": "body", "quote": "jane@example.com"},
+                }
+            ],
+            "referenced_event": None,
+            "confidence": 0.95,
+            "ambiguity_reasons": [] if intent != "unclear" else ["No safe intent"],
+        }
+    )
+
+
+def admit_scheduling_run(
+    store: Store,
+    *,
+    active: bool = False,
+    provider_message_id: str = "schedule-1",
+    received_at: str | None = None,
+    principal_key: str = "a" * 64,
+):
+    account_id = f"microsoft365-{'d' * 32}"
+    if store.mail_account(MICROSOFT365_PROVIDER, account_id) is None:
+        store.register_mail_account(
+            MICROSOFT365_PROVIDER,
+            account_id,
+            display_name="Microsoft 365",
+            address="owner@example.com",
+            active=active,
+        )
+    message_id = scoped_message_id(
+        MICROSOFT365_PROVIDER,
+        account_id,
+        provider_message_id,
+    )
+    store.add_message(
+        message_id=message_id,
+        provider=MICROSOFT365_PROVIDER,
+        account_id=account_id,
+        provider_message_id=provider_message_id,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Meeting request",
+        received_at=received_at or datetime.now(UTC).isoformat(),
+    )
+    store.mark_analyzed(
+        message_id,
+        SchedulingModel().analyze().model_dump(),
+        scheduling_automation_principal_key=principal_key,
+    )
+    run = store.automation_run_for_message(message_id)
+    assert run is not None
+    return account_id, run
+
+
+def allow_automation_processing(
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: AutomationGateway,
+) -> None:
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda config, store, provider, account_id: MailboxSession(
+            provider,
+            account_id,
+            gateway,
+        ),
     )
 
 
@@ -444,6 +638,649 @@ def test_watcher_rechecks_entitlements_after_live_calendar_authorization(
     assert result["summarized"] == 1
     message_id = scoped_message_id(MICROSOFT365_PROVIDER, account_id, "allowed")
     assert store.automation_run_for_message(message_id) is None
+
+
+def test_scheduling_extraction_retries_once_with_feedback_then_proposes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel(["{}", valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "proposing"
+    assert result.processed == 1
+    assert result.review_required == 0
+    assert len(model.extraction_calls) == 2
+    assert model.extraction_calls[0][1] == ()
+    assert "schema_missing_field" in model.extraction_calls[1][1]
+    assert len(store.automation_extraction_payloads(admitted.run_id)) == 2
+
+
+def test_scheduling_transport_retry_reuses_reserved_request_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    received_at = "2026-09-07T12:00:00+00:00"
+    _account_id, admitted = admit_scheduling_run(store, received_at=received_at)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel(
+        [
+            GatewayModelError(
+                "worker_unavailable",
+                retryable=True,
+                retry_after_seconds=30,
+            ),
+            valid_scheduling_output(),
+        ]
+    )
+    first_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: first_at)
+
+    first = process_scheduling_automations(cfg, store, model, now=first_at)
+    after_failure = store.automation_run(admitted.run_id)
+    store = Store(store.path)
+    store.initialize()
+    before_due = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=first_at + timedelta(seconds=29),
+    )
+    second = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=first_at + timedelta(seconds=30),
+    )
+
+    assert after_failure is not None
+    assert after_failure.state == "extracting"
+    assert first.processed == 0
+    assert before_due.processed == 0
+    assert second.processed == 1
+    assert model.extraction_calls[0][0] == model.extraction_calls[1][0]
+    payloads = store.automation_extraction_payloads(admitted.run_id)
+    assert len(payloads) == 1
+    assert payloads[0].status == "accepted"
+
+
+def test_scheduling_transport_retry_delay_starts_when_request_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel(
+        [GatewayModelError("worker_unavailable", retryable=True, retry_after_seconds=30)]
+    )
+    started_at = datetime.now(UTC)
+    failed_at = started_at + timedelta(minutes=2)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: failed_at)
+
+    process_scheduling_automations(cfg, store, model, now=started_at)
+
+    current = store.automation_run(admitted.run_id)
+    payload = store.automation_extraction_payloads(admitted.run_id)[0]
+    assert current is not None
+    assert current.updated_at == failed_at.isoformat()
+    assert payload.next_retry_at == (failed_at + timedelta(seconds=30)).isoformat()
+
+
+def test_permanent_gateway_extraction_failure_becomes_reviewable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(
+        store,
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel([GatewayModelError("forbidden", retryable=False)])
+
+    result = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    repeated = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=datetime(2026, 9, 7, 14, tzinfo=UTC),
+    )
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == ("manual_review", "model_forbidden")
+    assert result.review_required == 1
+    assert repeated.processed == 0
+    assert len(model.extraction_calls) == 1
+
+
+def test_first_extraction_context_is_anchored_to_message_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(
+        store,
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=datetime(2026, 9, 10, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "proposing"
+    assert result.processed == 1
+    assert model.extraction_sources[0].context_at.isoformat() == "2026-09-07T07:00:00-05:00"
+
+
+def test_retry_uses_the_organizer_pinned_before_account_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, _admitted = admit_scheduling_run(
+        store,
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel([ModelError("offline"), valid_scheduling_output()])
+    first_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+    monkeypatch.setattr(service_module, "_utc_now", lambda: first_at)
+
+    process_scheduling_automations(cfg, store, model, now=first_at)
+    store.update_mail_account_identity(
+        MICROSOFT365_PROVIDER,
+        account_id,
+        display_name="Microsoft 365",
+        address="changed@example.com",
+    )
+    process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=first_at + timedelta(seconds=60),
+    )
+
+    assert [item.organizer_address for item in model.extraction_sources] == [
+        "owner@example.com",
+        "owner@example.com",
+    ]
+
+
+def test_second_invalid_extraction_stops_in_review_without_third_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel(["{}", "{}"])
+
+    result = process_scheduling_automations(cfg, store, model)
+    repeated = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "manual_review",
+        "validation_rejected",
+    )
+    assert result.review_required == 1
+    assert repeated.processed == 0
+    assert len(model.extraction_calls) == 2
+    intent = next(
+        intent for intent in store.notification_intents() if intent.kind == "automation_review"
+    )
+    assert (intent.kind, intent.subject_id, intent.revision) == (
+        "automation_review",
+        admitted.run_id,
+        str(current.state_version),
+    )
+
+
+@pytest.mark.parametrize(
+    ("intent", "state", "failure_code"),
+    [
+        ("reschedule", "manual_review", "reschedule_not_supported"),
+        ("cancellation", "manual_review", "cancellation_not_supported"),
+        ("unclear", "ambiguous", "ambiguous_extraction"),
+    ],
+)
+def test_non_creation_intents_are_durable_non_writing_review_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    intent: str,
+    state: str,
+    failure_code: str,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel([valid_scheduling_output(intent)])
+
+    process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (state, failure_code)
+    assert any(intent.kind == "automation_review" for intent in store.notification_intents())
+
+
+def test_missing_scheduling_source_becomes_reviewable_terminal_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MissingAutomationSource())
+    model = ExtractionModel([])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert result.review_required == 1
+    assert model.extraction_calls == []
+    assert any(intent.kind == "automation_review" for intent in store.notification_intents())
+
+
+def test_scheduling_source_moved_out_of_inbox_becomes_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MovedAutomationSource())
+    model = ExtractionModel([])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert result.review_required == 1
+    assert model.extraction_calls == []
+
+
+def test_canonical_check_resumes_nonactive_account_with_empty_watchlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store, active=False)
+    allow_automation_processing(monkeypatch, AutomationGateway())
+    model = ExtractionModel([valid_scheduling_output()])
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: pytest.fail("Inactive check must not load the active mailbox"),
+    )
+
+    result = run_watcher_check(cfg, store, model, deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "proposing"
+    assert result["active"] is False
+    assert result["automation_processed"] == 1
+    assert result["automation_review_required"] == 0
+
+
+def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    reviewed = store.transition_automation_to_review(
+        admitted.run_id,
+        admitted.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+    older = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    with store.connection() as db:
+        db.executemany(
+            """INSERT INTO messages (
+                    message_id, provider, account_id, provider_message_id,
+                    sender, subject, received_at, discovered_at, status, last_error
+                ) VALUES (
+                    ?1, 'gmail', 'gmail-default', ?1,
+                    'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable'
+                )""",
+            [(f"backlog-{index}", older) for index in range(25)],
+        )
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        service_module,
+        "send_review",
+        lambda *args, **kwargs: delivered.append(args[1]),
+    )
+
+    run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=True)
+
+    current = store.automation_run(admitted.run_id)
+    assert delivered == ["Meeting request"]
+    assert current is not None
+    assert current.review_notified_at is not None
+    assert current.state_version == reviewed.state_version
+
+
+def test_recovery_rechecks_authorization_before_fetch_or_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("Unauthorized recovery fetched mailbox content"),
+    )
+    model = ExtractionModel([])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "detected"
+    assert result.processed == 0
+    assert model.extraction_calls == []
+
+
+def test_recovery_provider_failure_does_not_abort_active_mailbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", provider="gmail", account_id="gmail-default")
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, FailingAutomationProvider())
+    healthy_mailbox = FreshGmail()
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: MailboxSession("gmail", "gmail-default", healthy_mailbox),
+    )
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert result["active"] is True
+    assert current is not None
+    assert current.state == "detected"
+    assert healthy_mailbox.full_payload_calls == 1
+
+
+def test_recovery_session_failure_does_not_abort_active_mailbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", provider="gmail", account_id="gmail-default")
+    _account_id, admitted = admit_scheduling_run(store)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda *args: (_ for _ in ()).throw(Microsoft365Error("temporarily unavailable")),
+    )
+    healthy_mailbox = FreshGmail()
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: MailboxSession("gmail", "gmail-default", healthy_mailbox),
+    )
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert result["active"] is True
+    assert current is not None
+    assert current.state == "detected"
+    assert healthy_mailbox.full_payload_calls == 1
+
+
+def test_transient_source_failure_does_not_starve_newer_runnable_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, failed = admit_scheduling_run(
+        store,
+        provider_message_id="older-failure",
+    )
+    _account_id, runnable = admit_scheduling_run(
+        store,
+        provider_message_id="runnable",
+    )
+    allow_automation_processing(monkeypatch, FailingOlderAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model, limit=1)
+
+    failed_current = store.automation_run(failed.run_id)
+    runnable_current = store.automation_run(runnable.run_id)
+    assert failed_current is not None
+    assert failed_current.state == "detected"
+    assert runnable_current is not None
+    assert runnable_current.state == "proposing"
+    assert result.processed == 1
+    assert result.attempted_run_ids == frozenset({failed.run_id, runnable.run_id})
+
+
+def test_scheduling_source_bounds_attachment_metadata_before_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MetadataHeavyAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    bounded_source = model.extraction_sources[0]
+    assert result.processed == 1
+    assert len(bounded_source.attachment_names) == MAX_GATEWAY_ATTACHMENT_COUNT
+    assert all(
+        len(name) <= MAX_GATEWAY_ATTACHMENT_NAME_CHARS
+        for name in bounded_source.attachment_names
+    )
+    assert current is not None
+    assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
+
+
+def test_scheduling_source_sanitizes_unicode_before_hash_and_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(store)
+    allow_automation_processing(monkeypatch, MalformedUnicodeAutomationProvider())
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(cfg, store, model)
+
+    current = store.automation_run(admitted.run_id)
+    bounded_source = model.extraction_sources[0]
+    assert result.processed == 1
+    assert "\ud800" not in bounded_source.body
+    assert bounded_source.body.encode("utf-8").endswith(b"?")
+    assert current is not None
+    assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
+
+
+def test_recovery_purges_expired_source_before_fetch_or_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(
+        store,
+        received_at="2026-01-01T12:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("Expired recovery fetched mailbox content"),
+    )
+    model = ExtractionModel([])
+
+    result = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert result.processed == 1
+    assert result.review_required == 1
+    assert result.purged == 1
+    assert model.extraction_calls == []
+
+
+def test_canonical_check_reports_recovery_purge_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(
+        config(tmp_path),
+        senders=(),
+        retention_days=1,
+        notifications_enabled=False,
+    )
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, admitted = admit_scheduling_run(
+        store,
+        received_at="2026-01-01T12:00:00+00:00",
+    )
+    monkeypatch.setattr(service_module, "_utc_now", lambda: datetime(2026, 9, 7, 13, tzinfo=UTC))
+
+    result = run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=False)
+
+    current = store.automation_run(admitted.run_id)
+    assert current is not None
+    assert current.state == "source_unavailable"
+    assert result["purged"] == 1
+    assert result["automation_processed"] == 1
+    assert result["automation_review_required"] == 1
+
+
+def test_unauthorized_oldest_page_does_not_starve_newer_runnable_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    for index in range(25):
+        admit_scheduling_run(
+            store,
+            provider_message_id=f"unauthorized-{index:02d}",
+            received_at="2026-09-07T12:00:00+00:00",
+            principal_key="b" * 64,
+        )
+    _account_id, runnable = admit_scheduling_run(
+        store,
+        provider_message_id="runnable",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_authorization_principal",
+        lambda *args, **kwargs: "a" * 64 if kwargs["expected_principal_key"] == "a" * 64 else None,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_mailbox_account",
+        lambda config, store, provider, account_id: MailboxSession(
+            provider,
+            account_id,
+            AnyAutomationGateway(),
+        ),
+    )
+    model = ExtractionModel([valid_scheduling_output()])
+
+    result = process_scheduling_automations(
+        cfg,
+        store,
+        model,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(runnable.run_id)
+    assert current is not None
+    assert current.state == "proposing"
+    assert result.processed == 1
+    assert result.attempted_run_ids == frozenset({runnable.run_id})
 
 
 def test_watcher_uses_provider_polling_session_for_the_complete_check(tmp_path: Path) -> None:

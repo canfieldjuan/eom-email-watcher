@@ -101,7 +101,6 @@ from .microsoft_calendar import (
 from .runtime import (
     MAIL_PROVIDER_NAMES,
     Runtime,
-    load_configured_mailbox,
     load_mailbox_account,
     load_runtime,
     mail_account_connected,
@@ -110,7 +109,7 @@ from .runtime import (
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
 )
-from .service import Watcher
+from .service import run_watcher_check
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
@@ -1530,15 +1529,11 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     _require_host_delivery_compatible(runtime)
 
     def run(active_runtime: Runtime) -> dict[str, object]:
-        config = active_runtime.config
         _require_host_delivery_compatible(active_runtime)
-        if not config.senders:
-            return {
-                **Watcher.inactive_result(config, active_runtime.store, dry_run=dry_run),
-                "pending_notifications": _host_notification_intent_count(active_runtime),
-            }
-        mailbox = load_configured_mailbox(config, active_runtime.store)
-        result = Watcher(config, active_runtime.store, mailbox, active_runtime.model).check(
+        result = run_watcher_check(
+            active_runtime.config,
+            active_runtime.store,
+            active_runtime.model,
             dry_run=dry_run,
             deliver_notifications=False,
         )
@@ -2781,6 +2776,9 @@ def _notification_payload(
             lines.append(f"Deadline: {intent.deadline_iso}")
         body = "\n".join(line for line in lines if line)
         priority = intent.priority or "normal"
+    elif intent.kind == "automation_review":
+        body = intent.summary or "A scheduling mention needs manual review."
+        priority = "normal"
     else:
         body = "A watched email arrived. Local summary unavailable; it will be retried."
         priority = "normal"
@@ -2790,6 +2788,9 @@ def _notification_payload(
         "kind": intent.kind,
         "message_id": intent.message_id,
         "priority": priority,
+        "revision": intent.revision,
+        "subject_id": intent.subject_id,
+        "subject_type": intent.subject_type,
         "title": title,
     }
 
@@ -2839,16 +2840,39 @@ def _notifications_count_under_host_lock(
 
 
 def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"message_id", "kind", "analysis_at"})
+    payload = _payload(
+        request,
+        {
+            "message_id",
+            "kind",
+            "analysis_at",
+            "subject_type",
+            "subject_id",
+            "revision",
+        },
+    )
     message_id = payload.get("message_id")
     kind = payload.get("kind")
     analysis_at = payload.get("analysis_at")
+    subject_type = payload.get("subject_type")
+    subject_id = payload.get("subject_id")
+    revision = payload.get("revision")
     if not isinstance(message_id, str) or not message_id.strip():
         raise ApiError("invalid_request", "message_id must be a non-empty string")
-    if kind not in {"analysis", "fallback"}:
-        raise ApiError("invalid_request", "kind must be analysis or fallback")
+    if kind not in {"analysis", "fallback", "automation_review"}:
+        raise ApiError(
+            "invalid_request",
+            "kind must be analysis, fallback, or automation_review",
+        )
     if analysis_at is not None and not isinstance(analysis_at, str):
         raise ApiError("invalid_request", "analysis_at must be a string or null")
+    for field_name, value in (
+        ("subject_type", subject_type),
+        ("subject_id", subject_id),
+        ("revision", revision),
+    ):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ApiError("invalid_request", f"{field_name} must be a non-empty string or null")
     runtime = _runtime(request)
     _require_host_delivery_compatible(runtime)
     try:
@@ -2856,6 +2880,9 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
             message_id=message_id,
             kind=kind,
             analysis_at=analysis_at,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            revision=revision,
         )
     except KeyError as exc:
         raise ApiError("not_found", "Notification message was not found") from exc

@@ -11,6 +11,7 @@ from eom_email_watcher import engine_api
 from eom_email_watcher import model as model_module
 from eom_email_watcher.model import GatewayModel, GatewayModelError, ModelError
 from eom_email_watcher.runtime import load_runtime
+from eom_email_watcher.scheduling import SchedulingSource, SchedulingViolation
 
 
 def analysis_json() -> str:
@@ -24,6 +25,53 @@ def analysis_json() -> str:
             "deadline_text": None,
             "deadline_iso": None,
             "confidence": 0.91,
+        }
+    )
+
+
+def scheduling_source() -> SchedulingSource:
+    return SchedulingSource(
+        sender="trusted@example.com",
+        subject="Meeting request",
+        received_at="2026-09-07T12:00:00+00:00",
+        body="Meet jane@example.com on September 8, 2026 from 10:00 to 10:30 AM.",
+        attachment_names=(),
+        organizer_address="owner@example.com",
+        configured_timezone="America/Chicago",
+        context_at=datetime(2026, 9, 7, 9, 0, tzinfo=UTC),
+    )
+
+
+def scheduling_json() -> str:
+    return json.dumps(
+        {
+            "intent": "new_meeting",
+            "intent_evidence": {
+                "source": "body",
+                "quote": "Meet jane@example.com",
+            },
+            "proposed_times": [
+                {
+                    "start": "2026-09-08T10:00:00-05:00",
+                    "end": "2026-09-08T10:30:00-05:00",
+                    "timezone": "America/Chicago",
+                    "evidence": [
+                        {
+                            "source": "body",
+                            "quote": "September 8, 2026 from 10:00 to 10:30 AM",
+                        }
+                    ],
+                }
+            ],
+            "attendees": [
+                {
+                    "email": "jane@example.com",
+                    "evidence": {"source": "body", "quote": "jane@example.com"},
+                }
+            ],
+            "referenced_event": None,
+            "confidence": 0.95,
+            "ambiguity_reasons": [],
         }
     )
 
@@ -162,6 +210,43 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
         "test trust root",
         "test trust root",
     ]
+
+
+def test_gateway_scheduling_extraction_reuses_versioned_email_task_and_request_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {
+                    "media_type": "application/json",
+                    "content": scheduling_json(),
+                },
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+
+    result = model.extract_scheduling(
+        source=scheduling_source(),
+        feedback=(SchedulingViolation("time_naive", "proposed_times.0"),),
+        request_id="stable-extraction-request",
+    )
+
+    assert result.accepted is True
+    assert requests[0]["request_id"] == "stable-extraction-request"
+    assert requests[0]["task"] == {"id": "email.analyze", "version": 1}
+    assert requests[0]["requirements"]["max_output_tokens"] == 1_500
+    assert "time_naive" in requests[0]["generation"]["messages"][1]["content"]
+    assert "model" not in requests[0]
 
 
 def test_gateway_client_disables_environment_proxy_and_redirects(
@@ -325,8 +410,11 @@ def test_gateway_rejects_mismatched_response_envelope(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="required envelope"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 @pytest.mark.parametrize("http_status", [200, 429])
@@ -425,8 +513,11 @@ def test_gateway_rejects_boolean_protocol_version(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="required envelope"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_request_and_response_size_limits_fail_closed(
@@ -440,8 +531,11 @@ def test_gateway_request_and_response_size_limits_fail_closed(
     with pytest.raises(ModelError, match="request exceeded"):
         model._request("POST", "/v1/inference", {"value": "x" * 1_000_000})
 
-    with pytest.raises(ModelError, match="response exceeded"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model, "short")
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_request_accepts_maximum_configured_multibyte_body(
@@ -565,8 +659,11 @@ def test_gateway_rejects_encoded_response_before_decompression(
         ),
     )
 
-    with pytest.raises(ModelError, match="content encoding is unsupported"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_converts_deeply_nested_json_to_model_error(
@@ -579,8 +676,11 @@ def test_gateway_converts_deeply_nested_json_to_model_error(
         lambda request: httpx.Response(200, content=deeply_nested),
     )
 
-    with pytest.raises(ModelError, match="returned invalid JSON"):
+    with pytest.raises(GatewayModelError) as captured:
         analyze(model)
+
+    assert captured.value.code == "invalid_success_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_converts_deeply_nested_output_content_to_model_error(

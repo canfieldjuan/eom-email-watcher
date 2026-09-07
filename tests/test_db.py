@@ -15,6 +15,7 @@ from eom_email_watcher.db import (
     SCHEDULING_AUTOMATION_VERSION,
     SCHEDULING_EXTRACTION_SCHEMA_VERSION,
     SCHEMA_VERSION,
+    AutomationSourceChanged,
     CalendarEventMutation,
     CalendarEventProjection,
     Store,
@@ -23,6 +24,42 @@ from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.mime import AttachmentDescriptor
 
 CALENDAR_PRINCIPAL_KEY = "a" * 64
+
+
+def admitted_scheduling_run(
+    store: Store,
+    *,
+    message_id: str = "local-scheduling",
+    provider_message_id: str = "provider-scheduling",
+):
+    account_id = f"microsoft365-{'a' * 32}"
+    store.register_mail_account(
+        "microsoft365",
+        account_id,
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    assert store.add_message(
+        message_id=message_id,
+        provider="microsoft365",
+        account_id=account_id,
+        provider_message_id=provider_message_id,
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name="Sender",
+        subject="Can we meet?",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    store.mark_analyzed(
+        message_id,
+        scheduling_analysis(),
+        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
+        now=datetime(2026, 9, 7, 12, 1, tzinfo=UTC),
+    )
+    run = store.automation_run_for_message(message_id)
+    assert run is not None
+    return run
 
 
 def scheduling_analysis() -> dict[str, object]:
@@ -134,7 +171,12 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
     ] == [(0, None, "detected", 1, "detected")]
     with store.connection() as db, pytest.raises(sqlite3.IntegrityError):
         db.execute(
-            """INSERT INTO automation_runs
+            """INSERT INTO automation_runs(
+                    run_id, provider, account_id, calendar_principal_key,
+                    source_message_key, automation_id, automation_version,
+                    extraction_schema_version, state, state_version, failure_code,
+                    expires_at, created_at, updated_at
+                )
                 SELECT '11111111-1111-4111-8111-111111111111', provider,
                     account_id, calendar_principal_key, source_message_key, automation_id,
                     automation_version, extraction_schema_version, state,
@@ -177,6 +219,402 @@ def test_scheduling_admission_rolls_back_analysis_when_event_append_fails(
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM automation_runs").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM automation_events").fetchone()[0] == 0
+
+
+def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    work = store.recoverable_automation_runs()
+    assert len(work) == 1
+    assert work[0].organizer_address == "owner@example.com"
+
+    first = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+    assert (extracting.state, extracting.state_version) == ("extracting", 2)
+    repeated = store.reserve_automation_extraction(
+        detected.run_id,
+        extracting.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    assert repeated == first
+
+    rejected_result = b'{"intent":"new_meeting"}'
+    rejected_once = store.record_automation_extraction(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=first.payload_id,
+        result_sha256=hashlib.sha256(rejected_result).hexdigest(),
+        result_json=rejected_result,
+        violations=[{"code": "schema_missing_field", "path": "proposed_times"}],
+    )
+    assert (rejected_once.state, rejected_once.state_version, rejected_once.failure_code) == (
+        "extracting",
+        3,
+        "validation_rejected_once",
+    )
+    store = Store(store.path)
+    store.initialize()
+    second = store.reserve_automation_extraction(
+        detected.run_id,
+        rejected_once.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    assert second.attempt_no == 2
+    second_reserved = store.automation_run(detected.run_id)
+    assert second_reserved is not None
+    final = store.record_automation_extraction(
+        detected.run_id,
+        second_reserved.state_version,
+        payload_id=second.payload_id,
+        result_sha256=hashlib.sha256(rejected_result).hexdigest(),
+        result_json=rejected_result,
+        violations=[{"code": "evidence_not_found", "path": "intent_evidence"}],
+    )
+    assert (final.state, final.failure_code) == ("manual_review", "validation_rejected")
+    with pytest.raises(RuntimeError, match="expected-state"):
+        store.reserve_automation_extraction(
+            detected.run_id,
+            final.state_version,
+            source_content_sha256="b" * 64,
+            context_at="2026-09-07T08:00:00-05:00",
+            timezone="America/Chicago",
+            body_char_limit=20_000,
+            organizer_address="owner@example.com",
+        )
+    assert [item.attempt_no for item in store.automation_extraction_payloads(detected.run_id)] == [
+        1,
+        2,
+    ]
+    assert [event.next_state for event in store.automation_events(detected.run_id)] == [
+        "detected",
+        "extracting",
+        "extracting",
+        "extracting",
+        "manual_review",
+    ]
+
+
+def test_extraction_transport_failure_preserves_request_and_retry_schedule(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    payload = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+    failed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+
+    retrying = store.record_automation_extraction_failure(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=payload.payload_id,
+        error_code="worker_unavailable",
+        retryable=True,
+        retry_after_seconds=30,
+        now=failed_at,
+    )
+
+    assert retrying.state == "extracting"
+    assert store.recoverable_automation_runs(now=failed_at + timedelta(seconds=29)) == []
+    due = store.recoverable_automation_runs(now=failed_at + timedelta(seconds=30))
+    assert [item.run.run_id for item in due] == [detected.run_id]
+    repeated = store.reserve_automation_extraction(
+        detected.run_id,
+        retrying.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    assert repeated.request_id == payload.request_id
+    persisted = store.automation_extraction_payloads(detected.run_id)[0]
+    assert persisted.failure_count == 1
+    assert persisted.last_error_code == "worker_unavailable"
+    assert persisted.next_retry_at == "2026-09-07T13:00:30+00:00"
+
+
+def test_schema_14_payload_table_migrates_retry_and_organizer_fields(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    with store.connection() as db:
+        for column in (
+            "organizer_address",
+            "failure_count",
+            "next_retry_at",
+            "last_error_code",
+        ):
+            db.execute(f"ALTER TABLE automation_extraction_payloads DROP COLUMN {column}")
+        db.execute("PRAGMA user_version = 14")
+
+    store.initialize()
+
+    with store.connection() as db:
+        columns = {
+            str(row["name"]): str(row["type"])
+            for row in db.execute("PRAGMA table_info(automation_extraction_payloads)").fetchall()
+        }
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert {
+        "organizer_address",
+        "failure_count",
+        "next_retry_at",
+        "last_error_code",
+    } <= columns.keys()
+
+
+@pytest.mark.parametrize(
+    ("next_state", "failure_code"),
+    [
+        ("proposing", None),
+        ("manual_review", "reschedule_not_supported"),
+        ("manual_review", "cancellation_not_supported"),
+        ("ambiguous", "ambiguous_extraction"),
+    ],
+)
+def test_valid_extraction_atomically_records_payload_and_outcome(
+    tmp_path: Path,
+    next_state: str,
+    failure_code: str | None,
+) -> None:
+    store = Store(tmp_path / next_state / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    payload = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+
+    result_json = b'{"intent":"new_meeting"}'
+    result_sha256 = hashlib.sha256(result_json).hexdigest()
+    result = store.record_automation_extraction(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=payload.payload_id,
+        result_sha256=result_sha256,
+        result_json=result_json,
+        violations=[],
+        accepted_state=next_state,
+        accepted_code=failure_code,
+    )
+
+    assert (result.state, result.failure_code, result.current_payload_sha256) == (
+        next_state,
+        failure_code,
+        result_sha256,
+    )
+    persisted = store.automation_extraction_payloads(detected.run_id)
+    assert len(persisted) == 1
+    assert persisted[0].status == "accepted"
+    assert persisted[0].violations_json == b"[]"
+    event = store.automation_events(detected.run_id)[-1]
+    assert (event.next_state, event.payload_id, event.payload_sha256) == (
+        next_state,
+        payload.payload_id,
+        result_sha256,
+    )
+
+
+def test_extraction_payload_hash_mismatch_cannot_enter_the_immutable_ledger(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    payload = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+
+    with pytest.raises(ValueError, match="result is not bounded"):
+        store.record_automation_extraction(
+            detected.run_id,
+            extracting.state_version,
+            payload_id=payload.payload_id,
+            result_sha256="c" * 64,
+            result_json=b"{}",
+            violations=[{"code": "schema_missing_field", "path": "intent"}],
+        )
+
+    unchanged = store.automation_run(detected.run_id)
+    assert unchanged == extracting
+    assert store.automation_extraction_payloads(detected.run_id)[0].status == "reserved"
+    assert [event.next_state for event in store.automation_events(detected.run_id)] == [
+        "detected",
+        "extracting",
+    ]
+
+
+def test_changed_source_fails_closed_without_reserving_another_attempt(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    first = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+    result_json = b"{}"
+    store.record_automation_extraction(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=first.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json,
+        violations=[{"code": "schema_missing_field", "path": "intent"}],
+    )
+    rejected = store.automation_run(detected.run_id)
+    assert rejected is not None
+
+    with pytest.raises(AutomationSourceChanged):
+        store.reserve_automation_extraction(
+            detected.run_id,
+            rejected.state_version,
+            source_content_sha256="e" * 64,
+            context_at="2026-09-07T08:00:00-05:00",
+            timezone="America/Chicago",
+            body_char_limit=20_000,
+            organizer_address="owner@example.com",
+        )
+
+    assert len(store.automation_extraction_payloads(detected.run_id)) == 1
+
+
+def test_source_cleanup_deletes_extraction_payload_and_transitions_active_run(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+
+    assert store.delete_message("local-scheduling") is True
+
+    tombstone = store.automation_run(detected.run_id)
+    assert tombstone is not None
+    assert (tombstone.state, tombstone.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert store.automation_extraction_payloads(detected.run_id) == []
+
+
+def test_automation_review_notification_is_durable_state_checked_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    reviewed = store.transition_automation_to_review(
+        detected.run_id,
+        detected.state_version,
+        next_state="manual_review",
+        failure_code="source_invalid",
+    )
+
+    intent = next(item for item in store.notification_intents() if item.kind == "automation_review")
+    assert (intent.subject_type, intent.subject_id, intent.revision) == (
+        "automation_run",
+        detected.run_id,
+        str(reviewed.state_version),
+    )
+    assert intent.message_id == detected.run_id
+    assert "could not be processed safely" in str(intent.summary)
+    assert (
+        store.acknowledge_notification(
+            message_id=intent.message_id,
+            kind=intent.kind,
+            analysis_at=intent.analysis_at,
+            subject_type=intent.subject_type,
+            subject_id=intent.subject_id,
+            revision=intent.revision,
+        )
+        == "acknowledged"
+    )
+    assert (
+        store.acknowledge_notification(
+            message_id=intent.message_id,
+            kind=intent.kind,
+            analysis_at=intent.analysis_at,
+            subject_type=intent.subject_type,
+            subject_id=intent.subject_id,
+            revision=intent.revision,
+        )
+        == "already_acknowledged"
+    )
+    assert all(item.subject_id != detected.run_id for item in store.notification_intents())
+
+
+def test_source_unavailable_notification_survives_source_deletion(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+
+    assert store.delete_message("local-scheduling") is True
+
+    intent = next(item for item in store.notification_intents() if item.kind == "automation_review")
+    assert intent.subject_id == detected.run_id
+    assert intent.sender == "Email Watcher"
+    assert "no longer available" in str(intent.summary)
 
 
 def test_automation_events_are_immutable_and_source_delete_is_atomic(
@@ -1384,7 +1822,9 @@ def test_initialize_migrates_current_schema_without_losing_messages(
         ).fetchone()
         automation_tables = db.execute(
             """SELECT name FROM sqlite_master
-            WHERE type='table' AND name IN ('automation_runs', 'automation_events')
+            WHERE type='table' AND name IN (
+                'automation_runs', 'automation_events', 'automation_extraction_payloads'
+            )
             ORDER BY name"""
         ).fetchall()
         suppression_table = db.execute(
@@ -1405,7 +1845,11 @@ def test_initialize_migrates_current_schema_without_losing_messages(
     assert state == [("gmail", "gmail-default", "legacy-cursor")]
     assert attachment_table == (1,)
     assert connect_table == (1,)
-    assert automation_tables == [("automation_events",), ("automation_runs",)]
+    assert automation_tables == [
+        ("automation_events",),
+        ("automation_extraction_payloads",),
+        ("automation_runs",),
+    ]
     assert suppression_table == (1,)
     assert account == ("gmail", "gmail-default", "Gmail", None, 1)
     migrated = Store(database)
