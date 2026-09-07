@@ -209,6 +209,51 @@ def test_proposed_date_and_clock_values_must_match_source_evidence() -> None:
     assert "time_value_unsupported" in codes(validate(wrong_time))
 
 
+def test_end_date_must_independently_match_source_evidence() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {"end": "2026-09-09T10:30:00-05:00"}
+    )
+
+    result = validate(value)
+
+    assert SchedulingViolation("time_date_unsupported", "proposed_times.0.end") in result.violations
+
+
+def test_new_meeting_time_must_be_future_relative_to_persisted_context() -> None:
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-06T10:00:00-05:00",
+            "end": "2026-09-06T10:30:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "September 6, 2026 from 10:00 to 10:30",
+                }
+            ],
+        }
+    )
+    scheduling_source = source(body="Please meet September 6, 2026 from 10:00 to 10:30.")
+
+    assert "time_range_past" in codes(validate(value, scheduling_source=scheduling_source))
+
+
+def test_event_reference_value_must_appear_in_its_evidence_quote() -> None:
+    value = valid_result()
+    value["intent"] = "reschedule"
+    value["referenced_event"] = {
+        "provider_event_id": None,
+        "human_reference": "quarterly planning call",
+        "evidence": {"source": "body", "quote": "Please move the meeting"},
+    }
+    scheduling_source = source(body=source().body + " Please move the meeting.")
+
+    assert "event_reference_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
 def test_new_meeting_requires_high_confidence_and_no_existing_event_reference() -> None:
     value = valid_result()
     value["confidence"] = 0.79

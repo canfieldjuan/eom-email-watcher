@@ -367,9 +367,7 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
     text = evidence_text.casefold()
     if re.search(rf"(?<!\d){local.hour:02d}:{local.minute:02d}(?!\d)", text):
         return True
-    if local.hour < 10 and re.search(
-        rf"(?<!\d){local.hour}:{local.minute:02d}(?!\d)", text
-    ):
+    if local.hour < 10 and re.search(rf"(?<!\d){local.hour}:{local.minute:02d}(?!\d)", text):
         return True
     meridiem = "am" if local.hour < 12 else "pm"
     hour = local.hour % 12 or 12
@@ -385,6 +383,8 @@ def _time_violations(
     item: SchedulingTimeRange,
     path: str,
     source: SchedulingSource,
+    *,
+    require_future: bool,
 ) -> list[SchedulingViolation]:
     violations: list[SchedulingViolation] = []
     try:
@@ -405,18 +405,16 @@ def _time_violations(
         elif len(offsets) > 1:
             violations.append(SchedulingViolation("timezone_ambiguous", f"{path}.{label}"))
         elif value.utcoffset() not in offsets:
-            violations.append(
-                SchedulingViolation("timezone_offset_mismatch", f"{path}.{label}")
-            )
+            violations.append(SchedulingViolation("timezone_offset_mismatch", f"{path}.{label}"))
     evidence_text = "\n".join(evidence.quote for evidence in item.evidence)
-    if not _date_has_source_support(
-        start,
-        evidence_text,
-        zone=zone,
-        context_at=source.context_at,
-    ):
-        violations.append(SchedulingViolation("time_date_unsupported", path))
     for label, value in (("start", start), ("end", end)):
+        if not _date_has_source_support(
+            value,
+            evidence_text,
+            zone=zone,
+            context_at=source.context_at,
+        ):
+            violations.append(SchedulingViolation("time_date_unsupported", f"{path}.{label}"))
         if not _time_has_source_support(value, evidence_text, zone=zone):
             violations.append(SchedulingViolation("time_value_unsupported", f"{path}.{label}"))
     if (
@@ -426,6 +424,8 @@ def _time_violations(
         violations.append(SchedulingViolation("timezone_unsupported", f"{path}.timezone"))
     if start.astimezone(UTC) >= end.astimezone(UTC):
         violations.append(SchedulingViolation("time_range_invalid", path))
+    if require_future and start.astimezone(UTC) <= source.context_at.astimezone(UTC):
+        violations.append(SchedulingViolation("time_range_past", path))
     return violations
 
 
@@ -482,8 +482,7 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         evidence_addresses = {
             normalize_validated_address(address)
             for _name, address in getaddresses([attendee.evidence.quote])
-            if address
-            and _is_valid_address(address)
+            if address and _is_valid_address(address)
         }
         if normalized not in evidence_addresses:
             semantic.append(SchedulingViolation("attendee_unsupported", f"{path}.email"))
@@ -494,7 +493,14 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
         seen_attendees.add(normalized)
     for index, proposed in enumerate(extraction.proposed_times):
         path = f"proposed_times.{index}"
-        semantic.extend(_time_violations(proposed, path, source))
+        semantic.extend(
+            _time_violations(
+                proposed,
+                path,
+                source,
+                require_future=extraction.intent == "new_meeting",
+            )
+        )
         for evidence_index, evidence in enumerate(proposed.evidence):
             if not _evidence_supported(evidence, source):
                 semantic.append(
@@ -503,11 +509,14 @@ def validate_scheduling_output(raw_text: str, source: SchedulingSource) -> Sched
                         f"{path}.evidence.{evidence_index}",
                     )
                 )
-    if extraction.referenced_event is not None and not _evidence_supported(
-        extraction.referenced_event.evidence,
-        source,
-    ):
-        semantic.append(SchedulingViolation("evidence_not_found", "referenced_event.evidence"))
+    if extraction.referenced_event is not None:
+        reference = extraction.referenced_event
+        if not _evidence_supported(reference.evidence, source):
+            semantic.append(SchedulingViolation("evidence_not_found", "referenced_event.evidence"))
+        reference_value = reference.provider_event_id or reference.human_reference
+        assert reference_value is not None
+        if reference_value.casefold() not in reference.evidence.quote.casefold():
+            semantic.append(SchedulingViolation("event_reference_unsupported", "referenced_event"))
     if extraction.intent == "new_meeting" and not extraction.proposed_times:
         semantic.append(SchedulingViolation("new_meeting_missing_time", "proposed_times"))
     if extraction.intent == "new_meeting" and extraction.confidence < 0.8:

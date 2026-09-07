@@ -172,148 +172,194 @@ def process_scheduling_automations(
     *,
     exclude_run_ids: frozenset[str] = frozenset(),
     limit: int = 25,
+    now: datetime | None = None,
 ) -> AutomationProcessing:
+    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+    store.purge(config.retention_days, now=observed_at)
     processed = 0
     review_required = 0
     attempted: set[str] = set()
-    for work in store.recoverable_automation_runs(limit):
-        run = work.run
-        if run.run_id in exclude_run_ids:
-            continue
-        attempted.add(run.run_id)
-        if (
-            _scheduling_authorization_principal(
-                config,
-                store,
-                provider=run.provider,
-                account_id=run.account_id,
-                expected_principal_key=run.calendar_principal_key,
-            )
-            is None
-        ):
-            continue
-        try:
-            mailbox = load_mailbox_account(config, store, run.provider, run.account_id)
-        except MailboxAccountUnavailable as exc:
-            logger.info("Scheduling run %s mailbox unavailable: %s", run.run_id, exc)
-            continue
-
-        body_char_limit = run.extraction_body_char_limit or config.body_char_limit
-        context_at = (
-            datetime.fromisoformat(run.extraction_context_at)
-            if run.extraction_context_at is not None
-            else datetime.now(config.zone)
-        )
-        timezone = run.extraction_timezone or config.timezone
-        try:
-            with mailbox_polling_session(mailbox.gateway):
-                content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
-        except MailboxMessageUnavailable as exc:
-            logger.info("Scheduling run %s source unavailable: %s", run.run_id, exc)
-            _transition_source_problem(
-                store,
-                work,
-                next_state="source_unavailable",
-                failure_code="source_unavailable",
-            )
-            processed += 1
-            review_required += 1
-            continue
-        except MailboxMessageInvalid as exc:
-            logger.warning("Scheduling run %s source invalid: %s", run.run_id, exc)
-            _transition_source_problem(
-                store,
-                work,
-                next_state="manual_review",
-                failure_code="source_invalid",
-            )
-            processed += 1
-            review_required += 1
-            continue
-
-        try:
-            organizer_address = normalize_validated_address(work.organizer_address)
-        except ValueError:
-            _transition_source_problem(
-                store,
-                work,
-                next_state="manual_review",
-                failure_code="source_invalid",
-            )
-            processed += 1
-            review_required += 1
-            continue
-        source = SchedulingSource(
-            sender=work.sender,
-            subject=work.subject,
-            received_at=work.received_at,
-            body=content.body,
-            attachment_names=content.attachment_names,
-            organizer_address=organizer_address,
-            configured_timezone=timezone,
-            context_at=context_at,
-        )
-        source_sha256 = scheduling_source_sha256(source)
-        current = run
-        while current.state in {"detected", "extracting"}:
-            try:
-                reservation = store.reserve_automation_extraction(
-                    current.run_id,
-                    current.state_version,
-                    source_content_sha256=source_sha256,
-                    context_at=context_at.isoformat(),
-                    timezone=timezone,
-                    body_char_limit=body_char_limit,
+    cursor: tuple[str, str] | None = None
+    while len(attempted) < limit:
+        page = store.recoverable_automation_runs(limit, after=cursor, now=observed_at)
+        if not page:
+            break
+        for work in page:
+            run = work.run
+            cursor = (run.created_at, run.run_id)
+            if run.run_id in exclude_run_ids:
+                continue
+            if len(attempted) >= limit:
+                break
+            if (
+                _scheduling_authorization_principal(
+                    config,
+                    store,
+                    provider=run.provider,
+                    account_id=run.account_id,
+                    expected_principal_key=run.calendar_principal_key,
                 )
-            except AutomationSourceChanged:
+                is None
+            ):
+                continue
+            try:
+                mailbox = load_mailbox_account(config, store, run.provider, run.account_id)
+            except MailboxAccountUnavailable as exc:
+                logger.info("Scheduling run %s mailbox unavailable: %s", run.run_id, exc)
+                continue
+            attempted.add(run.run_id)
+
+            body_char_limit = run.extraction_body_char_limit or config.body_char_limit
+            timezone = run.extraction_timezone or config.timezone
+            try:
+                if run.extraction_context_at is not None:
+                    context_at = datetime.fromisoformat(run.extraction_context_at)
+                else:
+                    received_at = datetime.fromisoformat(work.received_at)
+                    if received_at.tzinfo is None:
+                        raise ValueError("Scheduling source time must be timezone-aware")
+                    context_at = received_at.astimezone(config.zone)
+                if context_at.tzinfo is None:
+                    raise ValueError("Scheduling context must be timezone-aware")
+                if run.state == "extracting" and work.extraction_organizer_address is None:
+                    raise ValueError("Reserved extraction organizer is unavailable")
+                organizer_address = normalize_validated_address(
+                    work.extraction_organizer_address or work.organizer_address
+                )
+            except (OverflowError, ValueError):
                 _transition_source_problem(
                     store,
                     work,
                     next_state="manual_review",
-                    failure_code="source_changed",
+                    failure_code="extraction_context_invalid",
                 )
                 processed += 1
                 review_required += 1
-                break
-            reserved_run = store.automation_run(current.run_id)
-            if reserved_run is None or reserved_run.current_payload_id != reservation.payload_id:
-                raise RuntimeError("Scheduling extraction reservation was not current")
-            feedback = _retry_feedback(store.automation_extraction_payloads(current.run_id))
-            try:
-                result = model.extract_scheduling(
-                    source=source,
-                    feedback=feedback,
-                    request_id=reservation.request_id,
-                )
-            except (GatewayModelError, ModelError) as exc:
-                logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
-                break
-            accepted_state: str | None = None
-            accepted_code: str | None = None
-            if result.accepted:
-                assert result.extraction is not None
-                accepted_state, accepted_code = _accepted_extraction_outcome(
-                    result.extraction.intent
-                )
-            current = store.record_automation_extraction(
-                current.run_id,
-                reserved_run.state_version,
-                payload_id=reservation.payload_id,
-                result_sha256=result.result_sha256,
-                result_json=result.result_json,
-                violations=[
-                    {"code": violation.code, "path": violation.path}
-                    for violation in result.violations
-                ],
-                accepted_state=accepted_state,
-                accepted_code=accepted_code,
-            )
-            if current.state == "extracting":
                 continue
-            processed += 1
-            if current.state in {"ambiguous", "manual_review", "source_unavailable"}:
+            try:
+                with mailbox_polling_session(mailbox.gateway):
+                    content = mailbox.gateway.content(work.provider_message_id, body_char_limit)
+            except MailboxMessageUnavailable as exc:
+                logger.info("Scheduling run %s source unavailable: %s", run.run_id, exc)
+                _transition_source_problem(
+                    store,
+                    work,
+                    next_state="source_unavailable",
+                    failure_code="source_unavailable",
+                )
+                processed += 1
                 review_required += 1
-            break
+                continue
+            except MailboxMessageInvalid as exc:
+                logger.warning("Scheduling run %s source invalid: %s", run.run_id, exc)
+                _transition_source_problem(
+                    store,
+                    work,
+                    next_state="manual_review",
+                    failure_code="source_invalid",
+                )
+                processed += 1
+                review_required += 1
+                continue
+
+            source = SchedulingSource(
+                sender=work.sender,
+                subject=work.subject,
+                received_at=work.received_at,
+                body=content.body,
+                attachment_names=content.attachment_names,
+                organizer_address=organizer_address,
+                configured_timezone=timezone,
+                context_at=context_at,
+            )
+            source_sha256 = scheduling_source_sha256(source)
+            current = run
+            while current.state in {"detected", "extracting"}:
+                try:
+                    reservation = store.reserve_automation_extraction(
+                        current.run_id,
+                        current.state_version,
+                        source_content_sha256=source_sha256,
+                        context_at=context_at.isoformat(),
+                        timezone=timezone,
+                        body_char_limit=body_char_limit,
+                        organizer_address=organizer_address,
+                    )
+                except AutomationSourceChanged:
+                    _transition_source_problem(
+                        store,
+                        work,
+                        next_state="manual_review",
+                        failure_code="source_changed",
+                    )
+                    processed += 1
+                    review_required += 1
+                    break
+                reserved_run = store.automation_run(current.run_id)
+                if (
+                    reserved_run is None
+                    or reserved_run.current_payload_id != reservation.payload_id
+                ):
+                    raise RuntimeError("Scheduling extraction reservation was not current")
+                feedback = _retry_feedback(store.automation_extraction_payloads(current.run_id))
+                try:
+                    result = model.extract_scheduling(
+                        source=source,
+                        feedback=feedback,
+                        request_id=reservation.request_id,
+                    )
+                except GatewayModelError as exc:
+                    logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
+                    failed = store.record_automation_extraction_failure(
+                        current.run_id,
+                        reserved_run.state_version,
+                        payload_id=reservation.payload_id,
+                        error_code=exc.code,
+                        retryable=exc.retryable,
+                        retry_after_seconds=exc.retry_after_seconds,
+                        now=observed_at,
+                    )
+                    if failed.state == "manual_review":
+                        processed += 1
+                        review_required += 1
+                    break
+                except ModelError as exc:
+                    logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
+                    store.record_automation_extraction_failure(
+                        current.run_id,
+                        reserved_run.state_version,
+                        payload_id=reservation.payload_id,
+                        error_code="model_unavailable",
+                        retryable=True,
+                        now=observed_at,
+                    )
+                    break
+                accepted_state: str | None = None
+                accepted_code: str | None = None
+                if result.accepted:
+                    assert result.extraction is not None
+                    accepted_state, accepted_code = _accepted_extraction_outcome(
+                        result.extraction.intent
+                    )
+                current = store.record_automation_extraction(
+                    current.run_id,
+                    reserved_run.state_version,
+                    payload_id=reservation.payload_id,
+                    result_sha256=result.result_sha256,
+                    result_json=result.result_json,
+                    violations=[
+                        {"code": violation.code, "path": violation.path}
+                        for violation in result.violations
+                    ],
+                    accepted_state=accepted_state,
+                    accepted_code=accepted_code,
+                )
+                if current.state == "extracting":
+                    continue
+                processed += 1
+                if current.state in {"ambiguous", "manual_review", "source_unavailable"}:
+                    review_required += 1
+                break
     return AutomationProcessing(processed, review_required, frozenset(attempted))
 
 

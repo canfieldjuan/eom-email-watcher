@@ -238,6 +238,7 @@ def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     extracting = store.automation_run(detected.run_id)
     assert extracting is not None
@@ -249,6 +250,7 @@ def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     assert repeated == first
 
@@ -275,6 +277,7 @@ def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     assert second.attempt_no == 2
     second_reserved = store.automation_run(detected.run_id)
@@ -296,6 +299,7 @@ def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
             context_at="2026-09-07T08:00:00-05:00",
             timezone="America/Chicago",
             body_char_limit=20_000,
+            organizer_address="owner@example.com",
         )
     assert [item.attempt_no for item in store.automation_extraction_payloads(detected.run_id)] == [
         1,
@@ -308,6 +312,86 @@ def test_scheduling_extraction_reservation_and_retry_budget_survive_restart(
         "extracting",
         "manual_review",
     ]
+
+
+def test_extraction_transport_failure_preserves_request_and_retry_schedule(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    detected = admitted_scheduling_run(store)
+    payload = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+    failed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+
+    retrying = store.record_automation_extraction_failure(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=payload.payload_id,
+        error_code="worker_unavailable",
+        retryable=True,
+        retry_after_seconds=30,
+        now=failed_at,
+    )
+
+    assert retrying.state == "extracting"
+    assert store.recoverable_automation_runs(now=failed_at + timedelta(seconds=29)) == []
+    due = store.recoverable_automation_runs(now=failed_at + timedelta(seconds=30))
+    assert [item.run.run_id for item in due] == [detected.run_id]
+    repeated = store.reserve_automation_extraction(
+        detected.run_id,
+        retrying.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    assert repeated.request_id == payload.request_id
+    persisted = store.automation_extraction_payloads(detected.run_id)[0]
+    assert persisted.failure_count == 1
+    assert persisted.last_error_code == "worker_unavailable"
+    assert persisted.next_retry_at == "2026-09-07T13:00:30+00:00"
+
+
+def test_schema_14_payload_table_migrates_retry_and_organizer_fields(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    with store.connection() as db:
+        for column in (
+            "organizer_address",
+            "failure_count",
+            "next_retry_at",
+            "last_error_code",
+        ):
+            db.execute(f"ALTER TABLE automation_extraction_payloads DROP COLUMN {column}")
+        db.execute("PRAGMA user_version = 14")
+
+    store.initialize()
+
+    with store.connection() as db:
+        columns = {
+            str(row["name"]): str(row["type"])
+            for row in db.execute("PRAGMA table_info(automation_extraction_payloads)").fetchall()
+        }
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert {
+        "organizer_address",
+        "failure_count",
+        "next_retry_at",
+        "last_error_code",
+    } <= columns.keys()
 
 
 @pytest.mark.parametrize(
@@ -334,6 +418,7 @@ def test_valid_extraction_atomically_records_payload_and_outcome(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     extracting = store.automation_run(detected.run_id)
     assert extracting is not None
@@ -381,6 +466,7 @@ def test_extraction_payload_hash_mismatch_cannot_enter_the_immutable_ledger(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     extracting = store.automation_run(detected.run_id)
     assert extracting is not None
@@ -415,6 +501,7 @@ def test_changed_source_fails_closed_without_reserving_another_attempt(tmp_path:
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
     extracting = store.automation_run(detected.run_id)
     assert extracting is not None
@@ -438,6 +525,7 @@ def test_changed_source_fails_closed_without_reserving_another_attempt(tmp_path:
             context_at="2026-09-07T08:00:00-05:00",
             timezone="America/Chicago",
             body_char_limit=20_000,
+            organizer_address="owner@example.com",
         )
 
     assert len(store.automation_extraction_payloads(detected.run_id)) == 1
@@ -456,6 +544,7 @@ def test_source_cleanup_deletes_extraction_payload_and_transitions_active_run(
         context_at="2026-09-07T08:00:00-05:00",
         timezone="America/Chicago",
         body_char_limit=20_000,
+        organizer_address="owner@example.com",
     )
 
     assert store.delete_message("local-scheduling") is True
@@ -490,22 +579,28 @@ def test_automation_review_notification_is_durable_state_checked_and_idempotent(
     )
     assert intent.message_id == detected.run_id
     assert "could not be processed safely" in str(intent.summary)
-    assert store.acknowledge_notification(
-        message_id=intent.message_id,
-        kind=intent.kind,
-        analysis_at=intent.analysis_at,
-        subject_type=intent.subject_type,
-        subject_id=intent.subject_id,
-        revision=intent.revision,
-    ) == "acknowledged"
-    assert store.acknowledge_notification(
-        message_id=intent.message_id,
-        kind=intent.kind,
-        analysis_at=intent.analysis_at,
-        subject_type=intent.subject_type,
-        subject_id=intent.subject_id,
-        revision=intent.revision,
-    ) == "already_acknowledged"
+    assert (
+        store.acknowledge_notification(
+            message_id=intent.message_id,
+            kind=intent.kind,
+            analysis_at=intent.analysis_at,
+            subject_type=intent.subject_type,
+            subject_id=intent.subject_id,
+            revision=intent.revision,
+        )
+        == "acknowledged"
+    )
+    assert (
+        store.acknowledge_notification(
+            message_id=intent.message_id,
+            kind=intent.kind,
+            analysis_at=intent.analysis_at,
+            subject_type=intent.subject_type,
+            subject_id=intent.subject_id,
+            revision=intent.revision,
+        )
+        == "already_acknowledged"
+    )
     assert all(item.subject_id != detected.run_id for item in store.notification_intents())
 
 
