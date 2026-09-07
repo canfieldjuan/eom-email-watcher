@@ -1075,7 +1075,11 @@ def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, obj
                     "account_identity_mismatch",
                     "The authorized calendar does not match the selected Microsoft principal",
                 )
-            if previous is not None and previous.principal_key not in {None, principal.key}:
+            if (
+                previous is not None
+                and previous.state == "ready"
+                and previous.principal_key not in {None, principal.key}
+            ):
                 _restore_calendar_grant(runtime, account.account_id, profile, previous)
                 raise ApiError(
                     "calendar_principal_mismatch",

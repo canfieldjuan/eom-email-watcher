@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -502,9 +503,13 @@ def _bounded_graph_text(
 ) -> str:
     if not isinstance(value, str) or (not value and not allow_empty):
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
-    if len(value.encode("utf-8")) > byte_limit:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}") from exc
+    if len(encoded) > byte_limit:
         raise Microsoft365Error(f"Microsoft Graph returned an oversized calendar {name}")
-    if any(not character.isprintable() for character in value):
+    if any(unicodedata.category(character) in {"Cc", "Cs"} for character in value):
         raise Microsoft365Error(f"Microsoft Graph returned an invalid calendar {name}")
     return value
 

@@ -1036,6 +1036,85 @@ def test_calendar_read_connect_is_entitled_and_uses_separate_private_cache(
     assert calendar_token.read_text(encoding="utf-8") == "calendar-read-cache"
 
 
+@pytest.mark.parametrize(
+    ("previous_state", "expected_ok"),
+    [("ready", False), ("revoked", True)],
+)
+def test_calendar_connect_rebinds_revoked_but_not_ready_grant_to_new_principal(
+    previous_state: str,
+    expected_ok: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'6' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    original = microsoft_principal()
+    replacement = microsoft_principal(object_id="replacement-object")
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        previous_state,
+        principal_key=original.key,
+        home_account_id=original.home_account_id,
+        tenant_id=original.tenant_id,
+        object_id=original.object_id,
+        email_address=original.email_address,
+    )
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("replacement-mailbox-cache", encoding="utf-8")
+    calendar_token = microsoft_calendar_read_token_file(runtime.config, account)
+    calendar_token.write_text("original-calendar-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: replacement,
+    )
+
+    class ReplacementCalendar:
+        principal = replacement
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("replacement-calendar-cache", encoding="utf-8")
+        return ReplacementCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.connect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["ok"] is expected_ok
+    grant = runtime.store.calendar_grant(account.account_id)
+    assert grant is not None
+    if expected_ok:
+        assert response["data"]["state"] == "ready"
+        assert grant.state == "ready"
+        assert grant.principal_key == replacement.key
+        assert calendar_token.read_text(encoding="utf-8") == "replacement-calendar-cache"
+    else:
+        assert response["error"]["code"] == "calendar_principal_mismatch"
+        assert grant.state == "ready"
+        assert grant.principal_key == original.key
+        assert calendar_token.read_text(encoding="utf-8") == "original-calendar-cache"
+
+
 @pytest.mark.parametrize("existing_ready", [False, True])
 def test_calendar_read_connect_recovers_exit_after_token_install(
     existing_ready: bool,

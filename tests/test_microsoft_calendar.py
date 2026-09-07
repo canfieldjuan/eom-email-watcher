@@ -540,6 +540,28 @@ def test_calendar_delta_rejects_malformed_event_projection_fields(
         )
 
 
+def test_calendar_text_accepts_unicode_formatting_and_rejects_unsafe_controls() -> None:
+    family_emoji = "Family 👨\u200d👩\u200d👧\u200d👦 review"
+
+    assert (
+        microsoft_calendar._bounded_graph_text(
+            family_emoji,
+            "subject",
+            microsoft_calendar.MAX_CALENDAR_SUBJECT_BYTES,
+            allow_empty=False,
+        )
+        == family_emoji
+    )
+    for rejected in ("line\nfeed", "surrogate-\ud800"):
+        with pytest.raises(microsoft_calendar.Microsoft365Error, match="invalid calendar subject"):
+            microsoft_calendar._bounded_graph_text(
+                rejected,
+                "subject",
+                microsoft_calendar.MAX_CALENDAR_SUBJECT_BYTES,
+                allow_empty=False,
+            )
+
+
 @pytest.mark.parametrize(
     "cursor",
     [
