@@ -935,7 +935,13 @@ def _calendar_status(request: dict[str, object], profile: str) -> dict[str, obje
         account = _calendar_account(runtime, payload, require_address=False)
         return _calendar_status_data(runtime, account, profile)
 
-    return _with_mail_account_mutation(request, status)
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        # Mutations fail closed on this platform, so the read cannot race one.
+        return status(runtime)
+    with operation_lock(lock_path, "Another mailbox operation is already running"):
+        return status(_runtime(request))
 
 
 def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, object]:
