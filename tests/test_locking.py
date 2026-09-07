@@ -25,6 +25,7 @@ except RuntimeError as exc:
 
 
 def test_native_operation_lock_is_available(tmp_path: Path) -> None:
+    assert locking.operation_lock_uses_soft_fallback(tmp_path / "watcher.lock") is False
     assert locking.operation_lock_supported(tmp_path / "watcher.lock") is True
 
 
@@ -70,6 +71,7 @@ def test_soft_lock_fallback_is_not_advertised_or_used(
     monkeypatch.setattr(locking, "FileLock", locking.SoftFileLock)
     lock_path = tmp_path / "watcher.lock"
 
+    assert locking.operation_lock_uses_soft_fallback(lock_path) is True
     assert locking.operation_lock_supported(lock_path) is False
     with (
         pytest.raises(RuntimeError, match="not available"),
@@ -95,9 +97,10 @@ def test_runtime_soft_lock_fallback_is_not_advertised_or_used(
     )
     lock_path = tmp_path / "watcher.lock"
 
+    assert locking.operation_lock_uses_soft_fallback(lock_path) is True
     assert locking.operation_lock_supported(lock_path) is False
-    assert probe_paths[0].parent.parent == tmp_path
-    assert not probe_paths[0].parent.exists()
+    assert probe_paths == [lock_path, lock_path]
+    assert not lock_path.exists()
     with (
         pytest.raises(RuntimeError, match="not available"),
         locking.operation_lock(lock_path, "watcher busy"),

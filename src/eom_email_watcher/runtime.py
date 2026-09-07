@@ -66,6 +66,19 @@ def mail_account_token_file(config: Config, account: MailAccount) -> Path:
     raise MailboxAccountUnavailable("The selected email provider is not available in this build")
 
 
+def microsoft_calendar_read_token_file(config: Config, account: MailAccount) -> Path:
+    """Resolve the isolated Calendars.Read cache for one generated Microsoft account."""
+    if account.provider != MICROSOFT365_PROVIDER or not MICROSOFT_GENERATED_ACCOUNT_ID.fullmatch(
+        account.account_id
+    ):
+        raise MailboxAccountUnavailable("Calendar read requires a Microsoft 365 account")
+    return (
+        config.database_file.parent
+        / "mail-accounts"
+        / f"{account.account_id}.calendar-read.msal-cache.json"
+    )
+
+
 def mail_account_connected(config: Config, account: MailAccount) -> bool:
     try:
         return mail_account_token_file(config, account).is_file()
