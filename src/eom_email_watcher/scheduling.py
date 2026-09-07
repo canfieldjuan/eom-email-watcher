@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.utils import getaddresses
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -19,22 +19,22 @@ MAX_SCHEDULING_TIME_RANGES = 8
 MAX_SCHEDULING_ATTENDEES = 64
 MAX_SCHEDULING_EVIDENCE_ITEMS = 4
 
-BoundedReason = Annotated[str, Field(min_length=1, max_length=300)]
+BoundedReason = Annotated[str, Field(strict=True, min_length=1, max_length=300)]
 
 
 class SchedulingEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: Literal["sender", "subject", "body", "attachment_name"]
-    quote: str = Field(min_length=1, max_length=500)
+    quote: str = Field(strict=True, min_length=1, max_length=500)
 
 
 class SchedulingTimeRange(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    start: str = Field(min_length=1, max_length=64)
-    end: str = Field(min_length=1, max_length=64)
-    timezone: str = Field(min_length=1, max_length=128)
+    start: str = Field(strict=True, min_length=1, max_length=64)
+    end: str = Field(strict=True, min_length=1, max_length=64)
+    timezone: str = Field(strict=True, min_length=1, max_length=128)
     evidence: tuple[SchedulingEvidence, ...] = Field(
         min_length=1,
         max_length=MAX_SCHEDULING_EVIDENCE_ITEMS,
@@ -44,15 +44,19 @@ class SchedulingTimeRange(BaseModel):
 class SchedulingAttendee(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    email: str = Field(min_length=3, max_length=320)
+    email: str = Field(strict=True, min_length=3, max_length=320)
     evidence: SchedulingEvidence
 
 
 class SchedulingEventReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider_event_id: str | None = Field(default=None, min_length=1, max_length=512)
-    human_reference: str | None = Field(default=None, min_length=1, max_length=500)
+    provider_event_id: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=512
+    )
+    human_reference: str | None = Field(
+        default=None, strict=True, min_length=1, max_length=500
+    )
     evidence: SchedulingEvidence
 
     @model_validator(mode="after")
@@ -74,7 +78,7 @@ class SchedulingExtraction(BaseModel):
         max_length=MAX_SCHEDULING_ATTENDEES,
     )
     referenced_event: SchedulingEventReference | None = None
-    confidence: float = Field(ge=0, le=1)
+    confidence: float = Field(strict=True, ge=0, le=1)
     ambiguity_reasons: tuple[BoundedReason, ...] = Field(max_length=8)
 
 
@@ -276,19 +280,57 @@ def _schema_violations(exc: ValidationError) -> list[SchedulingViolation]:
     return violations
 
 
-def _evidence_supported(
+def _evidence_candidates(
     evidence: SchedulingEvidence,
     source: SchedulingSource,
-) -> bool:
+) -> tuple[str, ...]:
     if evidence.source == "sender":
-        candidates = (source.sender,)
-    elif evidence.source == "subject":
-        candidates = (source.subject,)
-    elif evidence.source == "body":
-        candidates = (source.body,)
-    else:
-        candidates = source.attachment_names
-    return any(evidence.quote in candidate for candidate in candidates)
+        return (source.sender,)
+    if evidence.source == "subject":
+        return (source.subject,)
+    if evidence.source == "body":
+        return (source.body,)
+    return source.attachment_names
+
+
+def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) -> bool:
+    return any(
+        evidence.quote in candidate for candidate in _evidence_candidates(evidence, source)
+    )
+
+
+def _evidence_source_contexts(
+    evidence: SchedulingEvidence,
+    source: SchedulingSource,
+) -> tuple[str, ...]:
+    contexts: list[str] = []
+    for candidate in _evidence_candidates(evidence, source):
+        search_at = 0
+        while (quote_at := candidate.find(evidence.quote, search_at)) >= 0:
+            quote_end = quote_at + len(evidence.quote)
+            left = max(
+                candidate.rfind(delimiter, 0, quote_at) for delimiter in ".!?\r\n"
+            ) + 1
+            stripped_quote_end = quote_end
+            while stripped_quote_end > quote_at and candidate[stripped_quote_end - 1].isspace():
+                stripped_quote_end -= 1
+            if (
+                stripped_quote_end > quote_at
+                and candidate[stripped_quote_end - 1] in ".!?"
+            ):
+                right = stripped_quote_end
+            else:
+                right_candidates = tuple(
+                    position
+                    for delimiter in ".!?\r\n"
+                    if (position := candidate.find(delimiter, quote_end)) >= 0
+                )
+                right = min(right_candidates, default=len(candidate))
+            context = candidate[left:right].strip()
+            if context and context not in contexts:
+                contexts.append(context)
+            search_at = quote_at + 1
+    return tuple(contexts)
 
 
 def _wall_time_offsets(value: datetime, zone: ZoneInfo) -> set[object]:
@@ -302,6 +344,97 @@ def _wall_time_offsets(value: datetime, zone: ZoneInfo) -> set[object]:
     return offsets
 
 
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_MONTHS = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+
+
+def _explicit_calendar_dates(
+    text: str, context_date: date
+) -> tuple[tuple[tuple[date, re.Match[str]], ...], bool, bool]:
+    matches: list[tuple[date, re.Match[str]]] = []
+    occupied: set[tuple[int, int]] = set()
+    saw_explicit = False
+    invalid_explicit = False
+
+    def add(match: re.Match[str], year: int, month: int, day: int) -> None:
+        nonlocal invalid_explicit
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            invalid_explicit = True
+            return
+        span = match.span()
+        if span not in occupied:
+            matches.append((parsed, match))
+            occupied.add(span)
+
+    for match in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        saw_explicit = True
+        add(match, int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    for match in re.finditer(
+        r"(?<![\d-])(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2}|\d{4}))?(?!\d)",
+        text,
+    ):
+        saw_explicit = True
+        month = int(match.group(1))
+        day = int(match.group(2))
+        year_text = match.group(3)
+        year = (
+            int(year_text) + (2000 if len(year_text) == 2 else 0)
+            if year_text is not None
+            else context_date.year + int((month, day) < (context_date.month, context_date.day))
+        )
+        add(match, year, month, day)
+    month_numbers = {
+        spelling: month
+        for month, name in enumerate(_MONTHS, start=1)
+        for spelling in {name, name[:3]}
+    }
+    month_pattern = "|".join(sorted(month_numbers, key=len, reverse=True))
+    for match in re.finditer(
+        rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
+        text,
+    ):
+        saw_explicit = True
+        month = month_numbers[match.group(1)]
+        day = int(match.group(2))
+        year = (
+            int(match.group(3))
+            if match.group(3) is not None
+            else context_date.year + int((month, day) < (context_date.month, context_date.day))
+        )
+        add(match, year, month, day)
+    return tuple(matches), saw_explicit, invalid_explicit
+
+
+def _calendar_weekday_is_consistent(
+    text: str, match: re.Match[str], parsed: date
+) -> bool:
+    weekday_pattern = "|".join(_WEEKDAYS)
+    adjacent = [
+        item.group(1)
+        for item in (
+            re.search(rf"\b({weekday_pattern})\b\s*,?\s*$", text[: match.start()]),
+            re.match(rf"^\s*,?\s*\b({weekday_pattern})\b", text[match.end() :]),
+        )
+        if item is not None
+    ]
+    return not adjacent or all(item == _WEEKDAYS[parsed.weekday()] for item in adjacent)
+
+
 def _date_has_source_support(
     value: datetime,
     evidence_text: str,
@@ -312,75 +445,25 @@ def _date_has_source_support(
     local = value.astimezone(zone)
     text = evidence_text.casefold()
     context_date = context_at.astimezone(zone).date()
-    weekdays = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-
-    def weekday_is_consistent(match: re.Match[str]) -> bool:
-        weekday_pattern = "|".join(weekdays)
-        prefix = text[: match.start()]
-        suffix = text[match.end() :]
-        adjacent = [
-            item.group(1)
-            for item in (
-                re.search(rf"\b({weekday_pattern})\b\s*,?\s*$", prefix),
-                re.match(rf"^\s*,?\s*\b({weekday_pattern})\b", suffix),
-            )
-            if item is not None
-        ]
-        return not adjacent or all(item == weekdays[local.weekday()] for item in adjacent)
-
-    iso = re.search(rf"\b{re.escape(local.date().isoformat())}\b", text)
-    if iso:
-        return weekday_is_consistent(iso)
-    numeric = re.search(
-        rf"(?<!\d)0?{local.month}[/-]0?{local.day}(?:[/-](\d{{2}}|\d{{4}}))?(?!\d)",
-        text,
+    calendar_dates, saw_explicit_date, invalid_explicit_date = _explicit_calendar_dates(
+        text, context_date
     )
-    if numeric:
-        if not weekday_is_consistent(numeric):
+    if saw_explicit_date:
+        if invalid_explicit_date or not calendar_dates:
             return False
-        year_text = numeric.group(1)
-        if year_text is not None:
-            year = int(year_text) + (2000 if len(year_text) == 2 else 0)
-            return local.year == year
-        expected_year = context_date.year + int(
-            (local.month, local.day) < (context_date.month, context_date.day)
-        )
-        return local.year == expected_year
-    month_names = (
-        "january",
-        "february",
-        "march",
-        "april",
-        "may",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-    )
-    month = month_names[local.month - 1]
-    named = re.search(
-        rf"\b(?:{month}|{month[:3]})\s+{local.day}(?:st|nd|rd|th)?(?:,?\s+(\d{{4}}))?\b",
-        text,
-    )
-    if named:
-        if not weekday_is_consistent(named):
+        if not all(
+            _calendar_weekday_is_consistent(text, match, parsed)
+            for parsed, match in calendar_dates
+        ):
             return False
-        if named.group(1) is not None:
-            return local.year == int(named.group(1))
-        expected_year = context_date.year + int(
-            (local.month, local.day) < (context_date.month, context_date.day)
-        )
-        return local.year == expected_year
+        return any(parsed == local.date() for parsed, _match in calendar_dates)
     if re.search(r"\bday\s+after\s+tomorrow\b", text):
         return local.date().toordinal() == context_date.toordinal() + 2
-    for weekday_index, weekday in enumerate(weekdays):
+    for weekday_index, weekday in enumerate(_WEEKDAYS):
         if re.search(rf"\bnext\s+{weekday}\b", text):
             days_ahead = (weekday_index - context_date.weekday()) % 7 or 7
             return local.date().toordinal() == context_date.toordinal() + days_ahead
-    if re.search(rf"\b{weekdays[local.weekday()]}\b", text):
+    if re.search(rf"\b{_WEEKDAYS[local.weekday()]}\b", text):
         days_ahead = (local.weekday() - context_date.weekday()) % 7
         return local.date().toordinal() == context_date.toordinal() + days_ahead
     return (re.search(r"\btoday\b", text) is not None and local.date() == context_date) or (
@@ -460,10 +543,13 @@ def _range_source_options(
     )
     supported_options: list[str] = []
     start_matches = (
-        *_time_source_matches(start, evidence_text, zone=zone),
-        *_unqualified_12_hour_source_matches(start, evidence_text, zone=zone),
+        *((match, False) for match in _time_source_matches(start, evidence_text, zone=zone)),
+        *(
+            (match, True)
+            for match in _unqualified_12_hour_source_matches(start, evidence_text, zone=zone)
+        ),
     )
-    for start_match in start_matches:
+    for start_match, requires_shared_meridiem in start_matches:
         for end_match in _time_source_matches(end, evidence_text, zone=zone):
             if end_match.start() < start_match.end():
                 continue
@@ -475,6 +561,8 @@ def _range_source_options(
             ):
                 continue
             end_meridiem = re.search(r"\b(am|pm)\b", end_match.group(), re.IGNORECASE)
+            if requires_shared_meridiem and end_meridiem is None:
+                continue
             if end_meridiem and not re.search(r"\b(?:am|pm)\b", start_match.group(), re.IGNORECASE):
                 expected = "am" if start.astimezone(zone).hour < 12 else "pm"
                 if end_meridiem.group(1).casefold() != expected:
@@ -543,6 +631,7 @@ def _explicit_timezones(
         try:
             ZoneInfo(match)
         except (ValueError, ZoneInfoNotFoundError):
+            unsupported_label = True
             continue
         names.add(match.casefold())
     offsets: set[timedelta] = {
@@ -625,7 +714,11 @@ def _time_violations(
         zone = ZoneInfo(item.timezone)
     except (ValueError, ZoneInfoNotFoundError):
         return [SchedulingViolation("timezone_unknown", f"{path}.timezone")]
-    evidence_texts = tuple(evidence.quote for evidence in item.evidence)
+    evidence_texts = tuple(
+        context
+        for evidence in item.evidence
+        for context in _evidence_source_contexts(evidence, source)
+    )
     matching_options = tuple(
         option
         for text in evidence_texts
@@ -637,9 +730,12 @@ def _time_violations(
             violations.append(SchedulingViolation("timezone_nonexistent", f"{path}.{label}"))
         elif value.utcoffset() not in offsets:
             violations.append(SchedulingViolation("timezone_offset_mismatch", f"{path}.{label}"))
-        elif len(offsets) > 1 and not any(
-            value.utcoffset() in _explicit_timezones(option)[1]
-            for option in matching_options
+        elif len(offsets) > 1 and (
+            not matching_options
+            or not all(
+                value.utcoffset() in _explicit_timezones(option)[1]
+                for option in matching_options
+            )
         ):
             violations.append(SchedulingViolation("timezone_ambiguous", f"{path}.{label}"))
     for label, value in (("start", start), ("end", end)):
@@ -659,7 +755,7 @@ def _time_violations(
             violations.append(SchedulingViolation("time_value_unsupported", f"{path}.{label}"))
     if not matching_options:
         violations.append(SchedulingViolation("time_range_unsupported", path))
-    elif not any(
+    elif not all(
         _timezone_has_source_support(
             item.timezone,
             option,

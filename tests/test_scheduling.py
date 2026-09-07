@@ -117,6 +117,18 @@ def test_schema_and_source_boundaries_fail_closed(mutation, expected: str) -> No
     assert expected in codes(validate(value))
 
 
+@pytest.mark.parametrize("confidence", [True, "1"])
+def test_scheduling_scalar_types_are_strict(confidence: object) -> None:
+    value = valid_result()
+    value["confidence"] = confidence
+
+    result = validate(value)
+
+    assert result.extraction is None
+    assert SchedulingViolation("schema_invalid_field", "confidence") in result.violations
+    assert json.loads(result.result_json)["confidence"] == confidence
+
+
 def test_organizer_and_duplicate_attendees_fail_closed() -> None:
     value = valid_result()
     value["attendees"] = [
@@ -293,6 +305,22 @@ def test_trailing_meridiem_cannot_change_only_the_range_end() -> None:
     corrected_codes = codes(validate(value, scheduling_source=scheduling_source))
     assert "time_range_unsupported" not in corrected_codes
     assert "time_value_unsupported" not in corrected_codes
+
+
+def test_unqualified_12_hour_start_requires_a_shared_meridiem() -> None:
+    value = valid_result()
+    quote = "September 8 from 10:00 to 22:30"
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T22:00:00-05:00",
+            "end": "2026-09-08T22:30:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=source(body=quote))
+    )
 
 
 def test_range_endpoints_cannot_borrow_from_separate_alternatives() -> None:
@@ -563,6 +591,22 @@ def test_competing_timezones_in_one_option_fail_closed() -> None:
     )
 
 
+def test_time_validation_restores_qualifiers_omitted_from_the_model_quote() -> None:
+    value = valid_result()
+    full_source = (
+        "September 8 from 10:00 to 10:30 "
+        "America/Chicago (America/New_York)."
+    )
+    truncated_quote = "September 8 from 10:00 to 10:30 America/Chicago"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": truncated_quote}
+    ]
+
+    assert "timezone_unsupported" in codes(
+        validate(value, scheduling_source=source(body=full_source))
+    )
+
+
 def test_unsupported_composite_zone_is_not_treated_as_us_central() -> None:
     value = valid_result()
     value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
@@ -623,6 +667,14 @@ def test_conflicting_weekday_and_calendar_date_fail_closed() -> None:
     ]
     assert "time_date_unsupported" not in codes(
         validate(value, scheduling_source=source(body=consistent))
+    )
+
+    reverse_conflict = "Tuesday, September 9, 2026 from 10:00 to 10:30"
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": reverse_conflict}
+    ]
+    assert "time_date_unsupported" in codes(
+        validate(value, scheduling_source=source(body=reverse_conflict))
     )
 
 
@@ -736,7 +788,7 @@ def test_dst_fold_offset_must_share_the_matching_range_evidence() -> None:
             "evidence": [
                 {
                     "source": "body",
-                    "quote": "November 1, 2026 from 1:15 AM to 1:45 AM",
+                    "quote": "November 1, 2026 from 1:15 AM to 1:45 AM.",
                 },
                 {"source": "body", "quote": "footer offset -05:00"},
             ],
