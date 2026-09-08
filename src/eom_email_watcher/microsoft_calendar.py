@@ -65,6 +65,7 @@ MAX_CALENDAR_PROPOSAL_ATTENDEES = 64
 MAX_CALENDAR_WRITE_RESPONSE_BYTES = 512 * 1024
 MAX_CALENDAR_WRITE_SECONDS = 60.0
 MAX_CALENDAR_RECONCILIATION_EVENTS = 1_000
+MAX_CALENDAR_RECONCILIATION_PAGES = 64
 _CONSENT_PENDING_ERROR_CODES = frozenset({65001, 90094, 90095})
 _RFC3339_INSTANT = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z"
@@ -881,74 +882,90 @@ async def _find_calendar_event_by_transaction(
     window_start: str,
     window_end: str,
 ) -> CalendarWriteResult | None:
-    query = urlencode(
-        {
-            "startDateTime": window_start,
-            "endDateTime": window_end,
-            "$select": "id,transactionId",
-            "$top": str(MAX_CALENDAR_RECONCILIATION_EVENTS),
-        }
-    )
+    query_values = {
+        "startDateTime": window_start,
+        "endDateTime": window_end,
+        "$select": "id,transactionId",
+        "$top": str(MAX_CALENDAR_RECONCILIATION_EVENTS),
+    }
+    query = urlencode(query_values)
     owned_client = authorization._http_client is None
     client = authorization._http_client or httpx.AsyncClient(timeout=GRAPH_TIMEOUT_SECONDS)
     deadline = _calendar_monotonic() + MAX_CALENDAR_WRITE_SECONDS
+    current = f"{GRAPH_ROOT}/me/calendarView?{query}"
+    total_bytes = 0
+    events_seen = 0
+    pages = 0
+    matches: list[CalendarWriteResult] = []
     try:
-        try:
-            async with client.stream(
-                "GET",
-                f"{GRAPH_ROOT}/me/calendarView?{query}",
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "identity",
-                    "Authorization": f"Bearer {authorization._access_token}",
-                    "Prefer": 'IdType="ImmutableId", outlook.timezone="UTC"',
-                },
-                follow_redirects=False,
-                timeout=min(
-                    GRAPH_TIMEOUT_SECONDS,
-                    _calendar_round_time_remaining(deadline),
-                ),
-            ) as response:
-                if response.status_code in {401, 403}:
-                    raise MicrosoftAuthorizationRejected(
-                        "Microsoft rejected calendar write reconciliation authorization"
-                    )
-                if not response.is_success:
-                    raise Microsoft365Error(
-                        "Microsoft Graph calendar write reconciliation is unavailable"
-                    )
-                document, _response_bytes = await _bounded_graph_document(
-                    response,
-                    deadline,
-                    MAX_CALENDAR_WRITE_RESPONSE_BYTES,
-                )
-        except httpx.RequestError as exc:
-            raise Microsoft365Error(
-                "Microsoft Graph calendar write reconciliation is unavailable"
-            ) from exc
-        values = document.get("value")
-        if not isinstance(values, list) or len(values) > MAX_CALENDAR_RECONCILIATION_EVENTS:
-            raise Microsoft365Error(
-                "Microsoft Graph returned an invalid reconciliation result"
-            )
-        matches: list[CalendarWriteResult] = []
-        for item in values:
-            if not isinstance(item, dict):
+        while True:
+            if pages >= MAX_CALENDAR_RECONCILIATION_PAGES:
                 raise Microsoft365Error(
-                    "Microsoft Graph returned an invalid reconciliation event"
+                    "Microsoft Graph calendar reconciliation exceeded its page limit"
                 )
-            if item.get("transactionId") == transaction_id:
-                matches.append(
-                    CalendarWriteResult(
-                        event_id=_calendar_event_id(item.get("id")),
-                        transaction_id=transaction_id,
+            pages += 1
+            try:
+                async with client.stream(
+                    "GET",
+                    current,
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "identity",
+                        "Authorization": f"Bearer {authorization._access_token}",
+                        "Prefer": 'IdType="ImmutableId", outlook.timezone="UTC"',
+                    },
+                    follow_redirects=False,
+                    timeout=min(
+                        GRAPH_TIMEOUT_SECONDS,
+                        _calendar_round_time_remaining(deadline),
+                    ),
+                ) as response:
+                    if response.status_code in {401, 403}:
+                        raise MicrosoftAuthorizationRejected(
+                            "Microsoft rejected calendar write reconciliation authorization"
+                        )
+                    if not response.is_success:
+                        raise Microsoft365Error(
+                            "Microsoft Graph calendar write reconciliation is unavailable"
+                        )
+                    document, response_bytes = await _bounded_graph_document(
+                        response,
+                        deadline,
+                        MAX_CALENDAR_WRITE_RESPONSE_BYTES - total_bytes,
                     )
-                )
-        if len(matches) > 1:
-            raise Microsoft365Error(
-                "Microsoft Graph returned duplicate transaction identities"
+            except httpx.RequestError as exc:
+                raise Microsoft365Error(
+                    "Microsoft Graph calendar write reconciliation is unavailable"
+                ) from exc
+            total_bytes += response_bytes
+            values = document.get("value")
+            if not isinstance(values, list):
+                raise Microsoft365Error("Microsoft Graph returned an invalid reconciliation result")
+            events_seen += len(values)
+            if events_seen > MAX_CALENDAR_RECONCILIATION_EVENTS:
+                raise Microsoft365Error("Microsoft Graph returned too many reconciliation events")
+            for item in values:
+                if not isinstance(item, dict):
+                    raise Microsoft365Error(
+                        "Microsoft Graph returned an invalid reconciliation event"
+                    )
+                if item.get("transactionId") == transaction_id:
+                    matches.append(
+                        CalendarWriteResult(
+                            event_id=_calendar_event_id(item.get("id")),
+                            transaction_id=transaction_id,
+                        )
+                    )
+            if len(matches) > 1:
+                raise Microsoft365Error("Microsoft Graph returned duplicate transaction identities")
+            next_link = document.get("@odata.nextLink")
+            if next_link is None:
+                return matches[0] if matches else None
+            current = _safe_calendar_view_continuation(
+                next_link,
+                window_start=window_start,
+                window_end=window_end,
             )
-        return matches[0] if matches else None
     finally:
         if owned_client:
             await client.aclose()
@@ -1007,6 +1024,43 @@ def _safe_calendar_continuation(url: object, token_name: str) -> str:
     query = parse_qs(parsed.query, keep_blank_values=True)
     if set(query) != {token_name} or len(query[token_name]) != 1 or not query[token_name][0]:
         raise Microsoft365Error("Microsoft Graph returned an invalid calendar cursor")
+    return url
+
+
+def _safe_calendar_view_continuation(
+    url: object,
+    *,
+    window_start: str,
+    window_end: str,
+) -> str:
+    if not isinstance(url, str) or not url or len(url.encode("utf-8")) > MAX_GRAPH_URL_LENGTH:
+        raise Microsoft365Error("Microsoft Graph returned an invalid reconciliation cursor")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise Microsoft365Error(
+            "Microsoft Graph returned an invalid reconciliation cursor"
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "graph.microsoft.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or parsed.path.casefold() != "/v1.0/me/calendarview"
+    ):
+        raise Microsoft365Error("Microsoft Graph returned an invalid reconciliation cursor")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if (
+        len(query.get("$skiptoken", ())) != 1
+        or not query["$skiptoken"][0]
+        or query.get("startDateTime", [window_start]) != [window_start]
+        or query.get("endDateTime", [window_end]) != [window_end]
+        or query.get("$select", ["id,transactionId"]) != ["id,transactionId"]
+    ):
+        raise Microsoft365Error("Microsoft Graph returned an invalid reconciliation cursor")
     return url
 
 

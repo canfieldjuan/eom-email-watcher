@@ -1018,6 +1018,131 @@ def test_calendar_write_reconciliation_finds_only_matching_transaction() -> None
     assert requests[0].url.params["$top"] == "1000"
 
 
+def test_calendar_write_reconciliation_follows_validated_continuation() -> None:
+    transaction_id = "77d9c691-1c91-4e23-8f03-92973e12c385"
+    window_start = "2026-09-08T10:00:00-05:00"
+    window_end = "2026-09-08T10:30:00-05:00"
+    canonical_start, canonical_end = microsoft_calendar.canonical_calendar_window(
+        window_start,
+        window_end,
+    )
+    next_link = str(
+        httpx.URL(
+            f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView",
+            params={
+                "startDateTime": canonical_start,
+                "endDateTime": canonical_end,
+                "$select": "id,transactionId",
+                "$top": "1000",
+                "$skiptoken": "next",
+            },
+        )
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.params.get("$skiptoken") == "next":
+            return httpx.Response(
+                200,
+                json={"value": [{"id": "matched", "transactionId": transaction_id}]},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "value": [{"id": "other", "transactionId": "other"}],
+                "@odata.nextLink": next_link,
+            },
+        )
+
+    authorization = MicrosoftCalendarWriteAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    result = find_calendar_event_by_transaction(
+        authorization,
+        transaction_id=transaction_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    assert result is not None and result.event_id == "matched"
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    "next_link",
+    [
+        "https://attacker.invalid/v1.0/me/calendarView?%24skiptoken=next",
+        (
+            f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView?"
+            "startDateTime=2026-09-09T10%3A00%3A00-05%3A00&%24skiptoken=next"
+        ),
+        f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView",
+    ],
+)
+def test_calendar_write_reconciliation_rejects_unsafe_continuation(
+    next_link: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"value": [], "@odata.nextLink": next_link})
+
+    authorization = MicrosoftCalendarWriteAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(Microsoft365Error, match="reconciliation cursor"):
+        find_calendar_event_by_transaction(
+            authorization,
+            transaction_id="77d9c691-1c91-4e23-8f03-92973e12c385",
+            window_start="2026-09-08T10:00:00-05:00",
+            window_end="2026-09-08T10:30:00-05:00",
+        )
+
+    assert len(requests) == 1
+
+
+def test_calendar_write_reconciliation_bounds_events_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(microsoft_calendar, "MAX_CALENDAR_RECONCILIATION_EVENTS", 1)
+    next_link = str(
+        httpx.URL(
+            f"{microsoft_calendar.GRAPH_ROOT}/me/calendarView",
+            params={"$top": "1", "$skiptoken": "next"},
+        )
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("$skiptoken") == "next":
+            return httpx.Response(200, json={"value": [{"id": "two"}]})
+        return httpx.Response(
+            200,
+            json={"value": [{"id": "one"}], "@odata.nextLink": next_link},
+        )
+
+    authorization = MicrosoftCalendarWriteAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(Microsoft365Error, match="too many reconciliation events"):
+        find_calendar_event_by_transaction(
+            authorization,
+            transaction_id="77d9c691-1c91-4e23-8f03-92973e12c385",
+            window_start="2026-09-08T10:00:00-05:00",
+            window_end="2026-09-08T10:30:00-05:00",
+        )
+
+
 def test_calendar_write_reconciliation_absence_is_not_a_failure() -> None:
     authorization = MicrosoftCalendarWriteAuthorization(
         principal(),

@@ -906,7 +906,8 @@ def _purge_expired_automation_tombstones(
 ) -> None:
     rows = db.execute(
         """SELECT run_id FROM automation_runs
-        WHERE state NOT IN ('writing', 'unresolved', 'reconciling') AND expires_at <= ?
+        WHERE aware_iso_epoch(expires_at) IS NULL
+           OR aware_iso_epoch(expires_at) <= aware_iso_epoch(?)
         ORDER BY run_id""",
         (now,),
     ).fetchall()
@@ -915,9 +916,7 @@ def _purge_expired_automation_tombstones(
         chunk = run_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
         placeholders = ", ".join("?" for _ in chunk)
         db.execute(
-            f"""DELETE FROM automation_runs
-            WHERE state NOT IN ('writing', 'unresolved', 'reconciling')
-              AND run_id IN ({placeholders})""",
+            f"DELETE FROM automation_runs WHERE run_id IN ({placeholders})",
             tuple(chunk),
         )
         db.execute(
@@ -1800,9 +1799,8 @@ class Store:
                     "ALTER TABLE automation_proposal_payloads "
                     "RENAME TO automation_proposal_payloads_v16"
                 )
-                db.executescript(
-                    """
-                    CREATE TABLE automation_proposal_payloads (
+                db.execute(
+                    """CREATE TABLE automation_proposal_payloads (
                         payload_id TEXT PRIMARY KEY CHECK (length(payload_id) = 36),
                         run_id TEXT NOT NULL CHECK (run_id <> ''),
                         proposal_version INTEGER NOT NULL CHECK (proposal_version > 0),
@@ -1839,8 +1837,10 @@ class Store:
                                 AND timezone IS NULL AND suggestion_reason IS NULL
                                 AND empty_reason IS NOT NULL AND expires_at IS NULL)
                         )
-                    );
-                    INSERT INTO automation_proposal_payloads(
+                    )"""
+                )
+                db.execute(
+                    """INSERT INTO automation_proposal_payloads(
                         payload_id, run_id, proposal_version, status, request_sha256,
                         proposal_sha256, subject, attendees_json, start, end, timezone,
                         suggestion_reason, empty_reason, observed_at, expires_at, created_at
@@ -1848,13 +1848,15 @@ class Store:
                     SELECT payload_id, run_id, proposal_version, status, request_sha256,
                         proposal_sha256, subject, attendees_json, start, end, timezone,
                         suggestion_reason, empty_reason, observed_at, expires_at, created_at
-                    FROM automation_proposal_payloads_v16;
-                    DROP TABLE automation_proposal_payloads_v16;
-                    CREATE TRIGGER automation_runs_delete_proposal_payloads
+                    FROM automation_proposal_payloads_v16"""
+                )
+                db.execute("DROP TABLE automation_proposal_payloads_v16")
+                db.execute(
+                    """CREATE TRIGGER automation_runs_delete_proposal_payloads
                     AFTER DELETE ON automation_runs
                     BEGIN
                         DELETE FROM automation_proposal_payloads WHERE run_id = OLD.run_id;
-                    END;
+                    END
                     """
                 )
             automation_payload_columns = {
@@ -3555,6 +3557,8 @@ class Store:
                 failure_code = None
                 transaction_id = None
                 event_decision = "declined"
+                next_payload_id = str(proposal["payload_id"])
+                next_payload_sha256 = proposal_sha256
             else:
                 start_value = proposal["start"]
                 end_value = proposal["end"]
@@ -3571,15 +3575,27 @@ class Store:
                 except (OverflowError, ValueError) as exc:
                     raise RuntimeError("Stored automation proposal time is invalid") from exc
                 if stamp >= expires_at or stamp >= start_time:
+                    extraction = db.execute(
+                        """SELECT payload_id, result_sha256
+                        FROM automation_extraction_payloads
+                        WHERE run_id = ? AND status = 'accepted'""",
+                        (run_id,),
+                    ).fetchone()
+                    if extraction is None or extraction["result_sha256"] is None:
+                        raise RuntimeError("Accepted automation extraction is unavailable")
                     next_state = "proposing"
                     failure_code = "proposal_expired"
                     transaction_id = None
                     event_decision = None
+                    next_payload_id = str(extraction["payload_id"])
+                    next_payload_sha256 = str(extraction["result_sha256"])
                 else:
                     next_state = "write_authorized"
                     failure_code = None
                     transaction_id = str(uuid.uuid4())
                     event_decision = "confirmed"
+                    next_payload_id = str(proposal["payload_id"])
+                    next_payload_sha256 = proposal_sha256
                     db.execute(
                         """INSERT INTO automation_calendar_writes(
                             run_id, transaction_id, proposal_version, proposal_sha256,
@@ -3603,7 +3619,8 @@ class Store:
                     )
             changed = db.execute(
                 """UPDATE automation_runs SET state = ?, state_version = ?,
-                    failure_code = ?, review_notified_at = NULL, updated_at = ?
+                    failure_code = ?, current_payload_id = ?, current_payload_sha256 = ?,
+                    review_notified_at = NULL, updated_at = ?
                 WHERE run_id = ? AND state = 'awaiting_confirmation'
                   AND state_version = ? AND current_payload_id = ?
                   AND current_payload_sha256 = ?""",
@@ -3611,6 +3628,8 @@ class Store:
                     next_state,
                     next_version,
                     failure_code,
+                    next_payload_id,
+                    next_payload_sha256,
                     stamp.isoformat(),
                     run_id,
                     previous_version,
@@ -3658,17 +3677,24 @@ class Store:
         limit: int = 25,
         *,
         run_id: str | None = None,
+        now: datetime | None = None,
     ) -> list[AutomationCalendarWriteWork]:
         if limit < 1:
             raise ValueError("limit must be positive")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        now_epoch = (stamp - epoch).total_seconds()
         run_filter = " AND r.run_id = ?" if run_id is not None else ""
-        parameters: list[object] = [] if run_id is None else [run_id]
+        parameters: list[object] = [now_epoch]
+        if run_id is not None:
+            parameters.append(run_id)
         parameters.append(limit)
         with self.connection() as db:
             rows = db.execute(
                 f"""SELECT r.* FROM automation_runs AS r
                 JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
                 WHERE r.state IN ('write_authorized', 'writing', 'unresolved', 'reconciling')
+                  AND aware_iso_epoch(r.expires_at) > ?
                 {run_filter}
                 ORDER BY r.updated_at, r.run_id LIMIT ?""",
                 parameters,
