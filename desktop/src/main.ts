@@ -1324,7 +1324,7 @@ function renderInbox(items: InboxItem[]): void {
         onlineMeeting,
         note,
       );
-      if (proposal.state === "awaiting_confirmation" && hasSuggestion && !expired) {
+      if (proposal.state === "awaiting_confirmation" && hasSuggestion) {
         const actions = document.createElement("div");
         actions.className = "calendar-proposal-actions";
         const decline = document.createElement("button");
@@ -1333,16 +1333,17 @@ function renderInbox(items: InboxItem[]): void {
         decline.textContent = "Decline";
         const confirm = document.createElement("button");
         confirm.type = "button";
-        confirm.textContent = "Create event";
+        confirm.textContent = expired ? "Recheck proposal" : "Create event";
         const decide = async (decision: "confirm" | "decline"): Promise<void> => {
           if (decision === "confirm") {
             const invitationWarning = proposal.attendees.length
               ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
               : "";
+            const confirmationMessage = expired
+              ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
+              : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
             if (
-              !window.confirm(
-                `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`,
-              )
+              !window.confirm(confirmationMessage)
             ) {
               return;
             }

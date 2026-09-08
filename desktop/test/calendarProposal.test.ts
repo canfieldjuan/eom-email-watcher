@@ -24,8 +24,10 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /Account identity: \$\{proposal\.account_id\}/);
   assert.match(source, /location\.textContent = "Location: Not specified"/);
   assert.match(source, /onlineMeeting\.textContent = "Teams link: No"/);
-  assert.match(source, /proposal\.state === "awaiting_confirmation" && hasSuggestion && !expired/);
-  assert.match(source, /confirm\.textContent = "Create event"/);
+  assert.match(source, /proposal\.state === "awaiting_confirmation" && hasSuggestion/);
+  assert.doesNotMatch(source, /hasSuggestion && !expired/);
+  assert.match(source, /confirm\.textContent = expired \? "Recheck proposal" : "Create event"/);
+  assert.match(source, /otherwise it will refresh the proposal without creating an event/);
   assert.match(source, /decline\.textContent = "Decline"/);
   assert.match(source, /This will send meeting invitations from/);
   assert.match(source, /invoke<CalendarDecisionResult>\("calendar_proposal_decide"/);
