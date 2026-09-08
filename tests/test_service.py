@@ -2095,6 +2095,14 @@ def test_transient_source_failure_does_not_starve_newer_runnable_work(
         monkeypatch,
         provider_message_id="runnable",
     )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET created_at = ? WHERE run_id = ?",
+            (
+                (SCHEDULING_FIXTURE_NOW - timedelta(seconds=1)).isoformat(),
+                failed.run_id,
+            ),
+        )
     allow_automation_processing(monkeypatch, FailingOlderAutomationProvider())
     model = ExtractionModel([valid_scheduling_output()])
 
