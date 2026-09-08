@@ -54,8 +54,9 @@ identifier, or event identifier is retained in this evidence.
 
 Revision `b6a2d2ffef602ea8773e459c75d16456b97bca36` was installed from its
 production-profile Debian package and exercised with the native Linux desktop.
-A controlled watched-sender message named one separately licensed Microsoft
-test principal as its sole attendee. The resulting proposal survived process
+The organizer was the existing Microsoft 365 work-or-school test account; a
+controlled watched-sender message named one separately licensed Microsoft test
+principal as its sole attendee. The resulting proposal survived process
 boundaries and reached `awaiting_confirmation`. Before activation, the native
 accessibility tree exposed a persistent warning that creating the event would
 send an invitation from the selected organizer to the named attendee.
@@ -745,10 +746,10 @@ pending rather than inferred from fixtures:
 18. **Live no-attendee and attendee-bearing writes accepted.** Separate live,
     explicitly confirmed proposals created one event each through the isolated
     write grant and retained their event identity and provenance. Before the
-    attendee-bearing write, the native UI visibly named the invitation effect,
-    organizer, and sole attendee. Graph read-back matched the durable identities,
-    requested interval, and expected attendee; a later reconciliation found
-    exactly one matching transaction. Both controlled events were removed.
+    attendee-bearing write, the native accessibility tree exposed the invitation
+    effect, organizer, and sole attendee. Graph read-back matched the durable
+    identities, requested interval, and expected attendee; a later reconciliation
+    found exactly one matching transaction. Both controlled events were removed.
 19. Lost-response and repeated-confirmation probes reuse one transaction ID,
     cannot produce duplicate event work, and prove reconciliation can move an
     unresolved run to `completed` only when it finds or receives the matching
