@@ -85,6 +85,45 @@ def test_valid_new_meeting_is_accepted_with_normalized_evidence() -> None:
     assert result.result_sha256 == hashlib.sha256(result.result_json).hexdigest()
 
 
+def test_mime_hard_wrapped_evidence_is_accepted_without_weakening_source_checks() -> None:
+    body = (
+        "Please create a private calendar hold for Tuesday, September\n"
+        "15, 2026, from 2:00 PM to 2:30 PM America/Chicago."
+    )
+    value = valid_result()
+    value["intent_evidence"] = {
+        "source": "body",
+        "quote": "Please create a private calendar hold for Tuesday, September 15, 2026",
+    }
+    value["proposed_times"] = [
+        {
+            "start": "2026-09-15T14:00:00-05:00",
+            "end": "2026-09-15T14:30:00-05:00",
+            "timezone": "America/Chicago",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": (
+                        "Tuesday, September 15, 2026, from 2:00 PM to 2:30 PM "
+                        "America/Chicago"
+                    ),
+                }
+            ],
+        }
+    ]
+    scheduling_source = source(body=body)
+
+    accepted = validate(value, scheduling_source=scheduling_source)
+    assert accepted.accepted is True
+
+    value["intent_evidence"] = {
+        "source": "body",
+        "quote": "Please create a public calendar hold for Tuesday, September 15, 2026",
+    }
+    changed_content = validate(value, scheduling_source=scheduling_source)
+    assert "evidence_not_found" in codes(changed_content)
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [

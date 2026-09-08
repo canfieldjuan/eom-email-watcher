@@ -293,9 +293,17 @@ def _evidence_candidates(
     return source.attachment_names
 
 
+def _canonical_evidence_text(value: str) -> str:
+    return " ".join(value.split())
+
+
 def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) -> bool:
+    quote = _canonical_evidence_text(evidence.quote)
+    if not quote:
+        return False
     return any(
-        evidence.quote in candidate for candidate in _evidence_candidates(evidence, source)
+        quote in _canonical_evidence_text(candidate)
+        for candidate in _evidence_candidates(evidence, source)
     )
 
 
@@ -304,10 +312,14 @@ def _evidence_source_contexts(
     source: SchedulingSource,
 ) -> tuple[str, ...]:
     contexts: list[str] = []
-    for candidate in _evidence_candidates(evidence, source):
+    quote = _canonical_evidence_text(evidence.quote)
+    if not quote:
+        return ()
+    for raw_candidate in _evidence_candidates(evidence, source):
+        candidate = _canonical_evidence_text(raw_candidate)
         search_at = 0
-        while (quote_at := candidate.find(evidence.quote, search_at)) >= 0:
-            quote_end = quote_at + len(evidence.quote)
+        while (quote_at := candidate.find(quote, search_at)) >= 0:
+            quote_end = quote_at + len(quote)
             left = max(
                 candidate.rfind(delimiter, 0, quote_at) for delimiter in ".!?\r\n"
             ) + 1
@@ -534,9 +546,12 @@ def _range_source_options(
     zone: ZoneInfo,
     source: SchedulingSource,
 ) -> tuple[str, ...]:
+    month_pattern = "|".join(
+        sorted({name for month in _MONTHS for name in (month, month[:3])}, key=len, reverse=True)
+    )
     option_delimiters = tuple(
         re.finditer(
-            r"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{4}-\d{2}-\d{2}|[A-Za-z]+\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            rf"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
             evidence_text,
             re.IGNORECASE,
         )
