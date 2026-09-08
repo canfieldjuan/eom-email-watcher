@@ -146,6 +146,29 @@ interface InboxItem {
   analysis_error_code: string | null;
   analysis_retry_after_seconds: number | null;
   attachments: InboxAttachment[];
+  calendar_proposal: CalendarProposalPreview | null;
+}
+
+interface CalendarProposalPreview {
+  run_id: string;
+  state: "awaiting_confirmation" | "manual_review";
+  state_version: number;
+  proposal_version: number;
+  proposal_sha256: string;
+  status: "accepted" | "no_suggestions";
+  provider: string;
+  account_id: string;
+  account_display_name: string;
+  account_address: string | null;
+  subject: string;
+  attendees: string[];
+  start: string | null;
+  end: string | null;
+  timezone: string | null;
+  suggestion_reason: string | null;
+  empty_reason: string | null;
+  observed_at: string;
+  expires_at: string | null;
 }
 
 interface InboxQuery {
@@ -1168,6 +1191,59 @@ function renderInbox(items: InboxItem[]): void {
       details.append(deadline);
     }
 
+    let calendarProposal: HTMLElement | null = null;
+    if (item.calendar_proposal) {
+      const proposal = item.calendar_proposal;
+      calendarProposal = document.createElement("section");
+      calendarProposal.className = "calendar-proposal";
+      calendarProposal.setAttribute("aria-label", "Calendar proposal");
+      const heading = document.createElement("div");
+      heading.className = "calendar-proposal-heading";
+      const title = document.createElement("strong");
+      title.textContent = "Calendar proposal";
+      const state = document.createElement("span");
+      const hasSuggestion = proposal.status === "accepted";
+      const expired = Boolean(
+        hasSuggestion && proposal.expires_at && Date.parse(proposal.expires_at) <= Date.now(),
+      );
+      state.textContent = !hasSuggestion ? "Needs review" : expired ? "Expired" : "Not confirmed";
+      state.dataset.expired = String(expired);
+      heading.append(title, state);
+      const subject = document.createElement("p");
+      subject.textContent = `Event title: ${proposal.subject}`;
+      const timing = document.createElement("p");
+      if (!hasSuggestion) {
+        timing.textContent = proposal.empty_reason || "No meeting time satisfied the request.";
+      } else if (proposal.start && proposal.end && proposal.timezone) {
+        try {
+          const formatter = new Intl.DateTimeFormat(undefined, {
+            weekday: "short",
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+            timeZone: proposal.timezone,
+            timeZoneName: "short",
+          });
+          timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone}) · Exact interval: ${proposal.start} – ${proposal.end}`;
+        } catch {
+          timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
+        }
+      } else {
+        timing.textContent = "The calendar proposal is incomplete and needs review.";
+      }
+      const attendees = document.createElement("p");
+      attendees.textContent = proposal.attendees.length
+        ? `Attendees: ${proposal.attendees.join(", ")}`
+        : "No additional attendees";
+      const calendar = document.createElement("p");
+      calendar.textContent = `Calendar: ${proposal.account_address || proposal.account_display_name}`;
+      const note = document.createElement("p");
+      note.className = "calendar-proposal-note";
+      note.textContent = "No calendar event has been created.";
+      calendarProposal.append(heading, subject, timing, attendees, calendar, note);
+    }
+
     const attachments = document.createElement("ul");
     attachments.className = "attachment-list";
     for (const attachment of item.attachments) {
@@ -1443,6 +1519,7 @@ function renderInbox(items: InboxItem[]): void {
 
     card.append(meta, subject, summary);
     if (details.childElementCount) card.append(details);
+    if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
     inboxList.append(card);

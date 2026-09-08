@@ -26,6 +26,11 @@ from eom_email_watcher.microsoft365 import (
     Microsoft365Error,
     MicrosoftAuthorizationRejected,
 )
+from eom_email_watcher.microsoft_calendar import (
+    CalendarMeetingProposal,
+    CalendarProposalResult,
+    MicrosoftCalendarProposalRejected,
+)
 from eom_email_watcher.mime import extract_body
 from eom_email_watcher.model import (
     MAX_GATEWAY_ATTACHMENT_COUNT,
@@ -40,7 +45,12 @@ from eom_email_watcher.scheduling import (
     scheduling_source_sha256,
     validate_scheduling_output,
 )
-from eom_email_watcher.service import Watcher, process_scheduling_automations, run_watcher_check
+from eom_email_watcher.service import (
+    Watcher,
+    process_scheduling_automations,
+    process_scheduling_proposals,
+    run_watcher_check,
+)
 
 
 class FakeGmail:
@@ -418,6 +428,40 @@ def allow_automation_processing(
     )
 
 
+def proposing_automation_run(
+    cfg: Config,
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_message_id: str = "schedule-1",
+    principal_key: str = "a" * 64,
+):
+    account_id, admitted = admit_scheduling_run(
+        store,
+        provider_message_id=provider_message_id,
+        received_at="2026-09-07T12:00:00+00:00",
+        principal_key=principal_key,
+    )
+    allow_automation_processing(monkeypatch, AnyAutomationGateway())
+    result = process_scheduling_automations(
+        cfg,
+        store,
+        ExtractionModel([valid_scheduling_output()]),
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    assert result.processed == 1
+    proposing = store.automation_run(admitted.run_id)
+    assert proposing is not None
+    assert proposing.state == "proposing"
+    return account_id, proposing
+
+
+class ProposalAuthorization:
+    def __init__(self, grant=None):
+        self.authorization = object()
+        self.grant = grant
+
+
 def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
@@ -661,6 +705,488 @@ def test_scheduling_extraction_retries_once_with_feedback_then_proposes(
     assert model.extraction_calls[0][1] == ()
     assert "schema_missing_field" in model.extraction_calls[1][1]
     assert len(store.automation_extraction_payloads(admitted.run_id)) == 2
+
+
+def test_scheduling_proposal_reaches_durable_confirmation_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    authorization = ProposalAuthorization()
+    calls = []
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: authorization,
+    )
+
+    def find_proposal(received_authorization, attendees, candidates):
+        calls.append((received_authorization, attendees, candidates))
+        return CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(service_module, "find_meeting_time", find_proposal)
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    proposal = store.automation_proposal(proposing.run_id)
+    assert current is not None and proposal is not None
+    assert (current.state, result.processed, result.review_required) == (
+        "awaiting_confirmation",
+        1,
+        0,
+    )
+    assert proposal.attendees == ("jane@example.com",)
+    assert calls[0][0] is authorization.authorization
+    assert calls[0][1] == ("jane@example.com",)
+    assert calls[0][2][0].timezone == "America/Chicago"
+
+
+def test_scheduling_proposal_without_common_time_becomes_reviewable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            None,
+            "No times satisfy every attendee.",
+        ),
+    )
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "manual_review",
+        "proposal_no_suggestions",
+    )
+    assert (result.processed, result.review_required) == (1, 1)
+
+
+@pytest.mark.parametrize("blocked_mode", ["unauthorized", "excluded"])
+def test_scheduling_proposal_pages_past_unattempted_oldest_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_mode: str
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, blocked = proposing_automation_run(
+        cfg,
+        store,
+        monkeypatch,
+        provider_message_id="schedule-blocked",
+        principal_key="b" * 64,
+    )
+    _account_id, eligible = proposing_automation_run(
+        cfg,
+        store,
+        monkeypatch,
+        provider_message_id="schedule-eligible",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET created_at = ? WHERE run_id = ?",
+            ("2026-09-07T12:00:00+00:00", blocked.run_id),
+        )
+        db.execute(
+            "UPDATE automation_runs SET created_at = ? WHERE run_id = ?",
+            ("2026-09-07T12:01:00+00:00", eligible.run_id),
+        )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: (
+            None
+            if blocked_mode == "unauthorized"
+            and kwargs["expected_principal_key"] == "b" * 64
+            else ProposalAuthorization()
+        ),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        ),
+    )
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        exclude_run_ids=(
+            frozenset({blocked.run_id}) if blocked_mode == "excluded" else frozenset()
+        ),
+        limit=1,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert result.attempted_run_ids == frozenset({eligible.run_id})
+    blocked_after = store.automation_run(blocked.run_id)
+    eligible_after = store.automation_run(eligible.run_id)
+    assert blocked_after is not None and blocked_after.state == "proposing"
+    assert eligible_after is not None and eligible_after.state == "awaiting_confirmation"
+
+
+def test_scheduling_proposal_rechecks_time_after_graph_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    clock = iter(
+        (
+            datetime(2026, 9, 8, 14, 59, tzinfo=UTC),
+            datetime(2026, 9, 8, 14, 59, 30, tzinfo=UTC),
+            datetime(2026, 9, 8, 15, 0, 1, tzinfo=UTC),
+        )
+    )
+    monkeypatch.setattr(service_module, "_utc_now", lambda: next(clock))
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        ),
+    )
+
+    result = process_scheduling_proposals(cfg, store)
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == ("manual_review", "proposal_invalid")
+    assert store.automation_proposal(proposing.run_id) is None
+    assert (result.processed, result.review_required) == (1, 1)
+
+
+def test_canonical_check_keeps_both_proposal_passes_on_live_clocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    proposal_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        service_module,
+        "process_scheduling_automations",
+        lambda *args, **kwargs: service_module.AutomationProcessing(
+            0,
+            0,
+            frozenset(),
+            0,
+        ),
+    )
+
+    def proposals(*args, **kwargs):
+        proposal_calls.append(kwargs)
+        attempted = frozenset({"run-1"}) if len(proposal_calls) == 1 else frozenset()
+        return service_module.AutomationProcessing(0, 0, attempted, 0)
+
+    monkeypatch.setattr(service_module, "process_scheduling_proposals", proposals)
+
+    run_watcher_check(cfg, store, FakeModel(), deliver_notifications=False)
+
+    assert proposal_calls == [
+        {},
+        {"exclude_run_ids": frozenset({"run-1"}), "limit": 25},
+    ]
+
+
+def test_scheduling_proposal_definitive_rejection_becomes_reviewable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+
+    def reject(*args, **kwargs):
+        raise MicrosoftCalendarProposalRejected("invalid response")
+
+    monkeypatch.setattr(service_module, "find_meeting_time", reject)
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == ("manual_review", "proposal_invalid")
+    assert (result.processed, result.review_required) == (1, 1)
+
+
+def test_scheduling_proposal_that_has_passed_never_reaches_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: pytest.fail("Past proposal reached Microsoft Graph"),
+    )
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 9, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert (current.state, current.failure_code) == ("manual_review", "proposal_invalid")
+    assert (result.processed, result.review_required) == (1, 1)
+
+
+def test_scheduling_proposal_processing_rejects_naive_clock(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        process_scheduling_proposals(cfg, store, now=datetime(2026, 9, 7, 13))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [Microsoft365Error("temporarily unavailable"), MicrosoftAuthorizationRejected("revoked")],
+)
+def test_scheduling_proposal_transport_or_auth_failure_remains_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    identity = {
+        "principal_key": "a" * 64,
+        "home_account_id": "home",
+        "tenant_id": "tenant",
+        "object_id": "object",
+        "email_address": "owner@example.com",
+    }
+    grant = store.set_calendar_grant(account_id, "proposal", "ready", **identity)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(grant),
+    )
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(service_module, "find_meeting_time", fail)
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None
+    assert current.state == "proposing"
+    assert result.processed == 0
+    assert store.automation_proposal(proposing.run_id) is None
+    expected_grant_state = (
+        "revoked" if isinstance(error, MicrosoftAuthorizationRejected) else "ready"
+    )
+    grant = store.calendar_grant(account_id, "proposal")
+    assert grant is not None and grant.state == expected_grant_state
+
+
+def test_scheduling_proposal_rejection_does_not_revoke_refreshed_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    identity = {
+        "principal_key": "a" * 64,
+        "home_account_id": "home",
+        "tenant_id": "tenant",
+        "object_id": "object",
+        "email_address": "owner@example.com",
+    }
+    stale_grant = store.set_calendar_grant(account_id, "proposal", "ready", **identity)
+    with store.connection() as db:
+        db.execute(
+            """UPDATE microsoft_calendar_grants SET updated_at = ?
+            WHERE account_id = ? AND profile = 'proposal'""",
+            ("2026-09-07T13:01:00+00:00", account_id),
+        )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(stale_grant),
+    )
+
+    def reject(*args, **kwargs):
+        raise MicrosoftAuthorizationRejected("revoked")
+
+    monkeypatch.setattr(service_module, "find_meeting_time", reject)
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    grant = store.calendar_grant(account_id, "proposal")
+    assert current is not None and current.state == "proposing"
+    assert grant is not None and grant.state == "ready"
+    assert result.processed == 0
+
+
+def test_scheduling_proposal_is_not_retried_twice_in_one_check_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    calls = 0
+
+    def fail(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise Microsoft365Error("temporarily unavailable")
+
+    monkeypatch.setattr(service_module, "find_meeting_time", fail)
+
+    before = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    after = process_scheduling_proposals(
+        cfg,
+        store,
+        exclude_run_ids=before.attempted_run_ids,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert before.attempted_run_ids == frozenset({proposing.run_id})
+    assert after.attempted_run_ids == frozenset()
+    assert calls == 1
+
+
+def test_scheduling_proposal_lost_state_race_does_not_fail_the_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_proposal_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "find_meeting_time",
+        lambda *args, **kwargs: CalendarProposalResult(
+            CalendarMeetingProposal(
+                start="2026-09-08T10:00:00-05:00",
+                end="2026-09-08T10:30:00-05:00",
+                timezone="America/Chicago",
+                suggestion_reason="All attendees are available.",
+            ),
+            None,
+        ),
+    )
+
+    def lose_race(*args, **kwargs):
+        store.transition_automation_to_review(
+            proposing.run_id,
+            proposing.state_version,
+            next_state="source_unavailable",
+            failure_code="source_unavailable",
+        )
+        raise RuntimeError("Automation proposal lost its expected-state race")
+
+    monkeypatch.setattr(store, "record_automation_proposal", lose_race)
+
+    result = process_scheduling_proposals(
+        cfg,
+        store,
+        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    current = store.automation_run(proposing.run_id)
+    assert current is not None and current.state == "source_unavailable"
+    assert result.processed == 0
 
 
 def test_scheduling_transport_retry_reuses_reserved_request_identity(

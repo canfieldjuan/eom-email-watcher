@@ -119,6 +119,33 @@ def test_setup_connects_a_replacement_for_unidentified_migrated_history(
     assert operations == ["gmail.authorize", "mail.accounts.connect"]
 
 
+def test_recent_uses_entitlement_gated_engine_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    requests: list[dict[str, object]] = []
+
+    def dispatch(request: dict[str, object]) -> dict[str, object]:
+        requests.append(request)
+        return {"items": [{"message_id": "message-1", "calendar_proposal": None}]}
+
+    monkeypatch.setattr("eom_email_watcher.engine_api.dispatch", dispatch)
+
+    assert cli._recent(config_path, 20) == 0
+
+    assert requests == [
+        {
+            "protocol": 1,
+            "operation": "inbox.recent",
+            "config_path": str(config_path),
+            "payload": {"limit": 20},
+        }
+    ]
+    assert json.loads(capsys.readouterr().out) == [
+        {"message_id": "message-1", "calendar_proposal": None}
+    ]
+
+
 def _check_config(tmp_path: Path) -> SimpleNamespace:
     state = tmp_path / "state"
     state.mkdir()

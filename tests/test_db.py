@@ -33,13 +33,14 @@ def admitted_scheduling_run(
     provider_message_id: str = "provider-scheduling",
 ):
     account_id = f"microsoft365-{'a' * 32}"
-    store.register_mail_account(
-        "microsoft365",
-        account_id,
-        display_name="Microsoft 365",
-        address="owner@example.com",
-        active=True,
-    )
+    if store.mail_account("microsoft365", account_id) is None:
+        store.register_mail_account(
+            "microsoft365",
+            account_id,
+            display_name="Microsoft 365",
+            address="owner@example.com",
+            active=True,
+        )
     assert store.add_message(
         message_id=message_id,
         provider="microsoft365",
@@ -73,6 +74,79 @@ def scheduling_analysis() -> dict[str, object]:
         "deadline_iso": None,
         "confidence": 0.9,
     }
+
+
+def proposing_scheduling_run(
+    store: Store,
+    *,
+    message_id: str = "local-scheduling",
+    provider_message_id: str = "provider-scheduling",
+):
+    detected = admitted_scheduling_run(
+        store,
+        message_id=message_id,
+        provider_message_id=provider_message_id,
+    )
+    payload = store.reserve_automation_extraction(
+        detected.run_id,
+        detected.state_version,
+        source_content_sha256="b" * 64,
+        context_at="2026-09-07T08:00:00-05:00",
+        timezone="America/Chicago",
+        body_char_limit=20_000,
+        organizer_address="owner@example.com",
+    )
+    extracting = store.automation_run(detected.run_id)
+    assert extracting is not None
+    result_json = json.dumps(
+        {
+            "intent": "new_meeting",
+            "proposed_times": [
+                {
+                    "start": "2026-09-08T10:00:00-05:00",
+                    "end": "2026-09-08T10:30:00-05:00",
+                    "timezone": "America/Chicago",
+                }
+            ],
+            "attendees": [{"email": "jane@example.com"}],
+        },
+        separators=(",", ":"),
+    ).encode()
+    proposing = store.record_automation_extraction(
+        detected.run_id,
+        extracting.state_version,
+        payload_id=payload.payload_id,
+        result_sha256=hashlib.sha256(result_json).hexdigest(),
+        result_json=result_json,
+        violations=[],
+        accepted_state="proposing",
+    )
+    return proposing, payload
+
+
+def test_proposable_automation_runs_page_after_stable_cursor(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing_scheduling_run(
+        store,
+        message_id="local-scheduling-1",
+        provider_message_id="provider-scheduling-1",
+    )
+    proposing_scheduling_run(
+        store,
+        message_id="local-scheduling-2",
+        provider_message_id="provider-scheduling-2",
+    )
+
+    ordered = store.proposable_automation_runs(2)
+    assert len(ordered) == 2
+    first = ordered[0].run
+
+    remaining = store.proposable_automation_runs(
+        2,
+        after=(first.created_at, first.run_id),
+    )
+    assert [item.run.run_id for item in remaining] == [ordered[1].run.run_id]
 
 
 def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
@@ -556,6 +630,289 @@ def test_source_cleanup_deletes_extraction_payload_and_transitions_active_run(
         "source_unavailable",
     )
     assert store.automation_extraction_payloads(detected.run_id) == []
+
+
+def test_calendar_proposal_is_durable_and_atomically_awaits_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    observed_at = datetime(2026, 9, 7, 13, tzinfo=UTC)
+
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="c" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=observed_at,
+    )
+
+    assert (awaiting.state, awaiting.failure_code) == ("awaiting_confirmation", None)
+    store = Store(store.path)
+    store.initialize()
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    assert proposal.status == "accepted"
+    assert proposal.attendees == ("jane@example.com",)
+    assert proposal.request_sha256 == "c" * 64
+    assert len(proposal.proposal_sha256) == 64
+    assert proposal.expires_at == "2026-09-07T13:15:00+00:00"
+    assert store.automation_proposal_for_message("local-scheduling") == proposal
+    preview = store.recent(1)[0]["calendar_proposal"]
+    assert preview == {
+        "run_id": proposing.run_id,
+        "state": "awaiting_confirmation",
+        "state_version": awaiting.state_version,
+        "proposal_version": 1,
+        "proposal_sha256": proposal.proposal_sha256,
+        "status": "accepted",
+        "provider": "microsoft365",
+        "account_id": f"microsoft365-{'a' * 32}",
+        "account_display_name": "Microsoft 365",
+        "account_address": "owner@example.com",
+        "subject": "Meeting request",
+        "attendees": ["jane@example.com"],
+        "start": "2026-09-08T10:00:00-05:00",
+        "end": "2026-09-08T10:30:00-05:00",
+        "timezone": "America/Chicago",
+        "suggestion_reason": "All attendees are available.",
+        "empty_reason": None,
+        "observed_at": "2026-09-07T13:00:00+00:00",
+        "expires_at": "2026-09-07T13:15:00+00:00",
+    }
+    assert "principal" not in preview
+    event = store.automation_events(proposing.run_id)[-1]
+    assert (event.next_state, event.payload_id, event.payload_sha256) == (
+        "awaiting_confirmation",
+        proposal.payload_id,
+        proposal.proposal_sha256,
+    )
+
+
+def test_no_calendar_suggestion_becomes_durable_review_outcome(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+
+    reviewed = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="d" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start=None,
+        end=None,
+        timezone=None,
+        suggestion_reason=None,
+        empty_reason="No times satisfy every attendee.",
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert (reviewed.state, reviewed.failure_code) == (
+        "manual_review",
+        "proposal_no_suggestions",
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    assert proposal.status == "no_suggestions"
+    assert proposal.empty_reason == "No times satisfy every attendee."
+    preview = store.recent(1)[0]["calendar_proposal"]
+    assert preview is not None
+    assert preview["state"] == "manual_review"
+    assert preview["status"] == "no_suggestions"
+    assert preview["empty_reason"] == "No times satisfy every attendee."
+    assert preview["start"] is None
+    assert preview["expires_at"] is None
+    assert any(
+        intent.kind == "automation_review" and intent.subject_id == proposing.run_id
+        for intent in store.notification_intents()
+    )
+
+
+def test_calendar_proposal_compare_and_swap_prevents_duplicate_payloads(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    arguments = {
+        "extraction_payload_id": extraction.payload_id,
+        "request_sha256": "e" * 64,
+        "subject": "Meeting request",
+        "attendees": ("jane@example.com",),
+        "start": "2026-09-08T10:00:00-05:00",
+        "end": "2026-09-08T10:30:00-05:00",
+        "timezone": "America/Chicago",
+        "suggestion_reason": "All attendees are available.",
+        "empty_reason": None,
+        "observed_at": datetime(2026, 9, 7, 13, tzinfo=UTC),
+    }
+
+    store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        **arguments,
+    )
+    with pytest.raises(RuntimeError, match="expected-state race"):
+        store.record_automation_proposal(
+            proposing.run_id,
+            proposing.state_version,
+            **arguments,
+        )
+
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM automation_proposal_payloads WHERE run_id = ?",
+            (proposing.run_id,),
+        ).fetchone()[0] == 1
+
+
+def test_calendar_proposal_and_state_transition_roll_back_together(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    with store.connection() as db:
+        db.execute(
+            """CREATE TRIGGER reject_calendar_proposal_event
+            BEFORE INSERT ON automation_events
+            WHEN NEW.next_state = 'awaiting_confirmation'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected proposal event failure');
+            END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected proposal event failure"):
+        store.record_automation_proposal(
+            proposing.run_id,
+            proposing.state_version,
+            extraction_payload_id=extraction.payload_id,
+            request_sha256="a" * 64,
+            subject="Meeting request",
+            attendees=("jane@example.com",),
+            start="2026-09-08T10:00:00-05:00",
+            end="2026-09-08T10:30:00-05:00",
+            timezone="America/Chicago",
+            suggestion_reason="All attendees are available.",
+            empty_reason=None,
+            observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        )
+
+    assert store.automation_run(proposing.run_id) == proposing
+    assert store.automation_proposal(proposing.run_id) is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"request_sha256": False},
+        {"request_sha256": "g" * 64},
+        {"attendees": ("jane@example.com", "JANE@example.com")},
+        {"attendees": tuple(f"person-{index}@example.com" for index in range(65))},
+        {"suggestion_reason": "x" * 513},
+        {"suggestion_reason": ""},
+        {"start": "2026-09-08T10:00:00+00:00"},
+        {"observed_at": datetime(2026, 9, 7, 13)},
+    ],
+)
+def test_calendar_proposal_persistence_rejects_unbounded_or_ambiguous_input(
+    tmp_path: Path,
+    override: dict[str, object],
+) -> None:
+    store = Store(tmp_path / hashlib.sha256(repr(override).encode()).hexdigest() / "watcher.db")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    arguments: dict[str, object] = {
+        "extraction_payload_id": extraction.payload_id,
+        "request_sha256": "a" * 64,
+        "subject": "Meeting request",
+        "attendees": ("jane@example.com",),
+        "start": "2026-09-08T10:00:00-05:00",
+        "end": "2026-09-08T10:30:00-05:00",
+        "timezone": "America/Chicago",
+        "suggestion_reason": "All attendees are available.",
+        "empty_reason": None,
+        "observed_at": datetime(2026, 9, 7, 13, tzinfo=UTC),
+    }
+    arguments.update(override)
+
+    with pytest.raises(ValueError):
+        store.record_automation_proposal(
+            proposing.run_id,
+            proposing.state_version,
+            **arguments,
+        )
+
+    assert store.automation_run(proposing.run_id) == proposing
+    assert store.automation_proposal(proposing.run_id) is None
+
+
+def test_calendar_proposal_persistence_accepts_maximum_attendee_count(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    attendees = tuple(f"person-{index}@example.com" for index in range(64))
+
+    reviewed = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="a" * 64,
+        subject="Meeting request",
+        attendees=attendees,
+        start=None,
+        end=None,
+        timezone=None,
+        suggestion_reason=None,
+        empty_reason="No times satisfy every attendee.",
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert reviewed.state == "manual_review"
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None and proposal.attendees == attendees
+
+
+def test_source_cleanup_deletes_calendar_proposal_and_tombstones_review(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="f" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+
+    assert store.delete_message("local-scheduling") is True
+
+    tombstone = store.automation_run(proposing.run_id)
+    assert tombstone is not None
+    assert (tombstone.state, tombstone.failure_code) == (
+        "source_unavailable",
+        "source_unavailable",
+    )
+    assert store.automation_proposal(proposing.run_id) is None
 
 
 def test_automation_review_notification_is_durable_state_checked_and_idempotent(
@@ -1823,7 +2180,8 @@ def test_initialize_migrates_current_schema_without_losing_messages(
         automation_tables = db.execute(
             """SELECT name FROM sqlite_master
             WHERE type='table' AND name IN (
-                'automation_runs', 'automation_events', 'automation_extraction_payloads'
+                'automation_runs', 'automation_events', 'automation_extraction_payloads',
+                'automation_proposal_payloads'
             )
             ORDER BY name"""
         ).fetchall()
@@ -1848,6 +2206,7 @@ def test_initialize_migrates_current_schema_without_losing_messages(
     assert automation_tables == [
         ("automation_events",),
         ("automation_extraction_payloads",),
+        ("automation_proposal_payloads",),
         ("automation_runs",),
     ]
     assert suppression_table == (1,)

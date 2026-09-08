@@ -17,14 +17,17 @@ from eom_email_watcher.microsoft_calendar import (
     CALENDAR_PAGE_SIZE,
     CALENDAR_READ_SCOPES,
     MAX_CALENDAR_PAGE_BYTES,
+    CalendarProposalCandidate,
     MicrosoftCalendarConsentPending,
     MicrosoftCalendarProposalAuthorization,
+    MicrosoftCalendarProposalRejected,
     MicrosoftCalendarReadAuthorization,
     MicrosoftCalendarWriteAuthorization,
     MicrosoftPrincipal,
     StaleCalendarCursor,
     calendar_delta_round,
     canonical_calendar_window,
+    find_meeting_time,
     microsoft_cached_mailbox_principal,
     microsoft_mailbox_principal,
 )
@@ -48,6 +51,42 @@ def principal() -> MicrosoftPrincipal:
         object_id=OBJECT_ID,
         email_address="owner@example.com",
     )
+
+
+def proposal_candidates() -> tuple[CalendarProposalCandidate, ...]:
+    return (
+        CalendarProposalCandidate(
+            start="2026-09-08T10:00:00-05:00",
+            end="2026-09-08T10:30:00-05:00",
+            timezone="America/Chicago",
+        ),
+    )
+
+
+def proposal_document() -> dict[str, object]:
+    return {
+        "emptySuggestionsReason": "",
+        "meetingTimeSuggestions": [
+            {
+                "confidence": 100,
+                "order": 1,
+                "organizerAvailability": "free",
+                "suggestionReason": "Everyone is available.",
+                "attendeeAvailability": [
+                    {
+                        "availability": "free",
+                        "attendee": {
+                            "emailAddress": {"address": "invitee@example.com"}
+                        },
+                    }
+                ],
+                "meetingTimeSlot": {
+                    "start": {"dateTime": "2026-09-08T15:00:00", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-09-08T15:30:00", "timeZone": "UTC"},
+                },
+            }
+        ],
+    }
 
 
 class FakeCache:
@@ -527,6 +566,302 @@ def test_calendar_window_validation_pins_both_sides_of_duration_and_offsets() ->
         canonical_calendar_window("0001-01-01T00:00:00+14:00", exact_end.isoformat())
     with pytest.raises(ValueError, match="offset-bearing"):
         canonical_calendar_window(start.isoformat(), "9999-12-31T23:59:59-14:00")
+
+
+def test_find_meeting_time_sends_exact_read_only_constraints_and_preserves_iana_zone() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=proposal_document())
+
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    result = find_meeting_time(
+        authorization,
+        ("INVITEE@EXAMPLE.COM",),
+        proposal_candidates(),
+    )
+
+    assert result.proposal is not None
+    assert result.proposal.start == "2026-09-08T10:00:00-05:00"
+    assert result.proposal.end == "2026-09-08T10:30:00-05:00"
+    assert result.proposal.timezone == "America/Chicago"
+    assert result.empty_reason is None
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert str(request.url) == f"{microsoft_calendar.GRAPH_ROOT}/me/findMeetingTimes"
+    assert request.headers["prefer"] == 'outlook.timezone="UTC"'
+    assert request.headers["accept-encoding"] == "identity"
+    assert json.loads(request.content) == {
+        "attendees": [
+            {
+                "type": "required",
+                "emailAddress": {"address": "invitee@example.com"},
+            }
+        ],
+        "timeConstraint": {
+            "activityDomain": "unrestricted",
+            "timeSlots": [
+                {
+                    "start": {"dateTime": "2026-09-08T15:00:00", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-09-08T15:30:00", "timeZone": "UTC"},
+                }
+            ],
+        },
+        "isOrganizerOptional": False,
+        "meetingDuration": "PT30M",
+        "returnSuggestionReasons": True,
+        "minimumAttendeePercentage": 100,
+        "maxCandidates": 1,
+    }
+
+
+def test_find_meeting_time_returns_bounded_no_suggestions_domain_result() -> None:
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "emptySuggestionsReason": "Attendees unavailable",
+                        "meetingTimeSuggestions": [],
+                    },
+                )
+            )
+        ),
+    )
+
+    result = find_meeting_time(
+        authorization,
+        ("invitee@example.com",),
+        proposal_candidates(),
+    )
+
+    assert result.proposal is None
+    assert result.empty_reason == "Attendees unavailable"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda document: document["meetingTimeSuggestions"][0].update(  # type: ignore[index,union-attr]
+                {"confidence": 99}
+            ),
+            "full availability",
+        ),
+        (
+            lambda document: document["meetingTimeSuggestions"][0][  # type: ignore[index]
+                "attendeeAvailability"
+            ][0].update({"availability": "busy"}),  # type: ignore[index,union-attr]
+            "every attendee free",
+        ),
+        (
+            lambda document: document["meetingTimeSuggestions"][0][  # type: ignore[index]
+                "attendeeAvailability"
+            ][0]["attendee"]["emailAddress"].update(  # type: ignore[index,union-attr]
+                {"address": "other@example.com"}
+            ),
+            "unknown attendee set",
+        ),
+        (
+            lambda document: document["meetingTimeSuggestions"][0][  # type: ignore[index]
+                "meetingTimeSlot"
+            ]["start"].update({"dateTime": "2026-09-08T16:00:00"}),  # type: ignore[index,union-attr]
+            "escaped",
+        ),
+    ],
+)
+def test_find_meeting_time_fails_closed_on_unproven_suggestions(
+    mutate,
+    message: str,
+) -> None:
+    document = proposal_document()
+    mutate(document)
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=document))
+        ),
+    )
+
+    with pytest.raises(Microsoft365Error, match=message):
+        find_meeting_time(
+            authorization,
+            ("invitee@example.com",),
+            proposal_candidates(),
+        )
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 408, 429, 503])
+def test_find_meeting_time_classifies_status_before_parsing(status: int) -> None:
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status, content=b"not-json")
+            )
+        ),
+    )
+
+    expected = (
+        MicrosoftAuthorizationRejected
+        if status in {401, 403}
+        else MicrosoftCalendarProposalRejected
+        if status == 400
+        else Microsoft365Error
+    )
+    with pytest.raises(expected):
+        find_meeting_time(
+            authorization,
+            ("invitee@example.com",),
+            proposal_candidates(),
+        )
+
+
+def test_find_meeting_time_preserves_fractional_candidate_instants() -> None:
+    document = proposal_document()
+    suggestion = document["meetingTimeSuggestions"][0]  # type: ignore[index]
+    slot = suggestion["meetingTimeSlot"]  # type: ignore[index]
+    slot["start"]["dateTime"] = "2026-09-08T15:00:00.500000"  # type: ignore[index]
+    slot["end"]["dateTime"] = "2026-09-08T15:30:00.500000"  # type: ignore[index]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=document)
+
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    candidates = (
+        CalendarProposalCandidate(
+            start="2026-09-08T10:00:00.500000-05:00",
+            end="2026-09-08T10:30:00.500000-05:00",
+            timezone="America/Chicago",
+        ),
+    )
+
+    result = find_meeting_time(authorization, ("invitee@example.com",), candidates)
+
+    assert result.proposal is not None
+    request = json.loads(requests[0].content)
+    slot = request["timeConstraint"]["timeSlots"][0]
+    assert slot["start"]["dateTime"] == "2026-09-08T15:00:00.500000"
+    assert slot["end"]["dateTime"] == "2026-09-08T15:30:00.500000"
+
+
+def test_find_meeting_time_rejects_mismatched_durations_before_http() -> None:
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail("HTTP was reached"))
+        ),
+    )
+    candidates = (
+        *proposal_candidates(),
+        CalendarProposalCandidate(
+            start="2026-09-08T11:00:00-05:00",
+            end="2026-09-08T12:00:00-05:00",
+            timezone="America/Chicago",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="durations must match"):
+        find_meeting_time(authorization, ("invitee@example.com",), candidates)
+
+
+def test_find_meeting_time_accepts_exact_candidate_and_attendee_limits() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "emptySuggestionsReason": "No common time",
+                "meetingTimeSuggestions": [],
+            },
+        )
+
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    start = datetime.fromisoformat("2026-09-08T10:00:00-05:00")
+    candidates = tuple(
+        CalendarProposalCandidate(
+            start=(start + timedelta(hours=index)).isoformat(),
+            end=(start + timedelta(hours=index, minutes=30)).isoformat(),
+            timezone="America/Chicago",
+        )
+        for index in range(8)
+    )
+    attendees = tuple(f"person-{index}@example.com" for index in range(64))
+
+    result = find_meeting_time(authorization, attendees, candidates)
+
+    assert result.empty_reason == "No common time"
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("attendees", "candidates", "message"),
+    [
+        ((), (), "one to eight"),
+        (
+            tuple(f"person-{index}@example.com" for index in range(65)),
+            proposal_candidates(),
+            "too many attendees",
+        ),
+        (
+            ("invitee@example.com", "INVITEE@example.com"),
+            proposal_candidates(),
+            "unique",
+        ),
+        (
+            (),
+            tuple(
+                CalendarProposalCandidate(
+                    start=f"2026-09-08T{hour:02d}:00:00-05:00",
+                    end=f"2026-09-08T{hour:02d}:30:00-05:00",
+                    timezone="America/Chicago",
+                )
+                for hour in range(9, 18)
+            ),
+            "one to eight",
+        ),
+    ],
+)
+def test_find_meeting_time_rejects_inputs_outside_hard_bounds_before_http(
+    attendees,
+    candidates,
+    message: str,
+) -> None:
+    authorization = MicrosoftCalendarProposalAuthorization(
+        principal(),
+        "private-access",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail("HTTP was reached"))
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        find_meeting_time(authorization, attendees, candidates)
 
 
 def calendar_event(event_id: str, subject: str = "Planning") -> dict[str, object]:

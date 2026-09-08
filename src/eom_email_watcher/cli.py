@@ -297,10 +297,19 @@ def _outbound_resolve(
 
 
 def _recent(config_path: Path, limit: int) -> int:
+    from .engine_api import dispatch
+
     if not 1 <= limit <= 500:
         raise ConfigError("--limit must be between 1 and 500")
-    _config, store, _model = _runtime(config_path)
-    print(json.dumps(store.recent(limit), indent=2))
+    response = dispatch(
+        {
+            "protocol": 1,
+            "operation": "inbox.recent",
+            "config_path": str(config_path),
+            "payload": {"limit": limit},
+        }
+    )
+    print(json.dumps(response["items"], indent=2))
     return 0
 
 

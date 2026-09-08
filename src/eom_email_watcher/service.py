@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass
@@ -9,8 +10,10 @@ from .config import Config, normalize_validated_address
 from .db import (
     AnalyzedMessage,
     AutomationExtractionPayload,
+    AutomationProposalWork,
     AutomationSourceChanged,
     AutomationWork,
+    CalendarGrant,
     NotificationIntent,
     PendingMessage,
     Store,
@@ -37,7 +40,13 @@ from .microsoft365 import (
     Microsoft365Error,
     MicrosoftAuthorizationRejected,
 )
-from .microsoft_calendar import MicrosoftCalendarProposalAuthorization
+from .microsoft_calendar import (
+    MAX_CALENDAR_SUBJECT_BYTES,
+    CalendarProposalCandidate,
+    MicrosoftCalendarProposalAuthorization,
+    MicrosoftCalendarProposalRejected,
+    find_meeting_time,
+)
 from .model import (
     MAX_GATEWAY_BODY_CHARS,
     MAX_GATEWAY_SENDER_CHARS,
@@ -56,19 +65,30 @@ from .runtime import (
     mail_account_token_file,
     microsoft_calendar_token_file,
 )
-from .scheduling import SchedulingSource, SchedulingViolation, scheduling_source_sha256
+from .scheduling import (
+    SchedulingExtraction,
+    SchedulingSource,
+    SchedulingViolation,
+    scheduling_source_sha256,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _scheduling_authorization_principal(
+@dataclass(frozen=True)
+class SchedulingProposalAccess:
+    authorization: MicrosoftCalendarProposalAuthorization
+    grant: CalendarGrant
+
+
+def _scheduling_proposal_authorization(
     config: Config,
     store: Store,
     *,
     provider: str,
     account_id: str,
     expected_principal_key: str | None = None,
-) -> str | None:
+) -> SchedulingProposalAccess | None:
     if provider != MICROSOFT365_PROVIDER:
         return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
@@ -101,10 +121,30 @@ def _scheduling_authorization_principal(
         return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
         return None
-    principal_key = authorization.principal.key
-    if expected_principal_key is not None and principal_key != expected_principal_key:
+    if (
+        expected_principal_key is not None
+        and authorization.principal.key != expected_principal_key
+    ):
         return None
-    return principal_key
+    return SchedulingProposalAccess(authorization, proposal_grant)
+
+
+def _scheduling_authorization_principal(
+    config: Config,
+    store: Store,
+    *,
+    provider: str,
+    account_id: str,
+    expected_principal_key: str | None = None,
+) -> str | None:
+    authorization = _scheduling_proposal_authorization(
+        config,
+        store,
+        provider=provider,
+        account_id=account_id,
+        expected_principal_key=expected_principal_key,
+    )
+    return authorization.authorization.principal.key if authorization is not None else None
 
 
 def _scheduling_automation_principal(
@@ -408,6 +448,235 @@ def process_scheduling_automations(
         review_required,
         frozenset(attempted),
         purge_outcome.messages,
+    )
+
+
+def _proposal_request_sha256(
+    attendees: tuple[str, ...],
+    candidates: tuple[CalendarProposalCandidate, ...],
+) -> str:
+    document = {
+        "attendees": list(attendees),
+        "candidates": [
+            {"start": item.start, "end": item.end, "timezone": item.timezone}
+            for item in candidates
+        ],
+        "minimum_attendee_percentage": 100,
+        "version": 1,
+    }
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _proposal_subject(subject: str) -> str:
+    bounded = bounded_gateway_text(subject, MAX_GATEWAY_SUBJECT_CHARS)
+    try:
+        encoded = bounded.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Calendar proposal subject is invalid") from exc
+    if len(encoded) <= MAX_CALENDAR_SUBJECT_BYTES:
+        return bounded
+    return encoded[:MAX_CALENDAR_SUBJECT_BYTES].decode("utf-8", errors="ignore")
+
+
+def _proposal_extraction(work: AutomationProposalWork) -> SchedulingExtraction:
+    result_json = work.extraction_payload.result_json
+    if result_json is None:
+        raise ValueError("Accepted scheduling extraction has no result")
+    extraction = SchedulingExtraction.model_validate_json(result_json)
+    if extraction.intent != "new_meeting":
+        raise ValueError("Only new-meeting extraction can reach proposal")
+    return extraction
+
+
+def _proposal_candidates(
+    extraction: SchedulingExtraction,
+    *,
+    observed_at: datetime,
+) -> tuple[CalendarProposalCandidate, ...]:
+    candidates = tuple(
+        CalendarProposalCandidate(item.start, item.end, item.timezone)
+        for item in extraction.proposed_times
+    )
+    try:
+        starts = tuple(datetime.fromisoformat(candidate.start) for candidate in candidates)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("Calendar proposal time is invalid") from exc
+    if any(
+        start.tzinfo is None or start.astimezone(UTC) <= observed_at
+        for start in starts
+    ):
+        raise ValueError("Calendar proposal time has passed")
+    return candidates
+
+
+def _transition_proposal_to_review(
+    store: Store,
+    work: AutomationProposalWork,
+    *,
+    observed_at: datetime,
+) -> bool:
+    current = store.automation_run(work.run.run_id)
+    if current is None or (
+        current.state != "proposing"
+        or current.state_version != work.run.state_version
+        or current.current_payload_id != work.extraction_payload.payload_id
+    ):
+        return False
+    try:
+        store.transition_automation_to_review(
+            current.run_id,
+            current.state_version,
+            next_state="manual_review",
+            failure_code="proposal_invalid",
+            now=observed_at,
+        )
+    except RuntimeError:
+        latest = store.automation_run(current.run_id)
+        if latest is None or latest.state_version != current.state_version:
+            return False
+        raise
+    return True
+
+
+def process_scheduling_proposals(
+    config: Config,
+    store: Store,
+    *,
+    exclude_run_ids: frozenset[str] = frozenset(),
+    limit: int = 25,
+    now: datetime | None = None,
+) -> AutomationProcessing:
+    selected_now = now or _utc_now()
+    if selected_now.tzinfo is None:
+        raise ValueError("Calendar proposal processing time must be timezone-aware")
+    fixed_now = selected_now.astimezone(UTC) if now is not None else None
+
+    def current_time() -> datetime:
+        return fixed_now or _utc_now().astimezone(UTC)
+
+    processed = 0
+    review_required = 0
+    attempted: set[str] = set()
+    capacity_used = 0
+    cursor: tuple[str, str] | None = None
+    while capacity_used < limit:
+        page = store.proposable_automation_runs(limit, after=cursor)
+        if not page:
+            break
+        for work in page:
+            cursor = (work.run.created_at, work.run.run_id)
+            if work.run.run_id in exclude_run_ids:
+                continue
+            if capacity_used >= limit:
+                break
+            access = _scheduling_proposal_authorization(
+                config,
+                store,
+                provider=work.run.provider,
+                account_id=work.run.account_id,
+                expected_principal_key=work.run.calendar_principal_key,
+            )
+            if access is None:
+                continue
+            capacity_used += 1
+            attempted.add(work.run.run_id)
+            attempt_time = current_time()
+            try:
+                extraction = _proposal_extraction(work)
+                attendees = tuple(item.email for item in extraction.attendees)
+                candidates = _proposal_candidates(extraction, observed_at=attempt_time)
+                request_sha256 = _proposal_request_sha256(attendees, candidates)
+                result = find_meeting_time(access.authorization, attendees, candidates)
+            except MicrosoftAuthorizationRejected as exc:
+                logger.info(
+                    "Scheduling run %s proposal authorization rejected: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                store.revoke_calendar_grant_if_current(access.grant)
+                continue
+            except MicrosoftCalendarProposalRejected as exc:
+                logger.warning(
+                    "Scheduling run %s proposal rejected: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=current_time()
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+            except Microsoft365Error as exc:
+                logger.warning(
+                    "Scheduling run %s proposal unavailable: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                continue
+            except ValueError as exc:
+                logger.warning(
+                    "Scheduling run %s proposal input invalid: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=current_time()
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+
+            proposal = result.proposal
+            result_time = current_time()
+            try:
+                store.record_automation_proposal(
+                    work.run.run_id,
+                    work.run.state_version,
+                    extraction_payload_id=work.extraction_payload.payload_id,
+                    request_sha256=request_sha256,
+                    subject=_proposal_subject(work.subject),
+                    attendees=attendees,
+                    start=proposal.start if proposal is not None else None,
+                    end=proposal.end if proposal is not None else None,
+                    timezone=proposal.timezone if proposal is not None else None,
+                    suggestion_reason=(
+                        proposal.suggestion_reason if proposal is not None else None
+                    ),
+                    empty_reason=result.empty_reason,
+                    observed_at=result_time,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Scheduling run %s proposal could not be persisted safely: %s",
+                    work.run.run_id,
+                    exc,
+                )
+                if _transition_proposal_to_review(
+                    store, work, observed_at=result_time
+                ):
+                    processed += 1
+                    review_required += 1
+                continue
+            except RuntimeError:
+                latest = store.automation_run(work.run.run_id)
+                if latest is None or latest.state_version != work.run.state_version:
+                    continue
+                raise
+            processed += 1
+            if proposal is None:
+                review_required += 1
+    return AutomationProcessing(
+        processed,
+        review_required,
+        frozenset(attempted),
+        0,
     )
 
 
@@ -847,6 +1116,7 @@ def run_watcher_check(
         }
 
     before = process_scheduling_automations(config, store, model)
+    before_proposals = process_scheduling_proposals(config, store)
     if config.senders:
         mailbox = load_configured_mailbox(config, store)
         result = Watcher(config, store, mailbox, model).check(
@@ -861,6 +1131,12 @@ def run_watcher_check(
         model,
         exclude_run_ids=before.attempted_run_ids,
     )
+    after_proposals = process_scheduling_proposals(
+        config,
+        store,
+        exclude_run_ids=before_proposals.attempted_run_ids,
+        limit=25,
+    )
     if deliver_notifications and config.notifications_enabled:
         sender_names = {sender.email: sender.name for sender in config.senders}
         for intent in store.notification_intents(kind="automation_review"):
@@ -874,6 +1150,16 @@ def run_watcher_check(
     return {
         **result,
         "purged": int(result["purged"]) + before.purged + after.purged,
-        "automation_processed": before.processed + after.processed,
-        "automation_review_required": before.review_required + after.review_required,
+        "automation_processed": (
+            before.processed
+            + before_proposals.processed
+            + after.processed
+            + after_proposals.processed
+        ),
+        "automation_review_required": (
+            before.review_required
+            + before_proposals.review_required
+            + after.review_required
+            + after_proposals.review_required
+        ),
     }

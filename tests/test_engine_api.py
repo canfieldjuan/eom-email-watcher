@@ -256,6 +256,43 @@ def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
     assert second["data"]["next_cursor"] is None
 
 
+@pytest.mark.parametrize("entitled", [False, True])
+@pytest.mark.parametrize("operation", ["inbox.query", "inbox.recent"])
+def test_inbox_exposes_calendar_proposal_only_with_automation_entitlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entitled: bool,
+    operation: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    proposal = {
+        "run_id": "run-1",
+        "state": "awaiting_confirmation",
+        "proposal_version": 1,
+    }
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        runtime.store,
+        "query_inbox",
+        lambda **kwargs: ([{"message_id": "message-1", "calendar_proposal": proposal}], None),
+    )
+    monkeypatch.setattr(
+        runtime.store,
+        "recent",
+        lambda limit: [{"message_id": "message-1", "calendar_proposal": proposal}],
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: entitled)
+
+    response = engine_api._response(request(config_path, operation, {"limit": 25}))
+
+    assert response["ok"] is True
+    assert response["data"]["items"][0]["calendar_proposal"] == (
+        proposal if entitled else None
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
