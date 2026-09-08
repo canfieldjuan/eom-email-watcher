@@ -1358,6 +1358,66 @@ def test_expired_unresolved_calendar_write_stops_retrying_and_is_purged(
     assert store.automation_events(proposing.run_id) == []
 
 
+def test_expired_writing_calendar_write_survives_until_outcome_is_recorded(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="e" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    writing = store.begin_automation_calendar_write(
+        proposing.run_id,
+        authorized.state_version,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+    expires_at = datetime(2026, 9, 8, 13, tzinfo=UTC)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET expires_at = ? WHERE run_id = ?",
+            (expires_at.isoformat(), proposing.run_id),
+        )
+
+    store.purge_with_outcome(MAX_RETENTION_DAYS, now=expires_at)
+
+    pending = store.pending_automation_calendar_writes(now=expires_at)
+    assert [item.run.run_id for item in pending] == [proposing.run_id]
+    unresolved = store.transition_automation_calendar_write(
+        proposing.run_id,
+        writing.state_version,
+        next_state="unresolved",
+        failure_code="write_outcome_unknown",
+        now=expires_at,
+    )
+    store.purge_with_outcome(MAX_RETENTION_DAYS, now=expires_at)
+
+    assert unresolved.state == "unresolved"
+    assert store.automation_run(proposing.run_id) is None
+    assert store.automation_calendar_write(proposing.run_id) is None
+
+
 def test_source_cleanup_cancels_authorized_write_before_submission(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()

@@ -906,8 +906,11 @@ def _purge_expired_automation_tombstones(
 ) -> None:
     rows = db.execute(
         """SELECT run_id FROM automation_runs
-        WHERE aware_iso_epoch(expires_at) IS NULL
-           OR aware_iso_epoch(expires_at) <= aware_iso_epoch(?)
+        WHERE state NOT IN ('writing', 'reconciling')
+          AND (
+              aware_iso_epoch(expires_at) IS NULL
+              OR aware_iso_epoch(expires_at) <= aware_iso_epoch(?)
+          )
         ORDER BY run_id""",
         (now,),
     ).fetchall()
@@ -3694,7 +3697,10 @@ class Store:
                 f"""SELECT r.* FROM automation_runs AS r
                 JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
                 WHERE r.state IN ('write_authorized', 'writing', 'unresolved', 'reconciling')
-                  AND aware_iso_epoch(r.expires_at) > ?
+                  AND (
+                      r.state IN ('writing', 'reconciling')
+                      OR aware_iso_epoch(r.expires_at) > ?
+                  )
                 {run_filter}
                 ORDER BY r.updated_at, r.run_id LIMIT ?""",
                 parameters,
