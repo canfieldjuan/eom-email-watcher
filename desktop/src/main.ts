@@ -1295,7 +1295,10 @@ function renderInbox(items: InboxItem[]): void {
         ? `Attendees: ${proposal.attendees.join(", ")}`
         : "No additional attendees";
       const showInvitationWarning =
-        proposal.state === "awaiting_confirmation" && hasSuggestion && proposal.attendees.length > 0;
+        proposal.state === "awaiting_confirmation" &&
+        hasSuggestion &&
+        !expired &&
+        proposal.attendees.length > 0;
       const invitationWarning = document.createElement("p");
       invitationWarning.className = "calendar-proposal-invitation-warning";
       invitationWarning.hidden = !showInvitationWarning;

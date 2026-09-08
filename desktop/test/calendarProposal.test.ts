@@ -22,7 +22,7 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /attendees\.textContent = proposal\.attendees\.length/);
   assert.match(
     source,
-    /proposal\.state === "awaiting_confirmation" && hasSuggestion && proposal\.attendees\.length > 0/,
+    /proposal\.state === "awaiting_confirmation" &&\s+hasSuggestion &&\s+!expired &&\s+proposal\.attendees\.length > 0/,
   );
   assert.match(source, /invitationWarning\.hidden = !showInvitationWarning/);
   assert.match(source, /Creating this event will send meeting invitations from/);
@@ -32,7 +32,10 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /location\.textContent = "Location: Not specified"/);
   assert.match(source, /onlineMeeting\.textContent = "Teams link: No"/);
   assert.match(source, /proposal\.state === "awaiting_confirmation" && hasSuggestion/);
-  assert.doesNotMatch(source, /hasSuggestion && !expired/);
+  assert.doesNotMatch(
+    source,
+    /proposal\.state === "awaiting_confirmation" && hasSuggestion && proposal\.attendees\.length > 0/,
+  );
   assert.match(source, /confirm\.textContent = expired \? "Recheck proposal" : "Create event"/);
   assert.match(source, /otherwise it will refresh the proposal without creating an event/);
   assert.match(source, /decline\.textContent = "Decline"/);
