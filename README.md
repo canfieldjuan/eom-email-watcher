@@ -252,6 +252,14 @@ systemctl --user status eom-email-watcher.timer
 journalctl --user -u eom-email-watcher.service --since today
 ```
 
+For a paid Connect-enabled service snapshot, supply the approved production public-key ring when
+installing:
+
+```bash
+LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE=/secure/path/connect-public-keyring.json \
+  ./scripts/install-user-services.sh
+```
+
 The unit is a hardened one-shot service. Logs contain message IDs and sanitized failure classes,
 not bodies, OAuth tokens, or model prompts. It requests the local LM Studio service so existing
 loopback installs retain automatic startup, but that optional service cannot block a gateway-backed
@@ -259,7 +267,9 @@ watcher when LM Studio is absent or fails. The installer snapshots the current s
 its locked production dependencies into an isolated `uv tool` environment, and both timers execute
 `~/.local/bin/eom-mail-watch`; changing the branch in a development checkout cannot silently
 downgrade the production watcher. Rerun the installer from the intended revision to update that
-service snapshot.
+service snapshot. Supplying the approved production Connect public-key ring installs a validated
+copy for the non-frozen service snapshot; without it, mailbox watching remains available while
+paid Connect and automation features fail closed as unavailable.
 
 ## Model output and safety
 

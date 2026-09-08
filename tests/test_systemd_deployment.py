@@ -19,6 +19,10 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     assert script.index(locked_export) < script.index(snapshot)
     assert script.index(snapshot) < script.index(unit_install)
     assert 'test -x "$tool_bin_dir/eom-mail-watch"' in script
+    assert '[[ "$release_keyring_source" != /* ]]' in script
+    assert 'PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$release_keyring_source"' in script
+    assert "validate_entitlement_keyring" in script
+    assert 'install -m 0600 "$release_keyring_source" "$release_keyring_target"' in script
     assert '$tool_bin_dir/eom-mail-watch setup' in script
 
 
