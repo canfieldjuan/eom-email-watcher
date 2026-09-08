@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -61,6 +62,9 @@ MAX_CALENDAR_PROPOSAL_SECONDS = 60.0
 MAX_CALENDAR_PROPOSAL_REASON_BYTES = 512
 MAX_CALENDAR_PROPOSAL_CANDIDATES = 8
 MAX_CALENDAR_PROPOSAL_ATTENDEES = 64
+MAX_CALENDAR_WRITE_RESPONSE_BYTES = 512 * 1024
+MAX_CALENDAR_WRITE_SECONDS = 60.0
+MAX_CALENDAR_RECONCILIATION_EVENTS = 1_000
 _CONSENT_PENDING_ERROR_CODES = frozenset({65001, 90094, 90095})
 _RFC3339_INSTANT = re.compile(
     r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z"
@@ -82,6 +86,10 @@ class StaleCalendarCursor(Microsoft365Error):
 
 class MicrosoftCalendarProposalRejected(Microsoft365Error):
     """Microsoft definitively rejected or invalidated a meeting proposal."""
+
+
+class MicrosoftCalendarWriteRejected(Microsoft365Error):
+    """Microsoft definitively rejected the first event-creation request."""
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,12 @@ class CalendarMeetingProposal:
 class CalendarProposalResult:
     proposal: CalendarMeetingProposal | None
     empty_reason: str | None
+
+
+@dataclass(frozen=True)
+class CalendarWriteResult:
+    event_id: str
+    transaction_id: str
 
 
 def canonical_calendar_window(window_start: object, window_end: object) -> tuple[str, str]:
@@ -709,6 +723,261 @@ def find_meeting_time(
     except TimeoutError as exc:
         raise Microsoft365Error(
             "Microsoft Graph calendar proposal exceeded its time limit"
+        ) from exc
+
+
+def _calendar_transaction_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("calendar transaction identity is invalid")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("calendar transaction identity is invalid") from exc
+    if str(parsed) != value:
+        raise ValueError("calendar transaction identity is invalid")
+    return value
+
+
+def _calendar_write_request(
+    *,
+    transaction_id: str,
+    subject: str,
+    attendees: tuple[str, ...],
+    start: str,
+    end: str,
+    timezone: str,
+) -> dict[str, object]:
+    transaction_id = _calendar_transaction_id(transaction_id)
+    candidate = CalendarProposalCandidate(start=start, end=end, timezone=timezone)
+    parsed_start, parsed_end, _zone = _proposal_candidate_interval(candidate)
+    try:
+        subject_bytes = subject.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise ValueError("calendar event subject is invalid") from exc
+    if not subject or len(subject_bytes) > MAX_CALENDAR_SUBJECT_BYTES:
+        raise ValueError("calendar event subject is invalid")
+    if len(attendees) > MAX_CALENDAR_PROPOSAL_ATTENDEES:
+        raise ValueError("calendar event has too many attendees")
+    normalized_attendees = tuple(normalize_validated_address(value) for value in attendees)
+    if len(normalized_attendees) != len(set(normalized_attendees)):
+        raise ValueError("calendar event attendees must be unique")
+
+    def graph_time(value: datetime) -> dict[str, str]:
+        return {
+            "dateTime": value.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="auto"),
+            "timeZone": "UTC",
+        }
+
+    return {
+        "subject": subject,
+        "start": graph_time(parsed_start),
+        "end": graph_time(parsed_end),
+        "attendees": [
+            {
+                "emailAddress": {"address": address},
+                "type": "required",
+            }
+            for address in normalized_attendees
+        ],
+        "allowNewTimeProposals": True,
+        "isOnlineMeeting": False,
+        "transactionId": transaction_id,
+    }
+
+
+async def _create_calendar_event(
+    authorization: MicrosoftCalendarWriteAuthorization,
+    request: dict[str, object],
+) -> CalendarWriteResult:
+    owned_client = authorization._http_client is None
+    client = authorization._http_client or httpx.AsyncClient(timeout=GRAPH_TIMEOUT_SECONDS)
+    deadline = _calendar_monotonic() + MAX_CALENDAR_WRITE_SECONDS
+    try:
+        try:
+            async with client.stream(
+                "POST",
+                f"{GRAPH_ROOT}/me/events",
+                json=request,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {authorization._access_token}",
+                    "Content-Type": "application/json",
+                    "Prefer": 'IdType="ImmutableId", outlook.timezone="UTC"',
+                },
+                follow_redirects=False,
+                timeout=min(
+                    GRAPH_TIMEOUT_SECONDS,
+                    _calendar_round_time_remaining(deadline),
+                ),
+            ) as response:
+                if response.status_code in {408, 429} or response.status_code >= 500:
+                    raise Microsoft365Error(
+                        "Microsoft Graph calendar write outcome is unresolved"
+                    )
+                if response.status_code in {401, 403}:
+                    raise MicrosoftAuthorizationRejected(
+                        "Microsoft rejected the calendar write authorization"
+                    )
+                if not response.is_success:
+                    raise MicrosoftCalendarWriteRejected(
+                        f"Microsoft Graph calendar write failed (HTTP {response.status_code})"
+                    )
+                document, _response_bytes = await _bounded_graph_document(
+                    response,
+                    deadline,
+                    MAX_CALENDAR_WRITE_RESPONSE_BYTES,
+                )
+        except httpx.RequestError as exc:
+            raise Microsoft365Error(
+                "Microsoft Graph calendar write outcome is unresolved"
+            ) from exc
+        event_id = _calendar_event_id(document.get("id"))
+        transaction_id = document.get("transactionId")
+        if transaction_id != request["transactionId"]:
+            raise Microsoft365Error(
+                "Microsoft Graph calendar write omitted its transaction identity"
+            )
+        return CalendarWriteResult(event_id=event_id, transaction_id=str(transaction_id))
+    finally:
+        if owned_client:
+            await client.aclose()
+
+
+def create_calendar_event(
+    authorization: MicrosoftCalendarWriteAuthorization,
+    *,
+    transaction_id: str,
+    subject: str,
+    attendees: tuple[str, ...],
+    start: str,
+    end: str,
+    timezone: str,
+) -> CalendarWriteResult:
+    request = _calendar_write_request(
+        transaction_id=transaction_id,
+        subject=subject,
+        attendees=attendees,
+        start=start,
+        end=end,
+        timezone=timezone,
+    )
+    try:
+        return asyncio.run(
+            asyncio.wait_for(
+                _create_calendar_event(authorization, request),
+                timeout=MAX_CALENDAR_WRITE_SECONDS,
+            )
+        )
+    except TimeoutError as exc:
+        raise Microsoft365Error(
+            "Microsoft Graph calendar write outcome is unresolved"
+        ) from exc
+
+
+async def _find_calendar_event_by_transaction(
+    authorization: MicrosoftCalendarWriteAuthorization,
+    transaction_id: str,
+    window_start: str,
+    window_end: str,
+) -> CalendarWriteResult | None:
+    query = urlencode(
+        {
+            "startDateTime": window_start,
+            "endDateTime": window_end,
+            "$select": "id,transactionId",
+            "$top": str(MAX_CALENDAR_RECONCILIATION_EVENTS),
+        }
+    )
+    owned_client = authorization._http_client is None
+    client = authorization._http_client or httpx.AsyncClient(timeout=GRAPH_TIMEOUT_SECONDS)
+    deadline = _calendar_monotonic() + MAX_CALENDAR_WRITE_SECONDS
+    try:
+        try:
+            async with client.stream(
+                "GET",
+                f"{GRAPH_ROOT}/me/calendarView?{query}",
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Authorization": f"Bearer {authorization._access_token}",
+                    "Prefer": 'IdType="ImmutableId", outlook.timezone="UTC"',
+                },
+                follow_redirects=False,
+                timeout=min(
+                    GRAPH_TIMEOUT_SECONDS,
+                    _calendar_round_time_remaining(deadline),
+                ),
+            ) as response:
+                if response.status_code in {401, 403}:
+                    raise MicrosoftAuthorizationRejected(
+                        "Microsoft rejected calendar write reconciliation authorization"
+                    )
+                if not response.is_success:
+                    raise Microsoft365Error(
+                        "Microsoft Graph calendar write reconciliation is unavailable"
+                    )
+                document, _response_bytes = await _bounded_graph_document(
+                    response,
+                    deadline,
+                    MAX_CALENDAR_WRITE_RESPONSE_BYTES,
+                )
+        except httpx.RequestError as exc:
+            raise Microsoft365Error(
+                "Microsoft Graph calendar write reconciliation is unavailable"
+            ) from exc
+        values = document.get("value")
+        if not isinstance(values, list) or len(values) > MAX_CALENDAR_RECONCILIATION_EVENTS:
+            raise Microsoft365Error(
+                "Microsoft Graph returned an invalid reconciliation result"
+            )
+        matches: list[CalendarWriteResult] = []
+        for item in values:
+            if not isinstance(item, dict):
+                raise Microsoft365Error(
+                    "Microsoft Graph returned an invalid reconciliation event"
+                )
+            if item.get("transactionId") == transaction_id:
+                matches.append(
+                    CalendarWriteResult(
+                        event_id=_calendar_event_id(item.get("id")),
+                        transaction_id=transaction_id,
+                    )
+                )
+        if len(matches) > 1:
+            raise Microsoft365Error(
+                "Microsoft Graph returned duplicate transaction identities"
+            )
+        return matches[0] if matches else None
+    finally:
+        if owned_client:
+            await client.aclose()
+
+
+def find_calendar_event_by_transaction(
+    authorization: MicrosoftCalendarWriteAuthorization,
+    *,
+    transaction_id: str,
+    window_start: str,
+    window_end: str,
+) -> CalendarWriteResult | None:
+    transaction_id = _calendar_transaction_id(transaction_id)
+    canonical_start, canonical_end = canonical_calendar_window(window_start, window_end)
+    try:
+        return asyncio.run(
+            asyncio.wait_for(
+                _find_calendar_event_by_transaction(
+                    authorization,
+                    transaction_id,
+                    canonical_start,
+                    canonical_end,
+                ),
+                timeout=MAX_CALENDAR_WRITE_SECONDS,
+            )
+        )
+    except TimeoutError as exc:
+        raise Microsoft365Error(
+            "Microsoft Graph calendar write reconciliation is unavailable"
         ) from exc
 
 
