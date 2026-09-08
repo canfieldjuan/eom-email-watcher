@@ -651,6 +651,15 @@ select:focus {
   font-weight: 700;
 }
 
+.calendar-proposal-invitation-warning {
+  padding: 8px 10px;
+  border: 1px solid #d5aa54;
+  border-radius: 8px;
+  color: #6a3f0e;
+  background: #fff4d6;
+  font-weight: 800;
+}
+
 .calendar-proposal-actions {
   display: flex;
   flex-wrap: wrap;

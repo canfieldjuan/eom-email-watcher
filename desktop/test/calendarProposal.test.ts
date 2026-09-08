@@ -11,6 +11,13 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /subject\.textContent = `Event title: \$\{proposal\.subject\}`/);
   assert.match(source, /textContent = "No calendar event has been created\."/);
   assert.match(source, /proposal\.empty_reason \|\| "No meeting time satisfied the request\."/);
+  assert.match(source, /let inboxProposalExpiryTimer: number \| null = null/);
+  assert.match(source, /window\.clearTimeout\(inboxProposalExpiryTimer\)/);
+  assert.match(source, /const renderStartedAt = Date\.now\(\)/);
+  assert.match(source, /proposalExpiresAt > renderStartedAt/);
+  assert.match(source, /Math\.max\(nextProposalExpiry - Date\.now\(\) \+ 1, 0\)/);
+  assert.match(source, /inboxProposalExpiryTimer = window\.setTimeout/);
+  assert.match(source, /renderInbox\(inboxItems\)/);
   assert.match(
     source,
     /formatter\.format\(new Date\(proposal\.end\)\)\} \(\$\{proposal\.timezone\}\)/,
@@ -20,12 +27,22 @@ test("calendar proposals render exact native confirmation controls", () => {
     /Exact interval: \$\{proposal\.start\} – \$\{proposal\.end\}/,
   );
   assert.match(source, /attendees\.textContent = proposal\.attendees\.length/);
+  assert.match(
+    source,
+    /proposal\.state === "awaiting_confirmation" &&\s+hasSuggestion &&\s+!expired &&\s+proposal\.attendees\.length > 0/,
+  );
+  assert.match(source, /invitationWarning\.hidden = !showInvitationWarning/);
+  assert.match(source, /Creating this event will send meeting invitations from/);
+  assert.match(source, /attendees,\s+invitationWarning,\s+calendar/);
   assert.match(source, /calendar\.textContent = `Calendar owner:/);
   assert.match(source, /Account identity: \$\{proposal\.account_id\}/);
   assert.match(source, /location\.textContent = "Location: Not specified"/);
   assert.match(source, /onlineMeeting\.textContent = "Teams link: No"/);
   assert.match(source, /proposal\.state === "awaiting_confirmation" && hasSuggestion/);
-  assert.doesNotMatch(source, /hasSuggestion && !expired/);
+  assert.doesNotMatch(
+    source,
+    /proposal\.state === "awaiting_confirmation" && hasSuggestion && proposal\.attendees\.length > 0/,
+  );
   assert.match(source, /confirm\.textContent = expired \? "Recheck proposal" : "Create event"/);
   assert.match(source, /otherwise it will refresh the proposal without creating an event/);
   assert.match(source, /decline\.textContent = "Decline"/);
@@ -42,5 +59,6 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /await loadInbox\(\);\s+inboxStatus\.textContent = statusMessage/);
   assert.match(source, /inboxStatus\.dataset\.kind = "warning"/);
   assert.match(styles, /\.calendar-proposal\s*\{/);
+  assert.match(styles, /\.calendar-proposal-invitation-warning\s*\{/);
   assert.match(styles, /\.calendar-proposal-actions\s*\{/);
 });
