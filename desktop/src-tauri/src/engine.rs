@@ -543,6 +543,17 @@ pub struct CalendarProposalPreview {
     pub empty_reason: Option<String>,
     pub observed_at: String,
     pub expires_at: Option<String>,
+    pub write_status: Option<String>,
+    pub graph_event_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CalendarDecisionResult {
+    pub run_id: String,
+    pub state: String,
+    pub state_version: i64,
+    pub failure_code: Option<String>,
+    pub graph_event_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -1147,6 +1158,33 @@ impl Engine {
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.calendar_consent_request("disconnect", profile, provider, account_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_calendar_proposal(
+        &self,
+        message_id: String,
+        run_id: String,
+        state_version: i64,
+        proposal_version: i64,
+        proposal_sha256: String,
+        decision: String,
+    ) -> Result<CalendarDecisionResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "calendar.automation.decide",
+            json!({
+                "decision": decision,
+                "message_id": message_id,
+                "proposal_sha256": proposal_sha256,
+                "proposal_version": proposal_version,
+                "run_id": run_id,
+                "state_version": state_version,
+            }),
+        )
     }
 
     pub fn connect_mail_provider(
@@ -2055,6 +2093,55 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.write.connect","dat
         assert_eq!(
             request["payload"],
             json!({"provider": "microsoft365", "account_id": "microsoft365-account"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn calendar_decision_bridge_forwards_exact_durable_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide","data":{"run_id":"77d9c691-1c91-4e23-8f03-92973e12c385","state":"completed","state_version":8,"failure_code":null,"graph_event_id":"immutable-event-id"}}'"#,
+                ),
+                OsString::from("engine-calendar-decision-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let result = engine
+            .decide_calendar_proposal(
+                "message-1".into(),
+                "77d9c691-1c91-4e23-8f03-92973e12c385".into(),
+                7,
+                2,
+                "a".repeat(64),
+                "confirm".into(),
+            )
+            .expect("decide calendar proposal through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert_eq!(result.state, "completed");
+        assert_eq!(result.graph_event_id.as_deref(), Some("immutable-event-id"));
+        assert_eq!(
+            request["payload"],
+            json!({
+                "decision": "confirm",
+                "message_id": "message-1",
+                "proposal_sha256": "a".repeat(64),
+                "proposal_version": 2,
+                "run_id": "77d9c691-1c91-4e23-8f03-92973e12c385",
+                "state_version": 7
+            })
         );
     }
 

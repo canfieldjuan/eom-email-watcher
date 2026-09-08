@@ -159,7 +159,16 @@ interface InboxItem {
 
 interface CalendarProposalPreview {
   run_id: string;
-  state: "awaiting_confirmation" | "manual_review";
+  state:
+    | "awaiting_confirmation"
+    | "manual_review"
+    | "declined"
+    | "write_authorized"
+    | "writing"
+    | "unresolved"
+    | "reconciling"
+    | "completed"
+    | "failed";
   state_version: number;
   proposal_version: number;
   proposal_sha256: string;
@@ -177,6 +186,16 @@ interface CalendarProposalPreview {
   empty_reason: string | null;
   observed_at: string;
   expires_at: string | null;
+  write_status: string | null;
+  graph_event_id: string | null;
+}
+
+interface CalendarDecisionResult {
+  run_id: string;
+  state: string;
+  state_version: number;
+  failure_code: string | null;
+  graph_event_id: string | null;
 }
 
 interface InboxQuery {
@@ -1234,7 +1253,18 @@ function renderInbox(items: InboxItem[]): void {
       const expired = Boolean(
         hasSuggestion && proposal.expires_at && Date.parse(proposal.expires_at) <= Date.now(),
       );
-      state.textContent = !hasSuggestion ? "Needs review" : expired ? "Expired" : "Not confirmed";
+      const proposalStateLabels: Record<CalendarProposalPreview["state"], string> = {
+        awaiting_confirmation: expired ? "Expired" : "Not confirmed",
+        completed: "Created",
+        declined: "Declined",
+        failed: "Not created",
+        manual_review: "Needs review",
+        reconciling: "Reconciling",
+        unresolved: "Needs reconciliation",
+        write_authorized: "Authorized",
+        writing: "Creating event",
+      };
+      state.textContent = !hasSuggestion ? "Needs review" : proposalStateLabels[proposal.state];
       state.dataset.expired = String(expired);
       heading.append(title, state);
       const subject = document.createElement("p");
@@ -1265,11 +1295,107 @@ function renderInbox(items: InboxItem[]): void {
         ? `Attendees: ${proposal.attendees.join(", ")}`
         : "No additional attendees";
       const calendar = document.createElement("p");
-      calendar.textContent = `Calendar: ${proposal.account_address || proposal.account_display_name}`;
+      calendar.textContent = `Calendar owner: ${proposal.account_address || proposal.account_display_name} · Account identity: ${proposal.account_id}`;
+      const location = document.createElement("p");
+      location.textContent = "Location: Not specified";
+      const onlineMeeting = document.createElement("p");
+      onlineMeeting.textContent = "Teams link: No";
       const note = document.createElement("p");
       note.className = "calendar-proposal-note";
-      note.textContent = "No calendar event has been created.";
-      calendarProposal.append(heading, subject, timing, attendees, calendar, note);
+      if (proposal.state === "completed") {
+        note.textContent = "The calendar event was created.";
+      } else if (
+        proposal.state === "writing" ||
+        proposal.state === "unresolved" ||
+        proposal.state === "reconciling"
+      ) {
+        note.textContent =
+          "The write result is uncertain. Email Watcher will reconcile it without creating a second event.";
+      } else if (proposal.state === "failed") {
+        note.textContent = "Microsoft definitively rejected the event creation request.";
+      } else if (proposal.state === "declined") {
+        note.textContent = "You declined this calendar proposal. No event was created.";
+      } else {
+        note.textContent = "No calendar event has been created.";
+      }
+      calendarProposal.append(
+        heading,
+        subject,
+        timing,
+        attendees,
+        calendar,
+        location,
+        onlineMeeting,
+        note,
+      );
+      if (proposal.state === "awaiting_confirmation" && hasSuggestion) {
+        const actions = document.createElement("div");
+        actions.className = "calendar-proposal-actions";
+        const decline = document.createElement("button");
+        decline.type = "button";
+        decline.className = "secondary";
+        decline.textContent = "Decline";
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.textContent = expired ? "Recheck proposal" : "Create event";
+        const decide = async (decision: "confirm" | "decline"): Promise<void> => {
+          if (decision === "confirm") {
+            const invitationWarning = proposal.attendees.length
+              ? ` This will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
+              : "";
+            const confirmationMessage = expired
+              ? `Recheck the expired proposal “${proposal.subject}” before creating it? If Email Watcher still considers it valid, this confirmation will create the event on ${proposal.account_address || proposal.account_display_name}; otherwise it will refresh the proposal without creating an event.${invitationWarning}`
+              : `Create “${proposal.subject}” on ${proposal.account_address || proposal.account_display_name}?${invitationWarning}`;
+            if (
+              !window.confirm(confirmationMessage)
+            ) {
+              return;
+            }
+          }
+          confirm.disabled = true;
+          decline.disabled = true;
+          try {
+            const result = await invoke<CalendarDecisionResult>("calendar_proposal_decide", {
+              decision,
+              messageId: item.message_id,
+              proposalSha256: proposal.proposal_sha256,
+              proposalVersion: proposal.proposal_version,
+              runId: proposal.run_id,
+              stateVersion: proposal.state_version,
+            });
+            let statusMessage: string;
+            let statusKind: "success" | "error" | "warning";
+            if (result.state === "completed") {
+              statusMessage = "Calendar event created.";
+              statusKind = "success";
+            } else if (result.state === "declined") {
+              statusMessage = "Calendar proposal declined.";
+              statusKind = "success";
+            } else if (result.state === "failed") {
+              statusMessage = "Microsoft rejected the calendar event creation.";
+              statusKind = "error";
+            } else {
+              statusMessage = "Calendar decision saved; Email Watcher will reconcile the result.";
+              statusKind = "warning";
+            }
+            await loadInbox();
+            inboxStatus.textContent = statusMessage;
+            inboxStatus.dataset.kind = statusKind;
+          } catch (error) {
+            const statusMessage = errorMessage(error);
+            await loadInbox();
+            inboxStatus.textContent = statusMessage;
+            inboxStatus.dataset.kind = "error";
+          } finally {
+            confirm.disabled = false;
+            decline.disabled = false;
+          }
+        };
+        decline.addEventListener("click", () => void decide("decline"));
+        confirm.addEventListener("click", () => void decide("confirm"));
+        actions.append(decline, confirm);
+        calendarProposal.append(actions);
+      }
     }
 
     const attachments = document.createElement("ul");

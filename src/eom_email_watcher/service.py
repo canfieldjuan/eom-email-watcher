@@ -9,8 +9,10 @@ from datetime import UTC, datetime, timedelta
 from .config import Config, normalize_validated_address
 from .db import (
     AnalyzedMessage,
+    AutomationCalendarWrite,
     AutomationExtractionPayload,
     AutomationProposalWork,
+    AutomationRun,
     AutomationSourceChanged,
     AutomationWork,
     CalendarGrant,
@@ -45,6 +47,10 @@ from .microsoft_calendar import (
     CalendarProposalCandidate,
     MicrosoftCalendarProposalAuthorization,
     MicrosoftCalendarProposalRejected,
+    MicrosoftCalendarWriteAuthorization,
+    MicrosoftCalendarWriteRejected,
+    create_calendar_event,
+    find_calendar_event_by_transaction,
     find_meeting_time,
 )
 from .model import (
@@ -79,6 +85,18 @@ logger = logging.getLogger(__name__)
 class SchedulingProposalAccess:
     authorization: MicrosoftCalendarProposalAuthorization
     grant: CalendarGrant
+
+
+@dataclass(frozen=True)
+class SchedulingWriteAccess:
+    authorization: MicrosoftCalendarWriteAuthorization
+    grant: CalendarGrant
+
+
+@dataclass(frozen=True)
+class SchedulingDecision:
+    run: AutomationRun
+    write: AutomationCalendarWrite | None
 
 
 def _scheduling_proposal_authorization(
@@ -145,6 +163,52 @@ def _scheduling_authorization_principal(
         expected_principal_key=expected_principal_key,
     )
     return authorization.authorization.principal.key if authorization is not None else None
+
+
+def _scheduling_write_authorization(
+    config: Config,
+    store: Store,
+    *,
+    provider: str,
+    account_id: str,
+    expected_principal_key: str,
+    require_active_entitlements: bool = True,
+) -> SchedulingWriteAccess | None:
+    if provider != MICROSOFT365_PROVIDER:
+        return None
+    if require_active_entitlements and not feature_entitlements_active(
+        CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID
+    ):
+        return None
+    account = store.mail_account(provider, account_id)
+    if account is None or account.address is None:
+        return None
+    write_grant = store.calendar_grant(account_id, "write")
+    if (
+        write_grant is None
+        or write_grant.state != "ready"
+        or write_grant.principal_key != expected_principal_key
+    ):
+        return None
+    try:
+        authorization = MicrosoftCalendarWriteAuthorization.from_matching_tokens(
+            config.microsoft_credentials_file,
+            microsoft_calendar_token_file(config, account, "write"),
+            mail_account_token_file(config, account),
+            expected_principal_key,
+        )
+    except MicrosoftAuthorizationRejected:
+        store.revoke_calendar_grant_if_current(write_grant)
+        return None
+    except (MailboxAccountUnavailable, Microsoft365Error):
+        return None
+    if require_active_entitlements and not feature_entitlements_active(
+        CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID
+    ):
+        return None
+    if authorization.principal.key != expected_principal_key:
+        return None
+    return SchedulingWriteAccess(authorization, write_grant)
 
 
 def _scheduling_automation_principal(
@@ -680,6 +744,262 @@ def process_scheduling_proposals(
     )
 
 
+def process_scheduling_writes(
+    config: Config,
+    store: Store,
+    *,
+    run_id: str | None = None,
+    limit: int = 25,
+    now: datetime | None = None,
+) -> AutomationProcessing:
+    selected_now = now or _utc_now()
+    if selected_now.tzinfo is None:
+        raise ValueError("Calendar write processing time must be timezone-aware")
+    stamp = selected_now.astimezone(UTC)
+    processed = 0
+    review_required = 0
+    attempted: set[str] = set()
+    work_items = store.pending_automation_calendar_writes(
+        limit,
+        run_id=run_id,
+        now=stamp,
+    )
+    for work in work_items:
+        attempted.add(work.run.run_id)
+        current = store.automation_run(work.run.run_id)
+        if current is None or current.state_version != work.run.state_version:
+            continue
+        if current.state in {"writing", "reconciling"}:
+            code = (
+                "write_outcome_unknown"
+                if current.state == "writing"
+                else "reconciliation_interrupted"
+            )
+            try:
+                store.transition_automation_calendar_write(
+                    current.run_id,
+                    current.state_version,
+                    next_state="unresolved",
+                    failure_code=code,
+                    now=stamp,
+                )
+            except RuntimeError:
+                continue
+            processed += 1
+            continue
+
+        access = _scheduling_write_authorization(
+            config,
+            store,
+            provider=current.provider,
+            account_id=current.account_id,
+            expected_principal_key=current.calendar_principal_key,
+            require_active_entitlements=False,
+        )
+        if access is None:
+            continue
+
+        if current.state == "write_authorized":
+            try:
+                writing = store.begin_automation_calendar_write(
+                    current.run_id,
+                    current.state_version,
+                    now=stamp,
+                )
+            except RuntimeError:
+                continue
+            if writing.state == "source_unavailable":
+                processed += 1
+                review_required += 1
+                continue
+            proposal = work.proposal
+            if proposal is None:
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="unresolved",
+                    failure_code="write_payload_unavailable",
+                    now=stamp,
+                )
+                processed += 1
+                continue
+            try:
+                result = create_calendar_event(
+                    access.authorization,
+                    transaction_id=work.write.transaction_id,
+                    subject=proposal.subject,
+                    attendees=proposal.attendees,
+                    start=work.write.start,
+                    end=work.write.end,
+                    timezone=work.write.timezone,
+                )
+            except MicrosoftAuthorizationRejected:
+                store.revoke_calendar_grant_if_current(access.grant)
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="failed",
+                    failure_code="write_authorization_rejected",
+                    now=stamp,
+                )
+            except MicrosoftCalendarWriteRejected:
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="failed",
+                    failure_code="write_rejected",
+                    now=stamp,
+                )
+            except Microsoft365Error:
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="unresolved",
+                    failure_code="write_outcome_unknown",
+                    now=stamp,
+                )
+            except ValueError:
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="failed",
+                    failure_code="write_payload_invalid",
+                    now=stamp,
+                )
+            else:
+                store.transition_automation_calendar_write(
+                    writing.run_id,
+                    writing.state_version,
+                    next_state="completed",
+                    graph_event_id=result.event_id,
+                    now=stamp,
+                )
+            processed += 1
+            continue
+
+        if current.state != "unresolved":
+            continue
+        try:
+            reconciling = store.transition_automation_calendar_write(
+                current.run_id,
+                current.state_version,
+                next_state="reconciling",
+                now=stamp,
+            )
+        except RuntimeError:
+            continue
+        try:
+            result = find_calendar_event_by_transaction(
+                access.authorization,
+                transaction_id=work.write.transaction_id,
+                window_start=work.write.start,
+                window_end=work.write.end,
+            )
+        except MicrosoftAuthorizationRejected:
+            store.revoke_calendar_grant_if_current(access.grant)
+            store.transition_automation_calendar_write(
+                reconciling.run_id,
+                reconciling.state_version,
+                next_state="unresolved",
+                failure_code="reconciliation_authorization_rejected",
+                now=stamp,
+            )
+        except Microsoft365Error:
+            store.transition_automation_calendar_write(
+                reconciling.run_id,
+                reconciling.state_version,
+                next_state="unresolved",
+                failure_code="reconciliation_unavailable",
+                now=stamp,
+            )
+        else:
+            if result is None:
+                store.transition_automation_calendar_write(
+                    reconciling.run_id,
+                    reconciling.state_version,
+                    next_state="unresolved",
+                    failure_code="event_not_found",
+                    now=stamp,
+                )
+            else:
+                store.transition_automation_calendar_write(
+                    reconciling.run_id,
+                    reconciling.state_version,
+                    next_state="completed",
+                    graph_event_id=result.event_id,
+                    now=stamp,
+                )
+        processed += 1
+    return AutomationProcessing(processed, review_required, frozenset(attempted), 0)
+
+
+def decide_scheduling_proposal(
+    config: Config,
+    store: Store,
+    *,
+    run_id: str,
+    expected_state_version: int,
+    proposal_version: int,
+    proposal_sha256: str,
+    decision: str,
+    now: datetime | None = None,
+) -> SchedulingDecision:
+    if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
+        raise PermissionError("Scheduling automation requires an active entitlement")
+    current = store.automation_run(run_id)
+    if current is None:
+        raise KeyError(run_id)
+    if current.provider != MICROSOFT365_PROVIDER:
+        raise ValueError("Scheduling automation requires a Microsoft 365 account")
+    existing_write = (
+        store.automation_calendar_write(run_id) if decision == "confirm" else None
+    )
+    decision_args = {
+        "proposal_version": proposal_version,
+        "proposal_sha256": proposal_sha256,
+        "decision": decision,
+        "now": now,
+    }
+    if decision == "confirm" and existing_write is None:
+        try:
+            updated = store.decide_automation_proposal(
+                run_id,
+                expected_state_version,
+                write_authorized=False,
+                **decision_args,
+            )
+        except PermissionError:
+            access = _scheduling_write_authorization(
+                config,
+                store,
+                provider=current.provider,
+                account_id=current.account_id,
+                expected_principal_key=current.calendar_principal_key,
+            )
+            if access is None:
+                raise PermissionError(
+                    "Microsoft calendar write permission is unavailable"
+                ) from None
+            updated = store.decide_automation_proposal(
+                run_id,
+                expected_state_version,
+                write_authorized=True,
+                **decision_args,
+            )
+    else:
+        updated = store.decide_automation_proposal(
+            run_id,
+            expected_state_version,
+            **decision_args,
+        )
+    if decision == "confirm" and updated.state == "write_authorized":
+        process_scheduling_writes(config, store, run_id=run_id, limit=1, now=now)
+        updated = store.automation_run(run_id)
+        if updated is None:
+            raise RuntimeError("Scheduling automation disappeared after confirmation")
+    return SchedulingDecision(updated, store.automation_calendar_write(run_id))
+
+
 def _received_at_or_none(value: str, *, observed_at: datetime) -> datetime | None:
     try:
         received = datetime.fromisoformat(value)
@@ -1115,6 +1435,7 @@ def run_watcher_check(
             "automation_review_required": 0,
         }
 
+    writes = process_scheduling_writes(config, store)
     before = process_scheduling_automations(config, store, model)
     before_proposals = process_scheduling_proposals(config, store)
     if config.senders:
@@ -1152,12 +1473,14 @@ def run_watcher_check(
         "purged": int(result["purged"]) + before.purged + after.purged,
         "automation_processed": (
             before.processed
+            + writes.processed
             + before_proposals.processed
             + after.processed
             + after_proposals.processed
         ),
         "automation_review_required": (
             before.review_required
+            + writes.review_required
             + before_proposals.review_required
             + after.review_required
             + after_proposals.review_required

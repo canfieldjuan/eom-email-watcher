@@ -293,6 +293,197 @@ def test_inbox_exposes_calendar_proposal_only_with_automation_entitlement(
     )
 
 
+@pytest.mark.parametrize("operation", ["inbox.query", "inbox.recent"])
+@pytest.mark.parametrize(
+    "state",
+    ["write_authorized", "writing", "unresolved", "reconciling", "completed", "failed"],
+)
+def test_inbox_preserves_durable_calendar_write_outcomes_after_entitlement_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    state: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    proposal = {"run_id": "run-1", "state": state, "proposal_version": 1}
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        runtime.store,
+        "query_inbox",
+        lambda **kwargs: ([{"message_id": "message-1", "calendar_proposal": proposal}], None),
+    )
+    monkeypatch.setattr(
+        runtime.store,
+        "recent",
+        lambda limit: [{"message_id": "message-1", "calendar_proposal": proposal}],
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+
+    response = engine_api._response(request(config_path, operation, {"limit": 25}))
+
+    assert response["ok"] is True
+    assert response["data"]["items"][0]["calendar_proposal"] == proposal
+
+
+def test_calendar_proposal_decision_binds_message_and_exact_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    run_id = "77d9c691-1c91-4e23-8f03-92973e12c385"
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        runtime.store,
+        "automation_run_for_message",
+        lambda message_id: SimpleNamespace(run_id=run_id),
+    )
+    calls: list[dict[str, object]] = []
+
+    def decide(config, store, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                run_id=run_id,
+                state="completed",
+                state_version=8,
+                failure_code=None,
+            ),
+            write=SimpleNamespace(graph_event_id="immutable-event-id"),
+        )
+
+    monkeypatch.setattr(engine_api, "decide_scheduling_proposal", decide)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    @contextmanager
+    def lock(path, message):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", lock)
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.automation.decide",
+            {
+                "decision": "confirm",
+                "message_id": "message-1",
+                "proposal_sha256": "a" * 64,
+                "proposal_version": 2,
+                "run_id": run_id,
+                "state_version": 7,
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "run_id": run_id,
+        "state": "completed",
+        "state_version": 8,
+        "failure_code": None,
+        "graph_event_id": "immutable-event-id",
+    }
+    assert calls == [
+        {
+            "run_id": run_id,
+            "expected_state_version": 7,
+            "proposal_version": 2,
+            "proposal_sha256": "a" * 64,
+            "decision": "confirm",
+        }
+    ]
+
+
+def test_calendar_proposal_decision_rejects_cross_message_run_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        runtime.store,
+        "automation_run_for_message",
+        lambda message_id: SimpleNamespace(
+            run_id="11111111-1111-4111-8111-111111111111"
+        ),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "decide_scheduling_proposal",
+        lambda *args, **kwargs: pytest.fail("cross-message decision reached service"),
+    )
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    @contextmanager
+    def lock(path, message):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", lock)
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.automation.decide",
+            {
+                "decision": "decline",
+                "message_id": "message-1",
+                "proposal_sha256": "a" * 64,
+                "proposal_version": 1,
+                "run_id": "77d9c691-1c91-4e23-8f03-92973e12c385",
+                "state_version": 7,
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"decision": "approve"},
+        {"run_id": "not-a-uuid"},
+        {"proposal_sha256": "g" * 64},
+        {"proposal_version": False},
+        {"proposal_version": 2**63},
+        {"state_version": 0},
+        {"state_version": 2**63},
+        {"unexpected": True},
+    ],
+)
+def test_calendar_proposal_decision_rejects_ambiguous_identity_before_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "decision": "decline",
+        "message_id": "message-1",
+        "proposal_sha256": "a" * 64,
+        "proposal_version": 1,
+        "run_id": "77d9c691-1c91-4e23-8f03-92973e12c385",
+        "state_version": 7,
+    }
+    payload.update(override)
+    monkeypatch.setattr(
+        engine_api,
+        "load_runtime",
+        lambda path: pytest.fail("invalid proposal decision reached runtime"),
+    )
+
+    response = engine_api._response(
+        request(tmp_path / "unused.toml", "calendar.automation.decide", payload)
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "invalid_request"
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -3510,6 +3510,7 @@ class Store:
         proposal_version: int,
         proposal_sha256: str,
         decision: str,
+        write_authorized: bool = True,
         now: datetime | None = None,
     ) -> AutomationRun:
         if decision not in {"confirm", "decline"}:
@@ -3593,6 +3594,8 @@ class Store:
                     next_payload_id = str(extraction["payload_id"])
                     next_payload_sha256 = str(extraction["result_sha256"])
                 else:
+                    if not write_authorized:
+                        raise PermissionError("Calendar write authorization is required")
                     next_state = "write_authorized"
                     failure_code = None
                     transaction_id = str(uuid.uuid4())

@@ -29,6 +29,7 @@ from eom_email_watcher.microsoft365 import (
 from eom_email_watcher.microsoft_calendar import (
     CalendarMeetingProposal,
     CalendarProposalResult,
+    CalendarWriteResult,
     MicrosoftCalendarProposalRejected,
 )
 from eom_email_watcher.mime import extract_body
@@ -47,8 +48,10 @@ from eom_email_watcher.scheduling import (
 )
 from eom_email_watcher.service import (
     Watcher,
+    decide_scheduling_proposal,
     process_scheduling_automations,
     process_scheduling_proposals,
+    process_scheduling_writes,
     run_watcher_check,
 )
 
@@ -460,6 +463,36 @@ class ProposalAuthorization:
     def __init__(self, grant=None):
         self.authorization = object()
         self.grant = grant
+
+
+def awaiting_confirmation_run(
+    cfg: Config,
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    account_id, proposing = proposing_automation_run(cfg, store, monkeypatch)
+    extraction = next(
+        payload
+        for payload in store.automation_extraction_payloads(proposing.run_id)
+        if payload.status == "accepted"
+    )
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="b" * 64,
+        subject="Planning meeting",
+        attendees=("invitee@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="Everyone is available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    return account_id, awaiting, proposal
 
 
 def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
@@ -1006,6 +1039,410 @@ def test_scheduling_proposal_processing_rejects_naive_clock(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="timezone-aware"):
         process_scheduling_proposals(cfg, store, now=datetime(2026, 9, 7, 13))
+
+
+def test_confirmed_scheduling_proposal_writes_once_after_durable_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, awaiting, proposal = awaiting_confirmation_run(
+        cfg, store, monkeypatch
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    calls: list[str] = []
+
+    def create(_authorization, *, transaction_id: str, **kwargs) -> CalendarWriteResult:
+        durable = store.automation_calendar_write(awaiting.run_id)
+        current = store.automation_run(awaiting.run_id)
+        assert durable is not None and durable.transaction_id == transaction_id
+        assert durable.status == "writing"
+        assert current is not None and current.state == "writing"
+        calls.append(transaction_id)
+        return CalendarWriteResult("immutable-event-id", transaction_id)
+
+    monkeypatch.setattr(service_module, "create_calendar_event", create)
+
+    first = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: pytest.fail(
+            "repeated confirmation reloaded write authorization"
+        ),
+    )
+    repeated = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    assert first.run.state == repeated.run.state == "completed"
+    assert len(calls) == 1
+    assert first.write is not None and first.write.graph_event_id == "immutable-event-id"
+
+
+def test_expired_scheduling_proposal_requeues_without_write_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, awaiting, proposal = awaiting_confirmation_run(
+        cfg, store, monkeypatch
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: pytest.fail("expired proposal loaded write authorization"),
+    )
+
+    outcome = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 15, tzinfo=UTC),
+    )
+
+    assert (outcome.run.state, outcome.run.failure_code) == (
+        "proposing",
+        "proposal_expired",
+    )
+    assert outcome.write is None
+
+
+def test_ambiguous_calendar_write_reconciles_without_resubmission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, awaiting, proposal = awaiting_confirmation_run(
+        cfg, store, monkeypatch
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(),
+    )
+    create_calls: list[str] = []
+
+    def ambiguous(_authorization, *, transaction_id: str, **kwargs):
+        create_calls.append(transaction_id)
+        raise Microsoft365Error("lost response")
+
+    monkeypatch.setattr(service_module, "create_calendar_event", ambiguous)
+    first = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert first.run.state == "unresolved"
+    write = store.automation_calendar_write(awaiting.run_id)
+    assert write is not None
+    reconciliation_calls: list[str] = []
+
+    def reconcile(_authorization, *, transaction_id: str, **kwargs):
+        reconciliation_calls.append(transaction_id)
+        return CalendarWriteResult("reconciled-event", transaction_id)
+
+    monkeypatch.setattr(service_module, "find_calendar_event_by_transaction", reconcile)
+    outcome = process_scheduling_writes(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        limit=1,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    current = store.automation_run(awaiting.run_id)
+    assert current is not None and current.state == "completed"
+    assert create_calls == [write.transaction_id]
+    assert reconciliation_calls == [write.transaction_id]
+    assert outcome.processed == 1
+
+
+def test_confirmed_calendar_write_reconciles_after_entitlement_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
+    principal_key = "a" * 64
+    store.set_calendar_grant(
+        account_id,
+        "write",
+        "ready",
+        principal_key=principal_key,
+        home_account_id="home",
+        tenant_id="tenant",
+        object_id="object",
+        email_address="owner@example.com",
+    )
+
+    class Authorization:
+        principal = type("Principal", (), {"key": principal_key})()
+
+    entitled = True
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: entitled,
+    )
+    monkeypatch.setattr(
+        service_module.MicrosoftCalendarWriteAuthorization,
+        "from_matching_tokens",
+        lambda *args: Authorization(),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(Microsoft365Error("lost response")),
+    )
+    initial = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert initial.run.state == "unresolved"
+    entitled = False
+    monkeypatch.setattr(
+        service_module,
+        "find_calendar_event_by_transaction",
+        lambda _authorization, *, transaction_id, **kwargs: CalendarWriteResult(
+            "reconciled-after-expiry", transaction_id
+        ),
+    )
+
+    process_scheduling_writes(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        limit=1,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    current = store.automation_run(awaiting.run_id)
+    assert current is not None and current.state == "completed"
+
+
+def test_calendar_write_authorization_rejection_fails_and_revokes_grant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
+    grant = store.set_calendar_grant(
+        account_id,
+        "write",
+        "ready",
+        principal_key="a" * 64,
+        home_account_id="home",
+        tenant_id="tenant",
+        object_id="object",
+        email_address="owner@example.com",
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(grant),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MicrosoftAuthorizationRejected("revoked")
+        ),
+    )
+
+    result = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+
+    persisted = store.calendar_grant(account_id, "write")
+    assert (result.run.state, result.run.failure_code) == (
+        "failed",
+        "write_authorization_rejected",
+    )
+    assert persisted is not None and persisted.state == "revoked"
+
+
+def test_calendar_reconciliation_authorization_rejection_remains_unresolved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
+    grant = store.set_calendar_grant(
+        account_id,
+        "write",
+        "ready",
+        principal_key="a" * 64,
+        home_account_id="home",
+        tenant_id="tenant",
+        object_id="object",
+        email_address="owner@example.com",
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: ProposalAuthorization(grant),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: (_ for _ in ()).throw(Microsoft365Error("lost response")),
+    )
+    initial = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    assert initial.run.state == "unresolved"
+    monkeypatch.setattr(
+        service_module,
+        "find_calendar_event_by_transaction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            MicrosoftAuthorizationRejected("revoked")
+        ),
+    )
+
+    process_scheduling_writes(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        limit=1,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    current = store.automation_run(awaiting.run_id)
+    persisted = store.calendar_grant(account_id, "write")
+    assert current is not None
+    assert (current.state, current.failure_code) == (
+        "unresolved",
+        "reconciliation_authorization_rejected",
+    )
+    assert persisted is not None and persisted.state == "revoked"
+
+
+def test_decline_never_loads_write_authorization_or_calls_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    _account_id, awaiting, proposal = awaiting_confirmation_run(
+        cfg, store, monkeypatch
+    )
+    monkeypatch.setattr(
+        service_module,
+        "feature_entitlements_active",
+        lambda *features: True,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_scheduling_write_authorization",
+        lambda *args, **kwargs: pytest.fail("decline loaded calendar write authorization"),
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_calendar_event",
+        lambda *args, **kwargs: pytest.fail("decline reached Microsoft Graph"),
+    )
+
+    outcome = decide_scheduling_proposal(
+        cfg,
+        store,
+        run_id=awaiting.run_id,
+        expected_state_version=awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="decline",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+
+    assert outcome.run.state == "declined"
+    assert outcome.write is None
 
 
 @pytest.mark.parametrize(
