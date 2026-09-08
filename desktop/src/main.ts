@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  CALENDAR_CONSENT_PROFILES,
+  calendarConsentControls,
+  calendarConsentStateLabel,
+  calendarConsentVisible,
+  type CalendarConsentProfile,
+  type CalendarConsentStatus,
+} from "./calendarConsent";
 import { classifyCapabilityDiagnostic } from "./connectAvailability";
 import {
   buildMailServerConnection,
@@ -232,6 +240,13 @@ interface MailAccounts {
 interface MailAccountResult {
   account: MailAccountStatus;
   baseline_initialized?: boolean;
+}
+
+interface CalendarConsentEntry {
+  account: MailAccountStatus;
+  profile: CalendarConsentProfile;
+  status: CalendarConsentStatus | null;
+  error: string | null;
 }
 
 interface HealthStatus {
@@ -576,6 +591,14 @@ app.innerHTML = `
         <button type="submit">Save settings</button>
       </form>
       <p id="settings-status" class="status" role="status" aria-live="polite">Loading settings…</p>
+      <section id="calendar-consent-settings" class="calendar-consent-settings" hidden>
+        <div class="calendar-consent-heading">
+          <h3>Microsoft calendar access</h3>
+          <p>Each permission is separate from mailbox reading. Email Watcher never creates an event without a later explicit confirmation.</p>
+        </div>
+        <p id="calendar-consent-status" class="status" role="status" aria-live="polite"></p>
+        <div id="calendar-consent-list" class="calendar-consent-list"></div>
+      </section>
     </section>
   </div>
 `;
@@ -659,6 +682,9 @@ const autostartSettingsNote = requiredElement<HTMLParagraphElement>(
   "#autostart-settings-note",
 );
 const settingsStatus = requiredElement<HTMLParagraphElement>("#settings-status");
+const calendarConsentSettings = requiredElement<HTMLElement>("#calendar-consent-settings");
+const calendarConsentStatus = requiredElement<HTMLParagraphElement>("#calendar-consent-status");
+const calendarConsentList = requiredElement<HTMLElement>("#calendar-consent-list");
 let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
@@ -706,6 +732,8 @@ let autostartAvailable = false;
 let localModelSettingsEditable = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
+let calendarConsentOperationInFlight: string | null = null;
+let calendarConsentRequestGeneration = 0;
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -2279,6 +2307,242 @@ async function selectAndInstallConnectEntitlement(): Promise<void> {
   }
 }
 
+function calendarConsentDetail(status: CalendarConsentStatus): string {
+  if (!status.entitlement_active) {
+    return "Connect access is inactive. Saved authorization can still be removed.";
+  }
+  if (status.state === "consent_pending") {
+    return "Microsoft or your administrator still needs to complete consent.";
+  }
+  if (status.state === "rejected") return "Microsoft did not grant this permission.";
+  if (status.state === "revoked") return "Microsoft revoked or invalidated this permission.";
+  if (status.state === "ready" && !status.available) {
+    return "Consent is saved, but its account identity or token could not be verified.";
+  }
+  return status.available
+    ? "Authorized and available."
+    : "This permission has not been authorized.";
+}
+
+function setCalendarConsentButtonsBusy(): void {
+  for (const button of calendarConsentList.querySelectorAll("button")) {
+    button.disabled = true;
+  }
+}
+
+function renderCalendarConsents(
+  entitlementActive: boolean,
+  accounts: MailAccountStatus[],
+  entries: CalendarConsentEntry[],
+): void {
+  const visibleEntries = entries.filter(
+    (entry) =>
+      (entry.status !== null && calendarConsentVisible(entry.status)) ||
+      (entitlementActive && entry.error !== null),
+  );
+  const visible = entitlementActive || visibleEntries.length > 0;
+  calendarConsentSettings.hidden = !visible;
+  calendarConsentList.replaceChildren();
+  if (!visible) {
+    calendarConsentStatus.textContent = "";
+    delete calendarConsentStatus.dataset.kind;
+    return;
+  }
+
+  if (accounts.length === 0) {
+    calendarConsentStatus.textContent =
+      "Connect a Microsoft 365 email account before authorizing calendar access.";
+    delete calendarConsentStatus.dataset.kind;
+    return;
+  }
+
+  for (const account of accounts) {
+    const accountEntries = visibleEntries.filter(
+      (entry) => entry.account.account_id === account.account_id,
+    );
+    if (accountEntries.length === 0) continue;
+
+    const accountSection = document.createElement("article");
+    accountSection.className = "calendar-consent-account";
+    const accountHeading = document.createElement("div");
+    accountHeading.className = "calendar-consent-account-heading";
+    const accountTitle = document.createElement("h4");
+    accountTitle.textContent = account.address || account.display_name;
+    const accountState = document.createElement("p");
+    accountState.textContent = account.connected
+      ? "Microsoft 365 mailbox connected"
+      : "Mailbox disconnected — reconnect it before adding or renewing calendar access";
+    accountHeading.append(accountTitle, accountState);
+
+    const profileList = document.createElement("div");
+    profileList.className = "calendar-consent-profiles";
+    for (const entry of accountEntries) {
+      const definition = CALENDAR_CONSENT_PROFILES.find(
+        (candidate) => candidate.profile === entry.profile,
+      );
+      if (!definition) continue;
+      const card = document.createElement("section");
+      card.className = `calendar-consent-card calendar-consent-${entry.profile}`;
+      const title = document.createElement("h5");
+      title.textContent = definition.title;
+      const description = document.createElement("p");
+      description.textContent = definition.description;
+      const effect = document.createElement("p");
+      effect.className = "calendar-consent-effect";
+      effect.textContent = definition.effectNote;
+      card.append(title, description, effect);
+
+      if (entry.status === null) {
+        const failure = document.createElement("p");
+        failure.className = "calendar-consent-state calendar-consent-error";
+        failure.textContent = entry.error || "Calendar permission status is unavailable.";
+        card.append(failure);
+        profileList.append(card);
+        continue;
+      }
+
+      const status = entry.status;
+      const state = document.createElement("p");
+      state.className = "calendar-consent-state";
+      state.textContent = `${calendarConsentStateLabel(status)} · Scope: ${status.scope}`;
+      const detail = document.createElement("p");
+      detail.className = "calendar-consent-detail";
+      detail.textContent = calendarConsentDetail(status);
+      const actions = document.createElement("div");
+      actions.className = "calendar-consent-actions";
+      const controls = calendarConsentControls(status, account.connected);
+      if (controls.connectVisible) {
+        const connect = document.createElement("button");
+        connect.type = "button";
+        connect.textContent = `${controls.connectLabel} ${definition.actionLabel}`;
+        connect.disabled = !controls.connectEnabled || calendarConsentOperationInFlight !== null;
+        if (!account.connected) connect.title = "Reconnect this Microsoft 365 mailbox first";
+        connect.addEventListener("click", () => {
+          void mutateCalendarConsent("connect", account, entry.profile);
+        });
+        actions.append(connect);
+      }
+      if (controls.disconnectVisible) {
+        const disconnect = document.createElement("button");
+        disconnect.type = "button";
+        disconnect.className = "danger-action";
+        disconnect.textContent = `Remove ${definition.actionLabel}`;
+        disconnect.disabled = calendarConsentOperationInFlight !== null;
+        disconnect.addEventListener("click", () => {
+          void mutateCalendarConsent("disconnect", account, entry.profile);
+        });
+        actions.append(disconnect);
+      }
+      card.append(state, detail, actions);
+      profileList.append(card);
+    }
+    accountSection.append(accountHeading, profileList);
+    calendarConsentList.append(accountSection);
+  }
+}
+
+async function loadCalendarConsents(message?: string): Promise<void> {
+  if (calendarConsentOperationInFlight !== null) return;
+  const requestGeneration = ++calendarConsentRequestGeneration;
+  calendarConsentStatus.textContent = "Checking Microsoft calendar permissions…";
+  delete calendarConsentStatus.dataset.kind;
+  try {
+    const [entitlement, catalog] = await Promise.all([
+      invoke<ConnectEntitlementStatus>("connect_entitlement_status"),
+      invoke<MailAccounts>("mail_accounts_list"),
+    ]);
+    if (requestGeneration !== calendarConsentRequestGeneration) return;
+    applyConnectStatus(entitlement);
+    const accounts = catalog.accounts.filter((account) => account.provider === "microsoft365");
+    const entries = await Promise.all(
+      accounts.flatMap((account) =>
+        CALENDAR_CONSENT_PROFILES.map(async ({ profile }): Promise<CalendarConsentEntry> => {
+          try {
+            const status = await invoke<CalendarConsentStatus>("calendar_consent_status", {
+              profile,
+              provider: account.provider,
+              accountId: account.account_id,
+            });
+            return { account, profile, status, error: null };
+          } catch (error) {
+            return { account, profile, status: null, error: errorMessage(error) };
+          }
+        }),
+      ),
+    );
+    if (requestGeneration !== calendarConsentRequestGeneration) return;
+    renderCalendarConsents(entitlement.active, accounts, entries);
+    if (!calendarConsentSettings.hidden && accounts.length > 0) {
+      const failureCount = entries.filter((entry) => entry.error !== null).length;
+      if (failureCount > 0) {
+        calendarConsentStatus.textContent = `${failureCount} calendar permission status ${failureCount === 1 ? "is" : "are"} unavailable.`;
+        calendarConsentStatus.dataset.kind = "error";
+      } else {
+        calendarConsentStatus.textContent = message || "Calendar permissions are up to date.";
+        calendarConsentStatus.dataset.kind = "success";
+      }
+    }
+  } catch (error) {
+    if (requestGeneration !== calendarConsentRequestGeneration) return;
+    if (connectEntitlementActive) {
+      calendarConsentSettings.hidden = false;
+      calendarConsentList.replaceChildren();
+      calendarConsentStatus.textContent = errorMessage(error);
+      calendarConsentStatus.dataset.kind = "error";
+    } else {
+      calendarConsentSettings.hidden = true;
+    }
+  }
+}
+
+async function mutateCalendarConsent(
+  action: "connect" | "disconnect",
+  account: MailAccountStatus,
+  profile: CalendarConsentProfile,
+): Promise<void> {
+  if (calendarConsentOperationInFlight !== null) return;
+  const definition = CALENDAR_CONSENT_PROFILES.find(
+    (candidate) => candidate.profile === profile,
+  );
+  if (!definition) return;
+  if (
+    action === "disconnect" &&
+    !window.confirm(
+      `Remove ${definition.actionLabel} from ${account.address || account.display_name}? This removes only that calendar permission; mailbox reading remains connected.`,
+    )
+  ) {
+    return;
+  }
+
+  calendarConsentOperationInFlight = `${account.account_id}:${profile}:${action}`;
+  setCalendarConsentButtonsBusy();
+  calendarConsentStatus.textContent =
+    action === "connect"
+      ? `Complete ${definition.actionLabel} authorization in your browser…`
+      : `Removing ${definition.actionLabel}…`;
+  delete calendarConsentStatus.dataset.kind;
+  try {
+    const status = await invoke<CalendarConsentStatus>(`calendar_consent_${action}`, {
+      profile,
+      provider: account.provider,
+      accountId: account.account_id,
+    });
+    calendarConsentOperationInFlight = null;
+    const message =
+      action === "disconnect"
+        ? `${definition.title} permission removed. Mailbox reading was not changed.`
+        : status.state === "consent_pending"
+          ? `${definition.title} consent is pending Microsoft or administrator approval.`
+          : `${definition.title} permission authorized.`;
+    await loadCalendarConsents(message);
+  } catch (error) {
+    calendarConsentOperationInFlight = null;
+    await loadCalendarConsents();
+    calendarConsentStatus.textContent = errorMessage(error);
+    calendarConsentStatus.dataset.kind = "error";
+  }
+}
+
 function renderHealthUnknown(): void {
   const detail = "Health refresh failed; current status is unknown.";
   for (const [value, description] of [
@@ -2785,7 +3049,9 @@ healthTab.addEventListener("click", () => {
 });
 settingsTab.addEventListener("click", () => {
   showView("settings");
-  if (configurationReady) void Promise.all([loadSettings(), loadAutostart()]);
+  if (configurationReady) {
+    void Promise.all([loadSettings(), loadAutostart(), loadCalendarConsents()]);
+  }
 });
 autostartEnabledInput.addEventListener("change", () => {
   void updateAutostart(autostartEnabledInput.checked);
@@ -2829,10 +3095,19 @@ window.addEventListener("focus", () => {
       if (loaded) return loadInbox();
     });
   }
-  void refreshConnectStatus();
+  if (!settingsView.hidden && configurationReady) {
+    void loadCalendarConsents();
+  } else {
+    void refreshConnectStatus();
+  }
 });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") void refreshConnectStatus();
+  if (document.visibilityState !== "visible") return;
+  if (!settingsView.hidden && configurationReady) {
+    void loadCalendarConsents();
+  } else {
+    void refreshConnectStatus();
+  }
 });
 window.setInterval(() => {
   if (document.visibilityState === "visible" && !healthView.hidden) void refreshConnectStatus();

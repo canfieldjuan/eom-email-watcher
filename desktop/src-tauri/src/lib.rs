@@ -4,10 +4,11 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
-    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
-    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
-    MailAccountResult, MailAccounts, MailServerConnection, WatchedSender,
+    CalendarConsentProfile, CalendarConsentStatus, CheckResult, ConfigInitialization,
+    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
+    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
+    GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
+    MailServerConnection, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -495,6 +496,51 @@ async fn connect_entitlement_install(
 }
 
 #[tauri::command]
+async fn calendar_consent_status(
+    engine: State<'_, Engine>,
+    profile: CalendarConsentProfile,
+    provider: String,
+    account_id: String,
+) -> Result<CalendarConsentStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.calendar_consent_status(profile, provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn calendar_consent_connect(
+    engine: State<'_, Engine>,
+    profile: CalendarConsentProfile,
+    provider: String,
+    account_id: String,
+) -> Result<CalendarConsentStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.connect_calendar_consent(profile, provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn calendar_consent_disconnect(
+    engine: State<'_, Engine>,
+    profile: CalendarConsentProfile,
+    provider: String,
+    account_id: String,
+) -> Result<CalendarConsentStatus, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.disconnect_calendar_consent(profile, provider, account_id)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
@@ -753,6 +799,9 @@ pub fn run() {
             attachment_open,
             autostart_get,
             autostart_set,
+            calendar_consent_connect,
+            calendar_consent_disconnect,
+            calendar_consent_status,
             capability_output_export,
             capability_output_present,
             connect_entitlement_install,

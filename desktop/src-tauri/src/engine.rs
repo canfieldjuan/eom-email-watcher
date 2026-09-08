@@ -438,6 +438,52 @@ pub struct ConnectEntitlementStatus {
     pub active: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarConsentProfile {
+    Read,
+    Proposal,
+    Write,
+}
+
+impl CalendarConsentProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Proposal => "proposal",
+            Self::Write => "write",
+        }
+    }
+
+    fn expected_scope(self) -> &'static str {
+        match self {
+            Self::Read => "Calendars.Read",
+            Self::Proposal => "Calendars.Read.Shared",
+            Self::Write => "Calendars.ReadWrite",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarConsentState {
+    NotRequested,
+    ConsentPending,
+    Ready,
+    Rejected,
+    Revoked,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CalendarConsentStatus {
+    pub account_id: String,
+    pub available: bool,
+    pub entitlement_active: bool,
+    pub profile: CalendarConsentProfile,
+    pub scope: String,
+    pub state: CalendarConsentState,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConnectInvocationResult {
     pub protocol_version: u32,
@@ -1042,6 +1088,65 @@ impl Engine {
 
     pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
         self.request("mail.accounts.list", json!({}))
+    }
+
+    fn calendar_consent_request(
+        &self,
+        action: &str,
+        profile: CalendarConsentProfile,
+        provider: String,
+        account_id: String,
+    ) -> Result<CalendarConsentStatus, EngineError> {
+        let operation = format!("calendar.{}.{}", profile.as_str(), action);
+        let status: CalendarConsentStatus = self.request(
+            &operation,
+            json!({"provider": provider, "account_id": account_id}),
+        )?;
+        if status.account_id != account_id
+            || status.profile != profile
+            || status.scope != profile.expected_scope()
+        {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched calendar consent status",
+            ));
+        }
+        Ok(status)
+    }
+
+    pub fn calendar_consent_status(
+        &self,
+        profile: CalendarConsentProfile,
+        provider: String,
+        account_id: String,
+    ) -> Result<CalendarConsentStatus, EngineError> {
+        self.calendar_consent_request("status", profile, provider, account_id)
+    }
+
+    pub fn connect_calendar_consent(
+        &self,
+        profile: CalendarConsentProfile,
+        provider: String,
+        account_id: String,
+    ) -> Result<CalendarConsentStatus, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.calendar_consent_request("connect", profile, provider, account_id)
+    }
+
+    pub fn disconnect_calendar_consent(
+        &self,
+        profile: CalendarConsentProfile,
+        provider: String,
+        account_id: String,
+    ) -> Result<CalendarConsentStatus, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.calendar_consent_request("disconnect", profile, provider, account_id)
     }
 
     pub fn connect_mail_provider(
@@ -1892,6 +1997,91 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.connect","data
                 active: false,
             }
         );
+    }
+
+    #[test]
+    fn protocol_v1_calendar_consent_status_is_typed_and_secret_free() {
+        let status: CalendarConsentStatus = serde_json::from_value(json!({
+            "account_id": "microsoft365-account",
+            "available": false,
+            "entitlement_active": true,
+            "profile": "proposal",
+            "scope": "Calendars.Read.Shared",
+            "state": "consent_pending"
+        }))
+        .expect("deserialize calendar consent status");
+
+        assert_eq!(status.profile, CalendarConsentProfile::Proposal);
+        assert_eq!(status.state, CalendarConsentState::ConsentPending);
+        assert_eq!(status.scope, "Calendars.Read.Shared");
+        let encoded = serde_json::to_string(&status).expect("serialize calendar consent status");
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("cache"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn calendar_consent_mutation_uses_closed_profile_operation_and_selected_account() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.write.connect","data":{"account_id":"microsoft365-account","available":true,"entitlement_active":true,"profile":"write","scope":"Calendars.ReadWrite","state":"ready"}}'"#,
+                ),
+                OsString::from("engine-calendar-consent-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let status = engine
+            .connect_calendar_consent(
+                CalendarConsentProfile::Write,
+                "microsoft365".into(),
+                "microsoft365-account".into(),
+            )
+            .expect("connect calendar consent through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert!(status.available);
+        assert_eq!(request["operation"], "calendar.write.connect");
+        assert_eq!(
+            request["payload"],
+            json!({"provider": "microsoft365", "account_id": "microsoft365-account"})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn calendar_consent_bridge_rejects_mismatched_engine_identity() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.read.status","data":{"account_id":"other-account","available":true,"entitlement_active":true,"profile":"read","scope":"Calendars.Read","state":"ready"}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let error = engine
+            .calendar_consent_status(
+                CalendarConsentProfile::Read,
+                "microsoft365".into(),
+                "microsoft365-account".into(),
+            )
+            .expect_err("mismatched calendar consent status must fail closed");
+
+        assert_eq!(error.code, "engine_protocol_error");
     }
 
     #[test]

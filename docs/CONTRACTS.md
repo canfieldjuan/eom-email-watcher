@@ -708,9 +708,10 @@ Implementation remains split into reviewed vertical slices:
    file and keyring;
 2. **Implemented:** separate Microsoft calendar grants and read adapter;
 3. **Implemented:** scheduling extraction and immutable automation ledger;
-4. **Partially implemented:** read-only proposal adapter and native preview are
-   implemented; confirmation UI and the private confirmed-write adapter remain
-   pending; and
+4. **Partially implemented:** desktop controls expose the three isolated
+   Microsoft calendar consent profiles, and the read-only proposal adapter and
+   native preview are implemented; confirmation UI and the private
+   confirmed-write adapter remain pending; and
 5. **Pending:** live acceptance evidence.
 
 No implementation slice may weaken the existing mailbox read-only path or claim
