@@ -368,6 +368,10 @@ def valid_scheduling_output(intent: str = "new_meeting") -> str:
     )
 
 
+SCHEDULING_FIXTURE_RECEIVED_AT = "2026-09-07T12:00:00+00:00"
+SCHEDULING_FIXTURE_NOW = datetime(2026, 9, 7, 13, tzinfo=UTC)
+
+
 def admit_scheduling_run(
     store: Store,
     *,
@@ -399,9 +403,7 @@ def admit_scheduling_run(
         sender="trusted@example.com",
         sender_name="Trusted",
         subject="Meeting request",
-        # Keep the fixture's context before its fixed September 8 proposal.
-        # Using wall-clock time makes every scheduling test expire eventually.
-        received_at=received_at or "2026-09-07T12:00:00+00:00",
+        received_at=received_at or SCHEDULING_FIXTURE_RECEIVED_AT,
     )
     store.mark_analyzed(
         message_id,
@@ -417,6 +419,7 @@ def allow_automation_processing(
     monkeypatch: pytest.MonkeyPatch,
     gateway: AutomationGateway,
 ) -> None:
+    monkeypatch.setattr(service_module, "_utc_now", lambda: SCHEDULING_FIXTURE_NOW)
     monkeypatch.setattr(
         service_module,
         "_scheduling_authorization_principal",
@@ -444,7 +447,7 @@ def proposing_automation_run(
     account_id, admitted = admit_scheduling_run(
         store,
         provider_message_id=provider_message_id,
-        received_at="2026-09-07T12:00:00+00:00",
+        received_at=SCHEDULING_FIXTURE_RECEIVED_AT,
         principal_key=principal_key,
     )
     allow_automation_processing(monkeypatch, AnyAutomationGateway())
@@ -452,7 +455,7 @@ def proposing_automation_run(
         cfg,
         store,
         ExtractionModel([valid_scheduling_output()]),
-        now=datetime(2026, 9, 7, 13, tzinfo=UTC),
+        now=SCHEDULING_FIXTURE_NOW,
     )
     assert result.processed == 1
     proposing = store.automation_run(admitted.run_id)
