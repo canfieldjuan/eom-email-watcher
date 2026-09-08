@@ -655,9 +655,10 @@ automatic write mode.
 
 ## Acceptance evidence
 
-Calendar and automation implementation was accepted only after the following
-passed against merged code. The live evidence is summarized above and the
-deterministic boundaries remain regression-tested:
+The current acceptance record consists of the following live and deterministic
+evidence. The live evidence is summarized above, deterministic boundaries
+remain regression-tested, and any branch not yet exercised live is marked
+pending rather than inferred from fixtures:
 
 1. A fixture proves Microsoft mailbox setup requests exactly `Mail.Read` and
    never requests a calendar scope.
@@ -715,9 +716,12 @@ deterministic boundaries remain regression-tested:
 17. A multi-account fixture proves confirmation identifies the target principal
     and organizer, binds its immutable identity and calendar to the proposal
     hash, and invalidates confirmation when either target changes.
-18. A live, explicitly confirmed new-meeting proposal creates one event through
-    the separate write grant, visibly warns that attendee invitations will be
-    sent, and records its event identity and provenance.
+18. **Live no-attendee write accepted; attendee-bearing live proof pending.** A
+    live, explicitly confirmed no-attendee proposal created one event through
+    the separate write grant and recorded its event identity and provenance.
+    The native UI has deterministic coverage proving that a proposal with
+    attendees renders the meeting-invitation warning, but no attendee-bearing
+    event was created solely to claim live acceptance of that external effect.
 19. Lost-response and repeated-confirmation probes reuse one transaction ID,
     cannot produce duplicate event work, and prove reconciliation can move an
     unresolved run to `completed` only when it finds or receives the matching
