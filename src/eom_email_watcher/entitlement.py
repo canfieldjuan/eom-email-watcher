@@ -38,6 +38,19 @@ FEATURE_ID = CONNECT_FEATURE_ID
 ENTITLEMENT_FILE_NAME = "entitlement-v1.json"
 ENTITLEMENT_LOCK_FILE_NAME = ".entitlement-v1.lock"
 BUNDLED_KEYRING = Path("eom_email_watcher_data/connect-entitlement-keyring.json")
+INSTALLED_RELEASE_KEYRING = Path(
+    "eom-email-watcher/connect-entitlement-keyring.json"
+)
+APPROVED_RELEASE_AUTHORITIES = frozenset(
+    {
+        (
+            "local-connect-prod-2026-01",
+            bytes.fromhex(
+                "80df29263f56d87f3d2c1b0826a939c9d9a5c4d0ab6d25f101b0436107f57dad"
+            ),
+        )
+    }
+)
 MAX_ENTITLEMENT_BYTES = 16 * 1024
 MAX_KEYRING_BYTES = 64 * 1024
 MAX_PAYLOAD_BASE64URL_CHARS = 8192
@@ -156,13 +169,16 @@ class EntitlementGate:
 
     @classmethod
     def from_installation(cls) -> EntitlementGate:
+        keys = _load_bundled_keyring()
+        if keys is None and not hasattr(sys, "_MEIPASS"):
+            keys = _load_installed_release_keyring()
         return cls(
             path=_entitlement_path(
                 os.environ.get("XDG_CONFIG_HOME"),
                 os.environ.get("HOME"),
                 os.environ.get("LOCALAPPDATA"),
             ),
-            keys=_load_bundled_keyring(),
+            keys=keys,
             now=None,
         )
 
@@ -306,6 +322,31 @@ def _load_bundled_keyring() -> MappingProxyType[str, bytes] | None:
         return _parse_keyring(path.read_bytes())
     except (OSError, ValidationError, ValueError):
         return None
+
+
+def _load_installed_release_keyring() -> MappingProxyType[str, bytes] | None:
+    path = _installed_release_keyring_path(os.environ.get("HOME"))
+    if path is None:
+        return None
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= MAX_KEYRING_BYTES:
+            return None
+        keys = _parse_keyring(path.read_bytes())
+    except (OSError, ValidationError, ValueError):
+        return None
+    if frozenset(keys.items()) != APPROVED_RELEASE_AUTHORITIES:
+        return None
+    return keys
+
+
+def _installed_release_keyring_path(home: str | None) -> Path | None:
+    if not home:
+        return None
+    root = Path(home) / ".local" / "share"
+    if not root.is_absolute():
+        return None
+    return root / INSTALLED_RELEASE_KEYRING
 
 
 def _parse_keyring(content: bytes) -> MappingProxyType[str, bytes]:

@@ -264,6 +264,7 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
 
     monkeypatch.setattr(entitlement.sys, "_MEIPASS", str(bundle_root), raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(configured))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "missing-data"))
     monkeypatch.setenv("LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE", str(attacker_keyring))
     assert entitlement.connect_entitlement_decision() is entitlement.EntitlementDecision.ACTIVE
     assert (
@@ -288,6 +289,26 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
     ).public_dict() == {"state": "active", "active": True}
 
     monkeypatch.setattr(entitlement.sys, "_MEIPASS", str(tmp_path / "missing-bundle"))
+    installed_release = (
+        tmp_path / "missing-data" / entitlement.INSTALLED_RELEASE_KEYRING
+    )
+    installed_release.parent.mkdir(parents=True)
+    approved_key_id, approved_public_key = next(
+        iter(entitlement.APPROVED_RELEASE_AUTHORITIES)
+    )
+    installed_release.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": approved_key_id,
+                        "algorithm": "Ed25519",
+                        "public_key_base64url": encoded(approved_public_key),
+                    }
+                ]
+            }
+        )
+    )
     assert (
         entitlement.connect_entitlement_decision()
         is entitlement.EntitlementDecision.AUTHORITY_UNAVAILABLE
@@ -297,6 +318,49 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
 def test_empty_xdg_config_home_uses_home_fallback() -> None:
     assert entitlement._entitlement_path("", "/home/test-user") == Path(
         "/home/test-user/.config/local-connect/entitlement-v1.json"
+    )
+
+
+def test_non_frozen_installation_accepts_only_approved_installed_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    approved_key_id, approved_public_key = next(iter(entitlement.APPROVED_RELEASE_AUTHORITIES))
+    attacker = Ed25519PrivateKey.generate()
+    installed_keyring = (
+        tmp_path / ".local" / "share" / entitlement.INSTALLED_RELEASE_KEYRING
+    )
+    installed_keyring.parent.mkdir(parents=True)
+    installed_keyring.write_bytes(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": approved_key_id,
+                        "algorithm": "Ed25519",
+                        "public_key_base64url": encoded(approved_public_key),
+                    }
+                ]
+            }
+        ).encode()
+    )
+    monkeypatch.delattr(entitlement.sys, "_MEIPASS", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "ignored-data-root"))
+
+    assert entitlement._load_installed_release_keyring() == dict(
+        entitlement.APPROVED_RELEASE_AUTHORITIES
+    )
+
+    installed_keyring.write_bytes(keyring(attacker))
+    assert entitlement._load_installed_release_keyring() is None
+
+
+def test_installed_release_authority_path_requires_an_absolute_home() -> None:
+    assert entitlement._installed_release_keyring_path("relative") is None
+    assert entitlement._installed_release_keyring_path(None) is None
+    assert entitlement._installed_release_keyring_path("/home/test-user") == (
+        Path("/home/test-user/.local/share") / entitlement.INSTALLED_RELEASE_KEYRING
     )
 
 
