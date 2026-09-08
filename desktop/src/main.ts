@@ -1294,6 +1294,14 @@ function renderInbox(items: InboxItem[]): void {
       attendees.textContent = proposal.attendees.length
         ? `Attendees: ${proposal.attendees.join(", ")}`
         : "No additional attendees";
+      const showInvitationWarning =
+        proposal.state === "awaiting_confirmation" && hasSuggestion && proposal.attendees.length > 0;
+      const invitationWarning = document.createElement("p");
+      invitationWarning.className = "calendar-proposal-invitation-warning";
+      invitationWarning.hidden = !showInvitationWarning;
+      invitationWarning.textContent = showInvitationWarning
+        ? `Creating this event will send meeting invitations from ${proposal.account_address || proposal.account_display_name} to ${proposal.attendees.join(", ")}.`
+        : "";
       const calendar = document.createElement("p");
       calendar.textContent = `Calendar owner: ${proposal.account_address || proposal.account_display_name} · Account identity: ${proposal.account_id}`;
       const location = document.createElement("p");
@@ -1323,6 +1331,7 @@ function renderInbox(items: InboxItem[]): void {
         subject,
         timing,
         attendees,
+        invitationWarning,
         calendar,
         location,
         onlineMeeting,

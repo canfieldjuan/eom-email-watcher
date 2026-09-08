@@ -20,6 +20,13 @@ test("calendar proposals render exact native confirmation controls", () => {
     /Exact interval: \$\{proposal\.start\} – \$\{proposal\.end\}/,
   );
   assert.match(source, /attendees\.textContent = proposal\.attendees\.length/);
+  assert.match(
+    source,
+    /proposal\.state === "awaiting_confirmation" && hasSuggestion && proposal\.attendees\.length > 0/,
+  );
+  assert.match(source, /invitationWarning\.hidden = !showInvitationWarning/);
+  assert.match(source, /Creating this event will send meeting invitations from/);
+  assert.match(source, /attendees,\s+invitationWarning,\s+calendar/);
   assert.match(source, /calendar\.textContent = `Calendar owner:/);
   assert.match(source, /Account identity: \$\{proposal\.account_id\}/);
   assert.match(source, /location\.textContent = "Location: Not specified"/);
@@ -42,5 +49,6 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /await loadInbox\(\);\s+inboxStatus\.textContent = statusMessage/);
   assert.match(source, /inboxStatus\.dataset\.kind = "warning"/);
   assert.match(styles, /\.calendar-proposal\s*\{/);
+  assert.match(styles, /\.calendar-proposal-invitation-warning\s*\{/);
   assert.match(styles, /\.calendar-proposal-actions\s*\{/);
 });
