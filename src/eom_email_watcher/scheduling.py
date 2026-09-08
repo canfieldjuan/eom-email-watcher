@@ -593,7 +593,15 @@ def _range_source_options(
         )
     )
     for newline in re.finditer(r"\n", evidence_text):
-        left = evidence_text[: newline.start()].rsplit("\n", 1)[-1]
+        option_start_at = max(
+            (
+                delimiter.end()
+                for delimiter in option_delimiters
+                if delimiter.end() <= newline.start()
+            ),
+            default=0,
+        )
+        left = evidence_text[option_start_at : newline.start()]
         right = evidence_text[newline.end() :].lstrip()
         if _contains_clock_range(left) and re.match(option_start, right, re.IGNORECASE):
             option_delimiters.append(newline)

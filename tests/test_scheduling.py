@@ -126,7 +126,7 @@ def test_mime_hard_wrapped_evidence_is_accepted_without_weakening_source_checks(
 
 def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
     body = (
-        "September 8 from 10:00 to 10:30\n"
+        "September 8 from 10:00\n to 10:30\n"
         "September 9 from 14:00 to 15:00"
     )
     value = valid_result()
