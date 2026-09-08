@@ -18,7 +18,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -466,6 +466,101 @@ BEGIN
     DELETE FROM automation_calendar_writes WHERE run_id = OLD.run_id;
 END;
 """
+
+
+def _microsoft_principal_key_v1(
+    home_account_id: str,
+    tenant_id: str,
+    object_id: str,
+) -> str:
+    value = "\0".join((home_account_id, tenant_id, object_id))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _microsoft_principal_key_v2(home_account_id: str, object_id: str) -> str:
+    value = "\0".join(("msal-principal-v2", home_account_id, object_id))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _migrate_microsoft_principal_keys_v2(db: sqlite3.Connection) -> None:
+    rows = db.execute(
+        """SELECT account_id, principal_key, home_account_id, tenant_id, object_id
+        FROM microsoft_calendar_grants
+        WHERE principal_key IS NOT NULL
+            AND home_account_id IS NOT NULL
+            AND tenant_id IS NOT NULL
+            AND object_id IS NOT NULL"""
+    ).fetchall()
+    migrations: dict[tuple[str, str], str] = {}
+    for row in rows:
+        account_id = str(row["account_id"])
+        old_key = str(row["principal_key"])
+        home_account_id = str(row["home_account_id"])
+        tenant_id = str(row["tenant_id"])
+        object_id = str(row["object_id"])
+        legacy_key = _microsoft_principal_key_v1(
+            home_account_id,
+            tenant_id,
+            object_id,
+        )
+        new_key = _microsoft_principal_key_v2(home_account_id, object_id)
+        if old_key not in {legacy_key, new_key}:
+            continue
+        source = (account_id, legacy_key)
+        previous = migrations.setdefault(source, new_key)
+        if previous != new_key:
+            raise RuntimeError(
+                "Microsoft calendar grants contain conflicting principal identities"
+            )
+
+    if not migrations:
+        return
+
+    db.execute("DROP TRIGGER IF EXISTS automation_events_no_update")
+    for (account_id, old_key), new_key in sorted(migrations.items()):
+        run_ids = [
+            str(row["run_id"])
+            for row in db.execute(
+                """SELECT run_id FROM automation_runs
+                WHERE provider = 'microsoft365' AND account_id = ?
+                    AND calendar_principal_key = ?""",
+                (account_id, old_key),
+            ).fetchall()
+        ]
+        for run_id in run_ids:
+            db.execute(
+                """UPDATE automation_events SET calendar_principal_key = ?
+                WHERE run_id = ? AND calendar_principal_key = ?""",
+                (new_key, run_id, old_key),
+            )
+            db.execute(
+                """UPDATE automation_calendar_writes SET calendar_principal_key = ?
+                WHERE run_id = ? AND calendar_principal_key = ?""",
+                (new_key, run_id, old_key),
+            )
+        db.execute(
+            """UPDATE automation_runs SET calendar_principal_key = ?
+            WHERE provider = 'microsoft365' AND account_id = ?
+                AND calendar_principal_key = ?""",
+            (new_key, account_id, old_key),
+        )
+        db.execute(
+            """UPDATE microsoft_calendar_windows SET principal_key = ?
+            WHERE account_id = ? AND principal_key = ?""",
+            (new_key, account_id, old_key),
+        )
+        db.execute(
+            """UPDATE microsoft_calendar_grants SET principal_key = ?
+            WHERE account_id = ? AND principal_key = ?""",
+            (new_key, account_id, old_key),
+        )
+    db.execute(
+        """CREATE TRIGGER automation_events_no_update
+        BEFORE UPDATE ON automation_events
+        BEGIN
+            SELECT RAISE(ABORT, 'automation_events are immutable');
+        END"""
+    )
 
 
 @dataclass(frozen=True)
@@ -1764,6 +1859,8 @@ class Store:
             )
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
+            if version < 18:
+                _migrate_microsoft_principal_keys_v2(db)
             automation_run_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(automation_runs)").fetchall()

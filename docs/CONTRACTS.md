@@ -3,8 +3,8 @@
 Status: **implemented: landing items 1–5 are complete**
 
 This document freezes the boundary for adding Microsoft 365 calendar operations
-and the first email-driven automation to Email Watcher. It is an implementation
-gate, not a claim that calendar or automation behavior exists today.
+and the first email-driven automation to Email Watcher. It records the implemented
+contract and the live acceptance evidence for the completed landing sequence.
 
 Feature-aware entitlement lookup, isolated calendar grants, calendar-read
 projection, strict scheduling extraction, the recoverable automation ledger,
@@ -48,9 +48,9 @@ The contract starts from these current-code facts:
   strict extraction now validates candidate times, attendees, intent, and source
   evidence before the automation can reach `proposing`.
 - The Microsoft calendar-read adapter and immutable automation run ledger exist.
-  Read-only meeting proposal and native preview exist; confirmation and write
-  remain pending. A systemd `OnCalendar` timer remains an unrelated use of the
-  word "calendar."
+  Read-only meeting proposal, native preview, explicit confirmation, and durable
+  write/reconciliation are implemented. A systemd `OnCalendar` timer remains an
+  unrelated use of the word "calendar."
 
 ## Definitions
 
@@ -160,7 +160,9 @@ and object claims, when returned, are validated against concrete cache identity
 and retained as provenance; their later omission cannot change the key. The
 multi-tenant authority alias `organizations` is not treated as a concrete tenant
 claim. A normalized email address is display/diagnostic metadata, not an identity
-key.
+key. Schema migration 18 atomically rewrites verified legacy principal-key
+references across grants, delta state, automation runs/events, and write
+reservations before runtime authorization can compare them.
 An immutable-principal mismatch is rejected before a cache replaces the previous
 cache or changes the profile's current consent state. The run binds that same
 principal before confirmation.
