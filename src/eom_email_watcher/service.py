@@ -172,10 +172,13 @@ def _scheduling_write_authorization(
     provider: str,
     account_id: str,
     expected_principal_key: str,
+    require_active_entitlements: bool = True,
 ) -> SchedulingWriteAccess | None:
     if provider != MICROSOFT365_PROVIDER:
         return None
-    if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
+    if require_active_entitlements and not feature_entitlements_active(
+        CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID
+    ):
         return None
     account = store.mail_account(provider, account_id)
     if account is None or account.address is None:
@@ -199,7 +202,9 @@ def _scheduling_write_authorization(
         return None
     except (MailboxAccountUnavailable, Microsoft365Error):
         return None
-    if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
+    if require_active_entitlements and not feature_entitlements_active(
+        CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID
+    ):
         return None
     if authorization.principal.key != expected_principal_key:
         return None
@@ -789,6 +794,7 @@ def process_scheduling_writes(
             provider=current.provider,
             account_id=current.account_id,
             expected_principal_key=current.calendar_principal_key,
+            require_active_entitlements=False,
         )
         if access is None:
             continue
@@ -948,24 +954,44 @@ def decide_scheduling_proposal(
     existing_write = (
         store.automation_calendar_write(run_id) if decision == "confirm" else None
     )
+    decision_args = {
+        "proposal_version": proposal_version,
+        "proposal_sha256": proposal_sha256,
+        "decision": decision,
+        "now": now,
+    }
     if decision == "confirm" and existing_write is None:
-        access = _scheduling_write_authorization(
-            config,
-            store,
-            provider=current.provider,
-            account_id=current.account_id,
-            expected_principal_key=current.calendar_principal_key,
+        try:
+            updated = store.decide_automation_proposal(
+                run_id,
+                expected_state_version,
+                write_authorized=False,
+                **decision_args,
+            )
+        except PermissionError:
+            access = _scheduling_write_authorization(
+                config,
+                store,
+                provider=current.provider,
+                account_id=current.account_id,
+                expected_principal_key=current.calendar_principal_key,
+            )
+            if access is None:
+                raise PermissionError(
+                    "Microsoft calendar write permission is unavailable"
+                ) from None
+            updated = store.decide_automation_proposal(
+                run_id,
+                expected_state_version,
+                write_authorized=True,
+                **decision_args,
+            )
+    else:
+        updated = store.decide_automation_proposal(
+            run_id,
+            expected_state_version,
+            **decision_args,
         )
-        if access is None:
-            raise PermissionError("Microsoft calendar write permission is unavailable")
-    updated = store.decide_automation_proposal(
-        run_id,
-        expected_state_version,
-        proposal_version=proposal_version,
-        proposal_sha256=proposal_sha256,
-        decision=decision,
-        now=now,
-    )
     if decision == "confirm" and updated.state == "write_authorized":
         process_scheduling_writes(config, store, run_id=run_id, limit=1, now=now)
         updated = store.automation_run(run_id)

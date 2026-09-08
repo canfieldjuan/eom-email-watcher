@@ -30,11 +30,16 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /otherwise it will refresh the proposal without creating an event/);
   assert.match(source, /decline\.textContent = "Decline"/);
   assert.match(source, /This will send meeting invitations from/);
+  assert.match(
+    source,
+    /proposal\.state === "writing" \|\|\s+proposal\.state === "unresolved"/,
+  );
   assert.match(source, /invoke<CalendarDecisionResult>\("calendar_proposal_decide"/);
   assert.match(source, /proposalSha256: proposal\.proposal_sha256/);
   assert.match(source, /proposalVersion: proposal\.proposal_version/);
   assert.match(source, /stateVersion: proposal\.state_version/);
   assert.match(source, /result\.state === "failed"/);
+  assert.match(source, /await loadInbox\(\);\s+inboxStatus\.textContent = statusMessage/);
   assert.match(source, /inboxStatus\.dataset\.kind = "warning"/);
   assert.match(styles, /\.calendar-proposal\s*\{/);
   assert.match(styles, /\.calendar-proposal-actions\s*\{/);

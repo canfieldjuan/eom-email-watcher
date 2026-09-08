@@ -293,6 +293,40 @@ def test_inbox_exposes_calendar_proposal_only_with_automation_entitlement(
     )
 
 
+@pytest.mark.parametrize("operation", ["inbox.query", "inbox.recent"])
+@pytest.mark.parametrize(
+    "state",
+    ["write_authorized", "writing", "unresolved", "reconciling", "completed", "failed"],
+)
+def test_inbox_preserves_durable_calendar_write_outcomes_after_entitlement_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    state: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    proposal = {"run_id": "run-1", "state": state, "proposal_version": 1}
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        runtime.store,
+        "query_inbox",
+        lambda **kwargs: ([{"message_id": "message-1", "calendar_proposal": proposal}], None),
+    )
+    monkeypatch.setattr(
+        runtime.store,
+        "recent",
+        lambda limit: [{"message_id": "message-1", "calendar_proposal": proposal}],
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+
+    response = engine_api._response(request(config_path, operation, {"limit": 25}))
+
+    assert response["ok"] is True
+    assert response["data"]["items"][0]["calendar_proposal"] == proposal
+
+
 def test_calendar_proposal_decision_binds_message_and_exact_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

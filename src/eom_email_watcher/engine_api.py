@@ -1566,7 +1566,16 @@ def _hide_locked_automation_previews(rows: list[dict[str, object]]) -> None:
     if _automation_entitlement_active():
         return
     for row in rows:
-        row["calendar_proposal"] = None
+        proposal = row.get("calendar_proposal")
+        if not isinstance(proposal, dict) or proposal.get("state") not in {
+            "write_authorized",
+            "writing",
+            "unresolved",
+            "reconciling",
+            "completed",
+            "failed",
+        }:
+            row["calendar_proposal"] = None
 
 
 def _recent(request: dict[str, object]) -> dict[str, object]:

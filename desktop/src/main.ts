@@ -1304,7 +1304,11 @@ function renderInbox(items: InboxItem[]): void {
       note.className = "calendar-proposal-note";
       if (proposal.state === "completed") {
         note.textContent = "The calendar event was created.";
-      } else if (proposal.state === "unresolved" || proposal.state === "reconciling") {
+      } else if (
+        proposal.state === "writing" ||
+        proposal.state === "unresolved" ||
+        proposal.state === "reconciling"
+      ) {
         note.textContent =
           "The write result is uncertain. Email Watcher will reconcile it without creating a second event.";
       } else if (proposal.state === "failed") {
@@ -1359,25 +1363,29 @@ function renderInbox(items: InboxItem[]): void {
               runId: proposal.run_id,
               stateVersion: proposal.state_version,
             });
+            let statusMessage: string;
+            let statusKind: "success" | "error" | "warning";
             if (result.state === "completed") {
-              inboxStatus.textContent = "Calendar event created.";
-              inboxStatus.dataset.kind = "success";
+              statusMessage = "Calendar event created.";
+              statusKind = "success";
             } else if (result.state === "declined") {
-              inboxStatus.textContent = "Calendar proposal declined.";
-              inboxStatus.dataset.kind = "success";
+              statusMessage = "Calendar proposal declined.";
+              statusKind = "success";
             } else if (result.state === "failed") {
-              inboxStatus.textContent = "Microsoft rejected the calendar event creation.";
-              inboxStatus.dataset.kind = "error";
+              statusMessage = "Microsoft rejected the calendar event creation.";
+              statusKind = "error";
             } else {
-              inboxStatus.textContent =
-                "Calendar decision saved; Email Watcher will reconcile the result.";
-              inboxStatus.dataset.kind = "warning";
+              statusMessage = "Calendar decision saved; Email Watcher will reconcile the result.";
+              statusKind = "warning";
             }
             await loadInbox();
+            inboxStatus.textContent = statusMessage;
+            inboxStatus.dataset.kind = statusKind;
           } catch (error) {
-            inboxStatus.textContent = errorMessage(error);
-            inboxStatus.dataset.kind = "error";
+            const statusMessage = errorMessage(error);
             await loadInbox();
+            inboxStatus.textContent = statusMessage;
+            inboxStatus.dataset.kind = "error";
           } finally {
             confirm.disabled = false;
             decline.disabled = false;
