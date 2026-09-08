@@ -312,7 +312,7 @@ def _canonical_evidence_with_offsets(value: str) -> tuple[str, tuple[int, ...]]:
 
 
 def _canonical_evidence_text(value: str) -> str:
-    return _canonical_evidence_with_offsets(value)[0]
+    return " ".join(value.split())
 
 
 def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) -> bool:
@@ -554,12 +554,16 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
 
 
 def _contains_clock_range(value: str) -> bool:
-    value_without_iso_dates = re.sub(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", "", value)
+    value_without_dashed_dates = re.sub(
+        r"(?<![\d-])(?:\d{4}-\d{2}-\d{2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)",
+        "",
+        value,
+    )
     clock = r"(?<!\d)\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)?(?!\d)"
     return (
         re.search(
             rf"{clock}\s*(?:-|–|—|to|until|through)\s*{clock}",
-            value_without_iso_dates,
+            value_without_dashed_dates,
             re.IGNORECASE,
         )
         is not None
@@ -581,17 +585,17 @@ def _range_source_options(
         r"(?:\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)\b|"
         r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?!\d|\s*(?:am|pm)\b))"
     )
-    option_start = (
+    non_clock_option_start = (
         rf"(?:day\s+after\s+tomorrow\b|today\b|tomorrow\b|"
         rf"\d{{4}}-\d{{2}}-\d{{2}}\b|(?:{month_pattern})\s+\d{{1,2}}\b|"
         rf"(?:option|choice|alternative|slot)\s+\d{{1,2}}\s*:|"
         rf"\d{{1,2}}[/-]\d{{1,2}}\b|"
-        rf"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
-        rf"{clock_start})"
+        rf"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)"
     )
+    option_start = rf"(?:{non_clock_option_start}|{clock_start})"
     option_delimiters = list(
         re.finditer(
-            rf"(?:\bor\b|;|,\s*(?={option_start}))",
+            rf"(?:\bor\b|;|,\s*(?={non_clock_option_start}))",
             evidence_text,
             re.IGNORECASE,
         )
@@ -611,6 +615,13 @@ def _range_source_options(
             r"^(?:[-*\u2022]\s+|[A-Za-z0-9]{1,2}[.)]\s+)",
             "",
             right,
+        )
+        option_candidate = re.sub(
+            r"^(?:(?:how|what)\s+about|alternatively|otherwise|instead|"
+            r"another\s+(?:option|choice)(?:\s+is)?)\s*[:,]?\s+",
+            "",
+            option_candidate,
+            flags=re.IGNORECASE,
         )
         date_continuation = re.search(r"\b(?:on|for)\s*$", left, re.IGNORECASE) is not None
         if (

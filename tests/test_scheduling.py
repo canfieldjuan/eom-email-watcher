@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import eom_email_watcher.scheduling as scheduling_module
 from eom_email_watcher.scheduling import (
     MAX_SCHEDULING_ATTENDEES,
     SCHEDULING_SYSTEM_PROMPT,
@@ -83,6 +84,20 @@ def test_valid_new_meeting_is_accepted_with_normalized_evidence() -> None:
     assert result.extraction.intent == "new_meeting"
     assert len(result.result_json) < 32 * 1024
     assert result.result_sha256 == hashlib.sha256(result.result_json).hexdigest()
+
+
+def test_plain_evidence_canonicalization_does_not_build_offset_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        scheduling_module,
+        "_canonical_evidence_with_offsets",
+        lambda _value: pytest.fail("plain canonicalization allocated an offset map"),
+    )
+
+    assert scheduling_module._canonical_evidence_text("hard\n wrapped\ttext") == (
+        "hard wrapped text"
+    )
 
 
 def test_mime_hard_wrapped_evidence_is_accepted_without_weakening_source_checks() -> None:
@@ -210,8 +225,9 @@ def test_24_hour_time_first_line_starts_a_new_option() -> None:
     assert "time_range_unsupported" in codes(result)
 
 
-def test_iso_date_line_remains_bound_to_following_clock_range() -> None:
-    body = "2026-09-08\n10:00 AM to 11:00 AM"
+@pytest.mark.parametrize("date_text", ["2026-09-08", "09-08-2026", "9-8-26"])
+def test_dashed_date_line_remains_bound_to_following_clock_range(date_text: str) -> None:
+    body = f"{date_text}\n10:00 AM to 11:00 AM"
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
         {
@@ -219,7 +235,7 @@ def test_iso_date_line_remains_bound_to_following_clock_range() -> None:
             "evidence": [
                 {
                     "source": "body",
-                    "quote": "2026-09-08 10:00 AM to 11:00 AM",
+                    "quote": f"{date_text} 10:00 AM to 11:00 AM",
                 }
             ],
         }
@@ -228,6 +244,41 @@ def test_iso_date_line_remains_bound_to_following_clock_range() -> None:
     result = validate(value, scheduling_source=source(body=body))
 
     assert "time_range_unsupported" not in codes(result)
+
+
+def test_date_clock_comma_remains_inside_one_option() -> None:
+    quote = "September 8, 10:00 to 10:30"
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": quote}
+    ]
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+@pytest.mark.parametrize(
+    "lead_in",
+    ["How about", "What about", "Alternatively,", "Another option is"],
+)
+def test_alternative_lead_in_starts_a_new_option(lead_in: str) -> None:
+    quote = (
+        "September 8 from 10:00 to 11:00\n"
+        f"{lead_in} September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" in codes(result)
 
 
 def test_numbered_option_labels_remain_range_delimiters() -> None:
