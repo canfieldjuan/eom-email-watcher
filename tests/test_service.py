@@ -372,6 +372,14 @@ SCHEDULING_FIXTURE_RECEIVED_AT = "2026-09-07T12:00:00+00:00"
 SCHEDULING_FIXTURE_NOW = datetime(2026, 9, 7, 13, tzinfo=UTC)
 
 
+class SchedulingFixtureDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return SCHEDULING_FIXTURE_NOW.replace(tzinfo=None)
+        return SCHEDULING_FIXTURE_NOW.astimezone(tz)
+
+
 def admit_scheduling_run(
     store: Store,
     monkeypatch: pytest.MonkeyPatch,
@@ -382,6 +390,7 @@ def admit_scheduling_run(
     principal_key: str = "a" * 64,
 ):
     monkeypatch.setattr(service_module, "_utc_now", lambda: SCHEDULING_FIXTURE_NOW)
+    monkeypatch.setattr(service_module, "datetime", SchedulingFixtureDatetime)
     account_id = f"microsoft365-{'d' * 32}"
     if store.mail_account(MICROSOFT365_PROVIDER, account_id) is None:
         store.register_mail_account(
