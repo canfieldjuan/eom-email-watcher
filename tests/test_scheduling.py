@@ -218,6 +218,26 @@ def test_time_first_date_hard_wrap_remains_one_option(
     assert "time_range_unsupported" not in codes(result)
 
 
+def test_time_first_wrap_before_lowercase_preposition_remains_one_option() -> None:
+    body = "Meet from 10:00 to 11:00\non September 8, 2026."
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "Meet from 10:00 to 11:00 on September 8, 2026",
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
 def test_24_hour_time_first_line_starts_a_new_option() -> None:
     quote = "September 8 from 10:00 to 11:00\n14:00 to 15:00 September 9"
     value = valid_result()
@@ -339,6 +359,21 @@ def test_wrapped_timezone_remains_bound_to_its_range() -> None:
     ]
 
     result = validate(value, scheduling_source=source(body=quote))
+
+    assert "timezone_unsupported" in codes(result)
+
+
+def test_wrapped_timezone_omitted_from_quote_is_restored_from_source() -> None:
+    body = "Tuesday, September\n8 from 10:00 to 10:30\nEastern Time."
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "Tuesday, September 8 from 10:00 to 10:30",
+        }
+    ]
+
+    result = validate(value, scheduling_source=source(body=body))
 
     assert "timezone_unsupported" in codes(result)
 

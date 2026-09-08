@@ -342,14 +342,14 @@ def _evidence_source_contexts(
             raw_quote_end = offsets[quote_end - 1] + 1
             left = max(
                 raw_candidate.rfind(delimiter, 0, raw_quote_at)
-                for delimiter in ".!?\r\n"
+                for delimiter in ".!?"
             ) + 1
             if quote[-1] in ".!?":
                 right = raw_quote_end
             else:
                 right_candidates = tuple(
                     position
-                    for delimiter in ".!?\r\n"
+                    for delimiter in ".!?"
                     if (position := raw_candidate.find(delimiter, raw_quote_end)) >= 0
                 )
                 right = min(right_candidates, default=len(raw_candidate))
@@ -617,7 +617,12 @@ def _range_source_options(
             right,
         )
         option_candidate = re.sub(
-            r"^(?:(?:how|what)\s+about|on|for|alternatively|otherwise|instead|"
+            r"^(?:On|For)\s*[:,]?\s+",
+            "",
+            option_candidate,
+        )
+        option_candidate = re.sub(
+            r"^(?:(?:how|what)\s+about|alternatively|otherwise|instead|"
             r"another\s+(?:option|choice)(?:\s+is)?)\s*[:,]?\s+",
             "",
             option_candidate,
