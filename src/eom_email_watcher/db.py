@@ -2202,7 +2202,7 @@ class Store:
         account_id: str,
         legacy_principal_keys: Iterable[str],
         current_principal_key: str,
-    ) -> None:
+    ) -> int:
         if not account_id:
             raise ValueError("calendar account ID is required")
         keys = set(legacy_principal_keys)
@@ -2219,6 +2219,17 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             _rewrite_microsoft_principal_keys(db, migrations)
+            row = db.execute(
+                """SELECT COUNT(*) FROM automation_runs
+                WHERE provider = 'microsoft365' AND account_id = ?
+                    AND calendar_principal_key <> ?
+                    AND state IN (
+                        'detected', 'extracting', 'proposing', 'awaiting_confirmation',
+                        'write_authorized', 'writing', 'unresolved', 'reconciling'
+                    )""",
+                (account_id, current_principal_key),
+            ).fetchone()
+        return int(row[0])
 
     def set_calendar_grant(
         self,

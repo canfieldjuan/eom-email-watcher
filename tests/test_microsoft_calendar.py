@@ -265,6 +265,8 @@ def test_calendar_principal_key_survives_missing_silent_claims_for_organizations
     assert interactive.tenant_id == TENANT_ID
     assert silent.principal.tenant_id == "organizations"
     assert silent.principal.key == interactive.key
+    assert silent.principal.migration_keys == ()
+    assert len(interactive.migration_keys) == 1
 
 
 def test_calendar_principal_key_normalizes_object_case_and_preserves_v1_spelling() -> None:

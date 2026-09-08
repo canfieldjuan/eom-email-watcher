@@ -237,14 +237,7 @@ class MicrosoftPrincipal:
 
     @property
     def migration_keys(self) -> tuple[str, ...]:
-        return (
-            self.legacy_principal_key
-            or _microsoft_principal_key_v1(
-                self.home_account_id,
-                self.tenant_id,
-                self.object_id,
-            ),
-        )
+        return (self.legacy_principal_key,) if self.legacy_principal_key is not None else ()
 
 
 def _identity_part(value: object, name: str) -> str:
@@ -302,10 +295,14 @@ def _principal(result: dict[str, Any], account: object) -> MicrosoftPrincipal:
         tenant_id=tenant_id,
         object_id=object_id,
         email_address=_profile_address(result, account),
-        legacy_principal_key=_microsoft_principal_key_v1(
-            home_account_id,
-            tenant_id,
-            legacy_object_id,
+        legacy_principal_key=(
+            _microsoft_principal_key_v1(
+                home_account_id,
+                tenant_id,
+                legacy_object_id,
+            )
+            if claimed_tenant is not None and claimed_object_id is not None
+            else None
         ),
     )
 

@@ -165,7 +165,11 @@ references across grants, delta state, automation runs/events, and write
 reservations before runtime authorization can compare them. Tenant-local object
 identifiers are case-normalized for the v2 key. A later verified reconnect also
 rekeys legacy run references when every grant was previously disconnected and
-therefore retained no identity metadata for startup migration.
+therefore retained no identity metadata for startup migration. If that interactive
+authorization omits the concrete tenant/object claims required to reproduce the
+v1 key while authorization-dependent legacy work remains, setup fails closed with
+`calendar_principal_recovery_required`; it neither installs the grant/token nor
+guesses from the `organizations` alias. The user may retry interactive setup.
 An immutable-principal mismatch is rejected before a cache replaces the previous
 cache or changes the profile's current consent state. The run binds that same
 principal before confirmation.

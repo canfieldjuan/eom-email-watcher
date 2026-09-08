@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -1343,7 +1344,9 @@ def test_calendar_connect_rebinds_revoked_but_not_ready_grant_to_new_principal(
         assert calendar_token.read_text(encoding="utf-8") == "original-calendar-cache"
 
 
-def test_calendar_connect_migrates_grantless_legacy_automation_run(
+@pytest.mark.parametrize("legacy_identity_available", [True, False])
+def test_calendar_connect_handles_grantless_legacy_automation_run(
+    legacy_identity_available: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1357,8 +1360,19 @@ def test_calendar_connect_migrates_grantless_legacy_automation_run(
         address="owner@example.com",
         active=True,
     )
-    selected_principal = microsoft_principal()
-    legacy_key = selected_principal.migration_keys[0]
+    identity = microsoft_principal()
+    legacy_key = hashlib.sha256(
+        "\0".join(
+            (identity.home_account_id, identity.tenant_id, identity.object_id)
+        ).encode()
+    ).hexdigest()
+    selected_principal = MicrosoftPrincipal(
+        home_account_id=identity.home_account_id,
+        tenant_id=identity.tenant_id,
+        object_id=identity.object_id,
+        email_address=identity.email_address,
+        legacy_principal_key=legacy_key if legacy_identity_available else None,
+    )
     runtime.store.set_calendar_grant(
         account.account_id,
         "read",
@@ -1433,13 +1447,23 @@ def test_calendar_connect_migrates_grantless_legacy_automation_run(
         )
     )
 
-    assert response["ok"] is True
     migrated = runtime.store.automation_run(run.run_id)
     assert migrated is not None
-    assert migrated.calendar_principal_key == selected_principal.key
-    assert {
+    event_keys = {
         event.calendar_principal_key for event in runtime.store.automation_events(run.run_id)
-    } == {selected_principal.key}
+    }
+    if legacy_identity_available:
+        assert response["ok"] is True
+        assert migrated.calendar_principal_key == selected_principal.key
+        assert event_keys == {selected_principal.key}
+    else:
+        assert response["error"]["code"] == "calendar_principal_recovery_required"
+        assert migrated.calendar_principal_key == legacy_key
+        assert event_keys == {legacy_key}
+        restored = runtime.store.calendar_grant(account.account_id, "read")
+        assert restored is not None
+        assert (restored.state, restored.principal_key) == ("not_requested", None)
+        assert not microsoft_calendar_read_token_file(runtime.config, account).exists()
 
 
 @pytest.mark.parametrize("existing_ready", [False, True])
