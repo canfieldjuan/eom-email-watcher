@@ -182,6 +182,21 @@ def test_numbered_option_labels_remain_range_delimiters() -> None:
     )
 
 
+def test_wrapped_timezone_remains_bound_to_its_range() -> None:
+    quote = "September 8 from 10:00 to 10:30\nEastern Time"
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "September 8 from 10:00 to 10:30 Eastern Time",
+        }
+    ]
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "timezone_unsupported" in codes(result)
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [

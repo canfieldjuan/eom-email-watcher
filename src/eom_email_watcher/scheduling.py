@@ -553,6 +553,18 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
     return bool(_time_source_matches(value, evidence_text, zone=zone))
 
 
+def _contains_clock_range(value: str) -> bool:
+    clock = r"(?<!\d)\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)?(?!\d)"
+    return (
+        re.search(
+            rf"{clock}\s*(?:-|–|—|to|until|through)\s*{clock}",
+            value,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
 def _range_source_options(
     start: datetime,
     end: datetime,
@@ -564,21 +576,26 @@ def _range_source_options(
     month_pattern = "|".join(
         sorted({name for month in _MONTHS for name in (month, month[:3])}, key=len, reverse=True)
     )
+    clock_start = r"\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)\b"
+    option_start = (
+        rf"(?:day\s+after\s+tomorrow\b|today\b|tomorrow\b|"
+        rf"\d{{4}}-\d{{2}}-\d{{2}}\b|(?:{month_pattern})\s+\d{{1,2}}\b|"
+        rf"(?:option|choice|alternative|slot)\s+\d{{1,2}}\s*:|"
+        rf"\d{{1,2}}[/-]\d{{1,2}}\b|"
+        rf"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+        rf"{clock_start})"
+    )
     option_delimiters = list(
         re.finditer(
-            rf"(?:\bor\b|;|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|(?:option|choice|alternative|slot)\s+\d{{1,2}}\s*:\s*(?=[A-Za-z0-9])|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            rf"(?:\bor\b|;|,\s*(?={option_start}))",
             evidence_text,
             re.IGNORECASE,
         )
     )
     for newline in re.finditer(r"\n", evidence_text):
-        left = evidence_text[: newline.start()].rstrip().casefold()
+        left = evidence_text[: newline.start()].rsplit("\n", 1)[-1]
         right = evidence_text[newline.end() :].lstrip()
-        continues_month_day = (
-            re.search(rf"\b(?:{month_pattern})\s*$", left) is not None
-            and re.match(r"\d{1,2}\b", right) is not None
-        )
-        if not continues_month_day:
+        if _contains_clock_range(left) and re.match(option_start, right, re.IGNORECASE):
             option_delimiters.append(newline)
     option_delimiters.sort(key=lambda match: match.start())
     supported_options: list[str] = []
