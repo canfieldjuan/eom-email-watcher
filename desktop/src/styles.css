@@ -651,6 +651,17 @@ select:focus {
   font-weight: 700;
 }
 
+.calendar-proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.calendar-proposal-actions button {
+  width: auto;
+}
+
 .attachment-list {
   display: grid;
   gap: 7px;

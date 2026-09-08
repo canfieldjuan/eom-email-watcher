@@ -4,11 +4,11 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CalendarConsentProfile, CalendarConsentStatus, CheckResult, ConfigInitialization,
-    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
-    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
-    GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
-    MailServerConnection, WatchedSender,
+    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
+    ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
+    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
+    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
+    MailAccounts, MailServerConnection, WatchedSender,
 };
 use scheduler::{PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -541,6 +541,32 @@ async fn calendar_consent_disconnect(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn calendar_proposal_decide(
+    engine: State<'_, Engine>,
+    message_id: String,
+    run_id: String,
+    state_version: i64,
+    proposal_version: i64,
+    proposal_sha256: String,
+    decision: String,
+) -> Result<CalendarDecisionResult, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.decide_calendar_proposal(
+            message_id,
+            run_id,
+            state_version,
+            proposal_version,
+            proposal_sha256,
+            decision,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization, EngineError> {
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
@@ -802,6 +828,7 @@ pub fn run() {
             calendar_consent_connect,
             calendar_consent_disconnect,
             calendar_consent_status,
+            calendar_proposal_decide,
             capability_output_export,
             capability_output_present,
             connect_entitlement_install,

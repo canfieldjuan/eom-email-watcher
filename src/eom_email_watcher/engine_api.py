@@ -109,7 +109,7 @@ from .runtime import (
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
 )
-from .service import run_watcher_check
+from .service import decide_scheduling_proposal, run_watcher_check
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
@@ -1616,6 +1616,100 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
     return {"items": rows, "next_cursor": _encode_inbox_cursor(next_cursor)}
 
 
+def _calendar_automation_decide(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {
+            "decision",
+            "message_id",
+            "proposal_sha256",
+            "proposal_version",
+            "run_id",
+            "state_version",
+        },
+    )
+    text_fields: dict[str, str] = {}
+    for name, maximum in (
+        ("message_id", 512),
+        ("run_id", 36),
+        ("proposal_sha256", 64),
+        ("decision", 7),
+    ):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value or len(value) > maximum:
+            raise ApiError("invalid_request", f"{name} is invalid")
+        text_fields[name] = value
+    if text_fields["decision"] not in {"confirm", "decline"}:
+        raise ApiError("invalid_request", "decision must be confirm or decline")
+    try:
+        if str(uuid.UUID(text_fields["run_id"])) != text_fields["run_id"]:
+            raise ValueError
+        if (
+            len(bytes.fromhex(text_fields["proposal_sha256"])) != 32
+            or text_fields["proposal_sha256"] != text_fields["proposal_sha256"].casefold()
+        ):
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ApiError("invalid_request", "proposal identity is invalid") from exc
+    state_version = payload.get("state_version")
+    proposal_version = payload.get("proposal_version")
+    if (
+        not isinstance(state_version, int)
+        or isinstance(state_version, bool)
+        or state_version < 1
+        or state_version > 2**63 - 1
+        or not isinstance(proposal_version, int)
+        or isinstance(proposal_version, bool)
+        or proposal_version < 1
+        or proposal_version > 2**63 - 1
+    ):
+        raise ApiError("invalid_request", "proposal version is invalid")
+    runtime = _runtime(request)
+    lock_path = _production_check_lock_path(runtime.config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Calendar decisions require native operation locking",
+        )
+    with operation_lock(lock_path, "Another watcher operation is already running"):
+        runtime = _runtime(request)
+        bound = runtime.store.automation_run_for_message(text_fields["message_id"])
+        if bound is None or bound.run_id != text_fields["run_id"]:
+            raise ApiError("not_found", "Calendar proposal was not found")
+        try:
+            outcome = decide_scheduling_proposal(
+                runtime.config,
+                runtime.store,
+                run_id=text_fields["run_id"],
+                expected_state_version=state_version,
+                proposal_version=proposal_version,
+                proposal_sha256=text_fields["proposal_sha256"],
+                decision=text_fields["decision"],
+            )
+        except KeyError as exc:
+            raise ApiError("not_found", "Calendar proposal was not found") from exc
+        except PermissionError as exc:
+            raise ApiError("calendar_write_unavailable", str(exc)) from exc
+        except ValueError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        except RuntimeError as exc:
+            raise ApiError("stale_proposal", str(exc)) from exc
+        if outcome.run.state == "proposing":
+            raise ApiError(
+                "proposal_expired",
+                "The calendar proposal expired and is being refreshed",
+            )
+        return {
+            "run_id": outcome.run.run_id,
+            "state": outcome.run.state,
+            "state_version": outcome.run.state_version,
+            "failure_code": outcome.run.failure_code,
+            "graph_event_id": (
+                outcome.write.graph_event_id if outcome.write is not None else None
+            ),
+        }
+
+
 def _inbox_delete(request: dict[str, object]) -> dict[str, object]:
     payload = _payload(request, {"message_id"})
     message_id = payload.get("message_id")
@@ -2923,6 +3017,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.connect": _calendar_write_connect,
     "calendar.write.disconnect": _calendar_write_disconnect,
     "calendar.write.status": _calendar_write_status,
+    "calendar.automation.decide": _calendar_automation_decide,
     "config.initialize": _config_initialize,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,
