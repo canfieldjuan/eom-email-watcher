@@ -399,7 +399,9 @@ def admit_scheduling_run(
         sender="trusted@example.com",
         sender_name="Trusted",
         subject="Meeting request",
-        received_at=received_at or datetime.now(UTC).isoformat(),
+        # Keep the fixture's context before its fixed September 8 proposal.
+        # Using wall-clock time makes every scheduling test expire eventually.
+        received_at=received_at or "2026-09-07T12:00:00+00:00",
     )
     store.mark_analyzed(
         message_id,
