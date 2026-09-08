@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from eom_email_watcher import db as db_module
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import Store
@@ -391,6 +392,7 @@ def admit_scheduling_run(
 ):
     monkeypatch.setattr(service_module, "_utc_now", lambda: SCHEDULING_FIXTURE_NOW)
     monkeypatch.setattr(service_module, "datetime", SchedulingFixtureDatetime)
+    monkeypatch.setattr(db_module, "datetime", SchedulingFixtureDatetime)
     account_id = f"microsoft365-{'d' * 32}"
     if store.mail_account(MICROSOFT365_PROVIDER, account_id) is None:
         store.register_mail_account(
