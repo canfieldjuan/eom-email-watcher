@@ -151,7 +151,7 @@ def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
     assert "time_range_unsupported" in codes(result)
 
 
-@pytest.mark.parametrize("marker", ["-", "*", "•", "2."])
+@pytest.mark.parametrize("marker", ["-", "*", "•", "2.", "b.", "C)"])
 def test_list_markers_preserve_newline_option_boundaries(marker: str) -> None:
     quote = (
         f"- September 8 from 10:00 to 11:00\n"
@@ -171,8 +171,9 @@ def test_list_markers_preserve_newline_option_boundaries(marker: str) -> None:
     assert "time_range_unsupported" in codes(result)
 
 
-def test_time_first_date_hard_wrap_remains_one_option() -> None:
-    body = "Meet from 10:00 to 11:00 on\nSeptember 8, 2026."
+@pytest.mark.parametrize("preposition", ["on", "for"])
+def test_time_first_date_hard_wrap_remains_one_option(preposition: str) -> None:
+    body = f"Meet from 10:00 to 11:00 {preposition}\nSeptember 8, 2026."
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
         {
@@ -180,7 +181,45 @@ def test_time_first_date_hard_wrap_remains_one_option() -> None:
             "evidence": [
                 {
                     "source": "body",
-                    "quote": "Meet from 10:00 to 11:00 on September 8, 2026",
+                    "quote": (
+                        f"Meet from 10:00 to 11:00 {preposition} September 8, 2026"
+                    ),
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+def test_24_hour_time_first_line_starts_a_new_option() -> None:
+    quote = "September 8 from 10:00 to 11:00\n14:00 to 15:00 September 9"
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" in codes(result)
+
+
+def test_iso_date_line_remains_bound_to_following_clock_range() -> None:
+    body = "2026-09-08\n10:00 AM to 11:00 AM"
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "2026-09-08 10:00 AM to 11:00 AM",
                 }
             ],
         }

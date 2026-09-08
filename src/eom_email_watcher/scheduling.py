@@ -554,11 +554,12 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
 
 
 def _contains_clock_range(value: str) -> bool:
+    value_without_iso_dates = re.sub(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", "", value)
     clock = r"(?<!\d)\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)?(?!\d)"
     return (
         re.search(
             rf"{clock}\s*(?:-|–|—|to|until|through)\s*{clock}",
-            value,
+            value_without_iso_dates,
             re.IGNORECASE,
         )
         is not None
@@ -576,7 +577,10 @@ def _range_source_options(
     month_pattern = "|".join(
         sorted({name for month in _MONTHS for name in (month, month[:3])}, key=len, reverse=True)
     )
-    clock_start = r"\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)\b"
+    clock_start = (
+        r"(?:\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)\b|"
+        r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?!\d|\s*(?:am|pm)\b))"
+    )
     option_start = (
         rf"(?:day\s+after\s+tomorrow\b|today\b|tomorrow\b|"
         rf"\d{{4}}-\d{{2}}-\d{{2}}\b|(?:{month_pattern})\s+\d{{1,2}}\b|"
@@ -604,11 +608,11 @@ def _range_source_options(
         left = evidence_text[option_start_at : newline.start()]
         right = evidence_text[newline.end() :].lstrip()
         option_candidate = re.sub(
-            r"^(?:[-*\u2022]\s+|\d{1,2}[.)]\s+)",
+            r"^(?:[-*\u2022]\s+|[A-Za-z0-9]{1,2}[.)]\s+)",
             "",
             right,
         )
-        date_continuation = re.search(r"\bon\s*$", left, re.IGNORECASE) is not None
+        date_continuation = re.search(r"\b(?:on|for)\s*$", left, re.IGNORECASE) is not None
         if (
             _contains_clock_range(left)
             and not date_continuation
