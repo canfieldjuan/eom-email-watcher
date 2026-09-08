@@ -850,3 +850,320 @@ The Microsoft boundary above was checked against these primary v1.0 references:
 - [create event](https://learn.microsoft.com/en-us/graph/api/user-post-events?view=graph-rest-1.0)
 - [Outlook event as an online meeting](https://learn.microsoft.com/en-us/graph/outlook-calendar-online-meetings)
 - [`dateTimeTimeZone`](https://learn.microsoft.com/en-us/graph/api/resources/datetimetimezone?view=graph-rest-1.0)
+
+---
+
+# Durable Local Connect provider-admission queue contract
+
+**Status:** prospective issue #117 contract. No queue implementation is present
+until a later commit lands the implementation slices below.
+
+## Verified baseline
+
+This contract was derived from current merged Email Watcher code and from the
+current canonical/provider contracts, not from the issue description alone.
+
+- Local Connect deliberately supplies no broker, provider-side queue, scheduler,
+  or automatic retry service. A provider may accept one job and answer another
+  submission with `PROVIDER_BUSY` and `retryable: true`
+  (`connect-contracts/adr/0001-connect-v0.md`, lines 82-98).
+- Connect v2 makes the caller-created `job_id` the idempotency identity and makes
+  `instance_id` the provider's durable job-state namespace across process
+  restarts (`connect-contracts/adr/0002-connect-v2-generic-capabilities.md`,
+  lines 79-96).
+- Invoice Processor correctly refuses a second concurrent job rather than
+  queueing it (`docs/contracts/SLICE-5.md`, S5-JOB-2 and D8). Its
+  `PROVIDER_BUSY` response is an authoritative pre-admission refusal.
+- Email Watcher persists the request, input identity, selected provider,
+  capability, status, output, and error in `connect_attachment_jobs`, but its
+  durable status set has no distinction between waiting, dispatching, and
+  reconciling (`src/eom_email_watcher/db.py`,
+  `_CONNECT_JOBS_TABLE_SQL`).
+- `connect.attachment.invoke` calls the provider synchronously. A retryable
+  `ConnectError` is re-raised while the job remains active; no component later
+  selects and resubmits that job (`src/eom_email_watcher/engine_api.py`,
+  `_run_generic_connect_job`).
+- The desktop suppresses only another click for the exact in-memory invocation
+  key. Another attachment or capability can therefore submit concurrently to
+  the same provider instance (`desktop/src/main.ts`, attachment invocation
+  handler).
+
+The claim in issue #117 is therefore confirmed. The provider is honoring the
+shared contract; the missing behavior is consumer-owned durable admission and
+retry policy.
+
+## Root cause and correct-fix boundary
+
+The root cause is not the provider's one-job capacity and not one missing UI
+error mapping. Email Watcher has a durable job ledger but no durable dispatch
+state, no provider-instance serialization boundary, and no host-owned queue
+pump. A correct fix must add all three while preserving the stable job identity
+and existing provider reconciliation rules.
+
+This change must not add a provider-side queue, alter Local Connect schemas,
+select a different provider silently, store attachment bytes, or turn Connect
+into a workflow engine.
+
+## Queue ownership and identity
+
+This contract applies to Connect v2 jobs. The legacy v1 compatibility path is
+unchanged.
+
+One queue lane is identified by:
+
+```text
+(protocol_version=2, provider_app_id, provider_instance_id)
+```
+
+All capabilities exposed by that instance share the lane because capacity is a
+provider-process/resource property, not a capability-label property. Two
+different durable provider instances may run concurrently. Two capabilities on
+one instance may not.
+
+The selected application version, capability identifier/version, parameters,
+artifact identity, and request JSON remain bound to the existing job. A queued
+job never migrates to a new provider instance or newly discovered application
+version. If that exact durable instance cannot return, the user may make a new
+explicit invocation against another provider; Email Watcher must not rewrite
+the old provenance.
+
+## Durable dispatch state
+
+Provider transport status remains:
+
+```text
+requested -> accepted -> processing -> completed | failed
+```
+
+Email Watcher adds a separate durable dispatch state for every active v2 job:
+
+```text
+waiting       eligible for a future admission attempt
+dispatching   owns the provider lane and is making/reconciling one attempt
+reconciling   submission outcome is ambiguous; GET must precede any POST
+provider_owned provider returned accepted or processing
+terminal      completed or failed
+```
+
+The dispatch record stores only bounded metadata:
+
+- `job_id`;
+- dispatch state and monotonically increasing attempt count;
+- `next_attempt_at` and queue-admission deadline;
+- the last bounded retryable code/message;
+- timestamps.
+
+It stores no attachment bytes, message body, mailbox credential, Connect bearer
+token, or provider-private path. Queue position is computed from durable order;
+it is not mutable stored truth.
+
+Migration is fail-closed. Existing `requested` v2 jobs become `reconciling`,
+never `waiting`, because current data cannot prove whether a POST reached the
+provider. Existing `accepted`/`processing` jobs become `provider_owned`; terminal
+jobs become `terminal`. V1 rows receive no queue behavior.
+
+If a new process acquires a lane whose durable head is still `dispatching`, the
+prior process can no longer own the native lock. Recovery changes that head to
+`reconciling` before network access; it never assumes the interrupted attempt
+stopped before POST.
+
+## Ordering, bounds, and cross-process exclusion
+
+- A provider lane admits at most **25 nonterminal v2 jobs**, including the job
+  holding the lane. The twenty-sixth distinct invocation is rejected before a
+  job row is created with a bounded `connect_queue_full` error. Repeating an
+  already admitted `job_id` is not a new queue entry.
+- Waiting jobs are ordered by `created_at`, then `job_id`. An existing
+  `reconciling` or `provider_owned` job always resumes before a new waiting job.
+- Each waiting job has a **two-hour queue-admission deadline** fixed when its
+  durable row is created. Retrying or restarting does not extend it.
+- `PROVIDER_BUSY` uses deterministic exponential backoff of **2, 4, 8, 16, then
+  30 seconds maximum**. The fixed deadline, not attempt count, is the terminal
+  bound.
+- A native per-lane process lock, derived from a SHA-256 digest of the lane
+  identity and stored beside the private database, is held across selection,
+  reconciliation, submission, polling, and durable outcome recording. After
+  acquiring it, a process must re-read the queue and operate only on the
+  authoritative head. Process exit releases the lock; no stale lock-file
+  deletion is used as ownership evidence.
+- If the platform can provide only a soft/advisory fallback rather than the
+  existing supported native lock, automatic dispatch fails closed and leaves
+  jobs waiting.
+
+The lock and the transactional head selection together are the execution model:
+for every admitted interleaving, at most one Email Watcher process can issue or
+reconcile work for one provider lane, and a later job cannot overtake an earlier
+eligible job after acquiring the lock.
+
+## Refusal, ambiguity, and retry rules
+
+### Authoritative pre-admission refusal
+
+`PROVIDER_BUSY` with `retryable: true` proves the provider did not accept the
+job. Email Watcher records the exact bounded code/message, returns the job to
+`waiting`, schedules the next attempt with the same `job_id`, and keeps the UI
+in a waiting state.
+
+If the two-hour deadline passes while every attempted submission has been
+authoritatively refused before admission, the job becomes `failed` with
+`connect_queue_deadline_exceeded` and retains the provider's last bounded
+refusal message for display.
+
+### Ambiguous outcome
+
+A timeout, connection loss, malformed response, or other failure after a POST
+may have reached the provider. It is not proof of refusal. The job becomes
+`reconciling`, keeps the same identity, and continues to hold the provider lane.
+Every later attempt must:
+
+1. rediscover and authenticate the same durable provider instance;
+2. issue `GET /v2/jobs/{job_id}` first;
+3. persist any authoritative provider state; and
+4. submit again only after `JOB_NOT_FOUND` proves that instance did not retain
+   the job, using the same request and `job_id`.
+
+An ambiguous job is never terminally failed merely because its queue-admission
+deadline elapsed. It remains visibly `reconciling` until the provider returns
+authoritative state. This preserves the existing no-duplicate-work contract and
+prevents later jobs from bypassing work that may already own provider capacity.
+
+### Provider absence and other errors
+
+- If the exact provider instance is absent before any POST attempt, the job
+  remains `waiting` and is rediscovered after a fixed 30-second backoff within
+  the same admission deadline.
+- If that instance disappears after a possible or confirmed submission, the job
+  is `reconciling`, not newly dispatched elsewhere.
+- A nonretryable provider response or proven contract/provenance violation is
+  persisted as the existing terminal `failed` state immediately.
+- A retryable error not explicitly proven to be pre-admission follows the
+  ambiguous-outcome path. The word `retryable` alone never authorizes a second
+  POST.
+- `accepted` and `processing` retain the provider lane and use the existing
+  status polling/restart reconciliation. Their processing time does not consume
+  or extend the queue-admission deadline.
+
+## Artifact and retention behavior
+
+Email Watcher does not persist attachment content for the queue. It re-fetches
+the selected attachment only after the job reaches the queue head and owns the
+provider lane, then verifies the stored byte size and SHA-256 identity before
+handoff.
+
+If the source message or attachment is unavailable before an authoritative
+provider acceptance, the job fails without a POST. Existing message retention
+continues to delete its associated Connect rows atomically. A queued job does
+not keep a message beyond the configured retention boundary.
+
+## Host and UI contract
+
+`connect.attachment.invoke` becomes enqueue-or-resume behavior. It persists or
+reuses the stable job first and may return a nonterminal queue result without
+waiting for another provider job to finish.
+
+The Tauri host owns queue pumping:
+
+- immediately after enqueue;
+- immediately after a lane job becomes terminal;
+- when a recorded backoff becomes due;
+- at desktop startup/restart; and
+- opportunistically after an ordinary watcher check.
+
+Only one pump may own a lane because the engine enforces the native lane lock;
+frontend timers are wakeups, not correctness locks. Closing Connect or stopping
+a provider never stops mailbox monitoring.
+
+Native Email Watcher UI renders durable state:
+
+```text
+Waiting for <provider>, <N> ahead
+Reconnecting to <provider>
+Running <action>
+<last provider refusal> (after the admission deadline)
+```
+
+Provider names and messages remain untrusted text rendered only with
+Email-Watcher-owned text components. Repeated clicks reuse the active durable
+job. The in-memory click set may improve responsiveness but is not an
+idempotency or concurrency boundary.
+
+## Acceptance evidence
+
+Implementation is not complete until current merged code demonstrates:
+
+1. two invocations against one provider instance produce one lane owner and one
+   durable waiting job, with the second job showing one ahead;
+2. a real or contract-faithful `PROVIDER_BUSY` refusal is resubmitted after the
+   bounded backoff with the original `job_id` and completes without another
+   click;
+3. consumer restart while the second job waits preserves order, deadline, last
+   refusal, and eventual completion;
+4. process death while dispatching releases the native lane lock, after which
+   recovery queries the same `job_id` before any resubmission;
+5. a lost POST acknowledgement cannot produce duplicate provider work;
+6. repeated authoritative busy refusals cross the two-hour deadline and fail
+   with `connect_queue_deadline_exceeded` plus the last provider message;
+7. nonretryable refusal remains an immediate terminal failure;
+8. the exact 25/26 lane-cap boundary is enforced, while replay of an admitted
+   identity does not consume another slot;
+9. two engine processes racing one lane cannot issue concurrent provider work,
+   while distinct provider instances may progress independently;
+10. source removal before acceptance produces no provider POST and retention
+    does not keep queued attachment content;
+11. the desktop displays waiting, reconciling, running, completed, and failed
+    states from durable engine data rather than inferred frontend state; and
+12. an end-to-end two-invoice proof against the real Invoice Processor shows one
+    active job, one automatically retried waiting job, two terminal results, and
+    no provider-side queue or operator retry.
+
+Boundary tests must cover zero/one/25/26 entries, equal timestamps, a request
+already present at the cap, just-before/at/after deadline, every backoff edge,
+provider disappearance before and after possible submission, lock contention,
+process death, and malformed or nonretryable provider errors.
+
+## Landing order
+
+1. **This commit:** contract only; no runtime behavior changes.
+2. SQLite migration, dispatch metadata, bounded queue admission, deterministic
+   ordering, and provider-lane lock/head claim.
+3. Engine enqueue/drain/reconciliation behavior and focused cross-process tests.
+4. Tauri wakeups and native durable queue presentation.
+5. Exact-current installed-app proof with the Invoice Processor, followed by
+   sanitized evidence in this contract.
+
+Each implementation slice must remain independently reviewable and preserve
+ordinary Gmail, Microsoft 365, IMAP, Inbox, notification, retention, calendar,
+and EOM monthly-reminder behavior.
+
+## Explicit non-scope
+
+- provider-side queueing or an Invoice Processor change;
+- Local Connect schema, registration, manifest, or error-taxonomy changes;
+- Connect v1 redesign;
+- automatic provider selection or migration to another provider instance;
+- storing raw email bodies or attachment bytes;
+- workflow/automation rules, batch policy, priorities between applications, or
+  a general scheduler;
+- cross-machine Connect, cloud transport, or inference-gateway work;
+- cancellation, manual ambiguous-job resolution, or retry-history UI; and
+- unrelated mailbox, model, calendar, release, or EOM business changes.
+
+## Rejected alternatives
+
+- **Queue inside Invoice Processor:** rejected because the provider contract
+  deliberately refuses excess work and assigns retry policy to the caller.
+- **Treat `PROVIDER_BUSY` as a red error:** rejected because it discards the
+  provider's explicit retryable pre-admission semantics and requires another
+  click.
+- **Serialize only in TypeScript:** rejected because another window, restart,
+  CLI process, or concurrent sidecar request bypasses frontend memory.
+- **Use one global Connect lock:** rejected because independent provider
+  instances have independent capacity and should not block one another.
+- **Delete stale lock files:** rejected because path existence is not lock
+  ownership; native process locks release on process death.
+- **Resubmit every retryable error:** rejected because transport failure can hide
+  a successful acceptance. Only authoritative not-found evidence permits a
+  second POST after ambiguity.
+- **Persist queued attachment bytes:** rejected because the mailbox remains the
+  content owner and current retention/privacy contracts intentionally avoid a
+  second raw-content store.
