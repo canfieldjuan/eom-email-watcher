@@ -11,6 +11,13 @@ test("calendar proposals render exact native confirmation controls", () => {
   assert.match(source, /subject\.textContent = `Event title: \$\{proposal\.subject\}`/);
   assert.match(source, /textContent = "No calendar event has been created\."/);
   assert.match(source, /proposal\.empty_reason \|\| "No meeting time satisfied the request\."/);
+  assert.match(source, /let inboxProposalExpiryTimer: number \| null = null/);
+  assert.match(source, /window\.clearTimeout\(inboxProposalExpiryTimer\)/);
+  assert.match(source, /const renderStartedAt = Date\.now\(\)/);
+  assert.match(source, /proposalExpiresAt > renderStartedAt/);
+  assert.match(source, /Math\.max\(nextProposalExpiry - Date\.now\(\) \+ 1, 0\)/);
+  assert.match(source, /inboxProposalExpiryTimer = window\.setTimeout/);
+  assert.match(source, /renderInbox\(inboxItems\)/);
   assert.match(
     source,
     /formatter\.format\(new Date\(proposal\.end\)\)\} \(\$\{proposal\.timezone\}\)/,

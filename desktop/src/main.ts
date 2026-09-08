@@ -732,6 +732,7 @@ let inboxRequestGeneration = 0;
 let inboxItems: InboxItem[] = [];
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
+let inboxProposalExpiryTimer: number | null = null;
 const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
@@ -1155,6 +1156,12 @@ function renderCapabilityResult(
 }
 
 function renderInbox(items: InboxItem[]): void {
+  if (inboxProposalExpiryTimer !== null) {
+    window.clearTimeout(inboxProposalExpiryTimer);
+    inboxProposalExpiryTimer = null;
+  }
+  const renderStartedAt = Date.now();
+  let nextProposalExpiry: number | null = null;
   capabilityOutputPreviews.clear();
   capabilityOutputViewButtons.clear();
   inboxList.replaceChildren();
@@ -1250,9 +1257,17 @@ function renderInbox(items: InboxItem[]): void {
       title.textContent = "Calendar proposal";
       const state = document.createElement("span");
       const hasSuggestion = proposal.status === "accepted";
+      const proposalExpiresAt = proposal.expires_at ? Date.parse(proposal.expires_at) : Number.NaN;
       const expired = Boolean(
-        hasSuggestion && proposal.expires_at && Date.parse(proposal.expires_at) <= Date.now(),
+        hasSuggestion && Number.isFinite(proposalExpiresAt) && proposalExpiresAt <= renderStartedAt,
       );
+      if (
+        proposal.state === "awaiting_confirmation" &&
+        hasSuggestion &&
+        proposalExpiresAt > renderStartedAt
+      ) {
+        nextProposalExpiry = Math.min(nextProposalExpiry ?? proposalExpiresAt, proposalExpiresAt);
+      }
       const proposalStateLabels: Record<CalendarProposalPreview["state"], string> = {
         awaiting_confirmation: expired ? "Expired" : "Not confirmed",
         completed: "Created",
@@ -1692,6 +1707,13 @@ function renderInbox(items: InboxItem[]): void {
   }
   for (const key of capabilityOutputPresentations.keys()) {
     if (!capabilityOutputPreviews.has(key)) capabilityOutputPresentations.delete(key);
+  }
+  if (nextProposalExpiry !== null) {
+    const delay = Math.min(Math.max(nextProposalExpiry - Date.now() + 1, 0), 2_147_483_647);
+    inboxProposalExpiryTimer = window.setTimeout(() => {
+      inboxProposalExpiryTimer = null;
+      renderInbox(inboxItems);
+    }, delay);
   }
 }
 
