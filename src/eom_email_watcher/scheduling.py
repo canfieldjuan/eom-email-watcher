@@ -603,7 +603,17 @@ def _range_source_options(
         )
         left = evidence_text[option_start_at : newline.start()]
         right = evidence_text[newline.end() :].lstrip()
-        if _contains_clock_range(left) and re.match(option_start, right, re.IGNORECASE):
+        option_candidate = re.sub(
+            r"^(?:[-*\u2022]\s+|\d{1,2}[.)]\s+)",
+            "",
+            right,
+        )
+        date_continuation = re.search(r"\bon\s*$", left, re.IGNORECASE) is not None
+        if (
+            _contains_clock_range(left)
+            and not date_continuation
+            and re.match(option_start, option_candidate, re.IGNORECASE)
+        ):
             option_delimiters.append(newline)
     option_delimiters.sort(key=lambda match: match.start())
     supported_options: list[str] = []
