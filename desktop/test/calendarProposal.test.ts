@@ -15,6 +15,10 @@ test("calendar proposals render as native non-writing inbox content", () => {
     source,
     /formatter\.format\(new Date\(proposal\.end\)\)\} \(\$\{proposal\.timezone\}\)/,
   );
+  assert.match(
+    source,
+    /Exact interval: \$\{proposal\.start\} – \$\{proposal\.end\}/,
+  );
   assert.match(source, /attendees\.textContent = proposal\.attendees\.length/);
   assert.match(source, /calendar\.textContent = `Calendar:/);
   assert.match(styles, /\.calendar-proposal\s*\{/);

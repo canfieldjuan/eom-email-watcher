@@ -1225,7 +1225,7 @@ function renderInbox(items: InboxItem[]): void {
             timeZone: proposal.timezone,
             timeZoneName: "short",
           });
-          timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone})`;
+          timing.textContent = `${formatter.format(new Date(proposal.start))} – ${formatter.format(new Date(proposal.end))} (${proposal.timezone}) · Exact interval: ${proposal.start} – ${proposal.end}`;
         } catch {
           timing.textContent = `${proposal.start} – ${proposal.end} (${proposal.timezone})`;
         }
