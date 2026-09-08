@@ -50,6 +50,33 @@ The paired ambiguous scheduling control remained non-writing with
 Graph continuation, raw message body, account address, tenant identifier, run
 identifier, or event identifier is retained in this evidence.
 
+### Attendee-bearing live acceptance addendum — 2026-09-08
+
+Revision `b6a2d2ffef602ea8773e459c75d16456b97bca36` was installed from its
+production-profile Debian package and exercised with the native Linux desktop.
+The organizer was the existing Microsoft 365 work-or-school test account; a
+controlled watched-sender message named one separately licensed Microsoft test
+principal as its sole attendee. The resulting proposal survived process
+boundaries and reached `awaiting_confirmation`. Before activation, the native
+accessibility tree exposed a persistent warning that creating the event would
+send an invitation from the selected organizer to the named attendee.
+
+The explicit **Create event** action advanced the durable write to `completed`.
+A Graph read-back matched the ledger's event and transaction identities, the
+requested Chicago interval, exactly one expected attendee, and no online
+meeting. A subsequent watcher round and transaction reconciliation still found
+exactly one matching event. The controlled Graph event and all local test rows
+were then removed, Gmail was restored as the active mailbox, and the watcher
+and monthly timers were active. Controlled source messages remain in the test
+mailbox because the mailbox authorization is intentionally read-only.
+
+Two malformed extraction attempts encountered during the repeat remained
+fail-closed: one could not prove an attendee address from the quoted evidence,
+and one did not produce valid structured output. Both reached manual review
+without a proposal or Graph write. This addendum retains no account address,
+tenant identifier, principal key, run identifier, transaction identifier,
+event identifier, token, cache path, or raw message body.
+
 ## Verified baseline
 
 The contract starts from these current-code facts:
@@ -716,12 +743,13 @@ pending rather than inferred from fixtures:
 17. A multi-account fixture proves confirmation identifies the target principal
     and organizer, binds its immutable identity and calendar to the proposal
     hash, and invalidates confirmation when either target changes.
-18. **Live no-attendee write accepted; attendee-bearing live proof pending.** A
-    live, explicitly confirmed no-attendee proposal created one event through
-    the separate write grant and recorded its event identity and provenance.
-    The native UI has deterministic coverage proving that a proposal with
-    attendees renders the meeting-invitation warning, but no attendee-bearing
-    event was created solely to claim live acceptance of that external effect.
+18. **Live no-attendee and attendee-bearing writes accepted.** Separate live,
+    explicitly confirmed proposals created one event each through the isolated
+    write grant and retained their event identity and provenance. Before the
+    attendee-bearing write, the native accessibility tree exposed the invitation
+    effect, organizer, and sole attendee. Graph read-back matched the durable
+    identities, requested interval, and expected attendee; a later reconciliation
+    found exactly one matching transaction. Both controlled events were removed.
 19. Lost-response and repeated-confirmation probes reuse one transaction ID,
     cannot produce duplicate event work, and prove reconciliation can move an
     unresolved run to `completed` only when it finds or receives the matching
