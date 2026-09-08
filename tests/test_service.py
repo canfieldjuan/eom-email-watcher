@@ -1855,6 +1855,8 @@ def test_non_creation_intents_are_durable_non_writing_review_outcomes(
     current = store.automation_run(admitted.run_id)
     assert current is not None
     assert (current.state, current.failure_code) == (state, failure_code)
+    assert store.automation_proposal(admitted.run_id) is None
+    assert store.automation_calendar_write(admitted.run_id) is None
     assert any(intent.kind == "automation_review" for intent in store.notification_intents())
 
 
