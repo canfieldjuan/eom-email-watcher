@@ -103,7 +103,8 @@ h1 {
 .remove-button:focus-visible,
 .primary-action:focus-visible,
 .mail-account-actions button:focus-visible,
-.settings-form button:focus-visible {
+.settings-form button:focus-visible,
+.calendar-consent-actions button:focus-visible {
   outline: 3px solid rgb(46 107 76 / 25%);
   outline-offset: 2px;
 }
@@ -339,6 +340,114 @@ select:focus {
   color: #fff;
   background: #245c40;
   font-weight: 800;
+}
+
+.calendar-consent-settings {
+  margin-top: 28px;
+  padding: 20px;
+  border: 1px solid #d7ded8;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 82%);
+  box-shadow: 0 18px 50px rgb(28 54 38 / 8%);
+}
+
+.calendar-consent-heading h3,
+.calendar-consent-account h4,
+.calendar-consent-card h5 {
+  margin: 0;
+}
+
+.calendar-consent-heading p,
+.calendar-consent-account-heading p,
+.calendar-consent-card p {
+  margin: 6px 0 0;
+  color: #526057;
+  line-height: 1.5;
+}
+
+.calendar-consent-heading p {
+  max-width: 640px;
+}
+
+.calendar-consent-list,
+.calendar-consent-profiles {
+  display: grid;
+  gap: 12px;
+}
+
+.calendar-consent-account {
+  padding-top: 18px;
+  border-top: 1px solid #d7ded8;
+}
+
+.calendar-consent-account-heading {
+  margin-bottom: 12px;
+}
+
+.calendar-consent-profiles {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.calendar-consent-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 14px;
+  border: 1px solid #d7ded8;
+  border-radius: 12px;
+  background: #f8faf8;
+}
+
+.calendar-consent-card h5 {
+  font-size: 0.95rem;
+}
+
+.calendar-consent-card p {
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+.calendar-consent-card .calendar-consent-effect {
+  color: #655a3e;
+  font-weight: 700;
+}
+
+.calendar-consent-card.calendar-consent-write {
+  border-color: #d9c695;
+  background: #fffdf5;
+}
+
+.calendar-consent-card .calendar-consent-state {
+  margin-top: 14px;
+  color: #245c40;
+  font-weight: 800;
+}
+
+.calendar-consent-card .calendar-consent-error {
+  color: #a33832;
+}
+
+.calendar-consent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+.calendar-consent-actions button {
+  padding: 8px 11px;
+  border: 1px solid #9fb2a5;
+  border-radius: 8px;
+  color: #245c40;
+  background: #f7faf7;
+  font-weight: 800;
+}
+
+.calendar-consent-actions .danger-action {
+  border-color: #d9aaa7;
+  color: #8f2f2b;
+  background: #fff8f7;
 }
 
 .status {
@@ -999,6 +1108,10 @@ select:focus {
   }
 
   .settings-form {
+    grid-template-columns: 1fr;
+  }
+
+  .calendar-consent-profiles {
     grid-template-columns: 1fr;
   }
 
