@@ -8,7 +8,7 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -209,17 +209,42 @@ def _entra_error_codes(result: dict[str, Any]) -> set[int]:
     return codes
 
 
+def _microsoft_principal_key_v1(
+    home_account_id: str,
+    tenant_id: str,
+    object_id: str,
+) -> str:
+    value = "\0".join((home_account_id, tenant_id, object_id))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _microsoft_principal_key_v2(home_account_id: str, object_id: str) -> str:
+    value = "\0".join(("msal-principal-v2", home_account_id, object_id.casefold()))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class MicrosoftPrincipal:
     home_account_id: str
     tenant_id: str
     object_id: str
     email_address: str
+    legacy_principal_key: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def key(self) -> str:
-        value = "\0".join(("msal-principal-v2", self.home_account_id, self.object_id))
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return _microsoft_principal_key_v2(self.home_account_id, self.object_id)
+
+    @property
+    def migration_keys(self) -> tuple[str, ...]:
+        return (
+            self.legacy_principal_key
+            or _microsoft_principal_key_v1(
+                self.home_account_id,
+                self.tenant_id,
+                self.object_id,
+            ),
+        )
 
 
 def _identity_part(value: object, name: str) -> str:
@@ -251,11 +276,13 @@ def _principal(result: dict[str, Any], account: object) -> MicrosoftPrincipal:
     claim_values = claims if isinstance(claims, dict) else {}
     home_account_id = _identity_part(account.get("home_account_id"), "home account")
     object_id = _identity_part(account.get("local_account_id"), "object")
+    legacy_object_id = object_id
     claimed_object_id = claim_values.get("oid")
     if claimed_object_id is not None:
+        legacy_object_id = _identity_part(claimed_object_id, "claimed object")
         _matching_identity(
             object_id,
-            _identity_part(claimed_object_id, "claimed object"),
+            legacy_object_id,
             "object",
         )
 
@@ -275,6 +302,11 @@ def _principal(result: dict[str, Any], account: object) -> MicrosoftPrincipal:
         tenant_id=tenant_id,
         object_id=object_id,
         email_address=_profile_address(result, account),
+        legacy_principal_key=_microsoft_principal_key_v1(
+            home_account_id,
+            tenant_id,
+            legacy_object_id,
+        ),
     )
 
 

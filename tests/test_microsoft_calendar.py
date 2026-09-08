@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -264,6 +265,34 @@ def test_calendar_principal_key_survives_missing_silent_claims_for_organizations
     assert interactive.tenant_id == TENANT_ID
     assert silent.principal.tenant_id == "organizations"
     assert silent.principal.key == interactive.key
+
+
+def test_calendar_principal_key_normalizes_object_case_and_preserves_v1_spelling() -> None:
+    claimed_object_id = OBJECT_ID.upper()
+    selected = microsoft_calendar._principal(
+        {
+            "id_token_claims": {
+                "preferred_username": "owner@example.com",
+                "tid": TENANT_ID,
+                "oid": claimed_object_id,
+            }
+        },
+        {
+            "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+            "local_account_id": OBJECT_ID,
+            "realm": TENANT_ID,
+            "username": "owner@example.com",
+        },
+    )
+
+    assert selected.key == principal().key
+    assert selected.migration_keys == (
+        hashlib.sha256(
+            "\0".join(
+                (selected.home_account_id, selected.tenant_id, claimed_object_id)
+            ).encode()
+        ).hexdigest(),
+    )
 
 
 @pytest.mark.parametrize(

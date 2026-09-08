@@ -21,6 +21,7 @@ from eom_email_watcher.db import (
     Store,
 )
 from eom_email_watcher.mailbox import scoped_message_id
+from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
 from eom_email_watcher.mime import AttachmentDescriptor
 
 CALENDAR_PRINCIPAL_KEY = "a" * 64
@@ -1162,13 +1163,16 @@ def test_schema_17_migrates_every_durable_microsoft_principal_reference(
     account_id = f"microsoft365-{'a' * 32}"
     home_account_id = "home-account-id"
     tenant_id = "tenant-id"
-    object_id = "object-id"
+    object_id = "OBJECT-ID"
     legacy_key = hashlib.sha256(
         "\0".join((home_account_id, tenant_id, object_id)).encode()
     ).hexdigest()
-    current_key = hashlib.sha256(
-        "\0".join(("msal-principal-v2", home_account_id, object_id)).encode()
-    ).hexdigest()
+    current_key = MicrosoftPrincipal(
+        home_account_id=home_account_id,
+        tenant_id=tenant_id,
+        object_id=object_id.casefold(),
+        email_address="owner@example.com",
+    ).key
     identity = {
         "principal_key": legacy_key,
         "home_account_id": home_account_id,
@@ -1261,9 +1265,12 @@ def test_schema_17_principal_migration_does_not_rewrite_unrecognized_keys(
     store.initialize()
     home_account_id = "home-account-id"
     object_id = "object-id"
-    current_key = hashlib.sha256(
-        "\0".join(("msal-principal-v2", home_account_id, object_id)).encode()
-    ).hexdigest()
+    current_key = MicrosoftPrincipal(
+        home_account_id=home_account_id,
+        tenant_id="tenant-id",
+        object_id=object_id,
+        email_address="owner@example.com",
+    ).key
     principal_key = current_key if principal_key_kind == "current" else "f" * 64
     account_id = f"microsoft365-{principal_key_kind}"
     store.set_calendar_grant(
@@ -1282,6 +1289,31 @@ def test_schema_17_principal_migration_does_not_rewrite_unrecognized_keys(
     store.initialize()
 
     assert store.calendar_grant(account_id).principal_key == principal_key  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("legacy_key", "current_key"),
+    [
+        ("", "b" * 64),
+        ("a" * 63, "b" * 64),
+        ("g" * 64, "b" * 64),
+        ("a" * 64, "z" * 64),
+    ],
+)
+def test_runtime_principal_migration_rejects_non_sha256_keys(
+    legacy_key: str,
+    current_key: str,
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+
+    with pytest.raises(ValueError, match="SHA-256 hex digests"):
+        store.migrate_calendar_principal_references(
+            "microsoft365-account",
+            (legacy_key,),
+            current_key,
+        )
 
 
 def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(tmp_path: Path) -> None:

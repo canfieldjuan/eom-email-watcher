@@ -1343,6 +1343,105 @@ def test_calendar_connect_rebinds_revoked_but_not_ready_grant_to_new_principal(
         assert calendar_token.read_text(encoding="utf-8") == "original-calendar-cache"
 
 
+def test_calendar_connect_migrates_grantless_legacy_automation_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'7' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    selected_principal = microsoft_principal()
+    legacy_key = selected_principal.migration_keys[0]
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=legacy_key,
+        home_account_id=selected_principal.home_account_id,
+        tenant_id=selected_principal.tenant_id,
+        object_id=selected_principal.object_id,
+        email_address=selected_principal.email_address,
+    )
+    message_id = scoped_message_id("microsoft365", account.account_id, "schedule-upgrade")
+    runtime.store.add_message(
+        message_id=message_id,
+        provider="microsoft365",
+        account_id=account.account_id,
+        provider_message_id="schedule-upgrade",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name="Sender",
+        subject="Can we meet?",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    runtime.store.mark_analyzed(
+        message_id,
+        {
+            "category": "scheduling",
+            "priority": "normal",
+            "summary": "A meeting was requested.",
+            "action_required": True,
+            "suggested_action": "Review the requested meeting.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        scheduling_automation_principal_key=legacy_key,
+    )
+    run = runtime.store.automation_run_for_message(message_id)
+    assert run is not None
+    runtime.store.disconnect_calendar_grant(account.account_id, "read")
+    disconnected = runtime.store.calendar_grant(account.account_id, "read")
+    assert disconnected is not None
+    assert disconnected.principal_key is None
+
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: selected_principal,
+    )
+
+    class SelectedCalendar:
+        principal = selected_principal
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("calendar-read-cache", encoding="utf-8")
+        return SelectedCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.connect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    assert response["ok"] is True
+    migrated = runtime.store.automation_run(run.run_id)
+    assert migrated is not None
+    assert migrated.calendar_principal_key == selected_principal.key
+    assert {
+        event.calendar_principal_key for event in runtime.store.automation_events(run.run_id)
+    } == {selected_principal.key}
+
+
 @pytest.mark.parametrize("existing_ready", [False, True])
 def test_calendar_read_connect_recovers_exit_after_token_install(
     existing_ready: bool,

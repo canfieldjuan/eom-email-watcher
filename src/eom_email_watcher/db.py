@@ -478,7 +478,7 @@ def _microsoft_principal_key_v1(
 
 
 def _microsoft_principal_key_v2(home_account_id: str, object_id: str) -> str:
-    value = "\0".join(("msal-principal-v2", home_account_id, object_id))
+    value = "\0".join(("msal-principal-v2", home_account_id, object_id.casefold()))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
@@ -513,6 +513,13 @@ def _migrate_microsoft_principal_keys_v2(db: sqlite3.Connection) -> None:
                 "Microsoft calendar grants contain conflicting principal identities"
             )
 
+    _rewrite_microsoft_principal_keys(db, migrations)
+
+
+def _rewrite_microsoft_principal_keys(
+    db: sqlite3.Connection,
+    migrations: dict[tuple[str, str], str],
+) -> None:
     if not migrations:
         return
 
@@ -2189,6 +2196,29 @@ class Store:
                 (account_id, profile),
             ).fetchone()
         return CalendarGrant(**dict(row)) if row is not None else None
+
+    def migrate_calendar_principal_references(
+        self,
+        account_id: str,
+        legacy_principal_keys: Iterable[str],
+        current_principal_key: str,
+    ) -> None:
+        if not account_id:
+            raise ValueError("calendar account ID is required")
+        keys = set(legacy_principal_keys)
+        if any(
+            len(key) != 64 or any(character not in "0123456789abcdef" for character in key)
+            for key in keys | {current_principal_key}
+        ):
+            raise ValueError("calendar principal keys must be SHA-256 hex digests")
+        migrations = {
+            (account_id, legacy_key): current_principal_key
+            for legacy_key in keys
+            if legacy_key != current_principal_key
+        }
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _rewrite_microsoft_principal_keys(db, migrations)
 
     def set_calendar_grant(
         self,

@@ -1105,6 +1105,11 @@ def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, obj
                 "email_address": principal.email_address,
             }
             try:
+                runtime.store.migrate_calendar_principal_references(
+                    account.account_id,
+                    principal.migration_keys,
+                    principal.key,
+                )
                 runtime.store.set_calendar_grant(
                     account.account_id,
                     profile,
