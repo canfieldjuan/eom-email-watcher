@@ -169,13 +169,16 @@ class EntitlementGate:
 
     @classmethod
     def from_installation(cls) -> EntitlementGate:
+        keys = _load_bundled_keyring()
+        if keys is None and not hasattr(sys, "_MEIPASS"):
+            keys = _load_installed_release_keyring()
         return cls(
             path=_entitlement_path(
                 os.environ.get("XDG_CONFIG_HOME"),
                 os.environ.get("HOME"),
                 os.environ.get("LOCALAPPDATA"),
             ),
-            keys=_load_bundled_keyring() or _load_installed_release_keyring(),
+            keys=keys,
             now=None,
         )
 

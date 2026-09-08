@@ -6,10 +6,17 @@ unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 tool_bin_dir="$HOME/.local/bin"
 tool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools"
 release_keyring_source="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
-release_keyring_dir="${XDG_DATA_HOME:-$HOME/.local/share}/eom-email-watcher"
+release_keyring_dir="$HOME/.local/share/eom-email-watcher"
 release_keyring_target="$release_keyring_dir/connect-entitlement-keyring.json"
+release_keyring_stage=""
 constraints_file="$(mktemp)"
-trap 'rm -f "$constraints_file"' EXIT
+cleanup() {
+  rm -f "$constraints_file"
+  if [[ -n "$release_keyring_stage" ]]; then
+    rm -f "$release_keyring_stage"
+  fi
+}
+trap cleanup EXIT
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required to install the systemd service CLI snapshot." >&2
@@ -29,14 +36,17 @@ if [[ -n "$release_keyring_source" ]]; then
     exit 1
   fi
   if [[ "$release_keyring_dir" != /* ]]; then
-    echo "XDG_DATA_HOME must be absolute when installing the Connect authority." >&2
+    echo "HOME must be absolute when installing the Connect authority." >&2
     exit 1
   fi
   PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$release_keyring_source" \
-    uv run --project "$repo_dir" python -c \
+    uv run --project "$repo_dir" --no-dev --locked python -c \
     'import os; from pathlib import Path; from scripts.build_desktop_sidecar import validate_entitlement_keyring; validate_entitlement_keyring(Path(os.environ["RELEASE_KEYRING_SOURCE"]))'
   install -d -m 0700 "$release_keyring_dir"
-  install -m 0600 "$release_keyring_source" "$release_keyring_target"
+  release_keyring_stage="$(mktemp "$release_keyring_dir/.connect-entitlement-keyring.XXXXXX")"
+  install -m 0600 "$release_keyring_source" "$release_keyring_stage"
+  mv -f "$release_keyring_stage" "$release_keyring_target"
+  release_keyring_stage=""
 fi
 
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"

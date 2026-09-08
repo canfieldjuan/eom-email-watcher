@@ -289,6 +289,26 @@ def test_installation_uses_bundled_authority_and_ignores_runtime_key_override(
     ).public_dict() == {"state": "active", "active": True}
 
     monkeypatch.setattr(entitlement.sys, "_MEIPASS", str(tmp_path / "missing-bundle"))
+    installed_release = (
+        tmp_path / "missing-data" / entitlement.INSTALLED_RELEASE_KEYRING
+    )
+    installed_release.parent.mkdir(parents=True)
+    approved_key_id, approved_public_key = next(
+        iter(entitlement.APPROVED_RELEASE_AUTHORITIES)
+    )
+    installed_release.write_text(
+        json.dumps(
+            {
+                "keys": [
+                    {
+                        "key_id": approved_key_id,
+                        "algorithm": "Ed25519",
+                        "public_key_base64url": encoded(approved_public_key),
+                    }
+                ]
+            }
+        )
+    )
     assert (
         entitlement.connect_entitlement_decision()
         is entitlement.EntitlementDecision.AUTHORITY_UNAVAILABLE

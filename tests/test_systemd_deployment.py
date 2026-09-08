@@ -21,8 +21,14 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     assert 'test -x "$tool_bin_dir/eom-mail-watch"' in script
     assert '[[ "$release_keyring_source" != /* ]]' in script
     assert 'PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$release_keyring_source"' in script
+    assert 'release_keyring_dir="$HOME/.local/share/eom-email-watcher"' in script
+    assert 'uv run --project "$repo_dir" --no-dev --locked python -c' in script
     assert "validate_entitlement_keyring" in script
-    assert 'install -m 0600 "$release_keyring_source" "$release_keyring_target"' in script
+    stage = 'install -m 0600 "$release_keyring_source" "$release_keyring_stage"'
+    promote = 'mv -f "$release_keyring_stage" "$release_keyring_target"'
+    assert stage in script
+    assert promote in script
+    assert script.index(stage) < script.index(promote)
     assert '$tool_bin_dir/eom-mail-watch setup' in script
 
 
