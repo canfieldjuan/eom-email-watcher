@@ -327,8 +327,9 @@ def test_non_frozen_installation_accepts_only_approved_installed_authority(
 ) -> None:
     approved_key_id, approved_public_key = next(iter(entitlement.APPROVED_RELEASE_AUTHORITIES))
     attacker = Ed25519PrivateKey.generate()
-    data_home = tmp_path / "data"
-    installed_keyring = data_home / entitlement.INSTALLED_RELEASE_KEYRING
+    installed_keyring = (
+        tmp_path / ".local" / "share" / entitlement.INSTALLED_RELEASE_KEYRING
+    )
     installed_keyring.parent.mkdir(parents=True)
     installed_keyring.write_bytes(
         json.dumps(
@@ -344,7 +345,8 @@ def test_non_frozen_installation_accepts_only_approved_installed_authority(
         ).encode()
     )
     monkeypatch.delattr(entitlement.sys, "_MEIPASS", raising=False)
-    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "ignored-data-root"))
 
     assert entitlement._load_installed_release_keyring() == dict(
         entitlement.APPROVED_RELEASE_AUTHORITIES
@@ -354,10 +356,10 @@ def test_non_frozen_installation_accepts_only_approved_installed_authority(
     assert entitlement._load_installed_release_keyring() is None
 
 
-def test_installed_release_authority_path_requires_an_absolute_data_root() -> None:
-    assert entitlement._installed_release_keyring_path("relative", "/home/test-user") is None
-    assert entitlement._installed_release_keyring_path(None, None) is None
-    assert entitlement._installed_release_keyring_path("", "/home/test-user") == (
+def test_installed_release_authority_path_requires_an_absolute_home() -> None:
+    assert entitlement._installed_release_keyring_path("relative") is None
+    assert entitlement._installed_release_keyring_path(None) is None
+    assert entitlement._installed_release_keyring_path("/home/test-user") == (
         Path("/home/test-user/.local/share") / entitlement.INSTALLED_RELEASE_KEYRING
     )
 

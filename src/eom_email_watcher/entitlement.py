@@ -325,10 +325,7 @@ def _load_bundled_keyring() -> MappingProxyType[str, bytes] | None:
 
 
 def _load_installed_release_keyring() -> MappingProxyType[str, bytes] | None:
-    path = _installed_release_keyring_path(
-        os.environ.get("XDG_DATA_HOME"),
-        os.environ.get("HOME"),
-    )
+    path = _installed_release_keyring_path(os.environ.get("HOME"))
     if path is None:
         return None
     try:
@@ -343,16 +340,10 @@ def _load_installed_release_keyring() -> MappingProxyType[str, bytes] | None:
     return keys
 
 
-def _installed_release_keyring_path(
-    xdg_data_home: str | None,
-    home: str | None,
-) -> Path | None:
-    if xdg_data_home:
-        root = Path(xdg_data_home)
-    elif home:
-        root = Path(home) / ".local" / "share"
-    else:
+def _installed_release_keyring_path(home: str | None) -> Path | None:
+    if not home:
         return None
+    root = Path(home) / ".local" / "share"
     if not root.is_absolute():
         return None
     return root / INSTALLED_RELEASE_KEYRING
