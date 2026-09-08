@@ -25,6 +25,31 @@ The no-attendee event avoided external invitations. The deterministic unclear-
 intent control remained non-writing and produced neither proposal nor write
 payload.
 
+### Exact-current live acceptance addendum — 2026-09-08
+
+Revision `ab48af93eb2ecffe213bb1eea5ee03a45108d978` was installed as the
+systemd service snapshot and exercised with the installed native desktop
+against the same class of Microsoft 365 work-or-school tenant. A controlled
+watched-sender message whose source contained an ordinary MIME hard wrap
+reached `awaiting_confirmation` with the requested Chicago start/end, no
+attendees, and the target Microsoft account bound to the durable proposal. A
+desktop process restart retained the same proposal and native **Create event**
+action.
+
+The native action advanced that run to `completed`. A read-back from Microsoft
+Graph matched the durable event and transaction identities, the requested
+Chicago times, zero attendees, and no online meeting because the source did not
+request one. A subsequent watcher process and bounded calendar-view read found
+exactly one event with that transaction identity. The controlled event and
+local test rows were then removed, the temporary watchlist entry was removed,
+Gmail was restored as the active mailbox, both production timers were active,
+and SQLite schema 18 passed `PRAGMA integrity_check`.
+
+The paired ambiguous scheduling control remained non-writing with
+`ambiguous_extraction` and produced no proposal. No token, cache path, opaque
+Graph continuation, raw message body, account address, tenant identifier, run
+identifier, or event identifier is retained in this evidence.
+
 ## Verified baseline
 
 The contract starts from these current-code facts:
@@ -628,11 +653,11 @@ new proposal version and confirmation; it cannot authorize a write. Repeated
 clicks and stale UI versions cannot create another write. Version 1 has no
 automatic write mode.
 
-## Acceptance evidence for later implementation
+## Acceptance evidence
 
-Calendar and automation implementation is not complete until all of the
-following pass against current merged code. Landing item 1 has its own merged
-evidence; items 2–5 remain pending:
+Calendar and automation implementation was accepted only after the following
+passed against merged code. The live evidence is summarized above and the
+deterministic boundaries remain regression-tested:
 
 1. A fixture proves Microsoft mailbox setup requests exactly `Mail.Read` and
    never requests a calendar scope.
