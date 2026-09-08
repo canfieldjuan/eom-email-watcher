@@ -21,6 +21,7 @@ from eom_email_watcher.db import (
     Store,
 )
 from eom_email_watcher.mailbox import scoped_message_id
+from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
 from eom_email_watcher.mime import AttachmentDescriptor
 
 CALENDAR_PRINCIPAL_KEY = "a" * 64
@@ -31,6 +32,7 @@ def admitted_scheduling_run(
     *,
     message_id: str = "local-scheduling",
     provider_message_id: str = "provider-scheduling",
+    principal_key: str = CALENDAR_PRINCIPAL_KEY,
 ):
     account_id = f"microsoft365-{'a' * 32}"
     if store.mail_account("microsoft365", account_id) is None:
@@ -55,7 +57,7 @@ def admitted_scheduling_run(
     store.mark_analyzed(
         message_id,
         scheduling_analysis(),
-        scheduling_automation_principal_key=CALENDAR_PRINCIPAL_KEY,
+        scheduling_automation_principal_key=principal_key,
         now=datetime(2026, 9, 7, 12, 1, tzinfo=UTC),
     )
     run = store.automation_run_for_message(message_id)
@@ -81,11 +83,13 @@ def proposing_scheduling_run(
     *,
     message_id: str = "local-scheduling",
     provider_message_id: str = "provider-scheduling",
+    principal_key: str = CALENDAR_PRINCIPAL_KEY,
 ):
     detected = admitted_scheduling_run(
         store,
         message_id=message_id,
         provider_message_id=provider_message_id,
+        principal_key=principal_key,
     )
     payload = store.reserve_automation_extraction(
         detected.run_id,
@@ -1149,6 +1153,167 @@ def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path)
         ).fetchone()[0]
     assert "UNIQUE (run_id, proposal_version)" in table_sql
     assert "proposal_version = 1" not in table_sql
+
+
+def test_schema_17_migrates_every_durable_microsoft_principal_reference(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    account_id = f"microsoft365-{'a' * 32}"
+    home_account_id = "home-account-id"
+    tenant_id = "tenant-id"
+    object_id = "OBJECT-ID"
+    legacy_key = hashlib.sha256(
+        "\0".join((home_account_id, tenant_id, object_id)).encode()
+    ).hexdigest()
+    current_key = MicrosoftPrincipal(
+        home_account_id=home_account_id,
+        tenant_id=tenant_id,
+        object_id=object_id.casefold(),
+        email_address="owner@example.com",
+    ).key
+    identity = {
+        "principal_key": legacy_key,
+        "home_account_id": home_account_id,
+        "tenant_id": tenant_id,
+        "object_id": object_id,
+        "email_address": "owner@example.com",
+    }
+    for profile in ("read", "proposal", "write"):
+        store.set_calendar_grant(account_id, profile, "ready", **identity)
+    store.set_calendar_grant(
+        account_id,
+        "write",
+        "ready",
+        **{**identity, "principal_key": current_key},
+    )
+    store.commit_calendar_round(
+        account_id=account_id,
+        principal_key=legacy_key,
+        window_start="2026-09-01T00:00:00.000000Z",
+        window_end="2026-10-01T00:00:00.000000Z",
+        cursor="https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=one",
+        changes=(),
+        replace=True,
+    )
+    run = admitted_scheduling_run(store, principal_key=legacy_key)
+    with store.connection() as db:
+        db.execute(
+            """INSERT INTO automation_calendar_writes(
+                run_id, transaction_id, proposal_version, proposal_sha256,
+                calendar_principal_key, calendar_id, start, end, timezone, status,
+                confirmed_at, updated_at
+            ) VALUES (?, ?, 1, ?, ?, 'primary', ?, ?, ?, 'authorized', ?, ?)""",
+            (
+                run.run_id,
+                "11111111-1111-4111-8111-111111111111",
+                "b" * 64,
+                legacy_key,
+                "2026-09-08T10:00:00-05:00",
+                "2026-09-08T10:30:00-05:00",
+                "America/Chicago",
+                "2026-09-07T13:00:00+00:00",
+                "2026-09-07T13:00:00+00:00",
+            ),
+        )
+        db.execute("PRAGMA user_version = 17")
+
+    store.initialize()
+
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert {
+            str(row[0])
+            for row in db.execute(
+                "SELECT principal_key FROM microsoft_calendar_grants WHERE account_id = ?",
+                (account_id,),
+            ).fetchall()
+        } == {current_key}
+        assert db.execute(
+            "SELECT principal_key FROM microsoft_calendar_windows WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()[0] == current_key
+        assert db.execute(
+            "SELECT calendar_principal_key FROM automation_runs WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()[0] == current_key
+        assert {
+            str(row[0])
+            for row in db.execute(
+                "SELECT calendar_principal_key FROM automation_events WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchall()
+        } == {current_key}
+        assert db.execute(
+            "SELECT calendar_principal_key FROM automation_calendar_writes WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()[0] == current_key
+        with pytest.raises(sqlite3.IntegrityError, match="automation_events are immutable"):
+            db.execute(
+                "UPDATE automation_events SET calendar_principal_key = ? WHERE run_id = ?",
+                (legacy_key, run.run_id),
+            )
+
+
+@pytest.mark.parametrize("principal_key_kind", ["current", "unknown"])
+def test_schema_17_principal_migration_does_not_rewrite_unrecognized_keys(
+    tmp_path: Path,
+    principal_key_kind: str,
+) -> None:
+    store = Store(tmp_path / principal_key_kind / "watcher.sqlite3")
+    store.initialize()
+    home_account_id = "home-account-id"
+    object_id = "object-id"
+    current_key = MicrosoftPrincipal(
+        home_account_id=home_account_id,
+        tenant_id="tenant-id",
+        object_id=object_id,
+        email_address="owner@example.com",
+    ).key
+    principal_key = current_key if principal_key_kind == "current" else "f" * 64
+    account_id = f"microsoft365-{principal_key_kind}"
+    store.set_calendar_grant(
+        account_id,
+        "read",
+        "ready",
+        principal_key=principal_key,
+        home_account_id=home_account_id,
+        tenant_id="tenant-id",
+        object_id=object_id,
+        email_address="owner@example.com",
+    )
+    with store.connection() as db:
+        db.execute("PRAGMA user_version = 17")
+
+    store.initialize()
+
+    assert store.calendar_grant(account_id).principal_key == principal_key  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("legacy_key", "current_key"),
+    [
+        ("", "b" * 64),
+        ("a" * 63, "b" * 64),
+        ("g" * 64, "b" * 64),
+        ("a" * 64, "z" * 64),
+    ],
+)
+def test_runtime_principal_migration_rejects_non_sha256_keys(
+    legacy_key: str,
+    current_key: str,
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+
+    with pytest.raises(ValueError, match="SHA-256 hex digests"):
+        store.migrate_calendar_principal_references(
+            "microsoft365-account",
+            (legacy_key,),
+            current_key,
+        )
 
 
 def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(tmp_path: Path) -> None:

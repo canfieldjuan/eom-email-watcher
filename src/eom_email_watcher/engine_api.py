@@ -1105,6 +1105,30 @@ def _calendar_connect(request: dict[str, object], profile: str) -> dict[str, obj
                 "email_address": principal.email_address,
             }
             try:
+                unrecoverable_runs = runtime.store.migrate_calendar_principal_references(
+                    account.account_id,
+                    principal.migration_keys,
+                    principal.key,
+                )
+                if unrecoverable_runs:
+                    try:
+                        _restore_calendar_grant(
+                            runtime,
+                            account.account_id,
+                            profile,
+                            previous,
+                        )
+                    except sqlite3.Error as restore_exc:
+                        raise ApiError(
+                            "calendar_state_error",
+                            "Microsoft calendar consent state could not be restored; "
+                            "disconnect and retry",
+                        ) from restore_exc
+                    raise ApiError(
+                        "calendar_principal_recovery_required",
+                        "Microsoft authorization did not return the identity claims needed "
+                        "to recover existing scheduling work; retry calendar setup",
+                    )
                 runtime.store.set_calendar_grant(
                     account.account_id,
                     profile,

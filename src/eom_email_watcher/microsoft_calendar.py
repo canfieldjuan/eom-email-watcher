@@ -8,7 +8,7 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
@@ -209,17 +209,35 @@ def _entra_error_codes(result: dict[str, Any]) -> set[int]:
     return codes
 
 
+def _microsoft_principal_key_v1(
+    home_account_id: str,
+    tenant_id: str,
+    object_id: str,
+) -> str:
+    value = "\0".join((home_account_id, tenant_id, object_id))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _microsoft_principal_key_v2(home_account_id: str, object_id: str) -> str:
+    value = "\0".join(("msal-principal-v2", home_account_id, object_id.casefold()))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class MicrosoftPrincipal:
     home_account_id: str
     tenant_id: str
     object_id: str
     email_address: str
+    legacy_principal_key: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def key(self) -> str:
-        value = "\0".join((self.home_account_id, self.tenant_id, self.object_id))
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+        return _microsoft_principal_key_v2(self.home_account_id, self.object_id)
+
+    @property
+    def migration_keys(self) -> tuple[str, ...]:
+        return (self.legacy_principal_key,) if self.legacy_principal_key is not None else ()
 
 
 def _identity_part(value: object, name: str) -> str:
@@ -235,6 +253,13 @@ def _identity_part(value: object, name: str) -> str:
     return value
 
 
+def _matching_identity(left: str, right: str, name: str) -> None:
+    if left.casefold() != right.casefold():
+        raise MicrosoftAuthorizationRejected(
+            f"Microsoft authorization returned inconsistent {name} identities"
+        )
+
+
 def _principal(result: dict[str, Any], account: object) -> MicrosoftPrincipal:
     if not isinstance(account, dict):
         raise MicrosoftAuthorizationRejected(
@@ -242,17 +267,43 @@ def _principal(result: dict[str, Any], account: object) -> MicrosoftPrincipal:
         )
     claims = result.get("id_token_claims")
     claim_values = claims if isinstance(claims, dict) else {}
-    return MicrosoftPrincipal(
-        home_account_id=_identity_part(account.get("home_account_id"), "home account"),
-        tenant_id=_identity_part(
-            claim_values.get("tid", account.get("realm")),
-            "tenant",
-        ),
-        object_id=_identity_part(
-            claim_values.get("oid", account.get("local_account_id")),
+    home_account_id = _identity_part(account.get("home_account_id"), "home account")
+    object_id = _identity_part(account.get("local_account_id"), "object")
+    legacy_object_id = object_id
+    claimed_object_id = claim_values.get("oid")
+    if claimed_object_id is not None:
+        legacy_object_id = _identity_part(claimed_object_id, "claimed object")
+        _matching_identity(
+            object_id,
+            legacy_object_id,
             "object",
-        ),
+        )
+
+    raw_account_tenant = account.get("realm")
+    claimed_tenant = claim_values.get("tid")
+    if claimed_tenant is None:
+        tenant_id = _identity_part(raw_account_tenant, "tenant")
+    else:
+        tenant_id = _identity_part(claimed_tenant, "claimed tenant")
+        if raw_account_tenant is not None:
+            account_tenant = _identity_part(raw_account_tenant, "tenant")
+            if account_tenant.casefold() != "organizations":
+                _matching_identity(account_tenant, tenant_id, "tenant")
+
+    return MicrosoftPrincipal(
+        home_account_id=home_account_id,
+        tenant_id=tenant_id,
+        object_id=object_id,
         email_address=_profile_address(result, account),
+        legacy_principal_key=(
+            _microsoft_principal_key_v1(
+                home_account_id,
+                tenant_id,
+                legacy_object_id,
+            )
+            if claimed_tenant is not None and claimed_object_id is not None
+            else None
+        ),
     )
 
 
@@ -590,25 +641,21 @@ def _calendar_proposal_result(
     if not suggestions:
         return CalendarProposalResult(None, empty_reason)
 
-    parsed: list[tuple[int, CalendarMeetingProposal]] = []
-    seen_orders: set[int] = set()
+    # Graph orders this collection but its live v1.0 response may omit the
+    # redundant documented `order` member on individual suggestions.
+    parsed: list[CalendarMeetingProposal] = []
+    seen_candidate_indices: set[int] = set()
     for item in suggestions:
         if not isinstance(item, dict):
             raise Microsoft365Error("Microsoft Graph returned an invalid proposal")
-        order = item.get("order")
         confidence = item.get("confidence")
         if (
-            not isinstance(order, int)
-            or isinstance(order, bool)
-            or order < 1
-            or order in seen_orders
-            or not isinstance(confidence, int | float)
+            not isinstance(confidence, int | float)
             or isinstance(confidence, bool)
             or confidence != 100
             or item.get("organizerAvailability") != "free"
         ):
             raise Microsoft365Error("Microsoft Graph proposal did not prove full availability")
-        seen_orders.add(order)
         _proposal_attendees_available(item.get("attendeeAvailability"), attendees)
         time_slot = item.get("meetingTimeSlot")
         if not isinstance(time_slot, dict):
@@ -624,8 +671,9 @@ def _calendar_proposal_result(
             ),
             None,
         )
-        if candidate_index is None:
+        if candidate_index is None or candidate_index in seen_candidate_indices:
             raise Microsoft365Error("Microsoft Graph proposal escaped the requested candidates")
+        seen_candidate_indices.add(candidate_index)
         reason = _bounded_graph_text(
             item.get("suggestionReason"),
             "proposal reason",
@@ -634,18 +682,14 @@ def _calendar_proposal_result(
         )
         candidate = candidates[candidate_index]
         parsed.append(
-            (
-                order,
-                CalendarMeetingProposal(
-                    start=candidate.start,
-                    end=candidate.end,
-                    timezone=candidate.timezone,
-                    suggestion_reason=reason,
-                ),
+            CalendarMeetingProposal(
+                start=candidate.start,
+                end=candidate.end,
+                timezone=candidate.timezone,
+                suggestion_reason=reason,
             )
         )
-    parsed.sort(key=lambda item: item[0])
-    return CalendarProposalResult(parsed[0][1], None)
+    return CalendarProposalResult(parsed[0], None)
 
 
 async def _find_meeting_time(

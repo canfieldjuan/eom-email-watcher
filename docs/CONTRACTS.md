@@ -1,19 +1,29 @@
 # Calendar capability and email automation contract
 
-Status: **partially implemented: landing items 1–3 and the read-only proposal
-stage of item 4 implemented; confirmation, write, and item 5 remain pending**
+Status: **implemented: landing items 1–5 are complete**
 
 This document freezes the boundary for adding Microsoft 365 calendar operations
-and the first email-driven automation to Email Watcher. It is an implementation
-gate, not a claim that calendar or automation behavior exists today.
+and the first email-driven automation to Email Watcher. It records the implemented
+contract and the live acceptance evidence for the completed landing sequence.
 
 Feature-aware entitlement lookup, isolated calendar grants, calendar-read
-projection, strict scheduling extraction, and the recoverable automation ledger
-are implemented. Accepted new-meeting extraction can call `findMeetingTimes`,
-persist a bounded proposal, and render a native non-writing preview. The existing
-mailbox watcher, Local Connect consumer, and monthly Gmail sender remain
-authoritative while confirmation, calendar writes, and live acceptance evidence
-remain pending.
+projection, strict scheduling extraction, the recoverable automation ledger,
+native confirmation, and idempotent confirmed writes are implemented. The
+existing mailbox watcher, Local Connect consumer, and monthly Gmail sender remain
+authoritative.
+
+Live acceptance was completed on 2026-09-07 with this revision against one
+Microsoft 365 work-or-school test tenant. The installed capability entitlement
+authorized the isolated read, proposal, and write consent profiles. A bounded
+`calendarView/delta` round completed, a real `findMeetingTimes` request returned
+a fully available no-attendee proposal, and a fresh process confirmed the exact
+durable proposal. Its write ledger reached `completed` with an event identity,
+and a subsequent delta round observed that event. The automation portion used an
+isolated, ephemeral signed test entitlement carrying both required features; the
+installed entitlement did not carry `connect.automations` and was not modified.
+The no-attendee event avoided external invitations. The deterministic unclear-
+intent control remained non-writing and produced neither proposal nor write
+payload.
 
 ## Verified baseline
 
@@ -38,9 +48,9 @@ The contract starts from these current-code facts:
   strict extraction now validates candidate times, attendees, intent, and source
   evidence before the automation can reach `proposing`.
 - The Microsoft calendar-read adapter and immutable automation run ledger exist.
-  Read-only meeting proposal and native preview exist; confirmation and write
-  remain pending. A systemd `OnCalendar` timer remains an unrelated use of the
-  word "calendar."
+  Read-only meeting proposal, native preview, explicit confirmation, and durable
+  write/reconciliation are implemented. A systemd `OnCalendar` timer remains an
+  unrelated use of the word "calendar."
 
 ## Definitions
 
@@ -144,9 +154,22 @@ database input:
 ```
 
 Every completed calendar grant must resolve to the same tenant-scoped immutable
-Microsoft principal selected for the automation. The durable identity uses the
-MSAL home-account identifier together with tenant/object claims when available;
-a normalized email address is display/diagnostic metadata, not an identity key.
+Microsoft principal selected for the automation. The durable identity key uses
+MSAL's opaque home-account identifier and tenant-local account identifier. Tenant
+and object claims, when returned, are validated against concrete cache identity
+and retained as provenance; their later omission cannot change the key. The
+multi-tenant authority alias `organizations` is not treated as a concrete tenant
+claim. A normalized email address is display/diagnostic metadata, not an identity
+key. Schema migration 18 atomically rewrites verified legacy principal-key
+references across grants, delta state, automation runs/events, and write
+reservations before runtime authorization can compare them. Tenant-local object
+identifiers are case-normalized for the v2 key. A later verified reconnect also
+rekeys legacy run references when every grant was previously disconnected and
+therefore retained no identity metadata for startup migration. If that interactive
+authorization omits the concrete tenant/object claims required to reproduce the
+v1 key while authorization-dependent legacy work remains, setup fails closed with
+`calendar_principal_recovery_required`; it neither installs the grant/token nor
+guesses from the `organizations` alias. The user may retry interactive setup.
 An immutable-principal mismatch is rejected before a cache replaces the previous
 cache or changes the profile's current consent state. The run binds that same
 principal before confirmation.
@@ -338,6 +361,9 @@ confirmation only when the bounded response proves that every required attendee
 is available for the complete proposed interval. Missing, malformed, unknown,
 partial, or conflicting attendee availability cannot become a confirmation and
 instead follows the same durable `manual_review` path as no suggestions.
+Graph's ordered response collection determines suggestion preference. The
+redundant per-suggestion `order` field is not required because the live v1.0
+service may omit it.
 
 ### Confirmed writes
 
@@ -708,11 +734,11 @@ Implementation remains split into reviewed vertical slices:
    file and keyring;
 2. **Implemented:** separate Microsoft calendar grants and read adapter;
 3. **Implemented:** scheduling extraction and immutable automation ledger;
-4. **Partially implemented:** desktop controls expose the three isolated
-   Microsoft calendar consent profiles, and the read-only proposal adapter and
-   native preview are implemented; confirmation UI and the private
-   confirmed-write adapter remain pending; and
-5. **Pending:** live acceptance evidence.
+4. **Implemented:** desktop controls expose the three isolated Microsoft calendar
+   consent profiles, native proposal preview and confirmation, and the private
+   idempotent confirmed-write adapter; and
+5. **Implemented:** live consent, read, proposal, confirmed-write, and negative-
+   control acceptance evidence recorded above.
 
 No implementation slice may weaken the existing mailbox read-only path or claim
 completion from mocks alone.

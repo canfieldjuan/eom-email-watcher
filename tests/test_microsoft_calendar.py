@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -72,7 +73,6 @@ def proposal_document() -> dict[str, object]:
         "meetingTimeSuggestions": [
             {
                 "confidence": 100,
-                "order": 1,
                 "organizerAvailability": "free",
                 "suggestionReason": "Everyone is available.",
                 "attendeeAvailability": [
@@ -218,6 +218,149 @@ def test_calendar_cache_validation_requests_only_its_exact_scope(
 
     assert authorization.principal == principal()
     assert calls == [[scope]]
+
+
+def test_calendar_principal_key_survives_missing_silent_claims_for_organizations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    token_file = tmp_path / "calendar-cache.json"
+    write_public_client(credentials)
+    token_file.write_text("private-cache", encoding="utf-8")
+    cache = FakeCache()
+    account = {
+        "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+        "local_account_id": OBJECT_ID,
+        "realm": "organizations",
+        "username": "owner@example.com",
+    }
+
+    class FakeApplication:
+        def acquire_token_silent_with_error(self, scopes: list[str], *, account: object):
+            return {"access_token": "private-access"}
+
+        def get_accounts(self):
+            return [account]
+
+    monkeypatch.setattr(microsoft_calendar, "_load_cache", lambda path: cache)
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda configuration, selected_cache: FakeApplication(),
+    )
+
+    silent = MicrosoftCalendarReadAuthorization.from_token(credentials, token_file)
+    interactive = microsoft_calendar._principal(
+        {
+            "id_token_claims": {
+                "preferred_username": "owner@example.com",
+                "tid": TENANT_ID,
+                "oid": OBJECT_ID,
+            }
+        },
+        account,
+    )
+
+    assert interactive.tenant_id == TENANT_ID
+    assert silent.principal.tenant_id == "organizations"
+    assert silent.principal.key == interactive.key
+    assert silent.principal.migration_keys == ()
+    assert len(interactive.migration_keys) == 1
+
+
+def test_calendar_principal_key_normalizes_object_case_and_preserves_v1_spelling() -> None:
+    claimed_object_id = OBJECT_ID.upper()
+    selected = microsoft_calendar._principal(
+        {
+            "id_token_claims": {
+                "preferred_username": "owner@example.com",
+                "tid": TENANT_ID,
+                "oid": claimed_object_id,
+            }
+        },
+        {
+            "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+            "local_account_id": OBJECT_ID,
+            "realm": TENANT_ID,
+            "username": "owner@example.com",
+        },
+    )
+
+    assert selected.key == principal().key
+    assert selected.migration_keys == (
+        hashlib.sha256(
+            "\0".join(
+                (selected.home_account_id, selected.tenant_id, claimed_object_id)
+            ).encode()
+        ).hexdigest(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("realm", "claimed_tenant", "local_object", "claimed_object", "error"),
+    [
+        (
+            "cccccccc-dddd-4eee-8fff-000000000000",
+            TENANT_ID,
+            OBJECT_ID,
+            OBJECT_ID,
+            "tenant identities",
+        ),
+        (
+            TENANT_ID,
+            TENANT_ID,
+            "cccccccc-dddd-4eee-8fff-000000000000",
+            OBJECT_ID,
+            "object identities",
+        ),
+    ],
+)
+def test_calendar_principal_rejects_conflicting_account_and_claim_identity(
+    realm: str,
+    claimed_tenant: str,
+    local_object: str,
+    claimed_object: str,
+    error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "microsoft.json"
+    token_file = tmp_path / "calendar-cache.json"
+    write_public_client(credentials)
+    token_file.write_text("private-cache", encoding="utf-8")
+    cache = FakeCache()
+
+    class FakeApplication:
+        def acquire_token_silent_with_error(self, scopes: list[str], *, account: object):
+            return {
+                "access_token": "private-access",
+                "id_token_claims": {
+                    "preferred_username": "owner@example.com",
+                    "tid": claimed_tenant,
+                    "oid": claimed_object,
+                },
+            }
+
+        def get_accounts(self):
+            return [
+                {
+                    "home_account_id": f"{OBJECT_ID}.{TENANT_ID}",
+                    "local_account_id": local_object,
+                    "realm": realm,
+                    "username": "owner@example.com",
+                }
+            ]
+
+    monkeypatch.setattr(microsoft_calendar, "_load_cache", lambda path: cache)
+    monkeypatch.setattr(
+        microsoft_calendar,
+        "_new_public_client",
+        lambda configuration, selected_cache: FakeApplication(),
+    )
+
+    with pytest.raises(MicrosoftAuthorizationRejected, match=error):
+        MicrosoftCalendarReadAuthorization.from_token(credentials, token_file)
 
 
 def test_mailbox_principal_lookup_requests_only_mail_read(
@@ -571,7 +714,7 @@ def test_calendar_window_validation_pins_both_sides_of_duration_and_offsets() ->
         canonical_calendar_window(start.isoformat(), "9999-12-31T23:59:59-14:00")
 
 
-def test_find_meeting_time_sends_exact_read_only_constraints_and_preserves_iana_zone() -> None:
+def test_find_meeting_time_accepts_live_shape_without_order_and_preserves_iana_zone() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:

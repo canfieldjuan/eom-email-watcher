@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -1341,6 +1342,128 @@ def test_calendar_connect_rebinds_revoked_but_not_ready_grant_to_new_principal(
         assert grant.state == "ready"
         assert grant.principal_key == original.key
         assert calendar_token.read_text(encoding="utf-8") == "original-calendar-cache"
+
+
+@pytest.mark.parametrize("legacy_identity_available", [True, False])
+def test_calendar_connect_handles_grantless_legacy_automation_run(
+    legacy_identity_available: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "microsoft365",
+        f"microsoft365-{'7' * 32}",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+        active=True,
+    )
+    identity = microsoft_principal()
+    legacy_key = hashlib.sha256(
+        "\0".join(
+            (identity.home_account_id, identity.tenant_id, identity.object_id)
+        ).encode()
+    ).hexdigest()
+    selected_principal = MicrosoftPrincipal(
+        home_account_id=identity.home_account_id,
+        tenant_id=identity.tenant_id,
+        object_id=identity.object_id,
+        email_address=identity.email_address,
+        legacy_principal_key=legacy_key if legacy_identity_available else None,
+    )
+    runtime.store.set_calendar_grant(
+        account.account_id,
+        "read",
+        "ready",
+        principal_key=legacy_key,
+        home_account_id=selected_principal.home_account_id,
+        tenant_id=selected_principal.tenant_id,
+        object_id=selected_principal.object_id,
+        email_address=selected_principal.email_address,
+    )
+    message_id = scoped_message_id("microsoft365", account.account_id, "schedule-upgrade")
+    runtime.store.add_message(
+        message_id=message_id,
+        provider="microsoft365",
+        account_id=account.account_id,
+        provider_message_id="schedule-upgrade",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name="Sender",
+        subject="Can we meet?",
+        received_at="2026-09-07T12:00:00+00:00",
+    )
+    runtime.store.mark_analyzed(
+        message_id,
+        {
+            "category": "scheduling",
+            "priority": "normal",
+            "summary": "A meeting was requested.",
+            "action_required": True,
+            "suggested_action": "Review the requested meeting.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        scheduling_automation_principal_key=legacy_key,
+    )
+    run = runtime.store.automation_run_for_message(message_id)
+    assert run is not None
+    runtime.store.disconnect_calendar_grant(account.account_id, "read")
+    disconnected = runtime.store.calendar_grant(account.account_id, "read")
+    assert disconnected is not None
+    assert disconnected.principal_key is None
+
+    mail_token = mail_account_token_file(runtime.config, account)
+    mail_token.parent.mkdir(parents=True)
+    mail_token.write_text("mail-read-cache", encoding="utf-8")
+    monkeypatch.setattr(engine_api, "_calendar_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api,
+        "microsoft_mailbox_principal",
+        lambda *args: selected_principal,
+    )
+
+    class SelectedCalendar:
+        principal = selected_principal
+
+    def authorize(credentials_file: Path, staged_token: Path):
+        staged_token.write_text("calendar-read-cache", encoding="utf-8")
+        return SelectedCalendar(), True
+
+    monkeypatch.setattr(
+        engine_api.MicrosoftCalendarReadAuthorization,
+        "authorize_with_status",
+        authorize,
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "calendar.read.connect",
+            {"provider": account.provider, "account_id": account.account_id},
+        )
+    )
+
+    migrated = runtime.store.automation_run(run.run_id)
+    assert migrated is not None
+    event_keys = {
+        event.calendar_principal_key for event in runtime.store.automation_events(run.run_id)
+    }
+    if legacy_identity_available:
+        assert response["ok"] is True
+        assert migrated.calendar_principal_key == selected_principal.key
+        assert event_keys == {selected_principal.key}
+    else:
+        assert response["error"]["code"] == "calendar_principal_recovery_required"
+        assert migrated.calendar_principal_key == legacy_key
+        assert event_keys == {legacy_key}
+        restored = runtime.store.calendar_grant(account.account_id, "read")
+        assert restored is not None
+        assert (restored.state, restored.principal_key) == ("not_requested", None)
+        assert not microsoft_calendar_read_token_file(runtime.config, account).exists()
 
 
 @pytest.mark.parametrize("existing_ready", [False, True])
