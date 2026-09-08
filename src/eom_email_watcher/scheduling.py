@@ -293,9 +293,35 @@ def _evidence_candidates(
     return source.attachment_names
 
 
+def _canonical_evidence_with_offsets(value: str) -> tuple[str, tuple[int, ...]]:
+    characters: list[str] = []
+    offsets: list[int] = []
+    whitespace_at: int | None = None
+    for index, character in enumerate(value):
+        if character.isspace():
+            if characters and whitespace_at is None:
+                whitespace_at = index
+            continue
+        if whitespace_at is not None:
+            characters.append(" ")
+            offsets.append(whitespace_at)
+            whitespace_at = None
+        characters.append(character)
+        offsets.append(index)
+    return "".join(characters), tuple(offsets)
+
+
+def _canonical_evidence_text(value: str) -> str:
+    return " ".join(value.split())
+
+
 def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) -> bool:
+    quote = _canonical_evidence_text(evidence.quote)
+    if not quote:
+        return False
     return any(
-        evidence.quote in candidate for candidate in _evidence_candidates(evidence, source)
+        quote in _canonical_evidence_text(candidate)
+        for candidate in _evidence_candidates(evidence, source)
     )
 
 
@@ -304,29 +330,30 @@ def _evidence_source_contexts(
     source: SchedulingSource,
 ) -> tuple[str, ...]:
     contexts: list[str] = []
-    for candidate in _evidence_candidates(evidence, source):
+    quote = _canonical_evidence_text(evidence.quote)
+    if not quote:
+        return ()
+    for raw_candidate in _evidence_candidates(evidence, source):
+        candidate, offsets = _canonical_evidence_with_offsets(raw_candidate)
         search_at = 0
-        while (quote_at := candidate.find(evidence.quote, search_at)) >= 0:
-            quote_end = quote_at + len(evidence.quote)
+        while (quote_at := candidate.find(quote, search_at)) >= 0:
+            quote_end = quote_at + len(quote)
+            raw_quote_at = offsets[quote_at]
+            raw_quote_end = offsets[quote_end - 1] + 1
             left = max(
-                candidate.rfind(delimiter, 0, quote_at) for delimiter in ".!?\r\n"
+                raw_candidate.rfind(delimiter, 0, raw_quote_at)
+                for delimiter in ".!?"
             ) + 1
-            stripped_quote_end = quote_end
-            while stripped_quote_end > quote_at and candidate[stripped_quote_end - 1].isspace():
-                stripped_quote_end -= 1
-            if (
-                stripped_quote_end > quote_at
-                and candidate[stripped_quote_end - 1] in ".!?"
-            ):
-                right = stripped_quote_end
+            if quote[-1] in ".!?":
+                right = raw_quote_end
             else:
                 right_candidates = tuple(
                     position
-                    for delimiter in ".!?\r\n"
-                    if (position := candidate.find(delimiter, quote_end)) >= 0
+                    for delimiter in ".!?"
+                    if (position := raw_candidate.find(delimiter, raw_quote_end)) >= 0
                 )
-                right = min(right_candidates, default=len(candidate))
-            context = candidate[left:right].strip()
+                right = min(right_candidates, default=len(raw_candidate))
+            context = raw_candidate[left:right].strip()
             if context and context not in contexts:
                 contexts.append(context)
             search_at = quote_at + 1
@@ -526,6 +553,23 @@ def _time_has_source_support(value: datetime, evidence_text: str, *, zone: ZoneI
     return bool(_time_source_matches(value, evidence_text, zone=zone))
 
 
+def _contains_clock_range(value: str) -> bool:
+    value_without_dashed_dates = re.sub(
+        r"(?<![\d-])(?:\d{4}-\d{2}-\d{2}|\d{1,2}-\d{1,2}-\d{2,4})(?!\d)",
+        "",
+        value,
+    )
+    clock = r"(?<!\d)\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)?(?!\d)"
+    return (
+        re.search(
+            rf"{clock}\s*(?:-|–|—|to|until|through)\s*{clock}",
+            value_without_dashed_dates,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
 def _range_source_options(
     start: datetime,
     end: datetime,
@@ -534,13 +578,67 @@ def _range_source_options(
     zone: ZoneInfo,
     source: SchedulingSource,
 ) -> tuple[str, ...]:
-    option_delimiters = tuple(
+    month_pattern = "|".join(
+        sorted({name for month in _MONTHS for name in (month, month[:3])}, key=len, reverse=True)
+    )
+    clock_start = (
+        r"(?:\d{1,2}(?::[0-5]\d(?::[0-5]\d)?)?\s*(?:am|pm)\b|"
+        r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?!\d|\s*(?:am|pm)\b))"
+    )
+    non_clock_option_start = (
+        rf"(?:day\s+after\s+tomorrow\b|today\b|tomorrow\b|"
+        rf"\d{{4}}-\d{{2}}-\d{{2}}\b|(?:{month_pattern})\s+\d{{1,2}}\b|"
+        rf"(?:option|choice|alternative|slot)\s+\d{{1,2}}\s*:|"
+        rf"\d{{1,2}}[/-]\d{{1,2}}\b|"
+        rf"(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)"
+    )
+    option_start = rf"(?:{non_clock_option_start}|{clock_start})"
+    option_delimiters = list(
         re.finditer(
-            r"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{4}-\d{2}-\d{2}|[A-Za-z]+\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            rf"(?:\bor\b|;|,\s*(?={non_clock_option_start}))",
             evidence_text,
             re.IGNORECASE,
         )
     )
+    for newline in re.finditer(r"\n", evidence_text):
+        option_start_at = max(
+            (
+                delimiter.end()
+                for delimiter in option_delimiters
+                if delimiter.end() <= newline.start()
+            ),
+            default=0,
+        )
+        left = evidence_text[option_start_at : newline.start()]
+        right = evidence_text[newline.end() :].lstrip()
+        option_candidate = re.sub(
+            r"^(?:[-*\u2022]\s+|[A-Za-z0-9]{1,2}[.)]\s+)",
+            "",
+            right,
+        )
+        option_candidate = re.sub(
+            r"^(?:On|For)\s*[:,]?\s+",
+            "",
+            option_candidate,
+        )
+        option_candidate = re.sub(
+            r"^(?:(?:how|what)\s+about|alternatively|otherwise|instead|"
+            r"another\s+(?:option|choice)(?:\s+is)?)\s*[:,]?\s+",
+            "",
+            option_candidate,
+            flags=re.IGNORECASE,
+        )
+        date_continuation = (
+            re.search(r"\b(?:on|for|next|day\s+after)\s*$", left, re.IGNORECASE)
+            is not None
+        )
+        if (
+            _contains_clock_range(left)
+            and not date_continuation
+            and re.match(option_start, option_candidate, re.IGNORECASE)
+        ):
+            option_delimiters.append(newline)
+    option_delimiters.sort(key=lambda match: match.start())
     supported_options: list[str] = []
     start_matches = (
         *((match, False) for match in _time_source_matches(start, evidence_text, zone=zone)),

@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import eom_email_watcher.scheduling as scheduling_module
 from eom_email_watcher.scheduling import (
     MAX_SCHEDULING_ATTENDEES,
     SCHEDULING_SYSTEM_PROMPT,
@@ -83,6 +84,298 @@ def test_valid_new_meeting_is_accepted_with_normalized_evidence() -> None:
     assert result.extraction.intent == "new_meeting"
     assert len(result.result_json) < 32 * 1024
     assert result.result_sha256 == hashlib.sha256(result.result_json).hexdigest()
+
+
+def test_plain_evidence_canonicalization_does_not_build_offset_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        scheduling_module,
+        "_canonical_evidence_with_offsets",
+        lambda _value: pytest.fail("plain canonicalization allocated an offset map"),
+    )
+
+    assert scheduling_module._canonical_evidence_text("hard\n wrapped\ttext") == (
+        "hard wrapped text"
+    )
+
+
+def test_mime_hard_wrapped_evidence_is_accepted_without_weakening_source_checks() -> None:
+    body = (
+        "Please create a private calendar hold for Tuesday, September\n"
+        "15, 2026, from 2:00 PM to 2:30 PM America/Chicago."
+    )
+    value = valid_result()
+    value["intent_evidence"] = {
+        "source": "body",
+        "quote": "Please create a private calendar hold for Tuesday, September 15, 2026",
+    }
+    value["proposed_times"] = [
+        {
+            "start": "2026-09-15T14:00:00-05:00",
+            "end": "2026-09-15T14:30:00-05:00",
+            "timezone": "America/Chicago",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": (
+                        "Tuesday, September 15, 2026, from 2:00 PM to 2:30 PM "
+                        "America/Chicago"
+                    ),
+                }
+            ],
+        }
+    ]
+    scheduling_source = source(body=body)
+
+    accepted = validate(value, scheduling_source=scheduling_source)
+    assert accepted.accepted is True
+
+    value["intent_evidence"] = {
+        "source": "body",
+        "quote": "Please create a public calendar hold for Tuesday, September 15, 2026",
+    }
+    changed_content = validate(value, scheduling_source=scheduling_source)
+    assert "evidence_not_found" in codes(changed_content)
+
+
+def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
+    body = (
+        "September 8 from 10:00\n to 10:30\n"
+        "September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T10:30:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": (
+                        "September 8 from 10:00 to 10:30 "
+                        "September 9 from 14:00 to 15:00"
+                    ),
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" in codes(result)
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "•", "2.", "b.", "C)"])
+def test_list_markers_preserve_newline_option_boundaries(marker: str) -> None:
+    quote = (
+        f"- September 8 from 10:00 to 11:00\n"
+        f"{marker} September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" in codes(result)
+
+
+@pytest.mark.parametrize(
+    ("date_prefix", "date_text"),
+    [
+        ("on", "September 8, 2026"),
+        ("for", "September 8, 2026"),
+        ("next", "Tuesday"),
+    ],
+)
+def test_time_first_date_hard_wrap_remains_one_option(
+    date_prefix: str,
+    date_text: str,
+) -> None:
+    body = f"Meet from 10:00 to 11:00 {date_prefix}\n{date_text}."
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-08T10:00:00-05:00",
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": f"Meet from 10:00 to 11:00 {date_prefix} {date_text}",
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+def test_time_first_wrap_before_lowercase_preposition_remains_one_option() -> None:
+    body = "Meet from 10:00 to 11:00\non September 8, 2026."
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "Meet from 10:00 to 11:00 on September 8, 2026",
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+def test_24_hour_time_first_line_starts_a_new_option() -> None:
+    quote = "September 8 from 10:00 to 11:00\n14:00 to 15:00 September 9"
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" in codes(result)
+
+
+@pytest.mark.parametrize("date_text", ["2026-09-08", "09-08-2026", "9-8-26"])
+def test_dashed_date_line_remains_bound_to_following_clock_range(date_text: str) -> None:
+    body = f"{date_text}\n10:00 AM to 11:00 AM"
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "end": "2026-09-08T11:00:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": f"{date_text} 10:00 AM to 11:00 AM",
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+def test_date_clock_comma_remains_inside_one_option() -> None:
+    quote = "September 8, 10:00 to 10:30"
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {"source": "body", "quote": quote}
+    ]
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" not in codes(result)
+
+
+@pytest.mark.parametrize(
+    "lead_in",
+    [
+        "How about",
+        "What about",
+        "On",
+        "For",
+        "Alternatively,",
+        "Another option is",
+    ],
+)
+def test_alternative_lead_in_starts_a_new_option(lead_in: str) -> None:
+    quote = (
+        "September 8 from 10:00 to 11:00\n"
+        f"{lead_in} September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "time_range_unsupported" in codes(result)
+
+
+def test_numbered_option_labels_remain_range_delimiters() -> None:
+    quote = (
+        "September 8 from 10:00 to 11:00, "
+        "option 2: 14:00 to 15:00 September 9"
+    )
+    value = valid_result()
+    proposed = value["proposed_times"][0]  # type: ignore[index]
+    proposed.update(
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+    scheduling_source = source(body=quote)
+
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    proposed.update(
+        {
+            "start": "2026-09-09T14:00:00-05:00",
+            "end": "2026-09-09T15:00:00-05:00",
+        }
+    )
+    assert "time_range_unsupported" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
+def test_wrapped_timezone_remains_bound_to_its_range() -> None:
+    quote = "September 8 from 10:00 to 10:30\nEastern Time"
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "September 8 from 10:00 to 10:30 Eastern Time",
+        }
+    ]
+
+    result = validate(value, scheduling_source=source(body=quote))
+
+    assert "timezone_unsupported" in codes(result)
+
+
+def test_wrapped_timezone_omitted_from_quote_is_restored_from_source() -> None:
+    body = "Tuesday, September\n8 from 10:00 to 10:30\nEastern Time."
+    value = valid_result()
+    value["proposed_times"][0]["evidence"] = [  # type: ignore[index]
+        {
+            "source": "body",
+            "quote": "Tuesday, September 8 from 10:00 to 10:30",
+        }
+    ]
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "timezone_unsupported" in codes(result)
 
 
 @pytest.mark.parametrize(
