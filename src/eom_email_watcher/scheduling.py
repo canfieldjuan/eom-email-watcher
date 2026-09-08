@@ -617,13 +617,16 @@ def _range_source_options(
             right,
         )
         option_candidate = re.sub(
-            r"^(?:(?:how|what)\s+about|alternatively|otherwise|instead|"
+            r"^(?:(?:how|what)\s+about|on|for|alternatively|otherwise|instead|"
             r"another\s+(?:option|choice)(?:\s+is)?)\s*[:,]?\s+",
             "",
             option_candidate,
             flags=re.IGNORECASE,
         )
-        date_continuation = re.search(r"\b(?:on|for)\s*$", left, re.IGNORECASE) is not None
+        date_continuation = (
+            re.search(r"\b(?:on|for|next|day\s+after)\s*$", left, re.IGNORECASE)
+            is not None
+        )
         if (
             _contains_clock_range(left)
             and not date_continuation

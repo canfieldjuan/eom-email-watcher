@@ -186,19 +186,28 @@ def test_list_markers_preserve_newline_option_boundaries(marker: str) -> None:
     assert "time_range_unsupported" in codes(result)
 
 
-@pytest.mark.parametrize("preposition", ["on", "for"])
-def test_time_first_date_hard_wrap_remains_one_option(preposition: str) -> None:
-    body = f"Meet from 10:00 to 11:00 {preposition}\nSeptember 8, 2026."
+@pytest.mark.parametrize(
+    ("date_prefix", "date_text"),
+    [
+        ("on", "September 8, 2026"),
+        ("for", "September 8, 2026"),
+        ("next", "Tuesday"),
+    ],
+)
+def test_time_first_date_hard_wrap_remains_one_option(
+    date_prefix: str,
+    date_text: str,
+) -> None:
+    body = f"Meet from 10:00 to 11:00 {date_prefix}\n{date_text}."
     value = valid_result()
     value["proposed_times"][0].update(  # type: ignore[index,union-attr]
         {
+            "start": "2026-09-08T10:00:00-05:00",
             "end": "2026-09-08T11:00:00-05:00",
             "evidence": [
                 {
                     "source": "body",
-                    "quote": (
-                        f"Meet from 10:00 to 11:00 {preposition} September 8, 2026"
-                    ),
+                    "quote": f"Meet from 10:00 to 11:00 {date_prefix} {date_text}",
                 }
             ],
         }
@@ -260,7 +269,14 @@ def test_date_clock_comma_remains_inside_one_option() -> None:
 
 @pytest.mark.parametrize(
     "lead_in",
-    ["How about", "What about", "Alternatively,", "Another option is"],
+    [
+        "How about",
+        "What about",
+        "On",
+        "For",
+        "Alternatively,",
+        "Another option is",
+    ],
 )
 def test_alternative_lead_in_starts_a_new_option(lead_in: str) -> None:
     quote = (
