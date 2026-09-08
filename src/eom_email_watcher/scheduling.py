@@ -293,8 +293,26 @@ def _evidence_candidates(
     return source.attachment_names
 
 
+def _canonical_evidence_with_offsets(value: str) -> tuple[str, tuple[int, ...]]:
+    characters: list[str] = []
+    offsets: list[int] = []
+    whitespace_at: int | None = None
+    for index, character in enumerate(value):
+        if character.isspace():
+            if characters and whitespace_at is None:
+                whitespace_at = index
+            continue
+        if whitespace_at is not None:
+            characters.append(" ")
+            offsets.append(whitespace_at)
+            whitespace_at = None
+        characters.append(character)
+        offsets.append(index)
+    return "".join(characters), tuple(offsets)
+
+
 def _canonical_evidence_text(value: str) -> str:
-    return " ".join(value.split())
+    return _canonical_evidence_with_offsets(value)[0]
 
 
 def _evidence_supported(evidence: SchedulingEvidence, source: SchedulingSource) -> bool:
@@ -316,29 +334,26 @@ def _evidence_source_contexts(
     if not quote:
         return ()
     for raw_candidate in _evidence_candidates(evidence, source):
-        candidate = _canonical_evidence_text(raw_candidate)
+        candidate, offsets = _canonical_evidence_with_offsets(raw_candidate)
         search_at = 0
         while (quote_at := candidate.find(quote, search_at)) >= 0:
             quote_end = quote_at + len(quote)
+            raw_quote_at = offsets[quote_at]
+            raw_quote_end = offsets[quote_end - 1] + 1
             left = max(
-                candidate.rfind(delimiter, 0, quote_at) for delimiter in ".!?\r\n"
+                raw_candidate.rfind(delimiter, 0, raw_quote_at)
+                for delimiter in ".!?\r\n"
             ) + 1
-            stripped_quote_end = quote_end
-            while stripped_quote_end > quote_at and candidate[stripped_quote_end - 1].isspace():
-                stripped_quote_end -= 1
-            if (
-                stripped_quote_end > quote_at
-                and candidate[stripped_quote_end - 1] in ".!?"
-            ):
-                right = stripped_quote_end
+            if quote[-1] in ".!?":
+                right = raw_quote_end
             else:
                 right_candidates = tuple(
                     position
                     for delimiter in ".!?\r\n"
-                    if (position := candidate.find(delimiter, quote_end)) >= 0
+                    if (position := raw_candidate.find(delimiter, raw_quote_end)) >= 0
                 )
-                right = min(right_candidates, default=len(candidate))
-            context = candidate[left:right].strip()
+                right = min(right_candidates, default=len(raw_candidate))
+            context = _canonical_evidence_text(raw_candidate[left:right])
             if context and context not in contexts:
                 contexts.append(context)
             search_at = quote_at + 1
@@ -551,7 +566,7 @@ def _range_source_options(
     )
     option_delimiters = tuple(
         re.finditer(
-            rf"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            rf"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|[A-Za-z]+\s+\d{{1,2}}\s*:(?!\d)\s*(?=[A-Za-z])|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
             evidence_text,
             re.IGNORECASE,
         )

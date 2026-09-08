@@ -124,6 +124,62 @@ def test_mime_hard_wrapped_evidence_is_accepted_without_weakening_source_checks(
     assert "evidence_not_found" in codes(changed_content)
 
 
+def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
+    body = (
+        "September 8 from 10:00 to 10:30\n"
+        "September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    value["proposed_times"][0].update(  # type: ignore[index,union-attr]
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T10:30:00-05:00",
+            "evidence": [
+                {
+                    "source": "body",
+                    "quote": "September 8 from 10:00 to 10:30",
+                }
+            ],
+        }
+    )
+
+    result = validate(value, scheduling_source=source(body=body))
+
+    assert "time_date_unsupported" in codes(result)
+    assert "time_range_unsupported" in codes(result)
+
+
+def test_numbered_option_labels_remain_range_delimiters() -> None:
+    quote = (
+        "September 8 from 10:00 to 11:00, "
+        "option 2: September 9 from 14:00 to 15:00"
+    )
+    value = valid_result()
+    proposed = value["proposed_times"][0]  # type: ignore[index]
+    proposed.update(
+        {
+            "start": "2026-09-09T10:00:00-05:00",
+            "end": "2026-09-09T11:00:00-05:00",
+            "evidence": [{"source": "body", "quote": quote}],
+        }
+    )
+    scheduling_source = source(body=quote)
+
+    assert "time_range_unsupported" in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+    proposed.update(
+        {
+            "start": "2026-09-09T14:00:00-05:00",
+            "end": "2026-09-09T15:00:00-05:00",
+        }
+    )
+    assert "time_range_unsupported" not in codes(
+        validate(value, scheduling_source=scheduling_source)
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected"),
     [
