@@ -374,12 +374,14 @@ SCHEDULING_FIXTURE_NOW = datetime(2026, 9, 7, 13, tzinfo=UTC)
 
 def admit_scheduling_run(
     store: Store,
+    monkeypatch: pytest.MonkeyPatch,
     *,
     active: bool = False,
     provider_message_id: str = "schedule-1",
     received_at: str | None = None,
     principal_key: str = "a" * 64,
 ):
+    monkeypatch.setattr(service_module, "_utc_now", lambda: SCHEDULING_FIXTURE_NOW)
     account_id = f"microsoft365-{'d' * 32}"
     if store.mail_account(MICROSOFT365_PROVIDER, account_id) is None:
         store.register_mail_account(
@@ -419,7 +421,6 @@ def allow_automation_processing(
     monkeypatch: pytest.MonkeyPatch,
     gateway: AutomationGateway,
 ) -> None:
-    monkeypatch.setattr(service_module, "_utc_now", lambda: SCHEDULING_FIXTURE_NOW)
     monkeypatch.setattr(
         service_module,
         "_scheduling_authorization_principal",
@@ -446,6 +447,7 @@ def proposing_automation_run(
 ):
     account_id, admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         provider_message_id=provider_message_id,
         received_at=SCHEDULING_FIXTURE_RECEIVED_AT,
         principal_key=principal_key,
@@ -728,7 +730,7 @@ def test_scheduling_extraction_retries_once_with_feedback_then_proposes(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel(["{}", valid_scheduling_output()])
 
@@ -1638,7 +1640,7 @@ def test_scheduling_transport_retry_reuses_reserved_request_identity(
     store = Store(cfg.database_file)
     store.initialize()
     received_at = "2026-09-07T12:00:00+00:00"
-    _account_id, admitted = admit_scheduling_run(store, received_at=received_at)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch, received_at=received_at)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel(
         [
@@ -1687,12 +1689,12 @@ def test_scheduling_transport_retry_delay_starts_when_request_fails(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel(
         [GatewayModelError("worker_unavailable", retryable=True, retry_after_seconds=30)]
     )
-    started_at = datetime.now(UTC)
+    started_at = SCHEDULING_FIXTURE_NOW
     failed_at = started_at + timedelta(minutes=2)
     monkeypatch.setattr(service_module, "_utc_now", lambda: failed_at)
 
@@ -1713,6 +1715,7 @@ def test_permanent_gateway_extraction_failure_becomes_reviewable(
     store.initialize()
     _account_id, admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         received_at="2026-09-07T12:00:00+00:00",
     )
     allow_automation_processing(monkeypatch, AutomationGateway())
@@ -1747,6 +1750,7 @@ def test_first_extraction_context_is_anchored_to_message_receipt(
     store.initialize()
     _account_id, admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         received_at="2026-09-07T12:00:00+00:00",
     )
     allow_automation_processing(monkeypatch, AutomationGateway())
@@ -1774,6 +1778,7 @@ def test_retry_uses_the_organizer_pinned_before_account_identity_changes(
     store.initialize()
     account_id, _admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         received_at="2026-09-07T12:00:00+00:00",
     )
     allow_automation_processing(monkeypatch, AutomationGateway())
@@ -1807,7 +1812,7 @@ def test_second_invalid_extraction_stops_in_review_without_third_attempt(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel(["{}", "{}"])
 
@@ -1851,7 +1856,7 @@ def test_non_creation_intents_are_durable_non_writing_review_outcomes(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel([valid_scheduling_output(intent)])
 
@@ -1871,7 +1876,7 @@ def test_missing_scheduling_source_becomes_reviewable_terminal_outcome(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, MissingAutomationSource())
     model = ExtractionModel([])
 
@@ -1894,7 +1899,7 @@ def test_scheduling_source_moved_out_of_inbox_becomes_unavailable(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, MovedAutomationSource())
     model = ExtractionModel([])
 
@@ -1916,7 +1921,7 @@ def test_canonical_check_resumes_nonactive_account_with_empty_watchlist(
     cfg = replace(config(tmp_path), senders=())
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store, active=False)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch, active=False)
     allow_automation_processing(monkeypatch, AutomationGateway())
     model = ExtractionModel([valid_scheduling_output()])
     monkeypatch.setattr(
@@ -1941,7 +1946,7 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
     cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     reviewed = store.transition_automation_to_review(
         admitted.run_id,
         admitted.state_version,
@@ -1982,7 +1987,7 @@ def test_recovery_rechecks_authorization_before_fetch_or_model(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "_scheduling_authorization_principal",
@@ -2011,7 +2016,7 @@ def test_recovery_provider_failure_does_not_abort_active_mailbox_check(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", provider="gmail", account_id="gmail-default")
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, FailingAutomationProvider())
     healthy_mailbox = FreshGmail()
     monkeypatch.setattr(
@@ -2036,7 +2041,7 @@ def test_recovery_session_failure_does_not_abort_active_mailbox_check(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", provider="gmail", account_id="gmail-default")
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "_scheduling_authorization_principal",
@@ -2071,10 +2076,12 @@ def test_transient_source_failure_does_not_starve_newer_runnable_work(
     store.initialize()
     _account_id, failed = admit_scheduling_run(
         store,
+        monkeypatch,
         provider_message_id="older-failure",
     )
     _account_id, runnable = admit_scheduling_run(
         store,
+        monkeypatch,
         provider_message_id="runnable",
     )
     allow_automation_processing(monkeypatch, FailingOlderAutomationProvider())
@@ -2098,7 +2105,7 @@ def test_scheduling_source_bounds_attachment_metadata_before_reservation(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, MetadataHeavyAutomationProvider())
     model = ExtractionModel([valid_scheduling_output()])
 
@@ -2122,7 +2129,7 @@ def test_scheduling_source_sanitizes_unicode_before_hash_and_inference(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, admitted = admit_scheduling_run(store)
+    _account_id, admitted = admit_scheduling_run(store, monkeypatch)
     allow_automation_processing(monkeypatch, MalformedUnicodeAutomationProvider())
     model = ExtractionModel([valid_scheduling_output()])
 
@@ -2145,6 +2152,7 @@ def test_recovery_purges_expired_source_before_fetch_or_inference(
     store.initialize()
     _account_id, admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         received_at="2026-01-01T12:00:00+00:00",
     )
     monkeypatch.setattr(
@@ -2191,6 +2199,7 @@ def test_canonical_check_reports_recovery_purge_outcomes(
     store.initialize()
     _account_id, admitted = admit_scheduling_run(
         store,
+        monkeypatch,
         received_at="2026-01-01T12:00:00+00:00",
     )
     monkeypatch.setattr(service_module, "_utc_now", lambda: datetime(2026, 9, 7, 13, tzinfo=UTC))
@@ -2214,12 +2223,14 @@ def test_unauthorized_oldest_page_does_not_starve_newer_runnable_work(
     for index in range(25):
         admit_scheduling_run(
             store,
+            monkeypatch,
             provider_message_id=f"unauthorized-{index:02d}",
             received_at="2026-09-07T12:00:00+00:00",
             principal_key="b" * 64,
         )
     _account_id, runnable = admit_scheduling_run(
         store,
+        monkeypatch,
         provider_message_id="runnable",
         received_at="2026-09-07T12:00:00+00:00",
     )
