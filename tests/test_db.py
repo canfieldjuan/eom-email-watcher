@@ -687,6 +687,8 @@ def test_calendar_proposal_is_durable_and_atomically_awaits_confirmation(
         "empty_reason": None,
         "observed_at": "2026-09-07T13:00:00+00:00",
         "expires_at": "2026-09-07T13:15:00+00:00",
+        "write_status": None,
+        "graph_event_id": None,
     }
     assert "principal" not in preview
     event = store.automation_events(proposing.run_id)[-1]
@@ -767,7 +769,7 @@ def test_calendar_proposal_compare_and_swap_prevents_duplicate_payloads(
             proposing.run_id,
             proposing.state_version,
             **arguments,
-        )
+    )
 
     with store.connection() as db:
         assert db.execute(
@@ -912,6 +914,545 @@ def test_source_cleanup_deletes_calendar_proposal_and_tombstones_review(
         "source_unavailable",
         "source_unavailable",
     )
+    assert store.automation_proposal(proposing.run_id) is None
+
+
+def test_calendar_proposal_decline_is_atomic_and_idempotent(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="a" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+
+    declined = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="decline",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    repeated = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="decline",
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    assert declined.state == repeated.state == "declined"
+    assert store.automation_calendar_write(proposing.run_id) is None
+    events = store.automation_events(proposing.run_id)
+    assert [event.decision for event in events].count("declined") == 1
+
+
+def test_calendar_confirmation_persists_one_transaction_before_write(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="b" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    write = store.automation_calendar_write(proposing.run_id)
+    repeated = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+
+    assert authorized.state == repeated.state == "write_authorized"
+    assert write is not None and write.status == "authorized"
+    assert len(write.transaction_id) == 36
+    events = store.automation_events(proposing.run_id)
+    confirmation = events[-1]
+    assert (confirmation.decision, confirmation.transaction_id) == (
+        "confirmed",
+        write.transaction_id,
+    )
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM automation_calendar_writes WHERE run_id = ?",
+            (proposing.run_id,),
+        ).fetchone()[0] == 1
+
+
+def test_expired_confirmation_reproposes_with_a_new_version(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="c" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    first = store.automation_proposal(proposing.run_id)
+    assert first is not None
+
+    expired = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=first.proposal_version,
+        proposal_sha256=first.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 15, tzinfo=UTC),
+    )
+    refreshed = store.record_automation_proposal(
+        proposing.run_id,
+        expired.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="d" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T11:00:00-05:00",
+        end="2026-09-08T11:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, 16, tzinfo=UTC),
+    )
+
+    assert (expired.state, expired.failure_code) == ("proposing", "proposal_expired")
+    accepted_extraction = store.automation_extraction_payloads(proposing.run_id)[0]
+    assert expired.current_payload_id == accepted_extraction.payload_id
+    assert expired.current_payload_sha256 == accepted_extraction.result_sha256
+    assert refreshed.state == "awaiting_confirmation"
+    second = store.automation_proposal(proposing.run_id)
+    assert second is not None and second.proposal_version == 2
+    assert second.proposal_sha256 != first.proposal_sha256
+    assert store.automation_calendar_write(proposing.run_id) is None
+
+
+def test_expired_confirmation_can_enter_review_when_refresh_is_invalid(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="c" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    expired = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 15, tzinfo=UTC),
+    )
+
+    work = store.proposable_automation_runs()[0]
+    assert work.run.current_payload_id == work.extraction_payload.payload_id
+    reviewed = store.transition_automation_to_review(
+        work.run.run_id,
+        expired.state_version,
+        next_state="manual_review",
+        failure_code="proposal_invalid",
+    )
+
+    assert (reviewed.state, reviewed.failure_code) == ("manual_review", "proposal_invalid")
+
+
+def test_schema_16_calendar_proposal_migration_preserves_payload(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="d" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    before = store.automation_proposal(proposing.run_id)
+    assert before is not None
+    with store.connection() as db:
+        db.execute("PRAGMA user_version = 16")
+
+    store.initialize()
+
+    after = store.automation_proposal(proposing.run_id)
+    assert after == before
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        table_sql = db.execute(
+            """SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'automation_proposal_payloads'"""
+        ).fetchone()[0]
+    assert "UNIQUE (run_id, proposal_version)" in table_sql
+    assert "proposal_version = 1" not in table_sql
+
+
+def test_failed_schema_17_proposal_rebuild_rolls_back_and_can_retry(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="d" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    with store.connection() as db:
+        table_sql = str(
+            db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'automation_proposal_payloads'"
+            ).fetchone()[0]
+        )
+        db.execute("DROP TRIGGER automation_runs_delete_proposal_payloads")
+        db.execute(
+            "ALTER TABLE automation_proposal_payloads "
+            "RENAME TO automation_proposal_payloads_current"
+        )
+        db.execute(table_sql.replace("UNIQUE (run_id, proposal_version),", ""))
+        db.execute(
+            "INSERT INTO automation_proposal_payloads "
+            "SELECT * FROM automation_proposal_payloads_current"
+        )
+        db.execute("DROP TABLE automation_proposal_payloads_current")
+        db.execute(
+            """CREATE TRIGGER automation_runs_delete_proposal_payloads
+            AFTER DELETE ON automation_runs
+            BEGIN
+                DELETE FROM automation_proposal_payloads WHERE run_id = OLD.run_id;
+            END"""
+        )
+        db.execute(
+            """INSERT INTO automation_proposal_payloads
+            SELECT '11111111-1111-4111-8111-111111111111', run_id,
+                proposal_version, status, request_sha256, proposal_sha256,
+                subject, attendees_json, start, end, timezone, suggestion_reason,
+                empty_reason, observed_at, expires_at, created_at
+            FROM automation_proposal_payloads LIMIT 1"""
+        )
+        db.execute("PRAGMA user_version = 16")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        Store(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert db.execute("SELECT COUNT(*) FROM automation_proposal_payloads").fetchone()[0] == 2
+        assert (
+            db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'automation_proposal_payloads_v16'"
+            ).fetchone()
+            is None
+        )
+        db.execute(
+            "DELETE FROM automation_proposal_payloads "
+            "WHERE payload_id = '11111111-1111-4111-8111-111111111111'"
+        )
+
+    Store(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert db.execute("SELECT COUNT(*) FROM automation_proposal_payloads").fetchone()[0] == 1
+
+
+def test_calendar_write_lifecycle_preserves_transaction_and_event_identity(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="e" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    writing = store.begin_automation_calendar_write(
+        proposing.run_id,
+        authorized.state_version,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+    unresolved = store.transition_automation_calendar_write(
+        proposing.run_id,
+        writing.state_version,
+        next_state="unresolved",
+        failure_code="write_outcome_unknown",
+    )
+    reconciling = store.transition_automation_calendar_write(
+        proposing.run_id,
+        unresolved.state_version,
+        next_state="reconciling",
+    )
+    completed = store.transition_automation_calendar_write(
+        proposing.run_id,
+        reconciling.state_version,
+        next_state="completed",
+        graph_event_id="immutable-event-id",
+    )
+
+    write = store.automation_calendar_write(proposing.run_id)
+    assert completed.state == "completed"
+    assert write is not None
+    assert (write.status, write.graph_event_id) == ("completed", "immutable-event-id")
+    transaction_ids = {
+        event.transaction_id
+        for event in store.automation_events(proposing.run_id)
+        if event.transaction_id is not None
+    }
+    assert transaction_ids == {write.transaction_id}
+    preview = store.recent(1)[0]["calendar_proposal"]
+    assert preview is not None
+    assert (preview["state"], preview["graph_event_id"]) == (
+        "completed",
+        "immutable-event-id",
+    )
+
+
+def test_expired_unresolved_calendar_write_stops_retrying_and_is_purged(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="e" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    writing = store.begin_automation_calendar_write(
+        proposing.run_id,
+        authorized.state_version,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+    store.transition_automation_calendar_write(
+        proposing.run_id,
+        writing.state_version,
+        next_state="unresolved",
+        failure_code="write_outcome_unknown",
+        now=datetime(2026, 9, 7, 13, 7, tzinfo=UTC),
+    )
+    expires_at = datetime(2026, 9, 8, 13, tzinfo=UTC)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET expires_at = ? WHERE run_id = ?",
+            (expires_at.isoformat(), proposing.run_id),
+        )
+
+    assert store.pending_automation_calendar_writes(now=expires_at) == []
+    store.purge_with_outcome(MAX_RETENTION_DAYS, now=expires_at)
+
+    assert store.automation_run(proposing.run_id) is None
+    assert store.automation_calendar_write(proposing.run_id) is None
+    assert store.automation_events(proposing.run_id) == []
+
+
+def test_expired_writing_calendar_write_survives_until_outcome_is_recorded(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="e" * 64,
+        subject="Meeting request",
+        attendees=("jane@example.com",),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="All attendees are available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    authorized = store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+    writing = store.begin_automation_calendar_write(
+        proposing.run_id,
+        authorized.state_version,
+        now=datetime(2026, 9, 7, 13, 6, tzinfo=UTC),
+    )
+    expires_at = datetime(2026, 9, 8, 13, tzinfo=UTC)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE automation_runs SET expires_at = ? WHERE run_id = ?",
+            (expires_at.isoformat(), proposing.run_id),
+        )
+
+    store.purge_with_outcome(MAX_RETENTION_DAYS, now=expires_at)
+
+    pending = store.pending_automation_calendar_writes(now=expires_at)
+    assert [item.run.run_id for item in pending] == [proposing.run_id]
+    unresolved = store.transition_automation_calendar_write(
+        proposing.run_id,
+        writing.state_version,
+        next_state="unresolved",
+        failure_code="write_outcome_unknown",
+        now=expires_at,
+    )
+    store.purge_with_outcome(MAX_RETENTION_DAYS, now=expires_at)
+
+    assert unresolved.state == "unresolved"
+    assert store.automation_run(proposing.run_id) is None
+    assert store.automation_calendar_write(proposing.run_id) is None
+
+
+def test_source_cleanup_cancels_authorized_write_before_submission(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    proposing, extraction = proposing_scheduling_run(store)
+    awaiting = store.record_automation_proposal(
+        proposing.run_id,
+        proposing.state_version,
+        extraction_payload_id=extraction.payload_id,
+        request_sha256="f" * 64,
+        subject="Meeting request",
+        attendees=(),
+        start="2026-09-08T10:00:00-05:00",
+        end="2026-09-08T10:30:00-05:00",
+        timezone="America/Chicago",
+        suggestion_reason="The organizer is available.",
+        empty_reason=None,
+        observed_at=datetime(2026, 9, 7, 13, tzinfo=UTC),
+    )
+    proposal = store.automation_proposal(proposing.run_id)
+    assert proposal is not None
+    store.decide_automation_proposal(
+        proposing.run_id,
+        awaiting.state_version,
+        proposal_version=proposal.proposal_version,
+        proposal_sha256=proposal.proposal_sha256,
+        decision="confirm",
+        now=datetime(2026, 9, 7, 13, 5, tzinfo=UTC),
+    )
+
+    assert store.delete_message("local-scheduling") is True
+
+    run = store.automation_run(proposing.run_id)
+    write = store.automation_calendar_write(proposing.run_id)
+    assert run is not None and run.state == "source_unavailable"
+    assert write is not None and write.status == "cancelled"
     assert store.automation_proposal(proposing.run_id) is None
 
 

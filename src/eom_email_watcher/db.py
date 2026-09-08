@@ -18,7 +18,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -312,6 +312,11 @@ CREATE TABLE IF NOT EXISTS automation_events (
     failure_code TEXT,
     payload_id TEXT CHECK (payload_id IS NULL OR length(payload_id) = 36),
     payload_sha256 TEXT CHECK (payload_sha256 IS NULL OR length(payload_sha256) = 64),
+    decision TEXT CHECK (decision IS NULL OR decision IN ('confirmed', 'declined')),
+    transaction_id TEXT CHECK (transaction_id IS NULL OR length(transaction_id) = 36),
+    graph_event_id TEXT CHECK (
+        graph_event_id IS NULL OR length(CAST(graph_event_id AS BLOB)) BETWEEN 1 AND 512
+    ),
     created_at TEXT NOT NULL,
     UNIQUE (run_id, sequence_no),
     UNIQUE (run_id, state_version),
@@ -387,8 +392,8 @@ BEGIN
 END;
 CREATE TABLE IF NOT EXISTS automation_proposal_payloads (
     payload_id TEXT PRIMARY KEY CHECK (length(payload_id) = 36),
-    run_id TEXT NOT NULL UNIQUE CHECK (run_id <> ''),
-    proposal_version INTEGER NOT NULL CHECK (proposal_version = 1),
+    run_id TEXT NOT NULL CHECK (run_id <> ''),
+    proposal_version INTEGER NOT NULL CHECK (proposal_version > 0),
     status TEXT NOT NULL CHECK (status IN ('accepted', 'no_suggestions')),
     request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
     proposal_sha256 TEXT NOT NULL CHECK (length(proposal_sha256) = 64),
@@ -409,6 +414,7 @@ CREATE TABLE IF NOT EXISTS automation_proposal_payloads (
     observed_at TEXT NOT NULL CHECK (observed_at <> ''),
     expires_at TEXT,
     created_at TEXT NOT NULL,
+    UNIQUE (run_id, proposal_version),
     CHECK (
         (status = 'accepted' AND start IS NOT NULL AND end IS NOT NULL
             AND timezone IS NOT NULL AND suggestion_reason IS NOT NULL
@@ -422,6 +428,42 @@ CREATE TRIGGER IF NOT EXISTS automation_runs_delete_proposal_payloads
 AFTER DELETE ON automation_runs
 BEGIN
     DELETE FROM automation_proposal_payloads WHERE run_id = OLD.run_id;
+END;
+CREATE TABLE IF NOT EXISTS automation_calendar_writes (
+    run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
+    transaction_id TEXT NOT NULL UNIQUE CHECK (length(transaction_id) = 36),
+    proposal_version INTEGER NOT NULL CHECK (proposal_version > 0),
+    proposal_sha256 TEXT NOT NULL CHECK (length(proposal_sha256) = 64),
+    calendar_principal_key TEXT NOT NULL CHECK (length(calendar_principal_key) = 64),
+    calendar_id TEXT NOT NULL CHECK (calendar_id = 'primary'),
+    start TEXT NOT NULL CHECK (length(CAST(start AS BLOB)) <= 64),
+    end TEXT NOT NULL CHECK (length(CAST(end AS BLOB)) <= 64),
+    timezone TEXT NOT NULL CHECK (length(CAST(timezone AS BLOB)) <= 128),
+    status TEXT NOT NULL CHECK (
+        status IN (
+            'authorized', 'writing', 'unresolved', 'reconciling',
+            'completed', 'failed', 'cancelled'
+        )
+    ),
+    graph_event_id TEXT CHECK (
+        graph_event_id IS NULL OR length(CAST(graph_event_id AS BLOB)) BETWEEN 1 AND 512
+    ),
+    failure_code TEXT CHECK (
+        failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 64
+    ),
+    confirmed_at TEXT NOT NULL,
+    submitted_at TEXT,
+    completed_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (status = 'completed' AND graph_event_id IS NOT NULL AND completed_at IS NOT NULL)
+        OR (status <> 'completed' AND graph_event_id IS NULL AND completed_at IS NULL)
+    )
+);
+CREATE TRIGGER IF NOT EXISTS automation_runs_delete_calendar_writes
+AFTER DELETE ON automation_runs
+BEGIN
+    DELETE FROM automation_calendar_writes WHERE run_id = OLD.run_id;
 END;
 """
 
@@ -521,6 +563,9 @@ class AutomationEvent:
     failure_code: str | None
     payload_id: str | None
     payload_sha256: str | None
+    decision: str | None
+    transaction_id: str | None
+    graph_event_id: str | None
     created_at: str
 
 
@@ -595,6 +640,33 @@ class AutomationProposalWork:
     extraction_payload: AutomationExtractionPayload
 
 
+@dataclass(frozen=True)
+class AutomationCalendarWrite:
+    run_id: str
+    transaction_id: str
+    proposal_version: int
+    proposal_sha256: str
+    calendar_principal_key: str
+    calendar_id: str
+    start: str
+    end: str
+    timezone: str
+    status: str
+    graph_event_id: str | None
+    failure_code: str | None
+    confirmed_at: str
+    submitted_at: str | None
+    completed_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AutomationCalendarWriteWork:
+    run: AutomationRun
+    proposal: AutomationProposalPayload | None
+    write: AutomationCalendarWrite
+
+
 class AutomationSourceChanged(RuntimeError):
     """A recoverable automation source no longer matches its first extraction input."""
 
@@ -615,6 +687,10 @@ def _automation_proposal_payload(row: sqlite3.Row) -> AutomationProposalPayload:
     return AutomationProposalPayload(**dict(row))
 
 
+def _automation_calendar_write(row: sqlite3.Row) -> AutomationCalendarWrite:
+    return AutomationCalendarWrite(**dict(row))
+
+
 def _append_automation_event(
     db: sqlite3.Connection,
     *,
@@ -632,14 +708,17 @@ def _append_automation_event(
     created_at: str,
     payload_id: str | None = None,
     payload_sha256: str | None = None,
+    decision: str | None = None,
+    transaction_id: str | None = None,
+    graph_event_id: str | None = None,
 ) -> None:
     db.execute(
         """INSERT INTO automation_events(
             event_id, run_id, sequence_no, previous_state, next_state, state_version,
             automation_id, automation_version, extraction_schema_version,
             calendar_principal_key, transition_kind, failure_code, payload_id,
-            payload_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            payload_sha256, decision, transaction_id, graph_event_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             str(uuid.uuid4()),
             run_id,
@@ -655,6 +734,9 @@ def _append_automation_event(
             failure_code,
             payload_id,
             payload_sha256,
+            decision,
+            transaction_id,
+            graph_event_id,
             created_at,
         ),
     )
@@ -729,8 +811,10 @@ def _mark_automation_sources_unavailable(
         runs = db.execute(
             f"""SELECT r.run_id, r.automation_id, r.automation_version,
                 r.extraction_schema_version, r.calendar_principal_key, r.state,
-                r.state_version, r.current_payload_id, r.current_payload_sha256
+                r.state_version, r.current_payload_id, r.current_payload_sha256,
+                w.transaction_id
             FROM automation_runs AS r
+            LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
             JOIN messages AS m
               ON m.provider = r.provider
              AND m.account_id = r.account_id
@@ -757,10 +841,20 @@ def _mark_automation_sources_unavailable(
                 "extracting",
                 "proposing",
                 "awaiting_confirmation",
+                "write_authorized",
             }:
                 continue
             previous_version = int(row["state_version"])
             next_version = previous_version + 1
+            if previous_state == "write_authorized":
+                cancelled = db.execute(
+                    """UPDATE automation_calendar_writes SET status = 'cancelled',
+                        failure_code = 'source_unavailable', updated_at = ?
+                    WHERE run_id = ? AND status = 'authorized'""",
+                    (updated_at, run_id),
+                )
+                if cancelled.rowcount != 1:
+                    raise RuntimeError("Automation source cleanup lost its write-state race")
             changed = db.execute(
                 """UPDATE automation_runs SET
                     state = 'source_unavailable', state_version = ?,
@@ -796,6 +890,11 @@ def _mark_automation_sources_unavailable(
                     if row["current_payload_sha256"] is not None
                     else None
                 ),
+                transaction_id=(
+                    str(row["transaction_id"])
+                    if row["transaction_id"] is not None
+                    else None
+                ),
             )
     return transitioned
 
@@ -807,7 +906,11 @@ def _purge_expired_automation_tombstones(
 ) -> None:
     rows = db.execute(
         """SELECT run_id FROM automation_runs
-        WHERE state NOT IN ('writing', 'unresolved', 'reconciling') AND expires_at <= ?
+        WHERE state NOT IN ('writing', 'reconciling')
+          AND (
+              aware_iso_epoch(expires_at) IS NULL
+              OR aware_iso_epoch(expires_at) <= aware_iso_epoch(?)
+          )
         ORDER BY run_id""",
         (now,),
     ).fetchall()
@@ -816,9 +919,7 @@ def _purge_expired_automation_tombstones(
         chunk = run_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
         placeholders = ", ".join("?" for _ in chunk)
         db.execute(
-            f"""DELETE FROM automation_runs
-            WHERE state NOT IN ('writing', 'unresolved', 'reconciling')
-              AND run_id IN ({placeholders})""",
+            f"DELETE FROM automation_runs WHERE run_id IN ({placeholders})",
             tuple(chunk),
         )
         db.execute(
@@ -1683,9 +1784,84 @@ class Store:
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(automation_events)").fetchall()
             }
-            for column in ("payload_id", "payload_sha256"):
+            automation_event_migrations = {
+                "payload_id": "TEXT",
+                "payload_sha256": "TEXT",
+                "decision": "TEXT",
+                "transaction_id": "TEXT",
+                "graph_event_id": "TEXT",
+            }
+            for column, definition in automation_event_migrations.items():
                 if column not in automation_event_columns:
-                    db.execute(f"ALTER TABLE automation_events ADD COLUMN {column} TEXT")
+                    db.execute(
+                        f"ALTER TABLE automation_events ADD COLUMN {column} {definition}"
+                    )
+            if version < 17:
+                db.execute("DROP TRIGGER IF EXISTS automation_runs_delete_proposal_payloads")
+                db.execute(
+                    "ALTER TABLE automation_proposal_payloads "
+                    "RENAME TO automation_proposal_payloads_v16"
+                )
+                db.execute(
+                    """CREATE TABLE automation_proposal_payloads (
+                        payload_id TEXT PRIMARY KEY CHECK (length(payload_id) = 36),
+                        run_id TEXT NOT NULL CHECK (run_id <> ''),
+                        proposal_version INTEGER NOT NULL CHECK (proposal_version > 0),
+                        status TEXT NOT NULL CHECK (status IN ('accepted', 'no_suggestions')),
+                        request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+                        proposal_sha256 TEXT NOT NULL CHECK (length(proposal_sha256) = 64),
+                        subject TEXT NOT NULL CHECK (length(CAST(subject AS BLOB)) <= 512),
+                        attendees_json BLOB NOT NULL CHECK (
+                            typeof(attendees_json) = 'blob'
+                            AND length(attendees_json) BETWEEN 2 AND 32768
+                        ),
+                        start TEXT CHECK (start IS NULL OR length(CAST(start AS BLOB)) <= 64),
+                        end TEXT CHECK (end IS NULL OR length(CAST(end AS BLOB)) <= 64),
+                        timezone TEXT CHECK (
+                            timezone IS NULL OR length(CAST(timezone AS BLOB)) <= 128
+                        ),
+                        suggestion_reason TEXT CHECK (
+                            suggestion_reason IS NULL
+                            OR length(CAST(suggestion_reason AS BLOB)) <= 512
+                        ),
+                        empty_reason TEXT CHECK (
+                            empty_reason IS NULL
+                            OR length(CAST(empty_reason AS BLOB)) <= 512
+                        ),
+                        observed_at TEXT NOT NULL CHECK (observed_at <> ''),
+                        expires_at TEXT,
+                        created_at TEXT NOT NULL,
+                        UNIQUE (run_id, proposal_version),
+                        CHECK (
+                            (status = 'accepted' AND start IS NOT NULL AND end IS NOT NULL
+                                AND timezone IS NOT NULL AND suggestion_reason IS NOT NULL
+                                AND empty_reason IS NULL AND expires_at IS NOT NULL)
+                            OR (status = 'no_suggestions' AND start IS NULL AND end IS NULL
+                                AND timezone IS NULL AND suggestion_reason IS NULL
+                                AND empty_reason IS NOT NULL AND expires_at IS NULL)
+                        )
+                    )"""
+                )
+                db.execute(
+                    """INSERT INTO automation_proposal_payloads(
+                        payload_id, run_id, proposal_version, status, request_sha256,
+                        proposal_sha256, subject, attendees_json, start, end, timezone,
+                        suggestion_reason, empty_reason, observed_at, expires_at, created_at
+                    )
+                    SELECT payload_id, run_id, proposal_version, status, request_sha256,
+                        proposal_sha256, subject, attendees_json, start, end, timezone,
+                        suggestion_reason, empty_reason, observed_at, expires_at, created_at
+                    FROM automation_proposal_payloads_v16"""
+                )
+                db.execute("DROP TABLE automation_proposal_payloads_v16")
+                db.execute(
+                    """CREATE TRIGGER automation_runs_delete_proposal_payloads
+                    AFTER DELETE ON automation_runs
+                    BEGIN
+                        DELETE FROM automation_proposal_payloads WHERE run_id = OLD.run_id;
+                    END
+                    """
+                )
             automation_payload_columns = {
                 str(row["name"])
                 for row in db.execute(
@@ -3018,11 +3194,9 @@ class Store:
                 JOIN mail_accounts AS a
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 JOIN automation_extraction_payloads AS p
-                  ON p.payload_id = r.current_payload_id
-                LEFT JOIN automation_proposal_payloads AS proposed
-                  ON proposed.run_id = r.run_id
+                  ON p.run_id = r.run_id AND p.status = 'accepted'
                 WHERE r.state = 'proposing' AND p.status = 'accepted'
-                  AND a.address IS NOT NULL AND proposed.run_id IS NULL
+                  AND a.address IS NOT NULL
                   {page}
                 ORDER BY r.created_at, r.run_id
                 LIMIT ?""",
@@ -3090,7 +3264,10 @@ class Store:
     def automation_proposal(self, run_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
             row = db.execute(
-                "SELECT * FROM automation_proposal_payloads WHERE run_id = ?",
+                """SELECT p.* FROM automation_proposal_payloads AS p
+                JOIN automation_runs AS r
+                  ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
+                WHERE p.run_id = ?""",
                 (run_id,),
             ).fetchone()
         return _automation_proposal_payload(row) if row is not None else None
@@ -3101,7 +3278,8 @@ class Store:
         with self.connection() as db:
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
-                JOIN automation_runs AS r ON r.run_id = p.run_id
+                JOIN automation_runs AS r
+                  ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
                 JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
@@ -3238,11 +3416,17 @@ class Store:
             if (
                 row["state"] != "proposing"
                 or int(row["state_version"]) != expected_state_version
-                or row["current_payload_id"] != extraction_payload_id
                 or extraction["status"] != "accepted"
             ):
                 raise RuntimeError("Automation proposal lost its expected-state race")
+            prior_proposal = db.execute(
+                """SELECT COALESCE(MAX(proposal_version), 0) AS latest
+                FROM automation_proposal_payloads WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            proposal_version = int(prior_proposal["latest"]) + 1
             proposal_document["principal_key"] = str(row["calendar_principal_key"])
+            proposal_document["version"] = proposal_version
             proposal_json = json.dumps(
                 proposal_document,
                 ensure_ascii=False,
@@ -3255,10 +3439,11 @@ class Store:
                     payload_id, run_id, proposal_version, status, request_sha256,
                     proposal_sha256, subject, attendees_json, start, end, timezone,
                     suggestion_reason, empty_reason, observed_at, expires_at, created_at
-                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     payload_id,
                     run_id,
+                    proposal_version,
                     status,
                     request_sha256,
                     proposal_sha256,
@@ -3279,8 +3464,7 @@ class Store:
                 """UPDATE automation_runs SET state = ?, state_version = ?,
                     failure_code = ?, current_payload_id = ?, current_payload_sha256 = ?,
                     review_notified_at = NULL, updated_at = ?
-                WHERE run_id = ? AND state = 'proposing' AND state_version = ?
-                  AND current_payload_id = ?""",
+                WHERE run_id = ? AND state = 'proposing' AND state_version = ?""",
                 (
                     next_state,
                     next_version,
@@ -3290,7 +3474,6 @@ class Store:
                     created_at,
                     run_id,
                     expected_state_version,
-                    extraction_payload_id,
                 ),
             )
             if changed.rowcount != 1:
@@ -3317,6 +3500,446 @@ class Store:
             ).fetchone()
         if updated is None:
             raise RuntimeError("Automation proposal was not readable")
+        return _automation_run(updated)
+
+    def decide_automation_proposal(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        proposal_version: int,
+        proposal_sha256: str,
+        decision: str,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        if decision not in {"confirm", "decline"}:
+            raise ValueError("automation proposal decision is invalid")
+        if proposal_version < 1 or len(proposal_sha256) != 64:
+            raise ValueError("automation proposal identity is invalid")
+        selected_now = now or datetime.now(UTC)
+        if selected_now.tzinfo is None:
+            raise ValueError("automation proposal decision time must be timezone-aware")
+        stamp = selected_now.astimezone(UTC)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            proposal = db.execute(
+                """SELECT * FROM automation_proposal_payloads
+                WHERE run_id = ? AND proposal_version = ? AND proposal_sha256 = ?""",
+                (run_id, proposal_version, proposal_sha256),
+            ).fetchone()
+            if row is None or proposal is None:
+                raise KeyError(run_id)
+            existing_write = db.execute(
+                "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if decision == "confirm" and existing_write is not None:
+                if (
+                    int(existing_write["proposal_version"]) == proposal_version
+                    and existing_write["proposal_sha256"] == proposal_sha256
+                ):
+                    return _automation_run(row)
+                raise RuntimeError("Automation confirmation conflicts with its durable write")
+            if decision == "decline" and row["state"] == "declined":
+                return _automation_run(row)
+            if (
+                row["state"] != "awaiting_confirmation"
+                or int(row["state_version"]) != expected_state_version
+                or row["current_payload_id"] != proposal["payload_id"]
+                or row["current_payload_sha256"] != proposal_sha256
+                or proposal["status"] != "accepted"
+            ):
+                raise RuntimeError("Automation proposal decision lost its expected-state race")
+
+            previous_version = int(row["state_version"])
+            next_version = previous_version + 1
+            if decision == "decline":
+                next_state = "declined"
+                failure_code = None
+                transaction_id = None
+                event_decision = "declined"
+                next_payload_id = str(proposal["payload_id"])
+                next_payload_sha256 = proposal_sha256
+            else:
+                start_value = proposal["start"]
+                end_value = proposal["end"]
+                timezone_value = proposal["timezone"]
+                expires_value = proposal["expires_at"]
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (start_value, end_value, timezone_value, expires_value)
+                ):
+                    raise RuntimeError("Stored automation proposal is incomplete")
+                try:
+                    start_time = datetime.fromisoformat(str(start_value)).astimezone(UTC)
+                    expires_at = datetime.fromisoformat(str(expires_value)).astimezone(UTC)
+                except (OverflowError, ValueError) as exc:
+                    raise RuntimeError("Stored automation proposal time is invalid") from exc
+                if stamp >= expires_at or stamp >= start_time:
+                    extraction = db.execute(
+                        """SELECT payload_id, result_sha256
+                        FROM automation_extraction_payloads
+                        WHERE run_id = ? AND status = 'accepted'""",
+                        (run_id,),
+                    ).fetchone()
+                    if extraction is None or extraction["result_sha256"] is None:
+                        raise RuntimeError("Accepted automation extraction is unavailable")
+                    next_state = "proposing"
+                    failure_code = "proposal_expired"
+                    transaction_id = None
+                    event_decision = None
+                    next_payload_id = str(extraction["payload_id"])
+                    next_payload_sha256 = str(extraction["result_sha256"])
+                else:
+                    next_state = "write_authorized"
+                    failure_code = None
+                    transaction_id = str(uuid.uuid4())
+                    event_decision = "confirmed"
+                    next_payload_id = str(proposal["payload_id"])
+                    next_payload_sha256 = proposal_sha256
+                    db.execute(
+                        """INSERT INTO automation_calendar_writes(
+                            run_id, transaction_id, proposal_version, proposal_sha256,
+                            calendar_principal_key, calendar_id, start, end, timezone,
+                            status, graph_event_id, failure_code, confirmed_at,
+                            submitted_at, completed_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'primary', ?, ?, ?, 'authorized',
+                            NULL, NULL, ?, NULL, NULL, ?)""",
+                        (
+                            run_id,
+                            transaction_id,
+                            proposal_version,
+                            proposal_sha256,
+                            str(row["calendar_principal_key"]),
+                            str(start_value),
+                            str(end_value),
+                            str(timezone_value),
+                            stamp.isoformat(),
+                            stamp.isoformat(),
+                        ),
+                    )
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?,
+                    failure_code = ?, current_payload_id = ?, current_payload_sha256 = ?,
+                    review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'awaiting_confirmation'
+                  AND state_version = ? AND current_payload_id = ?
+                  AND current_payload_sha256 = ?""",
+                (
+                    next_state,
+                    next_version,
+                    failure_code,
+                    next_payload_id,
+                    next_payload_sha256,
+                    stamp.isoformat(),
+                    run_id,
+                    previous_version,
+                    str(proposal["payload_id"]),
+                    proposal_sha256,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation proposal decision lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state="awaiting_confirmation",
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=failure_code,
+                created_at=stamp.isoformat(),
+                payload_id=str(proposal["payload_id"]),
+                payload_sha256=proposal_sha256,
+                decision=event_decision,
+                transaction_id=transaction_id,
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation proposal decision was not readable")
+        return _automation_run(updated)
+
+    def automation_calendar_write(self, run_id: str) -> AutomationCalendarWrite | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return _automation_calendar_write(row) if row is not None else None
+
+    def pending_automation_calendar_writes(
+        self,
+        limit: int = 25,
+        *,
+        run_id: str | None = None,
+        now: datetime | None = None,
+    ) -> list[AutomationCalendarWriteWork]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        now_epoch = (stamp - epoch).total_seconds()
+        run_filter = " AND r.run_id = ?" if run_id is not None else ""
+        parameters: list[object] = [now_epoch]
+        if run_id is not None:
+            parameters.append(run_id)
+        parameters.append(limit)
+        with self.connection() as db:
+            rows = db.execute(
+                f"""SELECT r.* FROM automation_runs AS r
+                JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
+                WHERE r.state IN ('write_authorized', 'writing', 'unresolved', 'reconciling')
+                  AND (
+                      r.state IN ('writing', 'reconciling')
+                      OR aware_iso_epoch(r.expires_at) > ?
+                  )
+                {run_filter}
+                ORDER BY r.updated_at, r.run_id LIMIT ?""",
+                parameters,
+            ).fetchall()
+            work: list[AutomationCalendarWriteWork] = []
+            for row in rows:
+                write_row = db.execute(
+                    "SELECT * FROM automation_calendar_writes WHERE run_id = ?",
+                    (str(row["run_id"]),),
+                ).fetchone()
+                proposal_row = db.execute(
+                    """SELECT * FROM automation_proposal_payloads
+                    WHERE payload_id = ? AND run_id = ?""",
+                    (row["current_payload_id"], str(row["run_id"])),
+                ).fetchone()
+                if write_row is None:
+                    raise RuntimeError("Automation write projection is incomplete")
+                work.append(
+                    AutomationCalendarWriteWork(
+                        run=_automation_run(row),
+                        proposal=(
+                            _automation_proposal_payload(proposal_row)
+                            if proposal_row is not None
+                            else None
+                        ),
+                        write=_automation_calendar_write(write_row),
+                    )
+                )
+        return work
+
+    def begin_automation_calendar_write(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            write = db.execute(
+                "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None or write is None:
+                raise KeyError(run_id)
+            if (
+                row["state"] != "write_authorized"
+                or int(row["state_version"]) != expected_state_version
+                or write["status"] != "authorized"
+            ):
+                raise RuntimeError("Automation write lost its expected-state race")
+            source_exists = db.execute(
+                """SELECT 1 FROM messages AS m WHERE m.provider = ? AND m.account_id = ?
+                AND message_source_key(m.provider, m.account_id, m.provider_message_id) = ?""",
+                (row["provider"], row["account_id"], row["source_message_key"]),
+            ).fetchone()
+            proposal_exists = db.execute(
+                """SELECT 1 FROM automation_proposal_payloads
+                WHERE run_id = ? AND payload_id = ? AND proposal_version = ?
+                  AND proposal_sha256 = ?""",
+                (
+                    run_id,
+                    row["current_payload_id"],
+                    int(write["proposal_version"]),
+                    str(write["proposal_sha256"]),
+                ),
+            ).fetchone()
+            next_version = expected_state_version + 1
+            if source_exists is None or proposal_exists is None:
+                db.execute("DELETE FROM automation_extraction_payloads WHERE run_id = ?", (run_id,))
+                db.execute("DELETE FROM automation_proposal_payloads WHERE run_id = ?", (run_id,))
+                next_state = "source_unavailable"
+                failure_code = "source_unavailable"
+            else:
+                next_state = "writing"
+                failure_code = None
+                changed_write = db.execute(
+                    """UPDATE automation_calendar_writes SET status = 'writing',
+                        submitted_at = ?, failure_code = NULL, updated_at = ?
+                    WHERE run_id = ? AND status = 'authorized'""",
+                    (stamp, stamp, run_id),
+                )
+                if changed_write.rowcount != 1:
+                    raise RuntimeError("Automation write lost its expected-state race")
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?,
+                    failure_code = ?, review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = 'write_authorized' AND state_version = ?""",
+                (next_state, next_version, failure_code, stamp, run_id, expected_state_version),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation write lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state="write_authorized",
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=failure_code,
+                created_at=stamp,
+                payload_id=(str(row["current_payload_id"]) if proposal_exists else None),
+                payload_sha256=(str(row["current_payload_sha256"]) if proposal_exists else None),
+                transaction_id=str(write["transaction_id"]),
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation write transition was not readable")
+        return _automation_run(updated)
+
+    def transition_automation_calendar_write(
+        self,
+        run_id: str,
+        expected_state_version: int,
+        *,
+        next_state: str,
+        failure_code: str | None = None,
+        graph_event_id: str | None = None,
+        now: datetime | None = None,
+    ) -> AutomationRun:
+        allowed = {
+            ("writing", "completed"),
+            ("writing", "failed"),
+            ("writing", "unresolved"),
+            ("unresolved", "reconciling"),
+            ("reconciling", "completed"),
+            ("reconciling", "unresolved"),
+        }
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            write = db.execute(
+                "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None or write is None:
+                raise KeyError(run_id)
+            previous_state = str(row["state"])
+            if (
+                (previous_state, next_state) not in allowed
+                or int(row["state_version"]) != expected_state_version
+            ):
+                raise RuntimeError("Automation write transition lost its expected-state race")
+            if next_state == "completed":
+                if not isinstance(graph_event_id, str) or not 1 <= len(
+                    graph_event_id.encode("utf-8")
+                ) <= 512:
+                    raise ValueError("Graph event identity is invalid")
+                write_status = "completed"
+                completed_at = stamp
+                stored_failure = None
+            else:
+                if graph_event_id is not None:
+                    raise ValueError("Only completed writes may record a Graph event identity")
+                if next_state in {"failed", "unresolved"}:
+                    if not isinstance(failure_code, str) or not 1 <= len(failure_code) <= 64:
+                        raise ValueError("Automation write failure code is invalid")
+                else:
+                    failure_code = None
+                write_status = next_state
+                completed_at = None
+                stored_failure = failure_code
+            next_version = expected_state_version + 1
+            changed_write = db.execute(
+                """UPDATE automation_calendar_writes SET status = ?, graph_event_id = ?,
+                    failure_code = ?, completed_at = ?, updated_at = ?
+                WHERE run_id = ? AND status = ?""",
+                (
+                    write_status,
+                    graph_event_id,
+                    stored_failure,
+                    completed_at,
+                    stamp,
+                    run_id,
+                    write["status"],
+                ),
+            )
+            if changed_write.rowcount != 1:
+                raise RuntimeError("Automation write transition lost its expected-state race")
+            changed = db.execute(
+                """UPDATE automation_runs SET state = ?, state_version = ?,
+                    failure_code = ?, review_notified_at = NULL, updated_at = ?
+                WHERE run_id = ? AND state = ? AND state_version = ?""",
+                (
+                    next_state,
+                    next_version,
+                    stored_failure,
+                    stamp,
+                    run_id,
+                    previous_state,
+                    expected_state_version,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("Automation write transition lost its expected-state race")
+            _append_automation_event(
+                db,
+                run_id=run_id,
+                sequence_no=next_version - 1,
+                previous_state=previous_state,
+                next_state=next_state,
+                state_version=next_version,
+                automation_id=str(row["automation_id"]),
+                automation_version=int(row["automation_version"]),
+                extraction_schema_version=int(row["extraction_schema_version"]),
+                calendar_principal_key=str(row["calendar_principal_key"]),
+                transition_kind=next_state,
+                failure_code=stored_failure,
+                created_at=stamp,
+                payload_id=(
+                    str(row["current_payload_id"])
+                    if row["current_payload_id"] is not None
+                    else None
+                ),
+                payload_sha256=(
+                    str(row["current_payload_sha256"])
+                    if row["current_payload_sha256"] is not None
+                    else None
+                ),
+                transaction_id=str(write["transaction_id"]),
+                graph_event_id=graph_event_id,
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation write outcome was not readable")
         return _automation_run(updated)
 
     def reserve_automation_extraction(
@@ -4340,9 +4963,12 @@ class Store:
         proposal_rows = db.execute(
             f"""SELECT p.*, r.state AS run_state, r.state_version, r.provider, r.account_id,
                 a.display_name AS account_display_name,
-                a.address AS account_address, m.message_id
+                a.address AS account_address, m.message_id,
+                w.status AS write_status, w.graph_event_id
             FROM automation_proposal_payloads AS p
-            JOIN automation_runs AS r ON r.run_id = p.run_id
+            JOIN automation_runs AS r
+              ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
+            LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
             JOIN messages AS m
               ON m.provider = r.provider
              AND m.account_id = r.account_id
@@ -4353,7 +4979,10 @@ class Store:
               ON a.provider = r.provider AND a.account_id = r.account_id
             WHERE m.message_id IN ({placeholders})
               AND (
-                  (r.state = 'awaiting_confirmation' AND p.status = 'accepted')
+                  (r.state IN (
+                      'awaiting_confirmation', 'declined', 'write_authorized', 'writing',
+                      'unresolved', 'reconciling', 'completed', 'failed'
+                  ) AND p.status = 'accepted')
                   OR (r.state = 'manual_review' AND p.status = 'no_suggestions')
               )""",
             message_ids,
@@ -4444,6 +5073,14 @@ class Store:
                 "empty_reason": proposal.empty_reason,
                 "observed_at": proposal.observed_at,
                 "expires_at": proposal.expires_at,
+                "write_status": (
+                    str(row["write_status"]) if row["write_status"] is not None else None
+                ),
+                "graph_event_id": (
+                    str(row["graph_event_id"])
+                    if row["graph_event_id"] is not None
+                    else None
+                ),
             }
         for message_id, attachments in attachments_by_message.items():
             for attachment in attachments:
