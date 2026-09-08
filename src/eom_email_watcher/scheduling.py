@@ -353,7 +353,7 @@ def _evidence_source_contexts(
                     if (position := raw_candidate.find(delimiter, raw_quote_end)) >= 0
                 )
                 right = min(right_candidates, default=len(raw_candidate))
-            context = _canonical_evidence_text(raw_candidate[left:right])
+            context = raw_candidate[left:right].strip()
             if context and context not in contexts:
                 contexts.append(context)
             search_at = quote_at + 1
@@ -564,13 +564,23 @@ def _range_source_options(
     month_pattern = "|".join(
         sorted({name for month in _MONTHS for name in (month, month[:3])}, key=len, reverse=True)
     )
-    option_delimiters = tuple(
+    option_delimiters = list(
         re.finditer(
-            rf"(?:\bor\b|;|\n|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|[A-Za-z]+\s+\d{{1,2}}\s*:(?!\d)\s*(?=[A-Za-z])|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
+            rf"(?:\bor\b|;|,\s*(?=(?:day\s+after\s+tomorrow|today|tomorrow|\d{{4}}-\d{{2}}-\d{{2}}|(?:{month_pattern})\s+\d{{1,2}}|(?:option|choice|alternative|slot)\s+\d{{1,2}}\s*:\s*(?=[A-Za-z0-9])|\d{{1,2}}[/-]\d{{1,2}}|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b))",
             evidence_text,
             re.IGNORECASE,
         )
     )
+    for newline in re.finditer(r"\n", evidence_text):
+        left = evidence_text[: newline.start()].rstrip().casefold()
+        right = evidence_text[newline.end() :].lstrip()
+        continues_month_day = (
+            re.search(rf"\b(?:{month_pattern})\s*$", left) is not None
+            and re.match(r"\d{1,2}\b", right) is not None
+        )
+        if not continues_month_day:
+            option_delimiters.append(newline)
+    option_delimiters.sort(key=lambda match: match.start())
     supported_options: list[str] = []
     start_matches = (
         *((match, False) for match in _time_source_matches(start, evidence_text, zone=zone)),

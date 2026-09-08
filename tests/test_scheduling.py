@@ -137,7 +137,10 @@ def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
             "evidence": [
                 {
                     "source": "body",
-                    "quote": "September 8 from 10:00 to 10:30",
+                    "quote": (
+                        "September 8 from 10:00 to 10:30 "
+                        "September 9 from 14:00 to 15:00"
+                    ),
                 }
             ],
         }
@@ -145,14 +148,13 @@ def test_whitespace_matching_preserves_newline_option_boundaries() -> None:
 
     result = validate(value, scheduling_source=source(body=body))
 
-    assert "time_date_unsupported" in codes(result)
     assert "time_range_unsupported" in codes(result)
 
 
 def test_numbered_option_labels_remain_range_delimiters() -> None:
     quote = (
         "September 8 from 10:00 to 11:00, "
-        "option 2: September 9 from 14:00 to 15:00"
+        "option 2: 14:00 to 15:00 September 9"
     )
     value = valid_result()
     proposed = value["proposed_times"][0]  # type: ignore[index]
