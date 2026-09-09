@@ -237,6 +237,13 @@ def test_entitlement_dynamically_hides_and_restores_both_discovery_versions(
         assert connect.discover_summary_capability(tmp_path, client=client).provider is None
         assert connect.discover_capabilities(tmp_path, client=client).items == ()
         assert len(requests) == 2
+        reconciliation_catalog = connect.discover_capabilities_for_reconciliation(
+            tmp_path,
+            client=client,
+            provider_instance_id=INSTANCE_A,
+        )
+        assert len(reconciliation_catalog.items) == 1
+        assert len(requests) == 3
 
 
 @pytest.mark.parametrize(

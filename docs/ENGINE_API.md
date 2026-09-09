@@ -68,7 +68,8 @@ only to stderr.
 | `connect.entitlement.status` | `{}` | Claim-free shared-license state and active boolean |
 | `connect.entitlement.install` | absolute `source_path` | Verify and atomically install an active signed license at the internally derived shared path |
 | `connect.attachment.capabilities` | `message_id`, `part_id` | Every live v2 capability compatible with the inventoried attachment; transport credentials are not exposed |
-| `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate and invoke one selected v2 capability; return or reuse its durable terminal result |
+| `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate, enqueue, and attempt one selected v2 capability; return or reuse its durable terminal result |
+| `connect.queue.pump` | optional `limit` from 1 through 25 | Drain due provider-lane heads, preserving durable identity, ordering, and retry state |
 | `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
 | `connect.output.export` | attachment, `job_id`, `artifact_id`, `destination_dir` | Export one validated completed output to a private random `.bin` file for the trusted host |
 | `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
@@ -311,6 +312,16 @@ authoritative terminal state for a previously accepted job under the same select
 consumer persists that state without reopening Gmail or creating another request.
 Completed and failed requests replay from durable state before live discovery, so a provider outage
 cannot erase an already authoritative result. Distinct caller request IDs remain distinct work.
+
+Retryable `PROVIDER_BUSY` is a durable pre-admission refusal, not a terminal
+error: the job returns to `waiting` with 2/4/8/16/30-second bounded backoff.
+Ambiguous submission failures and provider-owned polling failures remain in
+`reconciling` or `provider_owned` state and are queried before any possible
+same-identity resubmission. `connect.queue.pump` operates only on each due,
+authoritative lane head and may drain the next waiting job after a terminal
+result. It performs no provider selection or provider-side queueing. GET-only
+reconciliation remains available after entitlement expiry, while every proven
+new POST revalidates the signed Connect entitlement.
 
 `connect.output.present` revalidates stored output integrity and returns only bounded UTF-8 text or
 the known document-summary schema to frontend code; every other media type is opaque. The trusted

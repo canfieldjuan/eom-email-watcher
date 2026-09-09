@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -35,9 +36,12 @@ from .config import (
     update_settings,
 )
 from .db import (
+    CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
+    CONNECT_RETRY_DELAYS_SECONDS,
     CalendarEventMutation,
     CalendarEventProjection,
     CalendarGrant,
+    ConnectDispatch,
     ConnectJob,
     ConnectOutput,
     ConnectQueueFull,
@@ -67,6 +71,7 @@ from .imap import (
 from .locking import (
     connect_lane_lock_path,
     connect_operation_lock,
+    connect_source_lock_path,
     operation_lock,
     operation_lock_supported,
     operation_lock_uses_soft_fallback,
@@ -2346,31 +2351,6 @@ def _run_generic_connect_job(
     client = connect.ConnectV2Client(capability)
     try:
         initial = client.submit(job, content) if content is not None else client.get(job)
-        persisted = _apply_connect_update(runtime.store, initial)
-        if persisted.status == "completed":
-            return _generic_connect_result(persisted)
-        if persisted.status == "failed":
-            raise _stored_connect_failure(persisted)
-
-        def persist_update(update: connect.CapabilityJobUpdate) -> ConnectJob:
-            nonlocal persisted
-            persisted = _apply_connect_update(runtime.store, update)
-            return persisted
-
-        final = client.wait_for_terminal(
-            job,
-            initial,
-            persist_update,
-        )
-        if final.status == "failed":
-            if final.error is None:
-                raise RuntimeError("Failed Connect v2 job omitted its error")
-            raise final.error
-        if final.status != "completed" or final.result is None:
-            raise RuntimeError("Connect v2 job completed without a result")
-        if persisted.status != "completed":
-            persisted = runtime.store.connect_job(job.job_id) or persisted
-        return _generic_connect_result(persisted)
     except connect.ConnectError as exc:
         if content is not None and not exc.retryable and exc.code != "JOB_NOT_FOUND":
             try:
@@ -2378,6 +2358,97 @@ def _run_generic_connect_job(
             except Exception:
                 logger.exception("Connect v2 failure could not be persisted")
                 raise RuntimeError("Connect failure could not be persisted safely") from exc
+        raise
+    persisted = _apply_connect_update(runtime.store, initial)
+    if persisted.status == "completed":
+        return _generic_connect_result(persisted)
+    if persisted.status == "failed":
+        raise _stored_connect_failure(persisted)
+
+    def persist_update(update: connect.CapabilityJobUpdate) -> ConnectJob:
+        nonlocal persisted
+        persisted = _apply_connect_update(runtime.store, update)
+        return persisted
+
+    final = client.wait_for_terminal(
+        job,
+        initial,
+        persist_update,
+    )
+    if final.status == "failed":
+        if final.error is None:
+            raise RuntimeError("Failed Connect v2 job omitted its error")
+        raise final.error
+    if final.status != "completed" or final.result is None:
+        raise RuntimeError("Connect v2 job completed without a result")
+    if persisted.status != "completed":
+        persisted = runtime.store.connect_job(job.job_id) or persisted
+    return _generic_connect_result(persisted)
+
+
+def _connect_retry_delay(failure_count: int) -> int:
+    if failure_count < 0:
+        raise ValueError("Connect retry failure count cannot be negative")
+    return CONNECT_RETRY_DELAYS_SECONDS[
+        min(failure_count, len(CONNECT_RETRY_DELAYS_SECONDS) - 1)
+    ]
+
+
+def _defer_generic_connect_error(
+    runtime: Runtime,
+    job_id: str,
+    error: connect.ConnectError,
+    *,
+    submitted: bool,
+) -> None:
+    dispatch = runtime.store.connect_dispatch(job_id)
+    current = runtime.store.connect_job(job_id)
+    if dispatch is None or current is None or current.status not in {
+        "requested",
+        "accepted",
+        "processing",
+    }:
+        return
+    if (
+        submitted
+        and current.status == "requested"
+        and dispatch.state == "dispatching"
+        and error.code == "PROVIDER_BUSY"
+        and error.retryable
+    ):
+        runtime.store.defer_connect_job(
+            job_id=job_id,
+            expected_dispatch_state=dispatch.state,
+            next_dispatch_state="waiting",
+            error_code=error.code,
+            error_message=str(error),
+            delay_seconds=_connect_retry_delay(max(dispatch.attempt_count - 1, 0)),
+        )
+        return
+    next_state = "provider_owned" if current.status in {"accepted", "processing"} else "reconciling"
+    runtime.store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state=dispatch.state,
+        next_dispatch_state=next_state,
+        error_code=error.code,
+        error_message=str(error),
+        delay_seconds=_connect_retry_delay(dispatch.reconciliation_failure_count),
+    )
+
+
+def _require_connect_entitlement_for_job(
+    runtime: Runtime,
+    job_id: str,
+    capability: connect.DiscoveredCapability,
+) -> None:
+    try:
+        connect.require_connect_entitlement()
+    except connect.ConnectError as exc:
+        try:
+            _mark_connect_failed(runtime.store, job_id, capability, exc)
+        except Exception:
+            logger.exception("Connect entitlement failure could not be persisted")
+            raise RuntimeError("Connect entitlement failure could not be persisted safely") from exc
         raise
 
 
@@ -2390,10 +2461,13 @@ def _query_generic_connect_job(
         return _run_generic_connect_job(runtime, capability, job, None)
     except connect.ConnectError as exc:
         current = runtime.store.connect_job(job.job_id)
+        dispatch = runtime.store.connect_dispatch(job.job_id)
         if (
             exc.code == "JOB_NOT_FOUND"
             and current is not None
-            and current.status in {"requested", "accepted", "processing"}
+            and current.status == "requested"
+            and dispatch is not None
+            and dispatch.highest_provider_state == "requested"
         ):
             return None
         raise
@@ -2421,6 +2495,232 @@ def _require_generic_connect_lane_lock(
             "Connect provider dispatch requires native operation locking.",
         )
     return lock_path
+
+
+def _require_generic_connect_source_lock(runtime: Runtime, message_id: str) -> Path:
+    lock_path = connect_source_lock_path(runtime.store.path, message_id)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "connect_queue_unavailable",
+            "Connect attachment handoff requires native operation locking.",
+        )
+    return lock_path
+
+
+def _fail_generic_connect_source(
+    runtime: Runtime,
+    job_id: str,
+    capability: connect.DiscoveredCapability,
+) -> None:
+    _mark_connect_failed(
+        runtime.store,
+        job_id,
+        capability,
+        connect.ConnectError(
+            "CONNECT_SOURCE_UNAVAILABLE",
+            "The source attachment is no longer available for handoff.",
+        ),
+    )
+
+
+def _fail_generic_connect_record(
+    runtime: Runtime,
+    job: ConnectJob,
+    *,
+    code: str,
+    message: str,
+) -> None:
+    if job.provider_app_id is None or job.provider_instance_id is None:
+        raise RuntimeError("Connect v2 job is missing provider provenance")
+    runtime.store.transition_connect_job(
+        job_id=job.job_id,
+        expected_state=job.status,
+        next_state="failed",
+        provider_app_id=job.provider_app_id,
+        provider_instance_id=job.provider_instance_id,
+        error={"code": code, "message": message, "retryable": False},
+    )
+
+
+def _submit_generic_connect_job(
+    runtime: Runtime,
+    capability: connect.DiscoveredCapability,
+    tracked: connect.PreparedCapabilityJob,
+    message_id: str,
+    content: Callable[[], bytes],
+) -> dict[str, object]:
+    source_lock = _require_generic_connect_source_lock(runtime, message_id)
+    busy_message = "The Connect source attachment is being changed"
+    try:
+        with connect_operation_lock(source_lock, busy_message):
+            dispatch = runtime.store.connect_dispatch(tracked.job_id)
+            if dispatch is None:
+                raise RuntimeError("Connect source handoff is missing dispatch state")
+            if not dispatch.source_available:
+                _fail_generic_connect_source(runtime, tracked.job_id, capability)
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment is no longer available for handoff.",
+                )
+            try:
+                payload = content()
+            except ApiError as exc:
+                if exc.code != "not_found":
+                    raise
+                _fail_generic_connect_source(runtime, tracked.job_id, capability)
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment is no longer available for handoff.",
+                ) from exc
+            except (MailboxAccountUnavailable, MailboxError) as exc:
+                refreshed = runtime.store.connect_dispatch(tracked.job_id)
+                if refreshed is None:
+                    raise RuntimeError("Connect source retry is missing dispatch state") from exc
+                runtime.store.defer_connect_job(
+                    job_id=tracked.job_id,
+                    expected_dispatch_state=refreshed.state,
+                    next_dispatch_state="waiting",
+                    error_code="CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE",
+                    error_message="The source attachment could not be fetched.",
+                    delay_seconds=_connect_retry_delay(max(refreshed.attempt_count - 1, 0)),
+                )
+                raise ApiError(
+                    "connect_source_temporarily_unavailable",
+                    "The source attachment could not be fetched; it remains queued.",
+                ) from exc
+            if (
+                len(payload) != tracked.artifact.byte_size
+                or hashlib.sha256(payload).hexdigest() != tracked.artifact.sha256
+            ):
+                _fail_generic_connect_source(runtime, tracked.job_id, capability)
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment changed before handoff.",
+                )
+            return _run_generic_connect_job(runtime, capability, tracked, payload)
+    except RuntimeError as exc:
+        if str(exc) != busy_message:
+            raise
+        dispatch = runtime.store.connect_dispatch(tracked.job_id)
+        if dispatch is None:
+            raise RuntimeError("Connect source retry is missing dispatch state") from exc
+        runtime.store.defer_connect_job(
+            job_id=tracked.job_id,
+            expected_dispatch_state=dispatch.state,
+            next_dispatch_state="waiting",
+            error_code="CONNECT_SOURCE_LOCKED",
+            error_message="The source attachment is being changed.",
+            delay_seconds=2,
+        )
+        raise ApiError(
+            "connect_job_in_progress",
+            "The source attachment is being changed; the job remains queued.",
+        ) from exc
+
+
+def _run_claimed_generic_connect_job(
+    runtime: Runtime,
+    capability: connect.DiscoveredCapability,
+    claimed_job: ConnectJob,
+    dispatch: ConnectDispatch,
+    content: Callable[[], bytes],
+    *,
+    reconcile_first: bool = False,
+) -> dict[str, object]:
+    tracked = _tracked_generic_job(claimed_job, capability)
+    if dispatch.state == "dispatching" and not reconcile_first:
+        _require_connect_entitlement_for_job(
+            runtime,
+            tracked.job_id,
+            capability,
+        )
+        try:
+            return _submit_generic_connect_job(
+                runtime,
+                capability,
+                tracked,
+                claimed_job.message_id,
+                content,
+            )
+        except connect.ConnectError as exc:
+            _defer_generic_connect_error(
+                runtime,
+                tracked.job_id,
+                exc,
+                submitted=True,
+            )
+            raise
+
+    try:
+        reconciled = _query_generic_connect_job(runtime, capability, tracked)
+    except connect.ConnectError as exc:
+        _defer_generic_connect_error(
+            runtime,
+            tracked.job_id,
+            exc,
+            submitted=False,
+        )
+        raise
+    if reconciled is not None:
+        return reconciled
+    refreshed = runtime.store.connect_job(claimed_job.job_id)
+    if refreshed is None:
+        raise RuntimeError("Connect v2 job disappeared during reconciliation")
+    if refreshed.status == "completed":
+        return _generic_connect_result(refreshed)
+    if refreshed.status == "failed":
+        raise _stored_connect_failure(refreshed)
+    tracked = _tracked_generic_job(refreshed, capability)
+    if not capability.accepts_artifact(tracked.artifact.media_type, tracked.artifact.byte_size):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment is no longer accepted by the selected capability.",
+        )
+    try:
+        runtime.store.reset_connect_job_for_resubmission(
+            job_id=tracked.job_id,
+            expected_state=refreshed.status,
+            provider_app_id=capability.app_id,
+            provider_instance_id=capability.instance_id,
+        )
+        reclaimed = runtime.store.claim_connect_lane_head(
+            provider_app_id=capability.app_id,
+            provider_instance_id=capability.instance_id,
+            expected_job_id=tracked.job_id,
+        )
+        if reclaimed is None or reclaimed[1].state != "dispatching":
+            raise RuntimeError("Connect job could not reclaim its provider lane")
+    except RuntimeError as exc:
+        concurrent = runtime.store.connect_job(tracked.job_id)
+        if concurrent is not None and concurrent.status == "completed":
+            return _generic_connect_result(concurrent)
+        if concurrent is not None and concurrent.status == "failed":
+            raise _stored_connect_failure(concurrent) from exc
+        raise ApiError(
+            "connect_job_in_progress",
+            "The local capability job changed while it was being reconciled.",
+        ) from exc
+    _require_connect_entitlement_for_job(
+        runtime,
+        tracked.job_id,
+        capability,
+    )
+    try:
+        return _submit_generic_connect_job(
+            runtime,
+            capability,
+            tracked,
+            refreshed.message_id,
+            content,
+        )
+    except connect.ConnectError as exc:
+        _defer_generic_connect_error(
+            runtime,
+            tracked.job_id,
+            exc,
+            submitted=True,
+        )
+        raise
 
 
 def _resume_generic_connect_job(
@@ -2451,53 +2751,14 @@ def _resume_generic_connect_job(
                     "The capability job is queued behind earlier provider work.",
                 )
             claimed_job, dispatch = claimed
-            tracked = _tracked_generic_job(claimed_job, capability)
-            if dispatch.state == "dispatching" and not reconcile_first:
-                return _run_generic_connect_job(runtime, capability, tracked, content())
-
-            reconciled = _query_generic_connect_job(runtime, capability, tracked)
-            if reconciled is not None:
-                return reconciled
-            refreshed = runtime.store.connect_job(active.job_id)
-            if refreshed is None:
-                raise RuntimeError("Connect v2 job disappeared during reconciliation")
-            if refreshed.status == "completed":
-                return _generic_connect_result(refreshed)
-            if refreshed.status == "failed":
-                raise _stored_connect_failure(refreshed)
-            tracked = _tracked_generic_job(refreshed, capability)
-            if not capability.accepts_artifact(
-                tracked.artifact.media_type, tracked.artifact.byte_size
-            ):
-                raise ApiError(
-                    "unsupported_attachment",
-                    "The attachment is no longer accepted by the selected capability.",
-                )
-            try:
-                runtime.store.reset_connect_job_for_resubmission(
-                    job_id=tracked.job_id,
-                    expected_state=refreshed.status,
-                    provider_app_id=capability.app_id,
-                    provider_instance_id=capability.instance_id,
-                )
-                reclaimed = runtime.store.claim_connect_lane_head(
-                    provider_app_id=capability.app_id,
-                    provider_instance_id=capability.instance_id,
-                    expected_job_id=tracked.job_id,
-                )
-                if reclaimed is None or reclaimed[1].state != "dispatching":
-                    raise RuntimeError("Connect job could not reclaim its provider lane")
-            except RuntimeError as exc:
-                concurrent = runtime.store.connect_job(tracked.job_id)
-                if concurrent is not None and concurrent.status == "completed":
-                    return _generic_connect_result(concurrent)
-                if concurrent is not None and concurrent.status == "failed":
-                    raise _stored_connect_failure(concurrent) from exc
-                raise ApiError(
-                    "connect_job_in_progress",
-                    "The local capability job changed while it was being reconciled.",
-                ) from exc
-            return _run_generic_connect_job(runtime, capability, tracked, content())
+            return _run_claimed_generic_connect_job(
+                runtime,
+                capability,
+                claimed_job,
+                dispatch,
+                content,
+                reconcile_first=reconcile_first,
+            )
     except RuntimeError as exc:
         if str(exc) == busy_message:
             raise ApiError(
@@ -2505,6 +2766,163 @@ def _resume_generic_connect_job(
                 "Another capability job is using the selected provider.",
             ) from exc
         raise
+
+
+def _discover_persisted_generic_capability(
+    job: ConnectJob,
+    *,
+    require_entitlement: bool,
+) -> tuple[connect.DiscoveredCapability | None, str | None]:
+    if (
+        job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
+        or job.provider_app_id is None
+        or job.provider_app_version is None
+        or job.provider_instance_id is None
+    ):
+        raise RuntimeError("Connect v2 job is missing provider provenance")
+    if require_entitlement:
+        catalog = connect.discover_capabilities(
+            provider_instance_id=job.provider_instance_id,
+        )
+    else:
+        catalog = connect.discover_capabilities_for_reconciliation(
+            provider_instance_id=job.provider_instance_id,
+        )
+    matches = tuple(
+        item
+        for item in catalog.items
+        if item.app_id == job.provider_app_id
+        and item.app_version == job.provider_app_version
+        and item.instance_id == job.provider_instance_id
+        and item.capability_id == job.capability_id
+        and item.capability_version == job.capability_version
+    )
+    if len(matches) == 1:
+        return matches[0], None
+    return None, catalog.diagnostic_code or "capability_unavailable"
+
+
+def _connect_queue_item(runtime: Runtime, job_id: str, outcome: str) -> dict[str, object]:
+    job = runtime.store.connect_job(job_id)
+    dispatch = runtime.store.connect_dispatch(job_id)
+    return {
+        "job_id": job_id,
+        "job_status": job.status if job is not None else "removed",
+        "dispatch_state": dispatch.state if dispatch is not None else "removed",
+        "outcome": outcome,
+    }
+
+
+def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, object]:
+    if head.provider_app_id is None or head.provider_instance_id is None:
+        raise RuntimeError("Connect v2 job is missing provider provenance")
+    lock_path = connect_lane_lock_path(
+        runtime.store.path,
+        protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+        provider_app_id=head.provider_app_id,
+        provider_instance_id=head.provider_instance_id,
+    )
+    if not operation_lock_supported(lock_path):
+        return _connect_queue_item(runtime, head.job_id, "lock_unavailable")
+    busy_message = "Another Connect provider operation is already running"
+    try:
+        with connect_operation_lock(lock_path, busy_message):
+            claimed = runtime.store.claim_connect_lane_head(
+                provider_app_id=head.provider_app_id,
+                provider_instance_id=head.provider_instance_id,
+                expected_job_id=head.job_id,
+            )
+            if claimed is None:
+                return _connect_queue_item(runtime, head.job_id, "not_due")
+            claimed_job, dispatch = claimed
+            proven_new_submission = dispatch.state == "dispatching"
+            if proven_new_submission:
+                try:
+                    connect.require_connect_entitlement()
+                except connect.ConnectError as exc:
+                    _fail_generic_connect_record(
+                        runtime,
+                        claimed_job,
+                        code=exc.code,
+                        message=str(exc),
+                    )
+                    return _connect_queue_item(runtime, head.job_id, "failed")
+            capability, diagnostic = _discover_persisted_generic_capability(
+                claimed_job,
+                require_entitlement=proven_new_submission,
+            )
+            if capability is None:
+                next_state = (
+                    "waiting"
+                    if proven_new_submission
+                    else (
+                        "provider_owned"
+                        if claimed_job.status in {"accepted", "processing"}
+                        else "reconciling"
+                    )
+                )
+                runtime.store.defer_connect_job(
+                    job_id=claimed_job.job_id,
+                    expected_dispatch_state=dispatch.state,
+                    next_dispatch_state=next_state,
+                    error_code=(diagnostic or "provider_unavailable"),
+                    error_message="The durable Connect provider is unavailable.",
+                    delay_seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
+                )
+                return _connect_queue_item(runtime, head.job_id, "deferred")
+
+            def content() -> bytes:
+                try:
+                    attachment = runtime.store.attachment(
+                        claimed_job.message_id,
+                        claimed_job.part_id,
+                    )
+                except KeyError as exc:
+                    raise ApiError("not_found", "Attachment was not found") from exc
+                source = _configured_message_source(runtime, claimed_job.message_id)
+                gateway = _configured_mailbox_gateway(runtime, source)
+                return gateway.attachment_bytes(
+                    source.provider_message_id,
+                    claimed_job.part_id,
+                    attachment.attachment_id,
+                )
+
+            try:
+                _run_claimed_generic_connect_job(
+                    runtime,
+                    capability,
+                    claimed_job,
+                    dispatch,
+                    content,
+                )
+            except (ApiError, connect.ConnectError):
+                return _connect_queue_item(runtime, head.job_id, "deferred_or_failed")
+            return _connect_queue_item(runtime, head.job_id, "completed")
+    except RuntimeError as exc:
+        if str(exc) == busy_message:
+            return _connect_queue_item(runtime, head.job_id, "lock_contended")
+        raise
+
+
+def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"limit"})
+    raw_limit = payload.get("limit", 25)
+    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 25:
+        raise ApiError("invalid_request", "limit must be an integer between 1 and 25")
+    runtime = _runtime(request)
+    items: list[dict[str, object]] = []
+    attempted: set[str] = set()
+    while len(items) < raw_limit:
+        heads = runtime.store.due_connect_lane_heads(limit=raw_limit - len(items))
+        pending = [head for head in heads if head.job_id not in attempted]
+        if not pending:
+            break
+        for head in pending:
+            attempted.add(head.job_id)
+            items.append(_pump_generic_connect_lane(runtime, head))
+            if len(items) == raw_limit:
+                break
+    return {"items": items}
 
 
 def _tracked_invocation_job(
@@ -2615,20 +3033,15 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         capability_ref,
         requested_parameters,
     )
-    cached_content: bytes | None = None
 
     def attachment_content() -> bytes:
-        nonlocal cached_content
-        if cached_content is None:
-            gateway = _configured_mailbox_gateway(runtime, source)
-            cached_content = gateway.attachment_bytes(
-                source.provider_message_id,
-                part_id,
-                attachment.attachment_id,
-            )
-            if len(cached_content) != attachment.byte_size:
-                raise MailboxError("Mailbox attachment size did not match stored metadata")
-        return cached_content
+        gateway = _configured_mailbox_gateway(runtime, source)
+        content = gateway.attachment_bytes(
+            source.provider_message_id,
+            part_id,
+            attachment.attachment_id,
+        )
+        return content
 
     if existing is not None:
         _tracked_invocation_job(
@@ -2657,63 +3070,71 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             "The selected capability requires explicit confirmation.",
         )
     _require_generic_connect_lane_lock(runtime, capability)
-    content = attachment_content()
-    candidate = connect.prepare_capability_job(
-        capability,
-        content,
-        attachment.media_type,
-        attachment.filename,
-        parameters=parameters,
-        confirmed=confirmed,
-        job_id=request_id,
-    )
-    try:
-        created = runtime.store.create_connect_job(
-            job_id=candidate.job_id,
-            message_id=message_id,
-            part_id=part_id,
-            protocol_version=connect.GENERIC_PROTOCOL_VERSION,
-            capability_id=capability.capability_id,
-            capability_version=capability.capability_version,
-            provider_app_id=capability.app_id,
-            provider_app_version=capability.app_version,
-            provider_instance_id=capability.instance_id,
-            input_artifact_id=candidate.artifact.artifact_id,
-            input_media_type=candidate.artifact.media_type,
-            input_byte_size=candidate.artifact.byte_size,
-            input_sha256=candidate.artifact.sha256,
-            input_display_name=candidate.display_name,
-            source_app_id=connect.SOURCE_APP_ID,
-            request_json=candidate.request_json,
+    source_lock = _require_generic_connect_source_lock(runtime, message_id)
+    with connect_operation_lock(
+        source_lock,
+        "The Connect source attachment is being changed",
+    ):
+        _configured_message_source(runtime, message_id)
+        content = attachment_content()
+        if len(content) != attachment.byte_size:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment changed before it could be queued.",
+            )
+        candidate = connect.prepare_capability_job(
+            capability,
+            content,
+            attachment.media_type,
+            attachment.filename,
+            parameters=parameters,
+            confirmed=confirmed,
+            job_id=request_id,
         )
-    except ConnectQueueFull as exc:
-        raise ApiError(
-            "connect_queue_full",
-            "The selected provider already has the maximum number of queued jobs.",
-        ) from exc
-    except sqlite3.IntegrityError as exc:
-        exact = runtime.store.connect_job(request_id)
-        if exact is not None:
-            _tracked_invocation_job(
-                exact,
-                capability,
+        collision = False
+        try:
+            created = runtime.store.create_connect_job(
+                job_id=candidate.job_id,
                 message_id=message_id,
                 part_id=part_id,
-                parameters=parameters,
+                protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+                capability_id=capability.capability_id,
+                capability_version=capability.capability_version,
+                provider_app_id=capability.app_id,
+                provider_app_version=capability.app_version,
+                provider_instance_id=capability.instance_id,
+                input_artifact_id=candidate.artifact.artifact_id,
+                input_media_type=candidate.artifact.media_type,
+                input_byte_size=candidate.artifact.byte_size,
+                input_sha256=candidate.artifact.sha256,
+                input_display_name=candidate.display_name,
+                source_app_id=connect.SOURCE_APP_ID,
+                request_json=candidate.request_json,
             )
-            if exact.status == "completed":
-                return _generic_connect_result(exact)
-            if exact.status == "failed":
-                raise _stored_connect_failure(exact) from exc
-            return _resume_generic_connect_job(
-                runtime,
-                capability,
-                exact,
-                attachment_content,
-                reconcile_first=True,
-            )
-        raise
-    if created.job_id != candidate.job_id:
+        except ConnectQueueFull as exc:
+            raise ApiError(
+                "connect_queue_full",
+                "The selected provider already has the maximum number of queued jobs.",
+            ) from exc
+        except sqlite3.IntegrityError:
+            exact = runtime.store.connect_job(request_id)
+            if exact is not None:
+                _tracked_invocation_job(
+                    exact,
+                    capability,
+                    message_id=message_id,
+                    part_id=part_id,
+                    parameters=parameters,
+                )
+                created = exact
+                collision = True
+            else:
+                raise
+    if created.status == "completed":
+        return _generic_connect_result(created)
+    if created.status == "failed":
+        raise _stored_connect_failure(created)
+    if collision or created.job_id != candidate.job_id:
         _tracked_invocation_job(
             created,
             capability,
@@ -3155,6 +3576,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.entitlement.status": _connect_entitlement_status,
     "connect.output.export": _connect_output_export,
     "connect.output.present": _connect_output_present,
+    "connect.queue.pump": _connect_queue_pump,
     "gmail.authorize": _gmail_authorize,
     "health.get": _health,
     "host.operation_lock": _host_operation_lock,

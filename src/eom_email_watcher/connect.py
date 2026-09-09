@@ -1040,13 +1040,14 @@ def _generic_capabilities(
     )
 
 
-def discover_capabilities(
+def _discover_capabilities(
     runtime_dir: Path | None = None,
     *,
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
+    require_entitlement: bool = True,
 ) -> CapabilityCatalog:
-    if not entitlement.connect_entitlement_decision().is_active:
+    if require_entitlement and not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
     locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
     if locations is None:
@@ -1132,6 +1133,34 @@ def discover_capabilities(
     if not items:
         return CapabilityCatalog((), "provider_unavailable")
     return CapabilityCatalog(items)
+
+
+def discover_capabilities(
+    runtime_dir: Path | None = None,
+    *,
+    client: httpx.Client | None = None,
+    provider_instance_id: str | None = None,
+) -> CapabilityCatalog:
+    return _discover_capabilities(
+        runtime_dir,
+        client=client,
+        provider_instance_id=provider_instance_id,
+        require_entitlement=True,
+    )
+
+
+def discover_capabilities_for_reconciliation(
+    runtime_dir: Path | None = None,
+    *,
+    client: httpx.Client | None = None,
+    provider_instance_id: str,
+) -> CapabilityCatalog:
+    return _discover_capabilities(
+        runtime_dir,
+        client=client,
+        provider_instance_id=provider_instance_id,
+        require_entitlement=False,
+    )
 
 
 def _safe_display_name(filename: str) -> str:

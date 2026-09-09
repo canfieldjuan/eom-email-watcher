@@ -1,5 +1,7 @@
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,16 @@ REQUEST_ID = "66666666-6666-4666-8666-666666666666"
 SECOND_REQUEST_ID = "77777777-7777-4777-8777-777777777777"
 TOKEN = "A" * 43
 PDF = b"%PDF-1.4\nreal attachment\nEOF"
+LOCK_HOLDER = """
+import sys
+from pathlib import Path
+
+from eom_email_watcher.locking import connect_operation_lock
+
+with connect_operation_lock(Path(sys.argv[1]), "busy"):
+    print("locked", flush=True)
+    sys.stdin.read(1)
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +69,59 @@ def api_request(
     }
 
 
+def make_connect_job_due(runtime: Runtime, job_id: str) -> None:
+    with runtime.store.connection() as db:
+        db.execute(
+            "UPDATE connect_job_dispatch SET next_attempt_at = ? WHERE job_id = ?",
+            ("2000-01-01T00:00:00+00:00", job_id),
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure_count", "delay"),
+    [(0, 2), (1, 4), (2, 8), (3, 16), (4, 30), (25, 30)],
+)
+def test_connect_retry_delay_is_bounded(failure_count: int, delay: int) -> None:
+    assert engine_api._connect_retry_delay(failure_count) == delay
+
+
+def test_connect_retry_delay_rejects_negative_counts() -> None:
+    with pytest.raises(ValueError, match="cannot be negative"):
+        engine_api._connect_retry_delay(-1)
+
+
+@pytest.mark.parametrize("limit", [False, 0, 26])
+def test_connect_queue_pump_rejects_invalid_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: object,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+
+    response = engine_api._response(
+        api_request(config_path, "connect.queue.pump", {"limit": limit})
+    )
+
+    assert response["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize("limit", [1, 25])
+def test_connect_queue_pump_accepts_boundary_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+
+    response = engine_api._response(
+        api_request(config_path, "connect.queue.pump", {"limit": limit})
+    )
+
+    assert response["data"] == {"items": []}
+
+
 def seeded_runtime(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -84,6 +149,30 @@ def seeded_runtime(tmp_path: Path):
         ),
     )
     return config_path, runtime
+
+
+def seed_second_attachment(runtime: Runtime) -> None:
+    runtime.store.add_message(
+        message_id="message-2",
+        thread_id=None,
+        sender="second@example.com",
+        sender_name="Second Sender",
+        subject="Second private subject",
+        received_at="2026-08-30T12:01:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        "message-2",
+        (
+            AttachmentDescriptor(
+                "2",
+                "gmail-attachment-2",
+                "invoice-2.pdf",
+                "application/pdf",
+                len(PDF),
+                0,
+            ),
+        ),
+    )
 
 
 def capability(
@@ -121,13 +210,14 @@ def capability(
 def invocation_payload(
     selected: connect.DiscoveredCapability,
     *,
+    message_id: str = "message-1",
     parameters: dict[str, object] | None = None,
     confirmed: bool = False,
     request_id: str = REQUEST_ID,
 ) -> dict[str, object]:
     return {
         "request_id": request_id,
-        "message_id": "message-1",
+        "message_id": message_id,
         "part_id": "2",
         "provider": {
             "app_id": selected.app_id,
@@ -770,7 +860,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         {"target-language": "es"},
         {"target-language": "es"},
     ]
-    assert gmail_reads == 2
+    assert gmail_reads == 4
 
 
 def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
@@ -829,20 +919,532 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
 
     first = engine_api._response(request)
     durable = runtime.store.connect_job(submissions[0][0])
+    early = engine_api._response(request)
+    make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
     assert first["error"]["code"] == "provider_unavailable"
     assert durable is not None
     assert durable.status == "requested"
+    assert early["error"]["code"] == "connect_job_in_progress"
     assert second["ok"] is True
     assert queries == [durable.job_id]
     assert submissions == [
         (durable.job_id, durable.request_json),
         (durable.job_id, durable.request_json),
     ]
-    assert gmail_reads == 2
+    assert gmail_reads == 3
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_queue_pump_retries_provider_busy_with_same_job_after_durable_due_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions: list[str] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class BusyThenCompleteClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            assert content == PDF
+            submissions.append(job.job_id)
+            if len(submissions) == 1:
+                raise connect.ConnectError(
+                    "PROVIDER_BUSY",
+                    "The provider is already processing another job.",
+                    retryable=True,
+                )
+            return update(job, "completed", payload=b"Completed after retry")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", BusyThenCompleteClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    invoked = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+    early = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert invoked["error"]["code"] == "provider_busy"
+    assert dispatch is not None
+    assert dispatch.state == "waiting"
+    assert dispatch.attempt_count == 1
+    assert dispatch.last_error_code == "PROVIDER_BUSY"
+    assert early["data"]["items"] == []
+    assert submissions == [REQUEST_ID]
+
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert pumped["ok"] is True
+    assert pumped["data"]["items"] == [
+        {
+            "job_id": REQUEST_ID,
+            "job_status": "completed",
+            "dispatch_state": "terminal",
+            "outcome": "completed",
+        }
+    ]
+    assert submissions == [REQUEST_ID, REQUEST_ID]
+    assert runtime.store.connect_job(REQUEST_ID).status == "completed"  # type: ignore[union-attr]
+
+
+def test_queue_pump_respects_cross_process_lane_owner_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions: list[str] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class BusyThenCompleteClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            submissions.append(job.job_id)
+            if len(submissions) == 1:
+                raise connect.ConnectError(
+                    "PROVIDER_BUSY",
+                    "The provider is busy.",
+                    retryable=True,
+                )
+            return update(job, "completed", payload=b"Completed after contention")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", BusyThenCompleteClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    make_connect_job_due(runtime, REQUEST_ID)
+    lock_path = engine_api.connect_lane_lock_path(
+        runtime.store.path,
+        protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", LOCK_HOLDER, str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+        contended = engine_api._response(api_request(config_path, "connect.queue.pump"))
+        assert contended["data"]["items"][0]["outcome"] == "lock_contended"
+        assert submissions == [REQUEST_ID]
+    finally:
+        if holder.stdin is not None:
+            holder.stdin.write("\n")
+            holder.stdin.flush()
+        holder.wait(timeout=10)
+
+    recovered = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert recovered["data"]["items"][0]["outcome"] == "completed"
+    assert submissions == [REQUEST_ID, REQUEST_ID]
+
+
+def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    seed_second_attachment(runtime)
+    selected = capability()
+    submissions: list[str] = []
+    queries: list[str] = []
+
+    class FakeGmail:
+        def attachment_bytes(self, provider_message_id, *args) -> bytes:
+            assert provider_message_id in {"message-1", "message-2"}
+            return PDF
+
+    class SerializedClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            assert content == PDF
+            submissions.append(job.job_id)
+            if job.job_id == REQUEST_ID:
+                return update(job, "accepted")
+            return update(job, "completed", payload=b"Second invoice completed")
+
+        def get(self, job):
+            queries.append(job.job_id)
+            return update(job, "completed", payload=b"First invoice completed")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            if job.job_id == REQUEST_ID:
+                raise connect.ConnectError(
+                    "JOB_TIMEOUT",
+                    "The accepted provider job is still running.",
+                    retryable=True,
+                )
+            return initial
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities_for_reconciliation",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", SerializedClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    first = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    second = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(
+                selected,
+                message_id="message-2",
+                request_id=SECOND_REQUEST_ID,
+            ),
+        )
+    )
+
+    assert first["error"]["code"] == "job_timeout"
+    assert second["error"]["code"] == "connect_job_in_progress"
+    assert submissions == [REQUEST_ID]
+    assert runtime.store.connect_dispatch(REQUEST_ID).state == "provider_owned"  # type: ignore[union-attr]
+    assert runtime.store.connect_dispatch(SECOND_REQUEST_ID).state == "waiting"  # type: ignore[union-attr]
+
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert [item["job_id"] for item in pumped["data"]["items"]] == [
+        REQUEST_ID,
+        SECOND_REQUEST_ID,
+    ]
+    assert submissions == [REQUEST_ID, SECOND_REQUEST_ID]
+    assert queries == [REQUEST_ID]
+    assert runtime.store.connect_job(REQUEST_ID).status == "completed"  # type: ignore[union-attr]
+    assert runtime.store.connect_job(SECOND_REQUEST_ID).status == "completed"  # type: ignore[union-attr]
+
+
+def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions = 0
+    queries = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class LostAckThenCompleteClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+        def get(self, job):
+            nonlocal queries
+            queries += 1
+            return update(job, "completed", payload=b"Recovered without entitlement")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            return initial
+
+    discovery_modes: list[str] = []
+
+    def discover(**kwargs):
+        discovery_modes.append("entitlement-gated")
+        return connect.CapabilityCatalog((selected,))
+
+    def reconcile_discovery(**kwargs):
+        discovery_modes.append("reconciliation")
+        return connect.CapabilityCatalog((selected,))
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities_for_reconciliation",
+        reconcile_discovery,
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", LostAckThenCompleteClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    invoked = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    monkeypatch.setattr(
+        engine_api.connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.EXPIRED,
+    )
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert invoked["error"]["code"] == "provider_unavailable"
+    assert pumped["data"]["items"][0]["job_status"] == "completed"
+    assert submissions == 1
+    assert queries == 1
+    assert discovery_modes == ["entitlement-gated", "reconciliation"]
+
+
+def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions = 0
+    queries = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class AcceptedThenMissingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            return update(job, "accepted")
+
+        def get(self, job):
+            nonlocal queries
+            queries += 1
+            raise connect.ConnectError(
+                "JOB_NOT_FOUND",
+                "The accepted job was not found.",
+            )
+
+        def wait_for_terminal(self, job, initial, on_update):
+            raise connect.ConnectError(
+                "JOB_TIMEOUT",
+                "The accepted provider job is still running.",
+                retryable=True,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities_for_reconciliation",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", AcceptedThenMissingClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    invoked = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+
+    assert invoked["error"]["code"] == "job_timeout"
+    assert pumped["data"]["items"][0]["outcome"] == "deferred_or_failed"
+    assert submissions == 1
+    assert queries == 1
+    assert dispatch is not None
+    assert dispatch.state == "provider_owned"
+    assert dispatch.highest_provider_state == "accepted"
+
+
+def test_queue_pump_blocks_a_new_post_after_entitlement_revocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class BusyClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_BUSY",
+                "The provider is busy.",
+                retryable=True,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", BusyClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    invoked = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    monkeypatch.setattr(
+        engine_api.connect.entitlement,
+        "connect_entitlement_decision",
+        lambda: connect.entitlement.EntitlementDecision.EXPIRED,
+    )
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+    job = runtime.store.connect_job(REQUEST_ID)
+
+    assert invoked["error"]["code"] == "provider_busy"
+    assert pumped["data"]["items"][0]["outcome"] == "failed"
+    assert job is not None
+    assert job.status == "failed"
+    assert job.error_code == "CONNECT_ENTITLEMENT_REQUIRED"
+    assert submissions == 1
+
+
+def test_nonretryable_provider_refusal_remains_immediately_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class RejectingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            raise connect.ConnectError(
+                "INPUT_REJECTED",
+                "The provider rejected this input.",
+                retryable=False,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", RejectingClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    response = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    job = runtime.store.connect_job(REQUEST_ID)
+
+    assert response["error"]["code"] == "input_rejected"
+    assert job is not None
+    assert job.status == "failed"
+    assert runtime.store.connect_dispatch(REQUEST_ID).state == "terminal"  # type: ignore[union-attr]
+    assert runtime.store.due_connect_lane_heads() == ()
+
+
+def test_queue_pump_rejects_changed_source_before_a_retry_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    source_bytes = [PDF]
+    submissions = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return source_bytes[0]
+
+    class BusyClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_BUSY",
+                "The provider is busy.",
+                retryable=True,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", BusyClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    source_bytes[0] = PDF.replace(b"real", b"fake")
+    make_connect_job_due(runtime, REQUEST_ID)
+    pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
+    job = runtime.store.connect_job(REQUEST_ID)
+
+    assert pumped["data"]["items"][0]["outcome"] == "deferred_or_failed"
+    assert job is not None
+    assert job.status == "failed"
+    assert job.error_code == "CONNECT_SOURCE_UNAVAILABLE"
+    assert submissions == 1
 
 
 def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
@@ -972,6 +1574,7 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
     )
 
     first = engine_api._response(request)
+    make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
     assert first["error"]["code"] == "provider_unavailable"
@@ -1030,6 +1633,7 @@ def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
             invocation_payload(selected, confirmed=True, request_id=REQUEST_ID),
         )
     )
+    make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(
         api_request(
             config_path,
@@ -1112,6 +1716,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     )
 
     first = engine_api._response(request)
+    make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
     assert first["error"]["code"] == "provider_unavailable"
@@ -1119,7 +1724,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     assert second["data"]["job_id"] == REQUEST_ID
     assert submissions == 1
     assert queries == 1
-    assert gmail_reads == 1
+    assert gmail_reads == 2
     assert raced is True
 
 
@@ -1191,6 +1796,7 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
         return real_transition(**values)
 
     monkeypatch.setattr(runtime.store, "transition_connect_job", racing_transition)
+    make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
     assert first["error"]["code"] == "provider_unavailable"

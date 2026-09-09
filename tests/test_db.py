@@ -3604,6 +3604,125 @@ def test_lane_claim_honors_due_time_deadline_and_expected_head(tmp_path: Path) -
     assert store.connect_dispatch(second_id).state == "terminal"  # type: ignore[union-attr]
 
 
+def test_deferred_lane_head_is_not_due_early_and_preserves_bounded_diagnostic(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_v2_connect_job(store, job_id, now=created_at)
+    claimed = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        now=created_at,
+    )
+    assert claimed is not None
+
+    deferred = store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state="dispatching",
+        next_dispatch_state="waiting",
+        error_code="PROVIDER_BUSY",
+        error_message="busy",
+        delay_seconds=2,
+        now=created_at,
+    )
+
+    assert deferred.next_attempt_at == (created_at + timedelta(seconds=2)).isoformat()
+    assert deferred.last_error_code == "PROVIDER_BUSY"
+    assert deferred.last_error_message == "busy"
+    assert store.due_connect_lane_heads(now=created_at + timedelta(seconds=1)) == ()
+    assert [
+        job.job_id
+        for job in store.due_connect_lane_heads(now=created_at + timedelta(seconds=2))
+    ] == [job_id]
+    near_deadline = created_at + CONNECT_QUEUE_ADMISSION_WINDOW - timedelta(seconds=1)
+    claimed_again = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        now=near_deadline,
+    )
+    assert claimed_again is not None
+    clamped = store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state="dispatching",
+        next_dispatch_state="waiting",
+        error_code="PROVIDER_BUSY",
+        error_message="still busy",
+        delay_seconds=30,
+        now=near_deadline,
+    )
+    assert clamped.next_attempt_at == (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat()
+
+
+def test_due_connect_lane_heads_returns_only_authoritative_head_per_provider(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    first_id = "33333333-3333-4333-8333-333333333333"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    other_lane_id = "55555555-5555-4555-8555-555555555555"
+    create_v2_connect_job(store, first_id, parameters={"sequence": 1}, now=created_at)
+    create_v2_connect_job(store, second_id, parameters={"sequence": 2}, now=created_at)
+    create_v2_connect_job(
+        store,
+        other_lane_id,
+        provider_instance_id="22222222-2222-4222-8222-222222222222",
+        parameters={"sequence": 3},
+        now=created_at,
+    )
+
+    due = store.due_connect_lane_heads(now=created_at)
+
+    assert [job.job_id for job in due] == [first_id, other_lane_id]
+    assert second_id not in {job.job_id for job in due}
+
+
+def test_authoritative_provider_progress_resets_reconciliation_backoff(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_v2_connect_job(store, job_id)
+    claimed = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    assert claimed is not None
+    store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state="dispatching",
+        next_dispatch_state="reconciling",
+        error_code="PROVIDER_UNAVAILABLE",
+        error_message="lost response",
+        delay_seconds=2,
+    )
+
+    accepted = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    dispatch = store.connect_dispatch(job_id)
+
+    assert accepted.status == "accepted"
+    assert dispatch is not None
+    assert dispatch.state == "provider_owned"
+    assert dispatch.reconciliation_failure_count == 0
+    assert dispatch.next_attempt_at is None
+    assert dispatch.last_error_code is None
+    assert dispatch.last_error_message is None
+
+
 def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
