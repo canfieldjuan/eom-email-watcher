@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher import connect, engine_api
+from eom_email_watcher.db import ConnectQueueFull
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -364,6 +365,67 @@ def test_completed_connect_result_remains_readable_after_entitlement_expires(
     assert response["data"]["outputs"][0]["byte_size"] == 5
 
 
+def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    job = connect.prepare_capability_job(
+        selected,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    runtime.store.create_connect_job(
+        job_id=job.job_id,
+        message_id="message-1",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job.job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id=job.provider_app_id,
+        provider_instance_id=job.provider_instance_id,
+    )
+    assert runtime.store.delete_message("message-1") is True
+
+    class CompletingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def get(self, requested_job):
+            return update(requested_job, "accepted")
+
+        def wait_for_terminal(self, requested_job, initial, on_update):
+            assert initial.status == "accepted"
+            completed = update(requested_job, "completed", payload=b"Ephemeral result")
+            on_update(completed)
+            return completed
+
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
+
+    result = engine_api._run_generic_connect_job(runtime, selected, job, None)
+
+    assert result["job_id"] == REQUEST_ID
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert runtime.store.connect_dispatch(REQUEST_ID) is None
+
+
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -545,6 +607,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     )
     discovered_instances: list[str | None] = []
     gmail_reads = 0
+    lane_lock_held = False
 
     def discover(**kwargs):
         discovered_instances.append(kwargs.get("provider_instance_id"))
@@ -552,6 +615,24 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
+
+    class LaneLockProbe:
+        def __enter__(self):
+            nonlocal lane_lock_held
+            lane_lock_held = True
+
+        def __exit__(self, *_args):
+            nonlocal lane_lock_held
+            lane_lock_held = False
+
+    real_claim = runtime.store.claim_connect_lane_head
+
+    def claim_under_lock(**values):
+        assert lane_lock_held is True
+        return real_claim(**values)
+
+    monkeypatch.setattr(engine_api, "connect_operation_lock", lambda *_args: LaneLockProbe())
+    monkeypatch.setattr(runtime.store, "claim_connect_lane_head", claim_under_lock)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -598,9 +679,15 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
 
         def submit(self, job, content):
             assert content == PDF
+            assert lane_lock_held is True
             persisted = runtime.store.connect_job(job.job_id)
+            dispatch = runtime.store.connect_dispatch(job.job_id)
             assert persisted is not None
             assert persisted.status == "requested"
+            assert dispatch is not None
+            assert dispatch.state == "dispatching"
+            assert dispatch.submission_possible is True
+            assert dispatch.attempt_count == 1
             submitted.append(job)
             return update(job, "accepted")
 
@@ -656,6 +743,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     )
 
     assert response["ok"] is True
+    assert lane_lock_held is False
     assert repeated == response
     assert conflict["error"]["code"] == "request_id_conflict"
     assert second_effect["ok"] is True
@@ -757,12 +845,153 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
 
 
-def test_distinct_confirmed_request_ids_remain_distinct_while_active(
+def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    def reject_full_lane(**values):
+        raise ConnectQueueFull("Connect provider queue is full")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(runtime.store, "create_connect_job", reject_full_lane)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("A full provider lane must not reach transport"),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["error"] == {
+        "code": "connect_queue_full",
+        "message": "The selected provider already has the maximum number of queued jobs.",
+    }
+
+
+def test_generic_invoke_rejects_unsupported_lock_before_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: False)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *_args: pytest.fail("Unsupported locking must fail before mailbox access"),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("Unsupported locking must fail before provider access"),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["error"]["code"] == "connect_queue_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert runtime.store.connect_dispatch(REQUEST_ID) is None
+
+
+def test_nonterminal_get_error_preserves_reconciliation_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions = 0
+    queries = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class InconclusiveClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+        def get(self, job):
+            nonlocal queries
+            queries += 1
+            raise connect.ConnectError(
+                "PROVIDER_AUTHENTICATION_FAILED",
+                "The provider could not authenticate this reconciliation.",
+                retryable=False,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", InconclusiveClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    request = api_request(
+        config_path,
+        "connect.attachment.invoke",
+        invocation_payload(selected),
+    )
+
+    first = engine_api._response(request)
+    second = engine_api._response(request)
+
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["error"]["code"] == "provider_authentication_failed"
+    assert submissions == 1
+    assert queries == 1
+    assert runtime.store.connect_job(REQUEST_ID).status == "requested"  # type: ignore[union-attr]
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+    assert dispatch is not None
+    assert dispatch.state == "reconciling"
+    assert dispatch.submission_possible is True
+
+
+def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability(external_effects=True, confirmation_required=True)
     submissions: list[str] = []
+    queries: list[str] = []
 
     class FakeGmail:
         def attachment_bytes(self, *args) -> bytes:
@@ -781,6 +1010,10 @@ def test_distinct_confirmed_request_ids_remain_distinct_while_active(
                 retryable=True,
             )
 
+        def get(self, job):
+            queries.append(job.job_id)
+            return update(job, "completed", payload=b"Recovered")
+
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
         engine_api.connect,
@@ -790,25 +1023,31 @@ def test_distinct_confirmed_request_ids_remain_distinct_while_active(
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", AmbiguousClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
-    for request_id in (REQUEST_ID, SECOND_REQUEST_ID):
-        response = engine_api._response(
-            api_request(
-                config_path,
-                "connect.attachment.invoke",
-                invocation_payload(selected, confirmed=True, request_id=request_id),
-            )
+    first = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, confirmed=True, request_id=REQUEST_ID),
         )
-        assert response["error"]["code"] == "provider_unavailable"
+    )
+    second = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, confirmed=True, request_id=SECOND_REQUEST_ID),
+        )
+    )
 
-    assert submissions == [REQUEST_ID, SECOND_REQUEST_ID]
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["ok"] is True
+    assert second["data"]["job_id"] == REQUEST_ID
+    assert submissions == [REQUEST_ID]
+    assert queries == [REQUEST_ID]
     with runtime.store.connection() as db:
         rows = db.execute(
             "SELECT job_id, status FROM connect_attachment_jobs ORDER BY job_id"
         ).fetchall()
-    assert [tuple(row) for row in rows] == [
-        (REQUEST_ID, "requested"),
-        (SECOND_REQUEST_ID, "requested"),
-    ]
+    assert [tuple(row) for row in rows] == [(REQUEST_ID, "completed")]
 
 
 def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(

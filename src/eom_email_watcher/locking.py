@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -7,6 +9,48 @@ from tempfile import TemporaryDirectory
 
 from filelock import FileLock, SoftFileLock
 from filelock import Timeout as FileLockTimeout
+
+
+def _connect_lock_path(database_path: Path, kind: str, identity: tuple[str, ...]) -> Path:
+    if any(not value for value in identity):
+        raise ValueError("Connect lock identity cannot be empty")
+    encoded = "\0".join((kind, *identity)).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return database_path.parent / ".connect-locks" / f"{kind}-{digest}.lock"
+
+
+def connect_lane_lock_path(
+    database_path: Path,
+    *,
+    protocol_version: int,
+    provider_app_id: str,
+    provider_instance_id: str,
+) -> Path:
+    return _connect_lock_path(
+        database_path,
+        "lane",
+        (str(protocol_version), provider_app_id, provider_instance_id),
+    )
+
+
+def connect_source_lock_path(database_path: Path, message_id: str) -> Path:
+    return _connect_lock_path(database_path, "source", (message_id,))
+
+
+def prepare_private_lock_path(lock_path: Path) -> None:
+    state_directory = lock_path.parent.parent
+    if not state_directory.is_dir():
+        raise RuntimeError("Connect state directory must be initialized before locking")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        lock_path.parent.chmod(0o700)
+
+
+@contextmanager
+def connect_operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
+    prepare_private_lock_path(lock_path)
+    with operation_lock(lock_path, busy_message):
+        yield
 
 
 def operation_lock_uses_soft_fallback(lock_path: Path) -> bool:
