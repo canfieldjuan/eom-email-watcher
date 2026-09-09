@@ -8,13 +8,14 @@ import math
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import MAX_RETENTION_DAYS, normalize_validated_address
+from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
@@ -1166,6 +1167,7 @@ class MessageSource:
     provider: str
     account_id: str
     provider_message_id: str
+    received_at: str
 
 
 @dataclass(frozen=True)
@@ -1837,6 +1839,20 @@ class Store:
             connection.commit()
         finally:
             connection.close()
+
+    @contextmanager
+    def _source_cleanup_locks(self, message_ids: Iterable[str]) -> Iterator[None]:
+        identities = sorted(set(message_ids))
+        with ExitStack() as stack:
+            for message_id in identities:
+                stack.enter_context(
+                    connect_operation_lock(
+                        connect_source_lock_path(self.path, message_id),
+                        "The Connect source attachment is being handed off",
+                        timeout_seconds=-1,
+                    )
+                )
+            yield
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2671,7 +2687,7 @@ class Store:
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
             row = db.execute(
-                """SELECT message_id, provider, account_id, provider_message_id
+                """SELECT message_id, provider, account_id, provider_message_id, received_at
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -2757,21 +2773,21 @@ class Store:
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self.connection() as db:
+        with self._source_cleanup_locks((message_id,)), self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 """SELECT provider, account_id, provider_message_id, received_at
-                FROM messages WHERE message_id = ?""",
+                    FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
             if row is None:
                 return False
             db.execute(
                 """INSERT INTO suppressed_messages(
-                    provider, account_id, message_key, expires_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(provider, account_id, message_key)
-                DO UPDATE SET expires_at = excluded.expires_at""",
+                        provider, account_id, message_key, expires_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(provider, account_id, message_key)
+                    DO UPDATE SET expires_at = excluded.expires_at""",
                 (
                     str(row["provider"]),
                     str(row["account_id"]),
@@ -2795,45 +2811,67 @@ class Store:
     def clear_messages(self, *, now: datetime | None = None) -> int:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            rows = db.execute(
-                """SELECT message_id, provider, account_id, provider_message_id, received_at
-                FROM messages"""
-            ).fetchall()
-            db.executemany(
-                """INSERT INTO suppressed_messages(
-                    provider, account_id, message_key, expires_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(provider, account_id, message_key)
-                DO UPDATE SET expires_at = excluded.expires_at""",
-                [
-                    (
-                        str(row["provider"]),
-                        str(row["account_id"]),
-                        _message_suppression_key(
+            message_ids = [
+                str(row["message_id"])
+                for row in db.execute(
+                    "SELECT message_id FROM messages ORDER BY message_id"
+                ).fetchall()
+            ]
+        deleted = 0
+        for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
+            chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+            with self._source_cleanup_locks(chunk), self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = db.execute(
+                    f"""SELECT message_id, provider, account_id,
+                        provider_message_id, received_at FROM messages
+                        WHERE message_id IN ({placeholders})""",
+                    tuple(chunk),
+                ).fetchall()
+                db.executemany(
+                    """INSERT INTO suppressed_messages(
+                            provider, account_id, message_key, expires_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(provider, account_id, message_key)
+                        DO UPDATE SET expires_at = excluded.expires_at""",
+                    [
+                        (
                             str(row["provider"]),
                             str(row["account_id"]),
-                            str(row["provider_message_id"]),
-                        ),
-                        _suppression_expiry(str(row["received_at"]), stamp),
+                            _message_suppression_key(
+                                str(row["provider"]),
+                                str(row["account_id"]),
+                                str(row["provider_message_id"]),
+                            ),
+                            _suppression_expiry(str(row["received_at"]), stamp),
+                        )
+                        for row in rows
+                    ],
+                )
+                current_ids = [str(row["message_id"]) for row in rows]
+                _mark_automation_sources_unavailable(
+                    db,
+                    current_ids,
+                    updated_at=stamp.isoformat(),
+                )
+                if current_ids:
+                    current_placeholders = ", ".join("?" for _ in current_ids)
+                    cursor = db.execute(
+                        f"DELETE FROM messages WHERE message_id IN ({current_placeholders})",
+                        tuple(current_ids),
                     )
-                    for row in rows
-                ],
-            )
-            _mark_automation_sources_unavailable(
-                db,
-                [str(row["message_id"]) for row in rows],
-                updated_at=stamp.isoformat(),
-            )
-            cursor = db.execute("DELETE FROM messages")
+                    deleted += cursor.rowcount
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
             _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return cursor.rowcount
+        return deleted
 
     def replace_attachments(
         self, message_id: str, attachments: Iterable[AttachmentDescriptor]
     ) -> None:
         items = tuple(attachments)
-        with self.connection() as db:
+        with self._source_cleanup_locks((message_id,)), self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
                 db.execute("SELECT 1 FROM messages WHERE message_id = ?", (message_id,)).fetchone()
@@ -2843,8 +2881,9 @@ class Store:
             db.execute("DELETE FROM message_attachments WHERE message_id = ?", (message_id,))
             db.executemany(
                 """INSERT INTO message_attachments(
-                    message_id, part_id, attachment_id, filename, media_type, byte_size, position
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        message_id, part_id, attachment_id, filename,
+                        media_type, byte_size, position
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         message_id,
@@ -5817,31 +5856,55 @@ class Store:
             cutoff_epoch,
         )
         with self.connection() as db:
+            expired_ids = [
+                str(row["message_id"])
+                for row in db.execute(
+                    f"""SELECT message_id FROM messages
+                    WHERE {expiry_predicate} ORDER BY message_id""",
+                    expiry_parameters,
+                ).fetchall()
+            ]
+        deleted = 0
+        automation_review_required = 0
+        for offset in range(0, len(expired_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
+            chunk = expired_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+            with self._source_cleanup_locks(chunk), self.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                placeholders = ", ".join("?" for _ in chunk)
+                current_expired = [
+                    str(row["message_id"])
+                    for row in db.execute(
+                        f"""SELECT message_id FROM messages
+                            WHERE message_id IN ({placeholders})
+                              AND ({expiry_predicate})""",
+                        (*chunk, *expiry_parameters),
+                    ).fetchall()
+                ]
+                automation_review_required += _mark_automation_sources_unavailable(
+                    db,
+                    current_expired,
+                    updated_at=stamp.isoformat(),
+                )
+                if current_expired:
+                    current_placeholders = ", ".join("?" for _ in current_expired)
+                    cursor = db.execute(
+                        f"DELETE FROM messages WHERE message_id IN ({current_placeholders})",
+                        tuple(current_expired),
+                    )
+                    deleted += cursor.rowcount
+        with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            expired = db.execute(
-                f"SELECT message_id FROM messages WHERE {expiry_predicate}",
-                expiry_parameters,
-            ).fetchall()
-            automation_review_required = _mark_automation_sources_unavailable(
-                db,
-                [str(row["message_id"]) for row in expired],
-                updated_at=stamp.isoformat(),
-            )
-            cursor = db.execute(
-                f"DELETE FROM messages WHERE {expiry_predicate}",
-                expiry_parameters,
-            )
             _purge_expired_automation_tombstones(
                 db,
                 now=stamp.isoformat(),
             )
             db.execute(
                 """DELETE FROM suppressed_messages
-                WHERE julianday(expires_at) IS NULL
-                   OR julianday(expires_at) < julianday(?)""",
+                    WHERE julianday(expires_at) IS NULL
+                       OR julianday(expires_at) < julianday(?)""",
                 (stamp.isoformat(),),
             )
-        return PurgeOutcome(cursor.rowcount, automation_review_required)
+        return PurgeOutcome(deleted, automation_review_required)
 
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         return self.purge_with_outcome(retention_days, now=now).messages

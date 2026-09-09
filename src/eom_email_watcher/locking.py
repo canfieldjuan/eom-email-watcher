@@ -47,9 +47,18 @@ def prepare_private_lock_path(lock_path: Path) -> None:
 
 
 @contextmanager
-def connect_operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
+def connect_operation_lock(
+    lock_path: Path,
+    busy_message: str,
+    *,
+    timeout_seconds: float = 0,
+) -> Iterator[None]:
     prepare_private_lock_path(lock_path)
-    with operation_lock(lock_path, busy_message):
+    with operation_lock(
+        lock_path,
+        busy_message,
+        timeout_seconds=timeout_seconds,
+    ):
         yield
 
 
@@ -92,12 +101,17 @@ def operation_lock_supported(lock_path: Path) -> bool:
 
 
 @contextmanager
-def operation_lock(lock_path: Path, busy_message: str) -> Iterator[None]:
-    """Hold one native, nonblocking process lock on supported desktop platforms."""
+def operation_lock(
+    lock_path: Path,
+    busy_message: str,
+    *,
+    timeout_seconds: float = 0,
+) -> Iterator[None]:
+    """Hold one native process lock on supported desktop platforms."""
     if FileLock is SoftFileLock:
         raise RuntimeError("Production operation locking is not available on this platform")
 
-    lock = FileLock(lock_path, timeout=0, mode=0o600)
+    lock = FileLock(lock_path, timeout=timeout_seconds, mode=0o600)
     try:
         lock.acquire()
     except FileLockTimeout as exc:

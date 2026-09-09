@@ -23,6 +23,17 @@ except RuntimeError as exc:
     raise SystemExit(23 if str(exc) == "watcher busy" else 24) from exc
 """
 
+BLOCKING_LOCK_PROBE = """
+import sys
+from pathlib import Path
+
+from eom_email_watcher.locking import operation_lock
+
+print("waiting", flush=True)
+with operation_lock(Path(sys.argv[1]), "watcher busy", timeout_seconds=-1):
+    print("acquired", flush=True)
+"""
+
 
 def test_native_operation_lock_is_available(tmp_path: Path) -> None:
     assert locking.operation_lock_uses_soft_fallback(tmp_path / "watcher.lock") is False
@@ -53,6 +64,30 @@ def test_operation_lock_rejects_another_process_and_is_reusable(tmp_path: Path) 
         assert _probe_lock(lock_path) == 23
 
     assert _probe_lock(lock_path) == 0
+
+
+def test_operation_lock_can_wait_for_another_process_owner(tmp_path: Path) -> None:
+    lock_path = tmp_path / "watcher.lock"
+
+    with locking.operation_lock(lock_path, "watcher busy"):
+        waiter = subprocess.Popen(
+            [sys.executable, "-c", BLOCKING_LOCK_PROBE, str(lock_path)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert waiter.stdout is not None
+            assert waiter.stdout.readline().strip() == "waiting"
+            with pytest.raises(subprocess.TimeoutExpired):
+                waiter.wait(timeout=0.2)
+        except Exception:
+            waiter.kill()
+            waiter.wait(timeout=10)
+            raise
+
+    assert waiter.stdout is not None
+    assert waiter.stdout.readline().strip() == "acquired"
+    assert waiter.wait(timeout=10) == 0
 
 
 def test_connect_lock_paths_are_private_stable_and_namespaced(tmp_path: Path) -> None:
