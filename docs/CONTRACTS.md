@@ -920,6 +920,18 @@ provider-process/resource property, not a capability-label property. Two
 different durable provider instances may run concurrently. Two capabilities on
 one instance may not.
 
+An active logical invocation is identified by the existing v2 invocation
+fingerprint together with its message and attachment. That fingerprint binds
+the selected provider/version/instance, capability/version, trusted artifact
+identity, and canonical parameters; it excludes the caller-generated `job_id`.
+Enqueue performs active-fingerprint lookup and insertion in one immediate
+transaction backed by a partial unique index over nonterminal v2 jobs. It does
+this before applying the lane cap. If two processes supply different UUIDs for
+the same active logical invocation, exactly one row wins and both callers
+receive that row's original stable `job_id`. A terminal failure permits a new
+explicit invocation; process-local click suppression is never the deduplication
+boundary.
+
 The selected application version, capability identifier/version, parameters,
 artifact identity, and request JSON remain bound to the existing job. A queued
 job never migrates to a new provider instance or newly discovered application
@@ -953,6 +965,8 @@ The dispatch record stores only bounded metadata:
   queue-admission deadline;
 - whether provider submission may have occurred and whether the source is
   still available;
+- the highest authoritative provider state reached, so a later contradictory
+  response cannot erase prior acceptance;
 - the last bounded retryable code/message;
 - timestamps.
 
@@ -1015,6 +1029,14 @@ for every admitted interleaving, at most one Email Watcher process can issue or
 reconcile work for one provider lane, and a later job cannot overtake an earlier
 eligible job after acquiring the lock.
 
+Deadline maintenance is distinct from dispatch selection. In one immediate
+transaction, it conditionally fails every row whose dispatch state is still
+`waiting`, whose submission-possible flag is false, and whose admission
+deadline is due, including non-head rows behind provider-owned work. It never
+changes `dispatching`, `reconciling`, or `provider_owned` rows. The conditional
+state predicate makes the sweep safe if a head claim races it, and expired
+tails cannot consume lane capacity indefinitely.
+
 ## Refusal, ambiguity, and retry rules
 
 ### Authoritative pre-admission refusal
@@ -1042,8 +1064,21 @@ Every later attempt must:
 1. rediscover and authenticate the same durable provider instance;
 2. issue `GET /v2/jobs/{job_id}` first;
 3. persist any authoritative provider state; and
-4. submit again only after `JOB_NOT_FOUND` proves that instance did not retain
-   the job, using the same request and `job_id`.
+4. treat `JOB_NOT_FOUND` as proof of non-retention only when that job has never
+   returned authoritative `accepted` or `processing`; and
+5. before any same-identity resubmission, recheck the original admission
+   deadline, current Connect entitlement, source retention/availability, and
+   trusted artifact identity, then use the same request and `job_id`.
+
+If `JOB_NOT_FOUND` arrives after the admission deadline for a job that was
+never authoritatively accepted, the now-proven-unsubmitted job fails
+`connect_queue_deadline_exceeded` without a POST. If it arrives after an
+authoritative acceptance, it is contradictory evidence: the job remains
+`reconciling`, retains the lane, and exposes the bounded diagnostic for operator
+visibility. A GET error, malformed response, identity mismatch, or nonterminal
+contract violation after possible submission likewise cannot prove that
+provider work stopped and cannot release the lane. Only a valid terminal
+provider job status can make possibly submitted work terminal.
 
 An ambiguous job is never terminally failed merely because its queue-admission
 deadline elapsed. It remains visibly `reconciling` until the provider returns
@@ -1065,14 +1100,23 @@ mailbox event.
   the same admission deadline.
 - If that instance disappears after a possible or confirmed submission, the job
   is `reconciling`, not newly dispatched elsewhere.
-- A nonretryable provider response or proven contract/provenance violation is
-  persisted as the existing terminal `failed` state immediately.
+- A valid nonretryable refusal to a POST is terminal only when it
+  authoritatively proves pre-admission refusal. A valid terminal `failed` job
+  status is terminal. Errors returned by later GETs remain `reconciling`
+  because error retryability does not prove that accepted work stopped.
 - A retryable error not explicitly proven to be pre-admission follows the
   ambiguous-outcome path. The word `retryable` alone never authorizes a second
   POST.
 - `accepted` and `processing` retain the provider lane and use the existing
   status polling/restart reconciliation. Their processing time does not consume
   or extend the queue-admission deadline.
+
+Every POST—initial or same-identity resubmission—revalidates the current signed
+Connect entitlement immediately before handoff. GET-only reconciliation
+continues after entitlement loss because it can only learn the outcome of data
+already handed off. If the provider is proven not to have accepted the job and
+entitlement is no longer active, the job fails terminally with the existing
+`CONNECT_ENTITLEMENT_REQUIRED` error and no POST.
 
 ## Artifact and retention behavior
 
@@ -1082,6 +1126,17 @@ persists only the trusted size/hash identity before returning the queued job.
 After the job reaches the queue head and owns the provider lane, it re-fetches
 the bytes and verifies both values against that enqueue-time identity before
 handoff. A digest first computed at dispatch is not identity verification.
+
+Enqueue and final handoff both compare the source message's received time with
+the current configured retention boundary. A source outside that boundary is
+definitively unavailable even if purge has not yet removed its local row or the
+mailbox still returns bytes; it fails without a POST. A missing source or an
+enqueue-time/final size or digest mismatch is likewise definitive. By contrast,
+a timeout, temporary mailbox outage, or refreshable authorization failure
+before POST returns the job to `waiting` with the deterministic
+2/4/8/16/30-second backoff under its original admission deadline. Transient
+source fetch failure is neither provider ambiguity nor proof that the source is
+absent.
 
 Enqueue, handoff, and source deletion share a native per-message source lock
 stored beside the private database. Enqueue holds it across the source
@@ -1108,9 +1163,11 @@ tombstone retains only the request/provenance hashes and bounded dispatch
 metadata already listed above—never attachment bytes or the email body. If a
 later authoritative `JOB_NOT_FOUND` would normally permit resubmission, source
 unavailability makes it terminal `connect_source_unavailable` and no POST is
-sent. Once the authoritative outcome is atomically recorded, the tombstone is
-eligible for cleanup and cannot continue to own the lane. A queued job never
-keeps the source message or attachment content beyond configured retention.
+sent. A late terminal response for a source-unavailable tombstone is validated,
+then the job and dispatch tombstone are deleted atomically to release the lane;
+its content-bearing `result_json` and output payload are never inserted. A
+queued job never keeps the source message, attachment content, or late result
+content beyond configured retention.
 
 ## Host and UI contract
 
@@ -1125,6 +1182,13 @@ The Tauri host owns queue pumping:
 - when a recorded backoff becomes due;
 - at desktop startup/restart; and
 - opportunistically after an ordinary watcher check.
+
+If a pump cannot acquire a lane lock, the host schedules a coalesced retry for
+that lane after 2 seconds even though it does not mutate the owning process's
+dispatch row. Lock release is not treated as a notification. This bounded
+contention wakeup guarantees that another live process revisits a head left
+`dispatching` when the owner dies; startup remains the recovery wakeup if that
+host also exits.
 
 Only one pump may own a lane because the engine enforces the native lane lock;
 frontend timers are wakeups, not correctness locks. Closing Connect or stopping
@@ -1176,9 +1240,23 @@ Implementation is not complete until current merged code demonstrates:
     automatically without a hot loop or unrelated mailbox event;
 13. transport and dispatch transitions remain compatible after injected crashes
     at every persistence boundary;
-14. the desktop displays waiting, reconciling, running, completed, and failed
+14. concurrent requests with different UUIDs but one active invocation
+    fingerprint return one durable job and execute provider work once;
+15. expired waiting tails fail and stop consuming capacity while a submitted
+    head remains nonterminal;
+16. `JOB_NOT_FOUND` after deadline produces no POST, while `JOB_NOT_FOUND` or
+    other GET errors after authoritative acceptance retain the lane;
+17. entitlement revocation between enqueue and handoff blocks every proven-new
+    POST without blocking GET-only reconciliation;
+18. transient source-fetch failures retry under the original deadline, while a
+    definitive missing, changed, or retention-expired source produces no POST;
+19. a terminal response arriving after source cleanup releases the lane and
+    deletes its tombstone atomically without persisting result content;
+20. a live lock contender schedules a bounded retry and recovers a
+    `dispatching` head after the lock owner exits;
+21. the desktop displays waiting, reconciling, running, completed, and failed
     states from durable engine data rather than inferred frontend state; and
-15. an end-to-end two-invoice proof against the real Invoice Processor shows one
+22. an end-to-end two-invoice proof against the real Invoice Processor shows one
     active job, one automatically retried waiting job, two terminal results, and
     no provider-side queue or operator retry.
 
@@ -1187,8 +1265,11 @@ already present at the cap, just-before/at/after deadline, every backoff edge,
 provider disappearance before and after possible submission, lock contention,
 process death, repeated reconciliation `GET` failures, changed attachment bytes,
 source deletion before/during/after handoff, retention during provider-owned
-work, split-write crash injection, and malformed or nonretryable provider
-errors.
+work, split-write crash injection, different UUIDs for one active fingerprint,
+expired non-head waiters, accepted-then-not-found responses, entitlement
+revocation before resubmission, transient source fetches, startup after the
+retention boundary, late terminal result content, contender wakeup after owner
+death, and malformed or nonretryable provider errors.
 
 ## Landing order
 
