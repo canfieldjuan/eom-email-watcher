@@ -2434,6 +2434,8 @@ def _run_generic_connect_job(
     capability: connect.DiscoveredCapability,
     job: connect.PreparedCapabilityJob,
     content: bytes | None,
+    *,
+    wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     client = connect.ConnectV2Client(capability)
     try:
@@ -2447,7 +2449,14 @@ def _run_generic_connect_job(
                 raise RuntimeError("Connect failure could not be persisted safely") from exc
         raise
     persisted = _apply_connect_update(runtime.store, initial)
-    return _finish_generic_connect_job(runtime, client, job, initial, persisted)
+    return _finish_generic_connect_job(
+        runtime,
+        client,
+        job,
+        initial,
+        persisted,
+        wait_for_terminal=wait_for_terminal,
+    )
 
 
 def _finish_generic_connect_job(
@@ -2456,11 +2465,19 @@ def _finish_generic_connect_job(
     job: connect.PreparedCapabilityJob,
     initial: connect.CapabilityJobUpdate,
     persisted: ConnectJob,
+    *,
+    wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     if persisted.status == "completed":
         return _generic_connect_result(persisted)
     if persisted.status == "failed":
         raise _stored_connect_failure(persisted)
+    if not wait_for_terminal:
+        raise connect.ConnectError(
+            "JOB_TIMEOUT",
+            "The local capability job remains active after this queue pump pass.",
+            retryable=True,
+        )
 
     def persist_update(update: connect.CapabilityJobUpdate) -> ConnectJob:
         nonlocal persisted
@@ -2553,9 +2570,17 @@ def _query_generic_connect_job(
     runtime: Runtime,
     capability: connect.DiscoveredCapability,
     job: connect.PreparedCapabilityJob,
+    *,
+    wait_for_terminal: bool = True,
 ) -> dict[str, object] | None:
     try:
-        return _run_generic_connect_job(runtime, capability, job, None)
+        return _run_generic_connect_job(
+            runtime,
+            capability,
+            job,
+            None,
+            wait_for_terminal=wait_for_terminal,
+        )
     except connect.ConnectError as exc:
         current = runtime.store.connect_job(job.job_id)
         dispatch = runtime.store.connect_dispatch(job.job_id)
@@ -2645,6 +2670,8 @@ def _submit_generic_connect_job(
     tracked: connect.PreparedCapabilityJob,
     message_id: str,
     content: Callable[[], bytes],
+    *,
+    wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     source_lock = _require_generic_connect_source_lock(runtime, message_id)
     busy_message = "The Connect source attachment is being changed"
@@ -2738,7 +2765,14 @@ def _submit_generic_connect_job(
             "The source attachment is being changed; the job remains queued.",
         ) from exc
     try:
-        return _finish_generic_connect_job(runtime, client, tracked, initial, persisted)
+        return _finish_generic_connect_job(
+            runtime,
+            client,
+            tracked,
+            initial,
+            persisted,
+            wait_for_terminal=wait_for_terminal,
+        )
     except connect.ConnectError as exc:
         _defer_generic_connect_error(
             runtime,
@@ -2757,6 +2791,7 @@ def _run_claimed_generic_connect_job(
     content: Callable[[], bytes],
     *,
     reconcile_first: bool = False,
+    wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     tracked = _tracked_generic_job(claimed_job, capability)
     if dispatch.state == "dispatching" and not reconcile_first:
@@ -2771,10 +2806,16 @@ def _run_claimed_generic_connect_job(
             tracked,
             claimed_job.message_id,
             content,
+            wait_for_terminal=wait_for_terminal,
         )
 
     try:
-        reconciled = _query_generic_connect_job(runtime, capability, tracked)
+        reconciled = _query_generic_connect_job(
+            runtime,
+            capability,
+            tracked,
+            wait_for_terminal=wait_for_terminal,
+        )
     except connect.ConnectError as exc:
         _defer_generic_connect_error(
             runtime,
@@ -2833,6 +2874,7 @@ def _run_claimed_generic_connect_job(
         tracked,
         refreshed.message_id,
         content,
+        wait_for_terminal=wait_for_terminal,
     )
 
 
@@ -3045,6 +3087,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     claimed_job,
                     dispatch,
                     content,
+                    wait_for_terminal=False,
                 )
             except (ApiError, connect.ConnectError):
                 return _connect_queue_item(runtime, head.job_id, "deferred_or_failed")

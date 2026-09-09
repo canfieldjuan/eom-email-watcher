@@ -80,6 +80,14 @@ fn wait_for_queue_wakeup_with_clock(
     }
 }
 
+fn queue_refresh_needed(
+    queue_was_active: bool,
+    attempted: usize,
+    next_wake_unix_ms: Option<u64>,
+) -> bool {
+    attempted > 0 || (queue_was_active && next_wake_unix_ms.is_none())
+}
+
 impl ConnectQueueScheduler {
     pub fn start(app: AppHandle, engine: Engine) -> io::Result<Self> {
         let (wake_sender, receiver) = mpsc::sync_channel(1);
@@ -89,11 +97,18 @@ impl ConnectQueueScheduler {
             .name("email-watcher-connect-queue".into())
             .spawn(move || {
                 let mut next_wake_unix_ms = Some(unix_ms_now());
+                let mut queue_was_active = false;
                 while wait_for_queue_wakeup(&receiver, next_wake_unix_ms) {
                     match engine.pump_connect_queue() {
                         Ok(outcome) => {
                             next_wake_unix_ms = outcome.next_wake_unix_ms;
-                            if !outcome.items.is_empty()
+                            let refresh = queue_refresh_needed(
+                                queue_was_active,
+                                outcome.items.len(),
+                                next_wake_unix_ms,
+                            );
+                            queue_was_active = next_wake_unix_ms.is_some();
+                            if refresh
                                 && app
                                     .emit(
                                         CONNECT_QUEUE_EVENT,
@@ -374,5 +389,13 @@ mod tests {
 
         assert!(should_pump);
         assert_eq!(clock_calls.get(), 2);
+    }
+
+    #[test]
+    fn queue_refresh_includes_external_terminal_transition() {
+        assert!(!queue_refresh_needed(false, 0, None));
+        assert!(queue_refresh_needed(false, 1, None));
+        assert!(!queue_refresh_needed(false, 0, Some(100)));
+        assert!(queue_refresh_needed(true, 0, None));
     }
 }

@@ -744,6 +744,8 @@ let inboxItems: InboxItem[] = [];
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
+let connectQueueRefresh: Promise<void> | null = null;
+let connectQueueRefreshAgain = false;
 const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
@@ -2024,6 +2026,28 @@ async function loadInbox(append = false): Promise<void> {
   if (generation === inboxRequestGeneration) setInboxControlsBusy(false);
 }
 
+async function refreshLoadedInboxSpan(): Promise<void> {
+  const loadedCount = inboxItems.length;
+  await loadInbox();
+  while (inboxItems.length < loadedCount && inboxNextCursor) {
+    await loadInbox(true);
+  }
+}
+
+function scheduleConnectQueueRefresh(): void {
+  connectQueueRefreshAgain = true;
+  if (connectQueueRefresh) return;
+  connectQueueRefresh = (async () => {
+    while (connectQueueRefreshAgain) {
+      connectQueueRefreshAgain = false;
+      await refreshLoadedInboxSpan();
+    }
+  })().finally(() => {
+    connectQueueRefresh = null;
+    if (connectQueueRefreshAgain) scheduleConnectQueueRefresh();
+  });
+}
+
 function setHealthValue(element: HTMLElement, ready: boolean, text: string): void {
   element.textContent = text;
   element.dataset.ready = String(ready);
@@ -3283,7 +3307,7 @@ void listen<{
   }
 });
 void listen<{ attempted: number }>("watcher://connect-queue", () => {
-  if (configurationReady) void loadInbox();
+  if (configurationReady) scheduleConnectQueueRefresh();
 });
 window.addEventListener("focus", () => {
   if (configurationReady) {

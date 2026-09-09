@@ -322,7 +322,9 @@ authoritative lane head and may drain the next waiting job after a terminal
 result. Its `next_wake_unix_ms` is the earliest persisted lane retry or waiting
 deadline; `null` means no active queue remains. Inbox capability results expose
 the persisted dispatch state, queue-ahead count, next attempt, and bounded last
-dispatch error for native presentation. It performs no provider selection or provider-side queueing. GET-only
+dispatch error for native presentation. A scheduled pump performs one bounded
+POST or GET round per selected lane head, persists the next poll, and never waits
+for one provider to reach terminal state before advancing another lane. It performs no provider selection or provider-side queueing. GET-only
 reconciliation remains available after entitlement expiry, while every proven
 new POST revalidates the signed Connect entitlement.
 

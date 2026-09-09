@@ -1385,6 +1385,104 @@ def test_queue_pump_respects_cross_process_lane_owner_then_recovers(
     assert submissions == [REQUEST_ID, REQUEST_ID]
 
 
+def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    first_capability = capability(instance_id=INSTANCE_A)
+    second_capability = capability(instance_id=INSTANCE_B)
+    first_job = connect.prepare_capability_job(
+        first_capability,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    second_job = connect.prepare_capability_job(
+        second_capability,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=SECOND_REQUEST_ID,
+    )
+    for job in (first_job, second_job):
+        runtime.store.create_connect_job(
+            job_id=job.job_id,
+            message_id="message-1",
+            part_id="2",
+            protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+            capability_id=job.capability_id,
+            capability_version=job.capability_version,
+            provider_app_id=job.provider_app_id,
+            provider_app_version=job.provider_app_version,
+            provider_instance_id=job.provider_instance_id,
+            input_artifact_id=job.artifact.artifact_id,
+            input_media_type=job.artifact.media_type,
+            input_byte_size=job.artifact.byte_size,
+            input_sha256=job.artifact.sha256,
+            input_display_name=job.display_name,
+            source_app_id=connect.SOURCE_APP_ID,
+            request_json=job.request_json,
+        )
+    submissions: list[str] = []
+    waits = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class OneRoundClient:
+        def __init__(self, selected):
+            self.selected = selected
+
+        def submit(self, job, content):
+            assert content == PDF
+            submissions.append(job.job_id)
+            if self.selected.instance_id == INSTANCE_A:
+                return update(job, "accepted")
+            return update(job, "completed", payload=b"done")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            nonlocal waits
+            waits += 1
+            raise AssertionError("a scheduled queue pass must not wait for terminal state")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities_for_reconciliation",
+        lambda *, provider_instance_id: connect.CapabilityCatalog(
+            tuple(
+                candidate
+                for candidate in (first_capability, second_capability)
+                if candidate.instance_id == provider_instance_id
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda *, provider_instance_id: connect.CapabilityCatalog(
+            tuple(
+                candidate
+                for candidate in (first_capability, second_capability)
+                if candidate.instance_id == provider_instance_id
+            )
+        ),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", OneRoundClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    assert submissions == [REQUEST_ID, SECOND_REQUEST_ID]
+    assert waits == 0
+    assert runtime.store.connect_job(REQUEST_ID).status == "accepted"  # type: ignore[union-attr]
+    assert runtime.store.connect_job(SECOND_REQUEST_ID).status == "completed"  # type: ignore[union-attr]
+
+
 def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

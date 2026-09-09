@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
@@ -68,5 +69,18 @@ test("durable queue state controls capability status text", () => {
       "Read invoice",
     ),
     "Another job is running.",
+  );
+});
+
+test("queue progress refreshes the full loaded inbox span", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+
+  assert.match(
+    source,
+    /while \(inboxItems\.length < loadedCount && inboxNextCursor\) \{\s+await loadInbox\(true\);/,
+  );
+  assert.match(
+    source,
+    /listen<\{ attempted: number \}>\("watcher:\/\/connect-queue", \(\) => \{\s+if \(configurationReady\) scheduleConnectQueueRefresh\(\);/,
   );
 });
