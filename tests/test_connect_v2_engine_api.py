@@ -607,6 +607,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     )
     discovered_instances: list[str | None] = []
     gmail_reads = 0
+    lane_lock_held = False
 
     def discover(**kwargs):
         discovered_instances.append(kwargs.get("provider_instance_id"))
@@ -614,6 +615,24 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
+
+    class LaneLockProbe:
+        def __enter__(self):
+            nonlocal lane_lock_held
+            lane_lock_held = True
+
+        def __exit__(self, *_args):
+            nonlocal lane_lock_held
+            lane_lock_held = False
+
+    real_claim = runtime.store.claim_connect_lane_head
+
+    def claim_under_lock(**values):
+        assert lane_lock_held is True
+        return real_claim(**values)
+
+    monkeypatch.setattr(engine_api, "connect_operation_lock", lambda *_args: LaneLockProbe())
+    monkeypatch.setattr(runtime.store, "claim_connect_lane_head", claim_under_lock)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -660,9 +679,15 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
 
         def submit(self, job, content):
             assert content == PDF
+            assert lane_lock_held is True
             persisted = runtime.store.connect_job(job.job_id)
+            dispatch = runtime.store.connect_dispatch(job.job_id)
             assert persisted is not None
             assert persisted.status == "requested"
+            assert dispatch is not None
+            assert dispatch.state == "dispatching"
+            assert dispatch.submission_possible is True
+            assert dispatch.attempt_count == 1
             submitted.append(job)
             return update(job, "accepted")
 
@@ -718,6 +743,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     )
 
     assert response["ok"] is True
+    assert lane_lock_held is False
     assert repeated == response
     assert conflict["error"]["code"] == "request_id_conflict"
     assert second_effect["ok"] is True

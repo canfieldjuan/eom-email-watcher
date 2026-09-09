@@ -3495,7 +3495,8 @@ def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> N
     )
     assert claimed is not None and claimed[0].job_id == first_id
     assert claimed[1].state == "dispatching"
-    assert claimed[1].submission_possible is False
+    assert claimed[1].submission_possible is True
+    assert claimed[1].attempt_count == 1
     recovered = store.claim_connect_lane_head(
         provider_app_id="translation-provider",
         provider_instance_id="11111111-1111-4111-8111-111111111111",
@@ -3512,6 +3513,78 @@ def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> N
     assert store.connect_job(second_id).error_code == (  # type: ignore[union-attr]
         "connect_queue_deadline_exceeded"
     )
+
+
+def test_lane_claim_honors_due_time_deadline_and_expected_head(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    first_id = "33333333-3333-4333-8333-333333333333"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    create_v2_connect_job(store, first_id, parameters={"sequence": 1}, now=created_at)
+    create_v2_connect_job(store, second_id, parameters={"sequence": 2}, now=created_at)
+
+    assert (
+        store.claim_connect_lane_head(
+            provider_app_id="translation-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            expected_job_id=second_id,
+            now=created_at,
+        )
+        is None
+    )
+    assert store.connect_dispatch(first_id).state == "waiting"  # type: ignore[union-attr]
+    assert store.connect_dispatch(second_id).state == "waiting"  # type: ignore[union-attr]
+
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'reconciling', submission_possible = 1, next_attempt_at = ?
+            WHERE job_id = ?""",
+            ((created_at + timedelta(seconds=30)).isoformat(), first_id),
+        )
+    assert (
+        store.claim_connect_lane_head(
+            provider_app_id="translation-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            now=created_at,
+        )
+        is None
+    )
+    assert (
+        store.claim_connect_lane_head(
+            provider_app_id="translation-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            expected_job_id=first_id,
+            now=created_at,
+        )
+        is None
+    )
+    assert store.connect_dispatch(first_id).next_attempt_at is not None  # type: ignore[union-attr]
+    due = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        expected_job_id=first_id,
+        now=created_at + timedelta(seconds=30),
+    )
+    assert due is not None and due[0].job_id == first_id
+    assert due[1].state == "reconciling"
+    assert due[1].next_attempt_at is None
+
+    expired_at = created_at + CONNECT_QUEUE_ADMISSION_WINDOW
+    expired_claim = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        expected_job_id=second_id,
+        now=expired_at,
+    )
+    assert expired_claim is None
+    assert store.connect_job(second_id).status == "failed"  # type: ignore[union-attr]
+    assert store.connect_job(second_id).error_code == (  # type: ignore[union-attr]
+        "connect_queue_deadline_exceeded"
+    )
+    assert store.connect_dispatch(second_id).state == "terminal"  # type: ignore[union-attr]
 
 
 def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Path) -> None:

@@ -2898,38 +2898,45 @@ class Store:
             ).fetchone()
         return self._connect_dispatch(row) if row else None
 
+    @staticmethod
+    def _expire_waiting_connect_jobs_transaction(
+        db: sqlite3.Connection, stamp: str
+    ) -> tuple[str, ...]:
+        rows = db.execute(
+            """SELECT d.job_id
+            FROM connect_job_dispatch AS d
+            JOIN connect_attachment_jobs AS j ON j.job_id = d.job_id
+            WHERE j.protocol_version = 2
+              AND j.status = 'requested'
+              AND d.state = 'waiting'
+              AND d.submission_possible = 0
+              AND aware_iso_epoch(d.admission_deadline) <= aware_iso_epoch(?)
+            ORDER BY d.admission_deadline, d.job_id""",
+            (stamp,),
+        ).fetchall()
+        job_ids = tuple(str(row["job_id"]) for row in rows)
+        for job_id in job_ids:
+            db.execute(
+                """UPDATE connect_attachment_jobs
+                SET status = 'failed', error_code = 'connect_queue_deadline_exceeded',
+                    error_message = 'The provider queue admission deadline expired.',
+                    error_retryable = 0, updated_at = ?
+                WHERE job_id = ? AND status = 'requested'""",
+                (stamp, job_id),
+            )
+            db.execute(
+                """UPDATE connect_job_dispatch
+                SET state = 'terminal', next_attempt_at = NULL, updated_at = ?
+                WHERE job_id = ? AND state = 'waiting' AND submission_possible = 0""",
+                (stamp, job_id),
+            )
+        return job_ids
+
     def expire_waiting_connect_jobs(self, *, now: datetime | None = None) -> tuple[str, ...]:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute(
-                """SELECT d.job_id
-                FROM connect_job_dispatch AS d
-                JOIN connect_attachment_jobs AS j ON j.job_id = d.job_id
-                WHERE j.protocol_version = 2
-                  AND j.status = 'requested'
-                  AND d.state = 'waiting'
-                  AND d.submission_possible = 0
-                  AND aware_iso_epoch(d.admission_deadline) <= aware_iso_epoch(?)
-                ORDER BY d.admission_deadline, d.job_id""",
-                (stamp,),
-            ).fetchall()
-            job_ids = tuple(str(row["job_id"]) for row in rows)
-            for job_id in job_ids:
-                db.execute(
-                    """UPDATE connect_attachment_jobs
-                    SET status = 'failed', error_code = 'connect_queue_deadline_exceeded',
-                        error_message = 'The provider queue admission deadline expired.',
-                        error_retryable = 0, updated_at = ?
-                    WHERE job_id = ? AND status = 'requested'""",
-                    (stamp, job_id),
-                )
-                db.execute(
-                    """UPDATE connect_job_dispatch
-                    SET state = 'terminal', next_attempt_at = NULL, updated_at = ?
-                    WHERE job_id = ? AND state = 'waiting' AND submission_possible = 0""",
-                    (stamp, job_id),
-                )
+            job_ids = self._expire_waiting_connect_jobs_transaction(db, stamp)
         return job_ids
 
     def claim_connect_lane_head(
@@ -2937,36 +2944,39 @@ class Store:
         *,
         provider_app_id: str,
         provider_instance_id: str,
+        expected_job_id: str | None = None,
         now: datetime | None = None,
     ) -> tuple[ConnectJob, ConnectDispatch] | None:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._expire_waiting_connect_jobs_transaction(db, stamp)
             row = db.execute(
-                """SELECT j.*
+                """SELECT j.*, d.state AS claim_dispatch_state,
+                    CASE WHEN d.next_attempt_at IS NULL
+                              OR aware_iso_epoch(d.next_attempt_at) <= aware_iso_epoch(?)
+                         THEN 1 ELSE 0 END AS claim_is_due
                 FROM connect_attachment_jobs AS j
                 JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
                 WHERE j.protocol_version = 2
                   AND j.provider_app_id = ? AND j.provider_instance_id = ?
                   AND j.status IN ('requested', 'accepted', 'processing')
-                  AND (
-                    d.state IN ('dispatching', 'reconciling', 'provider_owned')
-                    OR (d.state = 'waiting' AND (
-                        d.next_attempt_at IS NULL
-                        OR aware_iso_epoch(d.next_attempt_at) <= aware_iso_epoch(?)
-                    ))
-                  )
+                  AND d.state IN ('waiting', 'dispatching', 'reconciling', 'provider_owned')
                 ORDER BY CASE
                     WHEN d.state = 'dispatching' THEN 0
                     WHEN d.state IN ('reconciling', 'provider_owned') THEN 1
                     ELSE 2 END,
                     j.created_at, j.job_id
                 LIMIT 1""",
-                (provider_app_id, provider_instance_id, stamp),
+                (stamp, provider_app_id, provider_instance_id),
             ).fetchone()
             if row is None:
                 return None
             job_id = str(row["job_id"])
+            if expected_job_id is not None and job_id != expected_job_id:
+                return None
+            if row["claim_dispatch_state"] != "dispatching" and not bool(row["claim_is_due"]):
+                return None
             db.execute(
                 """UPDATE connect_job_dispatch
                 SET state = CASE
@@ -2974,8 +2984,12 @@ class Store:
                         WHEN state = 'waiting' THEN 'dispatching'
                         ELSE state
                     END,
+                    attempt_count = attempt_count + CASE
+                        WHEN state = 'waiting' THEN 1
+                        ELSE 0
+                    END,
                     submission_possible = CASE
-                        WHEN state = 'dispatching' THEN 1
+                        WHEN state IN ('waiting', 'dispatching') THEN 1
                         ELSE submission_possible
                     END,
                     next_attempt_at = NULL, updated_at = ?
@@ -2985,9 +2999,12 @@ class Store:
             dispatch_row = db.execute(
                 "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
             ).fetchone()
-        if dispatch_row is None:
+            job_row = db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if dispatch_row is None or job_row is None:
             raise RuntimeError("Claimed Connect job is missing dispatch state")
-        return self._connect_job(row), self._connect_dispatch(dispatch_row)
+        return self._connect_job(job_row), self._connect_dispatch(dispatch_row)
 
     @staticmethod
     def completed_connect_warnings(job: ConnectJob) -> list[dict[str, str]]:
