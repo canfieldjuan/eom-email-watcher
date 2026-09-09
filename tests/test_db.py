@@ -2709,6 +2709,45 @@ def test_clear_messages_preserves_mailbox_and_outbound_state(tmp_path: Path) -> 
     )
 
 
+def test_clear_messages_bounds_simultaneously_held_source_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    for index in range(5):
+        assert store.add_message(
+            message_id=f"message-{index}",
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject="Bounded cleanup",
+            received_at="2026-09-01T00:00:00+00:00",
+        )
+    active = 0
+    maximum = 0
+
+    class TrackingLock:
+        def __enter__(self):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+
+        def __exit__(self, *args):
+            nonlocal active
+            active -= 1
+
+    monkeypatch.setattr(db_module, "SOURCE_CLEANUP_LOCK_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        db_module,
+        "connect_operation_lock",
+        lambda *args, **kwargs: TrackingLock(),
+    )
+
+    assert store.clear_messages() == 5
+    assert maximum == 2
+    assert active == 0
+
+
 def test_manual_delete_suppression_overlaps_maximum_retention_boundary(
     tmp_path: Path,
 ) -> None:

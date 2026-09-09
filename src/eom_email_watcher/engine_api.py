@@ -1877,10 +1877,20 @@ def _connect_source_is_retained(
         received_at = datetime.fromisoformat(source.received_at)
         if received_at.tzinfo is None:
             return False
-        received_at = min(received_at.astimezone(UTC), observed_at)
+        received_at = received_at.astimezone(UTC)
     except (OverflowError, ValueError):
         return False
-    return received_at >= observed_at - timedelta(days=retention_days)
+    cutoff = observed_at - timedelta(days=retention_days)
+    if received_at <= observed_at:
+        return received_at >= cutoff
+    try:
+        discovered_at = datetime.fromisoformat(source.discovered_at)
+        if discovered_at.tzinfo is None:
+            return False
+        discovered_at = discovered_at.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return False
+    return cutoff <= discovered_at <= observed_at
 
 
 def _retained_connect_message_source(runtime: Runtime, message_id: str) -> MessageSource:
@@ -2682,7 +2692,16 @@ def _submit_generic_connect_job(
             "connect_job_in_progress",
             "The source attachment is being changed; the job remains queued.",
         ) from exc
-    return _finish_generic_connect_job(runtime, client, tracked, initial, persisted)
+    try:
+        return _finish_generic_connect_job(runtime, client, tracked, initial, persisted)
+    except connect.ConnectError as exc:
+        _defer_generic_connect_error(
+            runtime,
+            tracked.job_id,
+            exc,
+            submitted=False,
+        )
+        raise
 
 
 def _run_claimed_generic_connect_job(

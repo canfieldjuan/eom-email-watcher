@@ -102,17 +102,30 @@ def test_connect_retry_delay_rejects_negative_counts() -> None:
 
 
 @pytest.mark.parametrize(
-    ("received_at", "expected"),
+    ("received_at", "discovered_at", "expected"),
     [
-        ("2026-08-10T11:59:59+00:00", False),
-        ("2026-08-10T12:00:00+00:00", True),
-        ("2026-09-10T12:00:01+00:00", True),
-        ("2026-09-01T12:00:00", False),
-        ("not-a-time", False),
+        ("2026-08-10T11:59:59+00:00", "2026-09-01T12:00:00+00:00", False),
+        ("2026-08-10T12:00:00+00:00", "2026-09-01T12:00:00+00:00", True),
+        ("2026-09-10T12:00:01+00:00", "2026-09-01T12:00:00+00:00", True),
+        ("2026-09-10T12:00:01+00:00", "2026-08-10T11:59:59+00:00", False),
+        ("2026-09-10T12:00:01+00:00", "2026-09-10T12:00:00+00:00", False),
+        ("2026-09-01T12:00:00", "2026-09-01T12:00:00+00:00", False),
+        ("not-a-time", "2026-09-01T12:00:00+00:00", False),
     ],
 )
-def test_connect_source_retention_boundary(received_at: str, expected: bool) -> None:
-    source = MessageSource("message-1", "gmail", "gmail-default", "gmail-1", received_at)
+def test_connect_source_retention_boundary(
+    received_at: str,
+    discovered_at: str,
+    expected: bool,
+) -> None:
+    source = MessageSource(
+        "message-1",
+        "gmail",
+        "gmail-default",
+        "gmail-1",
+        received_at,
+        discovered_at,
+    )
 
     assert (
         engine_api._connect_source_is_retained(
@@ -1041,6 +1054,56 @@ def test_queue_pump_retries_provider_busy_with_same_job_after_durable_due_time(
     ]
     assert submissions == [REQUEST_ID, REQUEST_ID]
     assert runtime.store.connect_job(REQUEST_ID).status == "completed"  # type: ignore[union-attr]
+
+
+def test_post_submit_poll_timeout_schedules_durable_reconciliation_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class AcceptedThenTimeoutClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            return update(job, "accepted")
+
+        def wait_for_terminal(self, job, initial, on_update):
+            raise connect.ConnectError(
+                "JOB_TIMEOUT",
+                "The accepted provider job is still running.",
+                retryable=True,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        AcceptedThenTimeoutClient,
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+
+    response = engine_api._response(
+        api_request(config_path, "connect.attachment.invoke", invocation_payload(selected))
+    )
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+
+    assert response["error"]["code"] == "job_timeout"
+    assert dispatch is not None
+    assert dispatch.state == "provider_owned"
+    assert dispatch.next_attempt_at is not None
+    assert dispatch.reconciliation_failure_count == 1
+    assert dispatch.last_error_code == "JOB_TIMEOUT"
 
 
 def test_queue_pump_respects_cross_process_lane_owner_then_recovers(

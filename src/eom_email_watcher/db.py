@@ -36,6 +36,7 @@ CONNECT_RETRY_DELAYS_SECONDS = (2, 4, 8, 16, 30)
 CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS = 30
 MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES = 128
 MAX_CONNECT_DISPATCH_ERROR_MESSAGE_BYTES = 1024
+SOURCE_CLEANUP_LOCK_BATCH_SIZE = 32
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -1168,6 +1169,7 @@ class MessageSource:
     account_id: str
     provider_message_id: str
     received_at: str
+    discovered_at: str
 
 
 @dataclass(frozen=True)
@@ -2687,7 +2689,8 @@ class Store:
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
             row = db.execute(
-                """SELECT message_id, provider, account_id, provider_message_id, received_at
+                """SELECT message_id, provider, account_id, provider_message_id,
+                    received_at, discovered_at
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -2818,8 +2821,8 @@ class Store:
                 ).fetchall()
             ]
         deleted = 0
-        for offset in range(0, len(message_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
-            chunk = message_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+        for offset in range(0, len(message_ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+            chunk = message_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self._source_cleanup_locks(chunk), self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
                 placeholders = ", ".join("?" for _ in chunk)
@@ -5866,8 +5869,8 @@ class Store:
             ]
         deleted = 0
         automation_review_required = 0
-        for offset in range(0, len(expired_ids), AUTOMATION_CLEANUP_CHUNK_SIZE):
-            chunk = expired_ids[offset : offset + AUTOMATION_CLEANUP_CHUNK_SIZE]
+        for offset in range(0, len(expired_ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+            chunk = expired_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
             with self._source_cleanup_locks(chunk), self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
                 placeholders = ", ".join("?" for _ in chunk)
