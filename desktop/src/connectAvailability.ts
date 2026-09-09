@@ -39,7 +39,10 @@ export function durableCapabilityStatus(
     return `Running ${actionLabel}`;
   }
   if (result.status === "failed") {
-    return result.dispatch_error?.message ?? result.error?.message ?? "Local capability failed";
+    if (result.error?.code === "connect_queue_deadline_exceeded") {
+      return result.dispatch_error?.message ?? result.error.message;
+    }
+    return result.error?.message ?? result.dispatch_error?.message ?? "Local capability failed";
   }
   return null;
 }

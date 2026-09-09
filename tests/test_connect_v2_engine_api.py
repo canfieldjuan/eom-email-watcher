@@ -192,6 +192,7 @@ def test_connect_queue_pump_accepts_boundary_limits(
     [
         ("lock_contended", 2, 1),
         ("lock_unavailable", 30, 10),
+        ("deferred_or_failed", 30, 10),
     ],
 )
 def test_connect_queue_wakeup_does_not_delay_another_provider_lane(
@@ -221,6 +222,37 @@ def test_connect_queue_wakeup_does_not_delay_another_provider_lane(
 
     assert blocked_retry_seconds > other_lane_seconds
     assert next_wakeup == other_lane_wakeup
+
+
+@pytest.mark.parametrize(
+    ("outcome", "retry_seconds"),
+    [
+        ("lock_contended", 2),
+        ("lock_unavailable", 30),
+        ("deferred_or_failed", 30),
+    ],
+)
+def test_connect_queue_wakeup_backs_off_an_attempted_head_still_due(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    retry_seconds: int,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    observed_at = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    monkeypatch.setattr(
+        runtime.store,
+        "connect_queue_wakeups",
+        lambda *, now: [(REQUEST_ID, observed_at)],
+    )
+
+    next_wakeup = engine_api._next_connect_queue_wakeup(
+        runtime,
+        [{"job_id": REQUEST_ID, "outcome": outcome}],
+        observed_at,
+    )
+
+    assert next_wakeup == observed_at + timedelta(seconds=retry_seconds)
 
 
 def test_connect_queue_pump_reports_admission_deadline_expiry(
@@ -276,6 +308,73 @@ def test_connect_queue_pump_reports_admission_deadline_expiry(
         }
     ]
     assert response["data"]["next_wake_unix_ms"] is None
+
+
+def test_active_result_replays_terminal_job_won_during_dispatch_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    job = connect.prepare_capability_job(
+        selected,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    runtime.store.create_connect_job(
+        job_id=job.job_id,
+        message_id="message-1",
+        part_id="2",
+        protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+    )
+    active = runtime.store.connect_job(REQUEST_ID)
+    assert active is not None
+    real_dispatch = runtime.store.connect_dispatch
+    raced = False
+
+    def racing_dispatch(job_id: str):
+        nonlocal raced
+        if not raced:
+            raced = True
+            output = connect.CapabilityOutput(
+                artifact_id=OUTPUT_ID,
+                media_type="text/plain",
+                display_name="translation.txt",
+                byte_size=4,
+                sha256=hashlib.sha256(b"done").hexdigest(),
+                payload=b"done",
+            )
+            runtime.store.transition_connect_job(
+                job_id=job_id,
+                expected_state="requested",
+                next_state="completed",
+                provider_app_id=selected.app_id,
+                provider_instance_id=selected.instance_id,
+                result=connect.CapabilityResult((output,)).store_dict(),
+            )
+        return real_dispatch(job_id)
+
+    monkeypatch.setattr(runtime.store, "connect_dispatch", racing_dispatch)
+
+    result = engine_api._generic_connect_active_result(runtime, active)
+
+    assert raced is True
+    assert result["status"] == "completed"
+    assert result["outputs"][0]["artifact_id"] == OUTPUT_ID
 
 
 def seeded_runtime(tmp_path: Path):

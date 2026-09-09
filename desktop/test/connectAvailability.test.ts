@@ -46,7 +46,23 @@ test("durable queue state controls capability status text", () => {
         status: "failed",
         dispatch_state: "terminal",
         dispatch_error: { code: "PROVIDER_BUSY", message: "Another job is running." },
-        error: { code: "connect_queue_deadline_exceeded", message: "Queue expired." },
+        error: { code: "connect_entitlement_required", message: "Connect license required." },
+      },
+      "Invoice Processor",
+      "Read invoice",
+    ),
+    "Connect license required.",
+  );
+  assert.equal(
+    durableCapabilityStatus(
+      {
+        status: "failed",
+        dispatch_state: "terminal",
+        dispatch_error: { code: "PROVIDER_BUSY", message: "Another job is running." },
+        error: {
+          code: "connect_queue_deadline_exceeded",
+          message: "Queue expired.",
+        },
       },
       "Invoice Processor",
       "Read invoice",

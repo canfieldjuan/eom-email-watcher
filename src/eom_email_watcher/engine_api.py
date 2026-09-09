@@ -2149,6 +2149,11 @@ def _generic_connect_active_result(runtime: Runtime, job: ConnectJob) -> dict[st
         raise RuntimeError("Active Connect v2 job is missing its durable provenance")
     dispatch = runtime.store.connect_dispatch(job.job_id)
     if dispatch is None or dispatch.state == "terminal":
+        current = runtime.store.connect_job(job.job_id)
+        if current is not None and current.status == "completed":
+            return _generic_connect_result(current)
+        if current is not None and current.status == "failed":
+            raise _stored_connect_failure(current)
         raise RuntimeError("Active Connect v2 job is missing its dispatch state")
     return {
         "protocol_version": job.protocol_version,
@@ -2942,14 +2947,13 @@ def _next_connect_queue_wakeup(
     items: list[dict[str, object]],
     observed_at: datetime,
 ) -> datetime | None:
-    blocked = {
+    attempted = {
         str(item["job_id"]): str(item["outcome"])
         for item in items
-        if item["outcome"] in {"lock_contended", "lock_unavailable"}
     }
     wakeups = []
     for job_id, wakeup in runtime.store.connect_queue_wakeups(now=observed_at):
-        outcome = blocked.get(job_id)
+        outcome = attempted.get(job_id)
         if wakeup <= observed_at and outcome is not None:
             retry_seconds = 2 if outcome == "lock_contended" else 30
             wakeup = observed_at + timedelta(seconds=retry_seconds)
