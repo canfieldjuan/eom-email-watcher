@@ -10,7 +10,7 @@ use engine::{
     EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
     MailAccounts, MailServerConnection, WatchedSender,
 };
-use scheduler::{PollScheduler, PollingStatus};
+use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -370,6 +370,7 @@ async fn attachment_capabilities(
 #[allow(clippy::too_many_arguments)]
 async fn attachment_capability_invoke(
     engine: State<'_, Engine>,
+    connect_queue: State<'_, ConnectQueueScheduler>,
     request_id: String,
     message_id: String,
     part_id: String,
@@ -379,13 +380,15 @@ async fn attachment_capability_invoke(
     confirmed: bool,
 ) -> Result<ConnectInvocationResult, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         engine.invoke_attachment_capability(
             request_id, message_id, part_id, provider, capability, parameters, confirmed,
         )
     })
     .await
-    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"));
+    connect_queue.wake();
+    result?
 }
 
 #[tauri::command]
@@ -675,10 +678,11 @@ async fn watcher_check(
     app: AppHandle,
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
+    connect_queue: State<'_, ConnectQueueScheduler>,
 ) -> Result<DesktopCheckResult, EngineError> {
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let outcome = delivery.check_and_deliver(&app, &engine)?;
         Ok(DesktopCheckResult {
             check: outcome.check,
@@ -688,7 +692,9 @@ async fn watcher_check(
         })
     })
     .await
-    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"));
+    connect_queue.wake();
+    result?
 }
 
 #[tauri::command]
@@ -793,10 +799,13 @@ pub fn run() {
                 );
             }
             let scheduler = PollScheduler::new(poll_interval_minutes, polling_supported);
+            let connect_queue =
+                ConnectQueueScheduler::start(app.handle().clone(), engine.clone())?;
             app.manage(engine.clone());
             app.manage(delivery.clone());
             app.manage(exports);
             app.manage(scheduler.clone());
+            app.manage(connect_queue.clone());
             let startup_app = app.handle().clone();
             let startup_engine = engine.clone();
             let startup_delivery = delivery.clone();
@@ -815,7 +824,7 @@ pub fn run() {
                     }
                 }
             });
-            scheduler.start(app.handle().clone(), engine, delivery)?;
+            scheduler.start(app.handle().clone(), engine, delivery, connect_queue)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

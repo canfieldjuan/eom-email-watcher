@@ -9,7 +9,10 @@ import {
   type CalendarConsentProfile,
   type CalendarConsentStatus,
 } from "./calendarConsent";
-import { classifyCapabilityDiagnostic } from "./connectAvailability";
+import {
+  classifyCapabilityDiagnostic,
+  durableCapabilityStatus,
+} from "./connectAvailability";
 import {
   buildMailServerConnection,
   type MailServerConnection,
@@ -50,6 +53,10 @@ interface AttachmentCapabilityResult {
   provider?: ConnectProviderIdentity;
   parameters?: Record<string, string | number | boolean>;
   status: "requested" | "accepted" | "processing" | "completed" | "failed";
+  dispatch_state?: "waiting" | "dispatching" | "reconciling" | "provider_owned" | "terminal";
+  queue_ahead?: number;
+  next_attempt_at?: string | null;
+  dispatch_error?: { code: string; message: string } | null;
   updated_at: string;
   summary: ConnectSummary | null;
   outputs?: ConnectOutputMetadata[];
@@ -111,8 +118,12 @@ interface ConnectInvocationResult {
   job_id: string;
   provider: ConnectProviderIdentity;
   capability: ConnectCapabilityRef;
-  status: "completed";
+  status: "requested" | "accepted" | "processing" | "completed";
   outputs: ConnectOutputMetadata[];
+  dispatch_state?: "waiting" | "dispatching" | "reconciling" | "provider_owned";
+  queue_ahead?: number;
+  next_attempt_at?: string | null;
+  dispatch_error?: { code: string; message: string } | null;
 }
 
 type ConnectOutputPresentation =
@@ -733,6 +744,8 @@ let inboxItems: InboxItem[] = [];
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
 let inboxProposalExpiryTimer: number | null = null;
+let connectQueueRefresh: Promise<void> | null = null;
+let connectQueueRefreshAgain = false;
 const inboxDeletionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
@@ -1146,10 +1159,21 @@ function renderCapabilityResult(
     }
   } else {
     const detail = document.createElement("p");
+    const discovered = attachmentCapabilities
+      .get(attachmentKey(messageId, partId))
+      ?.find(
+        (candidate) =>
+          candidate.provider.app_id === result.provider?.app_id &&
+          candidate.provider.version === result.provider.version &&
+          candidate.provider.instance_id === result.provider.instance_id &&
+          candidate.capability.id === result.capability_id &&
+          candidate.capability.version === result.capability_version,
+      );
+    const providerLabel = discovered?.provider.name ?? result.provider?.app_id ?? "local provider";
+    const actionLabel = discovered?.capability.action.label ?? result.capability_id;
     detail.textContent =
-      result.status === "failed" && result.error
-        ? result.error.message
-        : `Local capability status: ${result.status}`;
+      durableCapabilityStatus(result, providerLabel, actionLabel) ??
+      `Local capability status: ${result.status}`;
     presentation.append(detail);
   }
   row.append(presentation);
@@ -1632,8 +1656,19 @@ function renderInbox(items: InboxItem[]): void {
           }
           await loadInbox();
           if (result) {
-            inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
-            inboxStatus.dataset.kind = "success";
+            if (result.status === "completed") {
+              inboxStatus.textContent = `${capability.capability.action.label} completed for ${attachment.filename} with ${result.outputs.length} output${result.outputs.length === 1 ? "" : "s"}.`;
+              inboxStatus.dataset.kind = "success";
+            } else {
+              const state =
+                durableCapabilityStatus(
+                  result,
+                  capability.provider.name,
+                  capability.capability.action.label,
+                ) ?? "Capability job queued";
+              inboxStatus.textContent = `${state} for ${attachment.filename}.`;
+              inboxStatus.dataset.kind = "warning";
+            }
           } else {
             inboxStatus.textContent = errorMessage(invocationError);
             inboxStatus.dataset.kind = "error";
@@ -1989,6 +2024,28 @@ async function loadInbox(append = false): Promise<void> {
     inboxStatus.dataset.kind = "warning";
   }
   if (generation === inboxRequestGeneration) setInboxControlsBusy(false);
+}
+
+async function refreshLoadedInboxSpan(): Promise<void> {
+  const loadedCount = inboxItems.length;
+  await loadInbox();
+  while (inboxItems.length < loadedCount && inboxNextCursor) {
+    await loadInbox(true);
+  }
+}
+
+function scheduleConnectQueueRefresh(): void {
+  connectQueueRefreshAgain = true;
+  if (connectQueueRefresh) return;
+  connectQueueRefresh = (async () => {
+    while (connectQueueRefreshAgain) {
+      connectQueueRefreshAgain = false;
+      await refreshLoadedInboxSpan();
+    }
+  })().finally(() => {
+    connectQueueRefresh = null;
+    if (connectQueueRefreshAgain) scheduleConnectQueueRefresh();
+  });
 }
 
 function setHealthValue(element: HTMLElement, ready: boolean, text: string): void {
@@ -3248,6 +3305,9 @@ void listen<{
       void loadHealth("Automatic check failed; it will retry on schedule.", "error");
     }
   }
+});
+void listen<{ attempted: number }>("watcher://connect-queue", () => {
+  if (configurationReady) scheduleConnectQueueRefresh();
 });
 window.addEventListener("focus", () => {
   if (configurationReady) {

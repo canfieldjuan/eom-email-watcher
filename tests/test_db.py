@@ -3412,6 +3412,9 @@ def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -
             "instance_id": "11111111-1111-4111-8111-111111111111",
         },
         "parameters": {"target-language": "Spanish"},
+        "dispatch_state": "terminal",
+        "queue_ahead": 0,
+        "next_attempt_at": None,
         "outputs": [output.metadata() for output in outputs],
     }
     assert "payload_base64" not in json.dumps(projected)
@@ -3735,6 +3738,56 @@ def test_deferred_lane_head_is_not_due_early_and_preserves_bounded_diagnostic(
         now=near_deadline,
     )
     assert clamped.next_attempt_at == (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat()
+
+
+def test_connect_queue_wakeup_and_inbox_projection_use_durable_dispatch_state(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    first_id = "33333333-3333-4333-8333-333333333333"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    create_v2_connect_job(store, first_id, parameters={"sequence": 1}, now=created_at)
+    create_v2_connect_job(
+        store,
+        second_id,
+        parameters={"sequence": 2},
+        now=created_at + timedelta(seconds=1),
+    )
+    claimed = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        now=created_at,
+    )
+    assert claimed is not None
+    deferred = store.defer_connect_job(
+        job_id=first_id,
+        expected_dispatch_state="dispatching",
+        next_dispatch_state="waiting",
+        error_code="PROVIDER_BUSY",
+        error_message="Another job is running.",
+        delay_seconds=30,
+        now=created_at,
+    )
+
+    assert store.connect_queue_ahead(first_id) == 0
+    assert store.connect_queue_ahead(second_id) == 1
+    assert min(wakeup for _, wakeup in store.connect_queue_wakeups(now=created_at)) == (
+        datetime.fromisoformat(deferred.next_attempt_at or "")
+    )
+
+    results = store.recent(1)[0]["attachments"][0]["capability_results"]
+    by_job_id = {result["job_id"]: result for result in results}
+    assert by_job_id[first_id]["dispatch_state"] == "waiting"
+    assert by_job_id[first_id]["queue_ahead"] == 0
+    assert by_job_id[first_id]["next_attempt_at"] == deferred.next_attempt_at
+    assert by_job_id[first_id]["dispatch_error"] == {
+        "code": "PROVIDER_BUSY",
+        "message": "Another job is running.",
+    }
+    assert by_job_id[second_id]["queue_ahead"] == 1
 
 
 def test_due_connect_lane_heads_returns_only_authoritative_head_per_provider(
