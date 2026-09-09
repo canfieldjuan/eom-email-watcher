@@ -55,17 +55,27 @@ fn queue_wait_duration(deadline_unix_ms: u64, now_unix_ms: u64) -> Duration {
 }
 
 fn wait_for_queue_wakeup(receiver: &Receiver<()>, deadline_unix_ms: Option<u64>) -> bool {
+    wait_for_queue_wakeup_with_clock(receiver, deadline_unix_ms, MAX_SLEEP_SLICE, unix_ms_now)
+}
+
+fn wait_for_queue_wakeup_with_clock(
+    receiver: &Receiver<()>,
+    deadline_unix_ms: Option<u64>,
+    max_sleep_slice: Duration,
+    mut now_unix_ms: impl FnMut() -> u64,
+) -> bool {
     match deadline_unix_ms {
-        Some(deadline) => {
-            let duration = queue_wait_duration(deadline, unix_ms_now()).min(MAX_SLEEP_SLICE);
+        Some(deadline) => loop {
+            let duration = queue_wait_duration(deadline, now_unix_ms()).min(max_sleep_slice);
             if duration.is_zero() {
                 return true;
             }
             match receiver.recv_timeout(duration) {
-                Ok(()) | Err(RecvTimeoutError::Timeout) => true,
-                Err(RecvTimeoutError::Disconnected) => false,
+                Ok(()) => return true,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return false,
             }
-        }
+        },
         None => receiver.recv().is_ok(),
     }
 }
@@ -263,6 +273,7 @@ impl PollScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn next_check_uses_configured_interval() {
@@ -343,5 +354,25 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn intermediate_queue_sleep_slice_rechecks_deadline_without_pumping() {
+        let (_sender, receiver) = mpsc::sync_channel(1);
+        let clock_calls = Cell::new(0);
+
+        let should_pump = wait_for_queue_wakeup_with_clock(
+            &receiver,
+            Some(200),
+            Duration::from_millis(1),
+            || {
+                let call = clock_calls.get();
+                clock_calls.set(call + 1);
+                if call == 0 { 100 } else { 200 }
+            },
+        );
+
+        assert!(should_pump);
+        assert_eq!(clock_calls.get(), 2);
     }
 }
