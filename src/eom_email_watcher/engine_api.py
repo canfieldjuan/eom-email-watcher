@@ -40,6 +40,7 @@ from .db import (
     CalendarGrant,
     ConnectJob,
     ConnectOutput,
+    ConnectQueueFull,
     MailAccount,
     MessageSource,
     NotificationIntent,
@@ -2599,7 +2600,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         job_id=request_id,
     )
     try:
-        runtime.store.create_connect_job(
+        created = runtime.store.create_connect_job(
             job_id=candidate.job_id,
             message_id=message_id,
             part_id=part_id,
@@ -2617,6 +2618,11 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             source_app_id=connect.SOURCE_APP_ID,
             request_json=candidate.request_json,
         )
+    except ConnectQueueFull as exc:
+        raise ApiError(
+            "connect_queue_full",
+            "The selected provider already has the maximum number of queued jobs.",
+        ) from exc
     except sqlite3.IntegrityError as exc:
         exact = runtime.store.connect_job(request_id)
         if exact is not None:
@@ -2638,6 +2644,20 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
                 attachment_content,
             )
         raise
+    if created.job_id != candidate.job_id:
+        _tracked_invocation_job(
+            created,
+            capability,
+            message_id=message_id,
+            part_id=part_id,
+            parameters=parameters,
+        )
+        return _resume_generic_connect_job(
+            runtime,
+            capability,
+            created,
+            attachment_content,
+        )
     return _run_generic_connect_job(runtime, capability, candidate, content)
 
 

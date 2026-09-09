@@ -55,6 +55,34 @@ def test_operation_lock_rejects_another_process_and_is_reusable(tmp_path: Path) 
     assert _probe_lock(lock_path) == 0
 
 
+def test_connect_lock_paths_are_private_stable_and_namespaced(tmp_path: Path) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    lane = locking.connect_lane_lock_path(
+        database,
+        protocol_version=2,
+        provider_app_id="invoice-processor",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    same_lane = locking.connect_lane_lock_path(
+        database,
+        protocol_version=2,
+        provider_app_id="invoice-processor",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    source = locking.connect_source_lock_path(database, "message-1")
+
+    assert lane == same_lane
+    assert lane != source
+    assert lane.parent == database.parent / ".connect-locks"
+    assert "invoice-processor" not in lane.name
+    with locking.connect_operation_lock(lane, "lane busy"):
+        assert stat.S_IMODE(lane.parent.stat().st_mode) == 0o700
+        assert _probe_lock(lane) == 23
+
+    with pytest.raises(ValueError, match="cannot be empty"):
+        locking.connect_source_lock_path(database, "")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX lock files expose Unix permission bits")
 def test_operation_lock_normalizes_private_posix_permissions(tmp_path: Path) -> None:
     lock_path = tmp_path / "watcher.lock"

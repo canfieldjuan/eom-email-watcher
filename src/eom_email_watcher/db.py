@@ -18,7 +18,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -29,6 +29,8 @@ MAX_AUTOMATION_PROPOSAL_ATTENDEES = 64
 SCHEDULING_AUTOMATION_ID = "email.schedule_event"
 SCHEDULING_AUTOMATION_VERSION = 1
 SCHEDULING_EXTRACTION_SCHEMA_VERSION = 1
+CONNECT_QUEUE_MAX_JOBS = 25
+CONNECT_QUEUE_ADMISSION_WINDOW = timedelta(hours=2)
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -236,6 +238,75 @@ CREATE TRIGGER IF NOT EXISTS messages_delete_connect_attachment_jobs
 AFTER DELETE ON messages
 BEGIN
     DELETE FROM connect_attachment_jobs WHERE message_id = OLD.message_id;
+END
+"""
+
+_CONNECT_DISPATCH_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS connect_job_dispatch (
+    job_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (
+        state IN ('waiting', 'dispatching', 'reconciling', 'provider_owned', 'terminal')
+    ),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    reconciliation_failure_count INTEGER NOT NULL DEFAULT 0 CHECK (
+        reconciliation_failure_count >= 0
+    ),
+    next_attempt_at TEXT,
+    admission_deadline TEXT NOT NULL,
+    submission_possible INTEGER NOT NULL DEFAULT 0 CHECK (submission_possible IN (0, 1)),
+    source_available INTEGER NOT NULL DEFAULT 1 CHECK (source_available IN (0, 1)),
+    highest_provider_state TEXT NOT NULL DEFAULT 'requested' CHECK (
+        highest_provider_state IN ('requested', 'accepted', 'processing')
+    ),
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_CONNECT_DISPATCH_LANE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_connect_job_dispatch_lane
+ON connect_attachment_jobs(
+    protocol_version, provider_app_id, provider_instance_id, created_at, job_id
+)
+WHERE protocol_version = 2 AND status IN ('requested', 'accepted', 'processing')
+"""
+
+_CONNECT_JOBS_ACTIVE_V2_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_connect_attachment_jobs_active_v2
+ON connect_attachment_jobs(message_id, part_id, invocation_fingerprint)
+WHERE protocol_version = 2 AND status IN ('requested', 'accepted', 'processing')
+"""
+
+_CONNECT_DISPATCH_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS connect_jobs_delete_dispatch
+AFTER DELETE ON connect_attachment_jobs
+BEGIN
+    DELETE FROM connect_job_dispatch WHERE job_id = OLD.job_id;
+END
+"""
+
+_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = """
+CREATE TRIGGER messages_delete_connect_attachment_jobs
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM connect_attachment_jobs
+    WHERE message_id = OLD.message_id
+      AND (
+        protocol_version = 1
+        OR status IN ('completed', 'failed')
+        OR job_id IN (
+            SELECT job_id FROM connect_job_dispatch
+            WHERE state = 'waiting' AND submission_possible = 0
+        )
+      );
+    UPDATE connect_job_dispatch
+    SET source_available = 0,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    WHERE job_id IN (
+        SELECT job_id FROM connect_attachment_jobs WHERE message_id = OLD.message_id
+    );
 END
 """
 
@@ -1141,6 +1212,27 @@ class ConnectJob:
 
 
 @dataclass(frozen=True)
+class ConnectDispatch:
+    job_id: str
+    state: str
+    attempt_count: int
+    reconciliation_failure_count: int
+    next_attempt_at: str | None
+    admission_deadline: str
+    submission_possible: bool
+    source_available: bool
+    highest_provider_state: str
+    last_error_code: str | None
+    last_error_message: str | None
+    created_at: str
+    updated_at: str
+
+
+class ConnectQueueFull(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
 class ConnectOutput:
     artifact_id: str
     media_type: str
@@ -1215,6 +1307,53 @@ def _ensure_connect_jobs_schema(db: sqlite3.Connection, current_version: int) ->
         ORDER BY rowid"""
     )
     db.execute("DROP TABLE connect_attachment_jobs_v5")
+
+
+def _connect_admission_deadline(created_at: str) -> str:
+    created = datetime.fromisoformat(created_at)
+    if created.tzinfo is None:
+        raise ValueError("Connect job creation time must include a timezone")
+    return (created.astimezone(UTC) + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat()
+
+
+def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
+    db.execute(_CONNECT_DISPATCH_TABLE_SQL)
+    rows = db.execute(
+        """SELECT job_id, status, created_at, updated_at
+        FROM connect_attachment_jobs
+        WHERE protocol_version = 2
+        ORDER BY created_at, job_id"""
+    ).fetchall()
+    for row in rows:
+        status = str(row["status"])
+        state = {
+            "requested": "reconciling",
+            "accepted": "provider_owned",
+            "processing": "provider_owned",
+            "completed": "terminal",
+            "failed": "terminal",
+        }[status]
+        highest = status if status in {"accepted", "processing"} else "requested"
+        db.execute(
+            """INSERT OR IGNORE INTO connect_job_dispatch(
+                job_id, state, admission_deadline, submission_possible,
+                source_available, highest_provider_state, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+            (
+                str(row["job_id"]),
+                state,
+                _connect_admission_deadline(str(row["created_at"])),
+                int(status in {"requested", "accepted", "processing"}),
+                highest,
+                str(row["created_at"]),
+                str(row["updated_at"]),
+            ),
+        )
+    db.execute(_CONNECT_JOBS_ACTIVE_V2_INDEX_SQL)
+    db.execute(_CONNECT_DISPATCH_LANE_INDEX_SQL)
+    db.execute(_CONNECT_DISPATCH_DELETE_TRIGGER_SQL)
+    db.execute("DROP TRIGGER IF EXISTS messages_delete_connect_attachment_jobs")
+    db.execute(_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL)
 
 
 def _valid_uuid_v4(value: object) -> bool:
@@ -1866,6 +2005,7 @@ class Store:
             )
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
+            _ensure_connect_dispatch_schema(db)
             if version < 18:
                 _migrate_microsoft_principal_keys_v2(db)
             automation_run_columns = {
@@ -2735,6 +2875,101 @@ class Store:
         return self._connect_job(row) if row else None
 
     @staticmethod
+    def _connect_dispatch(row: sqlite3.Row) -> ConnectDispatch:
+        values = dict(row)
+        values["submission_possible"] = bool(values["submission_possible"])
+        values["source_available"] = bool(values["source_available"])
+        return ConnectDispatch(**values)
+
+    def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return self._connect_dispatch(row) if row else None
+
+    def expire_waiting_connect_jobs(self, *, now: datetime | None = None) -> tuple[str, ...]:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """SELECT d.job_id
+                FROM connect_job_dispatch AS d
+                JOIN connect_attachment_jobs AS j ON j.job_id = d.job_id
+                WHERE j.protocol_version = 2
+                  AND j.status = 'requested'
+                  AND d.state = 'waiting'
+                  AND d.submission_possible = 0
+                  AND aware_iso_epoch(d.admission_deadline) <= aware_iso_epoch(?)
+                ORDER BY d.admission_deadline, d.job_id""",
+                (stamp,),
+            ).fetchall()
+            job_ids = tuple(str(row["job_id"]) for row in rows)
+            for job_id in job_ids:
+                db.execute(
+                    """UPDATE connect_attachment_jobs
+                    SET status = 'failed', error_code = 'connect_queue_deadline_exceeded',
+                        error_message = 'The provider queue admission deadline expired.',
+                        error_retryable = 0, updated_at = ?
+                    WHERE job_id = ? AND status = 'requested'""",
+                    (stamp, job_id),
+                )
+                db.execute(
+                    """UPDATE connect_job_dispatch
+                    SET state = 'terminal', next_attempt_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND state = 'waiting' AND submission_possible = 0""",
+                    (stamp, job_id),
+                )
+        return job_ids
+
+    def claim_connect_lane_head(
+        self,
+        *,
+        provider_app_id: str,
+        provider_instance_id: str,
+        now: datetime | None = None,
+    ) -> tuple[ConnectJob, ConnectDispatch] | None:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.*
+                FROM connect_attachment_jobs AS j
+                JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                WHERE j.protocol_version = 2
+                  AND j.provider_app_id = ? AND j.provider_instance_id = ?
+                  AND j.status IN ('requested', 'accepted', 'processing')
+                  AND (
+                    d.state IN ('reconciling', 'provider_owned')
+                    OR (d.state = 'waiting' AND (
+                        d.next_attempt_at IS NULL
+                        OR aware_iso_epoch(d.next_attempt_at) <= aware_iso_epoch(?)
+                    ))
+                  )
+                ORDER BY CASE
+                    WHEN d.state IN ('reconciling', 'provider_owned') THEN 0
+                    ELSE 1 END,
+                    j.created_at, j.job_id
+                LIMIT 1""",
+                (provider_app_id, provider_instance_id, stamp),
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = str(row["job_id"])
+            db.execute(
+                """UPDATE connect_job_dispatch
+                SET state = 'dispatching', next_attempt_at = NULL, updated_at = ?
+                WHERE job_id = ? AND state = 'waiting'""",
+                (stamp, job_id),
+            )
+            dispatch_row = db.execute(
+                "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if dispatch_row is None:
+            raise RuntimeError("Claimed Connect job is missing dispatch state")
+        return self._connect_job(row), self._connect_dispatch(dispatch_row)
+
+    @staticmethod
     def completed_connect_warnings(job: ConnectJob) -> list[dict[str, str]]:
         if (
             job.status != "completed"
@@ -2927,6 +3162,7 @@ class Store:
         input_display_name: str | None = None,
         source_app_id: str | None = None,
         request_json: bytes | None = None,
+        now: datetime | None = None,
     ) -> ConnectJob:
         if protocol_version not in {1, 2}:
             raise ValueError("Connect protocol version is unsupported")
@@ -2957,7 +3193,8 @@ class Store:
                 input_display_name=input_display_name,
                 source_app_id=source_app_id,
             )
-        stamp = datetime.now(UTC).isoformat()
+        created_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = created_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -2969,6 +3206,28 @@ class Store:
                 is None
             ):
                 raise KeyError((message_id, part_id))
+            if protocol_version == 2:
+                existing = db.execute(
+                    """SELECT * FROM connect_attachment_jobs
+                    WHERE message_id = ? AND part_id = ?
+                      AND protocol_version = 2 AND invocation_fingerprint = ?
+                      AND status IN ('requested', 'accepted', 'processing')
+                    ORDER BY created_at, job_id LIMIT 1""",
+                    (message_id, part_id, invocation_fingerprint),
+                ).fetchone()
+                if existing is not None:
+                    if existing["job_id"] == job_id:
+                        raise sqlite3.IntegrityError("Connect job identity already exists")
+                    return self._connect_job(existing)
+                lane_size = db.execute(
+                    """SELECT COUNT(*) FROM connect_attachment_jobs
+                    WHERE protocol_version = 2
+                      AND provider_app_id = ? AND provider_instance_id = ?
+                      AND status IN ('requested', 'accepted', 'processing')""",
+                    (provider_app_id, provider_instance_id),
+                ).fetchone()[0]
+                if int(lane_size) >= CONNECT_QUEUE_MAX_JOBS:
+                    raise ConnectQueueFull("Connect provider queue is full")
             db.execute(
                 """INSERT INTO connect_attachment_jobs(
                     job_id, message_id, part_id, protocol_version,
@@ -3003,6 +3262,19 @@ class Store:
                     stamp,
                 ),
             )
+            if protocol_version == 2:
+                db.execute(
+                    """INSERT INTO connect_job_dispatch(
+                        job_id, state, admission_deadline, submission_possible,
+                        source_available, highest_provider_state, created_at, updated_at
+                    ) VALUES (?, 'waiting', ?, 0, 1, 'requested', ?, ?)""",
+                    (
+                        job_id,
+                        (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat(),
+                        stamp,
+                        stamp,
+                    ),
+                )
             row = db.execute(
                 "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
@@ -3139,6 +3411,34 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Connect job transition lost its expected-state race")
+            if current_job.protocol_version == 2:
+                dispatch_state = (
+                    "provider_owned" if next_state in {"accepted", "processing"} else "terminal"
+                )
+                dispatch_cursor = db.execute(
+                    """UPDATE connect_job_dispatch SET
+                        state = ?,
+                        submission_possible = CASE
+                            WHEN ? IN ('accepted', 'processing', 'completed') THEN 1
+                            ELSE submission_possible END,
+                        highest_provider_state = CASE
+                            WHEN ? = 'processing' THEN 'processing'
+                            WHEN ? = 'accepted' AND highest_provider_state = 'requested'
+                                THEN 'accepted'
+                            ELSE highest_provider_state END,
+                        next_attempt_at = NULL, updated_at = ?
+                    WHERE job_id = ?""",
+                    (
+                        dispatch_state,
+                        next_state,
+                        next_state,
+                        next_state,
+                        stamp,
+                        job_id,
+                    ),
+                )
+                if dispatch_cursor.rowcount != 1:
+                    raise RuntimeError("Connect job transition is missing dispatch state")
             row = db.execute(
                 "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()

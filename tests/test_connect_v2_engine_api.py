@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher import connect, engine_api
+from eom_email_watcher.db import ConnectQueueFull
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -757,12 +758,54 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
 
 
-def test_distinct_confirmed_request_ids_remain_distinct_while_active(
+def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    def reject_full_lane(**values):
+        raise ConnectQueueFull("Connect provider queue is full")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(runtime.store, "create_connect_job", reject_full_lane)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("A full provider lane must not reach transport"),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["error"] == {
+        "code": "connect_queue_full",
+        "message": "The selected provider already has the maximum number of queued jobs.",
+    }
+
+
+def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability(external_effects=True, confirmation_required=True)
     submissions: list[str] = []
+    queries: list[str] = []
 
     class FakeGmail:
         def attachment_bytes(self, *args) -> bytes:
@@ -781,6 +824,10 @@ def test_distinct_confirmed_request_ids_remain_distinct_while_active(
                 retryable=True,
             )
 
+        def get(self, job):
+            queries.append(job.job_id)
+            return update(job, "completed", payload=b"Recovered")
+
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
         engine_api.connect,
@@ -790,25 +837,31 @@ def test_distinct_confirmed_request_ids_remain_distinct_while_active(
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", AmbiguousClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
-    for request_id in (REQUEST_ID, SECOND_REQUEST_ID):
-        response = engine_api._response(
-            api_request(
-                config_path,
-                "connect.attachment.invoke",
-                invocation_payload(selected, confirmed=True, request_id=request_id),
-            )
+    first = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, confirmed=True, request_id=REQUEST_ID),
         )
-        assert response["error"]["code"] == "provider_unavailable"
+    )
+    second = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, confirmed=True, request_id=SECOND_REQUEST_ID),
+        )
+    )
 
-    assert submissions == [REQUEST_ID, SECOND_REQUEST_ID]
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["ok"] is True
+    assert second["data"]["job_id"] == REQUEST_ID
+    assert submissions == [REQUEST_ID]
+    assert queries == [REQUEST_ID]
     with runtime.store.connection() as db:
         rows = db.execute(
             "SELECT job_id, status FROM connect_attachment_jobs ORDER BY job_id"
         ).fetchall()
-    assert [tuple(row) for row in rows] == [
-        (REQUEST_ID, "requested"),
-        (SECOND_REQUEST_ID, "requested"),
-    ]
+    assert [tuple(row) for row in rows] == [(REQUEST_ID, "completed")]
 
 
 def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
