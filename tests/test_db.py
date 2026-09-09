@@ -3457,17 +3457,23 @@ def test_connect_v2_lane_cap_checks_replay_before_boundary(tmp_path: Path) -> No
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
     seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    job_ids = []
     for index in range(CONNECT_QUEUE_MAX_JOBS):
+        job_id = f"00000000-0000-4000-8000-{index:012d}"
+        job_ids.append(job_id)
         create_v2_connect_job(
             store,
-            f"00000000-0000-4000-8000-{index:012d}",
+            job_id,
             parameters={"sequence": index},
+            now=created_at,
         )
 
     create_v2_connect_job(
         store,
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         parameters={"sequence": 0},
+        now=created_at + timedelta(minutes=1),
     )
     assert store.connect_job("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") is None
     with pytest.raises(ConnectQueueFull, match="queue is full"):
@@ -3475,7 +3481,18 @@ def test_connect_v2_lane_cap_checks_replay_before_boundary(tmp_path: Path) -> No
             store,
             "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             parameters={"sequence": CONNECT_QUEUE_MAX_JOBS},
+            now=created_at + timedelta(minutes=1),
         )
+
+    replacement_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    create_v2_connect_job(
+        store,
+        replacement_id,
+        parameters={"sequence": CONNECT_QUEUE_MAX_JOBS + 1},
+        now=created_at + CONNECT_QUEUE_ADMISSION_WINDOW,
+    )
+    assert store.connect_job(replacement_id) is not None
+    assert all(store.connect_job(job_id).status == "failed" for job_id in job_ids)  # type: ignore[union-attr]
 
 
 def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> None:

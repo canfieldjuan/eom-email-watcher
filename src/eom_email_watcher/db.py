@@ -3244,6 +3244,7 @@ class Store:
             ):
                 raise KeyError((message_id, part_id))
             if protocol_version == 2:
+                self._expire_waiting_connect_jobs_transaction(db, stamp)
                 existing = db.execute(
                     """SELECT * FROM connect_attachment_jobs
                     WHERE message_id = ? AND part_id = ?

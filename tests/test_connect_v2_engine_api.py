@@ -886,6 +886,105 @@ def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
     }
 
 
+def test_generic_invoke_rejects_unsupported_lock_before_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: False)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *_args: pytest.fail("Unsupported locking must fail before mailbox access"),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("Unsupported locking must fail before provider access"),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected),
+        )
+    )
+
+    assert response["error"]["code"] == "connect_queue_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert runtime.store.connect_dispatch(REQUEST_ID) is None
+
+
+def test_nonterminal_get_error_preserves_reconciliation_lane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    submissions = 0
+    queries = 0
+
+    class FakeGmail:
+        def attachment_bytes(self, *args) -> bytes:
+            return PDF
+
+    class InconclusiveClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def submit(self, job, content):
+            nonlocal submissions
+            submissions += 1
+            raise connect.ConnectError(
+                "PROVIDER_UNAVAILABLE",
+                "The provider response was lost.",
+                retryable=True,
+            )
+
+        def get(self, job):
+            nonlocal queries
+            queries += 1
+            raise connect.ConnectError(
+                "PROVIDER_AUTHENTICATION_FAILED",
+                "The provider could not authenticate this reconciliation.",
+                retryable=False,
+            )
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", InconclusiveClient)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    request = api_request(
+        config_path,
+        "connect.attachment.invoke",
+        invocation_payload(selected),
+    )
+
+    first = engine_api._response(request)
+    second = engine_api._response(request)
+
+    assert first["error"]["code"] == "provider_unavailable"
+    assert second["error"]["code"] == "provider_authentication_failed"
+    assert submissions == 1
+    assert queries == 1
+    assert runtime.store.connect_job(REQUEST_ID).status == "requested"  # type: ignore[union-attr]
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+    assert dispatch is not None
+    assert dispatch.state == "reconciling"
+    assert dispatch.submission_possible is True
+
+
 def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

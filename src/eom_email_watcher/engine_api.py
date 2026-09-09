@@ -2372,7 +2372,7 @@ def _run_generic_connect_job(
             persisted = runtime.store.connect_job(job.job_id) or persisted
         return _generic_connect_result(persisted)
     except connect.ConnectError as exc:
-        if not exc.retryable and exc.code != "JOB_NOT_FOUND":
+        if content is not None and not exc.retryable and exc.code != "JOB_NOT_FOUND":
             try:
                 _mark_connect_failed(runtime.store, job.job_id, capability, exc)
             except Exception:
@@ -2406,14 +2406,9 @@ def _stored_connect_failure(job: ConnectJob) -> ApiError:
     )
 
 
-def _resume_generic_connect_job(
-    runtime: Runtime,
-    capability: connect.DiscoveredCapability,
-    active: ConnectJob,
-    content: Callable[[], bytes],
-    *,
-    reconcile_first: bool = False,
-) -> dict[str, object]:
+def _require_generic_connect_lane_lock(
+    runtime: Runtime, capability: connect.DiscoveredCapability
+) -> Path:
     lock_path = connect_lane_lock_path(
         runtime.store.path,
         protocol_version=connect.GENERIC_PROTOCOL_VERSION,
@@ -2425,6 +2420,18 @@ def _resume_generic_connect_job(
             "connect_queue_unavailable",
             "Connect provider dispatch requires native operation locking.",
         )
+    return lock_path
+
+
+def _resume_generic_connect_job(
+    runtime: Runtime,
+    capability: connect.DiscoveredCapability,
+    active: ConnectJob,
+    content: Callable[[], bytes],
+    *,
+    reconcile_first: bool = False,
+) -> dict[str, object]:
+    lock_path = _require_generic_connect_lane_lock(runtime, capability)
     busy_message = "Another Connect provider operation is already running"
     try:
         with connect_operation_lock(lock_path, busy_message):
@@ -2649,6 +2656,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             "confirmation_required",
             "The selected capability requires explicit confirmation.",
         )
+    _require_generic_connect_lane_lock(runtime, capability)
     content = attachment_content()
     candidate = connect.prepare_capability_job(
         capability,
