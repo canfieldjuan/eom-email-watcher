@@ -2,12 +2,15 @@ import base64
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from eom_email_watcher import db as db_module
+from eom_email_watcher import locking
 from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import (
     CONNECT_QUEUE_ADMISSION_WINDOW,
@@ -28,6 +31,16 @@ from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
 from eom_email_watcher.mime import AttachmentDescriptor
 
 CALENDAR_PRINCIPAL_KEY = "a" * 64
+DELETE_MESSAGE_PROBE = """
+import sys
+from pathlib import Path
+
+from eom_email_watcher.db import Store
+
+print("waiting", flush=True)
+deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
+print("deleted" if deleted else "missing", flush=True)
+"""
 
 
 def admitted_scheduling_run(
@@ -776,7 +789,7 @@ def test_calendar_proposal_compare_and_swap_prevents_duplicate_payloads(
             proposing.run_id,
             proposing.state_version,
             **arguments,
-    )
+        )
 
     with store.connection() as db:
         assert db.execute(
@@ -2611,6 +2624,34 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
     assert "m1" not in suppression
 
 
+def test_delete_message_waits_for_cross_process_source_handoff(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    lock_path = locking.connect_source_lock_path(store.path, "m1")
+
+    with locking.connect_operation_lock(lock_path, "source busy"):
+        cleanup = subprocess.Popen(
+            [sys.executable, "-c", DELETE_MESSAGE_PROBE, str(store.path), "m1"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert cleanup.stdout is not None
+            assert cleanup.stdout.readline().strip() == "waiting"
+            with pytest.raises(subprocess.TimeoutExpired):
+                cleanup.wait(timeout=0.2)
+        except Exception:
+            cleanup.kill()
+            cleanup.wait(timeout=10)
+            raise
+
+    assert cleanup.stdout is not None
+    assert cleanup.stdout.readline().strip() == "deleted"
+    assert cleanup.wait(timeout=10) == 0
+    assert store.has_message("m1") is False
+
+
 def test_delete_message_bounds_suppression_when_source_time_conversion_overflows(
     tmp_path: Path,
 ) -> None:
@@ -2666,6 +2707,45 @@ def test_clear_messages_preserves_mailbox_and_outbound_state(tmp_path: Path) -> 
         subject="Rediscovered",
         received_at="2026-09-01T00:00:00+00:00",
     )
+
+
+def test_clear_messages_bounds_simultaneously_held_source_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    for index in range(5):
+        assert store.add_message(
+            message_id=f"message-{index}",
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject="Bounded cleanup",
+            received_at="2026-09-01T00:00:00+00:00",
+        )
+    active = 0
+    maximum = 0
+
+    class TrackingLock:
+        def __enter__(self):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+
+        def __exit__(self, *args):
+            nonlocal active
+            active -= 1
+
+    monkeypatch.setattr(db_module, "SOURCE_CLEANUP_LOCK_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        db_module,
+        "connect_operation_lock",
+        lambda *args, **kwargs: TrackingLock(),
+    )
+
+    assert store.clear_messages() == 5
+    assert maximum == 2
+    assert active == 0
 
 
 def test_manual_delete_suppression_overlaps_maximum_retention_boundary(

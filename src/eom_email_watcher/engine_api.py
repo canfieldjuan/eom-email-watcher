@@ -12,6 +12,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from filelock import FileLock
@@ -82,6 +83,7 @@ from .mailbox import (
     MailboxAccountUnavailable,
     MailboxError,
     MailboxGateway,
+    MailboxMessageUnavailable,
 )
 from .microsoft365 import (
     MICROSOFT365_PROVIDER,
@@ -1865,6 +1867,46 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
     return source
 
 
+def _connect_source_is_retained(
+    source: MessageSource,
+    retention_days: int,
+    *,
+    observed_at: datetime,
+) -> bool:
+    try:
+        received_at = datetime.fromisoformat(source.received_at)
+        if received_at.tzinfo is None:
+            return False
+        received_at = received_at.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return False
+    cutoff = observed_at - timedelta(days=retention_days)
+    if received_at <= observed_at:
+        return received_at >= cutoff
+    try:
+        discovered_at = datetime.fromisoformat(source.discovered_at)
+        if discovered_at.tzinfo is None:
+            return False
+        discovered_at = discovered_at.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return False
+    return cutoff <= discovered_at <= observed_at
+
+
+def _retained_connect_message_source(runtime: Runtime, message_id: str) -> MessageSource:
+    source = _configured_message_source(runtime, message_id)
+    if not _connect_source_is_retained(
+        source,
+        runtime.config.retention_days,
+        observed_at=datetime.now(UTC),
+    ):
+        raise ApiError(
+            "connect_source_unavailable",
+            "The source attachment is outside the configured retention window.",
+        )
+    return source
+
+
 def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
     mailbox = load_mailbox_account(
         runtime.config,
@@ -2360,6 +2402,16 @@ def _run_generic_connect_job(
                 raise RuntimeError("Connect failure could not be persisted safely") from exc
         raise
     persisted = _apply_connect_update(runtime.store, initial)
+    return _finish_generic_connect_job(runtime, client, job, initial, persisted)
+
+
+def _finish_generic_connect_job(
+    runtime: Runtime,
+    client: connect.ConnectV2Client,
+    job: connect.PreparedCapabilityJob,
+    initial: connect.CapabilityJobUpdate,
+    persisted: ConnectJob,
+) -> dict[str, object]:
     if persisted.status == "completed":
         return _generic_connect_result(persisted)
     if persisted.status == "failed":
@@ -2565,8 +2617,14 @@ def _submit_generic_connect_job(
             try:
                 payload = content()
             except ApiError as exc:
-                if exc.code != "not_found":
+                if exc.code not in {"not_found", "connect_source_unavailable"}:
                     raise
+                _fail_generic_connect_source(runtime, tracked.job_id, capability)
+                raise ApiError(
+                    "connect_source_unavailable",
+                    "The source attachment is no longer available for handoff.",
+                ) from exc
+            except MailboxMessageUnavailable as exc:
                 _fail_generic_connect_source(runtime, tracked.job_id, capability)
                 raise ApiError(
                     "connect_source_unavailable",
@@ -2597,7 +2655,25 @@ def _submit_generic_connect_job(
                     "connect_source_unavailable",
                     "The source attachment changed before handoff.",
                 )
-            return _run_generic_connect_job(runtime, capability, tracked, payload)
+            client = connect.ConnectV2Client(capability)
+            try:
+                initial = client.submit(tracked, payload)
+            except connect.ConnectError as exc:
+                if not exc.retryable and exc.code != "JOB_NOT_FOUND":
+                    try:
+                        _mark_connect_failed(runtime.store, tracked.job_id, capability, exc)
+                    except Exception:
+                        logger.exception("Connect v2 failure could not be persisted")
+                        raise RuntimeError("Connect failure could not be persisted safely") from exc
+                else:
+                    _defer_generic_connect_error(
+                        runtime,
+                        tracked.job_id,
+                        exc,
+                        submitted=True,
+                    )
+                raise
+            persisted = _apply_connect_update(runtime.store, initial)
     except RuntimeError as exc:
         if str(exc) != busy_message:
             raise
@@ -2616,6 +2692,16 @@ def _submit_generic_connect_job(
             "connect_job_in_progress",
             "The source attachment is being changed; the job remains queued.",
         ) from exc
+    try:
+        return _finish_generic_connect_job(runtime, client, tracked, initial, persisted)
+    except connect.ConnectError as exc:
+        _defer_generic_connect_error(
+            runtime,
+            tracked.job_id,
+            exc,
+            submitted=False,
+        )
+        raise
 
 
 def _run_claimed_generic_connect_job(
@@ -2634,22 +2720,13 @@ def _run_claimed_generic_connect_job(
             tracked.job_id,
             capability,
         )
-        try:
-            return _submit_generic_connect_job(
-                runtime,
-                capability,
-                tracked,
-                claimed_job.message_id,
-                content,
-            )
-        except connect.ConnectError as exc:
-            _defer_generic_connect_error(
-                runtime,
-                tracked.job_id,
-                exc,
-                submitted=True,
-            )
-            raise
+        return _submit_generic_connect_job(
+            runtime,
+            capability,
+            tracked,
+            claimed_job.message_id,
+            content,
+        )
 
     try:
         reconciled = _query_generic_connect_job(runtime, capability, tracked)
@@ -2705,22 +2782,13 @@ def _run_claimed_generic_connect_job(
         tracked.job_id,
         capability,
     )
-    try:
-        return _submit_generic_connect_job(
-            runtime,
-            capability,
-            tracked,
-            refreshed.message_id,
-            content,
-        )
-    except connect.ConnectError as exc:
-        _defer_generic_connect_error(
-            runtime,
-            tracked.job_id,
-            exc,
-            submitted=True,
-        )
-        raise
+    return _submit_generic_connect_job(
+        runtime,
+        capability,
+        tracked,
+        refreshed.message_id,
+        content,
+    )
 
 
 def _resume_generic_connect_job(
@@ -2879,7 +2947,10 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     )
                 except KeyError as exc:
                     raise ApiError("not_found", "Attachment was not found") from exc
-                source = _configured_message_source(runtime, claimed_job.message_id)
+                source = _retained_connect_message_source(
+                    runtime,
+                    claimed_job.message_id,
+                )
                 gateway = _configured_mailbox_gateway(runtime, source)
                 return gateway.attachment_bytes(
                     source.provider_message_id,
@@ -3007,7 +3078,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
-    source = _configured_message_source(runtime, message_id)
+    _retained_connect_message_source(runtime, message_id)
     provider_ref, capability_ref, requested_parameters, confirmed = _generic_invocation_selection(
         payload
     )
@@ -3035,11 +3106,16 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
     )
 
     def attachment_content() -> bytes:
-        gateway = _configured_mailbox_gateway(runtime, source)
+        try:
+            current_attachment = runtime.store.attachment(message_id, part_id)
+        except KeyError as exc:
+            raise ApiError("not_found", "Attachment was not found") from exc
+        current_source = _retained_connect_message_source(runtime, message_id)
+        gateway = _configured_mailbox_gateway(runtime, current_source)
         content = gateway.attachment_bytes(
-            source.provider_message_id,
+            current_source.provider_message_id,
             part_id,
-            attachment.attachment_id,
+            current_attachment.attachment_id,
         )
         return content
 
@@ -3075,9 +3151,21 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         source_lock,
         "The Connect source attachment is being changed",
     ):
-        _configured_message_source(runtime, message_id)
+        _retained_connect_message_source(runtime, message_id)
+        try:
+            locked_attachment = runtime.store.attachment(message_id, part_id)
+        except KeyError as exc:
+            raise ApiError("connect_source_unavailable", "Attachment was not found") from exc
+        if not capability.accepts_artifact(
+            locked_attachment.media_type,
+            locked_attachment.byte_size,
+        ):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment changed before it could be queued.",
+            )
         content = attachment_content()
-        if len(content) != attachment.byte_size:
+        if len(content) != locked_attachment.byte_size:
             raise ApiError(
                 "connect_source_unavailable",
                 "The source attachment changed before it could be queued.",
@@ -3085,8 +3173,8 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         candidate = connect.prepare_capability_job(
             capability,
             content,
-            attachment.media_type,
-            attachment.filename,
+            locked_attachment.media_type,
+            locked_attachment.filename,
             parameters=parameters,
             confirmed=confirmed,
             job_id=request_id,
