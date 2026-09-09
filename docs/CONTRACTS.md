@@ -855,8 +855,8 @@ The Microsoft boundary above was checked against these primary v1.0 references:
 
 # Durable Local Connect provider-admission queue contract
 
-**Status:** issue #117 storage and locking foundation implemented; engine pump,
-host wakeups/UI, and operational proof remain the later slices below.
+**Status:** issue #117 durable storage, engine pump, and Tauri host/UI behavior
+implemented; exact-current Invoice Processor operational proof remains.
 
 ## Verified baseline
 
@@ -1188,6 +1188,13 @@ The Tauri host owns queue pumping:
 - when a recorded backoff becomes due;
 - at desktop startup/restart; and
 - opportunistically after an ordinary watcher check.
+
+Each pump response carries the next durable wake time in Unix milliseconds, or
+`null` when no active queue remains. The host coalesces explicit wake signals,
+waits until that engine-supplied time, and asks the engine to re-read durable
+state; it does not reproduce queue ordering or retry policy in Rust or
+JavaScript. Queue progress emits a host event that causes the native Inbox to
+reload its durable result rows.
 
 If a pump cannot acquire a lane lock, the host schedules a coalesced retry for
 that lane after 2 seconds even though it does not mutate the owning process's

@@ -314,6 +314,14 @@ pub struct AttachmentCapabilityResult {
     #[serde(default)]
     pub parameters: BTreeMap<String, Value>,
     pub status: String,
+    #[serde(default)]
+    pub dispatch_state: Option<String>,
+    #[serde(default)]
+    pub queue_ahead: Option<u64>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    #[serde(default)]
+    pub dispatch_error: Option<EngineError>,
     pub updated_at: String,
     pub summary: Option<ConnectSummary>,
     #[serde(default)]
@@ -492,6 +500,28 @@ pub struct ConnectInvocationResult {
     pub capability: ConnectCapabilityRef,
     pub status: String,
     pub outputs: Vec<ConnectOutputMetadata>,
+    #[serde(default)]
+    pub dispatch_state: Option<String>,
+    #[serde(default)]
+    pub queue_ahead: Option<u64>,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    #[serde(default)]
+    pub dispatch_error: Option<EngineError>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectQueueItem {
+    pub job_id: String,
+    pub job_status: String,
+    pub dispatch_state: String,
+    pub outcome: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConnectQueuePump {
+    pub items: Vec<ConnectQueueItem>,
+    pub next_wake_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1031,6 +1061,10 @@ impl Engine {
                 "confirmed": confirmed,
             }),
         )
+    }
+
+    pub fn pump_connect_queue(&self) -> Result<ConnectQueuePump, EngineError> {
+        self.request("connect.queue.pump", json!({"limit": 25}))
     }
 
     pub fn present_capability_output(
@@ -1881,6 +1915,42 @@ mod tests {
             Some("22222222-2222-4222-8222-222222222222")
         );
         assert_eq!(result.outputs[0].display_name, "summary.json");
+
+        let active: ConnectInvocationResult = serde_json::from_value(json!({
+            "protocol_version": 2,
+            "job_id": "22222222-2222-4222-8222-222222222222",
+            "provider": {
+                "app_id": "document-summarizer",
+                "version": "0.1.0",
+                "instance_id": "11111111-1111-4111-8111-111111111111"
+            },
+            "capability": {"id": "document.summarize", "version": "1.0"},
+            "status": "requested",
+            "outputs": [],
+            "dispatch_state": "waiting",
+            "queue_ahead": 1,
+            "next_attempt_at": "2026-09-09T12:00:02+00:00",
+            "dispatch_error": {
+                "code": "PROVIDER_BUSY",
+                "message": "Another job is running."
+            }
+        }))
+        .expect("deserialize active queue result");
+        assert_eq!(active.dispatch_state.as_deref(), Some("waiting"));
+        assert_eq!(active.queue_ahead, Some(1));
+
+        let pump: ConnectQueuePump = serde_json::from_value(json!({
+            "items": [{
+                "job_id": "22222222-2222-4222-8222-222222222222",
+                "job_status": "requested",
+                "dispatch_state": "waiting",
+                "outcome": "deferred"
+            }],
+            "next_wake_unix_ms": 1_788_955_202_000_u64
+        }))
+        .expect("deserialize queue pump result");
+        assert_eq!(pump.items[0].outcome, "deferred");
+        assert_eq!(pump.next_wake_unix_ms, Some(1_788_955_202_000));
 
         let view: ConnectOutputView = serde_json::from_value(json!({
             "job_id": "22222222-2222-4222-8222-222222222222",

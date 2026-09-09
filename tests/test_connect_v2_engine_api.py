@@ -88,6 +88,24 @@ def make_connect_job_due(runtime: Runtime, job_id: str) -> None:
         )
 
 
+def assert_active_response(
+    response: dict[str, object],
+    *,
+    status: str,
+    dispatch_state: str,
+    job_id: str = REQUEST_ID,
+    queue_ahead: int = 0,
+) -> None:
+    assert response["ok"] is True
+    data = response["data"]
+    assert isinstance(data, dict)
+    assert data["job_id"] == job_id
+    assert data["status"] == status
+    assert data["dispatch_state"] == dispatch_state
+    assert data["queue_ahead"] == queue_ahead
+    assert data["outputs"] == []
+
+
 @pytest.mark.parametrize(
     ("failure_count", "delay"),
     [(0, 2), (1, 4), (2, 8), (3, 16), (4, 30), (25, 30)],
@@ -166,7 +184,98 @@ def test_connect_queue_pump_accepts_boundary_limits(
         api_request(config_path, "connect.queue.pump", {"limit": limit})
     )
 
-    assert response["data"] == {"items": []}
+    assert response["data"] == {"items": [], "next_wake_unix_ms": None}
+
+
+@pytest.mark.parametrize(
+    ("blocked_outcome", "blocked_retry_seconds", "other_lane_seconds"),
+    [
+        ("lock_contended", 2, 1),
+        ("lock_unavailable", 30, 10),
+    ],
+)
+def test_connect_queue_wakeup_does_not_delay_another_provider_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_outcome: str,
+    blocked_retry_seconds: int,
+    other_lane_seconds: int,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    observed_at = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    other_lane_wakeup = observed_at + timedelta(seconds=other_lane_seconds)
+    monkeypatch.setattr(
+        runtime.store,
+        "connect_queue_wakeups",
+        lambda *, now: [
+            (REQUEST_ID, observed_at),
+            (SECOND_REQUEST_ID, other_lane_wakeup),
+        ],
+    )
+
+    next_wakeup = engine_api._next_connect_queue_wakeup(
+        runtime,
+        [{"job_id": REQUEST_ID, "outcome": blocked_outcome}],
+        observed_at,
+    )
+
+    assert blocked_retry_seconds > other_lane_seconds
+    assert next_wakeup == other_lane_wakeup
+
+
+def test_connect_queue_pump_reports_admission_deadline_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    job = connect.prepare_capability_job(
+        selected,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    runtime.store.create_connect_job(
+        job_id=job.job_id,
+        message_id="message-1",
+        part_id="2",
+        protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+        now=datetime(2000, 1, 1, tzinfo=UTC),
+    )
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'waiting', submission_possible = 0,
+                next_attempt_at = admission_deadline
+            WHERE job_id = ?""",
+            (REQUEST_ID,),
+        )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["data"]["items"] == [
+        {
+            "job_id": REQUEST_ID,
+            "job_status": "failed",
+            "dispatch_state": "terminal",
+            "outcome": "expired",
+        }
+    ]
+    assert response["data"]["next_wake_unix_ms"] is None
 
 
 def seeded_runtime(tmp_path: Path):
@@ -970,10 +1079,10 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
     make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
-    assert first["error"]["code"] == "provider_unavailable"
+    assert_active_response(first, status="requested", dispatch_state="reconciling")
     assert durable is not None
     assert durable.status == "requested"
-    assert early["error"]["code"] == "connect_job_in_progress"
+    assert_active_response(early, status="requested", dispatch_state="reconciling")
     assert second["ok"] is True
     assert queries == [durable.job_id]
     assert submissions == [
@@ -1032,7 +1141,7 @@ def test_queue_pump_retries_provider_busy_with_same_job_after_durable_due_time(
     dispatch = runtime.store.connect_dispatch(REQUEST_ID)
     early = engine_api._response(api_request(config_path, "connect.queue.pump"))
 
-    assert invoked["error"]["code"] == "provider_busy"
+    assert_active_response(invoked, status="requested", dispatch_state="waiting")
     assert dispatch is not None
     assert dispatch.state == "waiting"
     assert dispatch.attempt_count == 1
@@ -1098,7 +1207,7 @@ def test_post_submit_poll_timeout_schedules_durable_reconciliation_backoff(
     )
     dispatch = runtime.store.connect_dispatch(REQUEST_ID)
 
-    assert response["error"]["code"] == "job_timeout"
+    assert_active_response(response, status="accepted", dispatch_state="provider_owned")
     assert dispatch is not None
     assert dispatch.state == "provider_owned"
     assert dispatch.next_attempt_at is not None
@@ -1244,8 +1353,14 @@ def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
         )
     )
 
-    assert first["error"]["code"] == "job_timeout"
-    assert second["error"]["code"] == "connect_job_in_progress"
+    assert_active_response(first, status="accepted", dispatch_state="provider_owned")
+    assert_active_response(
+        second,
+        status="requested",
+        dispatch_state="waiting",
+        job_id=SECOND_REQUEST_ID,
+        queue_ahead=1,
+    )
     assert submissions == [REQUEST_ID]
     assert runtime.store.connect_dispatch(REQUEST_ID).state == "provider_owned"  # type: ignore[union-attr]
     assert runtime.store.connect_dispatch(SECOND_REQUEST_ID).state == "waiting"  # type: ignore[union-attr]
@@ -1327,7 +1442,7 @@ def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting
     make_connect_job_due(runtime, REQUEST_ID)
     pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
 
-    assert invoked["error"]["code"] == "provider_unavailable"
+    assert_active_response(invoked, status="requested", dispatch_state="reconciling")
     assert pumped["data"]["items"][0]["job_status"] == "completed"
     assert submissions == 1
     assert queries == 1
@@ -1391,7 +1506,7 @@ def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance
     pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
     dispatch = runtime.store.connect_dispatch(REQUEST_ID)
 
-    assert invoked["error"]["code"] == "job_timeout"
+    assert_active_response(invoked, status="accepted", dispatch_state="provider_owned")
     assert pumped["data"]["items"][0]["outcome"] == "deferred_or_failed"
     assert submissions == 1
     assert queries == 1
@@ -1445,7 +1560,7 @@ def test_queue_pump_blocks_a_new_post_after_entitlement_revocation(
     pumped = engine_api._response(api_request(config_path, "connect.queue.pump"))
     job = runtime.store.connect_job(REQUEST_ID)
 
-    assert invoked["error"]["code"] == "provider_busy"
+    assert_active_response(invoked, status="requested", dispatch_state="waiting")
     assert pumped["data"]["items"][0]["outcome"] == "failed"
     assert job is not None
     assert job.status == "failed"
@@ -1998,8 +2113,8 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
     make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
-    assert first["error"]["code"] == "provider_unavailable"
-    assert second["error"]["code"] == "provider_authentication_failed"
+    assert_active_response(first, status="requested", dispatch_state="reconciling")
+    assert_active_response(second, status="requested", dispatch_state="reconciling")
     assert submissions == 1
     assert queries == 1
     assert runtime.store.connect_job(REQUEST_ID).status == "requested"  # type: ignore[union-attr]
@@ -2063,7 +2178,7 @@ def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
         )
     )
 
-    assert first["error"]["code"] == "provider_unavailable"
+    assert_active_response(first, status="requested", dispatch_state="reconciling")
     assert second["ok"] is True
     assert second["data"]["job_id"] == REQUEST_ID
     assert submissions == [REQUEST_ID]
@@ -2140,7 +2255,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
-    assert first["error"]["code"] == "provider_unavailable"
+    assert_active_response(first, status="requested", dispatch_state="reconciling")
     assert second["ok"] is True
     assert second["data"]["job_id"] == REQUEST_ID
     assert submissions == 1
@@ -2220,7 +2335,7 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
     make_connect_job_due(runtime, REQUEST_ID)
     second = engine_api._response(request)
 
-    assert first["error"]["code"] == "provider_unavailable"
+    assert_active_response(first, status="requested", dispatch_state="reconciling")
     assert second["ok"] is True
     assert second["data"]["job_id"] == REQUEST_ID
     assert raced is True

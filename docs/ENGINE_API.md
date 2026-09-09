@@ -68,8 +68,8 @@ only to stderr.
 | `connect.entitlement.status` | `{}` | Claim-free shared-license state and active boolean |
 | `connect.entitlement.install` | absolute `source_path` | Verify and atomically install an active signed license at the internally derived shared path |
 | `connect.attachment.capabilities` | `message_id`, `part_id` | Every live v2 capability compatible with the inventoried attachment; transport credentials are not exposed |
-| `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate, enqueue, and attempt one selected v2 capability; return or reuse its durable terminal result |
-| `connect.queue.pump` | optional `limit` from 1 through 25 | Drain due provider-lane heads, preserving durable identity, ordering, and retry state |
+| `connect.attachment.invoke` | stable `request_id`, attachment, provider/capability refs, parameters, `confirmed` | Revalidate, enqueue, and attempt one selected v2 capability; return or reuse its durable active or terminal result |
+| `connect.queue.pump` | optional `limit` from 1 through 25 | Drain due provider-lane heads and return the next durable host wake time, preserving identity, ordering, and retry state |
 | `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
 | `connect.output.export` | attachment, `job_id`, `artifact_id`, `destination_dir` | Export one validated completed output to a private random `.bin` file for the trusted host |
 | `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
@@ -319,7 +319,10 @@ Ambiguous submission failures and provider-owned polling failures remain in
 `reconciling` or `provider_owned` state and are queried before any possible
 same-identity resubmission. `connect.queue.pump` operates only on each due,
 authoritative lane head and may drain the next waiting job after a terminal
-result. It performs no provider selection or provider-side queueing. GET-only
+result. Its `next_wake_unix_ms` is the earliest persisted lane retry or waiting
+deadline; `null` means no active queue remains. Inbox capability results expose
+the persisted dispatch state, queue-ahead count, next attempt, and bounded last
+dispatch error for native presentation. It performs no provider selection or provider-side queueing. GET-only
 reconciliation remains available after entitlement expiry, while every proven
 new POST revalidates the signed Connect entitlement.
 

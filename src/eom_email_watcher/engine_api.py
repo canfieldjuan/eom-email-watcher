@@ -2138,6 +2138,46 @@ def _generic_connect_result(job: ConnectJob) -> dict[str, object]:
     }
 
 
+def _generic_connect_active_result(runtime: Runtime, job: ConnectJob) -> dict[str, object]:
+    if (
+        job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
+        or job.status not in {"requested", "accepted", "processing"}
+        or job.provider_app_id is None
+        or job.provider_app_version is None
+        or job.provider_instance_id is None
+    ):
+        raise RuntimeError("Active Connect v2 job is missing its durable provenance")
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    if dispatch is None or dispatch.state == "terminal":
+        raise RuntimeError("Active Connect v2 job is missing its dispatch state")
+    return {
+        "protocol_version": job.protocol_version,
+        "job_id": job.job_id,
+        "status": job.status,
+        "provider": {
+            "app_id": job.provider_app_id,
+            "version": job.provider_app_version,
+            "instance_id": job.provider_instance_id,
+        },
+        "capability": {
+            "id": job.capability_id,
+            "version": job.capability_version,
+        },
+        "outputs": [],
+        "dispatch_state": dispatch.state,
+        "queue_ahead": runtime.store.connect_queue_ahead(job.job_id),
+        "next_attempt_at": dispatch.next_attempt_at,
+        "dispatch_error": (
+            {
+                "code": dispatch.last_error_code,
+                "message": dispatch.last_error_message,
+            }
+            if dispatch.last_error_code is not None and dispatch.last_error_message is not None
+            else None
+        ),
+    }
+
+
 def _selected_connect_output(
     payload: dict[str, object], runtime: Runtime
 ) -> tuple[ConnectJob, ConnectOutput]:
@@ -2814,21 +2854,37 @@ def _resume_generic_connect_job(
                     return _generic_connect_result(current)
                 if current is not None and current.status == "failed":
                     raise _stored_connect_failure(current)
-                raise ApiError(
-                    "connect_job_in_progress",
-                    "The capability job is queued behind earlier provider work.",
-                )
+                if current is not None:
+                    return _generic_connect_active_result(runtime, current)
+                raise RuntimeError("Connect v2 job disappeared while waiting in its lane")
             claimed_job, dispatch = claimed
-            return _run_claimed_generic_connect_job(
-                runtime,
-                capability,
-                claimed_job,
-                dispatch,
-                content,
-                reconcile_first=reconcile_first,
-            )
+            try:
+                return _run_claimed_generic_connect_job(
+                    runtime,
+                    capability,
+                    claimed_job,
+                    dispatch,
+                    content,
+                    reconcile_first=reconcile_first,
+                )
+            except (ApiError, connect.ConnectError):
+                current = runtime.store.connect_job(active.job_id)
+                if current is not None and current.status in {
+                    "requested",
+                    "accepted",
+                    "processing",
+                }:
+                    return _generic_connect_active_result(runtime, current)
+                raise
     except RuntimeError as exc:
         if str(exc) == busy_message:
+            current = runtime.store.connect_job(active.job_id)
+            if current is not None and current.status in {
+                "requested",
+                "accepted",
+                "processing",
+            }:
+                return _generic_connect_active_result(runtime, current)
             raise ApiError(
                 "connect_job_in_progress",
                 "Another capability job is using the selected provider.",
@@ -2879,6 +2935,26 @@ def _connect_queue_item(runtime: Runtime, job_id: str, outcome: str) -> dict[str
         "dispatch_state": dispatch.state if dispatch is not None else "removed",
         "outcome": outcome,
     }
+
+
+def _next_connect_queue_wakeup(
+    runtime: Runtime,
+    items: list[dict[str, object]],
+    observed_at: datetime,
+) -> datetime | None:
+    blocked = {
+        str(item["job_id"]): str(item["outcome"])
+        for item in items
+        if item["outcome"] in {"lock_contended", "lock_unavailable"}
+    }
+    wakeups = []
+    for job_id, wakeup in runtime.store.connect_queue_wakeups(now=observed_at):
+        outcome = blocked.get(job_id)
+        if wakeup <= observed_at and outcome is not None:
+            retry_seconds = 2 if outcome == "lock_contended" else 30
+            wakeup = observed_at + timedelta(seconds=retry_seconds)
+        wakeups.append(wakeup)
+    return min(wakeups) if wakeups else None
 
 
 def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, object]:
@@ -2981,7 +3057,8 @@ def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
     if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 25:
         raise ApiError("invalid_request", "limit must be an integer between 1 and 25")
     runtime = _runtime(request)
-    items: list[dict[str, object]] = []
+    expired = runtime.store.expire_waiting_connect_jobs()
+    items = [_connect_queue_item(runtime, job_id, "expired") for job_id in expired[:raw_limit]]
     attempted: set[str] = set()
     while len(items) < raw_limit:
         heads = runtime.store.due_connect_lane_heads(limit=raw_limit - len(items))
@@ -2993,7 +3070,14 @@ def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
             items.append(_pump_generic_connect_lane(runtime, head))
             if len(items) == raw_limit:
                 break
-    return {"items": items}
+    observed_at = datetime.now(UTC)
+    next_wakeup = _next_connect_queue_wakeup(runtime, items, observed_at)
+    return {
+        "items": items,
+        "next_wake_unix_ms": (
+            int(next_wakeup.timestamp() * 1000) if next_wakeup is not None else None
+        ),
+    }
 
 
 def _tracked_invocation_job(

@@ -13,6 +13,12 @@ alive. The system-tray menu restores the window or explicitly quits the host. An
 control registers the installed application to start after login; that launch stays hidden in the
 tray until the user opens it.
 
+The desktop host also owns the durable Local Connect queue wakeup loop. It pumps once at startup,
+after a capability invocation, after each mailbox check, and at the next due time returned by the
+Python engine. Wake signals are coalesced; provider-lane locks and SQLite state remain the
+correctness boundary. Queue progress refreshes Inbox cards, which render waiting position,
+reconciliation, running, terminal output, and the last bounded refusal from durable engine data.
+
 Settings can safely update polling cadence, message retention, and native-notification enablement
 through the engine contract without exposing TOML or secret-bearing fields to the frontend. For
 exact-loopback inference, the same UI can update the HTTP endpoint and model identifier. A gateway
