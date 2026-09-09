@@ -855,8 +855,8 @@ The Microsoft boundary above was checked against these primary v1.0 references:
 
 # Durable Local Connect provider-admission queue contract
 
-**Status:** prospective issue #117 contract. No queue implementation is present
-until a later commit lands the implementation slices below.
+**Status:** issue #117 storage and locking foundation implemented; engine pump,
+host wakeups/UI, and operational proof remain the later slices below.
 
 ## Verified baseline
 
@@ -931,6 +931,12 @@ the same active logical invocation, exactly one row wins and both callers
 receive that row's original stable `job_id`. A terminal failure permits a new
 explicit invocation; process-local click suppression is never the deduplication
 boundary.
+
+If a legacy database already contains multiple active rows for one fingerprint,
+migration preserves every identity as `reconciling` rather than discarding work
+that may have reached the provider. The immediate enqueue transaction prevents
+new duplicates while the partial unique index is deferred; initialization adds
+the index once reconciliation leaves no duplicate active group.
 
 The selected application version, capability identifier/version, parameters,
 artifact identity, and request JSON remain bound to the existing job. A queued

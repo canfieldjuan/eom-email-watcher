@@ -75,8 +75,15 @@ def test_connect_lock_paths_are_private_stable_and_namespaced(tmp_path: Path) ->
     assert lane != source
     assert lane.parent == database.parent / ".connect-locks"
     assert "invoice-processor" not in lane.name
+    with (
+        pytest.raises(RuntimeError, match="state directory must be initialized"),
+        locking.connect_operation_lock(lane, "lane busy"),
+    ):
+        pytest.fail("An uninitialized state directory acquired a Connect lock")
+    database.parent.mkdir(parents=True, mode=0o700)
     with locking.connect_operation_lock(lane, "lane busy"):
         if os.name == "posix":
+            assert stat.S_IMODE(database.parent.stat().st_mode) == 0o700
             assert stat.S_IMODE(lane.parent.stat().st_mode) == 0o700
         assert _probe_lock(lane) == 23
 

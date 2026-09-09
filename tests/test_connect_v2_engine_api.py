@@ -365,6 +365,67 @@ def test_completed_connect_result_remains_readable_after_entitlement_expires(
     assert response["data"]["outputs"][0]["byte_size"] == 5
 
 
+def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    job = connect.prepare_capability_job(
+        selected,
+        PDF,
+        "application/pdf",
+        "invoice.pdf",
+        job_id=REQUEST_ID,
+    )
+    runtime.store.create_connect_job(
+        job_id=job.job_id,
+        message_id="message-1",
+        part_id="2",
+        protocol_version=2,
+        capability_id=job.capability_id,
+        capability_version=job.capability_version,
+        provider_app_id=job.provider_app_id,
+        provider_app_version=job.provider_app_version,
+        provider_instance_id=job.provider_instance_id,
+        input_artifact_id=job.artifact.artifact_id,
+        input_media_type=job.artifact.media_type,
+        input_byte_size=job.artifact.byte_size,
+        input_sha256=job.artifact.sha256,
+        input_display_name=job.display_name,
+        source_app_id=connect.SOURCE_APP_ID,
+        request_json=job.request_json,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job.job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id=job.provider_app_id,
+        provider_instance_id=job.provider_instance_id,
+    )
+    assert runtime.store.delete_message("message-1") is True
+
+    class CompletingClient:
+        def __init__(self, capability_value):
+            assert capability_value == selected
+
+        def get(self, requested_job):
+            return update(requested_job, "accepted")
+
+        def wait_for_terminal(self, requested_job, initial, on_update):
+            assert initial.status == "accepted"
+            completed = update(requested_job, "completed", payload=b"Ephemeral result")
+            on_update(completed)
+            return completed
+
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
+
+    result = engine_api._run_generic_connect_job(runtime, selected, job, None)
+
+    assert result["job_id"] == REQUEST_ID
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert runtime.store.connect_dispatch(REQUEST_ID) is None
+
+
 def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

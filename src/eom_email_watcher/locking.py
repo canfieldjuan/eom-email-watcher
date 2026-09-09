@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,8 +38,12 @@ def connect_source_lock_path(database_path: Path, message_id: str) -> Path:
 
 
 def prepare_private_lock_path(lock_path: Path) -> None:
+    state_directory = lock_path.parent.parent
+    if not state_directory.is_dir():
+        raise RuntimeError("Connect state directory must be initialized before locking")
     lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock_path.parent.chmod(0o700)
+    if os.name == "posix":
+        lock_path.parent.chmod(0o700)
 
 
 @contextmanager

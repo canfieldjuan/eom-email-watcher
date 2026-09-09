@@ -2349,10 +2349,16 @@ def _run_generic_connect_job(
             return _generic_connect_result(persisted)
         if persisted.status == "failed":
             raise _stored_connect_failure(persisted)
+
+        def persist_update(update: connect.CapabilityJobUpdate) -> ConnectJob:
+            nonlocal persisted
+            persisted = _apply_connect_update(runtime.store, update)
+            return persisted
+
         final = client.wait_for_terminal(
             job,
             initial,
-            lambda update: _apply_connect_update(runtime.store, update),
+            persist_update,
         )
         if final.status == "failed":
             if final.error is None:

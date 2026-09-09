@@ -3494,10 +3494,19 @@ def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> N
         now=created_at,
     )
     assert claimed is not None and claimed[0].job_id == first_id
+    assert claimed[1].state == "dispatching"
+    assert claimed[1].submission_possible is False
+    recovered = store.claim_connect_lane_head(
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        now=created_at + timedelta(seconds=1),
+    )
+    assert recovered is not None and recovered[0].job_id == first_id
     expired = store.expire_waiting_connect_jobs(now=created_at + CONNECT_QUEUE_ADMISSION_WINDOW)
 
     assert expired == (second_id,)
-    assert store.connect_dispatch(first_id).state == "dispatching"  # type: ignore[union-attr]
+    assert store.connect_dispatch(first_id).state == "reconciling"  # type: ignore[union-attr]
+    assert store.connect_dispatch(first_id).submission_possible is True  # type: ignore[union-attr]
     assert store.connect_job(first_id).status == "requested"  # type: ignore[union-attr]
     assert store.connect_dispatch(second_id).state == "terminal"  # type: ignore[union-attr]
     assert store.connect_job(second_id).error_code == (  # type: ignore[union-attr]
@@ -3539,6 +3548,75 @@ def test_initialize_migrates_v2_jobs_to_fail_closed_dispatch_states(tmp_path: Pa
         assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
+def test_initialize_preserves_legacy_active_v2_duplicates_until_reconciled(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    first_id = "33333333-3333-4333-8333-333333333333"
+    second_id = "44444444-4444-4444-8444-444444444444"
+    third_id = "55555555-5555-4555-8555-555555555555"
+    request_json = create_v2_connect_job(store, first_id)
+    duplicate_request = json.loads(request_json)
+    duplicate_request["job_id"] = second_id
+    duplicate_json = json.dumps(duplicate_request, separators=(",", ":")).encode()
+    with store.connection() as db:
+        db.execute("DROP INDEX idx_connect_attachment_jobs_active_v2")
+        row = dict(
+            db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (first_id,)
+            ).fetchone()
+        )
+        row["job_id"] = second_id
+        row["request_json"] = duplicate_json
+        columns = tuple(row)
+        placeholders = ", ".join("?" for _ in columns)
+        db.execute(
+            f"INSERT INTO connect_attachment_jobs ({', '.join(columns)}) "
+            f"VALUES ({placeholders})",
+            tuple(row[column] for column in columns),
+        )
+        db.execute("DROP TRIGGER connect_jobs_delete_dispatch")
+        db.execute("DROP TABLE connect_job_dispatch")
+        db.execute("PRAGMA user_version = 18")
+
+    Store(database).initialize()
+
+    reopened = Store(database)
+    assert reopened.connect_dispatch(first_id).state == "reconciling"  # type: ignore[union-attr]
+    assert reopened.connect_dispatch(second_id).state == "reconciling"  # type: ignore[union-attr]
+    create_v2_connect_job(reopened, third_id)
+    assert reopened.connect_job(third_id) is None
+    with reopened.connection() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_connect_attachment_jobs_active_v2'"
+            ).fetchone()[0]
+            == 0
+        )
+
+    reopened.transition_connect_job(
+        job_id=second_id,
+        expected_state="requested",
+        next_state="failed",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        error={"code": "LEGACY_DUPLICATE", "message": "Reconciled.", "retryable": False},
+    )
+    reopened.initialize()
+    with reopened.connection() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_connect_attachment_jobs_active_v2'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
 def test_message_delete_preserves_provider_owned_job_as_content_free_tombstone(
     tmp_path: Path,
 ) -> None:
@@ -3564,6 +3642,31 @@ def test_message_delete_preserves_provider_owned_job_as_content_free_tombstone(
     assert dispatch.source_available is False
     with pytest.raises(KeyError):
         store.attachment("m1", "2")
+
+    with pytest.raises(ValueError, match="result is invalid"):
+        store.transition_connect_job(
+            job_id=job_id,
+            expected_state="accepted",
+            next_state="completed",
+            provider_app_id="translation-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+            result={"outputs": []},
+        )
+    assert store.connect_job(job_id).status == "accepted"  # type: ignore[union-attr]
+    assert store.connect_dispatch(job_id).source_available is False  # type: ignore[union-attr]
+
+    result, _ = v2_result()
+    late_terminal = store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+        result=result,
+    )
+    assert late_terminal.status == "completed"
+    assert store.connect_job(job_id) is None
+    assert store.connect_dispatch(job_id) is None
 
 
 def test_initialize_replaces_v6_active_index_without_losing_jobs(
@@ -3860,3 +3963,48 @@ def test_connect_job_resubmission_reset_is_atomic_and_provider_scoped(
             provider_app_id="alternate-provider",
             provider_instance_id="11111111-1111-4111-8111-111111111111",
         )
+
+
+def test_connect_v2_resubmission_reset_updates_dispatch_and_preserves_acceptance(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    job_id = "33333333-3333-4333-8333-333333333333"
+    create_v2_connect_job(store, job_id)
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'reconciling', submission_possible = 1
+            WHERE job_id = ?""",
+            (job_id,),
+        )
+
+    reset = store.reset_connect_job_for_resubmission(
+        job_id=job_id,
+        expected_state="requested",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    dispatch = store.connect_dispatch(job_id)
+    assert reset.status == "requested"
+    assert dispatch is not None and dispatch.state == "waiting"
+    assert dispatch.submission_possible is False
+
+    store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="translation-provider",
+        provider_instance_id="11111111-1111-4111-8111-111111111111",
+    )
+    with pytest.raises(RuntimeError, match="authoritative provider acceptance"):
+        store.reset_connect_job_for_resubmission(
+            job_id=job_id,
+            expected_state="accepted",
+            provider_app_id="translation-provider",
+            provider_instance_id="11111111-1111-4111-8111-111111111111",
+        )
+    assert store.connect_job(job_id).status == "accepted"  # type: ignore[union-attr]
+    assert store.connect_dispatch(job_id).state == "provider_owned"  # type: ignore[union-attr]
