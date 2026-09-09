@@ -31,6 +31,10 @@ SCHEDULING_AUTOMATION_VERSION = 1
 SCHEDULING_EXTRACTION_SCHEMA_VERSION = 1
 CONNECT_QUEUE_MAX_JOBS = 25
 CONNECT_QUEUE_ADMISSION_WINDOW = timedelta(hours=2)
+CONNECT_RETRY_DELAYS_SECONDS = (2, 4, 8, 16, 30)
+CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS = 30
+MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES = 128
+MAX_CONNECT_DISPATCH_ERROR_MESSAGE_BYTES = 1024
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -2898,6 +2902,146 @@ class Store:
             ).fetchone()
         return self._connect_dispatch(row) if row else None
 
+    def due_connect_lane_heads(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = CONNECT_QUEUE_MAX_JOBS,
+    ) -> tuple[ConnectJob, ...]:
+        if isinstance(limit, bool) or not 1 <= limit <= CONNECT_QUEUE_MAX_JOBS:
+            raise ValueError(
+                f"Connect queue pump limit must be between 1 and {CONNECT_QUEUE_MAX_JOBS}"
+            )
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._expire_waiting_connect_jobs_transaction(db, stamp)
+            rows = db.execute(
+                """WITH ranked AS (
+                    SELECT j.job_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY j.provider_app_id, j.provider_instance_id
+                            ORDER BY CASE
+                                WHEN d.state = 'dispatching' THEN 0
+                                WHEN d.state IN ('reconciling', 'provider_owned') THEN 1
+                                ELSE 2 END,
+                                j.created_at, j.job_id
+                        ) AS lane_rank,
+                        d.state,
+                        d.next_attempt_at
+                    FROM connect_attachment_jobs AS j
+                    JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                    WHERE j.protocol_version = 2
+                      AND j.status IN ('requested', 'accepted', 'processing')
+                      AND d.state IN (
+                          'waiting', 'dispatching', 'reconciling', 'provider_owned'
+                      )
+                )
+                SELECT j.*
+                FROM ranked AS r
+                JOIN connect_attachment_jobs AS j ON j.job_id = r.job_id
+                WHERE r.lane_rank = 1
+                  AND (
+                      r.state = 'dispatching'
+                      OR r.next_attempt_at IS NULL
+                      OR aware_iso_epoch(r.next_attempt_at) <= aware_iso_epoch(?)
+                  )
+                ORDER BY j.created_at, j.job_id
+                LIMIT ?""",
+                (stamp, limit),
+            ).fetchall()
+        return tuple(self._connect_job(row) for row in rows)
+
+    def defer_connect_job(
+        self,
+        *,
+        job_id: str,
+        expected_dispatch_state: str,
+        next_dispatch_state: str,
+        error_code: str,
+        error_message: str,
+        delay_seconds: int,
+        now: datetime | None = None,
+    ) -> ConnectDispatch:
+        if expected_dispatch_state not in {
+            "dispatching",
+            "reconciling",
+            "provider_owned",
+        }:
+            raise ValueError("Connect retry expected state is invalid")
+        if next_dispatch_state not in {"waiting", "reconciling", "provider_owned"}:
+            raise ValueError("Connect retry next state is invalid")
+        if isinstance(delay_seconds, bool) or not 0 <= delay_seconds <= 30:
+            raise ValueError("Connect retry delay must be between 0 and 30 seconds")
+        code = error_code.encode("utf-8")[:MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+        message = error_message.encode("utf-8")[:MAX_CONNECT_DISPATCH_ERROR_MESSAGE_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+        if not code or not message:
+            raise ValueError("Connect retry diagnostics cannot be empty")
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
+        next_attempt_at = (observed_at + timedelta(seconds=delay_seconds)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.status, d.*
+                FROM connect_attachment_jobs AS j
+                JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                WHERE j.job_id = ?""",
+                (job_id,),
+            ).fetchone()
+            if row is None or row["state"] != expected_dispatch_state:
+                raise RuntimeError("Connect retry lost its expected dispatch-state race")
+            if row["status"] not in {"requested", "accepted", "processing"}:
+                raise RuntimeError("Only active Connect jobs can be deferred")
+            if next_dispatch_state == "waiting" and (
+                row["status"] != "requested"
+                or row["highest_provider_state"] != "requested"
+            ):
+                raise RuntimeError("Provider-owned Connect work cannot return to waiting")
+            if next_dispatch_state == "provider_owned" and row["status"] == "requested":
+                raise RuntimeError("Requested Connect work cannot become provider-owned")
+            if next_dispatch_state == "waiting":
+                deadline = datetime.fromisoformat(str(row["admission_deadline"]))
+                if deadline.tzinfo is None:
+                    raise RuntimeError("Connect admission deadline must include a timezone")
+                if deadline < datetime.fromisoformat(next_attempt_at):
+                    next_attempt_at = deadline.astimezone(UTC).isoformat()
+            cursor = db.execute(
+                """UPDATE connect_job_dispatch SET
+                    state = ?,
+                    reconciliation_failure_count = reconciliation_failure_count + CASE
+                        WHEN ? IN ('reconciling', 'provider_owned') THEN 1 ELSE 0 END,
+                    next_attempt_at = ?,
+                    submission_possible = CASE WHEN ? = 'waiting' THEN 0 ELSE 1 END,
+                    last_error_code = ?, last_error_message = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?""",
+                (
+                    next_dispatch_state,
+                    next_dispatch_state,
+                    next_attempt_at,
+                    next_dispatch_state,
+                    code,
+                    message,
+                    stamp,
+                    job_id,
+                    expected_dispatch_state,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Connect retry lost its expected dispatch-state race")
+            if next_dispatch_state == "waiting":
+                self._expire_waiting_connect_jobs_transaction(db, stamp)
+            updated = db.execute(
+                "SELECT * FROM connect_job_dispatch WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Deferred Connect job is missing dispatch state")
+        return self._connect_dispatch(updated)
+
     @staticmethod
     def _expire_waiting_connect_jobs_transaction(
         db: sqlite3.Connection, stamp: str
@@ -3484,10 +3628,22 @@ class Store:
                             WHEN ? = 'accepted' AND highest_provider_state = 'requested'
                                 THEN 'accepted'
                             ELSE highest_provider_state END,
+                        reconciliation_failure_count = CASE
+                            WHEN ? IN ('accepted', 'processing') THEN 0
+                            ELSE reconciliation_failure_count END,
+                        last_error_code = CASE
+                            WHEN ? IN ('accepted', 'processing') THEN NULL
+                            ELSE last_error_code END,
+                        last_error_message = CASE
+                            WHEN ? IN ('accepted', 'processing') THEN NULL
+                            ELSE last_error_message END,
                         next_attempt_at = NULL, updated_at = ?
                     WHERE job_id = ?""",
                     (
                         dispatch_state,
+                        next_state,
+                        next_state,
+                        next_state,
                         next_state,
                         next_state,
                         next_state,
