@@ -417,7 +417,7 @@ Submission polls to a terminal state synchronously
 
 **`PROVIDER_BUSY` today.** With `retryable: true` on a proven-new POST it is
 recorded and the job returns to `waiting` with the 2/4/8/16/30-second
-schedule (`engine_api.py:2464-2478`, `2441-2446`); an ambiguous failure
+schedule (`engine_api.py:2526-2540`, `2503-2508`); an ambiguous failure
 goes to `reconciling` (`2480-2488`); a definitive non-retryable refusal is
 terminal (`2662-2667`). Ownership of the retry is the pump
 (`2884-2996`), which nothing calls (C1). So: retry policy exists, retry
@@ -470,7 +470,7 @@ but not specified. That is a contracts gap, not a code gap.
 | PR | Layer | Evidence |
 |---|---|---|
 | #120 storage | schema 19 (`db.py:22`); `connect_job_dispatch` with states `waiting / dispatching / reconciling / provider_owned / terminal` (`db.py:251-271`); lane ordering index (`274-280`); active-fingerprint unique index (`282-286`); delete triggers that keep reconciling tombstones (`288-317`); native lane and source lock identities (`locking.py`, per PR body) | storage and admission primitives only |
-| #121 pump | 2/4/8/16/30 backoff (`engine_api.py:2441-2446`); busy to `waiting` (`2464-2478`); `connect.queue.pump` draining due lane heads under the lane lock (`2884-2996`); entitlement-free discovery only for reconciliation (`connect.py:1152-1163`; `engine_api.py:2907-2921`) | engine operation exists; no host calls it (C1) |
+| #121 pump | 2/4/8/16/30 backoff (`engine_api.py:2503-2508`); busy to `waiting` (`2526-2540`); `connect.queue.pump` draining due lane heads under the lane lock (`3006-3127`); entitlement-free discovery only for reconciliation (`connect.py:1152-1163`; `engine_api.py:2907-2921`) | engine operation exists; no host calls it (C1) |
 | #122 source lock | source lock held across fetch, hash check, POST, and outcome persistence (`engine_api.py:2604-2676`); retention checked at enqueue and handoff (`1870-1896`, `2613-2616`); transient mailbox failure returns to `waiting` (`2633-2648`) | coordination between handoff and cleanup |
 
 Not landed: host wakeups, durable queue UI states
@@ -479,7 +479,7 @@ Not landed: host wakeups, durable queue UI states
 
 One-job-at-a-time still holds at the provider boundary (K1) and is now
 mirrored on the consumer side: one process may own one provider lane at a
-time (`engine_api.py:2802-2805`, `2897-2904`), and the lane is
+time (`engine_api.py:2889-2892`, `3009-3019`), and the lane is
 `(protocol 2, provider_app_id, provider_instance_id)`, shared by every
 capability that instance exposes (`docs/CONTRACTS.md:912-921`). Therefore
 the rule engine may fan out across distinct provider instances and must
@@ -943,7 +943,7 @@ part_id)` order, grouped by resolved provider instance, within the
    stay `pending_dispatch` for the next pass.
 
 The first draft's step 5 entered the click path, which "submits and waits
-for a terminal state synchronously" (`engine_api.py:2425`,
+for a terminal state synchronously" (`engine_api.py:2487`,
 `client.wait_for_terminal`), with a ten-minute budget checked only before
 each submission. That never bounded the pass: the nested wait had its own
 30-minute job timeout (`connect.py:53`, `DEFAULT_JOB_TIMEOUT_SECONDS`), so a
@@ -975,11 +975,11 @@ the provider never accepted it (`docs/CONTRACTS.md:1055-1061`,
 in `manual_review` on the second such failure. Fires not reached stay
 `pending_dispatch`; jobs left `provider_owned` or `reconciling` are
 reconciled by the next pump, GET-before-POST by construction
-(`engine_api.py:2731-2742`).
+(`engine_api.py:2813-2830`).
 
 `PROVIDER_BUSY` during the pass, which can only come from a user click that
 won the lane in between, is handled by the existing deferral
-(`engine_api.py:2464-2478`); the pump walks the backoff schedule.
+(`engine_api.py:2526-2540`); the pump walks the backoff schedule.
 Provider absence for a fire that has **not** yet produced a job is a
 pass-level retry with no Connect state; a fire that has been
 `pending_dispatch` for 24 hours halts in `provider_unavailable` and
@@ -1070,7 +1070,7 @@ Where the gate is checked:
    AUTOMATIONS_FEATURE_ID)` (`entitlement.py:280-281`), the same call the
    service loop makes (`service.py:112`);
 3. inside the enqueue path, the exchange feature again
-   (`engine_api.py:3100`) and at every proven-new POST (`2907-2917`); this
+   (`engine_api.py:3231`) and at every proven-new POST (`3029-3039`); this
    is not the engine's check to remove;
 4. at every human decision on a fire (section 6.7), both features
    (`service.py:947` pattern).
@@ -1134,7 +1134,7 @@ Stated explicitly because it is a known blind spot.
   only shared truth and neither actor holds a lock across calls. The two checks are
   mutually excluded by `<database>.check.lock` (`cli.py:74`,
   `engine_api.py:270`); the click is not, and contends only on the lane
-  lock (`engine_api.py:2802-2805`) and the source lock (`3149-3153`). The
+  lock (`engine_api.py:2889-2892`) and the source lock (`3279-3284`). The
   engine adds no lock: it runs inside the check and reuses both.
 - **Within a pass.** Single-threaded. The evaluate phase is a sequence of
   per-message transactions; the dispatch phase is a sequence of
@@ -1158,8 +1158,11 @@ Stated explicitly because it is a known blind spot.
   first time a click's busy refusal has been retried without a second click
   (C1).
 - **A click during a pass.** The click and the pass contend the lane lock;
-  the loser gets `connect_job_in_progress` (`engine_api.py:2817-2820`,
-  `2830-2835`) with a durable job row, and the pump advances it.
+  since #123 the losing click returns the job's durable active state
+  (`engine_api.py:2905`, `2934`) with a durable job row, and the pump
+  advances it. `connect_job_in_progress` is raised only when no active job
+  row exists for the request (`2936`) or the job changed during
+  reconciliation (`2863`).
 - **Rule edits during a pass.** Snapshot at phase start (one read
   transaction); the edit is visible next pass. Edit operations do not take
   the check lock and therefore never wait on a thirty-minute pass.
@@ -1180,7 +1183,7 @@ proves it does not.
 | I2 | A rule version fires on a message whose `analysis_at` precedes the version's `accepted_at`, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires and `rules_evaluated_version = 0`. |
 | I3 | Anything fires without both features active. | Matrix test over (none, exchange only, automations only, both) times (rule with `connect.invoke`, `calendar.propose`, `notify`): only (both, any) fires; the automations-only row also asserts the seeded scheduling rule does not admit a run (`tests/test_service.py:542` extended). Boundary probe: the licence active until `expires_at` minus one second fires; at `expires_at` does not. |
 | I4 | A capability with declared effects or confirmation is invoked without a person confirming that exact item. | Fixture manifest with `effects.external: true`; test asserts `awaiting_confirmation`, then confirms with a stale `item_sha256`, asserts refusal; confirms with the right one, asserts dispatch. Negative: a manifest with both false is dispatched without confirmation. |
-| I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2649-2657`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
+| I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
 | I7 | A pass runs past its deadline. | Simulated clock and a deadline propagated to every blocking call. Slow provider: a stub whose submit sleeps past the remaining time; assert the submit is cut at the deadline, the pass returns within it, the job is `requested`/`waiting`, and the next pump reconciles GET-before-POST. Slow mailbox: a gateway whose attachment fetch consumes the whole deadline; assert nothing is submitted, every fire is `pending_dispatch`, and the pass still returns by the deadline. |
 | I8 | The engine picks a provider. | Two registrations for one app id; assert `ambiguous_provider` and no job. One registration whose instance changed between confirmation and dispatch; assert `provider_changed`, no job. |
@@ -1193,7 +1196,7 @@ proves it does not.
 | I15 | Retention or deletion loses an idempotency record while a fire is still eligible. | Inherited from `messages_delete_connect_attachment_jobs` (`db.py:296-317`); test deletes the source message of a `submitted` fire and asserts the fire becomes `source_unavailable` and no later POST occurs. |
 | I17 | A fire causes more than one provider execution, or loses its job across a crash. | Crash probes at three points with a real provider process and a counting stub behind it: before submission (job row exists, no POST yet), after acceptance (job `provider_owned`), and after terminal persistence but before fire bookkeeping (job `completed`, fire not yet linked). After each, the next pass or pump resumes by the persisted `dispatch_request_id`; assert exactly one provider execution, the fire ends `completed` with that job's result, and no second request id was ever generated. |
 | I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution. |
-| I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and completes one `invoice.extract` job with no desktop open. This is the end-to-end proof; the two-invoice proof the queue contract owes (`docs/CONTRACTS.md:1265-1267`) is folded into it. |
+| I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and completes one `invoice.extract` job with no desktop process running. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the job. This is the end-to-end proof; the two-invoice proof the queue contract owes (`docs/CONTRACTS.md:1265-1267`) is folded into it. |
 
 Real adapters throughout: the provider is the reference provider script the
 repo already ships (`scripts/connect_reference_provider.py`) or the real
@@ -1394,3 +1397,9 @@ matching string literals across repos:
   content); 6.8 (the host queue thread as a fourth actor); 7 (I2, I6, I7,
   I13 rewritten; I17, I18 added); 9 (the Windows window-close claim
   corrected against `lib.rs:737-745`); 12 (landing order).
+- **r3 (2026-09-10).** Citation and accuracy pass only, no design change:
+  nine `engine_api.py` line citations that were `29fd046` numbers without
+  the label now point at the same code at `c10a37c`; section 6.8's
+  click-during-pass paragraph now describes the post-#123 behavior (the
+  losing click returns the job's active state, not an error); I16 adds
+  the desktop-present variant.
