@@ -420,8 +420,11 @@ recorded and the job returns to `waiting` with the 2/4/8/16/30-second
 schedule (`engine_api.py:2526-2540`, `2503-2508`); an ambiguous failure
 goes to `reconciling` (`2480-2488`); a definitive non-retryable refusal is
 terminal (`2662-2667`). Ownership of the retry is the pump
-(`2884-2996`), which nothing calls (C1). So: retry policy exists, retry
-execution does not, and a waiting job's fixed two-hour admission deadline
+(`engine_api.py:3101-3127`), called by the desktop host's queue thread
+(`scheduler.rs:99-104`) and by nothing in the timer-driven path (C1). So:
+retry policy and retry execution both exist when the desktop runs; under
+the timer alone there is no retry execution, and a waiting job's fixed
+two-hour admission deadline
 (`db.py:261`, `docs/CONTRACTS.md:1017-1018`) is measured against a systemd
 timer that fires every two hours. Section 6.5 designs around that.
 
@@ -473,9 +476,11 @@ but not specified. That is a contracts gap, not a code gap.
 | #121 pump | 2/4/8/16/30 backoff (`engine_api.py:2503-2508`); busy to `waiting` (`2526-2540`); `connect.queue.pump` draining due lane heads under the lane lock (`3006-3127`); entitlement-free discovery only for reconciliation (`connect.py:1152-1163`; `engine_api.py:2907-2921`) | engine operation exists; no host calls it (C1) |
 | #122 source lock | source lock held across fetch, hash check, POST, and outcome persistence (`engine_api.py:2604-2676`); retention checked at enqueue and handoff (`1870-1896`, `2613-2616`); transient mailbox failure returns to `waiting` (`2633-2648`) | coordination between handoff and cleanup |
 
-Not landed: host wakeups, durable queue UI states
-(`docs/CONTRACTS.md:1203-1210`), the installed two-invoice proof
-(`1265-1267`).
+| #123 host wake and UI | `ConnectQueueScheduler` started at setup (`lib.rs:802-803`); pump at startup, after clicks and checks, and at the engine's `next_wake_unix_ms` (`scheduler.rs:91-150`, `275`); non-blocking pump rounds (`engine_api.py:2475-2480`, `3090`); expiry sweep (`db.py:3202`); Inbox rows carry dispatch state (`db.py:5872-5884`) | landing step 4 |
+| #124 proof | two real invoices through the real Invoice Processor, four bounded pumps, zero operator retries (`docs/CONTRACTS.md:1302-1341`) | landing step 5, Linux |
+
+Not landed anywhere: a pump in the timer-driven path (C1). The `29fd046`
+citations in the #121 and #122 rows are labelled as such in section 0.
 
 One-job-at-a-time still holds at the provider boundary (K1) and is now
 mirrored on the consumer side: one process may own one provider lane at a
@@ -534,8 +539,23 @@ Rule
 ```
 
 Each accepted edit produces a new immutable row in `automation_rule_versions`
-(`rule_id`, `version`, the full definition, `accepted_at` UTC). `accepted_at`
-is the rule-version applicability boundary used in section 5.1.
+(`rule_id`, `version`, the full definition, `accepted_at` UTC for display,
+and `revision`). `revision` is a database-assigned monotonic integer: a
+single-row `automation_rule_set(revision)` counter incremented inside the
+same `BEGIN IMMEDIATE` transaction as every rule write, so two rule writes
+can never share a revision and a revision can never move backwards under a
+clock change. A superseded or deleted version also records
+`retired_revision`, the revision of the write that retired it. `revision`
+and `retired_revision`, not the timestamps, are the applicability boundary
+used in section 5.1.
+
+Deletion is a version, not a removal. `automation.rules.delete` writes a
+new immutable version with `deleted: true` and an empty definition, retires
+the previous version at that revision, and hides the rule from the list;
+it applies to no message. Every earlier version and every fire that
+references one stay exactly as they were, so a deleted rule can no longer
+fire and its past fires remain explainable by the text that produced them.
+A system rule cannot be deleted.
 
 ### 4.2 Matching vocabulary
 
@@ -657,8 +677,9 @@ always be explained by the exact rule text that produced it.
 
 Edited through engine operations, native desktop forms only:
 `automation.rules.list`, `automation.rules.get`, `automation.rules.put`,
-`automation.rules.delete`, `automation.rules.set_enabled`. There is no text
-DSL and no file a person edits by hand.
+`automation.rules.delete` (a tombstone version, section 4.1),
+`automation.rules.set_enabled`. There is no text DSL and no file a person
+edits by hand.
 
 Rejected: rules in `config.toml` beside the sender list. Senders are
 config because they are an allowlist with no run history; rules need a
@@ -737,34 +758,42 @@ Evaluation candidates are messages whose analysis is complete (`status` in
 once, ever.
 
 **Which rule versions apply to a message** is decided by two stored
-timestamps, not by when the pass happens to run:
+revision numbers, not by timestamps and not by when the pass happens to
+run:
 
-- `messages.analysis_at`, written by `mark_analyzed` when the analysis that
-  produced the matching fields committed (`db.py:5351`);
-- `automation_rule_versions.accepted_at`, written when a rule version was
-  saved (section 4.1).
+- `messages.rules_revision_at_analysis`, captured by `mark_analyzed` inside
+  its existing `BEGIN IMMEDIATE` transaction (`db.py:5340`) by reading the
+  current `automation_rule_set.revision`; the analysis result and the
+  revision it saw commit together;
+- `automation_rule_versions.revision` and `retired_revision` (section 4.1).
 
-A rule version applies to a message iff `accepted_at <= analysis_at` and it
-is the latest version of its rule with that property. A rule created after
-the message was analysed has no applicable version and cannot fire on it.
-A rule edited after the message was analysed is evaluated on the version
-that existed at analysis, so the edit neither fires retroactively nor
-loses the work the earlier version was entitled to. The evaluation reads
-the version table once per pass (one read transaction); a version accepted
-after that snapshot is by construction newer than every candidate's
-`analysis_at` and cannot apply in this pass. This is the rule the first
-draft promised (I2) but did not mechanise.
+A rule version applies to a message iff
+`revision <= rules_revision_at_analysis < retired_revision` (an unretired
+version has an infinite `retired_revision`). Because revisions are assigned
+by the database inside serialized write transactions, "before" and
+"after" are transaction order, not wall-clock order: equal timestamps and
+clock rollback cannot admit a later rule or hide an earlier one. A rule
+created after the message was analysed has a revision greater than the
+one the analysis captured and cannot fire on it. A rule edited after the
+message was analysed is evaluated on the version that was current at the
+captured revision, so the edit neither fires retroactively nor loses the
+work the earlier version was entitled to. A deleted rule's tombstone
+version applies to nothing, and the version it retired applies only to
+messages analysed before the deletion. The evaluation reads the version
+table once per pass (one read transaction); a version written after that
+snapshot has a revision greater than every candidate's captured revision
+and cannot apply in this pass.
 
 Consequences that follow from the boundary, not from extra rules:
 
 - **Crash between analysis and evaluation, new rule saved in between.**
-  The message stays a candidate; the new rule's `accepted_at` is later than
-  the message's `analysis_at`; it does not fire. The versions that did
-  exist at analysis fire as they would have.
-- **Migration.** Messages analysed before the migration have
-  `analysis_at` earlier than every rule version's `accepted_at`, including
-  the seeded rule's, so no rule applies to them and no retroactive fire is
-  possible. Their `rules_evaluated_version` is set to `0` by the migration
+  The message stays a candidate; the new rule's `revision` is greater than
+  the message's captured revision; it does not fire. The versions that did
+  exist at the captured revision fire as they would have.
+- **Migration.** Messages analysed before the migration receive
+  `rules_revision_at_analysis = 0`, below every rule version's `revision`
+  including the seeded rule's, so no rule applies to them and no
+  retroactive fire is possible. Their `rules_evaluated_version` is set to `0` by the migration
   ("evaluated under no rules") so they are not re-read every pass. The
   runs the old scheduling path already admitted for them live in
   `automation_runs` untouched.
@@ -772,7 +801,11 @@ Consequences that follow from the boundary, not from extra rules:
   which is the next pass at the earliest.
 - **Re-analysis.** `analysis.requeue` (`engine_api.py:1792`) does not clear
   `rules_evaluated_version`; a re-analysed message does not re-fire, even
-  though its `analysis_at` moves forward.
+  though its `analysis_at` and captured revision move forward.
+- **Deletion.** A rule deleted after a message was analysed still fires
+  its pre-deletion version on that message when evaluation catches up
+  (the work it was entitled to); a message analysed after the deletion
+  sees only the tombstone and nothing fires.
 
 In one `BEGIN IMMEDIATE` transaction per message the engine writes the
 message's `rules_evaluated_version`, the fire rows -- each with its own
@@ -840,10 +873,15 @@ jobs on two lanes.
 
 No match writes the message's `rules_evaluated_version` and nothing else.
 A rule cannot fire twice on the same message: unique index on
-`(event_id, rule_id, rule_version, artifact_ref)` in `automation_rule_runs`,
+`(event_id, rule_id, rule_version, artifact_key)` in `automation_rule_runs`,
 where `event_id` is the SHA-256 of `(provider, account_id,
 provider_message_id, "mail.message", 1)`, i.e. the same message key the
-scheduling admission uses (`db.py:934`).
+scheduling admission uses (`db.py:934`), and `artifact_key` is a `NOT NULL`
+text column equal to `message_id || "/" || part_id` for artifact-consuming
+actions and the sentinel `"-"` otherwise. SQLite treats every NULL as
+distinct in a unique index, so a nullable `artifact_ref` would not have
+enforced this for `calendar.propose` or `notify` fires; the sentinel makes
+the constraint real for both action classes, and I1 tests both.
 
 ### 5.4 The generic event
 
@@ -875,12 +913,20 @@ graph.
 
 ```text
 matched -> pending_dispatch -> submitted -> completed | failed
+matched -> not_admitted                                   (terminal; action refused
+                                                           admission, section 4.6)
 matched -> awaiting_confirmation -> pending_dispatch      (person confirmed)
                                  -> declined              (person declined)
 pending_dispatch -> provider_unavailable | ambiguous_provider
                  | source_unavailable | manual_review
+submitted -> pending_dispatch                             (attempt proven never
+                                                           accepted, section 6.2)
 submitted -> source_unavailable                           (cleanup won)
 ```
+
+`not_admitted` is terminal, recorded once with its reason, emits no
+notification, creates no run or job, and is never retried on a later
+pass; a later message fires afresh.
 
 `submitted` is not a stored truth of its own: a fire in `submitted` holds a
 `job_id`, and its displayed state is derived from that job's
@@ -903,9 +949,20 @@ row and the fire's `job_id`, and only then is the provider contacted. The
 existing request-id replay (`engine_api.py:3085-3100` at `29fd046`:
 a request id whose job is `completed` returns the completed result) makes
 this recoverable across every crash boundary: a fire in `pending_dispatch`
-or `submitted` whose `dispatch_request_id` already names a job row resumes
-that job by id -- through the pump if active, through the stored result if
-completed -- and never generates a second request id. The first draft
+or `submitted` whose current `dispatch_request_id` already names a job row
+resumes that job by id -- through the pump if active, through the stored
+result if completed or failed -- and never generates a second request id
+for the same attempt. A fire may have more than one **attempt**, each an
+immutable `automation_rule_run_attempts` row with its own
+`dispatch_request_id` and `attempt_no`; the fire's current request id is
+its highest attempt. A new attempt row is created only in a transaction
+that first observes the previous attempt's job terminal with a
+proven-never-accepted code (`connect_queue_deadline_exceeded` or
+`connect_source_unavailable` before any POST), and at most two attempts
+exist per fire. Recovery always reads the highest attempt; a lower
+attempt's request id replays its stored failure
+(`engine_api.py:3216-3229`), which is exactly why it can never be
+re-executed. The first draft
 entered the click path "with a fresh engine-owned request_id" and left the
 fire-to-job association to a later write, which permitted one provider
 execution per crash. A unique fire row alone is not proof of one provider
@@ -950,20 +1007,27 @@ each submission. That never bounded the pass: the nested wait had its own
 submission allowed at second 599 could hold the pass until second 2399.
 The pump exists precisely so that nothing waits, and the engine uses it.
 
-**Pass deadline.** The pass computes `deadline = pass_start + 10 minutes`
-once, at the start of `run_watcher_check`, before mail is fetched. Every
-blocking operation in the evaluate and dispatch phases -- attachment
-fetch, lock acquisition, provider submit and GET inside the pump, the
-pump call itself -- receives the remaining time to that deadline as its
-timeout, and an operation whose minimum duration would not fit is not
-started. Mail fetch and analysis run before dispatch and consume the same
-deadline, so a slow mailbox leaves less time for dispatch and never more;
-when nothing remains, nothing is dispatched and every fire stays
-`pending_dispatch`, which is a safe resumable state because admission is
-durable and idempotent. This is what makes the desktop scheduler's
-30-minute engine timeout (`scheduler.rs:17`) unreachable by a pass and is
-the invariant I7 now actually settles: both the slow-provider and the
-slow-mailbox case are tested with a simulated clock.
+**Phase deadline.** The engine computes `deadline = evaluate_start + 10
+minutes` once, when the evaluate phase begins, after `Watcher.check` has
+returned. Every blocking operation in the evaluate and dispatch phases --
+attachment fetch, lock acquisition, provider submit and GET inside the
+pump, the pump call itself -- receives the remaining time to that deadline
+as its timeout, and an operation whose minimum duration would not fit is
+not started. When nothing remains, nothing more is dispatched and every
+unbound fire stays `pending_dispatch`, which is a safe resumable state
+because admission is durable and idempotent.
+
+The guarantee is scoped, and this contract says so plainly: the two new
+phases add at most ten minutes to a pass. The work that precedes them --
+scheduling writes, extraction and proposals, mailbox polling, and model
+analysis (`service.py:1438-1448`) -- is unchanged by this contract and has
+no deadline today; the engine does not propagate cancellation into it,
+because changing the mail pass's own bounds is a separate contract. A
+pass can therefore still reach the desktop scheduler's 30-minute engine
+timeout (`scheduler.rs:17`) through the pre-existing phases, as it can
+today, and this contract does not claim otherwise. What it claims, and
+what I7 settles with a simulated clock, is that a slow provider or a slow
+mailbox inside the new phases cannot hold them past their ten minutes.
 
 **What the pass does not do.** It does not wait for jobs it admitted.
 With the desktop open, the host's queue thread pumps them at the
@@ -971,8 +1035,11 @@ engine-supplied wake times (C1). Without a desktop, the next pump is the
 next timer-driven pass (section 6.5), and the two-hour admission window
 can expire a `waiting` job first; `connect_queue_deadline_exceeded` proves
 the provider never accepted it (`docs/CONTRACTS.md:1055-1061`,
-`1156-1158`), so the fire may create one new job identity once, then halts
-in `manual_review` on the second such failure. Fires not reached stay
+`1156-1158`), so the fire returns to `pending_dispatch` and, on its next
+dispatch, opens a second attempt with a fresh `dispatch_request_id`
+(section 6.1); the first attempt's request id remains bound to its failed
+job and replays that failure forever. A second such failure halts the
+fire in `manual_review`. Fires not reached stay
 `pending_dispatch`; jobs left `provider_owned` or `reconciling` are
 reconciled by the next pump, GET-before-POST by construction
 (`engine_api.py:2813-2830`).
@@ -997,13 +1064,18 @@ and two hosts:
   the host's queue thread pumps again at the engine's `next_wake_unix_ms`
   and re-reads durable state (`scheduler.rs:91-101`). Nothing in the pass
   depends on the host, and the host reproduces no queue policy.
-- **Timer-driven install, no desktop.** The pass is the only pump until the
-  next pass (section 6.5).
+- **Timer-driven install, no desktop.** The pass admits and pumps once
+  within its deadline, and the dedicated pump timer of section 6.5 owns
+  progress between passes: it runs `eom-mail-watch pump` at a cadence
+  inside the admission window, so a `waiting` or `provider_owned` job
+  advances after the mail-check process has exited, without waiting for
+  the next mail check. The mail check is not the only pump on this host.
 
 Both hosts run the same tests (section 7); the tests that distinguish them
 are the wake-time tests (host present: a `waiting` job advances before the
-next pass; host absent: it advances at the next pass or expires under the
-admission window and is handled as section 6.2 says).
+next pass through the host thread; host absent: it advances before the
+next pass through the pump timer, and if that timer is disabled it
+expires under the admission window and is handled as section 6.2 says).
 
 ### 6.4 Failure taxonomy
 
@@ -1015,7 +1087,7 @@ admission window and is handled as section 6.2 says).
 | `PROVIDER_BUSY` (retryable) | `submitted` / job `waiting` | no | queue backoff |
 | ambiguous POST outcome | `submitted` / job `reconciling` | no | GET before POST, existing |
 | non-retryable refusal, or job `failed` | `failed` with the provider's bounded `code` and `message` | yes | none; a person may click |
-| deadline or source loss before acceptance | new job once, then `manual_review` | on the second | one |
+| admission deadline, or source loss before any POST | `pending_dispatch`, then a second attempt with a fresh request id; `manual_review` on the second failure | on the second | one |
 | source gone or changed | `source_unavailable` | yes | none |
 | licence not active at dispatch | fire stays `pending_dispatch`, evaluation continues recording `locked` outcomes | rules panel shows locked | resumes when active |
 | completed, output withheld fields | `completed` | yes | none |
@@ -1099,12 +1171,17 @@ for the selected capability, or when the rule author set
 `confirm_each: true` (an optional rule field, default false). A person
 confirms one specific fire by
 `(fire_id, state_version, item_sha256)` where `item_sha256` binds the
-artifact digest, capability id and version, provider app id and instance
-id, and canonical parameters; the engine operation
+artifact digest, capability id and version, provider app id, **provider
+app version**, provider instance id, and canonical parameters -- the same
+members the invocation fingerprint binds (`db.py:1461-1479`), because the
+existing client already treats an app-version mismatch as a different
+capability identity (`connect.py:1713-1723`); the engine operation
 `automation.rule_run.decide` mirrors `calendar.automation.decide`
-(`db.py:4277-4284` for the compare-and-set shape). If the resolved instance
-at dispatch differs from the confirmed instance, the fire halts in
-`manual_review` with `provider_changed`; it does not re-resolve. A confirm
+(`db.py:4277-4284` for the compare-and-set shape). If the resolved
+instance **or app version** at dispatch differs from what was confirmed,
+the fire halts in `manual_review` with `provider_changed`; it does not
+re-resolve, so an upgrade between confirmation and dispatch can never
+execute under a confirmation the person gave to a different version. A confirm
 is single-fire and non-transferable; repeated clicks return the existing
 result.
 
@@ -1180,12 +1257,12 @@ proves it does not.
 | # | Never | Settling evidence |
 |---|---|---|
 | I1 | A rule fires twice on one message and artifact. | Unique index on `(event_id, rule_id, rule_version, artifact_ref)`; test evaluates the same message in two passes and after a crash injected between evaluation commit and dispatch, asserts one fire. |
-| I2 | A rule version fires on a message whose `analysis_at` precedes the version's `accepted_at`, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires and `rules_evaluated_version = 0`. |
+| I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
 | I3 | Anything fires without both features active. | Matrix test over (none, exchange only, automations only, both) times (rule with `connect.invoke`, `calendar.propose`, `notify`): only (both, any) fires; the automations-only row also asserts the seeded scheduling rule does not admit a run (`tests/test_service.py:542` extended). Boundary probe: the licence active until `expires_at` minus one second fires; at `expires_at` does not. |
 | I4 | A capability with declared effects or confirmation is invoked without a person confirming that exact item. | Fixture manifest with `effects.external: true`; test asserts `awaiting_confirmation`, then confirms with a stale `item_sha256`, asserts refusal; confirms with the right one, asserts dispatch. Negative: a manifest with both false is dispatched without confirmation. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
-| I7 | A pass runs past its deadline. | Simulated clock and a deadline propagated to every blocking call. Slow provider: a stub whose submit sleeps past the remaining time; assert the submit is cut at the deadline, the pass returns within it, the job is `requested`/`waiting`, and the next pump reconciles GET-before-POST. Slow mailbox: a gateway whose attachment fetch consumes the whole deadline; assert nothing is submitted, every fire is `pending_dispatch`, and the pass still returns by the deadline. |
+| I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. The pre-existing mail phases are outside this invariant by section 6.2. |
 | I8 | The engine picks a provider. | Two registrations for one app id; assert `ambiguous_provider` and no job. One registration whose instance changed between confirmation and dispatch; assert `provider_changed`, no job. |
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
 | I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload for a completed fire and asserts it contains rule name, sender label, subject, outcome word, and no substring of the job's output. |
@@ -1194,9 +1271,9 @@ proves it does not.
 | I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
 | I15 | Retention or deletion loses an idempotency record while a fire is still eligible. | Inherited from `messages_delete_connect_attachment_jobs` (`db.py:296-317`); test deletes the source message of a `submitted` fire and asserts the fire becomes `source_unavailable` and no later POST occurs. |
-| I17 | A fire causes more than one provider execution, or loses its job across a crash. | Crash probes at three points with a real provider process and a counting stub behind it: before submission (job row exists, no POST yet), after acceptance (job `provider_owned`), and after terminal persistence but before fire bookkeeping (job `completed`, fire not yet linked). After each, the next pass or pump resumes by the persisted `dispatch_request_id`; assert exactly one provider execution, the fire ends `completed` with that job's result, and no second request id was ever generated. |
+| I17 | A fire causes more than one provider execution, or loses its job across a crash. | Crash probes with a real provider process and a counting stub behind it: after the admission transaction (job row exists and is linked to its fire, no POST yet); after acceptance (job `provider_owned`); and after the job's terminal commit but before post-completion bookkeeping (notification intent, display refresh) on the already-linked fire. After each, the next pass or pump resumes by the persisted `dispatch_request_id`; assert exactly one provider execution, the fire ends `completed` with that job's result, and no second request id was generated for that attempt. A separate assertion injects a failure inside the admission transaction and proves no job row is ever persisted without its fire link. Attempt probe: expire the first attempt under the admission window, assert the second attempt has a new request id, the first replays its stored failure, and the stub saw one POST in total. |
 | I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution. |
-| I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and completes one `invoice.extract` job with no desktop process running. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the job. This is the end-to-end proof; the two-invoice proof the queue contract owes (`docs/CONTRACTS.md:1265-1267`) is folded into it. |
+| I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and admits two `invoice.extract` jobs with no desktop process running. The mail-check process exits with the second job `waiting`; the installed `eom-email-watcher-connect-queue.timer` then runs `eom-mail-watch pump` and the proof observes the second job advance to `provider_owned` and `completed` through those pump invocations alone, before any further mail check, so the test cannot pass merely because the first job finished inside the initial check. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the jobs. This is the end-to-end proof for the timer-driven install. |
 
 Real adapters throughout: the provider is the reference provider script the
 repo already ships (`scripts/connect_reference_provider.py`) or the real
@@ -1213,15 +1290,15 @@ Section 1.1 in full. Rows for the claim ledger:
 
 | Brief location | Claim | Verdict | Evidence |
 |---|---|---|---|
-| `Local Connect Status.md:53` | queue closed | contradicted | no caller of `connect.queue.pump` (C1) |
+| `Local Connect Status.md:53` | queue closed | true for the desktop host since #123; false for the timer-driven install | C1 |
 | `Local Connect Status.md:52` | unattended permission closed | overstated | feature exists in one repo, no contract (C3) |
 | `Product Brief.md:107-116` | Email Watcher automatically hands to Summarizer/Invoices today | contradicted | no Connect call in `service.py` (C2) |
 | `Product Brief.md:138` | senders across multiple accounts | contradicted | one global allowlist, one active account (C5) |
 | `Product Brief.md:150-152`, `342` | bytes fetched only when you act | contradicted in part | pump re-fetches unattended (C6) |
 | `Product Brief.md:252-254` | gate refuses to run an automation | confirmed, with the authorized-write exception | `service.py:797` (K2) |
 | `Product Brief.md:261-262` | halts in `ambiguous` or `manual_review` | confirmed, incomplete | fourteen states (K3) |
-| `Product Brief.md:434-435` | "A queue ... in development" | confirmed | consistent with C1; the Status file, not the brief, is wrong here |
-| `docs/CONTRACTS.md:858-859` | engine pump remains a later slice | contradicted | #121 landed it (C4) |
+| `Product Brief.md:434-435` | "A queue ... in development" | stale for the desktop since #123/#124; still true for the timer-driven install | C1 |
+| `docs/CONTRACTS.md:858-859` @29fd046 | engine pump remains a later slice | was contradicted; corrected at `c10a37c` | C4 |
 | `adr/0004:132` | activation grants only capability exchange | stale | watcher grants a second feature from the same file (C9) |
 | issue #117 body | table `connect_jobs` at `db.py:83` | wrong name | `connect_attachment_jobs`, `db.py:92` (C8) |
 
@@ -1360,10 +1437,13 @@ matching string literals across repos:
 1. This document, contract only.
 2. ADR-0006 and the feature registry in `connect-contracts` (section 8.3),
    so the second key has a home before more code depends on it.
-3. Schema 20: rules, rule versions with `accepted_at`, fires with
-   `dispatch_request_id`, `rules_evaluated_version` (migration sets `0` on
-   already-analysed messages); the seeded system rule, enabled; the engine
-   core with I1, I2, I9, I11, I14.
+3. Schema 20: rules, rule versions with `revision`/`retired_revision` and
+   tombstone deletion, the `automation_rule_set` revision counter,
+   `messages.rules_revision_at_analysis`, fires with a non-null
+   `artifact_key`, attempts with `dispatch_request_id`,
+   `rules_evaluated_version` (migration sets `0` on already-analysed
+   messages); the seeded system rule, enabled; the engine core with I1,
+   I2, I9, I11, I14.
 4. Evaluate phase wired into `run_watcher_check`; the scheduling trigger
    replaced by the seeded rule; I3, I12, I13.
 5. Dispatch phase over the durable queue: admission under the fire's
@@ -1403,3 +1483,19 @@ matching string literals across repos:
   click-during-pass paragraph now describes the post-#123 behavior (the
   losing click returns the job's active state, not an error); I16 adds
   the desktop-present variant.
+- **r4 (2026-09-10).** After the PR #126 review and the Codex threads on
+  `01ee702`. Changed: 4.1 (database-assigned `revision`/`retired_revision`
+  replace timestamps as the applicability boundary; deletion is a tombstone
+  version); 4.5 (delete operation); 5.1 (applicability by
+  `revision <= rules_revision_at_analysis < retired_revision`, captured in
+  the analysis transaction; deletion consequence); 5.3 (non-null
+  `artifact_key` with a sentinel, because NULLs are distinct in a SQLite
+  unique index); 6.1 (`not_admitted` terminal state in the diagram;
+  attempts with their own request ids, at most two, opened only after a
+  proven-never-accepted terminal); 6.2 (deadline scoped to the evaluate
+  and dispatch phases, the 30-minute-timeout claim withdrawn; expiry opens
+  a second attempt); 6.3 (the pump timer owns progress between mail
+  checks on a timer-driven install); 6.4 table; 6.7 (provider app version
+  in `item_sha256`, `provider_changed` on version change); 2.3, 2.5 Q3 and
+  8.1 (the queue claims scoped to the timer-driven path; #123 and #124
+  rows added); 7 (I2, I7, I16, I17 rewritten); 12 (schema step).
