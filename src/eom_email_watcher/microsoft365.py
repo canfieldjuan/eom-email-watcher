@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import html
 import json
 import logging
 import os
@@ -10,7 +9,6 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -29,7 +27,7 @@ from .mailbox import (
     MessageMetadata,
     StaleMailboxCursor,
 )
-from .mime import AttachmentDescriptor
+from .mime import AttachmentDescriptor, html_to_text
 
 MICROSOFT365_PROVIDER = "microsoft365"
 SCOPES = ("Mail.Read",)
@@ -78,15 +76,6 @@ class MicrosoftPublicClient:
 @dataclass(frozen=True)
 class Microsoft365Profile:
     email_address: str
-
-
-class _TextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        self.parts.append(data)
 
 
 def resolve_microsoft_credentials_file(configured_file: Path) -> Path:
@@ -334,9 +323,7 @@ def _message_body_text(body: object, limit: int) -> str:
     if not isinstance(content, str):
         return ""
     if str(body.get("contentType", "")).casefold() == "html":
-        parser = _TextExtractor()
-        parser.feed(content)
-        content = html.unescape(" ".join(parser.parts))
+        content = html_to_text(content)
     normalized = "\n".join(line.strip() for line in content.splitlines() if line.strip())
     return normalized[:limit]
 

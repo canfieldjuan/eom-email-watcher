@@ -54,6 +54,30 @@ def graph_client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
+def test_html_message_body_preserves_reply_header_boundaries() -> None:
+    body = microsoft365._message_body_text(
+        {
+            "contentType": "html",
+            "content": (
+                "<div>Please send copies.</div>"
+                "<div>From: Sender &lt;sender@example.com&gt;</div>"
+                "<div>Sent: Tuesday, September 1, 2026 1:00 PM</div>"
+                "<div>To: Owner &lt;owner@example.com&gt;</div>"
+                "<div>Subject: Invoice due Friday</div>"
+            ),
+        },
+        10_000,
+    )
+
+    assert body.splitlines() == [
+        "Please send copies.",
+        "From: Sender <sender@example.com>",
+        "Sent: Tuesday, September 1, 2026 1:00 PM",
+        "To: Owner <owner@example.com>",
+        "Subject: Invoice due Friday",
+    ]
+
+
 def test_gateway_suppresses_transport_url_logging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

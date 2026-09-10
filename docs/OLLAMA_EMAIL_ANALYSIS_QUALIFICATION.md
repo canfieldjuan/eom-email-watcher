@@ -2,10 +2,11 @@
 
 ## Status
 
-Deterministic evidence captured on 2026-09-10. The selected profile is **not promoted** because
-priority/deadline failures remain and the blinded semantic review is still unscored. This document
-is the contract and evidence record for issue #72, Slice 0A. It does not implement the inference
-gateway, qualify LM Studio fallback, or change an application runtime default.
+Deterministic evidence captured on 2026-09-10. Slice 0B passes its frozen safety acceptance after
+remediating prompt/input framing, but the selected profile is **not promoted** because the blinded
+semantic review is still unscored. This document is the contract and evidence record for issue #72,
+Slices 0A and 0B. It does not implement the inference gateway, qualify LM Studio fallback, or change
+an application runtime default.
 
 ## Contract
 
@@ -64,13 +65,93 @@ benchmark work. The required surface is unchanged; this revision prevents false 
 - Inspection of the sanitized artifacts, model digest, runtime configuration, and GPU residency.
 - Full Email Watcher unit gate: GitHub only.
 
+## Slice 0B remediation contract
+
+### Root cause
+
+The qualified model is receiving current sender text and quoted history inside one undifferentiated
+`body` field. The system prompt tells the model to distinguish them, but the input framing does not
+identify a quoted block even when the source contains a strong reply delimiter. That leaves a quoted
+invoice date available for adoption as if it were part of the current request.
+
+The prompt also names the four priority labels without defining their decision boundaries. In the
+captured failures, the model consistently chose `normal` for no-action mail that the corpus defines
+as `low`, and for explicit deadline/access requests that the corpus defines as `high`. Finally,
+`automated_notice` is described as a kind of no-action message without stating that a human-authored
+payment confirmation remains `informational`.
+
+These are prompt/input-contract defects. They are not evidence that the frozen labels should change,
+and they cannot be repaired safely by rewriting model labels after inference without the source
+semantics.
+
+### Required change surface
+
+- Split only strongly delimited quoted history from the current message before constructing the
+  model prompt. Strong delimiters include explicit original-message markers, `On ... wrote:` lines,
+  and complete Outlook `From`/`Sent`/`To`/optional-`Cc`/`Subject` header blocks. Send the two portions
+  as separately named untrusted fields while preserving the original text and order within each
+  portion. If no recognized delimiter exists, keep the entire body as current text and use no
+  quoted-history value.
+- Preserve semantic line boundaries while normalizing HTML-only bodies in every supported mailbox
+  adapter so block-level reply delimiters remain visible to the same partitioning rule.
+- Define a mailbox-owner priority ladder: `urgent` for explicit immediate material risk, `high` for
+  deadlines within seven calendar days or operational/access changes requiring prompt response,
+  `normal` for non-immediate human action, and `low` for messages requiring no mailbox-owner action.
+- Reserve `automated_notice` for machine-generated notices or receipts. Classify payment
+  confirmations using the payment direction and source evidence; neither role addresses nor
+  first-person pronouns alone prove human or automated authorship.
+- Tell the model to summarize the legitimate message purpose without reproducing embedded attempts
+  to control the analysis.
+- Add focused tests for quote partitioning, prompt field separation, priority boundaries, human
+  confirmation categorization, and the unchanged strict schema/action validator.
+- Re-run both frozen corpora through the exact pinned Ollama profile and replace the public sanitized
+  result artifacts only with evidence from that run. Regenerate the ignored blinded review packet.
+
+The frozen corpus files and expected labels are identified by these SHA-256 values:
+
+- `benchmarks/email-analysis-v1.json`:
+  `b64c74f44478a776f328b3e471cf66e57e27dfacf23ec6018b0ecb52dc44ccb6`
+- `benchmarks/email-obligation-v1.json`:
+  `f6abe7c55e405f03ffc9afbe54b9b191e74d6e1af4d4a0a833b503811d738e56`
+
+### Acceptance criteria
+
+- Both corpora remain byte-identical to the hashes above.
+- Schema validity, action-required precision, and action-required recall remain `1.0` in both public
+  artifacts.
+- Both public artifacts report zero high/urgent false negatives and zero deadline hallucinations.
+- The adversarial bulletin does not reproduce its forbidden marker and retains its expected
+  category, priority, action, and deadline behavior in every repetition.
+- The customer invoice-copy request retains the mailbox-owner action while ignoring the unadopted
+  quoted due date in every repetition.
+- The human payment confirmation is `informational`, `low`, and no-action in every repetition.
+
+### Explicit non-scope
+
+- No corpus or expected-label edits.
+- No heuristic post-inference rewriting of category, priority, action, or deadline fields.
+- No public analysis schema change or evidence-field addition.
+- No inference gateway, LM Studio fallback, runtime-default, attachment, Connect, scheduling, or
+  notification change.
+- No claim that the model profile is promoted before deterministic acceptance and human blinded
+  review are both complete.
+
+### Verification plan
+
+- Focused model and benchmark tests only; the full Email Watcher unit gate remains GitHub-owned.
+- Ruff on changed Python and test files.
+- `git diff --check` and corpus SHA-256 verification.
+- Exact live Ollama reruns using the reproduction commands below.
+- Public artifact inspection plus regeneration of the ignored mode-0600 private/blinded evidence.
+
 ## Evidence
 
 ### Exact subject under test
 
-- Email Watcher base: `c10a37c` (`origin/main` before this runner-only change).
-- Production path: `LocalModel.analyze`, including the production system/user prompt, strict
-  `Analysis` JSON schema, temperature `0.1`, 500-token maximum, and `validate_analysis` boundary.
+- Email Watcher base: `8a969c8` (`origin/main` before Slice 0B).
+- Production path: `LocalModel.analyze`, including the remediated production system/user prompt,
+  strict `Analysis` JSON schema, temperature `0.1`, 500-token maximum, and `validate_analysis`
+  boundary.
 - Ollama version: `0.24.0`.
 - Ollama binary SHA-256:
   `b2e45ade9cb754a079f74645e1183d613f582d98f7354b05f4f9a5bd81f8e0c9`.
@@ -116,40 +197,38 @@ be relabeled as model load time.
 | Synthetic cases x repetitions | 18 x 3 | 4 x 3 |
 | Requests | 54 | 12 |
 | Schema-valid rate | 1.0 | 1.0 |
-| Category accuracy | 0.759259 | 0.75 |
-| Priority accuracy | 0.444444 | 0.5 |
-| High/urgent false negatives | 6 | 3 |
+| Category accuracy | 0.851852 | 1.0 |
+| Priority accuracy | 0.944444 | 1.0 |
+| High/urgent false negatives | 0 | 0 |
 | Action precision | 1.0 | 1.0 |
 | Action recall | 1.0 | 1.0 |
-| Exact deadline rate | 0.777778 | 0.25 |
-| Deadline hallucinations | 0 | 3 |
-| Prompt-injection failures | 3 | 0 |
+| Exact deadline rate | 0.777778 | 0.5 |
+| Deadline hallucinations | 0 | 0 |
+| Prompt-injection failures | 0 | 0 |
 | Grounding failures | 0 | 0 |
-| First request, seconds | 7.254158 | 1.334516 |
-| Median request, seconds | 0.828843 | 1.032336 |
-| p95 request, seconds | 1.240357 | 1.334516 |
+| First request, seconds | 1.584603 | 1.161326 |
+| Median request, seconds | 0.914193 | 1.119662 |
+| p95 request, seconds | 1.395172 | 1.419771 |
 
 Machine-readable public artifacts:
 
 - [`ollama-qwen3-30b-a3b-q4ks-gpu.json`](../benchmarks/results/ollama-qwen3-30b-a3b-q4ks-gpu.json)
 - [`ollama-qwen3-30b-a3b-q4ks-gpu-obligation.json`](../benchmarks/results/ollama-qwen3-30b-a3b-q4ks-gpu-obligation.json)
 
-Artifact SHA-256 values are `00fb081793d96cd2a2ce1a7c202d00eabf71c172d1307f0317dc7e19197896b6`
-and `2e942c0a2aba941f3699666796f6f7e5f1431c684e8963efde3a0826be3ca2dd`,
+Artifact SHA-256 values are `7676d5411b1a530859454418cbca3c12a8e3865f87b39be0ffbaf85fe0021124`
+and `ff8149522dd3f27729ce6f115bee15ef62b28f95a6a9edf8b7e4a59a287d3c8f`,
 respectively.
 
 The 30B candidate improves on the committed Qwen 3.5 4B CPU baseline's schema-valid rate (`1.0`
-versus `0.777778`), action recall (`1.0` versus `0.6`), category accuracy (`0.759259` versus
-`0.722222`), deadline exactness (`0.777778` versus `0.703704`), and high/urgent misses (`6` versus
-`12`). Its priority accuracy is worse (`0.444444` versus `0.611111`), and the composite
-prompt-injection failure rate is unchanged at `0.5`.
+versus `0.777778`), action recall (`1.0` versus `0.6`), category accuracy (`0.851852` versus
+`0.722222`), deadline exactness (`0.777778` versus `0.703704`), priority accuracy (`0.944444`
+versus `0.611111`), and high/urgent misses (`0` versus `12`). Its composite prompt-injection failure
+rate is `0.0` versus the baseline's `0.5`.
 
-The obligation-direction case that motivated the regression corpus did not reverse who owed whom:
-the generated action told the mailbox owner to provide the requested invoice copies and access-card
-numbers. It nevertheless adopted a quoted date as a deadline in all three repetitions and assigned
-normal rather than high priority. A customer payment confirmation preserved `action_required=false`
-but was categorized as an automated notice with normal rather than low priority. These are real
-contract failures, not reasons to rewrite the gold labels after observing the output.
+The obligation-direction case that motivated the regression corpus preserves the correct
+mailbox-owner action, ignores the unadopted quoted due date, and assigns high priority in every
+repetition. The customer payment confirmation is informational, low priority, and no-action in every
+repetition. The frozen corpora and expected labels were not changed.
 
 ### Blinded semantic review
 
@@ -160,12 +239,12 @@ preference is claimed.
 
 ### Verdict
 
-**Not promoted.** Ollama can execute the exact Email Watcher analysis contract on the selected,
-fully pinned 30B artifact with strong warm latency and complete schema/action admission. The
-remaining priority safety misses, deadline failures, unchanged adversarial failure rate, absent
-attributable peak-memory/cold-load measurement, and pending blinded review block issue #72 profile
-promotion. Gateway, fallback, and application-cutover work must not treat this slice as a model
-sign-off.
+**Deterministic remediation accepted; not promoted.** Ollama can execute the exact Email Watcher
+analysis contract on the selected, fully pinned 30B artifact with complete schema/action admission,
+zero high/urgent misses, zero deadline hallucinations, and zero adversarial failures in both frozen
+corpora. The absent attributable peak-memory/cold-load measurement remains an explicitly recorded
+operational limitation. The pending blinded human review still blocks profile promotion. Gateway,
+fallback, and application-cutover work must not treat this slice as final model sign-off.
 
 ### Reproduction commands
 

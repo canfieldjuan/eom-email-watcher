@@ -6,6 +6,31 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
 
+_HTML_LINE_BREAK_TAGS = frozenset(
+    {
+        "article",
+        "blockquote",
+        "br",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+    }
+)
+
 
 class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
@@ -15,12 +40,27 @@ class _TextExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
 
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag.casefold() in _HTML_LINE_BREAK_TAGS:
+            self._line_break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in _HTML_LINE_BREAK_TAGS:
+            self._line_break()
+
+    def _line_break(self) -> None:
+        if self.parts and self.parts[-1] != "\n":
+            self.parts.append("\n")
+
 
 def html_to_text(value: str) -> str:
     parser = _TextExtractor()
     parser.feed(value)
     parser.close()
-    return html.unescape(" ".join(parser.parts))
+    extracted = " ".join(parser.parts)
+    extracted = extracted.replace(" \n ", "\n").replace(" \n", "\n").replace("\n ", "\n")
+    return html.unescape(extracted)
 
 
 @dataclass(frozen=True)
