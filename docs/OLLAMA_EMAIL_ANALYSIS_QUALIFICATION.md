@@ -87,11 +87,13 @@ semantics.
 ### Required change surface
 
 - Split only strongly delimited quoted history from the current message before constructing the
-  model prompt. Send the two portions as separately named untrusted fields while preserving the
-  original text and order within each portion. If no recognized delimiter exists, keep the entire
-  body as current text and use no quoted-history value.
-- Preserve semantic line boundaries while normalizing HTML-only bodies so block-level reply
-  delimiters remain visible to the same partitioning rule.
+  model prompt. Strong delimiters include explicit original-message markers, `On ... wrote:` lines,
+  and complete Outlook `From`/`Sent`/`To`/optional-`Cc`/`Subject` header blocks. Send the two portions
+  as separately named untrusted fields while preserving the original text and order within each
+  portion. If no recognized delimiter exists, keep the entire body as current text and use no
+  quoted-history value.
+- Preserve semantic line boundaries while normalizing HTML-only bodies in every supported mailbox
+  adapter so block-level reply delimiters remain visible to the same partitioning rule.
 - Define a mailbox-owner priority ladder: `urgent` for explicit immediate material risk, `high` for
   deadlines within seven calendar days or operational/access changes requiring prompt response,
   `normal` for non-immediate human action, and `low` for messages requiring no mailbox-owner action.

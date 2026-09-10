@@ -55,7 +55,15 @@ MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 QUOTED_HISTORY_RE = re.compile(
-    r"(?im)^(?:-{2,}[ \t]*Original Message[ \t]*-{2,}|On [^\r\n]+ wrote:)[ \t]*$"
+    r"(?im)^(?:"
+    r"-{2,}[ \t]*Original Message[ \t]*-{2,}[ \t]*$"
+    r"|On [^\r\n]+ wrote:[ \t]*$"
+    r"|[ \t]*From:[^\r\n]*\r?\n"
+    r"[ \t]*Sent:[^\r\n]*\r?\n"
+    r"[ \t]*To:[^\r\n]*\r?\n"
+    r"(?:[ \t]*Cc:[^\r\n]*\r?\n)?"
+    r"[ \t]*Subject:[^\r\n]*\r?$"
+    r")"
 )
 
 

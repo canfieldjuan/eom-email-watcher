@@ -184,6 +184,24 @@ def test_prompt_defines_priority_category_and_injection_boundaries() -> None:
             "Thanks.\n\n",
             "On Tue, Sep 1, 2026, Sender <sender@example.com> wrote:\nOld request",
         ),
+        (
+            "Thanks.\n\nFrom: Sender <sender@example.com>\r\n"
+            "Sent: Tuesday, September 1, 2026 1:00 PM\r\n"
+            "To: Owner <owner@example.com>\r\n"
+            "Cc: Accounts <accounts@example.com>\r\n"
+            "Subject: Invoice due Friday\r\nOld request",
+            "Thanks.\n\n",
+            "From: Sender <sender@example.com>\r\n"
+            "Sent: Tuesday, September 1, 2026 1:00 PM\r\n"
+            "To: Owner <owner@example.com>\r\n"
+            "Cc: Accounts <accounts@example.com>\r\n"
+            "Subject: Invoice due Friday\r\nOld request",
+        ),
+        (
+            "From: Sender <sender@example.com>\nSubject: This is current text",
+            "From: Sender <sender@example.com>\nSubject: This is current text",
+            None,
+        ),
         ("No quoted history here.", "No quoted history here.", None),
         (
             "Inline -----Original Message----- text.",
