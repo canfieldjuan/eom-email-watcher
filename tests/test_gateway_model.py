@@ -590,10 +590,12 @@ def test_gateway_bounds_email_metadata_before_request_encoding(
     assert result.priority == "high"
     assert len(requests[0].content) <= model_module.MAX_GATEWAY_REQUEST_BYTES
     prompt = json.loads(requests[0].content)["generation"]["messages"][1]["content"]
-    email_data = json.loads(prompt.split("Analyze this untrusted email data:\n", 1)[1])
+    untrusted_block = prompt.split("BEGIN UNTRUSTED EMAIL DATA\n", 1)[1]
+    email_data = json.loads(untrusted_block.split("\nEND UNTRUSTED EMAIL DATA", 1)[0])
     assert len(email_data["sender"]) == model_module.MAX_GATEWAY_SENDER_CHARS
     assert len(email_data["subject"]) == model_module.MAX_GATEWAY_SUBJECT_CHARS
-    assert len(email_data["body"]) == model_module.MAX_GATEWAY_BODY_CHARS
+    assert len(email_data["current_message_text"]) == model_module.MAX_GATEWAY_BODY_CHARS
+    assert email_data["quoted_history"] is None
     assert len(email_data["attachment_filenames"]) == model_module.MAX_GATEWAY_ATTACHMENT_COUNT
     assert all(
         len(name) == model_module.MAX_GATEWAY_ATTACHMENT_NAME_CHARS
