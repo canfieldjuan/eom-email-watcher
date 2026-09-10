@@ -1,5 +1,9 @@
 # CPU-only local model benchmark: initial observed results
 
+Shared GPU qualification for issue #72 is tracked separately in
+[`OLLAMA_EMAIL_ANALYSIS_QUALIFICATION.md`](OLLAMA_EMAIL_ANALYSIS_QUALIFICATION.md). Nothing in that
+evidence changes this report's CPU-only status or completes its pending human review.
+
 ## Status
 
 This is a partial issue #18 result, not a model-selection sign-off. The reproducible runner,

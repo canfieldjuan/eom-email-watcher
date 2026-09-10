@@ -1,8 +1,9 @@
-# CPU-only local model benchmark
+# Local model benchmark
 
 This benchmark measures the production email-analysis prompt and schema against a finite,
-synthetic corpus. It never contacts Gmail, downloads attachments, or sends benchmark content to a
-non-loopback endpoint. It is an operator/developer tool, not part of normal watcher execution.
+synthetic corpus on explicitly declared CPU-only or GPU-backed local execution. It never contacts
+Gmail, downloads attachments, or sends benchmark content to a non-loopback endpoint. It is an
+operator/developer tool, not part of normal watcher execution.
 
 The current observed comparison and its unresolved acceptance items are recorded in
 [`MODEL_BENCHMARK_RESULTS.md`](MODEL_BENCHMARK_RESULTS.md).
@@ -14,6 +15,10 @@ The benchmark answers issue #18 in two stages:
 
 Do not recommend a model until both stages are complete. String similarity is not a substitute for
 the human analysis review.
+
+Shared GPU profile evidence for issue #72 is recorded separately in
+[`OLLAMA_EMAIL_ANALYSIS_QUALIFICATION.md`](OLLAMA_EMAIL_ANALYSIS_QUALIFICATION.md); it does not
+change the incomplete CPU-only recommendation in `MODEL_BENCHMARK_RESULTS.md`.
 
 ## Privacy boundary
 
@@ -35,6 +40,20 @@ resolve under the Git-ignored `benchmarks/local/` directory.
 The public result deliberately records only exception class names. Model response/error text is not
 copied into it. A private corpus may be supplied by path, but neither that corpus nor its local
 review artifacts belong in Git, CI output, issue comments, or PR comments.
+
+## Execution-device metadata
+
+`run` defaults to CPU-only execution for compatibility with the issue #18 procedure. Pass
+`--execution-device gpu` only when the runtime process has been independently verified as
+GPU-backed. The candidate record then sets `cpu_only=false`, clears `cpu_only_method`, and records a
+runtime-specific `gpu_offload_method`. Current `main` admits GPU evidence only for Ollama and fixes
+that method to `ollama-runtime-managed-gpu`; unsupported runtime/device combinations fail before
+inference.
+
+Results produced after this generalization use public/private result schema version 2. Historical
+schema-version-1 artifacts remain valid observations and are not rewritten. `cold_start_seconds`
+may be omitted when a genuinely cold model load cannot be isolated; use `null` rather than an old
+measurement, a warm request, or a guess.
 
 ## Validate the corpus
 
