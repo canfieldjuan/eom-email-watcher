@@ -64,6 +64,80 @@ benchmark work. The required surface is unchanged; this revision prevents false 
 - Inspection of the sanitized artifacts, model digest, runtime configuration, and GPU residency.
 - Full Email Watcher unit gate: GitHub only.
 
+## Slice 0B remediation contract
+
+### Root cause
+
+The qualified model is receiving current sender text and quoted history inside one undifferentiated
+`body` field. The system prompt tells the model to distinguish them, but the input framing does not
+identify a quoted block even when the source contains a strong reply delimiter. That leaves a quoted
+invoice date available for adoption as if it were part of the current request.
+
+The prompt also names the four priority labels without defining their decision boundaries. In the
+captured failures, the model consistently chose `normal` for no-action mail that the corpus defines
+as `low`, and for explicit deadline/access requests that the corpus defines as `high`. Finally,
+`automated_notice` is described as a kind of no-action message without stating that a human-authored
+payment confirmation remains `informational`.
+
+These are prompt/input-contract defects. They are not evidence that the frozen labels should change,
+and they cannot be repaired safely by rewriting model labels after inference without the source
+semantics.
+
+### Required change surface
+
+- Split only strongly delimited quoted history from the current message before constructing the
+  model prompt. Send the two portions as separately named untrusted fields while preserving the
+  original text and order within each portion. If no recognized delimiter exists, keep the entire
+  body as current text and use no quoted-history value.
+- Define a mailbox-owner priority ladder: `urgent` for explicit immediate material risk, `high` for
+  explicit near-term deadlines or operational/access changes requiring prompt response, `normal`
+  for non-immediate human action, and `low` for messages requiring no mailbox-owner action.
+- Reserve `automated_notice` for machine-generated notices or receipts. Human-authored status and
+  payment confirmations that require no action are `informational`.
+- Tell the model to summarize the legitimate message purpose without reproducing embedded attempts
+  to control the analysis.
+- Add focused tests for quote partitioning, prompt field separation, priority boundaries, human
+  confirmation categorization, and the unchanged strict schema/action validator.
+- Re-run both frozen corpora through the exact pinned Ollama profile and replace the public sanitized
+  result artifacts only with evidence from that run. Regenerate the ignored blinded review packet.
+
+The frozen corpus files and expected labels are identified by these SHA-256 values:
+
+- `benchmarks/email-analysis-v1.json`:
+  `b64c74f44478a776f328b3e471cf66e57e27dfacf23ec6018b0ecb52dc44ccb6`
+- `benchmarks/email-obligation-v1.json`:
+  `f6abe7c55e405f03ffc9afbe54b9b191e74d6e1af4d4a0a833b503811d738e56`
+
+### Acceptance criteria
+
+- Both corpora remain byte-identical to the hashes above.
+- Schema validity, action-required precision, and action-required recall remain `1.0` in both public
+  artifacts.
+- Both public artifacts report zero high/urgent false negatives and zero deadline hallucinations.
+- The adversarial bulletin does not reproduce its forbidden marker and retains its expected
+  category, priority, action, and deadline behavior in every repetition.
+- The customer invoice-copy request retains the mailbox-owner action while ignoring the unadopted
+  quoted due date in every repetition.
+- The human payment confirmation is `informational`, `low`, and no-action in every repetition.
+
+### Explicit non-scope
+
+- No corpus or expected-label edits.
+- No heuristic post-inference rewriting of category, priority, action, or deadline fields.
+- No public analysis schema change or evidence-field addition.
+- No inference gateway, LM Studio fallback, runtime-default, attachment, Connect, scheduling, or
+  notification change.
+- No claim that the model profile is promoted before deterministic acceptance and human blinded
+  review are both complete.
+
+### Verification plan
+
+- Focused model and benchmark tests only; the full Email Watcher unit gate remains GitHub-owned.
+- Ruff on changed Python and test files.
+- `git diff --check` and corpus SHA-256 verification.
+- Exact live Ollama reruns using the reproduction commands below.
+- Public artifact inspection plus regeneration of the ignored mode-0600 private/blinded evidence.
+
 ## Evidence
 
 ### Exact subject under test
