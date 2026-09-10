@@ -532,9 +532,13 @@ Rule
   trigger          { source_kind: "mail.message" }
   conditions       1..8 entries, all must hold (AND)
   action           exactly one of the kinds in section 4.3
-  confirm_each     boolean, optional, default false; when true every fire
-                   of this rule waits for a person (section 6.7) even if
-                   the capability declares no effects
+  confirm_each     boolean, optional, default false; permitted only when
+                   action.kind is "connect.invoke" (rejected at validation
+                   on calendar.propose and notify, whose handoff is fixed
+                   by their own paths); when true every fire of this rule
+                   is prepared and hashed by dispatch step 3a and then
+                   waits for a person (section 6.7) even if the capability
+                   declares no effects
   created_at, updated_at   UTC
 ```
 
@@ -673,7 +677,7 @@ rendered only through the watcher's own text components
 
 Rejected at validation, with tests required for each (section 7):
 unknown field or op; op not permitted for the field; empty conditions; more
-than eight conditions; a per-artifact `attachment.*` condition on a non-artifact action; an artifact-consuming action without an
+than eight conditions; a per-artifact `attachment.*` condition on a non-artifact action; `confirm_each` on a non-`connect.invoke` action; an artifact-consuming action without an
 `attachment.media_type` condition; a sender that does not normalize; a glob
 containing a path separator; a category or priority outside the closed set;
 a capability id or version that does not match the schema patterns
@@ -1013,9 +1017,11 @@ ever reach the numbered steps below.
 - **`notify`** also completes inside the evaluation transaction: the
   fire's `automation_review`-class intent row is written with the fire and
   the fire is `completed`; delivery follows the existing path.
-- **`connect.invoke`** fires are created `pending_dispatch` (or
-  `awaiting_confirmation` when the rule has `confirm_each`) and are
-  processed by the dispatch phase below.
+- **`connect.invoke`** fires are always created `pending_dispatch`, whether
+  or not the rule has `confirm_each`, and are processed by the dispatch
+  phase below; a rule-requested confirmation is prepared by step 3a
+  exactly like a manifest-required one, so every fire that waits for a
+  person waits with a hashed, confirmable item.
 
 For every `connect.invoke` fire in `pending_dispatch`, in `(occurred_at,
 message_id, part_id)` order, grouped by resolved provider instance, within
@@ -1026,10 +1032,15 @@ the **phase deadline** (below):
    `pending_dispatch` for the next pass; two or more instances of the
    same app id halts it in `ambiguous_provider` (`adr/0001:110-112`);
 3. validate the artifact and parameters against the live manifest
-   (section 4.3);
+   (section 4.3); a parameter set that the live declaration rejects --
+   undeclared name, missing required value, or type mismatch, the
+   validator's `PARAMETERS_INVALID` (`connect.py:1212-1263`) -- halts the
+   fire in `manual_review` with reason `parameters_invalid` and the
+   bounded validator message, notifies, and is never retried; the pass
+   continues with the next fire;
 3a. if that manifest declares `effects.external` or
-   `effects.confirmation_required` and the fire has not been confirmed,
-   compute `item_sha256` (section 6.7) from the resolved provider, the
+   `effects.confirmation_required`, **or the rule has `confirm_each`**, and
+   the fire has not been confirmed, compute `item_sha256` (section 6.7) from the resolved provider, the
    manifest, and the artifact identity, persist it on the fire, transition
    `pending_dispatch -> awaiting_confirmation`, and stop here for this
    fire; the engine core never sees Connect (I11) because discovery and
@@ -1141,22 +1152,33 @@ expires under the admission window and is handled as section 6.2 says).
 | provider absent, no job yet | `pending_dispatch` | after 24 h, as `provider_unavailable` | every pass until then |
 | two instances of the pinned app | `ambiguous_provider` | yes | none; person picks by clicking |
 | artifact not accepted by live manifest | `manual_review` (`unsupported_attachment`) | yes | none |
+| parameters rejected by the live manifest | `manual_review` (`parameters_invalid`) | yes | none; a rule edit produces a new version and applies to later messages |
 | `PROVIDER_BUSY` (retryable) | `submitted` / job `waiting` | no | queue backoff |
 | ambiguous POST outcome | `submitted` / job `reconciling` | no | GET before POST, existing |
 | non-retryable refusal, or job `failed` | `failed` with the provider's bounded `code` and `message` | yes | none; a person may click |
 | admission deadline before any POST (`connect_queue_deadline_exceeded`) | `pending_dispatch`, then a second attempt with a fresh request id; `manual_review` on the second failure | on the second | one |
 | source gone or changed | `source_unavailable` | yes | none |
 | licence not active at dispatch | fire stays `pending_dispatch`, evaluation continues recording `locked` outcomes | rules panel shows locked | resumes when active |
-| completed, output withheld fields | `completed` | yes | none |
+| completed `connect.invoke`, including output with withheld fields | `completed` | yes, one `automation_complete` intent | none |
 
 "A result that comes back withheld" is a completed job whose output carries
 withheld fields (Invoice Processor's contract). The engine does not parse
 `application/vnd.local-connect.invoice+json`; unknown media types are
-opaque by contract (`adr/0002:108-111`). The completion notification says
-the rule completed and that a result is waiting; it never includes
-provider output text, so this contract adds no new content class to the
-phone channel beyond what `send_review` already carries
-(`service.py:1025-1032`).
+opaque by contract (`adr/0002:108-111`).
+
+**Completion intent.** A completed `connect.invoke` fire creates exactly
+one intent of kind `automation_complete`, written in the same transaction
+that records the fire as `completed` (including completion by linking to
+an already completed job, section 5.2). It travels the same durable
+intent table and delivery path as `automation_review`
+(`db.py:5396-5420`, `service.py:1461-1470`), honours the same opt-in phone
+setting, and carries the rule name, sender label, subject, and the word
+"completed"; it never includes provider output text, so this contract adds
+no new content class to the phone channel beyond what `send_review`
+already carries (`service.py:1025-1032`). A completed `calendar.propose`
+fire adds no intent of its own: the calendar ledger already notifies at
+its own boundaries. A completed `notify` fire's only intent is the one the
+action exists to send. `not_admitted` and `declined` create no intent.
 
 ### 6.5 Why the engine pumps inside the timer-driven pass
 
@@ -1316,15 +1338,15 @@ proves it does not.
 | I1 | A rule fires twice on one message and artifact, or the database admits a duplicate fire row. | Unique index on `(event_id, rule_id, rule_version, artifact_key)` with `artifact_key NOT NULL` (section 5.3). Database-level: a direct second insert of a `calendar.propose` fire and of a `notify` fire for the same `(event, rule, version)` fails on the sentinel key; a direct second insert of a `connect.invoke` fire for the same artifact fails; an insert with a NULL key fails; a control insert for a distinct valid artifact of the same message succeeds. Engine-level: the same message evaluated in two passes and after a crash injected between evaluation commit and dispatch yields one fire per key. |
 | I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
 | I3 | Anything fires without both features active. | Matrix test over (none, exchange only, automations only, both) times (rule with `connect.invoke`, `calendar.propose`, `notify`): only (both, any) fires; the automations-only row also asserts the seeded scheduling rule does not admit a run (`tests/test_service.py:542` extended). Boundary probe: the licence active until `expires_at` minus one second fires; at `expires_at` does not. |
-| I4 | A capability with declared effects or confirmation is invoked without a person confirming that exact item. | Fixture manifest with `effects.external: true`; test asserts `awaiting_confirmation`, then confirms with a stale `item_sha256`, asserts refusal; confirms with the right one, asserts dispatch. Negative: a manifest with both false is dispatched without confirmation. |
+| I4 | A capability with declared effects, or a rule with `confirm_each`, is invoked without a person confirming that exact hashed item, or a waiting fire has no confirmable item. | Matrix over `confirm_each` in {false, true} times manifest effects in {both false, external true}: (false, false) dispatches without confirmation; the other three reach `awaiting_confirmation` only through step 3a and each carries a persisted `item_sha256`; confirming with a stale hash is refused, confirming with the right one dispatches, and an app-version or instance change before dispatch halts in `provider_changed`. Validation: `confirm_each` on a `calendar.propose` or `notify` rule is rejected at save. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
 | I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. The pre-existing mail phases are outside this invariant by section 6.2. |
 | I8 | The engine picks a provider. | Two registrations for one app id; assert `ambiguous_provider` and no job. One registration whose instance changed between confirmation and dispatch; assert `provider_changed`, no job. |
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
-| I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload for a completed fire and asserts it contains rule name, sender label, subject, outcome word, and no substring of the job's output. |
+| I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload of the `automation_complete` intent for a completed `connect.invoke` fire whose output carries withheld fields, and asserts it contains rule name, sender label, subject, the word "completed", and no substring of the job's output; with the phone topic unset, asserts no network call and a desktop-only delivery. |
 | I11 | The engine core imports mail, provider, calendar, or Connect code. | Test walks the core module's import graph and asserts the allowlist. |
-| I12 | A halt that needs a person is silent, or an intentionally silent state notifies. | For each of `awaiting_confirmation`, `provider_unavailable`, `ambiguous_provider`, `source_unavailable`, `manual_review`, and `failed`, a test asserts exactly one `automation_review` intent exists and is delivered by the existing path. For each of `not_admitted`, `declined`, and `completed` (except the `notify` action's own intent), a test asserts no intent is created. |
+| I12 | A state that needs a person is silent, an intentionally silent state notifies, or a completion produces more or fewer than one notice. | For each of `awaiting_confirmation`, `provider_unavailable`, `ambiguous_provider`, `source_unavailable`, `manual_review` (including `parameters_invalid`), and `failed`, a test asserts exactly one `automation_review` intent exists and is delivered by the existing path. A completed `connect.invoke` fire, whether by its own job or by linking to an already completed job, asserts exactly one `automation_complete` intent and no `automation_review` intent. A completed `notify` fire asserts exactly its own intent. A completed `calendar.propose` fire asserts no engine intent beyond the calendar ledger's own. `not_admitted` and `declined` assert no intent. |
 | I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
 | I15 | Retention or deletion loses an idempotency record while a fire is still eligible. | Inherited from `messages_delete_connect_attachment_jobs` (`db.py:296-317`); test deletes the source message of a `submitted` fire and asserts the fire becomes `source_unavailable` and no later POST occurs. |
@@ -1571,3 +1593,14 @@ matching string literals across repos:
   6.4 (a second attempt only after `connect_queue_deadline_exceeded`;
   `connect_source_unavailable` is terminal); I12 (enumerated handoff
   states, silent states excluded).
+- **r6 (2026-09-10).** After the review of `f3f73e9` and three Codex
+  threads on it. Changed: 4.1 and 4.4 (`confirm_each` permitted only on
+  `connect.invoke`, rejected elsewhere); 6.2 (`connect.invoke` fires are
+  always created `pending_dispatch`; step 3a prepares and hashes a
+  rule-requested confirmation exactly like a manifest-required one; live
+  parameter rejection halts in `manual_review` with `parameters_invalid`);
+  6.4 (new taxonomy row; a defined `automation_complete` intent for
+  completed `connect.invoke` fires, one per completion, same delivery path
+  and opt-in as review intents); I4 (confirmation matrix, validation
+  case), I10 (payload of the completion intent), I12 (completion and
+  silent states reconciled).
