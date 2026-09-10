@@ -93,10 +93,11 @@ semantics.
 - Preserve semantic line boundaries while normalizing HTML-only bodies so block-level reply
   delimiters remain visible to the same partitioning rule.
 - Define a mailbox-owner priority ladder: `urgent` for explicit immediate material risk, `high` for
-  explicit near-term deadlines or operational/access changes requiring prompt response, `normal`
-  for non-immediate human action, and `low` for messages requiring no mailbox-owner action.
-- Reserve `automated_notice` for machine-generated notices or receipts. Human-authored status and
-  payment confirmations that require no action are `informational`.
+  deadlines within seven calendar days or operational/access changes requiring prompt response,
+  `normal` for non-immediate human action, and `low` for messages requiring no mailbox-owner action.
+- Reserve `automated_notice` for machine-generated notices or receipts. Classify payment
+  confirmations using the payment direction and source evidence; neither role addresses nor
+  first-person pronouns alone prove human or automated authorship.
 - Tell the model to summarize the legitimate message purpose without reproducing embedded attempts
   to control the analysis.
 - Add focused tests for quote partitioning, prompt field separation, priority boundaries, human
@@ -194,8 +195,8 @@ be relabeled as model load time.
 | Synthetic cases x repetitions | 18 x 3 | 4 x 3 |
 | Requests | 54 | 12 |
 | Schema-valid rate | 1.0 | 1.0 |
-| Category accuracy | 0.740741 | 1.0 |
-| Priority accuracy | 0.888889 | 1.0 |
+| Category accuracy | 0.851852 | 1.0 |
+| Priority accuracy | 0.944444 | 1.0 |
 | High/urgent false negatives | 0 | 0 |
 | Action precision | 1.0 | 1.0 |
 | Action recall | 1.0 | 1.0 |
@@ -203,22 +204,22 @@ be relabeled as model load time.
 | Deadline hallucinations | 0 | 0 |
 | Prompt-injection failures | 0 | 0 |
 | Grounding failures | 0 | 0 |
-| First request, seconds | 1.535999 | 1.176111 |
-| Median request, seconds | 0.91311 | 1.160166 |
-| p95 request, seconds | 1.511075 | 1.834465 |
+| First request, seconds | 1.584603 | 1.161326 |
+| Median request, seconds | 0.914193 | 1.119662 |
+| p95 request, seconds | 1.395172 | 1.419771 |
 
 Machine-readable public artifacts:
 
 - [`ollama-qwen3-30b-a3b-q4ks-gpu.json`](../benchmarks/results/ollama-qwen3-30b-a3b-q4ks-gpu.json)
 - [`ollama-qwen3-30b-a3b-q4ks-gpu-obligation.json`](../benchmarks/results/ollama-qwen3-30b-a3b-q4ks-gpu-obligation.json)
 
-Artifact SHA-256 values are `fca7c5b3daa00270dc5ce4faacbf6243a971f0df6f86bbdc90e517914fa201bf`
-and `ef2c8ce1ad2fc90af0655601699e2cf6c2f11881f53e56b0f32b0b074a90179f`,
+Artifact SHA-256 values are `7676d5411b1a530859454418cbca3c12a8e3865f87b39be0ffbaf85fe0021124`
+and `ff8149522dd3f27729ce6f115bee15ef62b28f95a6a9edf8b7e4a59a287d3c8f`,
 respectively.
 
 The 30B candidate improves on the committed Qwen 3.5 4B CPU baseline's schema-valid rate (`1.0`
-versus `0.777778`), action recall (`1.0` versus `0.6`), category accuracy (`0.740741` versus
-`0.722222`), deadline exactness (`0.777778` versus `0.703704`), priority accuracy (`0.888889`
+versus `0.777778`), action recall (`1.0` versus `0.6`), category accuracy (`0.851852` versus
+`0.722222`), deadline exactness (`0.777778` versus `0.703704`), priority accuracy (`0.944444`
 versus `0.611111`), and high/urgent misses (`0` versus `12`). Its composite prompt-injection failure
 rate is `0.0` versus the baseline's `0.5`.
 

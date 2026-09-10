@@ -113,9 +113,9 @@
     "temperature": 0.1
   },
   "latency_seconds": {
-    "first_request": 1.176111,
-    "median": 1.160166,
-    "p95": 1.834465,
+    "first_request": 1.161326,
+    "median": 1.119662,
+    "p95": 1.419771,
     "runtime_cold_start": null
   },
   "peak_resident_memory_mib": null,
