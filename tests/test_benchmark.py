@@ -96,6 +96,7 @@ def _candidate(model: str = "baseline-model") -> BenchmarkCandidate:
         cold_start_seconds=5.34,
         cpu_only=True,
         cpu_only_method="lms-load-gpu-off",
+        gpu_offload_method=None,
         capabilities=["structured_email_analysis"],
     )
 
@@ -121,6 +122,8 @@ def test_public_result_omits_email_and_free_form_model_text() -> None:
     assert "INJECTION_SOURCE_ONLY" not in encoded_public
     assert "The customer asks for a schedule change." not in encoded_public
     assert "Reply to confirm" not in encoded_public
+    assert public["schema_version"] == 2
+    assert private["schema_version"] == 2
     assert public["aggregate"]["schema_valid_rate"] == 1.0
     assert public["aggregate"]["priority_accuracy"] == 1.0
     assert public["aggregate"]["action_required_precision"] == 1.0
@@ -545,10 +548,39 @@ def test_candidate_contract_accepts_only_matching_runtime_methods(
     assert candidate.cpu_only_method == cpu_only_method
 
 
+def test_candidate_contract_accepts_ollama_managed_gpu() -> None:
+    data = _candidate().model_dump(mode="json")
+    data.update(
+        runtime="ollama",
+        cold_start_seconds=None,
+        cpu_only=False,
+        cpu_only_method=None,
+        gpu_offload_method="ollama-runtime-managed-gpu",
+    )
+
+    candidate = BenchmarkCandidate.model_validate(data)
+
+    assert candidate.cpu_only is False
+    assert candidate.cold_start_seconds is None
+    assert candidate.cpu_only_method is None
+    assert candidate.gpu_offload_method == "ollama-runtime-managed-gpu"
+
+
+def test_candidate_contract_accepts_zero_cold_start() -> None:
+    data = _candidate().model_dump(mode="json")
+    data["cold_start_seconds"] = 0
+
+    candidate = BenchmarkCandidate.model_validate(data)
+
+    assert candidate.cold_start_seconds == 0
+
+
 @pytest.mark.parametrize(
     "updates",
     [
-        {"cpu_only": False},
+        {"cold_start_seconds": -0.001},
+        {"cpu_only": False, "cpu_only_method": None},
+        {"gpu_offload_method": "ollama-runtime-managed-gpu"},
         {"cpu_only_method": "ollama-gpus-hidden"},
         {"runtime": "llama_cpp", "cpu_only_method": "lms-load-gpu-off"},
         {"runtime": "ollama", "cpu_only_method": "prism-llama-cpp-cpu-only"},
@@ -568,6 +600,38 @@ def test_candidate_contract_rejects_non_cpu_or_incomplete_profiles(
     data.update(updates)
     with pytest.raises(ValueError):
         BenchmarkCandidate.model_validate(data)
+
+
+@pytest.mark.parametrize("runtime", ["lmstudio", "llama_cpp"])
+def test_cli_rejects_unsupported_gpu_runtime(runtime: str, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "run",
+                "--corpus",
+                str(Path(__file__).parents[1] / "benchmarks" / "email-analysis-v1.json"),
+                "--runtime",
+                runtime,
+                "--execution-device",
+                "gpu",
+                "--base-url",
+                "http://127.0.0.1:11434/v1",
+                "--model",
+                "candidate",
+                "--quantization",
+                "Q4_K_M",
+                "--context-length",
+                "8192",
+                "--cold-start-seconds",
+                "0",
+                "--output",
+                str(tmp_path / "public.json"),
+                "--private-review-output",
+                str(tmp_path / "private.local.json"),
+            ]
+        )
+
+    assert exit_info.value.code == 2
 
 
 def test_committed_corpus_covers_required_behavior_classes() -> None:
@@ -601,9 +665,14 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
     corpus = BenchmarkCorpus.model_validate_json(
         (root / "benchmarks" / "email-analysis-v1.json").read_text(encoding="utf-8")
     )
-    results = sorted((root / "benchmarks" / "results").glob("*.json"))
+    results = [
+        path
+        for path in sorted((root / "benchmarks" / "results").glob("*.json"))
+        if json.loads(path.read_text(encoding="utf-8"))["corpus"]["name"]
+        == corpus.name
+    ]
 
-    assert len(results) == 5
+    assert len(results) == 6
     for path in results:
         encoded = path.read_text(encoding="utf-8")
         result = json.loads(encoded)
@@ -613,6 +682,33 @@ def test_committed_results_match_corpus_and_omit_free_text() -> None:
         assert all(case.body not in encoded for case in corpus.email_cases if case.body)
         assert all(case.subject not in encoded for case in corpus.email_cases)
         assert all(case.sender not in encoded for case in corpus.email_cases)
+
+
+def test_committed_ollama_obligation_result_matches_corpus_and_omits_free_text() -> None:
+    root = Path(__file__).parents[1]
+    corpus = BenchmarkCorpus.model_validate_json(
+        (root / "benchmarks" / "email-obligation-v1.json").read_text(encoding="utf-8")
+    )
+    path = (
+        root
+        / "benchmarks"
+        / "results"
+        / "ollama-qwen3-30b-a3b-q4ks-gpu-obligation.json"
+    )
+    encoded = path.read_text(encoding="utf-8")
+    result = json.loads(encoded)
+
+    assert result["schema_version"] == 2
+    assert result["corpus"]["name"] == corpus.name
+    assert result["aggregate"]["runs"] == len(corpus.email_cases) * 3
+    assert result["validation_boundary"]["failed"] == 0
+    assert result["candidate"]["cpu_only"] is False
+    assert result["candidate"]["gpu_offload_method"] == (
+        "ollama-runtime-managed-gpu"
+    )
+    assert all(case.body not in encoded for case in corpus.email_cases if case.body)
+    assert all(case.subject not in encoded for case in corpus.email_cases)
+    assert all(case.sender not in encoded for case in corpus.email_cases)
 
 
 def test_validation_boundary_is_included_in_public_result() -> None:
