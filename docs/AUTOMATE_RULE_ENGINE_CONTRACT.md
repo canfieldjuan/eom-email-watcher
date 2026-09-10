@@ -656,8 +656,8 @@ run unattended.
 No fields. Delegates to the existing scheduling automation: the fire admits
 an `email.schedule_event` run exactly as `_admit_scheduling_automation` does
 today (`db.py:924-975`), and that run proceeds through its own fourteen-state
-ledger unchanged. The engine's fire references the run id and derives its
-state from it (section 6.6).
+ledger unchanged. The fire stores its own state, links the run id, and
+settles from the run through section 6.1; display reads the linked run.
 
 **`notify`**
 
@@ -867,13 +867,13 @@ Collapse happens at dispatch admission, not at evaluation: every fire is
 its own row with its own `dispatch_request_id`. Whether a fire joins an
 existing job or creates one is decided by exactly one procedure, the
 **admission decision** in section 6.2 step 4, which this section does not
-restate. In summary it fetches and hashes the artifact under the source
-lock, resolves the provider, computes the fingerprint, and then prefers an
-active job, then the newest completed job, and otherwise creates a job
-under the fire's current attempt; failed history never blocks creation
-and never satisfies a fire. A click is allowed to re-run; a rule is not,
-because a rule that re-runs on every pass is a loop, which is why a
-completed job is joined rather than repeated.
+restate. Discovery and source preparation precede confirmation and
+admission. The decision replays the current attempt when already bound;
+otherwise it prefers an active job, then the newest completed job, and
+otherwise creates a job under the fire's current attempt. Failed history
+from another attempt never blocks creation or satisfies a fire. A click
+may re-run completed work; a rule joins a completed result when there is
+no active match, instead of starting another execution on each pass.
 
 Confirmation does not cross fires. A fire in `awaiting_confirmation` is not
 admitted and therefore neither creates nor joins a job; a fire that needs
@@ -945,32 +945,45 @@ machine; prose elsewhere refers to it.
 
 | From | To | Guard | Written by |
 |---|---|---|---|
-| (none) | `matched` | rule applies (5.1) | evaluation transaction |
+| (none) | `matched` | rule applies (5.1), candidate authorization passes (6.6) | evaluation transaction |
 | `matched` | `not_admitted` | `calendar.propose` readiness refused (4.6) | evaluation transaction |
 | `matched` | `submitted` (run) | `calendar.propose` run admitted, `run_id` linked | evaluation transaction |
 | `matched` | `completed` | `notify`; its intent written alongside | evaluation transaction |
 | `matched` | `pending_dispatch` | `connect.invoke`, always, `confirm_each` or not | evaluation transaction |
-| `pending_dispatch` | `awaiting_confirmation` | manifest effects or `confirm_each`; `item_sha256` persisted | dispatch step 3a |
+| `pending_dispatch` | `awaiting_confirmation` | manifest effects or `confirm_each`; verified source identity and `item_sha256` persisted | dispatch step 3a |
 | `awaiting_confirmation` | `pending_dispatch` | person confirmed that hash; `confirmed = true` | decide operation |
 | `awaiting_confirmation` | `declined` | person declined | decide operation |
-| `pending_dispatch` | `ambiguous_provider` | two instances of the pinned app | dispatch step 2 |
-| `pending_dispatch` | `manual_review` | `unsupported_attachment`, `parameters_invalid`, `capability_unavailable`, `provider_changed`, `stalled` (24 h without a job) | dispatch steps 2, 3, 3a |
-| `pending_dispatch` | `submitted` (job) | `job_id` linked, created or joined (5.2) | dispatch step 4, admission transaction |
-| `pending_dispatch` or `awaiting_confirmation` | `source_unavailable` | source message removed by retention or deletion | cleanup transaction |
-| `submitted` | `completed` | linked job `completed`, or linked run `completed` | settlement |
-| `submitted` | `submitted` (no change) | linked run in any nonterminal state: `detected`, `extracting`, `proposing`, `awaiting_confirmation`, `write_authorized`, `writing`, `unresolved`, `reconciling` (`db.py:329-333`, `docs/CONTRACTS.md:585-596`); the run may still confirm, reconcile, or complete | (none) |
-| `submitted` | `failed` | linked job `failed` other than the two codes below, or linked run `failed` | settlement |
-| `submitted` | `pending_dispatch` | linked job failed `connect_queue_deadline_exceeded`; a second attempt row is opened in the same transaction; at most two attempts | settlement |
-| `submitted` | `source_unavailable` | linked job failed `connect_source_unavailable`, or cleanup removed the source | settlement, cleanup transaction |
-| `submitted` | `manual_review` | second attempt also expired; or linked run terminal in `ambiguous` or `manual_review` | settlement |
-| `submitted` | `source_unavailable` (run) | linked run terminal `source_unavailable`; or the linked job's content-free tombstone reaches a late terminal state whose result is not persisted (`docs/CONTRACTS.md:1172-1176`) | settlement, in the transaction that removes the tombstone |
+| `pending_dispatch` | `ambiguous_provider` | two or more validated instances of the pinned app, before capability filtering | dispatch step 2 |
+| `pending_dispatch` | `manual_review` | `unsupported_attachment`, `parameters_invalid`, `capability_unavailable`, `provider_changed`, or `stalled` (24 h without a current job) | dispatch steps 2, 3, 3a |
+| `pending_dispatch` | `submitted` (job) | `job_id` linked, created or joined by the single admission decision | dispatch step 4, admission transaction |
+| `pending_dispatch` or `awaiting_confirmation` | `source_unavailable` | definitive missing/changed source in preparation, or source removed by cleanup | dispatch step 3, cleanup transaction |
+| `submitted` | `completed` | retained linked job `completed`, or linked run `completed` | settlement |
+| `submitted` | `failed` | retained linked job `failed` with a code other than `connect_queue_deadline_exceeded` or `connect_source_unavailable`, or linked run `failed` | settlement |
+| `submitted` | `pending_dispatch` | retained linked job failed `connect_queue_deadline_exceeded` on attempt 1; open attempt 2 and clear the current `job_id` atomically (Attempts below) | settlement |
+| `submitted` | `manual_review` | retained linked job failed `connect_queue_deadline_exceeded` on attempt 2; or linked run `ambiguous` or `manual_review` | settlement |
+| `submitted` | `source_unavailable` | retained linked job failed `connect_source_unavailable`, or linked run `source_unavailable` | settlement |
+| `submitted` | `source_unavailable` | cleanup removes a linked terminal or never-submitted waiting job; or a source-unavailable job tombstone has a validated terminal outcome and is being removed (6.4) | transaction removing the job, before removal |
 | `submitted` | `declined` | linked run `declined` | settlement |
+| `submitted` | `source_unavailable` | resumable calendar tombstone expires; close fire before both records are purged | calendar expiry transaction |
 
 Terminal states: `not_admitted`, `declined`, `completed`, `failed`,
 `source_unavailable`, `manual_review`, `ambiguous_provider`. A terminal
 fire never transitions again. `not_admitted` is recorded once with its
 reason, emits no notification, creates no run or job, and is never
-retried; a later message fires afresh.
+retried; a later message fires afresh. All job-outcome rows marked
+`retained` require `source_available = true` and no source deletion in
+that transaction. Removal has precedence over success, failure and retry:
+it uses the removal row, never a completion notice for discarded output.
+The two deadline guards are exclusive by attempt number.
+
+A linked calendar run is resumable in `detected`, `extracting`, `proposing`,
+`awaiting_confirmation`, `write_authorized`, `writing`, `unresolved` and
+`reconciling`. It is final for settlement in `ambiguous`, `manual_review`,
+`source_unavailable`, `declined`, `completed` and `failed`
+(`db.py:329-333`, `docs/CONTRACTS.md:585-605`). Active jobs and resumable
+runs cause **no fire transition, no version increment and no fire intent**.
+They are not self-transition rows. A person or reconciliation may advance
+the run later; repeated settlement while it waits must be a no-op.
 
 **Display.** A `submitted` fire is displayed from its linked job's
 dispatch state (`waiting` shows "Waiting for <provider>", `reconciling`
@@ -982,55 +995,62 @@ run's to leave, through the calendar contract's own confirmation and
 reconciliation paths; the fire stays `submitted` until the run is
 terminal, and the run's own notifications cover the handoff.
 
-**Settlement.** `settle` is one idempotent engine step that advances
-`submitted` fires from the durable state of what they link to. For every
-`submitted` fire whose linked job or run is terminal, in one
-`BEGIN IMMEDIATE` transaction with compare-and-set on `state_version`, it
-applies the matching row of the table and writes the fire-owned effect of
-that row: the `automation_complete` intent on `completed`, the
-`automation_review` intent on `failed`, `source_unavailable`, or
-`manual_review`, and the second attempt row on the deadline row. Because
-the fire is the only thing settlement writes and the compare-and-set
-rejects a stale version, running it any number of times, from any process,
-produces each effect exactly once. Settlement runs: at the end of every
-`connect.queue.pump` call, whoever issued it (the desktop queue thread,
-the pump timer's `eom-mail-watch pump`, or the pass); at the start and end
-of every pass's dispatch phase; and after every calendar-run transition
-the existing `process_scheduling_*` functions make (they already run in
-the pass, `service.py:1438-1460`). A job completed by a standalone pump
-with no mail-check process alive is therefore settled by that pump's own
-call, and a crash between the job's terminal commit and settlement leaves
-the fire `submitted` for the next settle, which finds the same terminal
-job and applies the same row once (I17, I20).
+**Settlement.** `settle` advances `submitted` fires using the durable
+linked outcome and the disjoint guards above. In one `BEGIN IMMEDIATE`
+transaction it compare-and-sets the fire's `state_version` and writes the
+associated attempt changes and intents. Connect fires receive the
+transition-specific intents in section 6.4/6.7; calendar fires receive
+**no additional fire-owned intent**, because their linked run owns both
+handoff and completion notifications. A `notify` fire has already written
+its one intent in evaluation and is not settled again. Intent insertion
+and attempt creation roll back if the fire CAS loses; uniqueness on
+`(fire_id, new_state_version, intent_kind)` and `(fire_id, attempt_no)`
+prevents duplicate effects on replay.
 
-**Recovery.** A fire is recovered through what it links to, never through
-its request id. A `submitted` fire reads its `job_id` or `run_id`; the job
-is pumped if active and settled if terminal, whichever fire or click
-created it. A `pending_dispatch` fire with no `job_id` re-enters dispatch
-and reaches the admission decision of section 6.2 step 4, which is the
-only place a job is ever created or joined and the only place a request
-id is used: the decision first looks for a job the fire's current
-attempt's request id already names (the crash-after-create case), then
-applies its precedence over fingerprint matches, and only then creates.
-A fire that joined a job created by another fire or a click has a request
-id that names no job, and that is correct. A second attempt (below) has a
-fresh request id that names no job, so the decision creates for it even
-though the first attempt's failed job is still on file; failed history
-never blocks creation. The existing request-id replay
-(`engine_api.py:3216-3229`) protects the creating attempt: a lower
-attempt's request id replays its stored failure and can never be
-re-executed.
+Settlement runs at the end of every `connect.queue.pump` call, whoever
+issued it (desktop queue thread, pump timer or pass), at the start and end
+of every dispatch phase, and after calendar transitions, including human
+decisions. It scans resumable links without mutating them, and settles
+final links. A crash after a retained job's terminal commit leaves the
+fire available to the next scan. **When a linked job is about to be
+removed**, the same settlement logic must instead run *inside the removal
+transaction*, before deletion, using that transaction's validated outcome
+or cleanup decision (6.4); an after-commit scan cannot recover a deleted
+row. A standalone pump therefore updates the fire even when the mail
+check is not alive. I17/I20 cover both retained and removed dependencies.
 
-**Attempts.** A fire may have at most two attempts, each an immutable
-`automation_rule_run_attempts` row with its own `dispatch_request_id`
-and `attempt_no`. The second is opened only by the settlement row for
-`connect_queue_deadline_exceeded`, the one code that proves the provider
-never accepted the job and that the source is intact
-(`docs/CONTRACTS.md:1055-1061`). `connect_source_unavailable` is
-definitive (missing source, or size or digest changed,
-`engine_api.py:2684-2727`) and settles to `source_unavailable`; a temporary
-mailbox failure is `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` and leaves the
-same job `waiting`, so the fire stays `submitted`.
+**Recovery.** A `submitted` fire resumes through its current `job_id` or
+`run_id`, whether created by this fire, another fire or a click. It never
+creates another job while that link is current. A `pending_dispatch`
+fire has no current `job_id`; it re-enters preparation and the single
+admission decision in section 6.2 step 4. A joining fire's request id may
+name no job; it does not need one. Admission commits the job, attempt
+binding and fire link together, so a crash exposes either all of them or
+none. Replaying an already bound attempt uses its existing link and
+outcome, not a fresh fingerprint search. A request id from a lower attempt
+replays that attempt's stored outcome and never creates work.
+
+**Attempts.** A Connect fire has at most two attempts, each with an
+immutable `automation_rule_run_attempts` identity (`attempt_no` and
+`dispatch_request_id`). The first identity is created with the fire;
+admission records a write-once `job_id` binding for that attempt, including
+when it joins a click's job. Only the first-attempt deadline row opens
+attempt 2: in the same CAS transaction, retain attempt 1's binding for
+audit, create the fresh attempt identity, set the fire's current attempt
+to 2, clear its current `job_id`, and set `pending_dispatch`. Repeated
+settlement cannot open another attempt. Preparation and admission then
+run normally; attempt 2 may join eligible active/completed work that
+appeared meanwhile, or create if only failed history remains. The second
+deadline row is terminal `manual_review` and never opens attempt 3.
+
+`connect_queue_deadline_exceeded` proves no accepted provider submission,
+not that the source is still intact (`docs/CONTRACTS.md:1055-1061`). Every
+new attempt rechecks the source under the source lock before admission.
+The confirmation receipt remains bound to the original item; a retry
+cannot replace it with a newly hashed item. Definitive source loss or
+size/digest drift is `source_unavailable`; a temporary mailbox failure
+leaves the unbound fire `pending_dispatch` or the existing job `waiting`,
+with the same attempt. No other failure opens a new attempt.
 
 **Origin.** A job the engine creates carries a durable `origin`
 (`automation`, with the fire and attempt identifiers) on its job row,
@@ -1048,9 +1068,9 @@ ever reach the numbered steps below.
   `db.py:924-975`, whose `ON CONFLICT DO NOTHING` on the run's unique key
   makes it idempotent) and links the fire to the resulting `run_id` in
   state `submitted`, or records `not_admitted` when the action's readiness
-  checks (section 4.6) refuse. From then on the fire's state is derived
-  from `automation_runs` (section 6.1). This preserves the atomic
-  admission the calendar contract requires (`docs/CONTRACTS.md:575-581`).
+  checks (section 4.6) refuse. The fire then stays `submitted` through
+  resumable run states and is settled as specified in section 6.1. This
+  preserves the atomic admission the calendar contract requires (`docs/CONTRACTS.md:575-581`).
 - **`notify`** also completes inside the evaluation transaction: the
   fire's `automation_review`-class intent row is written with the fire and
   the fire is `completed`; delivery follows the existing path.
@@ -1069,9 +1089,13 @@ the **phase deadline** (below):
    through catalog-level discovery, `connect.discover_capabilities()`
    (`connect.py:1138-1149`), which returns every live v2 capability with
    its app id, app version, instance id, capability id and version, and
-   accepted media (`connect.py:435-508`). The engine filters the catalog
-   to the rule's app id and capability id and version and counts distinct
-   instance ids. The persisted-job helper
+   accepted media (`connect.py:435-508`). First filter only by the rule's
+   app id and count distinct instance ids across **all** its capabilities.
+   Only after exactly one instance is established may the engine select
+   the pinned capability id/version from that instance's live manifest.
+   Thus two instances remain ambiguous even if only one advertises the
+   requested capability, and a present app with other capabilities is
+   distinguishable from an absent app. The persisted-job helper
    (`_discover_persisted_generic_capability`, `engine_api.py:2839-2870`
    @29fd046) takes a `ConnectJob` and is used only by the pump and
    reconciliation, after a job exists. Outcome map:
@@ -1083,61 +1107,74 @@ the **phase deadline** (below):
    | instance present, capability id or version absent from its live manifest (`capability_unavailable`) | `manual_review` (`capability_unavailable`), notify, no retry; a rule edit produces a new version for later messages |
    | one instance, capability present | continue |
 
-3. validate the artifact and parameters against the live manifest
-   (section 4.3): an artifact the manifest does not accept halts in
-   `manual_review` (`unsupported_attachment`); a parameter set the live
-   declaration rejects (`PARAMETERS_INVALID`, `connect.py:1212-1263`)
-   halts in `manual_review` (`parameters_invalid`) with the bounded
-   validator message; both notify, are never retried, and the pass
-   continues with the next fire;
-3a. if that manifest declares `effects.external` or
-   `effects.confirmation_required`, or the rule has `confirm_each`, and the
-   fire has not been confirmed: compute `item_sha256` (section 6.7) from
-   the resolved provider, the manifest, and the artifact identity, persist
-   it on the fire, transition `pending_dispatch -> awaiting_confirmation`,
-   and stop here for this fire. The engine core never sees Connect (I11)
-   because discovery and hashing happen in the dispatch phase. A
-   confirmation returns the fire to `pending_dispatch` with
-   `confirmed = true`; on its next dispatch the hash is recomputed and a
-   mismatch halts in `manual_review` (`provider_changed`);
-4. **admit**, the one admission decision (5.2 and 6.1 refer here):
-   - **Fetch and hash.** Under the per-message source lock and bounded by
-     the phase deadline, re-check retention
-     (`_retained_connect_message_source`), fetch the attachment bytes
-     through the mailbox gateway exactly as the click path does
-     (`engine_api.py:3239-3251`, `attachment_bytes`), verify the length
-     against the stored descriptor, and compute the SHA-256. The event's
-     artifact carried no digest until now (5.4); this is where the fire
-     acquires its trusted artifact identity. The bytes are not retained;
-     the pump re-fetches and re-verifies at handoff (`2721-2729`). A
-     transient mailbox failure leaves the fire `pending_dispatch`; a
-     missing or changed attachment settles it to `source_unavailable`.
-   - **Fingerprint.** From the resolved provider (app id, version,
-     instance id), capability id and version, the artifact identity, and
-     canonical parameters, compute the same fingerprint the queue uses
-     (`db.py:1432-1487`).
-   - **Decide**, in one `BEGIN IMMEDIATE` transaction, over the rows of
-     `connect_attachment_jobs` for `(message_id, part_id, fingerprint)`,
-     in this precedence:
-     1. a job the fire's current attempt's request id already names
-        (crash after an earlier create): link to it, whatever its status;
-     2. an active job (`requested`, `accepted`, `processing`): join it;
-        this is the same guarantee the active-fingerprint unique index
-        gives a click (`db.py:282-286`);
-     3. the newest `completed` job: join it; the invocation already
-        produced a result and a rule never repeats it; settlement then
-        completes the fire without a provider call;
-     4. otherwise (no rows, or only `failed` rows): create the job under
-        the current attempt's `dispatch_request_id` with
-        `origin = automation`. Failed history from clicks or from an
-        earlier attempt never blocks creation and is never joined.
-     Active beats completed because a rerun in flight is the freshest
-     truth; completed beats failed because a result exists. The fire's
-     `job_id` and its transition to `submitted` are written in this same
-     transaction, so no job row ever exists without its fire link, and
-     **no provider call has been made yet**. This is the same durable
-     queue admission a click performs (`engine_api.py:3138-3245`
-     @29fd046).
+3. **Validate and prepare every source before confirmation or admission.**
+   Validate parameters and the stored artifact descriptor against the live
+   manifest; reject unsupported artifacts or parameters as `manual_review`
+   (`unsupported_attachment` or `parameters_invalid`). Then take the
+   existing lane lock followed by the per-message source lock, in the
+   same order as a click (`engine_api.py:3279-3284`). If a lock is busy,
+   release any acquired lock and leave `pending_dispatch`. Do not wait
+   beyond the phase deadline. Under the source lock, recheck retention and
+   the current attachment descriptor, fetch through the mailbox gateway,
+   verify size, and compute the artifact SHA-256 exactly as the click
+   preparation does (`engine_api.py:3285-3312`). This is unconditional,
+   including when both effects flags and `confirm_each` are false.
+   The verified descriptor, digest and canonical parameters form one
+   prepared candidate used by **both** steps 3a and 4. Keep the source
+   lock until the waiting-item or admission transaction commits, then
+   release all locks; no database transaction spans the mailbox fetch.
+   Do not persist attachment bytes. The pump independently re-fetches and
+   verifies them at handoff (`engine_api.py:2721-2729`).
+
+   A transient fetch failure leaves `pending_dispatch`; definitive missing
+   source or size/digest drift from an already prepared identity uses the
+   `source_unavailable` row. Initial preparation has no earlier digest to
+   compare. Later preparation must compare against the saved identity
+   before replacing anything. Preparation failure never creates or joins
+   a job, and never leaves a waiting item without its identity.
+3a. **Check confirmation against the prepared candidate.** Compute
+   `item_sha256` from that candidate and the resolved provider as in 6.7.
+   If already confirmed, compare to the saved confirmation receipt on
+   **every** dispatch, even if a new manifest no longer declares effects:
+   source drift follows step 3; any other identity mismatch is
+   `manual_review` (`provider_changed`). Never overwrite the receipt to
+   make it match. Otherwise, when either manifest effect flag or
+   `confirm_each` is true, atomically persist the prepared identity and
+   item hash, transition to `awaiting_confirmation`, and stop. A person's
+   confirmation returns the fire to `pending_dispatch` with that receipt;
+   the next dispatch prepares and checks it again. If confirmation is
+   unnecessary, continue with the same prepared candidate.
+4. **Admit**, the one admission decision (5.2 and 6.1 refer here). Compute
+   the complete v2 invocation fingerprint from the prepared candidate
+   (`db.py:1440-1480` at `29fd046`). Under the locks held from step 3,
+   use one `BEGIN IMMEDIATE` transaction and verify that the fire still
+   has the expected version and current attempt. The decision is:
+
+   1. If this attempt already has a `job_id` binding, replay it. If its
+      request id already names a job, validate that job's source and full
+      fingerprint before binding/replay; a mismatch is an integrity
+      error, never permission to create or join unrelated work. Under
+      atomic admission, a normal crash cannot leave a created job with
+      no attempt/fire link.
+   2. Otherwise, among `(message_id, part_id, invocation_fingerprint)`
+      matches, join the active job (`requested`, `accepted`, `processing`).
+      The active-fingerprint unique index admits at most one
+      (`db.py:282-286`).
+   3. Otherwise join the newest `completed` match, ordered by
+      `(created_at DESC, job_id DESC)` so equal timestamps are deterministic.
+   4. Otherwise create under the current attempt's `dispatch_request_id`
+      with `origin = automation`. Failed rows from other attempts or
+      clicks never block creation or satisfy this fire.
+
+   Active work takes precedence over completed history; completed takes
+   precedence over failed history. Preserve this ordering even when rows
+   appear concurrently: selection, create-or-join, the write-once attempt
+   binding, the fire's current `job_id` and `submitted` transition all
+   commit together. On queue-cap rejection, leave the same attempt unbound
+   and `pending_dispatch`. No provider submission occurs in admission.
+   If the joined job is terminal, settle in this pass; completion is
+   written only by settlement, not as an extra admission transition.
+
 5. **pump**: call the same `connect.queue.pump` operation the desktop host
    calls (`engine_api.py:3101`; `engine.rs:1066` sends it with
    `limit: 25`). The pump submits or reconciles due lane heads and runs each
@@ -1270,26 +1307,45 @@ boundaries. A completed `notify` fire's only intent is the one the action
 exists to send, written with the fire in the evaluation transaction.
 `not_admitted` and `declined` create no intent.
 
-**Source cleanup.** Retention purge, `inbox.delete`, and `inbox.clear`
-already take the per-message source lock before their deletion
-transaction (`docs/CONTRACTS.md:1147-1160`). That transaction now also
-settles every nonterminal fire of the message: a `pending_dispatch` or
-`awaiting_confirmation` fire, which has no job for the existing trigger
-(`db.py:296-317`) to preserve, becomes `source_unavailable` with its
-`automation_review` intent; a `submitted` fire is settled **before** the
-trigger runs, in the same transaction: if its job was never submitted
-(dispatch `waiting`, `submission_possible = 0`), which the trigger
-deletes (`db.py:296-317`), the fire becomes `source_unavailable` with its
-intent first, so settlement never later looks for a deleted row; if its
-job may have been submitted, the trigger keeps a content-free tombstone
-and the fire stays `submitted` until that tombstone reaches a terminal
-state, at which point the transaction that removes the tombstone
-(`docs/CONTRACTS.md:1172-1176`) settles the fire to `source_unavailable`,
-because the late result is not persisted. Fire rows are content-free (identifiers, hashes, states,
-timestamps) and are retained as idempotency records until the message's
-retention window ends, then purged with the same expiry rule the calendar
-tombstones use (`docs/CONTRACTS.md:646-652`); a fire is never
-cascade-deleted while nonterminal.
+**Source cleanup.** Retention purge, `inbox.delete` and `inbox.clear`
+hold the existing per-message source lock before their deletion
+transaction (`docs/CONTRACTS.md:1147-1160`). That same transaction handles
+all linked fires before removing their dependencies:
+
+- An unbound Connect fire (`pending_dispatch` or `awaiting_confirmation`)
+  becomes `source_unavailable` with its transition intent.
+- For a `submitted` Connect fire, the removal row has precedence whenever
+  cleanup will delete its job: this includes both never-submitted waiting
+  jobs and **already terminal jobs not yet settled to the fire**. Transition
+  it to `source_unavailable` and write the intent before the existing
+  trigger removes the job (`db.py:296-317`). Do not open a retry or create
+  a completion notice for a result being removed.
+- If Connect may own an active job (`dispatching`, `reconciling` or
+  `provider_owned`), retain its content-free tombstone and leave the fire
+  `submitted`. On a later validated terminal response, the transaction
+  removing that tombstone first settles all linked fires to
+  `source_unavailable`, with no persisted late result and no completion
+  intent (`db.py:3707-3716`, `docs/CONTRACTS.md:1172-1176`). This includes
+  failure outcomes as well as completion. Settlement after deletion is
+  insufficient because there is no row left to inspect.
+- For a `calendar.propose` fire, apply the calendar ledger's existing
+  cleanup/compaction rules, then settle from its resulting state within
+  the transaction. A resumable run remains linked and `submitted`, while
+  a final run maps through 6.1. Calendar notifications remain owned by the
+  run, with no duplicate fire intent. If its reconciliation tombstone
+  expires while still resumable, close the fire as `source_unavailable`
+  before purging both at the same cutoff; expiry does not authorize new
+  work or another notification (`docs/CONTRACTS.md:635-652`).
+
+Already-terminal fires never transition again. Fire and attempt records
+retain only identifiers, hashes, states and timestamps, not source text,
+attachment bytes or result content. Retain them for the source's configured
+eligibility window and purge them at its cutoff, together with any expired
+calendar tombstone. A nonterminal fire whose Connect tombstone still owns
+an unresolved request remains a bounded content-free reconciliation record
+until that dependency is terminal; it is never dispatchable again after
+source loss. This does not extend retention of source or result content.
+Deletion cannot cascade away a nonterminal fire while leaving work eligible.
 
 ### 6.5 Why the engine pumps inside the timer-driven pass
 
@@ -1330,10 +1386,14 @@ Where the gate is checked:
    missing the candidate is still marked evaluated with outcome `locked`
    and no fire is created (so activating the licence later does not fire
    rules on the whole retention window). This is the authorization
-   boundary for the internal actions: a `notify` intent or a
-   `calendar.propose` admission is written only by a transaction whose
-   own check passed, so a licence that expires mid-phase stops the next
-   candidate, not the next phase;
+   boundary for the message's candidate batch: once the check passes,
+   the bounded, database-only writes in that transaction are authorized.
+   There is no network/model work between that check and commit. A
+   `notify` intent or `calendar.propose` admission belongs to that batch;
+   expiry before the next candidate check stops the next batch, while
+   expiry after an authorized batch's check does not revoke its commit.
+   I3 tests this exact boundary; later calendar writes still use the
+   calendar contract's own authorization and confirmation gates;
 2. immediately before each dispatch (section 6.2 step 1), both features,
    through `feature_entitlements_active(CONNECT_FEATURE_ID,
    AUTOMATIONS_FEATURE_ID)` (`entitlement.py:280-281`), the same call the
@@ -1366,8 +1426,8 @@ and failed fires stay visible after entitlement loss, as writes do.
 
 ### 6.7 Human handoff and confirmation
 
-Every transition into `awaiting_confirmation`, `ambiguous_provider`,
-`manual_review`, `failed`, or `source_unavailable` writes one
+For a `connect.invoke` fire, each transition into `awaiting_confirmation`,
+`ambiguous_provider`, `manual_review`, `failed`, or `source_unavailable` writes one
 `automation_review` intent in the transaction that makes the transition
 (section 6.1 table, "Written by" column), delivered through the same
 UNION the calendar runs use (`db.py:5396-5420`), by the same code
@@ -1375,8 +1435,8 @@ UNION the calendar runs use (`db.py:5396-5420`), by the same code
 (`db.py:5473-5490`). The intent names the rule, the sender label, and the
 subject; nothing else.
 
-A fire enters `awaiting_confirmation` instead of `pending_dispatch` when the
-live manifest declares `effects.external` or `effects.confirmation_required`
+A prepared Connect fire moves from `pending_dispatch` to
+`awaiting_confirmation` when the live manifest declares `effects.external` or `effects.confirmation_required`
 for the selected capability, or when the rule author set
 `confirm_each: true` (an optional rule field, default false). A person
 confirms one specific fire by
@@ -1469,24 +1529,24 @@ proves it does not.
 |---|---|---|
 | I1 | A rule fires twice on one message and artifact, or the database admits a duplicate fire row. | Unique index on `(event_id, rule_id, rule_version, artifact_key)` with `artifact_key NOT NULL` (section 5.3). Database-level: a direct second insert of a `calendar.propose` fire and of a `notify` fire for the same `(event, rule, version)` fails on the sentinel key; a direct second insert of a `connect.invoke` fire for the same artifact fails; an insert with a NULL key fails; a control insert for a distinct valid artifact of the same message succeeds. Engine-level: the same message evaluated in two passes and after a crash injected between evaluation commit and dispatch yields one fire per key. |
 | I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
-| I3 | Anything fires, or an automation job is POSTed, without both features active. | Matrix test over (none, exchange only, automations only, both) times (rule with `connect.invoke`, `calendar.propose`, `notify`): only (both, any) fires; the automations-only row also asserts the seeded scheduling rule does not admit a run (`tests/test_service.py:542` extended). Boundary probe: the licence active until `expires_at` minus one second fires; at `expires_at` does not. Mid-phase expiry: two candidates in one evaluate phase, the licence expiring between them (simulated clock); assert the first fires and the second is `locked`, for a `notify` rule in particular. Deferred POST: admit an automation job with both keys active, let it sit `waiting`, replace the licence with an exchange-only one, run the pump from a separate process (desktop thread and `eom-mail-watch pump`); assert zero POSTs, the job failed `CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED`, the fire `failed` with one review intent, and that a click-originated `waiting` job on the same lane still POSTs. |
-| I4 | A capability with declared effects, or a rule with `confirm_each`, is invoked without a person confirming that exact hashed item, or a waiting fire has no confirmable item. | Matrix over `confirm_each` in {false, true} times manifest effects in {both false, external true}: (false, false) dispatches without confirmation; the other three reach `awaiting_confirmation` only through step 3a and each carries a persisted `item_sha256`; confirming with a stale hash is refused, confirming with the right one dispatches, and an app-version or instance change before dispatch halts in `provider_changed`. Validation: `confirm_each` on a `calendar.propose` or `notify` rule is rejected at save. |
+| I3 | A candidate batch is authorized, or an automation job is newly POSTed, without both features active at its authorization boundary. | Matrix over (none, exchange only, automations only, both) times each action kind: only both authorizes a candidate batch. With a simulated clock, authorize at expires_at minus one second and reject at expires_at. Two messages in one phase with expiry between their checks: first batch commits; second records locked, including notify. Expiry after a batch's check but before its database-only commit does not revoke that batch (6.6); no blocking provider work is allowed there. Admit an automation job with both keys, revoke Automate before a later pump in a separate desktop/timer process: zero POSTs, CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED, one failure intent; an exchange-authorized click job still POSTs. |
+| I4 | A capability bypasses required confirmation, or a waiting fire lacks a verified source identity. | Cross confirm_each true/false with effects (neither, external only, confirmation_required only, both). Every case fetches and hashes before step 3a; only the false/neither case proceeds without waiting. Other cases persist a confirmable item with the real artifact digest. Stale confirmation hash is refused; valid confirmation resumes. Before redispatch, change same-sized bytes, provider version, instance or effect flags: source drift is source_unavailable; provider identity drift is provider_changed; a removed effects flag never skips comparison to the saved receipt. Transient fetch failure leaves pending_dispatch without a waiting item or job; definitive missing source closes it. Non-Connect confirm_each is rejected at save. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
 | I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. The pre-existing mail phases are outside this invariant by section 6.2. |
-| I8 | The engine picks a provider. | Two registrations for one app id; assert `ambiguous_provider` and no job. One registration whose instance changed between confirmation and dispatch; assert `provider_changed`, no job. |
+| I8 | Discovery chooses an instance by filtering away a conflicting instance, or confuses an absent capability with an absent app. | Two app instances both offering the pinned capability, and two where only one offers it: ambiguous_provider in both, no job. One instance with multiple capabilities counts once. One instance offering only other capabilities: capability_unavailable; no instance of the app: pending_dispatch. A changed unique instance after confirmation: provider_changed, no job. Exercise catalog discovery with real manifest fixtures, not a synthetic persisted job. |
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
 | I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload of the `automation_complete` intent for a completed `connect.invoke` fire whose output carries withheld fields, and asserts it contains rule name, sender label, subject, the word "completed", and no substring of the job's output; with the phone topic unset, asserts no network call and a desktop-only delivery. |
 | I11 | The engine core imports mail, provider, calendar, or Connect code. | Test walks the core module's import graph and asserts the allowlist. |
-| I12 | A state that needs a person is silent, an intentionally silent state notifies, or a completion produces more or fewer than one notice. | For each of `awaiting_confirmation`, `ambiguous_provider`, `source_unavailable`, `manual_review` (including `stalled`, `capability_unavailable`, `parameters_invalid`, `unsupported_attachment`, and `provider_changed`), and `failed`, a test asserts exactly one `automation_review` intent exists and is delivered by the existing path. A completed `connect.invoke` fire, whether by its own job or by linking to an already completed job, asserts exactly one `automation_complete` intent and no `automation_review` intent. A completed `notify` fire asserts exactly its own intent. A completed `calendar.propose` fire asserts no engine intent beyond the calendar ledger's own. `not_admitted` and `declined` assert no intent. |
+| I12 | Notification ownership is duplicated or a transition's required intent is missing. | For each Connect transition to awaiting_confirmation, ambiguous_provider, source_unavailable, manual_review or failed, assert one automation_review intent keyed by the new state version, even under CAS replay. A Connect completion, including a joined completed job, adds exactly one automation_complete and no new automation_review; any earlier confirmation intent remains historical. A notify fire has exactly its action intent. Calendar fires add no intents beyond the linked run's own notifications, through confirmation, manual review, completion and cleanup. not_admitted and declined add no intent. Existing delivery and opt-in settings apply. |
 | I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
-| I15 | Retention or deletion loses an idempotency record while a fire is still eligible, or leaves a no-job fire dispatchable after its source is gone. | For each of `pending_dispatch` (provider absent), `awaiting_confirmation`, and `submitted` (job `waiting`, never submitted; and job `provider_owned`): delete the source message through `inbox.delete` and through retention purge; assert the fire is `source_unavailable` (settled before the never-submitted job is deleted; or, for the provider-owned case, `submitted` until the tombstone's late terminal state settles it to `source_unavailable` in the tombstone-removing transaction), exactly one review intent, no later POST, the fire row still present as a content-free record, and after the retention window the record purged. |
-| I17 | A fire causes more than one provider execution, or loses its job across a crash. | Crash probes with a real provider process and a counting stub behind it: after the admission transaction (job row exists and is linked, no POST yet); after acceptance (job `provider_owned`); and after the job's terminal commit but before settlement. After each, recovery resumes through the fire's `job_id`; assert exactly one provider execution, the fire ends `completed` with that job's result and exactly one `automation_complete` intent, and no request id was generated beyond the creating attempt's. Collapse probe: two fires on one identity, the second having joined the first's job; crash at each of the three points; assert both fires end `completed` from the one job, one POST in total, and that the joining fire's request id never names a job. A separate assertion injects a failure inside the admission transaction and proves no job row is ever persisted without its fire link. Attempt probe: expire the first attempt under the admission window, assert the second attempt has a new request id, the admission decision creates for it despite the first attempt's failed row, the first replays its stored failure, and the stub saw one POST in total. Mixed history: for one fingerprint seed (a) failed then completed click jobs, (b) completed then failed, (c) completed plus an active rerun; assert the fire joins the completed job in (a) and (b) with no POST, joins the active job in (c), and creates only when every row is failed. Calendar link: a `calendar.propose` fire whose run reaches `awaiting_confirmation` stays `submitted`, then settles `completed` after the person confirms; a run in `unresolved` stays `submitted` until reconciliation. |
+| I15 | Cleanup deletes a dependency before settling its fire, permits a later POST, or retains source/result content. | Race inbox.delete, inbox.clear and retention against unbound preparation, waiting confirmation, a never-submitted job, retained completed/failed jobs before settlement, and possibly-submitted jobs. Source lock winner determines ordering. Unbound/removed-job fires become source_unavailable in the removal transaction; no retry or completion notice for removed results. Possibly-submitted jobs retain content-free tombstones and submitted fires; late completed AND failed outcomes settle all linked fires before atomic job deletion, with one review intent and no stored late output. Repeat with multiple fires joined to one job. Calendar cleanup covers awaiting_confirmation, unresolved, terminal and expired-tombstone runs, using the run's state/notifications without duplication. Verify configured expiry and the bounded unresolved Connect-record exception in 6.4. |
+| I17 | Recovery duplicates an execution, retries a forbidden failure, or loses a linked job. | Crash after admission commit, after acceptance, and after retained terminal commit before settlement; a counting provider observes one execution and the same job_id throughout, with one completion intent per Connect fire. Two joined fires recover from the same job, although the joining request id names no job. Roll back admission mid-transaction: no partial job/attempt binding/fire link. Expire attempt 1: one CAS transaction opens attempt 2, preserves the old binding, clears current job_id and leaves pending_dispatch; crash there and resume. Failed-only history creates one replacement; if another fire has meanwhile created active work, or completed work now exists, join it instead. Expire attempt 2: manual_review, no third identity. Other failures never open an attempt. Replay old request ids without execution. History permutations failed/completed and completed/failed select completed; completed plus active selects active; completed timestamps tied use job_id order. Calendar awaiting_confirmation and unresolved remain submitted with unchanged fire version, then settle after confirmation/reconciliation. |
 | I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution; both fires settle `completed` with one `automation_complete` intent each. |
 | I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and admits two `invoice.extract` jobs with no desktop process running. The mail-check process exits with the second job `waiting`; the installed `eom-email-watcher-connect-queue.timer` then runs `eom-mail-watch pump` and the proof observes the second job advance to `provider_owned` and `completed` through those pump invocations alone, before any further mail check, so the test cannot pass merely because the first job finished inside the initial check. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the jobs. This is the end-to-end proof for the timer-driven install. |
-| I20 | A fire-owned effect happens more or fewer than once, or a job completed by one actor is never settled by another. | Settlement idempotency: complete a job, then run settle from the pass, from the desktop queue thread, and from `eom-mail-watch pump`, concurrently and repeatedly; assert one transition, one `automation_complete` intent, one attempt row where applicable. Standalone completion: the mail-check process exits with the job `provider_owned`; the pump timer alone completes the job; assert the fire is `completed` with its intent before any further mail check. Stale version: a settle holding an old `state_version` is rejected and writes nothing. |
-| I21 | The state machine in 6.1 and the prose disagree. | A test enumerates every `(from, to)` pair the implementation can perform and asserts it is a row of the 6.1 table with its guard; every row is exercised by at least one test; no transition leaves a terminal state. |
+| I20 | Multiple actors duplicate a fire effect or removal loses final settlement. | Concurrent, repeated settle from pass, desktop queue thread and pump timer after retained completion: one CAS transition and one completion intent per Connect fire. Crash between job terminal commit and settle, then run only a standalone pump: settlement completes. Crash immediately before and after source-tombstone deletion: fire transition, review intent and job deletion are all committed or all absent. Repeated active-job/resumable-run scans change no fire version or intents. Losing a CAS inserts neither intent nor attempt; calendar final settlement adds no duplicate calendar intent. |
+| I21 | The transition table, guards, prose and implementation disagree. | Enumerate implementation transitions and compare to 6.1, including definitive pre-admission source loss and tombstone removal. Exercise every row with a positive case and rejected guard. Prove deadline attempt 1 and 2, retained completion and source-unavailable removal are mutually exclusive. No transition leaves a terminal fire; scans of resumable links are no-ops, not self-transitions. Audit effects against the action-specific ownership in 6.1/6.7. |
 
 Real adapters throughout: the provider is the reference provider script the
 repo already ships (`scripts/connect_reference_provider.py`) or the real
@@ -1653,7 +1713,8 @@ matching string literals across repos:
 3. Schema 20: rules, rule versions with `revision`/`retired_revision` and
    tombstone deletion, the `automation_rule_set` revision counter,
    `messages.rules_revision_at_analysis`, fires with a non-null
-   `artifact_key`, attempts with `dispatch_request_id`,
+   `artifact_key`, attempts with `dispatch_request_id` and write-once job
+   bindings, the fire's current attempt and job link,
    `rules_evaluated_version` (migration sets `0` on already-analysed
    messages), stored fire `state`/`state_version`, the job `origin`
    column, and the settlement step; the seeded system rule, enabled; the
@@ -1777,3 +1838,16 @@ matching string literals across repos:
   settles a fire before the trigger deletes its never-submitted job; 6.6
   makes the entitlement check per candidate inside the evaluation
   transaction; I3, I15, I17 extended.
+
+- **r9 (2026-09-10).** Operator-requested correction pass on top of r8.
+  Prepared source identity now precedes both confirmation and admission,
+  with one lock scope and explicit missing/transient source outcomes.
+  Discovery counts app instances before filtering capabilities. The
+  transition table uses disjoint retained/removal and first/second-attempt
+  guards; resumable calendar states are no-ops. Retry atomically clears
+  the current link while retaining attempt bindings; active/completed
+  work can be joined by a second attempt. Settlement effects are owned by
+  action kind, and dependency removal settles before deleting waiting,
+  terminal or reconciliation rows. Candidate authorization has an explicit
+  transaction boundary. I3, I4, I8, I12, I15, I17, I20 and I21 cover these
+  paths. These are contract requirements, not implemented behavior.
