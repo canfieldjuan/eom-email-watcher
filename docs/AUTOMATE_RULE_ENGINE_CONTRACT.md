@@ -17,6 +17,19 @@ could-not-determine**. Nothing is marked confirmed without a citation.
 
 ## 0. Ground truth this contract is anchored to
 
+**Revision 2 (2026-09-09).** Revised after the local review of the first
+draft (`f500a1f`). The review confirmed every finding it raised; the
+changes are listed in section 13. This document is a design contract for a
+separately authorised Automate slice. It is not part of, and does not count
+as progress on, the Local Connect progress dashboard, which reports both
+Automate rows as *planned* until a rule engine exists in code.
+
+Two revisions of `eom-email-watcher` matter here. The first draft was read
+against `29fd046` (#122). Since then #123 ("Wake and render the durable
+Connect queue") and #124 ("Record Invoice Processor queue proof") merged;
+this revision is anchored to `c10a37c` and keeps the `29fd046`
+observations as dated history where they no longer hold.
+
 Read from `origin/main` after `git fetch` on 2026-09-09. Local checkouts were
 not trusted: the `eom-email-watcher` checkout was on a benchmark branch 63
 commits behind main with four modified files, and `doc_sum` was on a test
@@ -24,7 +37,7 @@ branch.
 
 | Repo | origin/main head read | Subject |
 |---|---|---|
-| eom-email-watcher | `29fd046f7ba1ef8cead5d742836378989359d3d1` | Coordinate Connect handoff with source retention (#122) |
+| eom-email-watcher | `c10a37c06b8fc75a0f84ce5efe75945435312730` | Record Invoice Processor queue proof (#124); first draft read `29fd046f7ba1ef8cead5d742836378989359d3d1` (#122) |
 | invoice-processor | `74f8bca0d1e0b9c0bae177ef6ee4c9ebce890086` | Roadmap: Slices 6 and 7 shipped; Slice 8 not yet chosen (#33) |
 | document-summarizer | `3babb35a205300dfa11926328271166e08ad4a16` | Add combined profile release acceptance gate (#50) |
 | connect-contracts | `3005d82a7be885fba36f8688b5967a5b56a0abea` | Define Windows Local Connect placement (#8) |
@@ -44,21 +57,40 @@ The commit-title check the prompt asked for reproduces exactly:
 ### 1.1 Contradicted
 
 **C1. "A queue, so a batch does not hit a busy provider: closed"
-(`Local Connect Status.md:53`) is not true at the head read.**
-The storage, the engine pump operation, and the source-lock coordination
-exist, but nothing invokes the pump. The only reference to
-`connect.queue.pump` outside its definition is its entry in the operation
-table (`src/eom_email_watcher/engine_api.py:3667`). A search of
-`desktop/src-tauri/src/*.rs`, `desktop/src/main.ts`,
-`src/eom_email_watcher/cli.py`, and `src/eom_email_watcher/service.py` finds
-no caller. The queue contract itself assigns pumping to the Tauri host and
-lists it as a later slice (`docs/CONTRACTS.md:1184-1190`, `1280-1288`), and
-the PR bodies of #121 and #122 both defer "Tauri wakeups" (landing step 4).
-Consequence today: a job deferred to `waiting` after `PROVIDER_BUSY`
-(`engine_api.py:2464-2478`) advances only when a person clicks the same
-action again (`engine_api.py:3122-3136` resumes through the lane head claim
-at `2806-2810`). There is no unattended retry in the tree. A rule engine
-that runs unattended must own the pump call itself (section 6.5).
+(`Local Connect Status.md:53`) was not true at `29fd046`, and is true at
+`c10a37c` only while the desktop host process is running.**
+
+Dated history (`29fd046`): the storage, the engine pump operation, and the
+source-lock coordination existed, but nothing invoked the pump; the only
+reference to `connect.queue.pump` outside its definition was its entry in
+the operation table (`engine_api.py:3667`), and a job deferred to `waiting`
+after `PROVIDER_BUSY` advanced only when a person clicked again.
+
+Current (`c10a37c`, #123): the Tauri host starts a
+`ConnectQueueScheduler` at setup (`desktop/src-tauri/src/lib.rs:802-803`).
+It runs one thread, `email-watcher-connect-queue`, that calls
+`engine.pump_connect_queue()` (`scheduler.rs:91-101`), which sends
+`connect.queue.pump` with `{"limit": 25}` (`engine.rs:1066`); the thread
+sleeps until the engine-supplied `next_wake_unix_ms`, retries after 30 s on
+error, and gives each pump request a 30-minute timeout
+(`scheduler.rs:17-18`). The pump (`engine_api.py:3101`) expires overdue
+waiting jobs, takes due lane heads, and runs each claimed job with
+`wait_for_terminal=False` (`engine_api.py:3090`): a job that is still active
+after the submit or GET raises retryable `JOB_TIMEOUT`
+(`engine_api.py:2475-2480`) and the pump moves on, so no pump call blocks
+on provider completion. #124 recorded a live two-invoice proof of this loop
+against Invoice Processor `74f8bca` (`docs/CONTRACTS.md`, "Exact-current
+operational proof").
+
+Still true at `c10a37c`: the timer-driven install never pumps. The unit runs
+`eom-mail-watch check` (`systemd/eom-email-watcher.service:11`, timer
+`OnBootSec=2min`, `OnUnitActiveSec=2h`), and neither `cli.py` nor
+`service.py` references the pump. A job left `waiting` with no desktop open
+advances only when the desktop next runs, and the two-hour admission window
+(`db.py:34`, `CONNECT_QUEUE_ADMISSION_WINDOW`) can expire it first. A rule
+engine that runs unattended without a desktop must therefore own a pump
+call of its own (section 6.5); with the desktop open it must not duplicate
+the host's.
 
 **C2. The State 03 diagram (`Local Connect Product Brief.md:107-116`) draws
 Email Watcher automatically handing work to Summarizer or Invoices. No such
@@ -86,10 +118,12 @@ only `connect.capability_exchange`), and nowhere in `invoice-processor`
 schema types `features` as any array of pattern-matching strings with no
 enumeration (`entitlements/v1/claims.schema.json:27-37`). See 1e-Q1.
 
-**C4. `docs/CONTRACTS.md:858-859` says "engine pump ... remain the later
-slices".** The engine pump landed in #121 (`engine_api.py:2884-2996`,
-`docs/ENGINE_API.md:72`, `316-324`). The status line was not updated by #121
-or #122. The doc is behind its own repo by two merged PRs.
+**C4. Resolved by #123.** At `29fd046`, `docs/CONTRACTS.md:858-859` still
+said "engine pump ... remain the later slices" two merged PRs after the pump
+landed in #121. #123 changed the status line to "issue #117 complete.
+Durable storage, engine pump, Tauri host/UI behavior, and the exact-current
+Invoice Processor operational proof are implemented and recorded below."
+Kept as dated history; no longer a contradiction.
 
 **C5. "Follows a list of senders you choose, across multiple accounts"
 (`Brief:138`) describes a shape the code does not have.** The sender list is
@@ -493,8 +527,15 @@ Rule
   trigger          { source_kind: "mail.message" }
   conditions       1..8 entries, all must hold (AND)
   action           exactly one of the kinds in section 4.3
+  confirm_each     boolean, optional, default false; when true every fire
+                   of this rule waits for a person (section 6.7) even if
+                   the capability declares no effects
   created_at, updated_at   UTC
 ```
+
+Each accepted edit produces a new immutable row in `automation_rule_versions`
+(`rule_id`, `version`, the full definition, `accepted_at` UTC). `accepted_at`
+is the rule-version applicability boundary used in section 5.1.
 
 ### 4.2 Matching vocabulary
 
@@ -626,28 +667,53 @@ TOML cannot give, and a hand edit would bypass validation.
 
 ### 4.6 The acceptance test: the existing automation as a rule
 
-Seeded at migration as a system rule, enabled if and only if the watcher
-currently has a Microsoft 365 account with a `ready` proposal grant:
+Seeded at migration as a system rule, **always present and enabled by
+default**, whatever accounts or grants exist at migration time:
 
 ```text
 rule_id     fixed uuid, recorded in code
 name        "Meeting request -> propose a calendar event"
 system      true
+enabled     true at seed; false only by an explicit person action
 scope       { provider: "microsoft365" }
 trigger     { source_kind: "mail.message" }
 conditions  [ { category equals scheduling } ]
 action      { kind: "calendar.propose" }
 ```
 
-Everything the current code does after admission is unchanged, because the
-action **is** the current admission. What moves is only the predicate
-(`service.py:1354`) and the constant automation identity
-(`db.py:30-31`), both of which become rule data. The action still refuses
-to admit a run unless the provider is Microsoft 365, the account has an
-address, the grant is ready, and the tokens validate
-(`service.py:110-147`); those are action-side admission checks, not rule
-conditions, and stay in code. A person may disable the seeded rule; they
-may not delete it or change its conditions in version 1.
+Readiness is not a rule property. Today the admission checks -- provider is
+Microsoft 365, the account has an address, the `proposal` grant is `ready`,
+the tokens validate -- run when a scheduling message is processed
+(`service.py:110-125`, `1351`), not at install time, and the first draft's
+"enabled if and only if a ready grant exists at migration" would have
+seeded the rule disabled on any install that connected Microsoft 365 later,
+with no path back. Instead:
+
+- The rule fires whenever its conditions match; the action's admission
+  checks decide, per fire, whether a run is admitted. A fire whose action
+  is not admitted (no Microsoft 365 account, grant not ready, tokens
+  invalid) records the outcome `not_admitted` with the reason and does not
+  halt, notify, or create a run -- exactly what today's code does for the
+  same message (it skips silently). When the account or grant later becomes
+  ready, the next matching message fires normally. No message is re-fired
+  retroactively (section 5.1).
+- `enabled` is owned by the person. A person may disable the seeded rule;
+  the engine records `disabled_by_person_at` and never re-enables it, not
+  on migration, not on an account or grant transition, not on upgrade.
+  A person may re-enable it. They may not delete it or change its
+  conditions in version 1.
+- Everything the current code does after admission is unchanged, because
+  the action **is** the current admission. What moves is only the predicate
+  (`service.py:1354`) and the constant automation identity (`db.py:30-31`),
+  both of which become rule data.
+
+Settling cases (I13): install before any account, connect Microsoft 365
+and grant later, then a scheduling message admits a run; grant revoked then
+restored, a message during revocation records `not_admitted` and a message
+after restoration admits; a rule disabled by a person stays disabled across
+a migration re-run and across a grant transition; an install with a ready
+grant at migration behaves exactly as today on the existing scheduling
+suites.
 
 If this rule cannot be expressed, the design is wrong. It can.
 
@@ -668,20 +734,54 @@ Evaluation candidates are messages whose analysis is complete (`status` in
 `analyzed`, `summarized`), whose `received_at` is inside retention
 (`service.py:1305-1309` applies the same boundary), and whose
 `rules_evaluated_version` is null. Each candidate is evaluated exactly
-once, ever, against the rule set as it stands at the start of the phase,
-read in one transaction. In one `BEGIN IMMEDIATE` transaction per message
-the engine writes the message's `rules_evaluated_version`, the fire rows,
-and the first event of each fire. A crash before that commit leaves the
-message unevaluated and it is picked up next pass; a crash after it cannot
-re-fire because the unique key below rejects the duplicate. This is the
-same cannot-lose, cannot-duplicate property the calendar admission has
-(section 2.1), obtained without coupling evaluation into `mark_analyzed`.
+once, ever.
 
-Rule edits during a pass take effect next pass. A message analysed before
-a rule was created or edited is **not** re-evaluated against it;
-retroactive firing is a product decision and is deferred (section 9).
-`analysis.requeue` (`engine_api.py:1792`) does not clear
-`rules_evaluated_version`; a re-analysed message does not re-fire.
+**Which rule versions apply to a message** is decided by two stored
+timestamps, not by when the pass happens to run:
+
+- `messages.analysis_at`, written by `mark_analyzed` when the analysis that
+  produced the matching fields committed (`db.py:5351`);
+- `automation_rule_versions.accepted_at`, written when a rule version was
+  saved (section 4.1).
+
+A rule version applies to a message iff `accepted_at <= analysis_at` and it
+is the latest version of its rule with that property. A rule created after
+the message was analysed has no applicable version and cannot fire on it.
+A rule edited after the message was analysed is evaluated on the version
+that existed at analysis, so the edit neither fires retroactively nor
+loses the work the earlier version was entitled to. The evaluation reads
+the version table once per pass (one read transaction); a version accepted
+after that snapshot is by construction newer than every candidate's
+`analysis_at` and cannot apply in this pass. This is the rule the first
+draft promised (I2) but did not mechanise.
+
+Consequences that follow from the boundary, not from extra rules:
+
+- **Crash between analysis and evaluation, new rule saved in between.**
+  The message stays a candidate; the new rule's `accepted_at` is later than
+  the message's `analysis_at`; it does not fire. The versions that did
+  exist at analysis fire as they would have.
+- **Migration.** Messages analysed before the migration have
+  `analysis_at` earlier than every rule version's `accepted_at`, including
+  the seeded rule's, so no rule applies to them and no retroactive fire is
+  possible. Their `rules_evaluated_version` is set to `0` by the migration
+  ("evaluated under no rules") so they are not re-read every pass. The
+  runs the old scheduling path already admitted for them live in
+  `automation_runs` untouched.
+- **Edits during a pass** take effect for messages analysed after the edit,
+  which is the next pass at the earliest.
+- **Re-analysis.** `analysis.requeue` (`engine_api.py:1792`) does not clear
+  `rules_evaluated_version`; a re-analysed message does not re-fire, even
+  though its `analysis_at` moves forward.
+
+In one `BEGIN IMMEDIATE` transaction per message the engine writes the
+message's `rules_evaluated_version`, the fire rows -- each with its own
+durable `dispatch_request_id` (section 6.1) -- and the first event of each
+fire. A crash before that commit leaves the message unevaluated and it is
+picked up next pass; a crash after it cannot re-fire because the unique key
+in section 5.3 rejects the duplicate. This is the same cannot-lose,
+cannot-duplicate property the calendar admission has (section 2.1),
+obtained without coupling evaluation into `mark_analyzed`.
 
 ### 5.2 Ordering and multiple matches
 
@@ -689,13 +789,52 @@ Rules are evaluated in `(created_at, rule_id)` order. Every matching rule
 fires; there is no first-match-wins. A fire is the tuple
 `(event_id, rule_id, rule_version, artifact_ref)` where `artifact_ref` is
 `(message_id, part_id)` for artifact-consuming actions and null otherwise.
-Within one evaluation transaction the engine collapses fires that would
-invoke the same `(capability id, version, provider app_id)` on the same
-artifact into one Connect job; both fires reference it. Across passes the
-same collapse is guaranteed by the existing active-fingerprint unique index
-(`db.py:282-286`, `docs/CONTRACTS.md:923-933`), which returns the original
-job for a second logical invocation. Two rules sending the same artifact to
-two different providers produce two jobs on two lanes.
+
+Fires that would perform the **same invocation** share one Connect job.
+"Same invocation" is the existing v2 invocation fingerprint, unchanged
+(`db.py:1440-1480` at `29fd046`): protocol version 2, provider `app_id`,
+`version` and `instance_id`, capability id and version, the input artifact's
+media type, byte size, SHA-256, display name and source app id, and the
+**canonical parameters**. The first draft's key -- capability id and
+version, provider app id, artifact -- omitted provider version and instance
+and the parameters, so two rules requesting a parameterised capability
+with different parameters (say, two output languages) would have shared
+one result for two different requested operations; the review reproduced
+that with the extracted helper (`contract_keys_equal: true`,
+`existing_fingerprints_equal: false`). Neither current provider exposes
+parameters, and the manifest-based action surface (section 4.3) allows
+them, so the key must already be complete.
+
+Collapse happens at dispatch admission, not at evaluation: every fire is
+its own row with its own `dispatch_request_id`. When the dispatch phase
+admits a fire (section 6.2), it looks up, within the same transaction, a
+job for the same artifact with an equal fingerprint:
+
+- an active job (`requested`, `accepted`, `processing`) -- the fire links
+  to it and creates nothing; this is what the existing active-fingerprint
+  unique index already guarantees for a click (`db.py:282-286`,
+  `docs/CONTRACTS.md:923-933`);
+- a `completed` job -- the fire links to it and records `completed` with
+  that job's result; the bytes are not sent again for an invocation that
+  already produced a result. (A click is allowed to re-run; a rule is not,
+  because a rule that re-runs on every pass is a loop.)
+- a `failed` job, or none -- the fire creates a new job under its own
+  `dispatch_request_id`.
+
+Confirmation does not cross fires. A fire in `awaiting_confirmation` is not
+admitted and therefore neither creates nor joins a job; a fire that needs
+no confirmation and shares a fingerprint with one that does is admitted on
+its own and runs. When the confirmed fire is later admitted it finds the
+job by fingerprint as above and links to it -- the person confirmed exactly
+this invocation, and it has been, or is being, performed. An auto-admitted
+fire never satisfies another fire's unmet confirmation, and an unconfirmed
+fire never rides an admitted fire's job. Settled by I18: equal parameters
+collapse to one job; unequal parameters produce two jobs on one lane,
+serialised by the lane; mixed confirmation produces one running job and
+one waiting fire, which links to the same job after confirmation.
+
+Two rules sending the same artifact to two different providers produce two
+jobs on two lanes.
 
 ### 5.3 No match, and idempotency
 
@@ -756,10 +895,27 @@ For `calendar.propose` the fire holds a `run_id` and derives its state from
 every halting state of section 2.1 maps to `manual_review` for display and
 notification purposes while the underlying run keeps its exact state.
 
-### 6.2 Dispatch phase, current world (no host pump)
+**Durable dispatch identity.** Every fire is created with a
+`dispatch_request_id` (uuid4) in the evaluation transaction (section 5.1),
+before any external call can happen. A Connect job created for a fire is
+created under that request id, in the same transaction that writes the job
+row and the fire's `job_id`, and only then is the provider contacted. The
+existing request-id replay (`engine_api.py:3085-3100` at `29fd046`:
+a request id whose job is `completed` returns the completed result) makes
+this recoverable across every crash boundary: a fire in `pending_dispatch`
+or `submitted` whose `dispatch_request_id` already names a job row resumes
+that job by id -- through the pump if active, through the stored result if
+completed -- and never generates a second request id. The first draft
+entered the click path "with a fresh engine-owned request_id" and left the
+fire-to-job association to a later write, which permitted one provider
+execution per crash. A unique fire row alone is not proof of one provider
+execution; the persisted request id before the first POST is.
+
+### 6.2 Dispatch phase
 
 For every fire in `pending_dispatch`, in `(occurred_at, message_id,
-part_id)` order, grouped by resolved provider instance:
+part_id)` order, grouped by resolved provider instance, within the
+**pass deadline** (below):
 
 1. re-check both licence features (section 6.6);
 2. discover the pinned `provider.app_id`; zero instances leaves the fire
@@ -767,52 +923,87 @@ part_id)` order, grouped by resolved provider instance:
    same app id halts it in `ambiguous_provider` (`adr/0001:110-112`);
 3. validate the artifact and parameters against the live manifest
    (section 4.3);
-4. enqueue through the same path as a click (`engine_api.py:3138-3245`,
-   entered with a fresh engine-owned `request_id` and `confirmed` set
-   only when section 6.7 permits), which fetches the bytes once, records
-   the trusted digest, and claims the lane head;
-5. because that path submits and waits for a terminal state synchronously
-   (`2425`), the engine submits **one fire per provider instance at a
-   time** and does not enqueue the next fire for that instance until the
-   previous one is terminal. The engine's own ledger is the unattended
-   queue; the Connect queue's 25-job cap and two-hour admission deadline
-   (`db.py:261`, `docs/CONTRACTS.md:1011-1021`) are never the thing that
-   bounds unattended work, because at most one engine-originated job per
-   lane is ever nonterminal at a pass boundary.
+4. **admit**: in one transaction, look up an equal-fingerprint job
+   (section 5.2) and either link the fire to it or create the job row
+   under the fire's `dispatch_request_id` with the fire's `job_id` set --
+   the same durable queue admission a click performs
+   (`engine_api.py:3138-3245` at `29fd046`), so the job is in the lane's
+   queue with the trusted digest recorded, and **no provider call has been
+   made yet**;
+5. **pump**: call the same `connect.queue.pump` operation the desktop host
+   calls (`engine_api.py:3101`; `engine.rs:1066` sends it with
+   `limit: 25`). The pump submits or reconciles due lane heads and runs each
+   claimed job with `wait_for_terminal=False` (`engine_api.py:3090`): a job
+   still active after its submit or GET raises retryable `JOB_TIMEOUT`
+   (`:2475-2480`) and the pump moves to the next head. No engine dispatch
+   call waits for a terminal state. The engine's own ledger is therefore
+   not a second queue: the Connect queue's 25-job cap and two-hour
+   admission window (`db.py:33-34`) apply to engine-originated jobs
+   exactly as to clicks, and fires that cannot be admitted under the cap
+   stay `pending_dispatch` for the next pass.
 
-The pass has a **dispatch budget**: ten minutes of wall clock, checked
-before each submission, so a pass that runs under the desktop scheduler's
-thirty-minute engine timeout (`scheduler.rs:15`) cannot be killed
-mid-handoff by its own host. Fires not reached stay `pending_dispatch`;
-a job left `provider_owned` or `reconciling` at the budget is reconciled
-first thing next pass by calling the existing pump on due lane heads
-(`engine_api.py:2978-2996`), before any new submission. That reconciliation
-is GET-before-POST by construction (`2731-2742`).
+The first draft's step 5 entered the click path, which "submits and waits
+for a terminal state synchronously" (`engine_api.py:2425`,
+`client.wait_for_terminal`), with a ten-minute budget checked only before
+each submission. That never bounded the pass: the nested wait had its own
+30-minute job timeout (`connect.py:53`, `DEFAULT_JOB_TIMEOUT_SECONDS`), so a
+submission allowed at second 599 could hold the pass until second 2399.
+The pump exists precisely so that nothing waits, and the engine uses it.
+
+**Pass deadline.** The pass computes `deadline = pass_start + 10 minutes`
+once, at the start of `run_watcher_check`, before mail is fetched. Every
+blocking operation in the evaluate and dispatch phases -- attachment
+fetch, lock acquisition, provider submit and GET inside the pump, the
+pump call itself -- receives the remaining time to that deadline as its
+timeout, and an operation whose minimum duration would not fit is not
+started. Mail fetch and analysis run before dispatch and consume the same
+deadline, so a slow mailbox leaves less time for dispatch and never more;
+when nothing remains, nothing is dispatched and every fire stays
+`pending_dispatch`, which is a safe resumable state because admission is
+durable and idempotent. This is what makes the desktop scheduler's
+30-minute engine timeout (`scheduler.rs:17`) unreachable by a pass and is
+the invariant I7 now actually settles: both the slow-provider and the
+slow-mailbox case are tested with a simulated clock.
+
+**What the pass does not do.** It does not wait for jobs it admitted.
+With the desktop open, the host's queue thread pumps them at the
+engine-supplied wake times (C1). Without a desktop, the next pump is the
+next timer-driven pass (section 6.5), and the two-hour admission window
+can expire a `waiting` job first; `connect_queue_deadline_exceeded` proves
+the provider never accepted it (`docs/CONTRACTS.md:1055-1061`,
+`1156-1158`), so the fire may create one new job identity once, then halts
+in `manual_review` on the second such failure. Fires not reached stay
+`pending_dispatch`; jobs left `provider_owned` or `reconciling` are
+reconciled by the next pump, GET-before-POST by construction
+(`engine_api.py:2731-2742`).
 
 `PROVIDER_BUSY` during the pass, which can only come from a user click that
 won the lane in between, is handled by the existing deferral
-(`2464-2478`); the engine calls the pump again within its budget so the
-backoff schedule is actually walked. Provider absence for a fire that has
-**not** yet produced a job is a pass-level retry with no Connect state; a
-fire that has been `pending_dispatch` for 24 hours halts in
-`provider_unavailable` and notifies. A job that fails
-`connect_queue_deadline_exceeded` or `connect_source_unavailable` proves
-the provider never accepted it (`docs/CONTRACTS.md:1055-1061`,
-`1156-1158`); the fire may create one new job identity once, then halts in
-`manual_review` on the second such failure.
+(`engine_api.py:2464-2478`); the pump walks the backoff schedule.
+Provider absence for a fire that has **not** yet produced a job is a
+pass-level retry with no Connect state; a fire that has been
+`pending_dispatch` for 24 hours halts in `provider_unavailable` and
+notifies.
 
-### 6.3 Dispatch phase, post-queue world (host pump wired)
+### 6.3 One dispatch design for both hosts
 
-When the Tauri host owns pumping (`docs/CONTRACTS.md:1184-1197`), the engine
-may enqueue up to the lane cap and return without waiting, letting the host
-drain lanes. Nothing in section 6.2 changes except step 5: the engine
-enqueues every eligible fire, and the fire's displayed state follows the
-job's dispatch state. The two-hour admission deadline then applies to
-engine-originated jobs, and the engine handles
-`connect_queue_deadline_exceeded` exactly as section 6.2 says. The engine
-still calls the pump at the start of every pass, because the systemd path
-has no host and must not depend on the desktop being open. This contract
-requires both worlds to pass the same tests (section 7).
+The first draft carried a "current world (no host pump)" design and a
+"post-queue world (host pump wired)" design. #123 made the second the only
+world: the desktop host pumps at engine-supplied wake times, and the engine
+pass pumps within its deadline. There is one dispatch design (section 6.2)
+and two hosts:
+
+- **Desktop running.** The pass admits and pumps once within its deadline;
+  the host's queue thread pumps again at the engine's `next_wake_unix_ms`
+  and re-reads durable state (`scheduler.rs:91-101`). Nothing in the pass
+  depends on the host, and the host reproduces no queue policy.
+- **Timer-driven install, no desktop.** The pass is the only pump until the
+  next pass (section 6.5).
+
+Both hosts run the same tests (section 7); the tests that distinguish them
+are the wake-time tests (host present: a `waiting` job advances before the
+next pass; host absent: it advances at the next pass or expires under the
+admission window and is handled as section 6.2 says).
 
 ### 6.4 Failure taxonomy
 
@@ -838,15 +1029,33 @@ provider output text, so this contract adds no new content class to the
 phone channel beyond what `send_review` already carries
 (`service.py:1025-1032`).
 
-### 6.5 Why the engine owns the pump call
+### 6.5 Why the engine pumps inside the timer-driven pass
 
-Because nothing else does (C1), and because the systemd host has no
-desktop. `run_watcher_check` calling the pump is the only design in which
-"it did the work while you were asleep" is true for the timer-driven
-install (`systemd/eom-email-watcher.timer`). This is also why section 6.2
-keeps at most one engine job nonterminal per lane at a pass boundary: a
-timer that fires every two hours cannot walk a two-hour admission deadline
-for a job it left waiting.
+Because the timer-driven install has no other pump. At `c10a37c` the unit
+runs `eom-mail-watch check` every two hours after boot
+(`systemd/eom-email-watcher.service:11`, `eom-email-watcher.timer:5-6`),
+and neither `cli.py` nor `service.py` references `connect.queue.pump`; only
+the desktop's `ConnectQueueScheduler` does (C1). `run_watcher_check`
+calling the pump is the only design in which "it did the work while you
+were asleep" is true for the timer-driven install.
+
+It is not sufficient on its own, and this contract does not claim it is: a
+two-hour timer cannot walk the queue's own two-hour admission window
+(`db.py:34`) for a job it left `waiting`, and one outstanding job per lane
+does not stop a waiting job's deadline from expiring between passes. So the
+timer-driven install additionally gets:
+
+- a `eom-mail-watch pump` CLI subcommand that runs one bounded pump call
+  under the pass deadline rule of section 6.2 and exits with the engine's
+  `next_wake_unix_ms` in its output;
+- a second user timer, `eom-email-watcher-connect-queue.timer`, that runs
+  it. Its cadence is an operator decision recorded at implementation;
+  the admission window bounds the longest useful interval, and the pump is
+  a no-op (one read) when no queue is active.
+
+With the desktop open, the pass's pump and the host's pump are the same
+operation on the same durable state and contend only on the lane lock
+(`engine_api.py:3097`, `lock_contended`); neither waits for the other.
 
 ### 6.6 Entitlement enforcement
 
@@ -901,17 +1110,28 @@ result.
 
 Neither current provider declares effects, so in version 1 nothing a rule
 can do leaves the machine or has an outward effect without a person
-confirming a specific item: `calendar.propose` ends in the calendar
-ledger's own `awaiting_confirmation`, `connect.invoke` hands bytes to a
-loopback process with no external effect, and `notify` is the existing
-notification class.
+confirming a specific item, **with one opt-in exception**: the review and
+completion notifications of section 6.4 go out through the existing phone
+channel when a person has enabled it, and they carry the rule name, the
+sender label and the subject -- outbound content, the same class
+`send_review` already sends (`service.py:1025-1032`), never provider
+output. Otherwise `calendar.propose` ends in the calendar ledger's own
+`awaiting_confirmation`, `connect.invoke` hands bytes to a loopback
+process with no external effect, and `notify` is that same notification
+class.
 
 ### 6.8 Concurrency model
 
 Stated explicitly because it is a known blind spot.
 
-- **Processes.** Three can touch Connect state: the systemd check, the
-  desktop's scheduled check, and a desktop click. The two checks are
+- **Processes.** Four actors can touch Connect state: the systemd check,
+  the desktop's scheduled check, a desktop click, and -- since #123 -- the
+  desktop's `email-watcher-connect-queue` thread, which calls the pump at
+  engine-supplied wake times (`scheduler.rs:91-101`). The pump takes the
+  lane lock per head and returns `lock_contended` instead of waiting
+  (`engine_api.py:3097`), so a host pump that meets a pass, or a pass that
+  meets a host pump, skips that lane for this call; durable state is the
+  only shared truth and neither actor holds a lock across calls. The two checks are
   mutually excluded by `<database>.check.lock` (`cli.py:74`,
   `engine_api.py:270`); the click is not, and contends only on the lane
   lock (`engine_api.py:2802-2805`) and the source lock (`3149-3153`). The
@@ -925,10 +1145,11 @@ Stated explicitly because it is a known blind spot.
   collapse to one job (section 5.2); different capabilities on the same
   artifact are two jobs, possibly on one lane if one provider exposes both,
   in which case the lane serializes them.
-- **One rule, a batch.** N fires, one lane, dispatched in
-  `(occurred_at, message_id, part_id)` order, one at a time
-  (section 6.2 step 5). The order is durable and survives restart because it
-  is computed from stored columns, not from memory.
+- **One rule, a batch.** N fires, one lane, admitted into the durable
+  queue in `(occurred_at, message_id, part_id)` order up to the 25-job cap
+  (section 6.2 step 4); the lane serialises them and each pump advances the
+  head. The order is durable and survives restart because it is computed
+  from stored columns, not from memory.
 - **A pass starting while the previous pass's jobs are outstanding.**
   Cannot overlap (check lock). Outstanding means `provider_owned` or
   `reconciling` rows at the budget boundary; the next pass reconciles due
@@ -956,20 +1177,22 @@ proves it does not.
 | # | Never | Settling evidence |
 |---|---|---|
 | I1 | A rule fires twice on one message and artifact. | Unique index on `(event_id, rule_id, rule_version, artifact_ref)`; test evaluates the same message in two passes and after a crash injected between evaluation commit and dispatch, asserts one fire. |
-| I2 | A rule fires on a message analysed before the rule existed or was edited. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a rule, asserts no re-fire on prior messages. |
+| I2 | A rule version fires on a message whose `analysis_at` precedes the version's `accepted_at`, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires and `rules_evaluated_version = 0`. |
 | I3 | Anything fires without both features active. | Matrix test over (none, exchange only, automations only, both) times (rule with `connect.invoke`, `calendar.propose`, `notify`): only (both, any) fires; the automations-only row also asserts the seeded scheduling rule does not admit a run (`tests/test_service.py:542` extended). Boundary probe: the licence active until `expires_at` minus one second fires; at `expires_at` does not. |
 | I4 | A capability with declared effects or confirmation is invoked without a person confirming that exact item. | Fixture manifest with `effects.external: true`; test asserts `awaiting_confirmation`, then confirms with a stale `item_sha256`, asserts refusal; confirms with the right one, asserts dispatch. Negative: a manifest with both false is dispatched without confirmation. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2649-2657`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
-| I6 | Two engine-originated jobs are nonterminal on one lane at a pass boundary (current world). | Test with three PDFs, one provider, a provider stub that completes slowly; assert after the pass exactly one job per lane is nonterminal and the remaining fires are `pending_dispatch`; next pass drains one more. |
-| I7 | A pass exceeds its dispatch budget. | Simulated clock; provider stub that never completes; assert the pass returns within budget, the job is `provider_owned`, and the next pass reconciles it with GET before any POST. |
+| I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
+| I7 | A pass runs past its deadline. | Simulated clock and a deadline propagated to every blocking call. Slow provider: a stub whose submit sleeps past the remaining time; assert the submit is cut at the deadline, the pass returns within it, the job is `requested`/`waiting`, and the next pump reconciles GET-before-POST. Slow mailbox: a gateway whose attachment fetch consumes the whole deadline; assert nothing is submitted, every fire is `pending_dispatch`, and the pass still returns by the deadline. |
 | I8 | The engine picks a provider. | Two registrations for one app id; assert `ambiguous_provider` and no job. One registration whose instance changed between confirmation and dispatch; assert `provider_changed`, no job. |
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
 | I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload for a completed fire and asserts it contains rule name, sender label, subject, outcome word, and no substring of the job's output. |
 | I11 | The engine core imports mail, provider, calendar, or Connect code. | Test walks the core module's import graph and asserts the allowlist. |
 | I12 | A halt is silent. | For every non-`completed` terminal or waiting-on-person state in section 6.1, a test asserts one `automation_review` intent exists and is delivered by the existing path. |
-| I13 | The seeded scheduling rule behaves differently from today. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule; a test disables the rule and asserts a `scheduling` message admits no run. |
+| I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
 | I15 | Retention or deletion loses an idempotency record while a fire is still eligible. | Inherited from `messages_delete_connect_attachment_jobs` (`db.py:296-317`); test deletes the source message of a `submitted` fire and asserts the fire becomes `source_unavailable` and no later POST occurs. |
+| I17 | A fire causes more than one provider execution, or loses its job across a crash. | Crash probes at three points with a real provider process and a counting stub behind it: before submission (job row exists, no POST yet), after acceptance (job `provider_owned`), and after terminal persistence but before fire bookkeeping (job `completed`, fire not yet linked). After each, the next pass or pump resumes by the persisted `dispatch_request_id`; assert exactly one provider execution, the fire ends `completed` with that job's result, and no second request id was ever generated. |
+| I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution. |
 | I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and completes one `invoice.extract` job with no desktop open. This is the end-to-end proof; the two-invoice proof the queue contract owes (`docs/CONTRACTS.md:1265-1267`) is folded into it. |
 
 Real adapters throughout: the provider is the reference provider script the
@@ -1073,9 +1296,14 @@ matching string literals across repos:
 - **Output-aware actions** ("if withheld, then ..."). Requires the engine to
   parse provider media types; ADR-0002 says unknown types are opaque.
 - **Windows.** The engine reuses the existing locks and paths, which have
-  Windows implementations (`connect_windows.py`), but the unattended host on
-  Windows (no systemd) is unspecified; the desktop scheduler path covers it
-  only while the window is open.
+  Windows implementations (`connect_windows.py`). The desktop scheduler and
+  the queue thread run for as long as the host process runs: closing the
+  window does not stop it, because the host intercepts `CloseRequested`,
+  prevents the close and hides the window (`lib.rs:737-745`); quitting the
+  host does. An unattended host on Windows with no desktop process (the
+  systemd role) is unspecified and is not claimed. Installed Windows
+  behaviour is unverified; the release target tracks Linux and Windows
+  together and this contract does not redefine it.
 
 ---
 
@@ -1101,10 +1329,15 @@ matching string literals across repos:
   make a slow or failing rule evaluation block the analysis commit. The
   durable "unevaluated" marker gives the same cannot-lose property.
 - **Rules in `config.toml`.** Section 4.5.
-- **Let the engine enqueue up to the lane cap in the current world.**
-  Rejected: with no host pump, jobs left `waiting` at a pass boundary die
-  on the two-hour admission deadline before the next timer fires
-  (section 6.5).
+- **Make the engine's own ledger the queue: submit one job per lane per
+  pass and wait for it synchronously** (r1's section 6.2). Rejected in r2:
+  the synchronous wait carries its own 30-minute job timeout
+  (`connect.py:53`), so no pre-submission budget bounds the pass; and the
+  durable queue with a non-blocking pump now exists (#123), so a second
+  queue in the engine would reproduce policy the pump already owns. The
+  concern that motivated r1 -- a `waiting` job dying on the two-hour
+  admission window between timer passes -- is real and is met by the
+  connect-queue timer of section 6.5, not by refusing to enqueue.
 - **A per-rule provider instance pin.** Rejected: instances rotate on
   provider state reset (`adr/0002:87-96`); pinning the app id and resolving
   the instance at fire time is what the click path does.
@@ -1124,11 +1357,40 @@ matching string literals across repos:
 1. This document, contract only.
 2. ADR-0006 and the feature registry in `connect-contracts` (section 8.3),
    so the second key has a home before more code depends on it.
-3. Schema 20: rules, rule versions, fires, `rules_evaluated_version`; the
-   seeded system rule; the engine core with I1, I2, I9, I11, I14.
+3. Schema 20: rules, rule versions with `accepted_at`, fires with
+   `dispatch_request_id`, `rules_evaluated_version` (migration sets `0` on
+   already-analysed messages); the seeded system rule, enabled; the engine
+   core with I1, I2, I9, I11, I14.
 4. Evaluate phase wired into `run_watcher_check`; the scheduling trigger
    replaced by the seeded rule; I3, I12, I13.
-5. Dispatch phase, current world, with the in-pass pump call; I5, I6, I7,
-   I8, I15.
-6. Confirmation operation and rules UI, "Automations locked"; I4, I10.
-7. Live systemd proof, I16, recorded here with the tested revision.
+5. Dispatch phase over the durable queue: admission under the fire's
+   request id, fingerprint collapse, the in-pass pump call, the pass
+   deadline; I5, I6, I7, I8, I15, I17, I18.
+6. `eom-mail-watch pump` and the connect-queue user timer for the
+   timer-driven install (section 6.5).
+7. Confirmation operation and rules UI, "Automations locked"; I4, I10.
+8. Live systemd proof, I16, recorded here with the tested revision.
+
+---
+
+## 13. Revision history
+
+- **r1, `f500a1f` (2026-09-09).** First draft, read against `29fd046`.
+- **r2 (2026-09-09).** After the local review of r1, which confirmed every
+  finding against the code. Changed: section 0 (baseline `c10a37c`,
+  relationship to the dashboard assignment); C1 and C4 (the desktop host
+  pumps since #123; the timer-driven install still does not); 4.1
+  (`confirm_each` and `accepted_at` are normative); 4.6 (the seeded rule is
+  enabled by default and readiness is decided per fire, never at
+  migration); 5.1 (rule-version applicability is
+  `accepted_at <= analysis_at`, with crash, migration and edit cases); 5.2
+  (collapse on the complete v2 invocation fingerprint including parameters;
+  confirmation never crosses fires); 6.1 (`dispatch_request_id` persisted
+  before any provider call); 6.2 (dispatch admits into the durable queue
+  and pumps, nothing waits for a terminal state, one absolute pass deadline
+  propagated to every blocking call); 6.3 (one design, two hosts); 6.5
+  (why the pass pumps, plus the CLI pump and timer the systemd install
+  needs); 6.7 (the opt-in phone notification is named as outbound
+  content); 6.8 (the host queue thread as a fourth actor); 7 (I2, I6, I7,
+  I13 rewritten; I17, I18 added); 9 (the Windows window-close claim
+  corrected against `lib.rs:737-745`); 12 (landing order).
