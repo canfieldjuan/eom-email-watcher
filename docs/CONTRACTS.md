@@ -855,8 +855,9 @@ The Microsoft boundary above was checked against these primary v1.0 references:
 
 # Durable Local Connect provider-admission queue contract
 
-**Status:** issue #117 storage and locking foundation implemented; engine pump,
-host wakeups/UI, and operational proof remain the later slices below.
+**Status:** issue #117 complete. Durable storage, engine pump, Tauri host/UI
+behavior, and the exact-current Invoice Processor operational proof are
+implemented and recorded below.
 
 ## Verified baseline
 
@@ -1189,6 +1190,13 @@ The Tauri host owns queue pumping:
 - at desktop startup/restart; and
 - opportunistically after an ordinary watcher check.
 
+Each pump response carries the next durable wake time in Unix milliseconds, or
+`null` when no active queue remains. The host coalesces explicit wake signals,
+waits until that engine-supplied time, and asks the engine to re-read durable
+state; it does not reproduce queue ordering or retry policy in Rust or
+JavaScript. Queue progress emits a host event that causes the native Inbox to
+reload its durable result rows.
+
 If a pump cannot acquire a lane lock, the host schedules a coalesced retry for
 that lane after 2 seconds even though it does not mutate the owning process's
 dispatch row. Lock release is not treated as a notification. This bounded
@@ -1290,6 +1298,46 @@ death, and malformed or nonretryable provider errors.
 Each implementation slice must remain independently reviewable and preserve
 ordinary Gmail, Microsoft 365, IMAP, Inbox, notification, retention, calendar,
 and EOM monthly-reminder behavior.
+
+## Exact-current operational proof (2026-09-09)
+
+The final proof ran Email Watcher
+`b5ea470ff1e60632d63cc5965fc3d2ca5ddfa32a` against Invoice Processor
+`74f8bca0d1e0b9c0bae177ef6ee4c9ebce890086`, the two repositories' current
+remote `main` revisions at the time of the run. The provider used its real
+`invoice-connect serve` process, active signed Connect entitlement, loopback
+registration and bearer-token transport, SQLite job store, extraction
+pipeline, and Ollama's real `qwen3-30b-a3b:latest` model. Its source checkout
+differed from remote `main` only by one handoff-document commit; no provider
+runtime code differed or changed for this proof.
+
+Two distinct deterministic native-text invoice PDFs were exposed through a
+fixture mailbox gateway so the proof used no mailbox credentials, raw email
+bodies, or customer documents. Everything after that explicit attachment-byte
+boundary was the production Email Watcher discovery, capability matching,
+durable job/dispatch store, provider-lane lock, Connect v2 HTTP client, queue
+pump, and Invoice Processor runtime.
+
+Observed evidence, with identifiers and document contents omitted:
+
+1. Email Watcher discovered exactly one `invoice.extract` 1.0 capability from
+   the running `invoice-processor` 0.1.0 instance.
+2. After the first job reached provider state `accepted`, the second invocation
+   returned durable consumer state `requested` / `waiting` with one job ahead.
+   At that point Invoice Processor's database contained one job total and one
+   active job, proving that the consumer had not created a provider-side queue.
+3. The first job completed. An unattended loop invoked the public
+   `connect.queue.pump` operation only at its returned durable due times. The
+   second job moved through provider-owned `accepted`, `processing`, and
+   `completed` states without another invocation click or operator retry.
+4. The final Email Watcher ledger contained two completed jobs. Invoice
+   Processor contained two terminal jobs and zero active jobs. The provider
+   registration was removed when its process stopped.
+
+The proof process made four bounded queue-pump calls and zero operator retry
+calls. It validates the real Linux consumer/provider boundary and current model
+runtime; it does not claim Windows signing or packaging evidence, which remains
+the separate release-stage work already deferred by both applications.
 
 ## Explicit non-scope
 

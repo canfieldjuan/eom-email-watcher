@@ -2944,6 +2944,87 @@ class Store:
             ).fetchone()
         return self._connect_dispatch(row) if row else None
 
+    def connect_queue_ahead(self, job_id: str) -> int:
+        with self.connection() as db:
+            row = db.execute(
+                """WITH ranked AS (
+                    SELECT j.job_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY j.provider_app_id, j.provider_instance_id
+                            ORDER BY CASE
+                                WHEN d.state = 'dispatching' THEN 0
+                                WHEN d.state IN ('reconciling', 'provider_owned') THEN 1
+                                ELSE 2 END,
+                                j.created_at, j.job_id
+                        ) AS lane_rank
+                    FROM connect_attachment_jobs AS j
+                    JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                    WHERE j.protocol_version = 2
+                      AND j.status IN ('requested', 'accepted', 'processing')
+                      AND d.state IN (
+                          'waiting', 'dispatching', 'reconciling', 'provider_owned'
+                      )
+                )
+                SELECT lane_rank - 1 AS queue_ahead
+                FROM ranked WHERE job_id = ?""",
+                (job_id,),
+            ).fetchone()
+        return int(row["queue_ahead"]) if row else 0
+
+    def connect_queue_wakeups(
+        self, *, now: datetime | None = None
+    ) -> tuple[tuple[str, datetime], ...]:
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        with self.connection() as db:
+            head_rows = db.execute(
+                """WITH ranked AS (
+                    SELECT j.job_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY j.provider_app_id, j.provider_instance_id
+                            ORDER BY CASE
+                                WHEN d.state = 'dispatching' THEN 0
+                                WHEN d.state IN ('reconciling', 'provider_owned') THEN 1
+                                ELSE 2 END,
+                                j.created_at, j.job_id
+                        ) AS lane_rank,
+                        d.state, d.next_attempt_at
+                    FROM connect_attachment_jobs AS j
+                    JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                    WHERE j.protocol_version = 2
+                      AND j.status IN ('requested', 'accepted', 'processing')
+                      AND d.state IN (
+                          'waiting', 'dispatching', 'reconciling', 'provider_owned'
+                      )
+                )
+                SELECT job_id, state, next_attempt_at FROM ranked WHERE lane_rank = 1"""
+            ).fetchall()
+            deadline_rows = db.execute(
+                """SELECT j.job_id, d.admission_deadline
+                FROM connect_attachment_jobs AS j
+                JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                WHERE j.protocol_version = 2
+                  AND j.status = 'requested'
+                  AND d.state = 'waiting'
+                  AND d.submission_possible = 0"""
+            ).fetchall()
+
+        candidates: list[tuple[str, datetime]] = []
+        for row in head_rows:
+            value = row["next_attempt_at"]
+            if row["state"] == "dispatching" or value is None:
+                candidates.append((str(row["job_id"]), observed_at))
+                continue
+            candidate = datetime.fromisoformat(str(value))
+            if candidate.tzinfo is None:
+                raise RuntimeError("Connect queue wakeup time is missing its timezone")
+            candidates.append((str(row["job_id"]), candidate.astimezone(UTC)))
+        for row in deadline_rows:
+            candidate = datetime.fromisoformat(str(row["admission_deadline"]))
+            if candidate.tzinfo is None:
+                raise RuntimeError("Connect queue deadline is missing its timezone")
+            candidates.append((str(row["job_id"]), candidate.astimezone(UTC)))
+        return tuple(candidates)
+
     def due_connect_lane_heads(
         self,
         *,
@@ -5656,7 +5737,13 @@ class Store:
             message_ids,
         ).fetchall()
         connect_rows = db.execute(
-            f"""SELECT
+            f"""SELECT latest.*,
+                d.state AS dispatch_state,
+                d.next_attempt_at AS dispatch_next_attempt_at,
+                d.last_error_code AS dispatch_error_code,
+                d.last_error_message AS dispatch_error_message
+            FROM (
+                SELECT
                 job_id, message_id, part_id, protocol_version,
                 capability_id, capability_version,
                 provider_app_id, provider_app_version, provider_instance_id,
@@ -5668,7 +5755,7 @@ class Store:
                 summary_version, summary_text, warnings_json,
                 NULL AS result_json, result_metadata_json,
                 error_code, error_message, error_retryable, created_at, updated_at
-            FROM (
+                FROM (
                 SELECT
                     job_id, message_id, part_id, protocol_version,
                     capability_id, capability_version,
@@ -5685,13 +5772,40 @@ class Store:
                         capability_id, capability_version, invocation_fingerprint
                     ORDER BY created_at DESC, rowid DESC
                     ) AS recency
-                FROM connect_attachment_jobs
-                WHERE message_id IN ({placeholders})
-            )
-            WHERE recency = 1
-            ORDER BY created_at DESC""",
+                    FROM connect_attachment_jobs
+                    WHERE message_id IN ({placeholders})
+                )
+                WHERE recency = 1
+            ) AS latest
+            LEFT JOIN connect_job_dispatch AS d ON d.job_id = latest.job_id
+            ORDER BY latest.created_at DESC""",
             message_ids,
         ).fetchall()
+        queue_rows = db.execute(
+            """SELECT j.job_id, j.provider_app_id, j.provider_instance_id,
+                j.created_at, d.state
+            FROM connect_attachment_jobs AS j
+            JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+            WHERE j.protocol_version = 2
+              AND j.status IN ('requested', 'accepted', 'processing')
+              AND d.state IN ('waiting', 'dispatching', 'reconciling', 'provider_owned')
+            ORDER BY j.provider_app_id, j.provider_instance_id,
+                CASE
+                    WHEN d.state = 'dispatching' THEN 0
+                    WHEN d.state IN ('reconciling', 'provider_owned') THEN 1
+                    ELSE 2 END,
+                j.created_at, j.job_id"""
+        ).fetchall()
+        queue_positions: dict[str, int] = {}
+        current_lane: tuple[str, str] | None = None
+        lane_position = 0
+        for row in queue_rows:
+            lane = (str(row["provider_app_id"]), str(row["provider_instance_id"]))
+            if lane != current_lane:
+                current_lane = lane
+                lane_position = 0
+            queue_positions[str(row["job_id"])] = lane_position
+            lane_position += 1
         proposal_rows = db.execute(
             f"""SELECT p.*, r.state AS run_state, r.state_version, r.provider, r.account_id,
                 a.display_name AS account_display_name,
@@ -5742,6 +5856,8 @@ class Store:
                 "updated_at": str(row["updated_at"]),
             }
             if int(row["protocol_version"]) == 2:
+                if row["dispatch_state"] is None:
+                    raise RuntimeError("Connect v2 inbox result is missing dispatch state")
                 request_json = row["request_json"]
                 if not isinstance(request_json, bytes):
                     raise RuntimeError("Connect v2 job is missing its durable request")
@@ -5753,8 +5869,21 @@ class Store:
                     "instance_id": str(row["provider_instance_id"]),
                 }
                 item["parameters"] = _canonical_v2_parameters(request.get("parameters"))
+                item["dispatch_state"] = str(row["dispatch_state"])
+                item["queue_ahead"] = queue_positions.get(str(row["job_id"]), 0)
+                item["next_attempt_at"] = row["dispatch_next_attempt_at"]
+                if (
+                    row["dispatch_error_code"] is not None
+                    and row["dispatch_error_message"] is not None
+                ):
+                    item["dispatch_error"] = {
+                        "code": str(row["dispatch_error_code"]),
+                        "message": str(row["dispatch_error_message"]),
+                    }
             if row["status"] == "completed":
-                completed = self._connect_job(row)
+                completed = ConnectJob(
+                    **{name: row[name] for name in ConnectJob.__dataclass_fields__}
+                )
                 if completed.protocol_version == 1:
                     item["summary"] = {
                         "summary_version": completed.summary_version,
