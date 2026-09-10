@@ -53,6 +53,24 @@ def test_html_text_flushes_unfinished_reference_and_tag_fragments() -> None:
     assert extracted.endswith("<")
 
 
+def test_html_text_preserves_block_boundaries_around_reply_history() -> None:
+    extracted = html_to_text(
+        "<div>Please send copies.</div>"
+        "<div>-----Original Message-----</div>"
+        "<div>Invoice 2042 is due September 5, 2026.</div>"
+    )
+
+    assert extracted.splitlines() == [
+        "Please send copies.",
+        "-----Original Message-----",
+        "Invoice 2042 is due September 5, 2026.",
+    ]
+
+
+def test_html_text_keeps_inline_text_readable_without_inventing_a_line_break() -> None:
+    assert html_to_text("<p>Hello <strong>there</strong>.</p>").strip() == "Hello  there ."
+
+
 def test_explicit_empty_root_part_id_is_a_valid_attachment_identity() -> None:
     body, attachment_names, attachments = extract_body(
         {

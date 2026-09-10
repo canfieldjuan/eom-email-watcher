@@ -90,6 +90,8 @@ semantics.
   model prompt. Send the two portions as separately named untrusted fields while preserving the
   original text and order within each portion. If no recognized delimiter exists, keep the entire
   body as current text and use no quoted-history value.
+- Preserve semantic line boundaries while normalizing HTML-only bodies so block-level reply
+  delimiters remain visible to the same partitioning rule.
 - Define a mailbox-owner priority ladder: `urgent` for explicit immediate material risk, `high` for
   explicit near-term deadlines or operational/access changes requiring prompt response, `normal`
   for non-immediate human action, and `low` for messages requiring no mailbox-owner action.

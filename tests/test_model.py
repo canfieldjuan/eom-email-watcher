@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from eom_email_watcher.mime import html_to_text
 from eom_email_watcher.model import (
     SYSTEM_PROMPT,
     LocalModel,
@@ -229,6 +230,23 @@ def test_email_prompt_names_current_text_and_quoted_history_separately() -> None
     assert "Apply these trusted checks after reading the data:" in prompt
     assert "date found only in quoted_history MUST NOT populate" in prompt
     assert "classify the remaining legitimate message purpose" in prompt
+
+
+def test_html_normalization_preserves_a_reply_boundary_for_prompt_partitioning() -> None:
+    body = html_to_text(
+        "<div>Please send copies.</div>"
+        "<blockquote><div>On Tue, Sender wrote:</div>"
+        "<div>Invoice 2042 is due September 5, 2026.</div></blockquote>"
+    )
+
+    current, history = _split_quoted_history(body)
+
+    assert current.strip() == "Please send copies."
+    assert history is not None
+    assert history.splitlines() == [
+        "On Tue, Sender wrote:",
+        "Invoice 2042 is due September 5, 2026.",
+    ]
 
 
 def test_required_api_token_is_loaded_from_private_file(tmp_path: Path) -> None:
