@@ -1222,6 +1222,8 @@ the **phase deadline** (below):
    If the joined job is terminal, settle in this pass; completion is
    written only by settlement, not as an extra admission transition.
 
+After the loop, **once per pass**, not per fire:
+
 5. **pump**: call the same `connect.queue.pump` operation the desktop host
    calls (`engine_api.py:3101`; `engine.rs:1066` sends it with
    `limit: 25`). The pump submits or reconciles due lane heads and runs each
@@ -1259,11 +1261,14 @@ only its external calls. Bounds: an install holds at most **100 rules**
 conditions and a message at most 64 attachments, so matching one candidate
 is at most 100 x 8 x 64 comparisons over persisted fields. Candidates are
 read in **chunks of 50** ordered by `analysis_at`; the version snapshot
-for a chunk is one indexed query on `(rule_id, revision)` restricted to
-versions whose `[revision, retired_revision)` window overlaps the chunk's
-captured revision range, so a long edit history costs at most one version
-per rule per distinct captured revision in the chunk, never the whole
-history. The deadline is checked before each chunk read and before each
+for a chunk is built from the chunk's **distinct captured revisions**, at
+most 50: for each such revision and each live rule, one indexed point
+lookup on `(rule_id, revision)` returns the single version with the
+greatest revision at or below it (`ORDER BY revision DESC LIMIT 1`), which
+applies iff its `retired_revision` is null or greater. A chunk therefore
+costs at most 50 x 100 point lookups however long any rule's edit history
+is, and a chunk spanning revisions 1 and 1,000,000 loads two versions per
+rule, not the million between. No range query over history exists. The deadline is checked before each chunk read and before each
 candidate's transaction begins; when it is exhausted the phase stops, and
 a candidate whose transaction has not begun keeps its null
 `rules_evaluated_version` and is picked up first next pass. Nothing is
@@ -1307,16 +1312,30 @@ clock when evaluation first enters `pending_dispatch`; reset it in the
 same transaction when a person confirms a waiting item or settlement opens
 attempt 2. Retries while already pending (provider absence, temporary
 fetch failure, lock contention or full queue) do not reset it. An inactive
-licence **pauses** it: when dispatch step 1 fails for a fire, the fire
-records `licence_blocked_at` if not already set; when step 1 next passes
-for that fire, the same transaction adds the blocked interval to
-`pending_since` and clears `licence_blocked_at`, so authorization
-downtime never counts toward the stall. This is what makes the taxonomy
+licence **pauses** it, and the pause is anchored to the licence, not to
+when the engine happened to notice. The fire accumulates
+`authorized_pending_seconds` and records `last_authorized_at` together
+with `last_authorized_entitlement_id` at every dispatch step 1 that
+passes. At such an observation, the interval since `last_authorized_at`
+is added **only if** the licence now active carries the same
+`entitlement_id` as at the previous observation: a licence's validity is
+one contiguous interval (`issued_at <= not_before <= now < expires_at`,
+`adr/0003:61-65`), so a licence active at both ends of a gap was active
+throughout it. If the entitlement id differs, or there was no previous
+authorized observation, nothing is added and the observation is recorded
+afresh. A failed step 1 adds nothing and records nothing. A licence that
+expired one minute after a pass and was replaced thirty hours later thus
+contributes zero authorized time to the gap, whenever the engine observes
+it. Re-installing a licence with the same entitlement id after removing
+it counts the gap as authorized; that is the person restoring the same
+rights and is accepted. This is what makes the taxonomy
 row "licence not active at dispatch: stays `pending_dispatch`, resumes
 when active" true without a contradictory terminal rule; previously
 admitted work resumes, while a candidate that was evaluated `locked`
-never fires (6.6). After 24 hours of **authorized** pending time without
-admission, transition to `manual_review` (`stalled`). Time spent in `awaiting_confirmation` or
+never fires (6.6). When `authorized_pending_seconds` reaches 24 hours without
+admission, transition to `manual_review` (`stalled`). `pending_since`
+remains the display anchor of the current interval; the stall decision
+uses only the accumulated authorized time. Time spent in `awaiting_confirmation` or
 `submitted` does not consume a later pending interval. Confirmation does
 not extend source retention or permit changed bytes: source preparation
 and the saved receipt must still pass before admission.
@@ -1544,8 +1563,10 @@ and failed fires stay visible after entitlement loss, as writes do.
 
 For a `connect.invoke` fire, each transition into `awaiting_confirmation`,
 `ambiguous_provider`, `manual_review`, `failed`, or `source_unavailable`
-writes one `automation_review` intent before its notification deadline;
-expired transitions are silent as specified in section 6.4. The intent is
+writes one `automation_review` intent before its notification deadline,
+**except the removal transitions of section 6.4 source cleanup**, which
+write none because the message they would describe is being removed;
+expired transitions are likewise silent as specified in section 6.4. The intent is
 written in the transaction that makes the transition
 (section 6.1 table, "Written by" column), delivered through the same
 UNION the calendar runs use (`db.py:5396-5420`), by the same code
@@ -1652,7 +1673,7 @@ proves it does not.
 |---|---|---|
 | I1 | A rule fires twice on one message and artifact, or the database admits a duplicate fire row. | Unique index on `(event_id, rule_id, rule_version, artifact_key)` with `artifact_key NOT NULL` (section 5.3). Database-level: a direct second insert of a `calendar.propose` fire and of a `notify` fire for the same `(event, rule, version)` fails on the sentinel key; a direct second insert of a `connect.invoke` fire for the same artifact fails; an insert with a NULL key fails; a control insert for a distinct valid artifact of the same message succeeds. Engine-level: the same message evaluated in two passes and after a crash injected between evaluation commit and dispatch yields one fire per key. |
 | I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
-| I3 | A candidate batch is authorized, or an automation job is newly POSTed, without both features active at its authorization boundary. | Matrix over (none, exchange only, automations only, both) times each action kind: only both authorizes a candidate batch. With a simulated clock, authorize at expires_at minus one second and reject at expires_at. Two messages in one phase with expiry between their checks: first batch commits; second records locked, including notify. Expiry after a batch's check but before its database-only commit does not revoke that batch (6.6); no blocking provider work is allowed there. Licence pause: a pending_dispatch fire blocked at step 1 for 30 simulated hours, then the licence restored; assert the fire is still pending_dispatch (not stalled), dispatches on the next pass, and that pending_since excludes the blocked interval; a candidate evaluated locked during that interval never fires. Admit an automation job with both keys, revoke Automate before a later pump in a separate desktop/timer process: zero POSTs, CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED, one failure intent; an exchange-authorized click job still POSTs. Mixed authority: automation creates a waiting job, a real validated click joins the same job_id, then Automate expires; exchange plus the persisted interactive receipt permits one POST. Control: fire-only joins do not create interactive authority and fail after Automate expiry. Exchange loss blocks both. Repeat a click-origin job joined by a fire. Receipt identity/effects mismatches cannot authorize. |
+| I3 | A candidate batch is authorized, or an automation job is newly POSTed, without both features active at its authorization boundary. | Matrix over (none, exchange only, automations only, both) times each action kind: only both authorizes a candidate batch. With a simulated clock, authorize at expires_at minus one second and reject at expires_at. Two messages in one phase with expiry between their checks: first batch commits; second records locked, including notify. Expiry after a batch's check but before its database-only commit does not revoke that batch (6.6); no blocking provider work is allowed there. Licence pause: a pending_dispatch fire observed authorized at T0, the licence expiring at T0 plus one minute, no pass until T0 plus 30 hours (step 1 fails), a new licence installed and observed at T0 plus 31 hours; assert authorized_pending_seconds is zero, the fire is still pending_dispatch (not stalled) and dispatches on that pass; the same sequence with the original licence re-installed (same entitlement id) counts the gap; a candidate evaluated locked during the gap never fires. Admit an automation job with both keys, revoke Automate before a later pump in a separate desktop/timer process: zero POSTs, CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED, one failure intent; an exchange-authorized click job still POSTs. Mixed authority: automation creates a waiting job, a real validated click joins the same job_id, then Automate expires; exchange plus the persisted interactive receipt permits one POST. Control: fire-only joins do not create interactive authority and fail after Automate expiry. Exchange loss blocks both. Repeat a click-origin job joined by a fire. Receipt identity/effects mismatches cannot authorize. |
 | I4 | A capability bypasses required confirmation, or a waiting fire lacks a verified source identity. | Cross confirm_each true/false with effects (neither, external only, confirmation_required only, both). Every case fetches and hashes before step 3a; only the false/neither case proceeds without waiting. Other cases persist a confirmable item with the real artifact digest. Stale confirmation hash is refused; valid confirmation resumes. Before redispatch, change same-sized bytes, provider version, instance or effect flags: source drift is source_unavailable; provider identity drift is provider_changed; a removed effects flag never skips comparison to the saved receipt. Transient fetch failure leaves pending_dispatch without a waiting item or job; definitive missing source closes it. Non-Connect confirm_each is rejected at save. A person confirms after more than 24 hours while the source is still retained: pending_since resets and dispatch succeeds if otherwise eligible. At pending_since + 24 hours, continuous provider absence stalls; an ordinary retry before that boundary never resets the clock. Repeat pending-clock reset for attempt 2; expired source remains source_unavailable despite confirmation. Effect drift after enqueue: hold a no-effects job waiting, change either manifest flag without changing app/version/instance, and pump in a separate process. Assert CONNECT_EFFECTS_CHANGED and zero POSTs; matching flags/receipt authorize normally. Repeat after GET returns JOB_NOT_FOUND. Missing legacy policy metadata cannot authorize a new POST; fresh validated click replay may attach it to the same active job; GET-only recovery remains allowed. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
@@ -1664,7 +1685,7 @@ proves it does not.
 | I12 | Notification ownership is duplicated, a transition's required intent is missing, an obsolete intent is delivered, or an intent carries message content. | For each Connect transition before its notification deadline to awaiting_confirmation, ambiguous_provider, source_unavailable, manual_review or failed, assert one automation_review intent keyed by the new state version, even under CAS replay; assert the intent row stores no sender, subject, or rule text. A Connect completion before its notification deadline, including a joined completed job, adds exactly one automation_complete and no new automation_review. Supersession: delay delivery of an awaiting_confirmation intent, then confirm, decline, complete, or fail the fire; assert the old intent is marked superseded in the decision transaction and delivery sends nothing for it, while an already-delivered one is untouched. A notify fire has exactly its action intent. Calendar fires add no intents beyond the linked run's own notifications. not_admitted, declined, and every removal transition add no intent. Existing delivery and opt-in settings apply. |
 | I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
-| I15 | Cleanup deletes a dependency before settling its fire, permits a later POST, retains source/result content, or leaves message-derived notification content deliverable. | Race inbox.delete, inbox.clear and retention against unbound preparation, waiting confirmation, a never-submitted job, retained completed/failed jobs before settlement, and possibly-submitted jobs. Source lock winner determines ordering. Unbound/removed-job fires become source_unavailable in the removal transaction with no intent; every undelivered intent of the message is deleted in that transaction; a delivery attempt after removal finds no message row and sends nothing (assert zero network calls). Possibly-submitted jobs retain content-free tombstones and submitted fires; late completed AND failed outcomes settle all linked fires before atomic job deletion, silently, with no stored late output. Repeat with multiple fires joined to one job. Calendar cleanup covers awaiting_confirmation, unresolved, terminal and expired-tombstone runs, using the calendar ledger's own rules. Fire and attempt records are content-free and are purged at the source's retention cutoff. |
+| I15 | Cleanup deletes a dependency before settling its fire, permits a later POST, retains source/result content, or leaves message-derived notification content deliverable. | Race inbox.delete, inbox.clear and retention against unbound preparation, waiting confirmation, a never-submitted job, retained completed/failed jobs before settlement, and possibly-submitted jobs. Source lock winner determines ordering. Unbound/removed-job fires become source_unavailable in the removal transaction with no intent; every undelivered intent of the message is deleted in that transaction; a delivery attempt after removal finds no message row and sends nothing (assert zero network calls). Possibly-submitted jobs retain content-free tombstones and submitted fires; late completed AND failed outcomes settle all linked fires before atomic job deletion, silently, with no stored late output. Repeat with multiple fires joined to one job. Calendar cleanup covers awaiting_confirmation, unresolved, terminal and expired-tombstone runs, using the calendar ledger's own rules. Fire and attempt records are content-free and are purged at the source's retention cutoff, except a fire whose Connect tombstone is still `reconciling` or `provider_owned`, which is retained with that tombstone until its validated terminal response settles it (6.4), then purged with it. |
 | I17 | Recovery duplicates an execution, retries a forbidden failure, or loses a linked job. | Crash after admission commit, after acceptance, and after retained terminal commit before settlement; a counting provider observes one execution and the same job_id throughout, with one completion intent per Connect fire. Two joined fires recover from the same job, although the joining request id names no job. Roll back admission mid-transaction: no partial job/attempt binding/fire link. Expire attempt 1: one CAS transaction opens attempt 2, preserves the old binding, clears current job_id and leaves pending_dispatch; crash there and resume. Failed-only history creates one replacement; if another fire has meanwhile created active work, or completed work now exists, join it instead. Expire attempt 2: manual_review, no third identity. Other failures never open an attempt. Replay old request ids without execution. History permutations failed/completed and completed/failed select completed; completed plus active selects active; completed timestamps tied use job_id order. Calendar awaiting_confirmation and unresolved remain submitted with unchanged fire version, then settle after confirmation/reconciliation. |
 | I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution; both fires settle `completed` with one `automation_complete` intent each. |
 | I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and admits two `invoice.extract` jobs with no desktop process running. The mail-check process exits with the second job `waiting`; the installed `eom-email-watcher-connect-queue.timer` then runs `eom-mail-watch pump` and the proof observes the second job advance to `provider_owned` and `completed` through those pump invocations alone, before any further mail check, so the test cannot pass merely because the first job finished inside the initial check. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the jobs. This is the end-to-end proof for the timer-driven install. |
@@ -2006,3 +2027,14 @@ matching string literals across repos:
   chunks, an indexed per-chunk version snapshot, and a deadline check
   before every candidate transaction (6.2, 4.4). I3, I7, I12, I15
   updated. No runtime implementation is added.
+
+- **r13 (2026-09-11 UTC).** After five Codex threads on `706f5f9`.
+  Changed: 6.2 (the chunk snapshot is one indexed point lookup per live
+  rule per distinct captured revision, never a range over history; the
+  pump runs once per pass after the admission loop); 6.2 stall clock (the
+  pause is anchored to the licence: authorized time accrues only between
+  two authorized observations of the same `entitlement_id`, so a licence
+  that expired long before the engine noticed contributes nothing); 6.7
+  (the intent mandate excludes the removal transitions of 6.4); I15 (a
+  fire whose Connect tombstone is unresolved is retained with it past the
+  cutoff); I3 (the pause test anchored to expiry and reinstall).
