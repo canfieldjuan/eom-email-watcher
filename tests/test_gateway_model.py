@@ -85,6 +85,8 @@ def gateway_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     handler,
+    *,
+    clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
 ) -> tuple[GatewayModel, list[str]]:
     token_file = tmp_path / "gateway-token"
     token_file.write_text("app-credential\n", encoding="utf-8")
@@ -106,6 +108,7 @@ def gateway_model(
         token_file,
         ca_file,
         transport=httpx.MockTransport(handler),
+        clock=clock,
     )
     return model, requested_ca_files
 
@@ -255,6 +258,65 @@ def test_gateway_retry_reuses_request_identity_and_immutable_expiry(
         "2026-09-11T10:10:00Z",
         "2026-09-11T10:10:00Z",
     ]
+
+
+def test_gateway_expiry_boundary_blocks_transport_and_requires_requeue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    observed_at = [datetime(2026, 9, 11, 10, 9, 59, 999999, tzinfo=UTC)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        handler,
+        clock=lambda: observed_at[0],
+    )
+    reserved_at = datetime(2026, 9, 11, 10, 0, tzinfo=UTC)
+
+    analyze(model, current_local_time=reserved_at)
+    observed_at[0] = datetime(2026, 9, 11, 10, 10, tzinfo=UTC)
+    with pytest.raises(GatewayModelError) as captured:
+        analyze(model, current_local_time=reserved_at)
+
+    assert captured.value.code == "request_expired"
+    assert captured.value.retryable is False
+    assert len(requests) == 1
+
+
+def test_gateway_expired_scheduling_request_never_reaches_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: pytest.fail("expired scheduling request reached transport"),
+        clock=lambda: datetime(2026, 9, 7, 10, 10, tzinfo=UTC),
+    )
+
+    with pytest.raises(GatewayModelError) as captured:
+        model.extract_scheduling(
+            source=scheduling_source(),
+            feedback=(),
+            request_id="11111111-1111-4111-8111-111111111111",
+            request_started_at=datetime(2026, 9, 7, 10, 0, tzinfo=UTC),
+        )
+
+    assert captured.value.code == "request_expired"
+    assert captured.value.retryable is False
 
 
 def test_gateway_request_expiry_rejects_naive_reservation_time(
@@ -941,7 +1003,13 @@ def test_gateway_rejects_nul_in_notification_text(
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
     token_file = tmp_path / "gateway-token"
     ca_file = tmp_path / "gateway-ca.pem"
-    model = GatewayModel("https://inference.office.internal", 30, token_file, ca_file)
+    model = GatewayModel(
+        "https://inference.office.internal",
+        30,
+        token_file,
+        ca_file,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
 
     with pytest.raises(ModelError, match="credential is unavailable"):
         analyze(model, "short")

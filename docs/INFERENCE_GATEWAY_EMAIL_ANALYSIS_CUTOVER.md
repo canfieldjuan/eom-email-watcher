@@ -25,6 +25,8 @@ identity, application-side validation, and loopback model path unchanged.
   synthetic email content.
 - Preserve explicit analysis requeue: a permanently rejected result remains paused until the user
   requests a new durable analysis identity.
+- Fail an expired durable request locally before transport as a permanent `request_expired`
+  attempt; explicit requeue is the only path to a fresh request identity.
 
 ### Acceptance criteria
 
@@ -38,7 +40,9 @@ identity, application-side validation, and loopback model path unchanged.
    inference submission.
 5. The exact gateway request validator accepts Email Watcher's ordinary analysis schema and
    envelope, and its acknowledgement removes the retained output.
-6. Loopback inference, mailbox polling, notification delivery, Connect, and calendar write behavior
+6. The request is admitted immediately before its expiry but is permanently paused without
+   transport at or after expiry; this same guard covers analysis and scheduling extraction.
+7. Loopback inference, mailbox polling, notification delivery, Connect, and calendar write behavior
    are unchanged.
 
 ## Intentional
@@ -48,6 +52,8 @@ identity, application-side validation, and loopback model path unchanged.
   sources for one immutable value.
 - An acknowledgement is best-effort cleanup after the application's terminal transaction. Gateway
   expiry remains the bounded cleanup fallback if the acknowledgement cannot be delivered.
+- A durable request cannot be reused once its immutable expiry is reached. The existing explicit
+  requeue operation clears the paused request and creates a fresh identity on the next attempt.
 - The client continues to submit app-owned prompts and schemas; it does not select a model or worker.
 
 ## Deferred

@@ -6,6 +6,7 @@ import re
 import ssl
 import stat
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol, TextIO
@@ -438,12 +439,14 @@ class GatewayModel:
         ca_file: Path,
         *,
         transport: httpx.BaseTransport | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.base_url = base_url
         self.timeout = timeout
         self.api_token_file = api_token_file
         self.ca_file = ca_file
         self.transport = transport
+        self.clock = clock or (lambda: datetime.now(UTC))
 
     @staticmethod
     def _open_readonly(path: Path) -> TextIO:
@@ -712,13 +715,17 @@ class GatewayModel:
         except ModelError as exc:
             raise GatewayOutputRejected(request_id) from exc
 
-    @staticmethod
-    def _request_expires_at(reserved_at: datetime) -> str:
+    def _request_expires_at(self, reserved_at: datetime) -> str:
         if reserved_at.tzinfo is None:
             raise ModelError("Inference gateway reservation time must include a time zone")
         expires_at = reserved_at.astimezone(UTC).replace(microsecond=0) + timedelta(
             seconds=GATEWAY_REQUEST_LIFETIME_SECONDS
         )
+        observed_at = self.clock()
+        if observed_at.tzinfo is None:
+            raise ModelError("Inference gateway clock must include a time zone")
+        if observed_at.astimezone(UTC) >= expires_at:
+            raise GatewayModelError("request_expired", retryable=False)
         return expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @staticmethod
