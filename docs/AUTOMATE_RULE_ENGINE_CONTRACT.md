@@ -1262,13 +1262,23 @@ conditions and a message at most 64 attachments, so matching one candidate
 is at most 100 x 8 x 64 comparisons over persisted fields. Candidates are
 read in **chunks of 50** ordered by `analysis_at`; the version snapshot
 for a chunk is built from the chunk's **distinct captured revisions**, at
-most 50: for each such revision and each live rule, one indexed point
-lookup on `(rule_id, revision)` returns the single version with the
-greatest revision at or below it (`ORDER BY revision DESC LIMIT 1`), which
-applies iff its `retired_revision` is null or greater. A chunk therefore
-costs at most 50 x 100 point lookups however long any rule's edit history
-is, and a chunk spanning revisions 1 and 1,000,000 loads two versions per
-rule, not the million between. No range query over history exists. The deadline is checked before each chunk read and before each
+most 50. For each such revision `r`, the rules in effect at `r` are
+enumerated from the version table itself, not from the current rules
+list, so a rule deleted after a candidate's analysis still fires the
+version it had at that analysis (4.1, 5.1): the query is
+`kind = 'definition' AND revision <= r AND (retired_revision IS NULL OR
+retired_revision > r)`, and its result is at most 100 rows because the
+100-rule cap held at every past revision, tombstones included at the time.
+The rows the query must examine are those versions plus every version
+written after `r` (an index on `retired_revision` makes the retired-before-`r`
+majority unreachable), so the cost per revision is bounded by 100 plus the
+number of rule writes since that candidate's analysis, which is small
+because evaluation runs every pass and never by the size of the deleted or
+edited history before `r`. Rules the person has disabled are excluded by
+their current flag, which is the person's own stop switch (4.6); deletion
+is a version and does not flip that flag. A chunk spanning revisions 1 and
+1,000,000 therefore examines the versions active at each of the two, plus
+the writes since, never the million between. The deadline is checked before each chunk read and before each
 candidate's transaction begins; when it is exhausted the phase stops, and
 a candidate whose transaction has not begun keeps its null
 `rules_evaluated_version` and is picked up first next pass. Nothing is
@@ -1308,9 +1318,11 @@ won the lane in between, is handled by the existing deferral
 An unbound fire retries transient dispatch obstacles on later passes.
 Its stall clock is the persisted `pending_since` of its **current**
 `pending_dispatch` interval, not its original match time. Initialize that
-clock when evaluation first enters `pending_dispatch`; reset it in the
-same transaction when a person confirms a waiting item or settlement opens
-attempt 2. Retries while already pending (provider absence, temporary
+clock when evaluation first enters `pending_dispatch`; reset it, together
+with `authorized_pending_seconds` and the `last_authorized_at` baseline, in
+the same transaction when a person confirms a waiting item or settlement
+opens attempt 2, so a fresh pending interval starts with zero authorized
+time. Retries while already pending (provider absence, temporary
 fetch failure, lock contention or full queue) do not reset it. An inactive
 licence **pauses** it, and the pause is anchored to the licence, not to
 when the engine happened to notice. The fire accumulates
@@ -1415,14 +1427,23 @@ superseded (below), or expired. At/after the cutoff, transitions are
 silent. Delivery rechecks the deadline and the live message row and
 discards an intent that fails either.
 
-**Supersession.** Every fire transition is a compare-and-set on
-`state_version`. The same transaction marks every undelivered intent of
-that fire whose `state_version` is lower as superseded, and delivery
-delivers an intent only if the fire's current `state_version` equals the
-intent's. An `awaiting_confirmation` request whose delivery was delayed
-and whose fire has since been confirmed, declined, completed, or failed is
-therefore never sent; a delivered (acknowledged) intent is history and is
-not retracted. Calendar notices remain governed by their existing ledger,
+**Supersession and delivery claim.** Every fire transition is a
+compare-and-set on `state_version`. The same transaction marks every
+undelivered intent of that fire whose `state_version` is lower as
+superseded. Delivery of a fire intent runs under the host operation lock
+that native notification delivery already holds across selection, platform
+delivery, and acknowledgement (`docs/ENGINE_API.md:88-94`,
+`notifications.pending_under_host_lock`), and the human-decision operation
+`automation.rule_run.decide` acquires that same native lock before its
+transition, as `inbox.delete` acquires the production lock before a
+deletion. Under the lock, delivery re-reads the intent and delivers it only
+if the fire's current `state_version` equals the intent's; a decision
+cannot interleave between that check and the acknowledgement, because it
+waits for the lock. An `awaiting_confirmation` request whose delivery was
+delayed and whose fire has since been confirmed, declined, completed, or
+failed is therefore never sent; a delivered (acknowledged) intent is
+history and is not retracted. The timer-driven pass delivers through the
+same lock (`notifications.pending` acquires it itself). Calendar notices remain governed by their existing ledger,
 not this fire outbox.
 
 **Completion intent.** Before that deadline, a completed `connect.invoke`
@@ -1682,10 +1703,10 @@ proves it does not.
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
 | I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload of the `automation_complete` intent for a completed `connect.invoke` fire whose output carries withheld fields, and asserts it contains rule name, sender label, subject, the word "completed", and no substring of the job's output; with the phone topic unset, asserts no network call and a desktop-only delivery. |
 | I11 | The engine core imports mail, provider, calendar, or Connect code. | Test walks the core module's import graph and asserts the allowlist. |
-| I12 | Notification ownership is duplicated, a transition's required intent is missing, an obsolete intent is delivered, or an intent carries message content. | For each Connect transition before its notification deadline to awaiting_confirmation, ambiguous_provider, source_unavailable, manual_review or failed, assert one automation_review intent keyed by the new state version, even under CAS replay; assert the intent row stores no sender, subject, or rule text. A Connect completion before its notification deadline, including a joined completed job, adds exactly one automation_complete and no new automation_review. Supersession: delay delivery of an awaiting_confirmation intent, then confirm, decline, complete, or fail the fire; assert the old intent is marked superseded in the decision transaction and delivery sends nothing for it, while an already-delivered one is untouched. A notify fire has exactly its action intent. Calendar fires add no intents beyond the linked run's own notifications. not_admitted, declined, and every removal transition add no intent. Existing delivery and opt-in settings apply. |
+| I12 | Notification ownership is duplicated, a transition's required intent is missing, an obsolete intent is delivered, or an intent carries message content. | For each Connect transition before its notification deadline to awaiting_confirmation, ambiguous_provider, source_unavailable, manual_review or failed, assert one automation_review intent keyed by the new state version, even under CAS replay; assert the intent row stores no sender, subject, or rule text. A Connect completion before its notification deadline, including a joined completed job, adds exactly one automation_complete and no new automation_review. Supersession under the lock: a delivery holding the host operation lock past its version check and a concurrent decide operation; assert the decision waits for the lock, the delivery either completes and acknowledges before the decision or observes the superseded row and sends nothing, and no obsolete request is ever handed to the platform channel; an already-delivered intent is untouched. A notify fire has exactly its action intent. Calendar fires add no intents beyond the linked run's own notifications. not_admitted, declined, and every removal transition add no intent. Existing delivery and opt-in settings apply. |
 | I13 | The seeded scheduling rule behaves differently from today, or its enablement depends on setup order. | The existing scheduling tests (`tests/test_scheduling.py`, `tests/test_service.py` automation cases) pass unchanged with the trigger replaced by the seeded rule. Lifecycle: migrate with no account, connect and grant later, assert the next scheduling message admits a run; revoke the grant, assert `not_admitted` and no run; restore it, assert admission resumes; a person disables the rule, re-run the migration and flip the grant, assert it stays disabled and admits nothing; re-enable, assert admission. |
 | I14 | A rule reads message bodies. | The event builder's inputs are asserted by type: message row, attachment descriptors, analysis fields; a test asserts `gateway.content` is not called during evaluation. |
-| I15 | Cleanup deletes a dependency before settling its fire, permits a later POST, retains source/result content, or leaves message-derived notification content deliverable. | Race inbox.delete, inbox.clear and retention against unbound preparation, waiting confirmation, a never-submitted job, retained completed/failed jobs before settlement, and possibly-submitted jobs. Source lock winner determines ordering. Unbound/removed-job fires become source_unavailable in the removal transaction with no intent; every undelivered intent of the message is deleted in that transaction; a delivery attempt after removal finds no message row and sends nothing (assert zero network calls). Possibly-submitted jobs retain content-free tombstones and submitted fires; late completed AND failed outcomes settle all linked fires before atomic job deletion, silently, with no stored late output. Repeat with multiple fires joined to one job. Calendar cleanup covers awaiting_confirmation, unresolved, terminal and expired-tombstone runs, using the calendar ledger's own rules. Fire and attempt records are content-free and are purged at the source's retention cutoff, except a fire whose Connect tombstone is still `reconciling` or `provider_owned`, which is retained with that tombstone until its validated terminal response settles it (6.4), then purged with it. |
+| I15 | Cleanup deletes a dependency before settling its fire, permits a later POST, retains source/result content, or leaves message-derived notification content deliverable. | Race inbox.delete, inbox.clear and retention against unbound preparation, waiting confirmation, a never-submitted job, retained completed/failed jobs before settlement, and possibly-submitted jobs. Source lock winner determines ordering. Unbound/removed-job fires become source_unavailable in the removal transaction with no intent; every undelivered intent of the message is deleted in that transaction; a delivery attempt after removal finds no message row and sends nothing (assert zero network calls). Possibly-submitted jobs retain content-free tombstones and submitted fires; late completed AND failed outcomes settle all linked fires before atomic job deletion, silently, with no stored late output. Repeat with multiple fires joined to one job. Calendar cleanup covers awaiting_confirmation, unresolved, terminal and expired-tombstone runs, using the calendar ledger's own rules. Fire and attempt records are content-free and are purged at the source's retention cutoff, except a fire whose Connect tombstone is still `dispatching`, `reconciling`, or `provider_owned` (a pump that died after persisting `dispatching` is recovered as `reconciling` by the next pump, 6.4), which is retained with that tombstone until its validated terminal response settles it, then purged with it; the cleanup test covers all three states. |
 | I17 | Recovery duplicates an execution, retries a forbidden failure, or loses a linked job. | Crash after admission commit, after acceptance, and after retained terminal commit before settlement; a counting provider observes one execution and the same job_id throughout, with one completion intent per Connect fire. Two joined fires recover from the same job, although the joining request id names no job. Roll back admission mid-transaction: no partial job/attempt binding/fire link. Expire attempt 1: one CAS transaction opens attempt 2, preserves the old binding, clears current job_id and leaves pending_dispatch; crash there and resume. Failed-only history creates one replacement; if another fire has meanwhile created active work, or completed work now exists, join it instead. Expire attempt 2: manual_review, no third identity. Other failures never open an attempt. Replay old request ids without execution. History permutations failed/completed and completed/failed select completed; completed plus active selects active; completed timestamps tied use job_id order. Calendar awaiting_confirmation and unresolved remain submitted with unchanged fire version, then settle after confirmation/reconciliation. |
 | I18 | Fires with different invocation parameters share a job, or confirmation crosses fires. | Two rules, one PDF, one parameterised fixture capability: equal parameters produce one job referenced by two fires; unequal parameters produce two jobs on one lane, serialised; one rule with `confirm_each: true` and one without, equal parameters: the unconfirmed fire runs alone, the confirming fire stays `awaiting_confirmation` with no job, and after confirmation links to the same job's result without a second execution; both fires settle `completed` with one `automation_complete` intent each. |
 | I16 | The unattended path fails under the systemd sandbox. | Live: the installed unit (`ProtectHome=read-only`, `ReadWritePaths` to the state directory) runs one pass that discovers Invoice Processor under `XDG_RUNTIME_DIR`, reads the entitlement under `~/.config`, takes the lane and source locks beside the database, and admits two `invoice.extract` jobs with no desktop process running. The mail-check process exits with the second job `waiting`; the installed `eom-email-watcher-connect-queue.timer` then runs `eom-mail-watch pump` and the proof observes the second job advance to `provider_owned` and `completed` through those pump invocations alone, before any further mail check, so the test cannot pass merely because the first job finished inside the initial check. A desktop-present variant repeats it with the host running and asserts that the host's queue thread, not the pass, completed the jobs. This is the end-to-end proof for the timer-driven install. |
@@ -2038,3 +2059,14 @@ matching string literals across repos:
   (the intent mandate excludes the removal transitions of 6.4); I15 (a
   fire whose Connect tombstone is unresolved is retained with it past the
   cutoff); I3 (the pause test anchored to expiry and reinstall).
+
+- **r14 (2026-09-11 UTC).** After four Codex threads on `0a408c9`, all
+  consequences of r12 and r13 text. Changed: 6.2 (the snapshot enumerates
+  the rules in effect at each captured revision from the version table,
+  so a deleted rule's pre-deletion version still fires for an earlier
+  analysis; cost bounded by 100 plus writes since that analysis; deletion
+  does not flip the enabled flag); 6.2 stall clock (authorized time and
+  its baseline reset with each fresh pending interval); 6.4 (delivery of
+  a fire intent and the decide operation share the host operation lock,
+  which is what makes "never sent" true); I15 (retention exception
+  includes `dispatching`); I12 (the lock-based supersession test).
