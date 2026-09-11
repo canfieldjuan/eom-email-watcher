@@ -6,7 +6,7 @@ import re
 import ssl
 import stat
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Protocol, TextIO
 
@@ -42,6 +42,12 @@ class GatewayModelError(ModelError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class GatewayOutputRejected(GatewayModelError):
+    def __init__(self, request_id: str):
+        super().__init__("application_output_rejected", retryable=False)
+        self.request_id = request_id
+
+
 MAX_GATEWAY_RESPONSE_BYTES = 1_000_000
 MAX_GATEWAY_REQUEST_BYTES = 1_000_000
 MAX_GATEWAY_TOKEN_BYTES = 16_384
@@ -53,6 +59,7 @@ MAX_GATEWAY_ATTACHMENT_COUNT = 100
 MAX_GATEWAY_ATTACHMENT_NAME_CHARS = 512
 MAX_GATEWAY_RETRY_AFTER_SECONDS = 86_400
 GATEWAY_HEALTH_TIMEOUT_SECONDS = 5.0
+GATEWAY_REQUEST_LIFETIME_SECONDS = 600
 GATEWAY_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 QUOTED_HISTORY_RE = re.compile(
     r"(?im)^(?:"
@@ -227,6 +234,7 @@ class ModelRuntime(Protocol):
         source: SchedulingSource,
         feedback: tuple[SchedulingViolation, ...],
         request_id: str,
+        request_started_at: datetime,
     ) -> SchedulingAttemptResult: ...
 
 
@@ -405,8 +413,9 @@ class LocalModel:
         source: SchedulingSource,
         feedback: tuple[SchedulingViolation, ...],
         request_id: str,
+        request_started_at: datetime,
     ) -> SchedulingAttemptResult:
-        del request_id
+        del request_id, request_started_at
         content = self._completion(
             system_prompt=SCHEDULING_SYSTEM_PROMPT,
             user_prompt=scheduling_prompt(source, feedback),
@@ -685,6 +694,7 @@ class GatewayModel:
         request_id = request_id or str(uuid.uuid4())
         content = self._inference(
             request_id=request_id,
+            request_expires_at=self._request_expires_at(current_local_time),
             system_prompt=SYSTEM_PROMPT,
             user_prompt=_email_prompt(
                 sender=bounded_gateway_text(sender, MAX_GATEWAY_SENDER_CHARS),
@@ -697,20 +707,44 @@ class GatewayModel:
             schema=Analysis.model_json_schema(),
             max_output_tokens=500,
         )
-        return validate_analysis(_json_object(content), received_at)
+        try:
+            return validate_analysis(_json_object(content), received_at)
+        except ModelError as exc:
+            raise GatewayOutputRejected(request_id) from exc
+
+    @staticmethod
+    def _request_expires_at(reserved_at: datetime) -> str:
+        if reserved_at.tzinfo is None:
+            raise ModelError("Inference gateway reservation time must include a time zone")
+        expires_at = reserved_at.astimezone(UTC).replace(microsecond=0) + timedelta(
+            seconds=GATEWAY_REQUEST_LIFETIME_SECONDS
+        )
+        return expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _validate_request_id(request_id: str) -> None:
+        try:
+            parsed = uuid.UUID(request_id)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ModelError("Inference gateway request identity is invalid") from exc
+        if parsed.version != 4 or str(parsed) != request_id:
+            raise ModelError("Inference gateway request identity is invalid")
 
     def _inference(
         self,
         *,
         request_id: str,
+        request_expires_at: str,
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, object],
         max_output_tokens: int,
     ) -> str:
+        self._validate_request_id(request_id)
         payload = {
             "protocol_version": 1,
             "request_id": request_id,
+            "request_expires_at": request_expires_at,
             "task": {"id": self.task_id, "version": self.task_version},
             "requirements": {
                 "input_modalities": ["text"],
@@ -740,15 +774,37 @@ class GatewayModel:
             raise GatewayModelError("invalid_success_envelope", retryable=False)
         return output["content"]
 
+    def acknowledge(
+        self,
+        request_id: str,
+        disposition: Literal["persisted", "application_rejected"],
+    ) -> None:
+        self._validate_request_id(request_id)
+        payload = {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "disposition": disposition,
+        }
+        response = self._request("POST", f"/v1/inference/{request_id}/ack", payload)
+        if (
+            not self._matches_version(response.get("protocol_version"), 1)
+            or response.get("request_id") != request_id
+            or response.get("status") != "acknowledged"
+            or response.get("disposition") != disposition
+        ):
+            raise GatewayModelError("invalid_acknowledgement_envelope", retryable=False)
+
     def extract_scheduling(
         self,
         *,
         source: SchedulingSource,
         feedback: tuple[SchedulingViolation, ...],
         request_id: str,
+        request_started_at: datetime,
     ) -> SchedulingAttemptResult:
         content = self._inference(
             request_id=request_id,
+            request_expires_at=self._request_expires_at(request_started_at),
             system_prompt=SCHEDULING_SYSTEM_PROMPT,
             user_prompt=scheduling_prompt(source, feedback),
             schema=SchedulingExtraction.model_json_schema(),

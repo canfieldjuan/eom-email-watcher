@@ -372,9 +372,10 @@ Minimum classes:
 Application validation happens after the gateway returns a valid envelope. If the application
 rejects that output, it durably marks the original request terminally rejected and acknowledges
 receipt so the gateway can delete the buffered result. It must not automatically resubmit that
-identity and receive the same retained output forever. Email Watcher's current generic `ModelError`
-path retries such failures, so gateway cutover is blocked until the client maps this case to the
-terminal rejection plus explicit requeue behavior.
+identity and receive the same retained output forever. Email Watcher's ordinary analysis path maps
+this case to terminal rejection plus explicit requeue behavior. Its nested scheduling-extraction
+schema remains outside the gateway's initial bounded schema subset and requires a separate contract
+slice before that automation can use the gateway.
 
 v0 scheduling is a bounded fair queue across client credentials, with per-credential in-flight and
 queued limits. It must prevent one document workload from starving small email tasks. Exact queue

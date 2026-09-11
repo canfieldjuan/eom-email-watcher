@@ -35,7 +35,8 @@ inference request.
 ## Requirements
 
 - Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
-- LM Studio `llmster` with its API bound to `127.0.0.1`
+- An administrator-managed on-prem inference gateway, or LM Studio `llmster` with its API bound to
+  `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
 - A Gmail/Google Workspace account with a Google Desktop OAuth client, or a Microsoft 365 work or
   school account with an Entra public desktop-client registration
@@ -52,8 +53,20 @@ chmod 700 ~/.config/eom-email-watcher ~/.local/state/eom-email-watcher
 chmod 600 ~/.config/eom-email-watcher/config.toml
 ```
 
-Edit the private config with the real exact sender list and the LM Studio model identifier. Never
-commit that config; the repository example intentionally contains placeholders.
+Edit the private config with the real exact sender list and one of the inference configurations
+below. Never commit that config; the repository example intentionally contains placeholders.
+
+### Secure shared inference gateway
+
+For an administrator-managed gateway, set `model_backend = "gateway"`, use its private-LAN HTTPS
+URL, and install the administrator-provided application credential and CA certificate at the paths
+named by `model_api_token_file` and `model_ca_file`. The credential file must be owner-only; the CA
+file must not be group/world-writable. Do not put the credential value in TOML.
+
+Gateway mode sends only the same bounded text inference request used by the local watcher. The
+application does not select a worker or model, and mailbox credentials, raw message storage, and
+Local Connect tokens remain outside the inference boundary. Use the desktop Health view to confirm
+that `email.analyze` is available before enabling normal polling.
 
 ### Secure LM Studio
 
