@@ -527,7 +527,9 @@ user input and never as code. Version 1:
 Rule
   rule_id          uuid4, engine-assigned
   name             1..80 characters, untrusted display text
-  enabled          boolean
+  enabled          boolean; recorded on every version row (below), so the
+                   enabled state in effect at a revision is history, not a
+                   mutable flag
   system           boolean; true only for the seeded scheduling rule
   version          integer >= 1; incremented on every accepted edit
   scope            { provider?: identifier, account_id?: string(<=128) }
@@ -545,9 +547,13 @@ Rule
   created_at, updated_at   UTC
 ```
 
-Each accepted edit produces a new immutable row in `automation_rule_versions`
-(`rule_id`, `version`, the full definition, `accepted_at` UTC for display,
-and `revision`). `revision` is a database-assigned monotonic integer: a
+Each accepted edit, **and each enable or disable**, produces a new
+immutable row in `automation_rule_versions` (`rule_id`, `version`, the
+full definition, `enabled`, `accepted_at` UTC for display, and
+`revision`). An enable or disable row repeats the previous definition
+bytes with the flag changed; it is a version like any other, so whether a
+rule was enabled at a given revision is decided by the version in effect
+at that revision and never by a mutable current flag. `revision` is a database-assigned monotonic integer: a
 single-row `automation_rule_set(revision)` counter incremented inside the
 same `BEGIN IMMEDIATE` transaction as every rule write, so two rule writes
 can never share a revision and a revision can never move backwards under a
@@ -741,10 +747,14 @@ with no path back. Instead:
   ready, the next matching message fires normally. No message is re-fired
   retroactively (section 5.1).
 - `enabled` is owned by the person. A person may disable the seeded rule;
-  the engine records `disabled_by_person_at` and never re-enables it, not
-  on migration, not on an account or grant transition, not on upgrade.
-  A person may re-enable it. They may not delete it or change its
-  conditions in version 1.
+  that writes a disabled version at a fresh revision, and the engine never
+  writes an enabled version on its own, not on migration, not on an
+  account or grant transition, not on upgrade. A person may re-enable it,
+  which writes an enabled version. Because enablement is a version, a
+  message analysed while the rule was enabled still fires it if evaluation
+  catches up after a disable, exactly as with deletion (4.1): the person's
+  switch takes effect for messages analysed at or after it. They may not
+  delete it or change its conditions in version 1.
 - Everything the current code does after admission is unchanged, because
   the action **is** the current admission. What moves is only the predicate
   (`service.py:1354`) and the constant automation identity (`db.py:30-31`),
@@ -1271,12 +1281,17 @@ retired_revision > r)`, and its result is at most 100 rows because the
 100-rule cap held at every past revision, tombstones included at the time.
 The rows the query must examine are those versions plus every version
 written after `r` (an index on `retired_revision` makes the retired-before-`r`
-majority unreachable), so the cost per revision is bounded by 100 plus the
-number of rule writes since that candidate's analysis, which is small
-because evaluation runs every pass and never by the size of the deleted or
-edited history before `r`. Rules the person has disabled are excluded by
-their current flag, which is the person's own stop switch (4.6); deletion
-is a version and does not flip that flag. A chunk spanning revisions 1 and
+majority unreachable). The number of writes since a candidate's analysis
+is not bounded by design, so the statement is bounded by time instead:
+every statement the evaluate phase runs is registered with SQLite's
+progress handler, which aborts the statement when the phase deadline has
+passed; an aborted snapshot or candidate transaction rolls back, the
+candidate keeps its null marker, and the next pass, whose deadline is
+fresh, evaluates it first. I7 exercises this with a history of writes
+larger than the budget. Compacting retired versions that no unevaluated
+message can still need is deferred (section 9). A rule is excluded at `r` only when the version
+in effect at `r` is a disabled one; enabling and disabling are version
+rows (4.1), so there is no current flag and no exception to the formula. A chunk spanning revisions 1 and
 1,000,000 therefore examines the versions active at each of the two, plus
 the writes since, never the million between. The deadline is checked before each chunk read and before each
 candidate's transaction begins; when it is exhausted the phase stops, and
@@ -1693,12 +1708,12 @@ proves it does not.
 | # | Never | Settling evidence |
 |---|---|---|
 | I1 | A rule fires twice on one message and artifact, or the database admits a duplicate fire row. | Unique index on `(event_id, rule_id, rule_version, artifact_key)` with `artifact_key NOT NULL` (section 5.3). Database-level: a direct second insert of a `calendar.propose` fire and of a `notify` fire for the same `(event, rule, version)` fails on the sentinel key; a direct second insert of a `connect.invoke` fire for the same artifact fails; an insert with a NULL key fails; a control insert for a distinct valid artifact of the same message succeeds. Engine-level: the same message evaluated in two passes and after a crash injected between evaluation commit and dispatch yields one fire per key. |
-| I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
+| I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. Disable then evaluate: a rule enabled at analysis, disabled before evaluation; assert the version in effect at the captured revision fires; a message analysed after the disable does not; re-enabling writes a version and applies only to later analyses. |
 | I3 | A candidate batch is authorized, or an automation job is newly POSTed, without both features active at its authorization boundary. | Matrix over (none, exchange only, automations only, both) times each action kind: only both authorizes a candidate batch. With a simulated clock, authorize at expires_at minus one second and reject at expires_at. Two messages in one phase with expiry between their checks: first batch commits; second records locked, including notify. Expiry after a batch's check but before its database-only commit does not revoke that batch (6.6); no blocking provider work is allowed there. Licence pause: a pending_dispatch fire observed authorized at T0, the licence expiring at T0 plus one minute, no pass until T0 plus 30 hours (step 1 fails), a new licence installed and observed at T0 plus 31 hours; assert authorized_pending_seconds is zero, the fire is still pending_dispatch (not stalled) and dispatches on that pass; the same sequence with the original licence re-installed (same entitlement id) counts the gap; a candidate evaluated locked during the gap never fires. Admit an automation job with both keys, revoke Automate before a later pump in a separate desktop/timer process: zero POSTs, CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED, one failure intent; an exchange-authorized click job still POSTs. Mixed authority: automation creates a waiting job, a real validated click joins the same job_id, then Automate expires; exchange plus the persisted interactive receipt permits one POST. Control: fire-only joins do not create interactive authority and fail after Automate expiry. Exchange loss blocks both. Repeat a click-origin job joined by a fire. Receipt identity/effects mismatches cannot authorize. |
 | I4 | A capability bypasses required confirmation, or a waiting fire lacks a verified source identity. | Cross confirm_each true/false with effects (neither, external only, confirmation_required only, both). Every case fetches and hashes before step 3a; only the false/neither case proceeds without waiting. Other cases persist a confirmable item with the real artifact digest. Stale confirmation hash is refused; valid confirmation resumes. Before redispatch, change same-sized bytes, provider version, instance or effect flags: source drift is source_unavailable; provider identity drift is provider_changed; a removed effects flag never skips comparison to the saved receipt. Transient fetch failure leaves pending_dispatch without a waiting item or job; definitive missing source closes it. Non-Connect confirm_each is rejected at save. A person confirms after more than 24 hours while the source is still retained: pending_since resets and dispatch succeeds if otherwise eligible. At pending_since + 24 hours, continuous provider absence stalls; an ordinary retry before that boundary never resets the clock. Repeat pending-clock reset for attempt 2; expired source remains source_unavailable despite confirmation. Effect drift after enqueue: hold a no-effects job waiting, change either manifest flag without changing app/version/instance, and pump in a separate process. Assert CONNECT_EFFECTS_CHANGED and zero POSTs; matching flags/receipt authorize normally. Repeat after GET returns JOB_NOT_FOUND. Missing legacy policy metadata cannot authorize a new POST; fresh validated click replay may attach it to the same active job; GET-only recovery remains allowed. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
-| I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. Evaluation work: 100 rules each with 200 versions and 500 unevaluated candidates under a simulated clock that advances per candidate; assert the phase returns at the deadline, the chunk snapshot query touched at most one version per rule per captured revision, every candidate whose transaction had not begun still has a null `rules_evaluated_version`, and the next pass evaluates them first. Validation: the 101st rule is rejected. The pre-existing mail phases are outside this invariant by section 6.2. |
+| I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. Evaluation work: 100 rules each with 200 versions and 500 unevaluated candidates under a simulated clock that advances per candidate; assert the phase returns at the deadline, the chunk snapshot query touched at most one version per rule per captured revision, every candidate whose transaction had not begun still has a null `rules_evaluated_version`, and the next pass evaluates them first. Validation: the 101st rule is rejected. The pre-existing mail phases are outside this invariant by section 6.2. Progress-handler abort: 100,000 rule writes after a candidate's analysis under a simulated clock that expires mid-query; assert the snapshot statement aborts, the candidate keeps its null marker, nothing is written, and the next pass evaluates it. |
 | I8 | Discovery chooses an instance by filtering away a conflicting instance, or confuses an absent capability with an absent app. | Two app instances both offering the pinned capability, and two where only one offers it: ambiguous_provider in both, no job. One instance with multiple capabilities counts once. One instance offering only other capabilities: capability_unavailable; no instance of the app: pending_dispatch. A changed unique instance after confirmation: provider_changed, no job. Exercise catalog discovery with real manifest fixtures, not a synthetic persisted job. |
 | I9 | An invalid rule is partially applied or evaluated. | Every rejection in section 4.4 has a test asserting the write returns an error, the prior version is unchanged, and a corrupted stored definition loads as `invalid` and is skipped without failing the pass. Both error directions: a rule with exactly eight conditions saves; nine does not; a 16-key parameters object saves; 17 does not. |
 | I10 | Provider output text leaves the machine in a notification. | Test captures the ntfy payload of the `automation_complete` intent for a completed `connect.invoke` fire whose output carries withheld fields, and asserts it contains rule name, sender label, subject, the word "completed", and no substring of the job's output; with the phone topic unset, asserts no network call and a desktop-only delivery. |
@@ -1799,6 +1814,10 @@ matching string literals across repos:
   evaluation and would make evaluation depend on mailbox availability;
   breaks section 5.3's pure-function property. Revisit with a stored,
   bounded, retention-purged body digest if a real rule needs it.
+- **Compaction of retired rule versions.** A version retired at revision x
+  could be removed once no message with a captured revision below x is
+  still unevaluated; deferred because the progress-handler bound makes it
+  a space concern, not a correctness one.
 - **Retroactive firing on rule creation or edit.** Product decision: a new
   rule silently sending every retained PDF to a provider is the kind of
   surprise the brief promises not to cause. Offer as an explicit
@@ -2070,3 +2089,12 @@ matching string literals across repos:
   a fire intent and the decide operation share the host operation lock,
   which is what makes "never sent" true); I15 (retention exception
   includes `dispatching`); I12 (the lock-based supersession test).
+
+- **r15 (2026-09-11 UTC).** After two Codex threads on `b9c7259`, both on
+  r14's snapshot paragraph. Enabling and disabling are now version rows
+  (4.1, 4.6), so applicability is revision-only with no current-flag
+  exception and a disable behaves like a deletion for messages analysed
+  before it. Every evaluate-phase statement is bounded by SQLite's
+  progress handler at the phase deadline (6.2), replacing the claim that
+  writes since analysis are "usually small"; history compaction is
+  deferred (9). I2 and I7 gain the corresponding cases.
