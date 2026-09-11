@@ -301,8 +301,9 @@ def test_reasoning_field_used_when_content_empty(tmp_path: Path, monkeypatch) ->
 
         def json(self) -> dict:
             return {"choices": [{"message": {"content": "", "reasoning": (
-                '{"category":"invoice","priority":"normal","summary":"An invoice is due.",'
-                '"action_required":true,"suggested_action":"Pay it","deadline_text":null,'
+                '{"category":"invoice","priority":"normal",'
+                '"summary":"An invoice is due.","action_required":true,'
+                '"suggested_action":"Pay it","deadline_text":null,'
                 '"deadline_iso":null,"confidence":0.9}')}}]}
 
     monkeypatch.setattr("eom_email_watcher.model.httpx.post", lambda *a, **k: FakeResp())
@@ -344,6 +345,7 @@ def test_local_model_uses_strict_scheduling_schema_and_feedback(
         source=scheduling_source(),
         feedback=(SchedulingViolation("time_naive", "proposed_times.0"),),
         request_id="reserved-request-id",
+        request_started_at=datetime(2026, 9, 7, 9, 0, tzinfo=UTC),
     )
 
     assert result.accepted is True

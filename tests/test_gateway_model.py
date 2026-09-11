@@ -9,7 +9,12 @@ import pytest
 
 from eom_email_watcher import engine_api
 from eom_email_watcher import model as model_module
-from eom_email_watcher.model import GatewayModel, GatewayModelError, ModelError
+from eom_email_watcher.model import (
+    GatewayModel,
+    GatewayModelError,
+    GatewayOutputRejected,
+    ModelError,
+)
 from eom_email_watcher.runtime import load_runtime
 from eom_email_watcher.scheduling import SchedulingSource, SchedulingViolation
 
@@ -80,6 +85,8 @@ def gateway_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     handler,
+    *,
+    clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
 ) -> tuple[GatewayModel, list[str]]:
     token_file = tmp_path / "gateway-token"
     token_file.write_text("app-credential\n", encoding="utf-8")
@@ -101,6 +108,7 @@ def gateway_model(
         token_file,
         ca_file,
         transport=httpx.MockTransport(handler),
+        clock=clock,
     )
     return model, requested_ca_files
 
@@ -124,14 +132,21 @@ gmail_token_file = "{tmp_path / "token.json"}"
     return config_path
 
 
-def analyze(model: GatewayModel, body: str = "Please move the appointment."):
+def analyze(
+    model: GatewayModel,
+    body: str = "Please move the appointment.",
+    *,
+    request_id: str | None = None,
+    current_local_time: datetime | None = None,
+):
     return model.analyze(
         sender="trusted@example.com",
         subject="Schedule",
         received_at="2026-08-29T12:00:00+00:00",
         body=body,
         attachment_names=(),
-        current_local_time=datetime(2026, 8, 29, tzinfo=UTC),
+        current_local_time=current_local_time or datetime(2026, 8, 29, tzinfo=UTC),
+        request_id=request_id,
     )
 
 
@@ -186,6 +201,7 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
         payload = json.loads(request.content)
         assert request.url.path == "/v1/inference"
         assert payload["task"] == {"id": "email.analyze", "version": 1}
+        assert payload["request_expires_at"] == "2026-08-29T00:10:00Z"
         assert payload["requirements"]["input_modalities"] == ["text"]
         assert "model" not in payload
         assert "worker" not in payload
@@ -210,6 +226,194 @@ def test_gateway_health_and_analysis_use_scoped_model_free_contract(
         "test trust root",
         "test trust root",
     ]
+
+
+def test_gateway_retry_reuses_request_identity_and_immutable_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+    request_id = "11111111-1111-4111-8111-111111111111"
+    reserved_at = datetime(2026, 9, 11, 10, 0, 0, 999999, tzinfo=UTC)
+
+    analyze(model, request_id=request_id, current_local_time=reserved_at)
+    analyze(model, request_id=request_id, current_local_time=reserved_at)
+
+    assert [request["request_id"] for request in requests] == [request_id, request_id]
+    assert [request["request_expires_at"] for request in requests] == [
+        "2026-09-11T10:10:00Z",
+        "2026-09-11T10:10:00Z",
+    ]
+
+
+def test_gateway_expiry_boundary_blocks_transport_and_requires_requeue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[httpx.Request] = []
+    observed_at = [datetime(2026, 9, 11, 10, 9, 59, 999999, tzinfo=UTC)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "completed",
+                "output": {"media_type": "application/json", "content": analysis_json()},
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        handler,
+        clock=lambda: observed_at[0],
+    )
+    reserved_at = datetime(2026, 9, 11, 10, 0, tzinfo=UTC)
+
+    analyze(model, current_local_time=reserved_at)
+    observed_at[0] = datetime(2026, 9, 11, 10, 10, tzinfo=UTC)
+    with pytest.raises(GatewayModelError) as captured:
+        analyze(model, current_local_time=reserved_at)
+
+    assert captured.value.code == "request_expired"
+    assert captured.value.retryable is False
+    assert len(requests) == 1
+
+
+def test_gateway_expired_scheduling_request_never_reaches_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: pytest.fail("expired scheduling request reached transport"),
+        clock=lambda: datetime(2026, 9, 7, 10, 10, tzinfo=UTC),
+    )
+
+    with pytest.raises(GatewayModelError) as captured:
+        model.extract_scheduling(
+            source=scheduling_source(),
+            feedback=(),
+            request_id="11111111-1111-4111-8111-111111111111",
+            request_started_at=datetime(2026, 9, 7, 10, 0, tzinfo=UTC),
+        )
+
+    assert captured.value.code == "request_expired"
+    assert captured.value.retryable is False
+
+
+def test_gateway_request_expiry_rejects_naive_reservation_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: pytest.fail("naive reservation reached transport"),
+    )
+
+    with pytest.raises(ModelError, match="must include a time zone"):
+        analyze(model, current_local_time=datetime(2026, 9, 11, 10, 0))
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "../health/live",
+        "33333333-3333-4333-8333-333333333333/extra",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        "11111111-1111-1111-8111-111111111111",
+    ],
+)
+def test_gateway_rejects_noncanonical_request_identity_before_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_id: str,
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: pytest.fail("invalid request identity reached transport"),
+    )
+
+    with pytest.raises(ModelError, match="request identity is invalid"):
+        model.acknowledge(request_id, "persisted")
+
+
+def test_gateway_acknowledges_only_the_matching_result_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append((request.url.path, payload))
+        return httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": payload["request_id"],
+                "status": "acknowledged",
+                "disposition": payload["disposition"],
+            },
+        )
+
+    model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
+    request_id = "33333333-3333-4333-8333-333333333333"
+
+    model.acknowledge(request_id, "persisted")
+
+    assert requests == [
+        (
+            f"/v1/inference/{request_id}/ack",
+            {
+                "protocol_version": 1,
+                "request_id": request_id,
+                "disposition": "persisted",
+            },
+        )
+    ]
+
+
+def test_gateway_rejects_mismatched_acknowledgement_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "44444444-4444-4444-8444-444444444444"
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "protocol_version": 1,
+                "request_id": request_id,
+                "status": "acknowledged",
+                "disposition": "application_rejected",
+            },
+        ),
+    )
+
+    with pytest.raises(GatewayModelError) as captured:
+        model.acknowledge(request_id, "persisted")
+
+    assert captured.value.code == "invalid_acknowledgement_envelope"
+    assert captured.value.retryable is False
 
 
 def test_gateway_scheduling_extraction_reuses_versioned_email_task_and_request_id(
@@ -238,11 +442,13 @@ def test_gateway_scheduling_extraction_reuses_versioned_email_task_and_request_i
     result = model.extract_scheduling(
         source=scheduling_source(),
         feedback=(SchedulingViolation("time_naive", "proposed_times.0"),),
-        request_id="stable-extraction-request",
+        request_id="22222222-2222-4222-8222-222222222222",
+        request_started_at=datetime(2026, 9, 7, 10, 0, 0, 999999, tzinfo=UTC),
     )
 
     assert result.accepted is True
-    assert requests[0]["request_id"] == "stable-extraction-request"
+    assert requests[0]["request_id"] == "22222222-2222-4222-8222-222222222222"
+    assert requests[0]["request_expires_at"] == "2026-09-07T10:10:00Z"
     assert requests[0]["task"] == {"id": "email.analyze", "version": 1}
     assert requests[0]["requirements"]["max_output_tokens"] == 1_500
     assert "time_naive" in requests[0]["generation"]["messages"][1]["content"]
@@ -704,8 +910,9 @@ def test_gateway_converts_deeply_nested_output_content_to_model_error(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="returned invalid JSON"):
+    with pytest.raises(GatewayOutputRejected) as captured:
         analyze(model)
+    assert captured.value.code == "application_output_rejected"
 
 
 def test_gateway_converts_oversized_json_integers_to_model_error(
@@ -737,8 +944,9 @@ def test_gateway_converts_oversized_json_integers_to_model_error(
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
     assert model.health() == (False, "Inference gateway returned invalid JSON")
-    with pytest.raises(ModelError, match="returned invalid JSON"):
+    with pytest.raises(GatewayOutputRejected) as captured:
         analyze(model)
+    assert captured.value.code == "application_output_rejected"
 
 
 def test_gateway_rejects_lone_unicode_surrogate_in_analysis(
@@ -761,8 +969,9 @@ def test_gateway_rejects_lone_unicode_surrogate_in_analysis(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="required schema"):
+    with pytest.raises(GatewayOutputRejected) as captured:
         analyze(model)
+    assert captured.value.code == "application_output_rejected"
 
 
 @pytest.mark.parametrize("field", ["summary", "suggested_action"])
@@ -786,14 +995,21 @@ def test_gateway_rejects_nul_in_notification_text(
 
     model, _requested_ca_files = gateway_model(tmp_path, monkeypatch, handler)
 
-    with pytest.raises(ModelError, match="unsupported control characters"):
+    with pytest.raises(GatewayOutputRejected) as captured:
         analyze(model)
+    assert captured.value.code == "application_output_rejected"
 
 
 def test_gateway_missing_credential_and_trust_root_fail_closed(tmp_path: Path) -> None:
     token_file = tmp_path / "gateway-token"
     ca_file = tmp_path / "gateway-ca.pem"
-    model = GatewayModel("https://inference.office.internal", 30, token_file, ca_file)
+    model = GatewayModel(
+        "https://inference.office.internal",
+        30,
+        token_file,
+        ca_file,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
 
     with pytest.raises(ModelError, match="credential is unavailable"):
         analyze(model, "short")

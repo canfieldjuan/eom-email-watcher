@@ -38,7 +38,9 @@ from eom_email_watcher.model import (
     MAX_GATEWAY_ATTACHMENT_COUNT,
     MAX_GATEWAY_ATTACHMENT_NAME_CHARS,
     Analysis,
+    GatewayModel,
     GatewayModelError,
+    GatewayOutputRejected,
     ModelError,
 )
 from eom_email_watcher.notifications import NotificationError
@@ -233,7 +235,9 @@ class ExtractionModel(FakeModel):
         source: SchedulingSource,
         feedback,
         request_id: str,
+        request_started_at: datetime,
     ):
+        assert request_started_at.tzinfo is not None
         self.extraction_sources.append(source)
         self.extraction_calls.append((request_id, tuple(violation.code for violation in feedback)))
         output = self.outputs.pop(0)
@@ -2755,6 +2759,44 @@ class GatewayRetryModel(FakeModel):
         )
 
 
+class GatewayLifecycleModel(GatewayModel):
+    def __init__(
+        self,
+        store: Store,
+        *,
+        reject_output: bool = False,
+        fail_acknowledgement: bool = False,
+    ):
+        self.store = store
+        self.reject_output = reject_output
+        self.fail_acknowledgement = fail_acknowledgement
+        self.calls = 0
+        self.acknowledgements: list[tuple[str, str, object]] = []
+
+    def analyze(self, **kwargs) -> Analysis:
+        self.calls += 1
+        request_id = kwargs["request_id"]
+        assert isinstance(request_id, str)
+        if self.reject_output:
+            raise GatewayOutputRejected(request_id)
+        return Analysis(
+            category="informational",
+            priority="normal",
+            summary="A short update.",
+            action_required=False,
+            suggested_action=None,
+            deadline_text=None,
+            deadline_iso=None,
+            confidence=0.9,
+        )
+
+    def acknowledge(self, request_id, disposition) -> None:
+        row = self.store.recent(1)[0]
+        self.acknowledgements.append((request_id, disposition, row["status"]))
+        if self.fail_acknowledgement:
+            raise GatewayModelError("transport_error", retryable=True)
+
+
 def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
@@ -2773,6 +2815,59 @@ def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
     assert retry_watcher.check()["summarized"] == 1
     assert model.requests[0] == model.requests[1]
     assert store.recent(1)[0]["status"] == "summarized"
+
+
+def test_gateway_result_is_persisted_before_acknowledgement(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = GatewayLifecycleModel(store)
+
+    result = Watcher(cfg, store, FakeGmail(), model).check()
+
+    assert result["summarized"] == 1
+    assert model.acknowledgements == [(model.acknowledgements[0][0], "persisted", "analyzed")]
+    assert store.recent(1)[0]["status"] == "summarized"
+
+
+def test_gateway_output_rejection_is_durable_before_acknowledgement(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = GatewayLifecycleModel(store, reject_output=True)
+    watcher = Watcher(cfg, store, FakeGmail(), model)
+
+    assert watcher.check()["summarized"] == 0
+
+    failed = store.recent(1)[0]
+    assert failed["analysis_retryable"] == 0
+    assert failed["analysis_error_code"] == "application_output_rejected"
+    assert model.acknowledgements == [
+        (model.acknowledgements[0][0], "application_rejected", "pending")
+    ]
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 1
+
+
+def test_gateway_acknowledgement_failure_does_not_rerun_inference(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    model = GatewayLifecycleModel(store, fail_acknowledgement=True)
+    watcher = Watcher(cfg, store, FakeGmail(), model)
+
+    assert watcher.check()["summarized"] == 1
+    assert store.recent(1)[0]["status"] == "summarized"
+    assert "result acknowledgement failed" in caplog.text
+
+    assert watcher.check()["summarized"] == 0
+    assert model.calls == 1
+    assert len(model.acknowledgements) == 1
 
 
 def test_gateway_permanent_failure_waits_for_explicit_requeue(tmp_path: Path) -> None:

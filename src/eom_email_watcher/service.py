@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from .config import Config, normalize_validated_address
 from .db import (
@@ -58,7 +59,9 @@ from .model import (
     MAX_GATEWAY_SENDER_CHARS,
     MAX_GATEWAY_SUBJECT_CHARS,
     Analysis,
+    GatewayModel,
     GatewayModelError,
+    GatewayOutputRejected,
     ModelError,
     ModelRuntime,
     bounded_gateway_attachment_names,
@@ -79,6 +82,19 @@ from .scheduling import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _acknowledge_gateway_result(
+    model: ModelRuntime,
+    request_id: str,
+    disposition: Literal["persisted", "application_rejected"],
+) -> None:
+    if not isinstance(model, GatewayModel):
+        return
+    try:
+        model.acknowledge(request_id, disposition)
+    except ModelError as exc:
+        logger.warning("Inference gateway result acknowledgement failed: %s", exc)
 
 
 @dataclass(frozen=True)
@@ -454,6 +470,7 @@ def process_scheduling_automations(
                         source=source,
                         feedback=feedback,
                         request_id=reservation.request_id,
+                        request_started_at=datetime.fromisoformat(reservation.created_at),
                     )
                 except GatewayModelError as exc:
                     logger.warning("Scheduling run %s extraction unavailable: %s", run.run_id, exc)
@@ -500,6 +517,11 @@ def process_scheduling_automations(
                     ],
                     accepted_state=accepted_state,
                     accepted_code=accepted_code,
+                )
+                _acknowledge_gateway_result(
+                    model,
+                    reservation.request_id,
+                    "persisted" if result.accepted else "application_rejected",
                 )
                 if current.state == "extracting":
                     continue
@@ -1359,6 +1381,8 @@ class Watcher:
                         analysis.model_dump(),
                         scheduling_automation_principal_key=scheduling_principal_key,
                     )
+                    assert request_id is not None
+                    _acknowledge_gateway_result(self.model, request_id, "persisted")
                 summarized += 1
                 if deliver_notifications:
                     fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
@@ -1384,6 +1408,23 @@ class Watcher:
                         message.attempts,
                         retryable=False,
                         error_code=exc.code,
+                    )
+            except GatewayOutputRejected as exc:
+                logger.warning("Message %s summary was rejected: %s", message.message_id, exc)
+                if deliver_notifications:
+                    fallback += self._send_fallback(message, dry_run)
+                if not dry_run:
+                    self.store.record_analysis_failure(
+                        message.message_id,
+                        str(exc),
+                        message.attempts,
+                        retryable=False,
+                        error_code=exc.code,
+                    )
+                    _acknowledge_gateway_result(
+                        self.model,
+                        exc.request_id,
+                        "application_rejected",
                     )
             except GatewayModelError as exc:
                 logger.warning("Message %s summary unavailable: %s", message.message_id, exc)
