@@ -949,12 +949,12 @@ machine; prose elsewhere refers to it.
 | `matched` | `not_admitted` | `calendar.propose` readiness refused (4.6) | evaluation transaction |
 | `matched` | `submitted` (run) | `calendar.propose` run admitted, `run_id` linked | evaluation transaction |
 | `matched` | `completed` | `notify`; its intent written alongside | evaluation transaction |
-| `matched` | `pending_dispatch` | `connect.invoke`, always, `confirm_each` or not | evaluation transaction |
+| `matched` | `pending_dispatch` | `connect.invoke`, always, `confirm_each` or not; initialize `pending_since` | evaluation transaction |
 | `pending_dispatch` | `awaiting_confirmation` | manifest effects or `confirm_each`; verified source identity and `item_sha256` persisted | dispatch step 3a |
-| `awaiting_confirmation` | `pending_dispatch` | person confirmed that hash; `confirmed = true` | decide operation |
+| `awaiting_confirmation` | `pending_dispatch` | person confirmed that hash; `confirmed = true`, reset `pending_since` | decide operation |
 | `awaiting_confirmation` | `declined` | person declined | decide operation |
 | `pending_dispatch` | `ambiguous_provider` | two or more validated instances of the pinned app, before capability filtering | dispatch step 2 |
-| `pending_dispatch` | `manual_review` | `unsupported_attachment`, `parameters_invalid`, `capability_unavailable`, `provider_changed`, or `stalled` (24 h without a current job) | dispatch steps 2, 3, 3a |
+| `pending_dispatch` | `manual_review` | `unsupported_attachment`, `parameters_invalid`, `capability_unavailable`, `provider_changed`, or `stalled` (24 h in the current pending interval) | dispatch steps 2, 3, 3a |
 | `pending_dispatch` | `submitted` (job) | `job_id` linked, created or joined by the single admission decision | dispatch step 4, admission transaction |
 | `pending_dispatch` or `awaiting_confirmation` | `source_unavailable` | definitive missing/changed source in preparation, or source removed by cleanup | dispatch step 3, cleanup transaction |
 | `submitted` | `completed` | retained linked job `completed`, or linked run `completed` | settlement |
@@ -1037,7 +1037,8 @@ admission records a write-once `job_id` binding for that attempt, including
 when it joins a click's job. Only the first-attempt deadline row opens
 attempt 2: in the same CAS transaction, retain attempt 1's binding for
 audit, create the fresh attempt identity, set the fire's current attempt
-to 2, clear its current `job_id`, and set `pending_dispatch`. Repeated
+to 2, clear its current `job_id`, and set `pending_dispatch` with a fresh
+`pending_since`. Repeated
 settlement cannot open another attempt. Preparation and admission then
 run normally; attempt 2 may join eligible active/completed work that
 appeared meanwhile, or create if only failed history remains. The second
@@ -1102,7 +1103,7 @@ the **phase deadline** (below):
 
    | Discovery outcome | Fire |
    |---|---|
-   | no instance of the app | stays `pending_dispatch`; `stalled` to `manual_review` after 24 h from `matched` |
+   | no instance of the app | stays `pending_dispatch`; `stalled` to `manual_review` after 24 h from `pending_since` |
    | two or more instances of the app | `ambiguous_provider` (`adr/0001:110-112`) |
    | instance present, capability id or version absent from its live manifest (`capability_unavailable`) | `manual_review` (`capability_unavailable`), notify, no retry; a rule edit produces a new version for later messages |
    | one instance, capability present | continue |
@@ -1237,10 +1238,18 @@ reconciled by the next pump, GET-before-POST by construction
 `PROVIDER_BUSY` during the pass, which can only come from a user click that
 won the lane in between, is handled by the existing deferral
 (`engine_api.py:2526-2540`); the pump walks the backoff schedule.
-Provider absence for a fire that has **not** yet produced a job is a
-pass-level retry with no Connect state; a fire that has been
-`pending_dispatch` for 24 hours from `matched`, for any reason, halts in
-`manual_review` (`stalled`) and notifies.
+An unbound fire retries transient dispatch obstacles on later passes.
+Its stall clock is the persisted `pending_since` of its **current**
+`pending_dispatch` interval, not its original match time. Initialize that
+clock when evaluation first enters `pending_dispatch`; reset it in the
+same transaction when a person confirms a waiting item or settlement opens
+attempt 2. Retries while already pending (provider absence, temporary
+fetch failure, lock contention, full queue or inactive licence) do not
+reset it. After 24 hours continuously pending without admission, transition
+to `manual_review` (`stalled`). Time spent in `awaiting_confirmation` or
+`submitted` does not consume a later pending interval. Confirmation does
+not extend source retention or permit changed bytes: source preparation
+and the saved receipt must still pass before admission.
 
 ### 6.3 One dispatch design for both hosts
 
@@ -1530,7 +1539,7 @@ proves it does not.
 | I1 | A rule fires twice on one message and artifact, or the database admits a duplicate fire row. | Unique index on `(event_id, rule_id, rule_version, artifact_key)` with `artifact_key NOT NULL` (section 5.3). Database-level: a direct second insert of a `calendar.propose` fire and of a `notify` fire for the same `(event, rule, version)` fails on the sentinel key; a direct second insert of a `connect.invoke` fire for the same artifact fails; an insert with a NULL key fails; a control insert for a distinct valid artifact of the same message succeeds. Engine-level: the same message evaluated in two passes and after a crash injected between evaluation commit and dispatch yields one fire per key. |
 | I2 | A rule version applies to a message outside its `[revision, retired_revision)` window, or an eligible earlier version is lost. | Test creates a rule after analysis, runs a pass, asserts no fire; edits a matching rule after analysis, asserts the message fires on the pre-edit version and not the edit; deletes a matching rule after analysis, asserts the pre-deletion version fires and a message analysed after the deletion does not; crash injected between analysis commit and evaluation with a new matching rule saved in between, asserts no fire from the new rule and the expected fire from the old; migration over retained analysed messages asserts zero fires, `rules_revision_at_analysis = 0`, and `rules_evaluated_version = 0`. Clock probes: a rule saved with the system clock set earlier than the analysis timestamp still does not apply (revision order wins); an analysis and a rule write with identical timestamps resolve by revision. |
 | I3 | A candidate batch is authorized, or an automation job is newly POSTed, without both features active at its authorization boundary. | Matrix over (none, exchange only, automations only, both) times each action kind: only both authorizes a candidate batch. With a simulated clock, authorize at expires_at minus one second and reject at expires_at. Two messages in one phase with expiry between their checks: first batch commits; second records locked, including notify. Expiry after a batch's check but before its database-only commit does not revoke that batch (6.6); no blocking provider work is allowed there. Admit an automation job with both keys, revoke Automate before a later pump in a separate desktop/timer process: zero POSTs, CONNECT_AUTOMATIONS_ENTITLEMENT_REQUIRED, one failure intent; an exchange-authorized click job still POSTs. |
-| I4 | A capability bypasses required confirmation, or a waiting fire lacks a verified source identity. | Cross confirm_each true/false with effects (neither, external only, confirmation_required only, both). Every case fetches and hashes before step 3a; only the false/neither case proceeds without waiting. Other cases persist a confirmable item with the real artifact digest. Stale confirmation hash is refused; valid confirmation resumes. Before redispatch, change same-sized bytes, provider version, instance or effect flags: source drift is source_unavailable; provider identity drift is provider_changed; a removed effects flag never skips comparison to the saved receipt. Transient fetch failure leaves pending_dispatch without a waiting item or job; definitive missing source closes it. Non-Connect confirm_each is rejected at save. |
+| I4 | A capability bypasses required confirmation, or a waiting fire lacks a verified source identity. | Cross confirm_each true/false with effects (neither, external only, confirmation_required only, both). Every case fetches and hashes before step 3a; only the false/neither case proceeds without waiting. Other cases persist a confirmable item with the real artifact digest. Stale confirmation hash is refused; valid confirmation resumes. Before redispatch, change same-sized bytes, provider version, instance or effect flags: source drift is source_unavailable; provider identity drift is provider_changed; a removed effects flag never skips comparison to the saved receipt. Transient fetch failure leaves pending_dispatch without a waiting item or job; definitive missing source closes it. Non-Connect confirm_each is rejected at save. A person confirms after more than 24 hours while the source is still retained: pending_since resets and dispatch succeeds if otherwise eligible. At pending_since + 24 hours, continuous provider absence stalls; an ordinary retry before that boundary never resets the clock. Repeat pending-clock reset for attempt 2; expired source remains source_unavailable despite confirmation. |
 | I5 | Bytes are sent that differ from the bytes that were queued. | Inherited (`engine_api.py:2721-2729`); test changes the attachment between enqueue and handoff through the engine path and asserts `connect_source_unavailable` and no POST. |
 | I6 | An engine dispatch call waits for a provider's terminal state, or the engine reproduces queue policy outside the pump. | Test with three PDFs, one provider, a provider stub that completes slowly; assert the pass admits all three under the cap, makes exactly one submit for the lane head, returns without any `wait_for_terminal` call (spy on `ConnectV2Client.wait_for_terminal`), and leaves the other two `waiting` in the durable queue; a host pump at the returned wake time advances the next. |
 | I7 | The evaluate and dispatch phases run past their deadline. | Simulated clock and a deadline propagated to every blocking call in the two new phases. Pre-submit timeout: a gateway whose attachment fetch exceeds the remaining time; assert no POST occurred, the job (if already admitted) is `waiting` with `CONNECT_SOURCE_TEMPORARILY_UNAVAILABLE` (`engine_api.py:2708-2716`) or the fire is still `pending_dispatch` if not, and the phases return by the deadline. Ambiguous POST: a provider stub that accepts the bytes and never answers; assert the submit is cut at the deadline, the job is `reconciling` (or `provider_owned` if acceptance was observed), never `waiting`, and the next pump issues GET for the same request identity before any POST is permitted. Slow mailbox: a gateway whose fetch consumes the whole deadline; assert nothing is submitted, every unbound fire is `pending_dispatch`, and the phases return by the deadline. The pre-existing mail phases are outside this invariant by section 6.2. |
@@ -1714,7 +1723,7 @@ matching string literals across repos:
    tombstone deletion, the `automation_rule_set` revision counter,
    `messages.rules_revision_at_analysis`, fires with a non-null
    `artifact_key`, attempts with `dispatch_request_id` and write-once job
-   bindings, the fire's current attempt and job link,
+   bindings, the fire's current attempt and job link, `pending_since`,
    `rules_evaluated_version` (migration sets `0` on already-analysed
    messages), stored fire `state`/`state_version`, the job `origin`
    column, and the settlement step; the seeded system rule, enabled; the
@@ -1851,3 +1860,10 @@ matching string literals across repos:
   terminal or reconciliation rows. Candidate authorization has an explicit
   transaction boundary. I3, I4, I8, I12, I15, I17, I20 and I21 cover these
   paths. These are contract requirements, not implemented behavior.
+
+- **r10 (2026-09-11 UTC).** Reconciled the remaining stall-clock feedback.
+  `pending_since` measures the current unbound pending interval and resets
+  on initial evaluation, human confirmation or the second attempt, never
+  on an ordinary retry. Confirmation wait and submitted work do not consume
+  that interval. I4 covers delayed confirmation, exact expiry, retry and
+  unchanged source-retention checks. No runtime implementation is added.
