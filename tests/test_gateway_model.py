@@ -16,7 +16,11 @@ from eom_email_watcher.model import (
     ModelError,
 )
 from eom_email_watcher.runtime import load_runtime
-from eom_email_watcher.scheduling import SchedulingSource, SchedulingViolation
+from eom_email_watcher.scheduling import (
+    SchedulingSchemaError,
+    SchedulingSource,
+    SchedulingViolation,
+)
 
 
 def analysis_json() -> str:
@@ -416,7 +420,7 @@ def test_gateway_rejects_mismatched_acknowledgement_envelope(
     assert captured.value.retryable is False
 
 
-def test_gateway_scheduling_extraction_reuses_versioned_email_task_and_request_id(
+def test_gateway_scheduling_extraction_uses_versioned_task_and_request_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     requests: list[dict[str, object]] = []
@@ -449,10 +453,39 @@ def test_gateway_scheduling_extraction_reuses_versioned_email_task_and_request_i
     assert result.accepted is True
     assert requests[0]["request_id"] == "22222222-2222-4222-8222-222222222222"
     assert requests[0]["request_expires_at"] == "2026-09-07T10:10:00Z"
-    assert requests[0]["task"] == {"id": "email.analyze", "version": 1}
+    assert requests[0]["task"] == {"id": "email.schedule.extract", "version": 1}
     assert requests[0]["requirements"]["max_output_tokens"] == 1_500
+    encoded_schema = json.dumps(requests[0]["generation"]["response_schema"])
+    assert '"$defs"' not in encoded_schema
+    assert '"$ref"' not in encoded_schema
     assert "time_naive" in requests[0]["generation"]["messages"][1]["content"]
     assert "model" not in requests[0]
+
+
+def test_gateway_scheduling_schema_failure_is_permanent_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model, _requested_ca_files = gateway_model(
+        tmp_path,
+        monkeypatch,
+        lambda request: pytest.fail("invalid scheduling schema reached transport"),
+    )
+
+    def invalid_schema() -> dict[str, object]:
+        raise SchedulingSchemaError("invalid test schema")
+
+    monkeypatch.setattr(model_module, "scheduling_response_schema", invalid_schema)
+
+    with pytest.raises(GatewayModelError) as captured:
+        model.extract_scheduling(
+            source=scheduling_source(),
+            feedback=(),
+            request_id="22222222-2222-4222-8222-222222222222",
+            request_started_at=datetime(2026, 9, 7, 10, 0, tzinfo=UTC),
+        )
+
+    assert captured.value.code == "invalid_request"
+    assert captured.value.retryable is False
 
 
 def test_gateway_client_disables_environment_proxy_and_redirects(

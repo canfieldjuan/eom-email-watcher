@@ -373,9 +373,9 @@ Application validation happens after the gateway returns a valid envelope. If th
 rejects that output, it durably marks the original request terminally rejected and acknowledges
 receipt so the gateway can delete the buffered result. It must not automatically resubmit that
 identity and receive the same retained output forever. Email Watcher's ordinary analysis path maps
-this case to terminal rejection plus explicit requeue behavior. Its nested scheduling-extraction
-schema remains outside the gateway's initial bounded schema subset and requires a separate contract
-slice before that automation can use the gateway.
+this case to terminal rejection plus explicit requeue behavior. Scheduling extraction uses the
+separately authorized `email.schedule.extract@1` task and a code-derived, reference-free bounded
+schema; Email Watcher remains the owner of deterministic application validation and acknowledgement.
 
 v0 scheduling is a bounded fair queue across client credentials, with per-credential in-flight and
 queued limits. It must prevent one document workload from starving small email tasks. Exact queue

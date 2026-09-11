@@ -8,10 +8,17 @@ import pytest
 import eom_email_watcher.scheduling as scheduling_module
 from eom_email_watcher.scheduling import (
     MAX_SCHEDULING_ATTENDEES,
+    MAX_SCHEDULING_EVIDENCE_ITEMS,
+    MAX_SCHEDULING_TIME_RANGES,
     SCHEDULING_SYSTEM_PROMPT,
+    SchedulingExtraction,
+    SchedulingSchemaError,
     SchedulingSource,
     SchedulingViolation,
+    _inline_local_schema_references,
+    _normalize_event_reference_wire_schema,
     scheduling_prompt,
+    scheduling_response_schema,
     scheduling_source_sha256,
     validate_scheduling_output,
 )
@@ -74,6 +81,86 @@ def validate(value: object, *, scheduling_source: SchedulingSource | None = None
 
 def codes(result) -> set[str]:
     return {item.code for item in result.violations}
+
+
+def test_gateway_schema_inlines_independent_bounded_local_definitions() -> None:
+    schema = scheduling_response_schema()
+    encoded = json.dumps(schema)
+    properties = schema["properties"]
+    proposed_times = properties["proposed_times"]
+    attendees = properties["attendees"]
+    intent_evidence = properties["intent_evidence"]
+    time_evidence = proposed_times["items"]["properties"]["evidence"]
+    attendee_evidence = attendees["items"]["properties"]["evidence"]
+    reference_schema = properties["referenced_event"]
+    reference_object = next(
+        branch for branch in reference_schema["anyOf"] if branch.get("type") == "object"
+    )
+    reference_properties = reference_object["properties"]
+
+    assert '"$defs"' not in encoded
+    assert '"$ref"' not in encoded
+    assert proposed_times["maxItems"] == MAX_SCHEDULING_TIME_RANGES
+    assert attendees["maxItems"] == MAX_SCHEDULING_ATTENDEES
+    assert time_evidence["maxItems"] == MAX_SCHEDULING_EVIDENCE_ITEMS
+    assert intent_evidence is not attendee_evidence
+    assert {"type": "null"} in reference_schema["anyOf"]
+    assert reference_properties["provider_event_id"]["type"] == "string"
+    assert reference_properties["human_reference"]["type"] == "string"
+    assert "provider_event_id" not in reference_object["required"]
+    assert "human_reference" not in reference_object["required"]
+    intent_evidence["properties"]["quote"]["maxLength"] = 1
+    assert attendee_evidence["properties"]["quote"]["maxLength"] == 500
+
+    payload = valid_result()
+    payload["referenced_event"] = {
+        "provider_event_id": "event-123",
+        "evidence": {"source": "body", "quote": "our existing meeting"},
+    }
+    assert SchedulingExtraction.model_validate(payload).referenced_event is not None
+
+
+def test_gateway_schema_rejects_required_optional_event_reference() -> None:
+    schema = SchedulingExtraction.model_json_schema()
+    definitions = schema.pop("$defs")
+    inlined = _inline_local_schema_references(schema, definitions)
+    assert isinstance(inlined, dict)
+    reference_schema = inlined["properties"]["referenced_event"]
+    reference_object = next(
+        branch for branch in reference_schema["anyOf"] if branch.get("type") == "object"
+    )
+    reference_object["required"].append("provider_event_id")
+
+    with pytest.raises(SchedulingSchemaError, match="became required"):
+        _normalize_event_reference_wire_schema(inlined)
+
+
+@pytest.mark.parametrize(
+    ("value", "definitions", "message"),
+    [
+        ({"$ref": "#/$defs/Missing"}, {}, "unknown"),
+        ({"$ref": None}, {}, "malformed"),
+        (
+            {"$ref": "#/$defs/Known", "title": "mixed"},
+            {"Known": {"type": "string"}},
+            "malformed",
+        ),
+        ({"$ref": "https://example.test/schema"}, {}, "not local"),
+        ({"$defs": {}}, {}, "root-local"),
+        (
+            {"$ref": "#/$defs/A"},
+            {"A": {"$ref": "#/$defs/B"}, "B": {"$ref": "#/$defs/A"}},
+            "cyclic",
+        ),
+    ],
+)
+def test_gateway_schema_rejects_unsafe_reference_shapes(
+    value: object,
+    definitions: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(SchedulingSchemaError, match=message):
+        _inline_local_schema_references(value, definitions)
 
 
 def test_valid_new_meeting_is_accepted_with_normalized_evidence() -> None:

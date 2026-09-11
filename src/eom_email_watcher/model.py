@@ -18,9 +18,11 @@ from .scheduling import (
     SCHEDULING_SYSTEM_PROMPT,
     SchedulingAttemptResult,
     SchedulingExtraction,
+    SchedulingSchemaError,
     SchedulingSource,
     SchedulingViolation,
     scheduling_prompt,
+    scheduling_response_schema,
     validate_scheduling_output,
 )
 
@@ -430,6 +432,8 @@ class LocalModel:
 class GatewayModel:
     task_id = "email.analyze"
     task_version = 1
+    scheduling_task_id = "email.schedule.extract"
+    scheduling_task_version = 1
 
     def __init__(
         self,
@@ -698,6 +702,8 @@ class GatewayModel:
         content = self._inference(
             request_id=request_id,
             request_expires_at=self._request_expires_at(current_local_time),
+            task_id=self.task_id,
+            task_version=self.task_version,
             system_prompt=SYSTEM_PROMPT,
             user_prompt=_email_prompt(
                 sender=bounded_gateway_text(sender, MAX_GATEWAY_SENDER_CHARS),
@@ -742,6 +748,8 @@ class GatewayModel:
         *,
         request_id: str,
         request_expires_at: str,
+        task_id: str,
+        task_version: int,
         system_prompt: str,
         user_prompt: str,
         schema: dict[str, object],
@@ -752,7 +760,7 @@ class GatewayModel:
             "protocol_version": 1,
             "request_id": request_id,
             "request_expires_at": request_expires_at,
-            "task": {"id": self.task_id, "version": self.task_version},
+            "task": {"id": task_id, "version": task_version},
             "requirements": {
                 "input_modalities": ["text"],
                 "output_media_type": "application/json",
@@ -809,12 +817,18 @@ class GatewayModel:
         request_id: str,
         request_started_at: datetime,
     ) -> SchedulingAttemptResult:
+        try:
+            schema = scheduling_response_schema()
+        except SchedulingSchemaError as exc:
+            raise GatewayModelError("invalid_request", retryable=False) from exc
         content = self._inference(
             request_id=request_id,
             request_expires_at=self._request_expires_at(request_started_at),
+            task_id=self.scheduling_task_id,
+            task_version=self.scheduling_task_version,
             system_prompt=SCHEDULING_SYSTEM_PROMPT,
             user_prompt=scheduling_prompt(source, feedback),
-            schema=SchedulingExtraction.model_json_schema(),
+            schema=schema,
             max_output_tokens=1_500,
         )
         return validate_scheduling_output(content, source)
