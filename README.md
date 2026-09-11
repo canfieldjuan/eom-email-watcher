@@ -66,7 +66,9 @@ file must not be group/world-writable. Do not put the credential value in TOML.
 Gateway mode sends only the same bounded text inference request used by the local watcher. The
 application does not select a worker or model, and mailbox credentials, raw message storage, and
 Local Connect tokens remain outside the inference boundary. Use the desktop Health view to confirm
-that `email.analyze` is available before enabling normal polling.
+that `email.analyze` is available before enabling normal polling. Scheduling automation additionally
+requires the same application credential to be granted `email.schedule.extract@1`; a missing grant
+fails closed and does not fall back to a direct model runtime.
 
 ### Secure LM Studio
 
