@@ -556,14 +556,19 @@ Before `process_scheduling_automations` calls provider metadata or content for a
 recoverable run, it opens the gateway under the production mailbox operation
 lock and verifies source identity. A run with a companion identity requires an
 exact match with the current gateway key. A legacy run without a companion row
-may fetch only when the account's provider-specific migration record is
-`continuity_proven` and its proven key equals the current gateway key. A
+may fetch when the account's provider-specific migration record is
+`continuity_proven` and its proven key equals the current gateway key. Existing
+schema-19 scheduling runs have a second, run-specific witness: because scheduling
+admission is Microsoft-only and stores the immutable `calendar_principal_key`, a
+legacy Microsoft run may fetch when that captured key equals the current
+authenticated `MicrosoftPrincipal.key`. This proves continuity only for that run;
+it does not bind unrelated legacy messages, seen rows, or suppressions. A
 transient identity lookup defers the run with retryable
 `mailbox_identity_unavailable`; a mismatch, `replacement`, or `unresolved`
-legacy identity transitions through the existing `source_unavailable` state
-with `mailbox_identity_unverified`, before any metadata or content access. A
-provider message id reused by a replacement mailbox therefore cannot supply the
-old scheduling run's extraction input.
+legacy identity without the Microsoft run witness transitions through the
+existing `source_unavailable` state with `mailbox_identity_unverified`, before
+any metadata or content access. A provider message id reused by a replacement
+mailbox therefore cannot supply the old scheduling run's extraction input.
 
 ## 7. Matching and fire identity
 
