@@ -132,19 +132,24 @@ Every definition has a `scope` object, defaulting to `{}`:
   account.
 
 An account-scoped version also stores an engine-owned
-`scope_mailbox_identity_key`. The 64-character key is the existing IMAP
-`imap_mailbox_identity` hash, the existing Microsoft `MicrosoftPrincipal.key`,
-or SHA-256 over the UTF-8 NUL-joined literal `gmail-credential-v1` and the
-installed Gmail refresh token. The refresh token is read under its existing
-credential lock and is never stored in the database or returned by the engine;
-only its one-way credential-epoch key is persisted. Gmail exposes no immutable
-principal identifier through its current profile adapter, so replacing the
-installed refresh token intentionally creates a new mailbox identity even when
-the normalized account address is unchanged. A verifier derives the key from
-the installed credentials under their existing lock before an account-scoped
-rule is accepted and before `watcher.check` admits messages. `Store.put_rule`
-binds the verified key inside its mutation transaction; a missing account or
-unverifiable identity is `invalid_rule`.
+`scope_mailbox_identity_key`. The 64-character IMAP key is SHA-256 over the
+UTF-8 NUL-joined literal `imap-mailbox-v2`, the existing
+`imap_mailbox_identity` credential hash, and the base-10 `UIDVALIDITY` observed
+from the authenticated read-only INBOX. Other keys are the existing Microsoft
+`MicrosoftPrincipal.key`, or SHA-256 over the UTF-8 NUL-joined literal
+`gmail-credential-v1` and the installed Gmail refresh token. The refresh token
+is read under its existing credential lock and is never stored in the database
+or returned by the engine; only its one-way credential-epoch key is persisted.
+Gmail exposes no immutable principal identifier through its current profile
+adapter, so replacing the installed refresh token intentionally creates a new
+mailbox identity even when the normalized account address is unchanged. IMAP
+credential verification opens INBOX read-only and binds the observed
+`UIDVALIDITY`; recreating/resetting the mailbox therefore advances the key even
+when host, address, username, and password are unchanged. A verifier derives
+the key from installed credentials before an account-scoped rule is accepted
+and before `watcher.check` admits messages. `Store.put_rule` binds the verified
+key inside its mutation transaction; a missing account or unverifiable identity
+is `invalid_rule`.
 
 Schema 20 adds nullable `mailbox_identity_key` to mail accounts and messages.
 Every newly admitted message receives the key derived from the gateway that
@@ -182,6 +187,12 @@ after the account key advances. Credential reconciliation advances the account
 key and resets its cursor in one database transaction. This compare-and-set
 fence is used instead of holding a credential-file lock across network/model
 work.
+
+Dry-run is strictly non-mutating and does not hold the production polling lock.
+It derives the installed/gateway identity and compares it with the stored
+account key, but never reconciles the key, resets a cursor, binds a rule, inserts
+a message, or advances state. A mismatch returns `mailbox_identity_changed`
+before mailbox polling or analysis, leaving production state untouched.
 
 ### Closure declaration: source scope
 
@@ -280,6 +291,14 @@ Booleans are not integers for numeric operands. `in` never accepts a scalar;
 `equals` never accepts a list. `attachment.count` is only a rule-threshold
 bound: evaluation compares it with the actual persisted attachment count and
 makes no 64-attachment workload claim.
+
+`AttachmentDescriptor.byte_size` and its persisted column are nullable. Gmail,
+Microsoft, and IMAP preserve null when the provider omits the size or supplies a
+malformed value; they never coerce unknown size to zero. A numeric
+`attachment.byte_size lte` condition evaluates false for null and can match a
+real zero-byte attachment only when the provider explicitly supplied verified
+integer zero. Other attachment predicates and `attachment.count` may still use
+that descriptor.
 
 Filename matching is platform-independent: replace `\\` with `/` in the
 persisted filename, take the final slash-delimited component, case-fold both it
@@ -535,8 +554,8 @@ Rule deletion does not rewrite already committed fires.
 - Matcher tests cover every canonical field/operator pair, scope, missing
   optional data, case-folding, the exact cross-platform `fnmatchcase` filename
   algorithm, actual attachment counts above 64, mailbox identity mismatch,
-  incoming analysis values versus null stored columns, mixed conditions, and
-  deterministic order.
+  unknown versus verified-zero attachment size, incoming analysis values versus
+  null stored columns, mixed conditions, and deterministic order.
 - Boundary tests prove 1,000 descriptors and 1,000 matched fires can commit.
   Descriptor 1,001 stops each provider extractor, causes
   `replace_attachments` to persist zero, and records a permanent
@@ -557,6 +576,9 @@ Rule deletion does not rewrite already committed fires.
   bookkeeping, it establishes the new key and cursor before fetching; new
   messages cannot inherit the old key. Existing address-mismatch rejection
   remains unchanged.
+- IMAP tests hold credential fields constant while changing `UIDVALIDITY` and
+  prove the mailbox key advances, old scoped rules become inert, and newly
+  admitted messages use the new key. An unchanged epoch is the opposite control.
 - Gmail tests prove the credential key changes when the installed refresh token
   changes even when the normalized account address does not, and that the raw
   token is never persisted or exposed.
@@ -564,6 +586,10 @@ Rule deletion does not rewrite already committed fires.
   advances the account key and resets its cursor, then proves the old session can
   neither insert, advance the cursor, nor commit analysis/fires. The opposite
   same-key control completes each mutation.
+- A dry-run with matching identity performs its existing preview without any
+  write. A dry-run with an installed/stored identity mismatch returns
+  `mailbox_identity_changed` and leaves the account key, cursor, messages,
+  rules, analyses, and fires byte-for-byte unchanged.
 - A pending row with a null or stale mailbox key is failed before content fetch;
   a reused provider message id cannot replace its descriptors through the new
   gateway.
@@ -617,6 +643,14 @@ Rule deletion does not rewrite already committed fires.
   immutable-version snapshot.
 - **Schema-19 post-migration insert:** confirmed. A schema-20 insert trigger
   rejects new null-key messages while preserving rows that predate migration.
+- **Unknown attachment sizes:** confirmed. Unknown sizes remain null and fail
+  numeric predicates; only a provider-supplied verified integer can satisfy
+  `attachment.byte_size lte`.
+- **IMAP mailbox epoch:** confirmed. The binding includes the authenticated
+  INBOX `UIDVALIDITY`, so a recreated/reset mailbox cannot inherit scoped rules
+  merely by reusing credential fields.
+- **Dry-run reconciliation:** confirmed. Dry-run compares identities and fails
+  on mismatch without reconciling credentials or mutating production state.
 - **Internationalized sender-domain equivalence:** waived-out-of-scope. The
   provider-specific Unicode-versus-IDNA sender normalization predates this rule
   engine and does not block the approved ASCII-domain reachability proof; a
@@ -737,3 +771,6 @@ Rule deletion does not rewrite already committed fires.
   replacement, moved descriptor bounding ahead of materialization/persistence,
   made rule-detail reads coherent, and blocked schema-19 inserts after migration;
   internationalized sender-domain equivalence remains deferred.
+- **Core revision 9 (2026-09-12):** made unknown attachment sizes non-matching,
+  included the IMAP mailbox epoch in identity, and kept credential reconciliation
+  out of non-mutating dry runs.
