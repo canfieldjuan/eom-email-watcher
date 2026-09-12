@@ -33,10 +33,12 @@ from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 FIXTURE_PART_ID = "fixture-mime-part"
+FIXTURE_MODEL_DIGEST = "b8693e6b4f5f228844ef5a842c7e7a332d9b2fa9e1241a423ef1de7928065b79"
 
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
     model_id = "connect-proof-model"
+    model_digest = FIXTURE_MODEL_DIGEST
     pause_next_generation = False
     generation_started = threading.Event()
     generation_release = threading.Event()
@@ -53,6 +55,26 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         with suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(encoded)
 
+    def _ndjson(self, values: list[dict[str, object]]) -> None:
+        encoded = b"".join(
+            json.dumps(value, separators=(",", ":")).encode() + b"\n" for value in values
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        with suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(encoded)
+
+    @classmethod
+    def _model_record(cls) -> dict[str, object]:
+        return {
+            "name": cls.model_id,
+            "digest": cls.model_digest,
+            "size": 1,
+            "details": {"family": "qwen3"},
+        }
+
     @classmethod
     def pause_one_generation(cls) -> None:
         cls.generation_started.clear()
@@ -60,23 +82,48 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         cls.pause_next_generation = True
 
     def do_GET(self) -> None:
-        if self.path != "/v1/models":
-            self.send_error(404)
+        if self.path == "/v1/models":
+            self._json({"data": [{"id": self.model_id}]})
             return
-        self._json({"data": [{"id": self.model_id}]})
+        if self.path in {"/api/tags", "/api/ps"}:
+            self._json({"models": [self._model_record()]})
+            return
+        self.send_error(404)
 
     def do_POST(self) -> None:
-        if self.path != "/v1/chat/completions":
-            self.send_error(404)
-            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length))
-            schema_name = request["response_format"]["json_schema"]["name"]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            self.send_error(400)
+            return
+
+        if self.path == "/api/show":
+            if request.get("model") != self.model_id:
+                self.send_error(400)
+                return
+            self._json(
+                {
+                    "model_info": {
+                        "general.architecture": "qwen3",
+                        "qwen3.context_length": 131_072,
+                    }
+                }
+            )
+            return
+
+        try:
             user_prompt = next(
                 message["content"] for message in request["messages"] if message["role"] == "user"
             )
             prompt = json.loads(user_prompt)
+            if self.path == "/v1/chat/completions":
+                schema_name = request["response_format"]["json_schema"]["name"]
+            elif self.path == "/api/chat" and request.get("model") == self.model_id:
+                schema_name = self._schema_name(prompt)
+            else:
+                self.send_error(404)
+                return
             handler = type(self)
             if handler.pause_next_generation:
                 handler.pause_next_generation = False
@@ -88,10 +135,93 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
         except (KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             self.send_error(400)
             return
+        if self.path == "/api/chat":
+            self._ndjson(
+                [
+                    {
+                        "model": self.model_id,
+                        "message": {"content": text},
+                        "done": False,
+                    },
+                    {
+                        "model": self.model_id,
+                        "message": {"content": ""},
+                        "done": True,
+                        "prompt_eval_count": 1,
+                        "eval_count": 1,
+                    },
+                ]
+            )
+            return
         self._json({"choices": [{"message": {"content": text}}]})
 
     @staticmethod
+    def _schema_name(prompt: dict[str, object]) -> str:
+        for key, schema_name in (
+            ("quote_candidates", "document_page_quote_selection_v4"),
+            ("exact_quote", "document_quote_paraphrase_v5"),
+            ("pairs", "document_contract_material_coverage_v1"),
+            ("source_blocks", "document_chunk_evidence_v1"),
+            ("evidence", "document_summary_claims_v1"),
+            ("candidates", "document_candidate_claims_v1"),
+            ("claims", "document_claim_verdicts_v1"),
+        ):
+            if key in prompt:
+                return schema_name
+        if "source_segments" in prompt:
+            if "requested_count" in prompt:
+                return "document_general_source_selection_v1"
+            return "document_general_summary_v1"
+        raise ValueError("unsupported fixture prompt")
+
+    @staticmethod
     def _structured_output(schema_name: str, prompt: dict[str, object]) -> str:
+        if schema_name == "document_page_quote_selection_v4":
+            return json.dumps(
+                {"selection": prompt["quote_candidates"][0]["quote_id"]},
+                separators=(",", ":"),
+            )
+        if schema_name == "document_quote_paraphrase_v5":
+            exact_quote = str(prompt["exact_quote"]).strip()
+            claim_text = (
+                exact_quote
+                if len(exact_quote) <= 384 and exact_quote.endswith((".", "!", "?"))
+                else "The document contains fixture content."
+            )
+            return json.dumps({"claim_text": claim_text}, separators=(",", ":"))
+        if schema_name == "document_general_source_selection_v1":
+            sources = prompt["source_segments"]
+            requested_count = int(prompt["requested_count"])
+            return json.dumps(
+                {"source_ids": [source["source_id"] for source in sources[:requested_count]]},
+                separators=(",", ":"),
+            )
+        if schema_name == "document_general_summary_v1":
+            sources = prompt["source_segments"]
+            return json.dumps(
+                {
+                    "units": [
+                        {
+                            "text": (
+                                "The document presents its central information, supporting "
+                                "details, and material qualifications."
+                            ),
+                            "source_ids": [source["source_id"] for source in sources[:8]],
+                        }
+                    ]
+                },
+                separators=(",", ":"),
+            )
+        if schema_name == "document_contract_material_coverage_v1":
+            return json.dumps(
+                {
+                    "verdicts": [
+                        {"pair_id": pair["pair_id"], "verdict": "material"}
+                        for pair in prompt["pairs"]
+                    ]
+                },
+                separators=(",", ":"),
+            )
         if schema_name == "document_chunk_evidence_v1":
             evidence = []
             for block in prompt["source_blocks"]:
@@ -388,6 +518,8 @@ def main() -> None:
             entitlement.connect_entitlement_decision = proof_entitlement.decision
             environment = os.environ.copy()
             environment.pop("DOC_SUM_MODEL_API_TOKEN_FILE", None)
+            environment.pop("DOC_SUM_CONNECT_PROOF_MODE", None)
+            environment.pop("DOC_SUM_CONNECT_PROOF_MODEL_DIGEST", None)
             environment.update(
                 {
                     "XDG_DATA_HOME": str(data_dir),
@@ -396,12 +528,21 @@ def main() -> None:
                     "DOC_SUM_MODEL_TIMEOUT_SECONDS": str(model_timeout_seconds),
                 }
             )
+            if model_mode == "fixture":
+                environment.update(
+                    {
+                        "DOC_SUM_CONNECT_PROOF_MODE": "local-fixture-v1",
+                        "DOC_SUM_CONNECT_PROOF_MODEL_DIGEST": FIXTURE_MODEL_DIGEST,
+                    }
+                )
             if token_path is not None:
                 environment["DOC_SUM_MODEL_API_TOKEN_FILE"] = str(token_path)
             restart_environment = environment.copy()
             restart_environment.pop("DOC_SUM_MODEL_API_TOKEN_FILE", None)
             restart_environment.update(
                 {
+                    "DOC_SUM_CONNECT_PROOF_MODE": "local-fixture-v1",
+                    "DOC_SUM_CONNECT_PROOF_MODEL_DIGEST": FIXTURE_MODEL_DIGEST,
                     "DOC_SUM_MODEL_BASE_URL": fixture_model_base_url,
                     "DOC_SUM_MODEL_NAME": FixtureModelHandler.model_id,
                     "DOC_SUM_MODEL_TIMEOUT_SECONDS": "10",
@@ -841,6 +982,28 @@ def main() -> None:
 
             engine_api.GmailGateway.from_token = staticmethod(reject_gmail_reopen)
             try:
+                reconciliation_deadline = time.monotonic() + 15
+                while True:
+                    reconciled_job = runtime.store.connect_job(
+                        interrupted_invocation["request_id"]
+                    )
+                    if reconciled_job is not None and reconciled_job.status in {
+                        "completed",
+                        "failed",
+                    }:
+                        break
+                    if time.monotonic() >= reconciliation_deadline:
+                        raise RuntimeError(
+                            "Interrupted Connect job did not reach a terminal queue state"
+                        )
+                    queue_pump = engine_api._response(
+                        request(config_path, "connect.queue.pump")
+                    )
+                    if not queue_pump["ok"]:
+                        raise RuntimeError(
+                            f"Interrupted Connect queue reconciliation failed: {queue_pump}"
+                        )
+                    time.sleep(0.1)
                 reconciled_interruption = engine_api._response(
                     request(
                         config_path,
@@ -872,10 +1035,6 @@ def main() -> None:
                 raise RuntimeError("Connect proof result was not durable")
             durable_request = json.loads(job_row[12])
             replayed_data = replayed.get("data") if replayed["ok"] else None
-            interrupted_error = interrupted_response.get("error")
-            interrupted_error_code = (
-                interrupted_error.get("code") if isinstance(interrupted_error, dict) else None
-            )
             reconciled_error = reconciled_interruption.get("error")
             reconciled_error_code = (
                 reconciled_error.get("code") if isinstance(reconciled_error, dict) else None
@@ -971,9 +1130,11 @@ def main() -> None:
                     and recovered_matches[0]["provider"]["instance_id"]
                     == selected["provider"]["instance_id"]
                 ),
-                "interrupted_submission_ambiguous": (
-                    interrupted_response.get("ok") is False
-                    and interrupted_error_code == "provider_unavailable"
+                "interrupted_submission_queued": (
+                    interrupted_response.get("ok") is True
+                    and interrupted_response.get("data", {}).get("status")
+                    in {"accepted", "processing"}
+                    and interrupted_response.get("data", {}).get("outputs") == []
                 ),
                 "interrupted_job_reconciled": (
                     reconciled_interruption.get("ok") is False
@@ -1109,6 +1270,9 @@ def main() -> None:
                             },
                             "parameters": {"target-language": "Spanish"},
                             "outputs": [translation_output],
+                            "dispatch_state": "terminal",
+                            "queue_ahead": 0,
+                            "next_attempt_at": None,
                         },
                         inspection_request_id: {
                             "job_id": inspection_request_id,
@@ -1124,6 +1288,9 @@ def main() -> None:
                             },
                             "parameters": {},
                             "outputs": [inspection_output],
+                            "dispatch_state": "terminal",
+                            "queue_ahead": 0,
+                            "next_attempt_at": None,
                         },
                     }
                 ),
@@ -1202,7 +1369,7 @@ def main() -> None:
                 "email_database_quick_check": quick_check,
                 "email_database_schema_version": schema_version,
                 "job_status": response["data"]["status"],
-                "interrupted_initial_error_code": interrupted_error_code,
+                "interrupted_initial_status": interrupted_response.get("data", {}).get("status"),
                 "interrupted_provider_submissions": interrupted_provider_submissions,
                 "interrupted_reconciled_error_code": reconciled_error_code,
                 "model_id": model_name,
