@@ -155,10 +155,16 @@ Schema 20 adds nullable `mailbox_identity_key` to mail accounts and messages.
 Every newly admitted message receives the key derived from the gateway that
 produced it, not a later account lookup. If credentials were replaced but the
 process died before database bookkeeping, the next verifier observes the
-installed identity, updates the account key and resets its cursor before
-fetching. A mismatch can therefore make an old account-scoped rule inert but
-cannot let it follow a new mailbox. Microsoft or Gmail address mismatches remain
-rejected. Provider-only and wildcard rules intentionally span mailbox keys.
+installed identity and updates the account key before fetching. Gmail and
+Microsoft retain their existing provider-specific baseline-reset behavior. An
+IMAP epoch change instead preserves the stale cursor and `last_success_at`; the
+existing `changes_since` mismatch must drive `recover_since` from that last
+successful observation rather than baselining at the new epoch's highest UID.
+The recovered result supplies the new cursor only after admitted messages are
+processed. A mismatch can therefore make an old account-scoped rule inert but
+cannot let it follow a new mailbox or skip mail already present in the new IMAP
+epoch. Microsoft or Gmail address mismatches remain rejected. Provider-only and
+wildcard rules intentionally span mailbox keys.
 
 Schema 20 also makes the mailbox key part of every persisted source identity:
 message lookup and uniqueness, `has_seen_message`, retained suppression keys,
@@ -184,9 +190,9 @@ atomic analysis/fire transaction. A concurrent credential change makes an old
 session fail with `mailbox_identity_changed`; it cannot admit more messages,
 overwrite the replacement mailbox's reset cursor, or commit an old-key fire
 after the account key advances. Credential reconciliation advances the account
-key and resets its cursor in one database transaction. This compare-and-set
-fence is used instead of holding a credential-file lock across network/model
-work.
+key and applies the provider-specific cursor transition in one database
+transaction. This compare-and-set fence is used instead of holding a
+credential-file lock across network/model work.
 
 Dry-run is strictly non-mutating and does not hold the production polling lock.
 It derives the installed/gateway identity and compares it with the stored
@@ -292,13 +298,16 @@ Booleans are not integers for numeric operands. `in` never accepts a scalar;
 bound: evaluation compares it with the actual persisted attachment count and
 makes no 64-attachment workload claim.
 
-`AttachmentDescriptor.byte_size` and its persisted column are nullable. Gmail,
-Microsoft, and IMAP preserve null when the provider omits the size or supplies a
-malformed value; they never coerce unknown size to zero. A numeric
-`attachment.byte_size lte` condition evaluates false for null and can match a
-real zero-byte attachment only when the provider explicitly supplied verified
-integer zero. Other attachment predicates and `attachment.count` may still use
-that descriptor.
+`AttachmentDescriptor.byte_size` and its existing persisted column remain
+non-null non-negative integers so attachment export, capability discovery, and
+interactive Connect invocation keep their current API shape. Schema 20 adds the
+strict boolean `byte_size_known` to the descriptor and table. Gmail, Microsoft,
+and IMAP set it false when the provider omits the size or supplies a malformed
+value; the compatibility integer remains zero in that case. A numeric
+`attachment.byte_size lte` condition first requires `byte_size_known`, so an
+unknown-size descriptor never matches and a real zero-byte attachment matches
+only when the provider explicitly supplied verified integer zero. Other
+attachment predicates and `attachment.count` may still use that descriptor.
 
 Filename matching is platform-independent: replace `\\` with `/` in the
 persisted filename, take the final slash-delimited component, case-fold both it
@@ -357,6 +366,15 @@ A value-changing enable/disable successor copies the prior immutable version's
 credentials happen to be installed at mutation time. An explicit definition
 edit resolves the current credential-backed key and therefore is the only core
 mutation that can intentionally rebind an account-scoped rule.
+
+Every rule mutation runs under the same production mailbox operation lock used
+by non-dry-run `watcher.check` and mail-account reconnect/authorization. For an
+account-scoped create or definition edit, the lock covers credential verification
+through the successful Store commit. `Store.put_rule` still compares the
+verified key with the current account key inside `BEGIN IMMEDIATE`; a mismatch
+rejects the mutation as `invalid_rule` rather than returning a rule already inert
+for the active mailbox. Provider-only and wildcard mutations take the same lock
+so mutation behavior does not depend on definition shape.
 
 New rules are enabled and non-system by default. Public create cannot override
 either flag.
@@ -544,6 +562,10 @@ Rule deletion does not rewrite already committed fires.
   writers. A current same-value enablement preserves version, revision, and
   timestamps. A value-changing toggle preserves the prior mailbox identity key;
   an explicit definition edit can bind the current key.
+- A rule-binding race test pauses after credential verification, attempts a
+  concurrent account reconnect, and proves the shared production operation lock
+  serializes them. The Store-side expected-key comparison independently rejects
+  a mismatched key.
 - Engine API tests exercise all five strict request and response schemas plus
   every error mapping. Create returns an enabled, non-system version 1 rule.
 - Schema 19 to 20 migration preserves existing data while installing rule
@@ -573,19 +595,21 @@ Rule deletion does not rewrite already committed fires.
   unverified.
 - Credential-backed preflight preserves a matching IMAP or Microsoft identity
   key. After replacement or an injected crash between file install and database
-  bookkeeping, it establishes the new key and cursor before fetching; new
-  messages cannot inherit the old key. Existing address-mismatch rejection
-  remains unchanged.
+  bookkeeping, it establishes the new key and provider-specific cursor transition
+  before fetching; new messages cannot inherit the old key. Existing
+  address-mismatch rejection remains unchanged.
 - IMAP tests hold credential fields constant while changing `UIDVALIDITY` and
-  prove the mailbox key advances, old scoped rules become inert, and newly
-  admitted messages use the new key. An unchanged epoch is the opposite control.
+  prove the mailbox key advances, the stale cursor drives recovery from the
+  prior `last_success_at`, mail already present in the new epoch is admitted,
+  old scoped rules become inert, and newly admitted messages use the new key. An
+  unchanged epoch is the opposite control.
 - Gmail tests prove the credential key changes when the installed refresh token
   changes even when the normalized account address does not, and that the raw
   token is never persisted or exposed.
 - A polling-session race test pauses an old-key gateway before message insert,
-  advances the account key and resets its cursor, then proves the old session can
-  neither insert, advance the cursor, nor commit analysis/fires. The opposite
-  same-key control completes each mutation.
+  advances the account key and applies its cursor transition, then proves the old
+  session can neither insert, advance the cursor, nor commit analysis/fires. The
+  opposite same-key control completes each mutation.
 - A dry-run with matching identity performs its existing preview without any
   write. A dry-run with an installed/stored identity mismatch returns
   `mailbox_identity_changed` and leaves the account key, cursor, messages,
@@ -643,14 +667,23 @@ Rule deletion does not rewrite already committed fires.
   immutable-version snapshot.
 - **Schema-19 post-migration insert:** confirmed. A schema-20 insert trigger
   rejects new null-key messages while preserving rows that predate migration.
-- **Unknown attachment sizes:** confirmed. Unknown sizes remain null and fail
-  numeric predicates; only a provider-supplied verified integer can satisfy
-  `attachment.byte_size lte`.
+- **Unknown attachment sizes:** confirmed. Unknown sizes retain the compatibility
+  integer but set `byte_size_known` false and fail numeric predicates; only a
+  provider-supplied verified integer can satisfy `attachment.byte_size lte`.
 - **IMAP mailbox epoch:** confirmed. The binding includes the authenticated
   INBOX `UIDVALIDITY`, so a recreated/reset mailbox cannot inherit scoped rules
   merely by reusing credential fields.
 - **Dry-run reconciliation:** confirmed. Dry-run compares identities and fails
   on mismatch without reconciling credentials or mutating production state.
+- **IMAP epoch recovery:** confirmed. Reconciliation preserves the stale cursor
+  and last-success timestamp so the existing recovery scan admits new-epoch mail
+  before committing its cursor.
+- **Rule-binding race:** confirmed. The production mailbox operation lock spans
+  credential verification through rule commit, with a Store-side expected-key
+  comparison as the transaction boundary.
+- **Existing attachment-size consumers:** confirmed. The shared byte-size value
+  stays a non-null integer; a separate known-size bit gates rule matching without
+  changing existing export/discovery/invocation types.
 - **Internationalized sender-domain equivalence:** waived-out-of-scope. The
   provider-specific Unicode-versus-IDNA sender normalization predates this rule
   engine and does not block the approved ASCII-domain reachability proof; a
@@ -774,3 +807,6 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 9 (2026-09-12):** made unknown attachment sizes non-matching,
   included the IMAP mailbox epoch in identity, and kept credential reconciliation
   out of non-mutating dry runs.
+- **Core revision 10 (2026-09-12):** preserved IMAP recovery across epoch
+  changes, serialized rule binding with account replacement, and separated
+  size-known matching state from the existing non-null attachment-size API.
