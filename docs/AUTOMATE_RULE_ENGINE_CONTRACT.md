@@ -376,6 +376,12 @@ rejects the mutation as `invalid_rule` rather than returning a rule already iner
 for the active mailbox. Provider-only and wildcard mutations take the same lock
 so mutation behavior does not depend on definition shape.
 
+If native operation locking is unavailable, a rule mutation returns
+`unsupported_platform` before credential or Store access. Lock contention with a
+poll or account mutation returns retryable `mailbox_busy`; it never falls through
+to the generic `runtime_error`. The five rule operations otherwise retain the
+closed domain-error set below.
+
 New rules are enabled and non-system by default. Public create cannot override
 either flag.
 
@@ -418,33 +424,37 @@ from one joined query or one explicit SQLite read transaction, so every member
 of `RuleDetail` describes the same immutable version.
 
 Public callers cannot set `system`, revision values, timestamps, digests, or
-version numbers. Errors are `invalid_rule`, `stale_rule`, `rule_limit`,
-`system_rule_protected`, or `not_found`. List is summary-only so the maximum
-rule count cannot create a response containing every maximum-sized definition.
+version numbers. Domain errors are `invalid_rule`, `stale_rule`, `rule_limit`,
+`system_rule_protected`, or `not_found`; mutation lock errors are the
+`unsupported_platform` and retryable `mailbox_busy` responses above. List is
+summary-only so the maximum rule count cannot create a response containing every
+maximum-sized definition.
 
 A definition is parsed and canonically serialized inside `Store.put_rule`.
-Reads first recompute SHA-256 over the canonical bytes and compare it with the
-stored lower-case digest, then parse again. A digest mismatch or parse failure
-is shown as invalid with a bounded reason, never evaluated, and never causes
-another rule to become an action.
+After strict validation, all defaulted members are materialized and the canonical
+Pydantic object is dumped in JSON mode. Canonical bytes are UTF-8 encoding of
+`json.dumps` with `sort_keys=True`, `separators=(",", ":")`,
+`ensure_ascii=False`, and `allow_nan=False`; there is no BOM or trailing newline.
+The 16 KiB definition limit applies to the length of these canonical UTF-8 bytes,
+not the raw request or Unicode character count. Reads first recompute SHA-256
+over the canonical bytes and compare it with the stored lower-case digest, then
+parse again. A digest mismatch or parse failure is shown as invalid with a
+bounded reason, never evaluated, and never causes another rule to become an
+action.
 
 ## 6. Atomic analysis-time evaluation
 
 `MAX_AUTOMATION_ATTACHMENTS` and `MAX_AUTOMATION_FIRES_PER_MESSAGE` are both
-1,000. Every Gmail MIME walk, Microsoft attachment-page loop, and IMAP MIME walk
-stops as soon as descriptor 1,001 is observed and raises the dedicated
-non-retryable `automation_fanout_limit`; it never materializes or requests the
-remainder. `Store.replace_attachments` independently consumes at most 1,001
-items and transactionally persists all descriptors only when the count is at
-most 1,000; overflow persists zero, so another adapter cannot bypass the bound.
-The pending message is then recorded through the existing permanent analysis
-failure path with that code, with zero fires, attempts, or scheduling admission.
-No truncated descriptor or matched-fire subset is committed. For an admitted
-descriptor set, the matcher stops before retaining candidate fire 1,001; fire
-overflow commits the email analysis and current rule-set revision with
-`rules_evaluation_error = "automation_fanout_limit"`, zero fires/attempts, and
-unchanged existing scheduling admission. Normal evaluation clears the nullable
-error field.
+1,000. Inside `mark_analyzed`, the Store counts persisted descriptors before
+loading any into the automation matcher, and the matcher stops before retaining
+candidate fire 1,001. Either overflow commits the email analysis, current
+rule-set revision, and existing scheduling admission with
+`rules_evaluation_error = "automation_fanout_limit"`, creates zero fires or
+attempts, and never evaluates or commits a truncated descriptor/fire subset.
+Normal evaluation clears the nullable error field. Provider MIME traversal,
+attachment-name materialization, and descriptor persistence predate this engine
+and remain unchanged; bounding that shared ingestion path is explicitly deferred
+rather than smuggled into the Automate core.
 
 `mark_analyzed` remains the single commit boundary:
 
@@ -557,6 +567,9 @@ Rule deletion does not rewrite already committed fires.
   cap, system protection, digest verification, mailbox identity binding,
   coherent list/get snapshots, tombstone non-resurrection, and rejection of
   invalid definitions at the Store boundary.
+- Canonical-byte tests prove raw key order, insignificant whitespace, explicit
+  versus omitted defaults, and equivalent non-ASCII text produce the specified
+  bytes/digest; 16,384 canonical UTF-8 bytes pass and 16,385 fail.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including current and stale same-value enablement plus two concurrent
   writers. A current same-value enablement preserves version, revision, and
@@ -566,6 +579,9 @@ Rule deletion does not rewrite already committed fires.
   concurrent account reconnect, and proves the shared production operation lock
   serializes them. The Store-side expected-key comparison independently rejects
   a mismatched key.
+- Rule-mutation lock tests prove unsupported native locking returns
+  `unsupported_platform`, contention returns retryable `mailbox_busy`, and
+  neither path reaches credential verification or Store mutation.
 - Engine API tests exercise all five strict request and response schemas plus
   every error mapping. Create returns an enabled, non-system version 1 rule.
 - Schema 19 to 20 migration preserves existing data while installing rule
@@ -578,12 +594,10 @@ Rule deletion does not rewrite already committed fires.
   algorithm, actual attachment counts above 64, mailbox identity mismatch,
   unknown versus verified-zero attachment size, incoming analysis values versus
   null stored columns, mixed conditions, and deterministic order.
-- Boundary tests prove 1,000 descriptors and 1,000 matched fires can commit.
-  Descriptor 1,001 stops each provider extractor, causes
-  `replace_attachments` to persist zero, and records a permanent
-  `automation_fanout_limit` analysis failure with no scheduling admission;
-  matcher candidate 1,001 commits the analysis plus that evaluation error, zero
-  fires/attempts, and unchanged scheduling behavior.
+- Boundary tests prove 1,000 persisted descriptors and 1,000 matched fires can
+  commit. Persisted descriptor 1,001 is detected before automation descriptors
+  are loaded; it and matcher candidate 1,001 both commit the analysis, scheduling
+  admission, and `automation_fanout_limit` with zero fires/attempts.
 - A failure injected between analysis update and fire insertion leaves the
   message pending with no marker, fire, attempt, or scheduling admission.
 - Concurrent rule mutation and analysis commit one coherent revision.
@@ -660,9 +674,11 @@ Rule deletion does not rewrite already committed fires.
   advancement, and atomic analysis/fire commit compare the polling session's
   expected key with the current account key; a stale session cannot write after
   reconciliation advances the key.
-- **Pre-materialization descriptor cap:** confirmed. Provider extractors and the
-  Store independently stop at descriptor 1,001, persist no partial descriptor
-  set, and record a bounded permanent failure before matching.
+- **Pre-materialization descriptor cap / Gmail duplicate candidates:**
+  waived-out-of-scope. Provider MIME traversal, attachment-name materialization,
+  and shared descriptor persistence predate this engine. The core bounds only
+  its added work by counting persisted descriptors before matcher loading and
+  committing zero automation fires on overflow.
 - **Rule-detail snapshot:** confirmed. Summary and definition are read from one
   immutable-version snapshot.
 - **Schema-19 post-migration insert:** confirmed. A schema-20 insert trigger
@@ -684,6 +700,14 @@ Rule deletion does not rewrite already committed fires.
 - **Existing attachment-size consumers:** confirmed. The shared byte-size value
   stays a non-null integer; a separate known-size bit gates rule matching without
   changing existing export/discovery/invocation types.
+- **Rule-mutation lock failures:** confirmed. Unsupported locking and contention
+  have explicit `unsupported_platform` and retryable `mailbox_busy` responses.
+- **Canonical definition bytes:** confirmed. Defaults, JSON-mode conversion,
+  key ordering, separators, Unicode encoding, finite-number handling, and the
+  post-canonicalization byte limit are exact.
+- **Scheduling on descriptor overflow:** confirmed. Overflow disables only
+  automation fire creation; the existing analysis and scheduling commit remains
+  unchanged.
 - **Internationalized sender-domain equivalence:** waived-out-of-scope. The
   provider-specific Unicode-versus-IDNA sender normalization predates this rule
   engine and does not block the approved ASCII-domain reachability proof; a
@@ -810,3 +834,6 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 10 (2026-09-12):** preserved IMAP recovery across epoch
   changes, serialized rule binding with account replacement, and separated
   size-known matching state from the existing non-null attachment-size API.
+- **Core revision 11 (2026-09-12):** defined rule-lock errors and canonical
+  definition bytes, kept scheduling unchanged on automation fan-out, and
+  deferred pre-existing provider descriptor materialization hardening.
