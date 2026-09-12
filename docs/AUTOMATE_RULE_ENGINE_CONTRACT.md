@@ -170,6 +170,19 @@ row is recorded as a non-retryable `mailbox_identity_unverified` analysis
 failure; its provider message id is never fetched through the replacement
 gateway, its attachment descriptors are not replaced, and no rule is evaluated.
 
+That pre-fetch check is not the concurrency fence. Each polling session captures
+the gateway key it opened, and schema-20 `add_message` and `set_state` accept it
+as an expected key. Each mutation uses one transaction to compare that key with
+the current `mail_accounts.mailbox_identity_key` before inserting a message or
+advancing the cursor. `mark_analyzed` repeats the same comparison inside its
+atomic analysis/fire transaction. A concurrent credential change makes an old
+session fail with `mailbox_identity_changed`; it cannot admit more messages,
+overwrite the replacement mailbox's reset cursor, or commit an old-key fire
+after the account key advances. Credential reconciliation advances the account
+key and resets its cursor in one database transaction. This compare-and-set
+fence is used instead of holding a credential-file lock across network/model
+work.
+
 ### Closure declaration: source scope
 
 1. **Membership:** CLOSED for the two scope members, `provider` and
@@ -363,6 +376,9 @@ Successful result objects are exact:
 
 List reads the singleton revision and all summaries inside one explicit SQLite
 read transaction, so the returned revision describes the returned rule set.
+Get reads the current identity, summary, canonical definition bytes, and digest
+from one joined query or one explicit SQLite read transaction, so every member
+of `RuleDetail` describes the same immutable version.
 
 Public callers cannot set `system`, revision values, timestamps, digests, or
 version numbers. Errors are `invalid_rule`, `stale_rule`, `rule_limit`,
@@ -378,12 +394,20 @@ another rule to become an action.
 ## 6. Atomic analysis-time evaluation
 
 `MAX_AUTOMATION_ATTACHMENTS` and `MAX_AUTOMATION_FIRES_PER_MESSAGE` are both
-1,000. The Store counts persisted descriptors before matching, and the matcher
-stops before retaining candidate 1,001. Either overflow commits the email
-analysis and current rule-set revision with
-`rules_evaluation_error = "automation_fanout_limit"`, creates zero fires or
-attempts, and leaves existing scheduling admission unchanged. It never commits
-a truncated subset. Normal evaluation clears the nullable error field.
+1,000. Every Gmail MIME walk, Microsoft attachment-page loop, and IMAP MIME walk
+stops as soon as descriptor 1,001 is observed and raises the dedicated
+non-retryable `automation_fanout_limit`; it never materializes or requests the
+remainder. `Store.replace_attachments` independently consumes at most 1,001
+items and transactionally persists all descriptors only when the count is at
+most 1,000; overflow persists zero, so another adapter cannot bypass the bound.
+The pending message is then recorded through the existing permanent analysis
+failure path with that code, with zero fires, attempts, or scheduling admission.
+No truncated descriptor or matched-fire subset is committed. For an admitted
+descriptor set, the matcher stops before retaining candidate fire 1,001; fire
+overflow commits the email analysis and current rule-set revision with
+`rules_evaluation_error = "automation_fanout_limit"`, zero fires/attempts, and
+unchanged existing scheduling admission. Normal evaluation clears the nullable
+error field.
 
 `mark_analyzed` remains the single commit boundary:
 
@@ -425,6 +449,10 @@ Schema-20 migration behavior:
   identity check and no account-scoped rule can match them;
 - existing accounts remain unverified until the credential-backed identity
   verifier establishes their current key;
+- a schema-20 `BEFORE INSERT` trigger rejects every new message whose mailbox
+  key is null. Rows that already existed when migration began may remain null,
+  but an already-running schema-19 process cannot insert another legacy-shaped
+  row after migration. Its insert aborts before its later cursor update;
 - a schema-20 trigger rejects any `pending` to `analyzed` transition whose
   `rules_revision_at_analysis` remains null. An already-running schema-19
   process that reaches its old completion SQL after migration therefore rolls
@@ -490,8 +518,8 @@ Rule deletion does not rewrite already committed fires.
   size/count boundaries, and opposite controls.
 - Store tests prove canonical storage, immutable successor history, live-rule
   cap, system protection, digest verification, mailbox identity binding,
-  coherent list snapshots, tombstone non-resurrection, and rejection of invalid
-  definitions at the Store boundary.
+  coherent list/get snapshots, tombstone non-resurrection, and rejection of
+  invalid definitions at the Store boundary.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including current and stale same-value enablement plus two concurrent
   writers. A current same-value enablement preserves version, revision, and
@@ -509,8 +537,11 @@ Rule deletion does not rewrite already committed fires.
   algorithm, actual attachment counts above 64, mailbox identity mismatch,
   incoming analysis values versus null stored columns, mixed conditions, and
   deterministic order.
-- Boundary tests prove 1,000 descriptors and 1,000 matched fires can commit;
-  1,001 of either commits the analysis plus `automation_fanout_limit`, zero
+- Boundary tests prove 1,000 descriptors and 1,000 matched fires can commit.
+  Descriptor 1,001 stops each provider extractor, causes
+  `replace_attachments` to persist zero, and records a permanent
+  `automation_fanout_limit` analysis failure with no scheduling admission;
+  matcher candidate 1,001 commits the analysis plus that evaluation error, zero
   fires/attempts, and unchanged scheduling behavior.
 - A failure injected between analysis update and fire insertion leaves the
   message pending with no marker, fire, attempt, or scheduling admission.
@@ -529,6 +560,10 @@ Rule deletion does not rewrite already committed fires.
 - Gmail tests prove the credential key changes when the installed refresh token
   changes even when the normalized account address does not, and that the raw
   token is never persisted or exposed.
+- A polling-session race test pauses an old-key gateway before message insert,
+  advances the account key and resets its cursor, then proves the old session can
+  neither insert, advance the cursor, nor commit analysis/fires. The opposite
+  same-key control completes each mutation.
 - A pending row with a null or stale mailbox key is failed before content fetch;
   a reused provider message id cannot replace its descriptors through the new
   gateway.
@@ -537,6 +572,9 @@ Rule deletion does not rewrite already committed fires.
   remains deduplicated; legacy null-key rows and suppressions do not suppress it.
 - An old schema-19 completion started after migration is rejected by the null
   revision trigger; the message remains pending for schema-20 evaluation.
+- An old schema-19 message insert started after migration is rejected by the
+  null-key insert trigger before that process can advance the mailbox cursor;
+  rows present before migration remain readable and unverified.
 - The real reachability test uses an allowlisted INBOX sender. Its opposite
   control proves a non-allowlisted sender is not stored or evaluated.
 - A real engine `watcher.check` request with test mailbox/model adapters creates
@@ -568,6 +606,22 @@ Rule deletion does not rewrite already committed fires.
 - **Cross-mailbox message deduplication:** confirmed. Message uniqueness, seen
   checks, suppression keys, and source-event digests include the mailbox key;
   legacy null-key records cannot suppress a verified current mailbox.
+- **In-flight credential replacement:** confirmed. Message admission, cursor
+  advancement, and atomic analysis/fire commit compare the polling session's
+  expected key with the current account key; a stale session cannot write after
+  reconciliation advances the key.
+- **Pre-materialization descriptor cap:** confirmed. Provider extractors and the
+  Store independently stop at descriptor 1,001, persist no partial descriptor
+  set, and record a bounded permanent failure before matching.
+- **Rule-detail snapshot:** confirmed. Summary and definition are read from one
+  immutable-version snapshot.
+- **Schema-19 post-migration insert:** confirmed. A schema-20 insert trigger
+  rejects new null-key messages while preserving rows that predate migration.
+- **Internationalized sender-domain equivalence:** waived-out-of-scope. The
+  provider-specific Unicode-versus-IDNA sender normalization predates this rule
+  engine and does not block the approved ASCII-domain reachability proof; a
+  separate normalization slice must align persisted senders and rule operands
+  before promising internationalized-domain equivalence.
 - **Filename glob semantics:** confirmed. Final-component normalization and the
   exact `fnmatchcase` grammar are now canonical.
 - **Retirement immutability:** confirmed. Stored retirement mutation is removed;
@@ -679,3 +733,7 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 7 (2026-09-12):** made Gmail identity a credential epoch,
   preserved mailbox binding across enablement successors, and included mailbox
   identity in message admission, suppression, deduplication, and event identity.
+- **Core revision 8 (2026-09-12):** fenced active polls against credential
+  replacement, moved descriptor bounding ahead of materialization/persistence,
+  made rule-detail reads coherent, and blocked schema-19 inserts after migration;
+  internationalized sender-domain equivalence remains deferred.
