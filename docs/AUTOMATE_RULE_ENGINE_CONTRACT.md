@@ -551,6 +551,20 @@ their legacy three-part digest; they may join only legacy null-key messages and
 can never collide with or attach to a newly admitted verified-key message. The
 existing scheduling states and transitions otherwise remain unchanged.
 
+That database join is not permission to fetch through current credentials.
+Before `process_scheduling_automations` calls provider metadata or content for a
+recoverable run, it opens the gateway under the production mailbox operation
+lock and verifies source identity. A run with a companion identity requires an
+exact match with the current gateway key. A legacy run without a companion row
+may fetch only when the account's provider-specific migration record is
+`continuity_proven` and its proven key equals the current gateway key. A
+transient identity lookup defers the run with retryable
+`mailbox_identity_unavailable`; a mismatch, `replacement`, or `unresolved`
+legacy identity transitions through the existing `source_unavailable` state
+with `mailbox_identity_unverified`, before any metadata or content access. A
+provider message id reused by a replacement mailbox therefore cannot supply the
+old scheduling run's extraction input.
+
 ## 7. Matching and fire identity
 
 Scope provider/account comparisons are exact. An account-scoped rule also
