@@ -143,7 +143,7 @@ def _assert_source_mail_is_unmodified(environment: GreenMailEnvironment) -> None
         status, response = client.uid("SEARCH", None, "ALL")
         assert status == "OK"
         uids = response[0].split()
-        assert len(uids) == 2
+        assert len(uids) == 3
         for uid in uids:
             status, flags = client.uid("FETCH", uid, "(FLAGS)")
             assert status == "OK"
@@ -201,6 +201,16 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
     assert state is not None
     cursor, _last_check = state
     assert cursor is not None
+
+    _send_message(environment, subject="Plain message", body="Single-part body.")
+    session = load_configured_mailbox(runtime.config, runtime.store)
+    with mailbox_polling_session(session.gateway):
+        plain_changes = session.gateway.changes_since(cursor)
+        assert len(plain_changes.message_ids) == 1
+        plain_content = session.gateway.content(plain_changes.message_ids[0], 20_000)
+        assert plain_content.body == "Single-part body."
+        assert plain_content.attachments == ()
+    cursor = plain_changes.cursor
 
     _send_message(
         environment,
