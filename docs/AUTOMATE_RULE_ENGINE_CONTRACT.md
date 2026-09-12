@@ -72,6 +72,9 @@ These are observations, not roadmap claims.
   Connect. Existing `connect.attachment.invoke` is an interactive engine API
   path. Neither is evidence that generic Automate-to-Connect composition is
   implemented.
+- `watcher.check` admits only INBOX messages whose normalized sender is already
+  in the global allowlist (`service.py:1142-1145`). Rules evaluate that retained
+  set; this slice does not widen mailbox discovery.
 
 ## 3. Scope and reachability
 
@@ -85,8 +88,8 @@ There is no deployable state in which callers can save rules while
 Reachability proof:
 
 - A rule is created through the real engine API request dispatcher.
-- A real `watcher.check` request processes a pending message through the
-  existing mailbox/model orchestration.
+- A real `watcher.check` request processes an allowlisted pending INBOX message
+  through the existing mailbox/model orchestration.
 - The observable result is one durable pending fire and one stable attempt-one
   request identity per matching rule and attachment.
 - The proof asserts zero provider submission; this slice records work but does
@@ -132,11 +135,13 @@ An account-scoped version also stores an engine-owned
 `scope_account_incarnation`. `Store.put_rule` resolves it from the named mail
 account inside the rule mutation transaction; a missing account is
 `invalid_rule`. Schema 20 adds `identity_incarnation`, starting at 1, to mail
-accounts and captures it on each new message. The existing IMAP
-`mailbox_changed` path increments the incarnation atomically with its cursor
-reset. Existing rules therefore do not silently follow an account id to a new
-IMAP server/security/username identity. Provider-only and wildcard rules
-intentionally span account incarnations.
+accounts and captures it on each new message. Reauthorization compares the
+provider's stable mailbox identity: the existing IMAP mailbox hash, the
+Microsoft `MicrosoftPrincipal.key`, or the Gmail normalized account address.
+An identity change increments the incarnation atomically with cursor reset;
+Microsoft or Gmail address mismatches remain rejected. Existing rules therefore
+do not silently follow an account id to a different mailbox principal.
+Provider-only and wildcard rules intentionally span account incarnations.
 
 ### Closure declaration: source scope
 
@@ -164,8 +169,11 @@ The `connect.invoke` action object contains exactly:
   strict lower-case ASCII matching `^[a-z0-9]+(?:[.-][a-z0-9]+)*$`, maximum
   100 characters;
 - `capability` contains exactly `id` and `version`; `provider` contains exactly
-  `app_id`. `capability.version` uses the canonical Connect
+  `app_id`, `version`, and `instance_id`. `capability.version` uses the canonical Connect
   `CapabilityVersion`: strict text matching `^[0-9]+\.[0-9]+$`;
+- `provider.version` uses the canonical Connect app-version pattern
+  `^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`; `provider.instance_id`
+  is a lower-case UUIDv4;
 - `parameters` has at most sixteen entries. Every key is an `Identifier`; every
   value is exactly a strict string of at most 1,000 characters, a strict integer
   from -9,007,199,254,740,991 through 9,007,199,254,740,991, or a strict
@@ -175,6 +183,10 @@ The `connect.invoke` action object contains exactly:
 
 The canonical value types and bounds are shared with or mechanically compared
 against `connect.py`; the rule model may not define a looser parallel wire type.
+Rule creation records the caller-selected provider identity without discovering
+or substituting another registration. The immutable rule version therefore
+preserves the exact app id, app version, and instance id for a future dispatcher;
+an unavailable identity may fail later but is never silently re-resolved.
 
 It must include an `attachment.media_type` condition, so every admitted action
 selects a concrete persisted attachment.
@@ -351,6 +363,10 @@ Matching uses only:
 It never reads the body, headers, generated summary, suggested action, source
 bytes, provider catalog, or entitlement state.
 
+Only messages retained by the existing INBOX, sender-allowlist, and retention
+gates can reach matching. A rule does not expand discovery, and a syntactically
+valid sender operand outside that retained set may remain inert.
+
 Each fire stores an engine-generated UUID, stable source event digest,
 `rule_id`, immutable rule version, required message/part ids,
 `connect.invoke`, `pending_dispatch`, state version 1, and timestamps. The event
@@ -378,8 +394,9 @@ Rule deletion does not rewrite already committed fires.
 - Raw decoder tests prove duplicate members at the request, definition, action,
   and condition levels return `invalid_json`; distinct-member controls pass.
 - Parser boundaries cover unknown members, unsupported action kinds, canonical
-  Connect identifiers/versions/parameter scalars, every field/operator operand
-  schema, normalization, all size/count boundaries, and opposite controls.
+  Connect identifiers/capability versions/app versions/provider instances/
+  parameter scalars, every field/operator operand schema, normalization, all
+  size/count boundaries, and opposite controls.
 - Store tests prove canonical storage, immutable history, live-rule cap, system
   protection, digest verification, mailbox incarnation binding, and rejection
   of invalid definitions at the Store boundary.
@@ -409,6 +426,12 @@ Rule deletion does not rewrite already committed fires.
 - IMAP reauthorization with the same mailbox identity preserves its
   incarnation; a changed server/security/username increments it, resets the
   cursor, and prevents an older account-scoped rule from matching new messages.
+- Microsoft reauthorization with the same `MicrosoftPrincipal.key` preserves
+  its incarnation; a changed key with the same presented email increments it
+  before any new message can be admitted. Existing address-mismatch rejection
+  remains unchanged.
+- The real reachability test uses an allowlisted INBOX sender. Its opposite
+  control proves a non-allowlisted sender is not stored or evaluated.
 - A real engine `watcher.check` request with test mailbox/model adapters creates
   the expected durable fire and attempt through the production dispatcher and
   performs zero provider submissions.
@@ -430,6 +453,13 @@ Rule deletion does not rewrite already committed fires.
 - **IMAP mailbox rebinding:** confirmed by the reconnect path. Account-scoped
   versions bind to an engine-owned incarnation that changes with the mailbox
   identity; wildcard/provider-only rules intentionally do not.
+- **Microsoft principal rebinding:** confirmed. Incarnations use the existing
+  immutable Microsoft principal key, not only the presented email address.
+- **Connect provider selection:** confirmed. The immutable action carries exact
+  app id, app version, and instance id; this core neither discovers nor silently
+  substitutes a registration.
+- **Sender allowlist:** confirmed as an existing discovery gate. Evaluation and
+  reachability cover retained allowlisted INBOX messages only.
 - **Source scope definition:** confirmed. Rule definitions now carry a bounded
   provider/account scope with explicit wildcard and invalid-shape behavior.
 - **CRUD-before-evaluation deployment gap:** confirmed. Rule authority, CRUD,
@@ -496,3 +526,6 @@ Rule deletion does not rewrite already committed fires.
   rejected duplicate JSON members, fixed enablement no-op semantics, required
   digest verification and persisted-source dedupe keys, and bound
   account-scoped rules to mailbox identity incarnations.
+- **Core revision 4 (2026-09-12):** extended mailbox incarnation checks to
+  Microsoft principal changes, pinned actions to exact Connect provider
+  instances, and made the existing sender-allowlist discovery gate explicit.
