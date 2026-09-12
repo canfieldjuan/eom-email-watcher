@@ -132,16 +132,22 @@ Every definition has a `scope` object, defaulting to `{}`:
   account.
 
 An account-scoped version also stores an engine-owned
-`scope_account_incarnation`. `Store.put_rule` resolves it from the named mail
-account inside the rule mutation transaction; a missing account is
-`invalid_rule`. Schema 20 adds `identity_incarnation`, starting at 1, to mail
-accounts and captures it on each new message. Reauthorization compares the
-provider's stable mailbox identity: the existing IMAP mailbox hash, the
-Microsoft `MicrosoftPrincipal.key`, or the Gmail normalized account address.
-An identity change increments the incarnation atomically with cursor reset;
-Microsoft or Gmail address mismatches remain rejected. Existing rules therefore
-do not silently follow an account id to a different mailbox principal.
-Provider-only and wildcard rules intentionally span account incarnations.
+`scope_mailbox_identity_key`. The 64-character key is the existing IMAP
+`imap_mailbox_identity` hash, the existing Microsoft `MicrosoftPrincipal.key`,
+or SHA-256 over the Gmail normalized account address. A verifier
+derives the key from the installed credentials under their existing lock before
+an account-scoped rule is accepted and before `watcher.check` admits messages.
+`Store.put_rule` binds the verified key inside its mutation transaction; a
+missing account or unverifiable identity is `invalid_rule`.
+
+Schema 20 adds nullable `mailbox_identity_key` to mail accounts and messages.
+Every newly admitted message receives the key derived from the gateway that
+produced it, not a later account lookup. If credentials were replaced but the
+process died before database bookkeeping, the next verifier observes the
+installed identity, updates the account key and resets its cursor before
+fetching. A mismatch can therefore make an old account-scoped rule inert but
+cannot let it follow a new mailbox. Microsoft or Gmail address mismatches remain
+rejected. Provider-only and wildcard rules intentionally span mailbox keys.
 
 ### Closure declaration: source scope
 
@@ -152,7 +158,7 @@ Provider-only and wildcard rules intentionally span account incarnations.
 3. **Outside behavior:** unknown members, malformed values, or account ids
    without a provider are rejected as `invalid_rule`. A well-formed provider
    value that does not exist matches nothing. A named account that does not
-   exist is rejected by `Store.put_rule` while binding its incarnation.
+   exist is rejected by `Store.put_rule` while binding its mailbox identity.
 
 ### Closure declaration: action kinds
 
@@ -200,6 +206,9 @@ selects a concrete persisted attachment.
 3. **Outside behavior:** unknown fields/operators and unsupported pairs are
    rejected as `invalid_rule`, so novel input cannot become an action.
 
+Every condition object contains exactly the required members `field`, `op`, and
+`value`. No aliases, defaults, or extra members are accepted.
+
 The closed matrix is:
 
 | Field | Operators |
@@ -238,6 +247,12 @@ Booleans are not integers for numeric operands. `in` never accepts a scalar;
 bound: evaluation compares it with the actual persisted attachment count and
 makes no 64-attachment workload claim.
 
+Filename matching is platform-independent: replace `\\` with `/` in the
+persisted filename, take the final slash-delimited component, case-fold both it
+and the admitted pattern, then apply Python `fnmatch.fnmatchcase`. The pattern
+grammar is exactly `*`, `?`, `[seq]`, and `[!seq]` as implemented by `fnmatch`;
+there is no escape syntax. Patterns themselves may contain neither slash kind.
+
 ### Open-input parser default
 
 JSON object shape is open input. The top-level engine decoder uses duplicate
@@ -256,8 +271,8 @@ The schema contains:
 - singleton `automation_rule_set(revision)`;
 - current `automation_rules` identities and flags;
 - immutable `automation_rule_versions` with definition/tombstone kind,
-  canonical definition bytes and digest, enabled state, optional account
-  incarnation, global revision, retirement revision, and accepted timestamp.
+  canonical definition bytes and digest, enabled state, optional mailbox
+  identity key, global revision, and accepted timestamp.
 
 `MAX_AUTOMATION_RULES` is 100 live, non-deleted rules. Create counts live rules
 inside its `BEGIN IMMEDIATE` transaction and returns `rule_limit` instead of
@@ -266,10 +281,11 @@ evaluates at most 100 current definitions. Tombstones and immutable retired
 versions do not consume a live-rule slot.
 
 Every mutation holds `BEGIN IMMEDIATE`, increments the global revision once,
-retires the prior version, and inserts one immutable successor. Direct version
-updates and deletes are rejected by database triggers. No compaction exists in
-this slice; every historical version remains available while any fire can refer
-to it.
+inserts one immutable successor, and moves the current-rule pointer. Version
+rows have no mutable retirement column: a version is superseded at the next
+version's revision, or remains current in `automation_rules`. Database triggers
+reject every version-row update and delete. No compaction exists in this slice;
+every historical version remains available while any fire can refer to it.
 
 Create omits `rule_id` and `expected_version`. Edit, delete, and enable/disable
 require the current version read by the caller. The comparison occurs inside
@@ -282,6 +298,9 @@ current value is a true no-op: it returns the current summary without changing
 the rule version, global revision, or timestamps. A stale same-value request
 still returns `stale_rule` because compare-and-set precedes the no-op check.
 
+New rules are enabled and non-system by default. Public create cannot override
+either flag.
+
 Engine operations:
 
 - `automation.rules.list` returns the global revision and bounded summaries of
@@ -293,6 +312,28 @@ Engine operations:
   tombstone version.
 - `automation.rules.set_enabled` accepts
   `{rule_id, expected_version, enabled}`.
+
+Each operation uses an exact strict payload model. `rule_id` is a lower-case
+UUIDv4, `expected_version` is a strict integer from 1 through
+9,223,372,036,854,775, and `enabled` is a strict boolean. Unknown members,
+booleans used as versions, zero/negative/overflowing versions, missing members,
+and wrong types return `invalid_request` before Store access. List accepts an
+empty payload only; create/edit are the two exact `put` shapes above.
+
+Successful result objects are exact:
+
+- `RuleSummary` is `{rule_id, version, enabled, system, valid, name,
+  invalid_reason, created_at, updated_at}`. Version is the current positive
+  integer; `name` is the parsed name or null; `invalid_reason` is null for a
+  valid row and bounded text otherwise; timestamps are UTC ISO-8601 strings.
+- `RuleDetail` is `{summary, definition}` where `definition` is the canonical
+  object for a valid current version and null for an invalid row.
+- list returns `{revision, rules}` with a non-negative global revision and
+  summaries; get, put, and set-enabled return `{rule: RuleDetail}`; delete
+  returns `{rule_id, version, deleted: true}` for the tombstone version.
+
+List reads the singleton revision and all summaries inside one explicit SQLite
+read transaction, so the returned revision describes the returned rule set.
 
 Public callers cannot set `system`, revision values, timestamps, digests, or
 version numbers. Errors are `invalid_rule`, `stale_rule`, `rule_limit`,
@@ -314,9 +355,11 @@ another rule to become an action.
 3. Read current, enabled, non-deleted definition versions, ordered by rule
    creation time and `rule_id`.
 4. Verify each definition digest, parse it, and exclude invalid rows.
-5. Read the message, its captured account incarnation, and its persisted
+5. Read the message, its captured mailbox identity key, and its persisted
    attachment descriptors ordered by position and `part_id`.
-6. Run the pure matcher in memory. It performs no network, filesystem, model,
+6. Run the pure matcher against that source data and the validated incoming
+   analysis `result` passed to `mark_analyzed`. It never reads the still-pending
+   message's unset analysis columns and performs no network, filesystem, model,
    Connect, calendar, or notification call.
 7. Update the message analysis and set `rules_revision_at_analysis` to the
    exact revision read in step 2.
@@ -340,13 +383,22 @@ Schema-20 migration behavior:
 - messages already analyzed when schema 20 is installed receive
   `rules_revision_at_analysis = 0` and never fire retroactively;
 - pending messages retain `NULL` until their first successful analysis;
-- existing mail accounts and messages receive identity incarnation 1;
+- legacy messages receive `mailbox_identity_key = NULL` because their historical
+  mailbox principal cannot be proven; account-scoped rules never match them;
+- existing accounts remain unverified until the credential-backed identity
+  verifier establishes their current key;
+- a schema-20 trigger rejects any `pending` to `analyzed` transition whose
+  `rules_revision_at_analysis` remains null. An already-running schema-19
+  process that reaches its old completion SQL after migration therefore rolls
+  back instead of bypassing evaluation; a transaction that completed before
+  migration is assigned revision 0 before rule CRUD becomes available;
 - unpublished local draft databases are not a compatibility target.
 
 ## 7. Matching and fire identity
 
 Scope provider/account comparisons are exact. An account-scoped rule also
-requires its captured account incarnation to equal the message incarnation.
+requires its captured mailbox identity key to equal the message key; null never
+equals a scoped key.
 Message-level conditions are evaluated once; attachment-level conditions are
 evaluated for each descriptor. All conditions are ANDed. A rule that matches
 two attachments creates two fires; two matching rules may create independent
@@ -397,23 +449,26 @@ Rule deletion does not rewrite already committed fires.
   Connect identifiers/capability versions/app versions/provider instances/
   parameter scalars, every field/operator operand schema, normalization, all
   size/count boundaries, and opposite controls.
-- Store tests prove canonical storage, immutable history, live-rule cap, system
-  protection, digest verification, mailbox incarnation binding, and rejection
-  of invalid definitions at the Store boundary.
+- Store tests prove canonical storage, immutable successor history, live-rule
+  cap, system protection, digest verification, mailbox identity binding,
+  coherent list snapshots, and rejection of invalid definitions at the Store
+  boundary.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including current and stale same-value enablement plus two concurrent
   writers. A current same-value enablement preserves version, revision, and
   timestamps.
-- Engine API tests exercise all five operations and every error mapping.
+- Engine API tests exercise all five strict request and response schemas plus
+  every error mapping. Create returns an enabled, non-system version 1 rule.
 - Schema 19 to 20 migration preserves existing data while installing rule
   authority and atomic evaluation together.
 
 ### Atomic evaluation
 
 - Matcher tests cover every canonical field/operator pair, scope, missing
-  optional data, case-folding, final-component filename globs, actual
-  attachment counts above 64, account incarnation mismatch, mixed conditions,
-  and deterministic order.
+  optional data, case-folding, the exact cross-platform `fnmatchcase` filename
+  algorithm, actual attachment counts above 64, mailbox identity mismatch,
+  incoming analysis values versus null stored columns, mixed conditions, and
+  deterministic order.
 - A failure injected between analysis update and fire insertion leaves the
   message pending with no marker, fire, attempt, or scheduling admission.
 - Concurrent rule mutation and analysis commit one coherent revision.
@@ -421,15 +476,15 @@ Rule deletion does not rewrite already committed fires.
   a different part or rule version passes. Nonexistent rule-version and
   message-attachment inserts are rejected.
 - The schema-20 migration marks historical analyzed messages revision 0 and
-  leaves pending messages null while initializing account/message incarnations
-  to 1.
-- IMAP reauthorization with the same mailbox identity preserves its
-  incarnation; a changed server/security/username increments it, resets the
-  cursor, and prevents an older account-scoped rule from matching new messages.
-- Microsoft reauthorization with the same `MicrosoftPrincipal.key` preserves
-  its incarnation; a changed key with the same presented email increments it
-  before any new message can be admitted. Existing address-mismatch rejection
+  leaves pending messages' revision null and every legacy message's mailbox key
+  unverified.
+- Credential-backed preflight preserves a matching IMAP or Microsoft identity
+  key. After replacement or an injected crash between file install and database
+  bookkeeping, it establishes the new key and cursor before fetching; new
+  messages cannot inherit the old key. Existing address-mismatch rejection
   remains unchanged.
+- An old schema-19 completion started after migration is rejected by the null
+  revision trigger; the message remains pending for schema-20 evaluation.
 - The real reachability test uses an allowlisted INBOX sender. Its opposite
   control proves a non-allowlisted sender is not stored or evaluated.
 - A real engine `watcher.check` request with test mailbox/model adapters creates
@@ -440,6 +495,22 @@ Rule deletion does not rewrite already committed fires.
 
 ## 9. Review-thread disposition
 
+- **Reauthorization crash window / legacy mailbox identity:** confirmed. Stable
+  credential-derived keys replace inferred numeric incarnations; preflight
+  reconciles installed credentials before fetch and legacy messages remain
+  unbound.
+- **Filename glob semantics:** confirmed. Final-component normalization and the
+  exact `fnmatchcase` grammar are now canonical.
+- **Retirement immutability:** confirmed. Stored retirement mutation is removed;
+  supersession is derived from the next immutable version/current-rule pointer,
+  and every version-row update remains forbidden.
+- **Create default, strict mutation envelopes, and response schemas:** confirmed.
+  Exact request/result models now expose the version required for CAS.
+- **Incoming analysis values:** confirmed. The matcher receives the validated
+  `mark_analyzed` result rather than reading unset stored columns.
+- **Coherent list:** confirmed. Revision and summaries share one read snapshot.
+- **Schema-19 in-flight completion:** confirmed. A schema-20 trigger prevents old
+  completion SQL from committing a null evaluation marker after migration.
 - **Closed action and condition values / duplicate JSON:** confirmed. The
   contract now defines every action and operand type/bound, shares the Connect
   wire constraints, and rejects duplicate members before model validation.
@@ -451,9 +522,9 @@ Rule deletion does not rewrite already committed fires.
   and part identity plus immutable rule identity, with a canonical event digest
   defined separately.
 - **IMAP mailbox rebinding:** confirmed by the reconnect path. Account-scoped
-  versions bind to an engine-owned incarnation that changes with the mailbox
-  identity; wildcard/provider-only rules intentionally do not.
-- **Microsoft principal rebinding:** confirmed. Incarnations use the existing
+  versions bind to the credential-derived mailbox key; wildcard/provider-only
+  rules intentionally do not.
+- **Microsoft principal rebinding:** confirmed. The binding uses the existing
   immutable Microsoft principal key, not only the presented email address.
 - **Connect provider selection:** confirmed. The immutable action carries exact
   app id, app version, and instance id; this core neither discovers nor silently
@@ -529,3 +600,7 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 4 (2026-09-12):** extended mailbox incarnation checks to
   Microsoft principal changes, pinned actions to exact Connect provider
   instances, and made the existing sender-allowlist discovery gate explicit.
+- **Core revision 5 (2026-09-12):** replaced inferred mailbox incarnations with
+  credential-derived identity keys and crash preflight; closed request/response,
+  condition, glob, retirement, matcher-input, list-snapshot, legacy-message, and
+  schema-upgrade completion boundaries.
