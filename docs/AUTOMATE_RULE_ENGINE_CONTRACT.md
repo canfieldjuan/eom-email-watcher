@@ -134,11 +134,17 @@ Every definition has a `scope` object, defaulting to `{}`:
 An account-scoped version also stores an engine-owned
 `scope_mailbox_identity_key`. The 64-character key is the existing IMAP
 `imap_mailbox_identity` hash, the existing Microsoft `MicrosoftPrincipal.key`,
-or SHA-256 over the Gmail normalized account address. A verifier
-derives the key from the installed credentials under their existing lock before
-an account-scoped rule is accepted and before `watcher.check` admits messages.
-`Store.put_rule` binds the verified key inside its mutation transaction; a
-missing account or unverifiable identity is `invalid_rule`.
+or SHA-256 over the UTF-8 NUL-joined literal `gmail-credential-v1` and the
+installed Gmail refresh token. The refresh token is read under its existing
+credential lock and is never stored in the database or returned by the engine;
+only its one-way credential-epoch key is persisted. Gmail exposes no immutable
+principal identifier through its current profile adapter, so replacing the
+installed refresh token intentionally creates a new mailbox identity even when
+the normalized account address is unchanged. A verifier derives the key from
+the installed credentials under their existing lock before an account-scoped
+rule is accepted and before `watcher.check` admits messages. `Store.put_rule`
+binds the verified key inside its mutation transaction; a missing account or
+unverifiable identity is `invalid_rule`.
 
 Schema 20 adds nullable `mailbox_identity_key` to mail accounts and messages.
 Every newly admitted message receives the key derived from the gateway that
@@ -148,6 +154,15 @@ installed identity, updates the account key and resets its cursor before
 fetching. A mismatch can therefore make an old account-scoped rule inert but
 cannot let it follow a new mailbox. Microsoft or Gmail address mismatches remain
 rejected. Provider-only and wildcard rules intentionally span mailbox keys.
+
+Schema 20 also makes the mailbox key part of every persisted source identity:
+message lookup and uniqueness, `has_seen_message`, retained suppression keys,
+and source-event digests use `(provider, account_id, mailbox_identity_key,
+provider_message_id)`. The old three-part message uniqueness index is removed.
+A legacy row or suppression record whose mailbox key is null never suppresses a
+message admitted under a verified current key. A provider message id reused by
+a replacement mailbox therefore denotes a new message rather than colliding
+with the old mailbox's retained row.
 
 Before `_process_pending` fetches content for any retained row, it requires the
 row's non-null mailbox key to equal the current gateway key. A null or mismatched
@@ -305,6 +320,12 @@ current value is a true no-op: it returns the current summary without changing
 the rule version, global revision, or timestamps. A stale same-value request
 still returns `stale_rule` because compare-and-set precedes the no-op check.
 
+A value-changing enable/disable successor copies the prior immutable version's
+`scope_mailbox_identity_key`; toggling a rule never rebinds it to whatever
+credentials happen to be installed at mutation time. An explicit definition
+edit resolves the current credential-backed key and therefore is the only core
+mutation that can intentionally rebind an account-scoped rule.
+
 New rules are enabled and non-system by default. Public create cannot override
 either flag.
 
@@ -439,8 +460,9 @@ valid sender operand outside that retained set may remain inert.
 Each fire stores an engine-generated UUID, stable source event digest,
 `rule_id`, immutable rule version, required message/part ids,
 `connect.invoke`, `pending_dispatch`, state version 1, and timestamps. The event
-digest is SHA-256 over the UTF-8 NUL-joined source provider, account id, and
-provider message id, matching the existing `message_source_key` derivation. A
+digest is SHA-256 over the UTF-8 NUL-joined source provider, account id,
+mailbox identity key, and provider message id, matching the schema-20
+`message_source_key` derivation. A
 unique constraint on `(message_id, part_id, rule_id, rule_version)` prevents a
 duplicate committed match without relying on generated values. Insert guards
 require the referenced definition version and exact message attachment to
@@ -473,7 +495,8 @@ Rule deletion does not rewrite already committed fires.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including current and stale same-value enablement plus two concurrent
   writers. A current same-value enablement preserves version, revision, and
-  timestamps.
+  timestamps. A value-changing toggle preserves the prior mailbox identity key;
+  an explicit definition edit can bind the current key.
 - Engine API tests exercise all five strict request and response schemas plus
   every error mapping. Create returns an enabled, non-system version 1 rule.
 - Schema 19 to 20 migration preserves existing data while installing rule
@@ -503,9 +526,15 @@ Rule deletion does not rewrite already committed fires.
   bookkeeping, it establishes the new key and cursor before fetching; new
   messages cannot inherit the old key. Existing address-mismatch rejection
   remains unchanged.
+- Gmail tests prove the credential key changes when the installed refresh token
+  changes even when the normalized account address does not, and that the raw
+  token is never persisted or exposed.
 - A pending row with a null or stale mailbox key is failed before content fetch;
   a reused provider message id cannot replace its descriptors through the new
   gateway.
+- Message admission tests prove the same provider message id under a replacement
+  mailbox key creates a distinct message, while a true replay under the same key
+  remains deduplicated; legacy null-key rows and suppressions do not suppress it.
 - An old schema-19 completion started after migration is rejected by the null
   revision trigger; the message remains pending for schema-20 evaluation.
 - The real reachability test uses an allowlisted INBOX sender. Its opposite
@@ -529,6 +558,16 @@ Rule deletion does not rewrite already committed fires.
   credential-derived keys replace inferred numeric incarnations; preflight
   reconciles installed credentials before fetch and legacy messages remain
   unbound.
+- **Gmail principal identity:** confirmed. Because the current gateway exposes no
+  immutable Gmail principal identifier, the mailbox key is a one-way credential
+  epoch derived from the installed refresh token; replacement cannot inherit the
+  prior rule or message namespace.
+- **Enablement rebinding:** confirmed. Value-changing toggles copy the prior
+  immutable mailbox key; only an explicit definition edit resolves and binds the
+  current credential key.
+- **Cross-mailbox message deduplication:** confirmed. Message uniqueness, seen
+  checks, suppression keys, and source-event digests include the mailbox key;
+  legacy null-key records cannot suppress a verified current mailbox.
 - **Filename glob semantics:** confirmed. Final-component normalization and the
   exact `fnmatchcase` grammar are now canonical.
 - **Retirement immutability:** confirmed. Stored retirement mutation is removed;
@@ -637,3 +676,6 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 6 (2026-09-12):** added the pre-fetch mailbox-key gate,
   deterministic all-or-zero fan-out limits, tombstone non-resurrection, and the
   exact `rules.get` payload.
+- **Core revision 7 (2026-09-12):** made Gmail identity a credential epoch,
+  preserved mailbox binding across enablement successors, and included mailbox
+  identity in message admission, suppression, deduplication, and event identity.
