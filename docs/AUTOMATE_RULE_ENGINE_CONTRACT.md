@@ -40,7 +40,8 @@ split.
 
 ### Must not change
 
-- The existing scheduling automation remains on its present code path.
+- The existing scheduling automation keeps its decision/state behavior; only its
+  source identity and joins gain the mailbox key required by schema 20.
 - Existing interactive Connect invocation and the consumer-side queue remain
   unchanged.
 - No Invoice Processor or provider-side queue behavior changes.
@@ -170,10 +171,14 @@ Schema 20 also makes the mailbox key part of every persisted source identity:
 message lookup and uniqueness, `has_seen_message`, retained suppression keys,
 and source-event digests use `(provider, account_id, mailbox_identity_key,
 provider_message_id)`. The old three-part message uniqueness index is removed.
-A legacy row or suppression record whose mailbox key is null never suppresses a
-message admitted under a verified current key. A provider message id reused by
-a replacement mailbox therefore denotes a new message rather than colliding
-with the old mailbox's retained row.
+For an upgraded account, schema 20 records a separate immutable
+`legacy_mailbox_identity_key` when the first production verifier establishes the
+current key. Legacy null-key message rows and deletion suppressions participate
+in `has_seen_message` only while the admitted key equals that one migration key;
+their original suppression expiry remains unchanged. A later credential/epoch
+change advances only the current key, so legacy seen/deleted markers cannot
+follow a replacement mailbox. A provider message id reused by that replacement
+therefore denotes a new message rather than colliding with the old namespace.
 
 Before `_process_pending` fetches content for any retained row, it requires the
 row's non-null mailbox key to equal the current gateway key. A null or mismatched
@@ -194,11 +199,14 @@ key and applies the provider-specific cursor transition in one database
 transaction. This compare-and-set fence is used instead of holding a
 credential-file lock across network/model work.
 
-Dry-run is strictly non-mutating and does not hold the production polling lock.
-It derives the installed/gateway identity and compares it with the stored
-account key, but never reconciles the key, resets a cursor, binds a rule, inserts
-a message, or advances state. A mismatch returns `mailbox_identity_changed`
-before mailbox polling or analysis, leaving production state untouched.
+Dry-run is strictly non-mutating but holds the same production mailbox operation
+lock as a real check for its entire preview, including runtime/gateway
+construction, identity comparison, mailbox reads, and model analysis. It never
+reconciles the key, resets a cursor, binds a rule, inserts a message, or advances
+state. A mismatch returns `mailbox_identity_changed` before mailbox polling or
+analysis, leaving production state untouched. Unsupported locking returns
+`unsupported_platform`; contention returns retryable `mailbox_busy`, matching
+rule mutations.
 
 ### Closure declaration: source scope
 
@@ -472,7 +480,8 @@ rather than smuggled into the Automate core.
 7. Update the message analysis and set `rules_revision_at_analysis` to the
    exact revision read in step 2.
 8. Insert every matched fire and its attempt-one identity.
-9. Run the existing scheduling-admission block unchanged.
+9. Run the existing scheduling-admission decision with the current message's
+   mailbox key; only source identity plumbing changes.
 10. Commit.
 
 Any exception before commit rolls back the analysis, revision marker, fires,
@@ -495,7 +504,9 @@ Schema-20 migration behavior:
   mailbox principal cannot be proven; pending legacy rows fail the pre-fetch
   identity check and no account-scoped rule can match them;
 - existing accounts remain unverified until the credential-backed identity
-  verifier establishes their current key;
+  verifier establishes their current key and, exactly once, their immutable
+  legacy migration key. Legacy null-key seen/deletion markers apply only when
+  the current key still equals that migration key and retain their old expiry;
 - a schema-20 `BEFORE INSERT` trigger rejects every new message whose mailbox
   key is null. Rows that already existed when migration began may remain null,
   but an already-running schema-19 process cannot insert another legacy-shaped
@@ -506,6 +517,16 @@ Schema-20 migration behavior:
   back instead of bypassing evaluation; a transaction that completed before
   migration is assigned revision 0 before rule CRUD becomes available;
 - unpublished local draft databases are not a compatibility target.
+
+Schema 20 also adds nullable `source_mailbox_identity_key` to existing
+`automation_runs`. New scheduling admission accepts the analyzed message's
+non-null mailbox key and derives `source_message_key` from the same four-part
+source tuple as messages and fires. Every scheduling join requires the run and
+message mailbox keys to be equal in addition to the digest. Migrated runs keep a
+null source key and their legacy three-part digest; they may join only legacy
+null-key messages and can never collide with or attach to a newly admitted
+verified-key message. The existing scheduling states and transitions otherwise
+remain unchanged.
 
 ## 7. Matching and fire identity
 
@@ -624,16 +645,21 @@ Rule deletion does not rewrite already committed fires.
   advances the account key and applies its cursor transition, then proves the old
   session can neither insert, advance the cursor, nor commit analysis/fires. The
   opposite same-key control completes each mutation.
-- A dry-run with matching identity performs its existing preview without any
-  write. A dry-run with an installed/stored identity mismatch returns
-  `mailbox_identity_changed` and leaves the account key, cursor, messages,
-  rules, analyses, and fires byte-for-byte unchanged.
+- A dry-run with matching identity performs its existing preview under the
+  production mailbox operation lock without any write. A race test blocks a
+  reconnect until preview completion. A dry-run with an installed/stored
+  identity mismatch returns `mailbox_identity_changed` and leaves the account
+  key, cursor, messages, rules, analyses, and fires byte-for-byte unchanged.
 - A pending row with a null or stale mailbox key is failed before content fetch;
   a reused provider message id cannot replace its descriptors through the new
   gateway.
 - Message admission tests prove the same provider message id under a replacement
   mailbox key creates a distinct message, while a true replay under the same key
-  remains deduplicated; legacy null-key rows and suppressions do not suppress it.
+  remains deduplicated. Legacy null-key rows/suppressions prevent replay only for
+  the first verified migration key and do not suppress a later replacement key.
+- Scheduling tests admit the same provider message id under two mailbox keys and
+  prove distinct source keys/runs with joins confined to the matching key.
+  Migrated null-key runs join only legacy null-key messages.
 - An old schema-19 completion started after migration is rejected by the null
   revision trigger; the message remains pending for schema-20 evaluation.
 - An old schema-19 message insert started after migration is rejected by the
@@ -669,7 +695,8 @@ Rule deletion does not rewrite already committed fires.
   current credential key.
 - **Cross-mailbox message deduplication:** confirmed. Message uniqueness, seen
   checks, suppression keys, and source-event digests include the mailbox key;
-  legacy null-key records cannot suppress a verified current mailbox.
+  legacy null-key records apply only to the immutable first migration key and
+  cannot suppress a later replacement mailbox.
 - **In-flight credential replacement:** confirmed. Message admission, cursor
   advancement, and atomic analysis/fire commit compare the polling session's
   expected key with the current account key; a stale session cannot write after
@@ -689,8 +716,9 @@ Rule deletion does not rewrite already committed fires.
 - **IMAP mailbox epoch:** confirmed. The binding includes the authenticated
   INBOX `UIDVALIDITY`, so a recreated/reset mailbox cannot inherit scoped rules
   merely by reusing credential fields.
-- **Dry-run reconciliation:** confirmed. Dry-run compares identities and fails
-  on mismatch without reconciling credentials or mutating production state.
+- **Dry-run reconciliation:** confirmed. The mailbox operation lock covers the
+  complete read-only preview; dry-run compares identities and fails on mismatch
+  without reconciling credentials or mutating production state.
 - **IMAP epoch recovery:** confirmed. Reconciliation preserves the stale cursor
   and last-success timestamp so the existing recovery scan admits new-epoch mail
   before committing its cursor.
@@ -708,6 +736,15 @@ Rule deletion does not rewrite already committed fires.
 - **Scheduling on descriptor overflow:** confirmed. Overflow disables only
   automation fire creation; the existing analysis and scheduling commit remains
   unchanged.
+- **Legacy deletion suppressions:** confirmed. Legacy markers remain effective
+  through their original expiry for the first verified migration key, but never
+  follow a later credential/epoch key.
+- **Scheduling source identity:** confirmed. New run identity and every join use
+  the mailbox key; migrated null-key runs remain confined to null-key messages.
+- **Matcher source-byte caps:** waived-out-of-scope. Persisted mailbox metadata
+  is already open-length input; this core bounds rules, descriptors loaded, and
+  fires, while per-field/aggregate storage normalization is a separate ingestion
+  hardening slice.
 - **Internationalized sender-domain equivalence:** waived-out-of-scope. The
   provider-specific Unicode-versus-IDNA sender normalization predates this rule
   engine and does not block the approved ASCII-domain reachability proof; a
@@ -783,6 +820,7 @@ Rule deletion does not rewrite already committed fires.
 - `calendar.propose`, `notify`, and replacement of the shipped scheduling
   automation.
 - Rule-version compaction.
+- Per-field or aggregate byte caps for pre-existing persisted mailbox metadata.
 - Provider-side queueing or any Invoice Processor change. Invoice Processor
   continues to accept one job at a time by design; any future watcher dispatch
   uses the watcher's existing consumer-side queue.
@@ -837,3 +875,7 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 11 (2026-09-12):** defined rule-lock errors and canonical
   definition bytes, kept scheduling unchanged on automation fan-out, and
   deferred pre-existing provider descriptor materialization hardening.
+- **Core revision 12 (2026-09-12):** serialized read-only previews with account
+  replacement, preserved legacy suppression for only the first migration key,
+  and extended scheduling source identity/joins with mailbox keys; matcher-source
+  byte caps remain deferred ingestion hardening.
