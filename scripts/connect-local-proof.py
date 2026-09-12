@@ -27,9 +27,10 @@ from connect_reference_provider import (
 )
 
 from eom_email_watcher import connect, engine_api, entitlement
-from eom_email_watcher.db import SCHEMA_VERSION
+from eom_email_watcher.db import SCHEMA_VERSION, MailAccount
+from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
-from eom_email_watcher.runtime import load_runtime
+from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 FIXTURE_PART_ID = "fixture-mime-part"
 
@@ -173,6 +174,23 @@ notifications_enabled = false
         encoding="utf-8",
     )
     path.chmod(0o600)
+
+
+def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
+    account = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+    if account is None:
+        account = runtime.store.register_mail_account(
+            DEFAULT_MAIL_PROVIDER,
+            DEFAULT_MAIL_ACCOUNT_ID,
+            display_name="Fixture mailbox",
+            address="fixture@example.invalid",
+            active=True,
+        )
+    token_file = mail_account_token_file(runtime.config, account)
+    token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token_file.write_bytes(b"fixture-only")
+    token_file.chmod(0o600)
+    return account
 
 
 def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
@@ -397,6 +415,7 @@ def main() -> None:
             config_path = email_dir / "config.toml"
             write_config(config_path)
             runtime = load_runtime(config_path)
+            fixture_account = install_fixture_mailbox(runtime)
             runtime.store.add_message(
                 message_id="fixture-message",
                 thread_id=None,
@@ -404,6 +423,8 @@ def main() -> None:
                 sender_name="Fixture Sender",
                 subject="Fixture document",
                 received_at="2026-08-29T12:00:00+00:00",
+                provider=fixture_account.provider,
+                account_id=fixture_account.account_id,
             )
             runtime.store.replace_attachments(
                 "fixture-message",
