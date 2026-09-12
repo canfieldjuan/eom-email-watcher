@@ -149,6 +149,12 @@ fetching. A mismatch can therefore make an old account-scoped rule inert but
 cannot let it follow a new mailbox. Microsoft or Gmail address mismatches remain
 rejected. Provider-only and wildcard rules intentionally span mailbox keys.
 
+Before `_process_pending` fetches content for any retained row, it requires the
+row's non-null mailbox key to equal the current gateway key. A null or mismatched
+row is recorded as a non-retryable `mailbox_identity_unverified` analysis
+failure; its provider message id is never fetched through the replacement
+gateway, its attachment descriptors are not replaced, and no rule is evaluated.
+
 ### Closure declaration: source scope
 
 1. **Membership:** CLOSED for the two scope members, `provider` and
@@ -288,10 +294,11 @@ reject every version-row update and delete. No compaction exists in this slice;
 every historical version remains available while any fire can refer to it.
 
 Create omits `rule_id` and `expected_version`. Edit, delete, and enable/disable
-require the current version read by the caller. The comparison occurs inside
-the same write transaction before a no-op or new revision. A stale request
-returns `stale_rule`; it never silently overwrites an intervening edit or
-enablement change.
+require the current live version read by the caller. The comparison occurs
+inside the same write transaction before a no-op or new revision. A stale
+request returns `stale_rule`; it never silently overwrites an intervening edit
+or enablement change. Tombstoned identities cannot be edited, enabled, disabled,
+or deleted again and return `not_found`; resurrection is not a core operation.
 
 After a successful expected-version comparison, setting `enabled` to its
 current value is a true no-op: it returns the current summary without changing
@@ -305,7 +312,8 @@ Engine operations:
 
 - `automation.rules.list` returns the global revision and bounded summaries of
   live rules.
-- `automation.rules.get` returns one rule and its canonical definition.
+- `automation.rules.get` accepts exactly `{rule_id}` and returns one rule and
+  its canonical definition.
 - `automation.rules.put` creates from `{definition}` or edits from
   `{rule_id, expected_version, definition}`.
 - `automation.rules.delete` accepts `{rule_id, expected_version}` and writes a
@@ -348,6 +356,14 @@ another rule to become an action.
 
 ## 6. Atomic analysis-time evaluation
 
+`MAX_AUTOMATION_ATTACHMENTS` and `MAX_AUTOMATION_FIRES_PER_MESSAGE` are both
+1,000. The Store counts persisted descriptors before matching, and the matcher
+stops before retaining candidate 1,001. Either overflow commits the email
+analysis and current rule-set revision with
+`rules_evaluation_error = "automation_fanout_limit"`, creates zero fires or
+attempts, and leaves existing scheduling admission unchanged. It never commits
+a truncated subset. Normal evaluation clears the nullable error field.
+
 `mark_analyzed` remains the single commit boundary:
 
 1. Begin `IMMEDIATE` and require the message to be pending.
@@ -384,7 +400,8 @@ Schema-20 migration behavior:
   `rules_revision_at_analysis = 0` and never fire retroactively;
 - pending messages retain `NULL` until their first successful analysis;
 - legacy messages receive `mailbox_identity_key = NULL` because their historical
-  mailbox principal cannot be proven; account-scoped rules never match them;
+  mailbox principal cannot be proven; pending legacy rows fail the pre-fetch
+  identity check and no account-scoped rule can match them;
 - existing accounts remain unverified until the credential-backed identity
   verifier establishes their current key;
 - a schema-20 trigger rejects any `pending` to `analyzed` transition whose
@@ -451,8 +468,8 @@ Rule deletion does not rewrite already committed fires.
   size/count boundaries, and opposite controls.
 - Store tests prove canonical storage, immutable successor history, live-rule
   cap, system protection, digest verification, mailbox identity binding,
-  coherent list snapshots, and rejection of invalid definitions at the Store
-  boundary.
+  coherent list snapshots, tombstone non-resurrection, and rejection of invalid
+  definitions at the Store boundary.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including current and stale same-value enablement plus two concurrent
   writers. A current same-value enablement preserves version, revision, and
@@ -469,6 +486,9 @@ Rule deletion does not rewrite already committed fires.
   algorithm, actual attachment counts above 64, mailbox identity mismatch,
   incoming analysis values versus null stored columns, mixed conditions, and
   deterministic order.
+- Boundary tests prove 1,000 descriptors and 1,000 matched fires can commit;
+  1,001 of either commits the analysis plus `automation_fanout_limit`, zero
+  fires/attempts, and unchanged scheduling behavior.
 - A failure injected between analysis update and fire insertion leaves the
   message pending with no marker, fire, attempt, or scheduling admission.
 - Concurrent rule mutation and analysis commit one coherent revision.
@@ -483,6 +503,9 @@ Rule deletion does not rewrite already committed fires.
   bookkeeping, it establishes the new key and cursor before fetching; new
   messages cannot inherit the old key. Existing address-mismatch rejection
   remains unchanged.
+- A pending row with a null or stale mailbox key is failed before content fetch;
+  a reused provider message id cannot replace its descriptors through the new
+  gateway.
 - An old schema-19 completion started after migration is rejected by the null
   revision trigger; the message remains pending for schema-20 evaluation.
 - The real reachability test uses an allowlisted INBOX sender. Its opposite
@@ -495,6 +518,13 @@ Rule deletion does not rewrite already committed fires.
 
 ## 9. Review-thread disposition
 
+- **Pending-row mailbox substitution:** confirmed. `_process_pending` now has a
+  pre-fetch key equality gate; null/stale rows fail without fetching or matching.
+- **Automation fan-out:** confirmed. Descriptor and committed-fire ceilings have
+  an explicit all-or-zero terminal error state.
+- **Tombstone resurrection:** confirmed. Every later mutation returns
+  `not_found`; only create can introduce a live identity and consume a slot.
+- **Get request shape:** confirmed. The exact strict payload is `{rule_id}`.
 - **Reauthorization crash window / legacy mailbox identity:** confirmed. Stable
   credential-derived keys replace inferred numeric incarnations; preflight
   reconciles installed credentials before fetch and legacy messages remain
@@ -604,3 +634,6 @@ Rule deletion does not rewrite already committed fires.
   credential-derived identity keys and crash preflight; closed request/response,
   condition, glob, retirement, matcher-input, list-snapshot, legacy-message, and
   schema-upgrade completion boundaries.
+- **Core revision 6 (2026-09-12):** added the pre-fetch mailbox-key gate,
+  deterministic all-or-zero fan-out limits, tombstone non-resurrection, and the
+  exact `rules.get` payload.
