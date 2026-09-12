@@ -149,8 +149,10 @@ credential verification opens INBOX read-only and binds the observed
 when host, address, username, and password are unchanged. A verifier derives
 the key from installed credentials before an account-scoped rule is accepted
 and before `watcher.check` admits messages. `Store.put_rule` binds the verified
-key inside its mutation transaction; a missing account or unverifiable identity
-is `invalid_rule`.
+key inside its mutation transaction; a missing account or semantically invalid
+identity is `invalid_rule`. A transient provider, network, token-lock, or
+authentication-service failure while obtaining identity returns retryable
+`mailbox_identity_unavailable`; it never masquerades as a malformed rule.
 
 Schema 20 adds nullable `mailbox_identity_key` to mail accounts and messages.
 Every newly admitted message receives the key derived from the gateway that
@@ -171,14 +173,20 @@ Schema 20 also makes the mailbox key part of every persisted source identity:
 message lookup and uniqueness, `has_seen_message`, retained suppression keys,
 and source-event digests use `(provider, account_id, mailbox_identity_key,
 provider_message_id)`. The old three-part message uniqueness index is removed.
-For an upgraded account, schema 20 records a separate immutable
-`legacy_mailbox_identity_key` when the first production verifier establishes the
-current key. Legacy null-key message rows and deletion suppressions participate
-in `has_seen_message` only while the admitted key equals that one migration key;
-their original suppression expiry remains unchanged. A later credential/epoch
-change advances only the current key, so legacy seen/deleted markers cannot
-follow a replacement mailbox. A provider message id reused by that replacement
-therefore denotes a new message rather than colliding with the old namespace.
+For an upgraded account, schema 20 records legacy source identity as
+`continuity_proven`, `replacement`, or `unresolved`; it never associates legacy
+null-key rows/suppressions merely because a verifier produced the first current
+key. IMAP continuity is proven only when the stored pre-migration cursor decodes
+to the same credential hash and `UIDVALIDITY` as the authenticated gateway; its
+legacy markers then apply to that exact key through their original expiry.
+Providers without an immutable pre-migration witness remain `unresolved`. Their
+existing cursor may continue normal incremental polling, but if it becomes stale
+while any legacy seen/deletion marker is unexpired, recovery returns retryable
+`legacy_mailbox_identity_unverified` before fetching or changing cursor/message
+state. An explicit account replacement records `replacement`, so legacy markers
+never apply to its key. A later credential/epoch change likewise cannot inherit
+markers bound by proven continuity. A reused provider message id in a proven
+replacement namespace therefore denotes a new message.
 
 Before `_process_pending` fetches content for any retained row, it requires the
 row's non-null mailbox key to equal the current gateway key. A null or mismatched
@@ -434,9 +442,11 @@ of `RuleDetail` describes the same immutable version.
 Public callers cannot set `system`, revision values, timestamps, digests, or
 version numbers. Domain errors are `invalid_rule`, `stale_rule`, `rule_limit`,
 `system_rule_protected`, or `not_found`; mutation lock errors are the
-`unsupported_platform` and retryable `mailbox_busy` responses above. List is
-summary-only so the maximum rule count cannot create a response containing every
-maximum-sized definition.
+`unsupported_platform` and retryable `mailbox_busy` responses above. Scoped
+create/edit may also return retryable `mailbox_identity_unavailable` when the
+provider identity cannot currently be obtained. List is summary-only so the
+maximum rule count cannot create a response containing every maximum-sized
+definition.
 
 A definition is parsed and canonically serialized inside `Store.put_rule`.
 After strict validation, all defaulted members are materialized and the canonical
@@ -504,9 +514,10 @@ Schema-20 migration behavior:
   mailbox principal cannot be proven; pending legacy rows fail the pre-fetch
   identity check and no account-scoped rule can match them;
 - existing accounts remain unverified until the credential-backed identity
-  verifier establishes their current key and, exactly once, their immutable
-  legacy migration key. Legacy null-key seen/deletion markers apply only when
-  the current key still equals that migration key and retain their old expiry;
+  verifier establishes their current key and separately classifies legacy
+  continuity from provider-specific evidence. Only proven IMAP continuity binds
+  legacy markers to a key; other providers remain unresolved until markers
+  expire or an explicit account replacement records that they do not apply;
 - a schema-20 `BEFORE INSERT` trigger rejects every new message whose mailbox
   key is null. Rows that already existed when migration began may remain null,
   but an already-running schema-19 process cannot insert another legacy-shaped
@@ -603,6 +614,9 @@ Rule deletion does not rewrite already committed fires.
 - Rule-mutation lock tests prove unsupported native locking returns
   `unsupported_platform`, contention returns retryable `mailbox_busy`, and
   neither path reaches credential verification or Store mutation.
+- Scoped rule-binding tests distinguish semantic identity rejection
+  (`invalid_rule`) from transient provider/network/token-lock failure
+  (`mailbox_identity_unavailable`) and prove the latter is retryable.
 - Engine API tests exercise all five strict request and response schemas plus
   every error mapping. Create returns an enabled, non-system version 1 rule.
 - Schema 19 to 20 migration preserves existing data while installing rule
@@ -655,8 +669,9 @@ Rule deletion does not rewrite already committed fires.
   gateway.
 - Message admission tests prove the same provider message id under a replacement
   mailbox key creates a distinct message, while a true replay under the same key
-  remains deduplicated. Legacy null-key rows/suppressions prevent replay only for
-  the first verified migration key and do not suppress a later replacement key.
+  remains deduplicated. IMAP legacy markers bind only after cursor-derived
+  continuity proof; an unproven provider refuses overlapping recovery while
+  markers remain, and an explicit replacement never inherits them.
 - Scheduling tests admit the same provider message id under two mailbox keys and
   prove distinct source keys/runs with joins confined to the matching key.
   Migrated null-key runs join only legacy null-key messages.
@@ -695,8 +710,8 @@ Rule deletion does not rewrite already committed fires.
   current credential key.
 - **Cross-mailbox message deduplication:** confirmed. Message uniqueness, seen
   checks, suppression keys, and source-event digests include the mailbox key;
-  legacy null-key records apply only to the immutable first migration key and
-  cannot suppress a later replacement mailbox.
+  legacy null-key records require continuity proof and cannot suppress a proven
+  replacement mailbox.
 - **In-flight credential replacement:** confirmed. Message admission, cursor
   advancement, and atomic analysis/fire commit compare the polling session's
   expected key with the current account key; a stale session cannot write after
@@ -737,14 +752,18 @@ Rule deletion does not rewrite already committed fires.
   automation fire creation; the existing analysis and scheduling commit remains
   unchanged.
 - **Legacy deletion suppressions:** confirmed. Legacy markers remain effective
-  through their original expiry for the first verified migration key, but never
-  follow a later credential/epoch key.
+  through their original expiry only with cursor-derived continuity proof.
+  Unresolved identity blocks overlapping recovery; replacement keys never inherit
+  the markers.
 - **Scheduling source identity:** confirmed. New run identity and every join use
   the mailbox key; migrated null-key runs remain confined to null-key messages.
 - **Matcher source-byte caps:** waived-out-of-scope. Persisted mailbox metadata
   is already open-length input; this core bounds rules, descriptors loaded, and
   fires, while per-field/aggregate storage normalization is a separate ingestion
   hardening slice.
+- **Transient rule identity verification:** confirmed. Operational provider,
+  network, token-lock, and authentication-service failures return retryable
+  `mailbox_identity_unavailable`; `invalid_rule` remains semantic.
 - **Internationalized sender-domain equivalence:** waived-out-of-scope. The
   provider-specific Unicode-versus-IDNA sender normalization predates this rule
   engine and does not block the approved ASCII-domain reachability proof; a
@@ -879,3 +898,6 @@ Rule deletion does not rewrite already committed fires.
   replacement, preserved legacy suppression for only the first migration key,
   and extended scheduling source identity/joins with mailbox keys; matcher-source
   byte caps remain deferred ingestion hardening.
+- **Core revision 13 (2026-09-12):** required evidence before legacy marker
+  binding, failed closed on ambiguous overlapping recovery, and separated
+  transient mailbox-identity lookup failures from invalid rule definitions.
