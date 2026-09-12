@@ -110,13 +110,33 @@ parameters to sixteen, and `in` values to six.
 The engine-owned values `rule_id`, version, enabled/system/deleted flags,
 revision boundaries, and timestamps are not definition members.
 
+The definition has exactly these members:
+
+- `name`: 1 through 80 printable characters;
+- `scope`: the source selector below, defaulting to `{}`;
+- `trigger`: exactly `{source_kind: "mail.message"}`;
+- `conditions`: 1 through 8 condition objects;
+- `action`: the one closed action below;
+- `confirm_each`: strict boolean, defaulting to false.
+
 Every definition has a `scope` object, defaulting to `{}`:
 
-- optional `provider` is case-folded text of 1 through 64 characters;
+- optional `provider` uses the Connect `Identifier` pattern and 100-character
+  maximum;
 - optional `account_id` is exact trimmed text of 1 through 128 characters and
   is accepted only when `provider` is also present;
 - omitted members are wildcards, so `{}` matches every retained mailbox
   account.
+
+An account-scoped version also stores an engine-owned
+`scope_account_incarnation`. `Store.put_rule` resolves it from the named mail
+account inside the rule mutation transaction; a missing account is
+`invalid_rule`. Schema 20 adds `identity_incarnation`, starting at 1, to mail
+accounts and captures it on each new message. The existing IMAP
+`mailbox_changed` path increments the incarnation atomically with its cursor
+reset. Existing rules therefore do not silently follow an account id to a new
+IMAP server/security/username identity. Provider-only and wildcard rules
+intentionally span account incarnations.
 
 ### Closure declaration: source scope
 
@@ -125,8 +145,9 @@ Every definition has a `scope` object, defaulting to `{}`:
 2. **Source:** ENUMERATED in the canonical `Scope` model. Parser and matcher use
    that model rather than copying its members.
 3. **Outside behavior:** unknown members, malformed values, or account ids
-   without a provider are rejected as `invalid_rule`. A well-formed provider or
-   account value that does not exist matches nothing, which is the safe side.
+   without a provider are rejected as `invalid_rule`. A well-formed provider
+   value that does not exist matches nothing. A named account that does not
+   exist is rejected by `Store.put_rule` while binding its incarnation.
 
 ### Closure declaration: action kinds
 
@@ -136,12 +157,24 @@ Every definition has a `scope` object, defaulting to `{}`:
 3. **Outside behavior:** any other `kind` is rejected as `invalid_rule`; this is
    the safe side because no durable or external action is authorized.
 
-`connect.invoke` contains:
+The `connect.invoke` action object contains exactly:
 
-- `capability: {id, version}`;
-- `provider: {app_id}`;
-- at most sixteen scalar `parameters`;
-- `confirm_each`, defaulting to false.
+- `kind: "connect.invoke"`;
+- `capability.id` and `provider.app_id` use the canonical Connect `Identifier`:
+  strict lower-case ASCII matching `^[a-z0-9]+(?:[.-][a-z0-9]+)*$`, maximum
+  100 characters;
+- `capability` contains exactly `id` and `version`; `provider` contains exactly
+  `app_id`. `capability.version` uses the canonical Connect
+  `CapabilityVersion`: strict text matching `^[0-9]+\.[0-9]+$`;
+- `parameters` has at most sixteen entries. Every key is an `Identifier`; every
+  value is exactly a strict string of at most 1,000 characters, a strict integer
+  from -9,007,199,254,740,991 through 9,007,199,254,740,991, or a strict
+  boolean. Null, floating-point, array, and object values are rejected.
+
+`confirm_each` remains the top-level definition member, not an action member.
+
+The canonical value types and bounds are shared with or mechanically compared
+against `connect.py`; the rule model may not define a looser parallel wire type.
 
 It must include an `attachment.media_type` condition, so every admitted action
 selects a concrete persisted attachment.
@@ -170,19 +203,39 @@ The closed matrix is:
 | `attachment.byte_size` | `lte` |
 | `attachment.count` | `gte`, `lte` |
 
-Sender addresses are normalized; domains and media types are lower-case;
-sender names, subjects, and filename patterns are case-folded. Filename
-patterns contain no path separators. `attachment.count` accepts 0 through 64
-as a rule threshold, but evaluation compares it with the actual persisted
-attachment count and makes no 64-attachment workload claim.
+Each admitted field/operator pair has one operand schema:
+
+| Field and operator | Admitted operand |
+|---|---|
+| `sender equals` | normalized address, 1..320 characters |
+| `sender domain_equals` | lower-case DNS domain, 1..253 characters |
+| `sender_name equals/contains` | case-folded non-empty text, at most 320 characters |
+| `subject contains/starts_with` | case-folded non-empty text, at most 4,096 characters |
+| `category equals` | one of `invoice`, `scheduling`, `customer_request`, `automated_notice`, `informational`, `other` |
+| `category in` | 1..6 distinct members of that closed category set |
+| `priority equals` | one of `urgent`, `high`, `normal`, `low` |
+| `priority in` | 1..4 distinct members of that closed priority set |
+| `action_required equals` | strict boolean |
+| `attachment.media_type equals` | lower-case media type matching the Connect pattern, at most 127 characters |
+| `attachment.filename glob` | case-folded non-empty pattern, at most 512 characters, with no `/` or `\\` |
+| `attachment.byte_size lte` | strict integer from 0 through 104,857,600 |
+| `attachment.count gte/lte` | strict integer from 0 through 64 |
+
+Booleans are not integers for numeric operands. `in` never accepts a scalar;
+`equals` never accepts a list. `attachment.count` is only a rule-threshold
+bound: evaluation compares it with the actual persisted attachment count and
+makes no 64-attachment workload claim.
 
 ### Open-input parser default
 
-JSON object shape is open input. Admission is a single strict Pydantic model:
-only positively recognized members and values are stored. Malformed,
-ambiguous, extra, or oversized input is rejected. The property tests derive
-both accepted and rejected shapes from the canonical model and field/operator
-matrix; they do not grow a denylist from review examples.
+JSON object shape is open input. The top-level engine decoder uses duplicate
+member detection at every object depth before `_response`; duplicate members
+return `invalid_json` rather than last-value-wins. Definition admission then
+uses one strict Pydantic model: only positively recognized members and values
+are stored. Malformed, ambiguous, extra, or oversized input is rejected. The
+property tests derive both accepted and rejected shapes from the canonical
+model and field/operator matrix; they do not grow a denylist from review
+examples.
 
 ## 5. Rule authority and mutation API
 
@@ -191,8 +244,8 @@ The schema contains:
 - singleton `automation_rule_set(revision)`;
 - current `automation_rules` identities and flags;
 - immutable `automation_rule_versions` with definition/tombstone kind,
-  canonical definition bytes and digest, enabled state, global revision,
-  retirement revision, and accepted timestamp.
+  canonical definition bytes and digest, enabled state, optional account
+  incarnation, global revision, retirement revision, and accepted timestamp.
 
 `MAX_AUTOMATION_RULES` is 100 live, non-deleted rules. Create counts live rules
 inside its `BEGIN IMMEDIATE` transaction and returns `rule_limit` instead of
@@ -212,6 +265,11 @@ the same write transaction before a no-op or new revision. A stale request
 returns `stale_rule`; it never silently overwrites an intervening edit or
 enablement change.
 
+After a successful expected-version comparison, setting `enabled` to its
+current value is a true no-op: it returns the current summary without changing
+the rule version, global revision, or timestamps. A stale same-value request
+still returns `stale_rule` because compare-and-set precedes the no-op check.
+
 Engine operations:
 
 - `automation.rules.list` returns the global revision and bounded summaries of
@@ -230,9 +288,10 @@ version numbers. Errors are `invalid_rule`, `stale_rule`, `rule_limit`,
 rule count cannot create a response containing every maximum-sized definition.
 
 A definition is parsed and canonically serialized inside `Store.put_rule`.
-Reads parse again. A row made invalid by external database corruption is shown
-as invalid with a bounded reason, never evaluated, and never causes another
-rule to become an action.
+Reads first recompute SHA-256 over the canonical bytes and compare it with the
+stored lower-case digest, then parse again. A digest mismatch or parse failure
+is shown as invalid with a bounded reason, never evaluated, and never causes
+another rule to become an action.
 
 ## 6. Atomic analysis-time evaluation
 
@@ -242,9 +301,9 @@ rule to become an action.
 2. Read the singleton rule-set revision.
 3. Read current, enabled, non-deleted definition versions, ordered by rule
    creation time and `rule_id`.
-4. Parse each definition and exclude invalid rows.
-5. Read the message and its persisted attachment descriptors ordered by
-   position and `part_id`.
+4. Verify each definition digest, parse it, and exclude invalid rows.
+5. Read the message, its captured account incarnation, and its persisted
+   attachment descriptors ordered by position and `part_id`.
 6. Run the pure matcher in memory. It performs no network, filesystem, model,
    Connect, calendar, or notification call.
 7. Update the message analysis and set `rules_revision_at_analysis` to the
@@ -269,14 +328,17 @@ Schema-20 migration behavior:
 - messages already analyzed when schema 20 is installed receive
   `rules_revision_at_analysis = 0` and never fire retroactively;
 - pending messages retain `NULL` until their first successful analysis;
+- existing mail accounts and messages receive identity incarnation 1;
 - unpublished local draft databases are not a compatibility target.
 
 ## 7. Matching and fire identity
 
-Scope provider/account comparisons are exact. Message-level conditions are
-evaluated once; attachment-level conditions are evaluated for each descriptor.
-All conditions are ANDed. A rule that matches two attachments creates two
-fires; two matching rules may create independent fires for the same attachment.
+Scope provider/account comparisons are exact. An account-scoped rule also
+requires its captured account incarnation to equal the message incarnation.
+Message-level conditions are evaluated once; attachment-level conditions are
+evaluated for each descriptor. All conditions are ANDed. A rule that matches
+two attachments creates two fires; two matching rules may create independent
+fires for the same attachment.
 
 Matching uses only:
 
@@ -290,11 +352,14 @@ It never reads the body, headers, generated summary, suggested action, source
 bytes, provider catalog, or entitlement state.
 
 Each fire stores an engine-generated UUID, stable source event digest,
-`rule_id`, immutable rule version, non-null artifact key, message/part ids,
-`connect.invoke`, `pending_dispatch`, state version 1, and timestamps. A unique
-constraint on `(event_id, rule_id, rule_version, artifact_key)` prevents a
-duplicate committed match. Insert guards require the referenced definition
-version and message attachment to exist.
+`rule_id`, immutable rule version, required message/part ids,
+`connect.invoke`, `pending_dispatch`, state version 1, and timestamps. The event
+digest is SHA-256 over the UTF-8 NUL-joined source provider, account id, and
+provider message id, matching the existing `message_source_key` derivation. A
+unique constraint on `(message_id, part_id, rule_id, rule_version)` prevents a
+duplicate committed match without relying on generated values. Insert guards
+require the referenced definition version and exact message attachment to
+exist.
 
 Each fire receives attempt 1 with one UUID `dispatch_request_id` before any
 future provider call. No job is created or submitted here. `confirm_each`
@@ -310,13 +375,18 @@ Rule deletion does not rewrite already committed fires.
 
 ### Rule authority
 
-- Parser boundaries cover unknown members, unsupported action kinds,
-  field/operator pairs, normalization, all size/count boundaries, and opposite
-  controls.
+- Raw decoder tests prove duplicate members at the request, definition, action,
+  and condition levels return `invalid_json`; distinct-member controls pass.
+- Parser boundaries cover unknown members, unsupported action kinds, canonical
+  Connect identifiers/versions/parameter scalars, every field/operator operand
+  schema, normalization, all size/count boundaries, and opposite controls.
 - Store tests prove canonical storage, immutable history, live-rule cap, system
-  protection, and rejection of invalid definitions at the Store boundary.
+  protection, digest verification, mailbox incarnation binding, and rejection
+  of invalid definitions at the Store boundary.
 - Edit/delete/enable tests prove current versions succeed and stale versions
-  fail, including a stale enablement no-op and two concurrent writers.
+  fail, including current and stale same-value enablement plus two concurrent
+  writers. A current same-value enablement preserves version, revision, and
+  timestamps.
 - Engine API tests exercise all five operations and every error mapping.
 - Schema 19 to 20 migration preserves existing data while installing rule
   authority and atomic evaluation together.
@@ -325,14 +395,20 @@ Rule deletion does not rewrite already committed fires.
 
 - Matcher tests cover every canonical field/operator pair, scope, missing
   optional data, case-folding, final-component filename globs, actual
-  attachment counts above 64, mixed conditions, and deterministic order.
+  attachment counts above 64, account incarnation mismatch, mixed conditions,
+  and deterministic order.
 - A failure injected between analysis update and fire insertion leaves the
   message pending with no marker, fire, attempt, or scheduling admission.
 - Concurrent rule mutation and analysis commit one coherent revision.
-- Duplicate fire, nonexistent rule version, and nonexistent attachment inserts
-  are rejected.
+- Repeating one `(message_id, part_id, rule_id, rule_version)` fire is rejected;
+  a different part or rule version passes. Nonexistent rule-version and
+  message-attachment inserts are rejected.
 - The schema-20 migration marks historical analyzed messages revision 0 and
-  leaves pending messages null.
+  leaves pending messages null while initializing account/message incarnations
+  to 1.
+- IMAP reauthorization with the same mailbox identity preserves its
+  incarnation; a changed server/security/username increments it, resets the
+  cursor, and prevents an older account-scoped rule from matching new messages.
 - A real engine `watcher.check` request with test mailbox/model adapters creates
   the expected durable fire and attempt through the production dispatcher and
   performs zero provider submissions.
@@ -341,6 +417,19 @@ Rule deletion does not rewrite already committed fires.
 
 ## 9. Review-thread disposition
 
+- **Closed action and condition values / duplicate JSON:** confirmed. The
+  contract now defines every action and operand type/bound, shares the Connect
+  wire constraints, and rejects duplicate members before model validation.
+- **Same-value enablement:** confirmed. Expected-version comparison happens
+  first; a current same-value request preserves every revision-bearing value.
+- **Definition digest:** confirmed against the contract's corruption claim.
+  Reads verify the digest before parsing or evaluation.
+- **Fire deduplication:** confirmed. The unique key now uses persisted message
+  and part identity plus immutable rule identity, with a canonical event digest
+  defined separately.
+- **IMAP mailbox rebinding:** confirmed by the reconnect path. Account-scoped
+  versions bind to an engine-owned incarnation that changes with the mailbox
+  identity; wildcard/provider-only rules intentionally do not.
 - **Source scope definition:** confirmed. Rule definitions now carry a bounded
   provider/account scope with explicit wildcard and invalid-shape behavior.
 - **CRUD-before-evaluation deployment gap:** confirmed. Rule authority, CRUD,
@@ -403,3 +492,7 @@ Rule deletion does not rewrite already committed fires.
 - **Core revision 2 (2026-09-12):** defined bounded source scope and the
   100-live-rule cap, and made CRUD plus evaluation one atomic deployment slice
   so no accepted rule can miss messages between schema releases.
+- **Core revision 3 (2026-09-12):** closed every action/operand value schema,
+  rejected duplicate JSON members, fixed enablement no-op semantics, required
+  digest verification and persisted-source dedupe keys, and bound
+  account-scoped rules to mailbox identity incarnations.
