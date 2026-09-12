@@ -178,7 +178,11 @@ For an upgraded account, schema 20 records legacy source identity as
 null-key rows/suppressions merely because a verifier produced the first current
 key. IMAP continuity is proven only when the stored pre-migration cursor decodes
 to the same credential hash and `UIDVALIDITY` as the authenticated gateway; its
-legacy markers then apply to that exact key through their original expiry.
+legacy markers then apply to that exact key through their original expiry. In
+the same transaction that records proven IMAP continuity, the Store assigns that
+key to retained pending legacy message rows for the account. Already-analyzed
+legacy messages keep their null key and revision-zero history; only work that was
+still pending can cross into schema-20 analysis after continuity is proven.
 Providers without an immutable pre-migration witness remain `unresolved`. Their
 existing cursor may continue normal incremental polling, but if it becomes stale
 while any legacy seen/deletion marker is unexpired, recovery returns retryable
@@ -188,8 +192,9 @@ never apply to its key. A later credential/epoch change likewise cannot inherit
 markers bound by proven continuity. A reused provider message id in a proven
 replacement namespace therefore denotes a new message.
 
-Before `_process_pending` fetches content for any retained row, it requires the
-row's non-null mailbox key to equal the current gateway key. A null or mismatched
+Before `_process_pending` fetches content for any retained row, the verifier first
+performs the proven-IMAP pending-row binding above, then requires the row's
+non-null mailbox key to equal the current gateway key. A still-null or mismatched
 row is recorded as a non-retryable `mailbox_identity_unverified` analysis
 failure; its provider message id is never fetched through the replacement
 gateway, its attachment descriptors are not replaced, and no rule is evaluated.
@@ -509,10 +514,13 @@ Schema-20 migration behavior:
 
 - messages already analyzed when schema 20 is installed receive
   `rules_revision_at_analysis = 0` and never fire retroactively;
-- pending messages retain `NULL` until their first successful analysis;
-- legacy messages receive `mailbox_identity_key = NULL` because their historical
-  mailbox principal cannot be proven; pending legacy rows fail the pre-fetch
-  identity check and no account-scoped rule can match them;
+- pending messages retain `rules_revision_at_analysis = NULL` until their first
+  successful analysis;
+- legacy messages initially receive `mailbox_identity_key = NULL` because their
+  historical mailbox principal cannot be inferred from account labels. Pending
+  IMAP rows are atomically rebound only after the provider-specific continuity
+  proof above; pending rows under unresolved or replacement identity fail the
+  pre-fetch check and no account-scoped rule can match them;
 - existing accounts remain unverified until the credential-backed identity
   verifier establishes their current key and separately classifies legacy
   continuity from provider-specific evidence. Only proven IMAP continuity binds
@@ -529,15 +537,19 @@ Schema-20 migration behavior:
   migration is assigned revision 0 before rule CRUD becomes available;
 - unpublished local draft databases are not a compatibility target.
 
-Schema 20 also adds nullable `source_mailbox_identity_key` to existing
-`automation_runs`. New scheduling admission accepts the analyzed message's
-non-null mailbox key and derives `source_message_key` from the same four-part
-source tuple as messages and fires. Every scheduling join requires the run and
-message mailbox keys to be equal in addition to the digest. Migrated runs keep a
-null source key and their legacy three-part digest; they may join only legacy
-null-key messages and can never collide with or attach to a newly admitted
-verified-key message. The existing scheduling states and transitions otherwise
-remain unchanged.
+Schema 20 does not alter the existing `automation_runs` row shape. It creates a
+one-to-one `automation_run_source_identities` companion table keyed by `run_id`,
+with the captured non-null `mailbox_identity_key`; this keeps schema-19
+`SELECT * FROM automation_runs` readers compatible if they finish after another
+process installs schema 20. New scheduling admission accepts the analyzed
+message's non-null mailbox key, inserts its companion row in the same transaction,
+and derives `source_message_key` from the same four-part source tuple as messages
+and fires. Schema-20 scheduling reads join the companion table explicitly and
+require its key to equal the message key in addition to the digest. Migrated runs
+and a schema-19 run that finishes after migration have no companion row and keep
+their legacy three-part digest; they may join only legacy null-key messages and
+can never collide with or attach to a newly admitted verified-key message. The
+existing scheduling states and transitions otherwise remain unchanged.
 
 ## 7. Matching and fire identity
 
