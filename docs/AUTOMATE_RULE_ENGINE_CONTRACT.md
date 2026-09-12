@@ -75,13 +75,12 @@ These are observations, not roadmap claims.
 
 ## 3. Scope and reachability
 
-The implementation lands as two code PRs after this contract is accepted.
-
-1. **Rule authority (schema 20):** strict Connect rule definition, immutable
-   revisions, compare-and-set mutation, and engine API CRUD.
-2. **Atomic evaluation (schema 21):** pure matcher, message revision capture,
-   durable pending fires, and attempt-one dispatch identities inside
-   `mark_analyzed`.
+The implementation lands as one vertical schema-20 code PR after this contract
+is accepted. Strict definitions, immutable rule authority, compare-and-set
+mutation, engine API CRUD, the pure matcher, message revision capture, durable
+pending fires, and attempt-one dispatch identities become reachable together.
+There is no deployable state in which callers can save rules while
+`watcher.check` omits evaluation.
 
 Reachability proof:
 
@@ -110,6 +109,24 @@ parameters to sixteen, and `in` values to six.
 
 The engine-owned values `rule_id`, version, enabled/system/deleted flags,
 revision boundaries, and timestamps are not definition members.
+
+Every definition has a `scope` object, defaulting to `{}`:
+
+- optional `provider` is case-folded text of 1 through 64 characters;
+- optional `account_id` is exact trimmed text of 1 through 128 characters and
+  is accepted only when `provider` is also present;
+- omitted members are wildcards, so `{}` matches every retained mailbox
+  account.
+
+### Closure declaration: source scope
+
+1. **Membership:** CLOSED for the two scope members, `provider` and
+   `account_id`; their string values are open but bounded.
+2. **Source:** ENUMERATED in the canonical `Scope` model. Parser and matcher use
+   that model rather than copying its members.
+3. **Outside behavior:** unknown members, malformed values, or account ids
+   without a provider are rejected as `invalid_rule`. A well-formed provider or
+   account value that does not exist matches nothing, which is the safe side.
 
 ### Closure declaration: action kinds
 
@@ -177,6 +194,12 @@ The schema contains:
   canonical definition bytes and digest, enabled state, global revision,
   retirement revision, and accepted timestamp.
 
+`MAX_AUTOMATION_RULES` is 100 live, non-deleted rules. Create counts live rules
+inside its `BEGIN IMMEDIATE` transaction and returns `rule_limit` instead of
+admitting the 101st. List therefore returns at most 100 summaries, and analysis
+evaluates at most 100 current definitions. Tombstones and immutable retired
+versions do not consume a live-rule slot.
+
 Every mutation holds `BEGIN IMMEDIATE`, increments the global revision once,
 retires the prior version, and inserts one immutable successor. Direct version
 updates and deletes are rejected by database triggers. No compaction exists in
@@ -241,9 +264,9 @@ analysis sees the complete rule set before or after a mutation, never a mixed
 revision. Historical versions remain for fire explanation; they are not
 searched to evaluate a newly completed analysis.
 
-Migration behavior:
+Schema-20 migration behavior:
 
-- messages already analyzed when schema 21 is installed receive
+- messages already analyzed when schema 20 is installed receive
   `rules_revision_at_analysis = 0` and never fire retroactively;
 - pending messages retain `NULL` until their first successful analysis;
 - unpublished local draft databases are not a compatibility target.
@@ -295,7 +318,8 @@ Rule deletion does not rewrite already committed fires.
 - Edit/delete/enable tests prove current versions succeed and stale versions
   fail, including a stale enablement no-op and two concurrent writers.
 - Engine API tests exercise all five operations and every error mapping.
-- Schema 19 to 20 migration preserves existing data.
+- Schema 19 to 20 migration preserves existing data while installing rule
+  authority and atomic evaluation together.
 
 ### Atomic evaluation
 
@@ -307,7 +331,7 @@ Rule deletion does not rewrite already committed fires.
 - Concurrent rule mutation and analysis commit one coherent revision.
 - Duplicate fire, nonexistent rule version, and nonexistent attachment inserts
   are rejected.
-- Schema 20 to 21 migration marks historical analyzed messages revision 0 and
+- The schema-20 migration marks historical analyzed messages revision 0 and
   leaves pending messages null.
 - A real engine `watcher.check` request with test mailbox/model adapters creates
   the expected durable fire and attempt through the production dispatcher and
@@ -317,6 +341,12 @@ Rule deletion does not rewrite already committed fires.
 
 ## 9. Review-thread disposition
 
+- **Source scope definition:** confirmed. Rule definitions now carry a bounded
+  provider/account scope with explicit wildcard and invalid-shape behavior.
+- **CRUD-before-evaluation deployment gap:** confirmed. Rule authority, CRUD,
+  matching, and atomic analysis-time evaluation land together in schema 20.
+- **Live-rule bound:** confirmed. The cap is 100 live rules and is enforced
+  inside the create transaction before the 101st rule can be admitted.
 - **Oversized history starvation / resumable snapshot:** confirmed defects in
   the unpublished split evaluator. The split and historical query are removed;
   no compaction or checkpoint mechanism is needed for current-rule evaluation.
@@ -358,10 +388,10 @@ Rule deletion does not rewrite already committed fires.
 ## 11. Landing order
 
 1. Accept and merge this docs-only contract.
-2. Land schema 20 rule authority and CRUD.
-3. Land schema 21 atomic evaluation and durable fires.
-4. Demonstrate the real create-rule to `watcher.check` to pending-fire path.
-5. Choose a separate dispatch/UI slice only after that proof is green.
+2. Land one schema-20 vertical PR containing rule authority, CRUD, atomic
+   evaluation, and durable fires.
+3. Demonstrate the real create-rule to `watcher.check` to pending-fire path.
+4. Choose a separate dispatch/UI slice only after that proof is green.
 
 ## 12. Revision history
 
@@ -370,3 +400,6 @@ Rule deletion does not rewrite already committed fires.
   classified the current review claims against executable code; added stale
   mutation CAS, Store-boundary validation, closure declarations, and explicit
   non-scope.
+- **Core revision 2 (2026-09-12):** defined bounded source scope and the
+  100-live-rule cap, and made CRUD plus evaluation one atomic deployment slice
+  so no accepted rule can miss messages between schema releases.
