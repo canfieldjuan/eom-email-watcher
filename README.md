@@ -1,9 +1,9 @@
 # EOM Email Watcher
 
-A private, local-first watched-sender email application. It checks one selected Gmail or Microsoft
-365 mailbox, selects messages only from an exact sender allowlist, asks a configured local model for
-a short structured summary, and sends a desktop notification (and, optionally, a phone push via
-[ntfy](https://ntfy.sh)).
+A private, local-first watched-sender email application. It checks one selected Gmail, Microsoft
+365, or IMAP mailbox, selects messages only from an exact sender allowlist, asks a configured local
+model for a short structured summary, and sends a desktop notification (and, optionally, a phone
+push via [ntfy](https://ntfy.sh)).
 
 Email content is never sent to a cloud model. Mailbox grants are read-only, attachment content is
 downloaded only when the user explicitly opens it or requests an available local capability,
@@ -13,12 +13,13 @@ inference request.
 ## Behavior
 
 - Starts at the provider's current cursor; setup does not backfill old mail.
-- Polls Gmail History or Microsoft Graph inbox delta for newly created messages.
+- Polls Gmail History, Microsoft Graph inbox delta, or IMAP UID changes for newly created messages.
 - Verifies the parsed `From` address against a case-insensitive exact allowlist in trusted config.
 - Fetches message bodies only after a sender matches.
 - Extracts `text/plain`, or text from HTML as a fallback, capped at 20,000 characters.
-- Records attachment filenames, provider-owned attachment IDs, media types, and byte sizes. An
-  explicit Open action fetches only that attachment into a mode-0600 process-owned temporary file.
+- Records attachment filenames, provider-owned attachment IDs when available, media types, and
+  provider-reported byte sizes. An explicit Open action fetches only that attachment into a
+  mode-0600 process-owned temporary file.
 - With an active paid Connect entitlement, discovers the provider-neutral `document.summarize`
   capability at runtime. For a compatible PDF, an explicit Summarize action fetches only that
   attachment and streams its bytes to the selected authenticated exact-loopback provider. It does
@@ -38,8 +39,9 @@ inference request.
 - An administrator-managed on-prem inference gateway, or LM Studio `llmster` with its API bound to
   `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
-- A Gmail/Google Workspace account with a Google Desktop OAuth client, or a Microsoft 365 work or
-  school account with an Entra public desktop-client registration
+- A Gmail/Google Workspace account with a Google Desktop OAuth client, a Microsoft 365 work or
+  school account with an Entra public desktop-client registration, or an IMAP account using TLS or
+  STARTTLS
 - Optional: an [ntfy](https://ntfy.sh) topic for phone push notifications alongside the desktop
   one -- set `ntfy_topic`/`ntfy_url` in `config.toml` (see `config.example.toml`)
 

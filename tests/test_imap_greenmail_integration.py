@@ -7,7 +7,9 @@ import smtplib
 import ssl
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from email.utils import format_datetime, make_msgid
 from pathlib import Path
 
@@ -110,6 +112,7 @@ def _send_message(
     subject: str,
     body: str,
     attach_pdf: bool = False,
+    attach_multipart: bool = False,
 ) -> None:
     message = EmailMessage()
     message["From"] = WATCHED_SENDER
@@ -125,6 +128,13 @@ def _send_message(
             subtype="pdf",
             filename="invoice.pdf",
         )
+    if attach_multipart:
+        attachment = EmailMessage()
+        attachment.set_content("Plain alternative")
+        attachment.add_alternative("<p>HTML alternative</p>", subtype="html")
+        attachment["Content-Disposition"] = "attachment; filename=bundle.eml"
+        message.make_mixed()
+        message.attach(attachment)
     with smtplib.SMTP("127.0.0.1", environment.smtp_port, timeout=5) as client:
         client.send_message(message)
 
@@ -143,7 +153,7 @@ def _assert_source_mail_is_unmodified(environment: GreenMailEnvironment) -> None
         status, response = client.uid("SEARCH", None, "ALL")
         assert status == "OK"
         uids = response[0].split()
-        assert len(uids) == 2
+        assert len(uids) == 4
         for uid in uids:
             status, flags = client.uid("FETCH", uid, "(FLAGS)")
             assert status == "OK"
@@ -202,6 +212,16 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
     cursor, _last_check = state
     assert cursor is not None
 
+    _send_message(environment, subject="Plain message", body="Single-part body.")
+    session = load_configured_mailbox(runtime.config, runtime.store)
+    with mailbox_polling_session(session.gateway):
+        plain_changes = session.gateway.changes_since(cursor)
+        assert len(plain_changes.message_ids) == 1
+        plain_content = session.gateway.content(plain_changes.message_ids[0], 20_000)
+        assert plain_content.body == "Single-part body."
+        assert plain_content.attachments == ()
+    cursor = plain_changes.cursor
+
     _send_message(
         environment,
         subject="Invoice ready",
@@ -222,10 +242,40 @@ def test_engine_connects_and_polls_real_imap_without_mutating_source(tmp_path: P
         assert len(content.attachments) == 1
         attachment = content.attachments[0]
         assert attachment.media_type == "application/pdf"
-        assert session.gateway.attachment_bytes(
-            message_id,
-            attachment.part_id,
-            attachment.attachment_id,
-        ) == PDF_BYTES
+        assert (
+            session.gateway.attachment_bytes(
+                message_id,
+                attachment.part_id,
+                attachment.attachment_id,
+            )
+            == PDF_BYTES
+        )
+    cursor = changes.cursor
+
+    _send_message(
+        environment,
+        subject="Multipart bundle",
+        body="Please review the attached message bundle.",
+        attach_multipart=True,
+    )
+    session = load_configured_mailbox(runtime.config, runtime.store)
+    with mailbox_polling_session(session.gateway):
+        multipart_changes = session.gateway.changes_since(cursor)
+        assert len(multipart_changes.message_ids) == 1
+        multipart_message_id = multipart_changes.message_ids[0]
+        multipart_content = session.gateway.content(multipart_message_id, 20_000)
+        assert multipart_content.body == "Please review the attached message bundle."
+        assert multipart_content.attachment_names == ("bundle.eml",)
+        multipart_attachment = multipart_content.attachments[0]
+        exported = BytesParser(policy=policy.default).parsebytes(
+            session.gateway.attachment_bytes(
+                multipart_message_id,
+                multipart_attachment.part_id,
+                multipart_attachment.attachment_id,
+            )
+        )
+        assert exported.get_content_type() == "multipart/alternative"
+        assert exported.get_boundary()
+        assert len(exported.get_payload()) == 2
 
     _assert_source_mail_is_unmodified(environment)
