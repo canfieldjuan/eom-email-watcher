@@ -17,6 +17,7 @@ from .db import (
     AutomationSourceChanged,
     AutomationWork,
     CalendarGrant,
+    MailboxIdentityChanged,
     NotificationIntent,
     PendingMessage,
     Store,
@@ -37,6 +38,7 @@ from .mailbox import (
     StaleMailboxCursor,
     default_mailbox_session,
     mailbox_polling_session,
+    mailbox_session_address,
     mailbox_session_identity_key,
     scoped_message_id,
 )
@@ -1091,6 +1093,12 @@ def reconcile_mailbox_session_identity(
     dry_run: bool,
 ) -> str:
     """Verify or atomically reconcile the identity of an open mailbox session."""
+    account = store.mail_account(mailbox.provider, mailbox.account_id)
+    if account is None:
+        raise MailboxAccountUnavailable("The selected email account is not configured")
+    authenticated_address = mailbox_session_address(mailbox)
+    if authenticated_address is not None and authenticated_address != account.address:
+        raise MailboxIdentityChanged("mailbox address changed")
     mailbox_identity_key = mailbox_session_identity_key(mailbox)
     if dry_run:
         store.require_mailbox_identity(
@@ -1100,9 +1108,6 @@ def reconcile_mailbox_session_identity(
         )
         return mailbox_identity_key
 
-    account = store.mail_account(mailbox.provider, mailbox.account_id)
-    if account is None:
-        raise MailboxAccountUnavailable("The selected email account is not configured")
     state = store.state(provider=mailbox.provider, account_id=mailbox.account_id)
     legacy_status: str | None = None
     if account.mailbox_identity_key is None:

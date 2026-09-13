@@ -181,6 +181,9 @@ class GmailGateway:
             raise GmailAuthorizationRejected("Gmail mailbox identity is unavailable")
         return self._mailbox_identity_key
 
+    def mailbox_address(self) -> str:
+        return self.profile().email_address
+
     @classmethod
     def from_token(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
         resolved_credentials_file = resolve_gmail_credentials_file(credentials_file)

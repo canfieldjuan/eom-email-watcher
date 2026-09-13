@@ -59,6 +59,7 @@ from eom_email_watcher.service import (
     process_scheduling_automations,
     process_scheduling_proposals,
     process_scheduling_writes,
+    reconcile_mailbox_session_identity,
     run_watcher_check,
 )
 
@@ -3303,6 +3304,82 @@ def test_dry_run_identity_mismatch_is_read_only_and_stops_before_polling(
     assert store.automation_rules_snapshot() == (0, [])
 
 
+def test_mailbox_address_mismatch_stops_before_identity_key_reconciliation(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    old_identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+    )
+    store.set_state("100", mailbox_identity_key=old_identity)
+
+    class DifferentMailbox(FakeGmail):
+        def mailbox_address(self) -> str:
+            return "other@example.com"
+
+        def mailbox_identity_key(self) -> str:
+            pytest.fail("address mismatch reached identity-key reconciliation")
+
+    before_account = store.mail_account("gmail", "gmail-default")
+    before_state = store.state()
+    with pytest.raises(MailboxIdentityChanged, match="mailbox address changed"):
+        reconcile_mailbox_session_identity(
+            store,
+            MailboxSession("gmail", "gmail-default", DifferentMailbox()),
+            dry_run=False,
+        )
+
+    assert store.mail_account("gmail", "gmail-default") == before_account
+    assert store.state() == before_state
+
+
+def test_matching_mailbox_address_preserves_identity_verification(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        identity,
+        legacy_status="replacement",
+    )
+
+    class SameMailbox(FakeGmail):
+        def mailbox_address(self) -> str:
+            return "owner@example.com"
+
+        def mailbox_identity_key(self) -> str:
+            return identity
+
+    assert (
+        reconcile_mailbox_session_identity(
+            store,
+            MailboxSession("gmail", "gmail-default", SameMailbox()),
+            dry_run=True,
+        )
+        == identity
+    )
+
+
 def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped_rule(
     tmp_path: Path,
 ) -> None:
@@ -3359,6 +3436,9 @@ def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped
 
         def mailbox_identity_key(self) -> str:
             return new_identity
+
+        def mailbox_address(self) -> str:
+            return "trusted@example.com"
 
         def initial_cursor(self) -> str:
             return new_cursor

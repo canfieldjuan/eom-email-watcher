@@ -24,7 +24,7 @@ definitions the parser never accepted, stale overwrites, evaluated revisions
 chosen by callers, and fires referring to rule versions or attachments outside
 the analysis transaction.
 
-Exact-head review exposed six additional boundary splits in the first runtime
+Exact-head review exposed nine additional boundary splits in the first runtime
 implementation: stale mailbox recovery could cross an unresolved migrated
 identity; missing provider size metadata was collapsed into verified zero;
 account-scoped stale edits performed credential reconciliation before their
@@ -32,8 +32,13 @@ version could reject; and CLI dry-runs constructed mailbox runtime state before
 acquiring the production operation lock. A later exact-head pass also proved
 that canonical byte-size rejection still occurred after account reconciliation
 and that dry-run identity mismatch fell through as a generic runtime error.
+The next exact-head pass proved that rule-cap rejection still occurred after
+mailbox reconciliation, that a valid empty Gmail root part ID violated the fire
+table constraint, and that credential replacement could cross the persisted
+mailbox address while presenting a new internally valid identity key.
 These are reachable violations of the accepted identity, matching, CAS,
-admission, error-envelope, and locking contracts rather than optional hardening.
+admission, source, error-envelope, and locking contracts rather than optional
+hardening.
 
 The correct fix must:
 
@@ -62,7 +67,13 @@ The correct fix must:
 11. reject a definition that exceeds the canonical byte limit before any
     mailbox/account access while retaining Store-side revalidation; and
 12. return the contract's `mailbox_identity_changed` domain error for dry-run
-    credential mismatch without changing the fail-closed identity check.
+    credential mismatch without changing the fail-closed identity check;
+13. reject a new rule when the live-rule cap is already full before any mailbox
+    reconciliation while retaining the Store's final transactional cap check;
+14. admit an empty Gmail root part ID as an exact automation-fire source while
+    continuing to reject any fire without a matching stored attachment; and
+15. compare each supported adapter's authenticated mailbox address with the
+    persisted account before requiring or reconciling its identity key.
 
 This change fixes the root boundary split. It must not add provider dispatch,
 provider-side queueing, an Invoice Processor change, UI, timers, notification
@@ -90,7 +101,9 @@ Slice phase: vertical slice
 8. Carry the migrated unresolved-marker horizon until it expires, preserve
    omitted size metadata as unknown, preflight edits before credential
    reconciliation, route CLI dry-runs through the production lock, validate
-   canonical bytes before mailbox access, and preserve the identity error code.
+   canonical bytes and live-rule capacity before mailbox access, preserve the
+   identity error code, admit empty root attachment identities, and bind mailbox
+   identity decisions to the authenticated address.
 
 ### Files touched
 
@@ -118,6 +131,7 @@ Slice phase: vertical slice
 - `tests/test_db.py`
 - `tests/test_engine_api.py`
 - `tests/test_gmail.py`
+- `tests/test_imap.py`
 - `tests/test_microsoft365.py`
 - `tests/test_mime.py`
 - `tests/test_service.py`
@@ -163,6 +177,10 @@ Acceptance criteria:
 10. Engine API tests prove a canonical-size failure performs no mailbox access
     and a dry-run credential mismatch returns `mailbox_identity_changed` rather
     than `runtime_error`.
+11. Boundary tests prove a full live-rule set rejects before mailbox access while
+    the Store cap remains authoritative, an empty root attachment produces a
+    source-verified fire and attempt, and matching/mismatched authenticated
+    mailbox addresses pass/fail before identity-key reconciliation.
 
 Affected surfaces: SQLite schema/migration; mailbox polling identity; pending
 message fetch; scheduling source joins/fetch; `mark_analyzed`; engine request
@@ -236,7 +254,12 @@ preflight inside that lock, then retain the Store CAS as the final authority.
 CLI dry-run and production checks both acquire the lock before constructing the
 runtime or reading mailbox identity. Canonical bytes are validated before the
 mutation acquires mailbox authority and are revalidated by Store; watcher checks
-map the existing identity fence to its explicit domain error.
+map the existing identity fence to its explicit domain error. New-rule capacity
+is read before account reconciliation and rechecked transactionally. Fire source
+identity preserves a valid empty root part ID and remains guarded by the exact
+message/part foreign-source trigger. Supported mailbox adapters expose their
+authenticated address, which is checked against the persisted account before
+the credential-derived key can be required or reconciled.
 
 ## Intentional
 
@@ -290,6 +313,9 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 - exact-head boundary probes across the canonical exact byte limit, oversized
   pre-runtime rejection, valid account-scoped commit, changed mailbox identity,
   and unresolved legacy identity — `5 passed`
+- third-pass boundary probes across full/deleted rule capacity, empty/exactly
+  sourced root parts, matching/mismatched mailbox addresses, dry-run identity,
+  and all three supported adapter addresses — `11 passed`
 - affected DB/service/provider/API/CLI suites — `443 passed in 48.75s`
 - focused parser/matcher tests in `tests/test_automation_rules.py`
 - focused Store/migration/atomicity tests in `tests/test_db.py`
@@ -298,7 +324,9 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 - focused concurrency probes for rule-write/analysis serialization, stale
   mailbox-session CAS rejection, and scoped verification/commit lock coverage —
   `3 passed`
-- `uv run pytest -o addopts='' --tb=short` — `1256 passed, 16 skipped in 77.21s`
+- integrated affected provider/Store/service/API/Connect suites reached `100%`
+- `uv run pytest -o addopts='' --tb=short` — `1300 passed, 16 skipped in 73.51s`
+- `bash scripts/test-imap-greenmail.sh` — `100%`
 - `git diff --check` — clean
 - cold diff reconstruction against this Problem-derived contract before push
 
@@ -310,9 +338,9 @@ format gate reports `25 files already formatted`.
 
 | Surface | LOC |
 |---|---:|
-| Tracked runtime, scripts, and tests | 5,142 |
-| Plan | 318 |
-| **Total** | **5,460** |
+| Tracked runtime, scripts, and tests | 5,416 |
+| Plan | 346 |
+| **Total** | **5,762** |
 
 The overage is justified by the indivisible schema-20 vertical boundary stated
 above; dispatch and every UI/product surface remain excluded.

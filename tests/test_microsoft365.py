@@ -221,6 +221,7 @@ def test_interactive_authorization_uses_only_mail_read_and_writes_private_cache(
 
     assert changed is True
     assert gateway.profile().email_address == "owner@example.com"
+    assert gateway.mailbox_address() == "owner@example.com"
     assert calls == [
         (
             ["Mail.Read"],

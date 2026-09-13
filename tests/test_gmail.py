@@ -628,6 +628,7 @@ def test_profile_returns_normalized_mailbox_identity_and_cursor() -> None:
 
     assert profile.email_address == "owner@example.com"
     assert profile.history_id == "12345"
+    assert gateway.mailbox_address() == "owner@example.com"
     assert gateway.profile_history_id() == "12345"
 
 

@@ -376,6 +376,9 @@ class Microsoft365Gateway:
             raise MicrosoftAuthorizationRejected("Microsoft mailbox identity is unavailable")
         return self._mailbox_identity_key
 
+    def mailbox_address(self) -> str:
+        return self._email_address
+
     @classmethod
     def from_token(
         cls,

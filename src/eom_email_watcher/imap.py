@@ -1383,6 +1383,9 @@ class ImapGateway:
         value = "\0".join(("imap-mailbox-v2", mailbox_id, str(uid_validity))).encode("utf-8")
         return hashlib.sha256(value).hexdigest()
 
+    def mailbox_address(self) -> str:
+        return self.credentials.email_address
+
     @contextlib.contextmanager
     def _mailbox(self) -> Iterator[imaplib.IMAP4]:
         if self._active_client is not None:

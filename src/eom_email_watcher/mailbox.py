@@ -70,6 +70,8 @@ class MessageContent:
 
 
 class MailboxGateway(Protocol):
+    def mailbox_address(self) -> str: ...
+
     def mailbox_identity_key(self) -> str: ...
 
     def initial_cursor(self) -> str: ...
@@ -118,6 +120,19 @@ def mailbox_session_identity_key(session: MailboxSession) -> str:
             "The selected email provider returned an invalid mailbox identity"
         )
     return key
+
+
+def mailbox_session_address(session: MailboxSession) -> str | None:
+    """Return a supported adapter's authenticated mailbox address when exposed."""
+    resolver = getattr(session.gateway, "mailbox_address", None)
+    if not callable(resolver):
+        return None
+    address = resolver()
+    if not isinstance(address, str) or not address.strip():
+        raise MailboxAccountUnavailable(
+            "The selected email provider returned an invalid mailbox address"
+        )
+    return address.strip().casefold()
 
 
 def scoped_message_id(

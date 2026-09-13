@@ -483,6 +483,67 @@ def test_rule_cas_noop_and_atomic_analysis_create_one_durable_fire(tmp_path: Pat
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
 
 
+def test_empty_root_part_id_creates_a_source_verified_fire_and_attempt(tmp_path: Path) -> None:
+    store = initialized_store(tmp_path)
+    created = store.put_automation_rule(rule_definition())
+    add_invoice_message(store)
+    store.replace_attachments(
+        "message-1",
+        (
+            AttachmentDescriptor(
+                "",
+                "root-attachment",
+                "root.pdf",
+                "application/pdf",
+                42,
+                0,
+            ),
+        ),
+    )
+
+    store.mark_analyzed(
+        "message-1",
+        analysis(),
+        mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+    )
+
+    fires = store.automation_fires_for_message("message-1")
+    assert len(fires) == 1
+    assert fires[0].part_id == ""
+    assert fires[0].rule_id == created.summary.rule_id
+    attempts = store.automation_fire_attempts(fires[0].fire_id)
+    assert len(attempts) == 1
+    assert attempts[0].attempt_no == 1
+
+
+def test_automation_fire_still_rejects_an_uncatalogued_part_id(tmp_path: Path) -> None:
+    store = initialized_store(tmp_path)
+    created = store.put_automation_rule(rule_definition())
+    add_invoice_message(store)
+
+    with (
+        store.connection() as db,
+        pytest.raises(sqlite3.IntegrityError, match="automation fire source is invalid"),
+    ):
+        db.execute(
+            """INSERT INTO automation_fires(
+                fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                action_kind, state, state_version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'connect.invoke',
+                'pending_dispatch', 1, ?, ?)""",
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "e" * 64,
+                created.summary.rule_id,
+                created.summary.version,
+                "message-1",
+                "missing-part",
+                "2026-09-13T00:00:00+00:00",
+                "2026-09-13T00:00:00+00:00",
+            ),
+        )
+
+
 def test_store_rule_authority_is_immutable_system_protected_and_non_resurrecting(
     tmp_path: Path,
 ) -> None:
@@ -577,10 +638,13 @@ def test_rule_limit_counts_only_live_rules(tmp_path: Path) -> None:
     assert revision == MAX_AUTOMATION_RULES
     assert len(summaries) == MAX_AUTOMATION_RULES
     with pytest.raises(AutomationRuleLimitExceeded):
+        store.require_automation_rule_create_capacity()
+    with pytest.raises(AutomationRuleLimitExceeded):
         store.put_automation_rule(rule_definition())
 
     deleted = rules[0]
     store.delete_automation_rule(deleted.summary.rule_id, deleted.summary.version)
+    store.require_automation_rule_create_capacity()
     replacement = store.put_automation_rule(rule_definition())
     assert replacement.summary.version == 1
     assert len(store.automation_rules_snapshot()[1]) == MAX_AUTOMATION_RULES

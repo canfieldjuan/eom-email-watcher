@@ -1766,7 +1766,9 @@ def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
 
     def put(runtime: Runtime) -> dict[str, object]:
         try:
-            if rule_id is not None:
+            if rule_id is None:
+                runtime.store.require_automation_rule_create_capacity()
+            else:
                 assert expected_version is not None
                 current = runtime.store.automation_rule(rule_id)
                 if current.summary.version != expected_version:

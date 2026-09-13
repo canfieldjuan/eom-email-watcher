@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
 from eom_email_watcher.db import Store
 from eom_email_watcher.gmail import (
@@ -5417,6 +5418,41 @@ def test_automation_rule_put_rejects_oversized_canonical_bytes_before_runtime_ac
 
     assert response["error"]["code"] == "invalid_rule"
     assert "16384 bytes" in response["error"]["message"]
+
+
+def test_account_scoped_rule_create_rejects_limit_before_mailbox_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    for _index in range(MAX_AUTOMATION_RULES):
+        runtime.store.put_automation_rule(_automation_definition())
+    definition = _automation_definition()
+    definition["scope"] = {
+        "provider": DEFAULT_MAIL_PROVIDER,
+        "account_id": DEFAULT_MAIL_ACCOUNT_ID,
+    }
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("rule-limit rejection reached mailbox reconciliation"),
+    )
+
+    response = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+
+    assert response["error"]["code"] == "rule_limit"
 
 
 def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failure(

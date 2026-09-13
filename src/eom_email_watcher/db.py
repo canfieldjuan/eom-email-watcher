@@ -398,7 +398,7 @@ CREATE TABLE IF NOT EXISTS automation_fires (
     rule_id TEXT NOT NULL CHECK (length(rule_id) = 36),
     rule_version INTEGER NOT NULL CHECK (rule_version >= 1),
     message_id TEXT NOT NULL CHECK (message_id <> ''),
-    part_id TEXT NOT NULL CHECK (part_id <> ''),
+    part_id TEXT NOT NULL,
     action_kind TEXT NOT NULL CHECK (action_kind = 'connect.invoke'),
     state TEXT NOT NULL CHECK (state = 'pending_dispatch'),
     state_version INTEGER NOT NULL CHECK (state_version = 1),
@@ -2821,6 +2821,15 @@ class Store:
         return int(revision["revision"]), [
             self._automation_rule_detail(row).summary for row in rows
         ]
+
+    def require_automation_rule_create_capacity(self) -> None:
+        """Reject a full live rule set without mutating mailbox or rule state."""
+        with self.connection() as db:
+            count = db.execute(
+                "SELECT COUNT(*) AS count FROM automation_rules WHERE deleted = 0"
+            ).fetchone()
+        if count is None or int(count["count"]) >= MAX_AUTOMATION_RULES:
+            raise AutomationRuleLimitExceeded("automation rule limit exceeded")
 
     def automation_rule(self, rule_id: str) -> AutomationRuleDetail:
         with self.connection() as db:
