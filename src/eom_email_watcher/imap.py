@@ -1602,6 +1602,8 @@ class ImapGateway:
         client: imaplib.IMAP4,
         uid: str,
         part: _ImapBodyPart | _ImapAttachment,
+        *,
+        byte_limit: int = MAX_MESSAGE_BYTES,
     ) -> bytes:
         root_attachment = isinstance(part, _ImapAttachment) and not part.section
         if not root_attachment and _IMAP_SECTION.fullmatch(part.section) is None:
@@ -1623,7 +1625,7 @@ class ImapGateway:
             remaining = MAX_MESSAGE_BYTES - len(prefix)
             body = cls._fetch_section_bytes(client, uid, part.section, remaining)
             return prefix + body
-        return cls._fetch_section_bytes(client, uid, part.section, MAX_MESSAGE_BYTES)
+        return cls._fetch_section_bytes(client, uid, part.section, byte_limit)
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         with self._mailbox() as client:
@@ -1635,10 +1637,16 @@ class ImapGateway:
                     "imap_message_too_large", "Message content exceeds the safe size limit"
                 )
             rendered: list[str] = []
+            remaining_bytes = MAX_MESSAGE_BYTES
             for part in selected_parts:
-                decoded = _decoded_section(
-                    self._section_bytes(client, uid, part), part.transfer_encoding
+                section = self._section_bytes(
+                    client,
+                    uid,
+                    part,
+                    byte_limit=remaining_bytes,
                 )
+                remaining_bytes -= len(section)
+                decoded = _decoded_section(section, part.transfer_encoding)
                 try:
                     text = decoded.decode(part.charset or "utf-8", errors="replace")
                 except LookupError:

@@ -579,6 +579,39 @@ def test_bodystructure_size_accepts_sqlite_maximum_and_rejects_next_integer() ->
     assert raised.value.code == "imap_bodystructure_invalid"
 
 
+def test_content_bounds_aggregate_actual_text_section_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    structure = (
+        b'(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 1 1 NIL NIL NIL NIL) '
+        b'("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 1 1 NIL NIL NIL NIL) '
+        b'"MIXED" ("BOUNDARY" "boundary") NIL NIL NIL)'
+    )
+
+    class UnderreportedText(FakeImap):
+        def __init__(self, second: bytes) -> None:
+            super().__init__()
+            self.bodystructure = structure
+            self.sections = {"1": b"abc", "2": second}
+
+    monkeypatch.setattr("eom_email_watcher.imap.MAX_MESSAGE_BYTES", 5)
+    accepted_client = UnderreportedText(b"de")
+    accepted = ImapGateway(credentials(), lambda _credentials, _context: accepted_client)
+
+    assert accepted.content(message_id(), 1000).body == "abc\nde"
+    accepted_fetches = [
+        str(call[-1]) for call in accepted_client.calls if call[:2] == ("uid", "FETCH")
+    ]
+    assert any("BODY.PEEK[1]<0.6>" in query for query in accepted_fetches)
+    assert any("BODY.PEEK[2]<0.3>" in query for query in accepted_fetches)
+
+    rejected = ImapGateway(credentials(), lambda _credentials, _context: UnderreportedText(b"def"))
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        rejected.content(message_id(), 1000)
+
+    assert raised.value.code == "imap_message_too_large"
+
+
 def test_zone_less_internaldate_is_interpreted_as_utc() -> None:
     class ZoneLessInternalDate(FakeImap):
         def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
