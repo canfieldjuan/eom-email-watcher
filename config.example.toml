@@ -23,7 +23,8 @@ model_timeout_seconds = 60
 notifications_enabled = true
 # Optional content-bearing phone push via ntfy (https://ntfy.sh).
 # Enabling this sends the configured topic and numeric priority plus:
-# - title: watched sender label/address and email subject
+# - title: configured sender label; otherwise the message-supplied display
+#   name; otherwise the email address; followed by the email subject
 # - message: local model summary, optional suggested action and deadline; or
 #   fallback/review text that can contain email-derived content
 # HTTPS protects transit only. The ntfy service can read and may retain or log

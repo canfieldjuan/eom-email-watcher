@@ -18,15 +18,18 @@ the guard would make the release claim unreviewable.
 ### Problem-derived contract
 
 - **Root cause:** `load_config` accepts `ntfy_topic` without a separate
-  acknowledgement of the disclosure, while `send_analysis` sends sender,
-  subject, model summary, optional suggested action, and optional deadline.
+  acknowledgement of the disclosure, while the notification title can send a
+  configured sender label, a message-supplied display name when no label exists,
+  or the sender address, followed by the subject. `send_analysis` also sends the
+  model summary, optional suggested action, and optional deadline.
   `send_review` can also send review text. The notification tests assert only
   selected JSON members, so they do not close the outbound payload shape.
 - **Correct fix must touch/change:** add an exact boolean acknowledgement to the
   typed config; reject a configured topic unless that value is literally
   `true`; carry it through every production ntfy caller; enforce it again
   immediately before notification-channel side effects; document every emitted
-  JSON field and which values contain email-derived content; and assert the
+  JSON field, every sender-label fallback, and which values contain email-derived
+  content; and assert the
   complete analysis, fallback, and review payloads.
 - **Must not change:** the content-bearing payload selected by the operator,
   desktop notification independence, topic format, HTTPS requirement,
@@ -70,10 +73,11 @@ Acceptance criteria:
    production `send_analysis`, `send_fallback`, and `send_review` path;
    engine API fixtures that intentionally configure ntfy include the same
    acknowledgement required from deployed TOML.
-5. `README.md` and `config.example.toml` state that HTTPS is transport
-   encryption only; the topic and ntfy service can read the content; the service
-   may retain or log it; and confidentiality-sensitive operators can leave ntfy
-   unset and keep desktop notifications.
+5. `README.md` and `config.example.toml` enumerate the configured-label,
+   message-supplied-display-name, and address title fallbacks; state that HTTPS is
+   transport encryption only; explain that the topic and ntfy service can read and
+   may retain or log the content; and tell confidentiality-sensitive operators
+   they can leave ntfy unset and keep desktop notifications.
 6. The existing notification, config, CLI, service, and full repository suites
    remain green.
 
@@ -147,10 +151,10 @@ before attempting either desktop or ntfy delivery, closing direct internal
 callers as well as configuration-based entrypoints.
 
 The ntfy JSON stays content-bearing and unchanged. Setup text enumerates its
-four keys and explains the title/message contents for analysis, fallback, and
-review notifications. Tests compare complete mappings rather than individual
-members, so adding another outbound key requires an explicit test and disclosure
-change.
+four keys and explains every title-label fallback plus the message contents for
+analysis, fallback, and review notifications. Tests compare complete mappings
+rather than individual members, so adding another outbound key requires an
+explicit test and disclosure change.
 
 ## Intentional
 
@@ -192,6 +196,9 @@ Parked hardening: issue #137 records the later opaque notification mode.
 - `uv run pytest -o addopts='' --tb=short` — `1309 passed, 16 skipped in
   84.19s`.
 - `uv run ruff check .` — `All checks passed!`.
+- Documentation-to-code trace: `service.py:1064` and `service.py:1356` select
+  configured label, then message-supplied display name, then sender address;
+  both disclosure surfaces enumerate that order.
 - `git diff --check` — clean.
 - Cold diff reconstruction found and removed formatter-only changes outside the
   contract. The remaining 13-file diff traces only to config admission,
@@ -202,10 +209,10 @@ Parked hardening: issue #137 records the later opaque notification mode.
 
 | File | LOC |
 |---|---:|
-| `README.md` | 40 |
-| `config.example.toml` | 17 |
+| `README.md` | 42 |
+| `config.example.toml` | 18 |
 | `docs/ENGINE_API.md` | 4 |
-| `plans/PR-Ntfy-Privacy-Opt-In.md` | 218 |
+| `plans/PR-Ntfy-Privacy-Opt-In.md` | 225 |
 | `src/eom_email_watcher/cli.py` | 1 |
 | `src/eom_email_watcher/config.py` | 10 |
 | `src/eom_email_watcher/notifications.py` | 9 |
@@ -215,4 +222,4 @@ Parked hardening: issue #137 records the later opaque notification mode.
 | `tests/test_engine_api.py` | 6 |
 | `tests/test_notifications.py` | 133 |
 | `tests/test_service.py` | 28 |
-| **Total** | **526** |
+| **Total** | **536** |

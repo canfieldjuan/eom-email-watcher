@@ -70,7 +70,8 @@ For every phone notification, Email Watcher sends one HTTPS JSON request to the 
 `ntfy_url` containing exactly:
 
 - `topic`: the configured topic;
-- `title`: the watched sender's configured label or email address, followed by the email subject;
+- `title`: the watched sender's configured label; otherwise the message-supplied display name;
+  otherwise the email address; followed by the email subject;
 - `message`: for a completed analysis, the local model summary plus any suggested action and
   normalized deadline; for a fallback, fixed retry text; for scheduling review, review text that may
   contain an email-derived summary; and
@@ -79,7 +80,8 @@ For every phone notification, Email Watcher sends one HTTPS JSON request to the 
 
 The application does not redact or encrypt these fields at the application layer. HTTPS protects
 the request while it travels to the server, but the configured ntfy service can read the topic,
-sender label or address, subject, summary, suggested action, deadline, and review text. A long random
+configured sender label, message-supplied display name, email address, subject, summary, suggested
+action, deadline, and review text. A long random
 topic limits who can subscribe or publish; it does not hide content from the service. The service may
 also retain this content in logs, storage, or backups according to its own policy.
 
