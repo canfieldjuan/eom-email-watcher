@@ -31,6 +31,7 @@ from eom_email_watcher.imap import (
     _bodystructure_response_bytes,
     _content,
     _content_and_attachment_payloads,
+    _multipart_attachment_prefix,
     _synthesized_attachment_name,
     credentials_from_connection,
     imap_cursor_mailbox_identity,
@@ -254,9 +255,7 @@ class FakeImap:
             )
             return "OK", [(metadata, headers + b"\r\n\r\n"), b")"]
         if "BODYSTRUCTURE" in query:
-            return "OK", [
-                f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + self.bodystructure + b")"
-            ]
+            return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + self.bodystructure + b")"]
         if "BODY.PEEK[]" in query:
             raise AssertionError("whole-message fetch is forbidden")
         section_match = re.search(r"BODY\.PEEK\[([1-9][0-9]*(?:\.[1-9][0-9]*)*)\]", query)
@@ -525,9 +524,7 @@ def test_metadata_and_content_skip_attachment_payload_sections() -> None:
                     ),
                     b")",
                 ]
-            if command == "FETCH" and (
-                "BODY.PEEK[]" in query or "BODY.PEEK[2]" in query
-            ):
+            if command == "FETCH" and ("BODY.PEEK[]" in query or "BODY.PEEK[2]" in query):
                 raise AssertionError("ordinary analysis fetched attachment content")
             return super().uid(command, *args)
 
@@ -646,9 +643,7 @@ def test_root_multipart_attachment_is_fetched_only_after_explicit_request() -> N
             uid = str(args[0])
             if command == "FETCH" and "BODYSTRUCTURE" in query:
                 self.calls.append(("uid", command, *args))
-                return "OK", [
-                    f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + root_structure + b")"
-                ]
+                return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + root_structure + b")"]
             if command == "FETCH" and "BODY.PEEK[]" in query:
                 self.calls.append(("uid", command, *args))
                 return "OK", [
@@ -674,6 +669,183 @@ def test_root_multipart_attachment_is_fetched_only_after_explicit_request() -> N
     assert fetched == RAW_MESSAGE
     assert all("BODY.PEEK[]" not in str(call[-1]) for call in clients[0].calls if call)
     assert any("BODY.PEEK[]" in str(call[-1]) for call in clients[1].calls if call)
+
+
+def test_non_root_multipart_attachment_export_preserves_wrapper_and_boundaries() -> None:
+    structure = (
+        b'(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 18 1 NIL NIL NIL NIL) '
+        b'(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 19 1 NIL NIL NIL NIL) '
+        b'("TEXT" "HTML" ("CHARSET" "utf-8") NIL NIL "7BIT" 23 1 NIL NIL NIL NIL) '
+        b'"ALTERNATIVE" ("BOUNDARY" "inner") '
+        b'("ATTACHMENT" ("FILENAME" "bundle.eml")) NIL NIL) '
+        b'"MIXED" ("BOUNDARY" "outer") NIL NIL NIL)'
+    )
+    mime_headers = (
+        b"Content-Type: multipart/alternative; boundary=inner\r\n"
+        b"Content-Disposition: attachment; filename=bundle.eml\r\n\r\n"
+    )
+    multipart_body = (
+        b"--inner\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"Plain alternative\r\n"
+        b"--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        b"<p>HTML alternative</p>\r\n"
+        b"--inner--\r\n"
+    )
+
+    class MultipartAttachment(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            query = str(args[-1])
+            uid = str(args[0])
+            if command == "FETCH" and "BODYSTRUCTURE" in query:
+                self.calls.append(("uid", command, *args))
+                return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + structure + b")"]
+            if command == "FETCH" and "BODY.PEEK[2.MIME]" in query:
+                self.calls.append(("uid", command, *args))
+                return "OK", [
+                    (
+                        f"{uid} (UID {uid} BODY[2.MIME]<0> {{{len(mime_headers)}}}".encode(),
+                        mime_headers,
+                    ),
+                    b")",
+                ]
+            if command == "FETCH" and "BODY.PEEK[2]" in query:
+                self.calls.append(("uid", command, *args))
+                return "OK", [
+                    (
+                        f"{uid} (UID {uid} BODY[2]<0> {{{len(multipart_body)}}}".encode(),
+                        multipart_body,
+                    ),
+                    b")",
+                ]
+            return super().uid(command, *args)
+
+    clients: list[MultipartAttachment] = []
+
+    def create(_credentials: ImapCredentials, _context: ssl.SSLContext) -> MultipartAttachment:
+        client = MultipartAttachment()
+        clients.append(client)
+        return client
+
+    gateway = ImapGateway(credentials(), create)
+
+    content = gateway.content(message_id(), 1000)
+    exported = BytesParser(policy=policy.default).parsebytes(
+        gateway.attachment_bytes(message_id(), "mime-0", None)
+    )
+
+    assert content.body == "The invoice is attached."
+    assert content.attachment_names == ("bundle.eml",)
+    assert all("BODY.PEEK[2" not in str(call[-1]) for call in clients[0].calls if call)
+    assert any("BODY.PEEK[2.MIME]" in str(call[-1]) for call in clients[1].calls if call)
+    assert any("BODY.PEEK[2]" in str(call[-1]) for call in clients[1].calls if call)
+    assert exported.get_content_type() == "multipart/alternative"
+    assert exported.get_boundary() == "inner"
+    assert len(exported.get_payload()) == 2
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        b"Content-Type: text/plain\r\n\r\n",
+        b"Content-Type: multipart/alternative\r\n\r\n",
+    ],
+)
+def test_multipart_attachment_rejects_mismatched_or_boundaryless_headers(headers: bytes) -> None:
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        _multipart_attachment_prefix(headers, "multipart/alternative")
+
+    assert raised.value.code == "imap_message_invalid"
+
+
+@pytest.mark.parametrize(
+    ("structure", "expected_filename"),
+    [
+        pytest.param(
+            b'("APPLICATION" "PDF" ("NAME*" "utf-8\'\'caf%C3%A9.pdf") '
+            b'NIL NIL "BASE64" 14 NIL NIL NIL NIL)',
+            "caf\u00e9.pdf",
+            id="rfc2231-single-content-type-name",
+        ),
+        pytest.param(
+            b'("APPLICATION" "PDF" NIL NIL NIL "BASE64" 14 NIL '
+            b'("ATTACHMENT" ("FILENAME*0*" "utf-8\'\'quarterly%20" '
+            b'"FILENAME*1*" "report.pdf")) NIL NIL)',
+            "quarterly report.pdf",
+            id="rfc2231-continuation-disposition-filename",
+        ),
+        pytest.param(
+            b'("APPLICATION" "PDF" NIL NIL NIL "BASE64" 14 NIL '
+            b'("ATTACHMENT" ("FILENAME" "=?utf-8?b?Y2Fmw6kucGRm?=")) NIL NIL)',
+            "caf\u00e9.pdf",
+            id="rfc2047-encoded-word",
+        ),
+    ],
+)
+def test_bodystructure_decodes_extended_and_encoded_attachment_filenames(
+    structure: bytes, expected_filename: str
+) -> None:
+    class EncodedFilename(FakeImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bodystructure = structure
+
+    client = EncodedFilename()
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    content = gateway.content(message_id(), 1000)
+
+    assert content.attachment_names == (expected_filename,)
+    assert all("BODY.PEEK[1]" not in str(call[-1]) for call in client.calls if call)
+
+
+def test_malformed_extended_filename_stays_catalogued_with_synthesized_name() -> None:
+    structure = (
+        b'("APPLICATION" "PDF" ("NAME*0*" "utf-8\'\'partial%20" '
+        b'"NAME*2*" "gap.pdf") NIL NIL "BASE64" 14 NIL NIL NIL NIL)'
+    )
+
+    class MalformedExtendedFilename(FakeImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bodystructure = structure
+
+    client = MalformedExtendedFilename()
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    content = gateway.content(message_id(), 1000)
+
+    assert content.attachment_names == ("attachment-1.pdf",)
+    assert all("BODY.PEEK[1]" not in str(call[-1]) for call in client.calls if call)
+
+
+def test_unknown_text_charset_falls_back_to_utf8_replacement() -> None:
+    class UnknownCharset(FakeImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bodystructure = (
+                b'("TEXT" "PLAIN" ("CHARSET" "x-vendor") NIL NIL "8BIT" 5 1 NIL NIL NIL NIL)'
+            )
+            self.sections = {"1": b"caf\xc3\xa9"}
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: UnknownCharset())
+
+    assert gateway.content(message_id(), 1000).body == "caf\u00e9"
+
+
+def test_empty_successful_bodystructure_fetch_is_message_unavailable() -> None:
+    class ExpungedBeforeBodystructure(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            if command == "FETCH" and "BODYSTRUCTURE" in str(args[-1]):
+                self.calls.append(("uid", command, *args))
+                return "OK", [None]
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(
+        credentials(), lambda _credentials, _context: ExpungedBeforeBodystructure()
+    )
+
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content(message_id(), 1000)
 
 
 def test_bodystructure_literal_filename_is_catalogued_without_attachment_fetch() -> None:
@@ -732,7 +904,7 @@ def test_bodystructure_literal_length_mismatch_fails_closed() -> None:
         def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
             if command == "FETCH" and "BODYSTRUCTURE" in str(args[-1]):
                 uid = str(args[0])
-                prefix = f"{uid} (UID {uid} BODYSTRUCTURE (\"TEXT\" {{2}}".encode()
+                prefix = f'{uid} (UID {uid} BODYSTRUCTURE ("TEXT" {{2}}'.encode()
                 return "OK", [(prefix, b"plain")]
             return super().uid(command, *args)
 
@@ -952,9 +1124,7 @@ def test_unrecognized_text_transfer_encoding_fails_before_section_fetch() -> Non
             if command == "FETCH" and "BODYSTRUCTURE" in str(args[-1]):
                 uid = str(args[0])
                 structure = RAW_BODYSTRUCTURE.replace(b'"7BIT"', b'"X-CUSTOM"', 1)
-                return "OK", [
-                    f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + structure + b")"
-                ]
+                return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + structure + b")"]
             return super().uid(command, *args)
 
     client = UnsupportedEncoding()
@@ -1075,9 +1245,7 @@ def test_recovery_pages_newest_matches_without_losing_older_matches() -> None:
     first = gateway.recover_since(frozenset(), datetime(2026, 9, 4, tzinfo=UTC))
     second = gateway.changes_since(first.cursor)
 
-    assert first.message_ids == tuple(
-        message_id(value) for value in range(2, message_count + 1)
-    )
+    assert first.message_ids == tuple(message_id(value) for value in range(2, message_count + 1))
     assert first.cursor == recovery_cursor(1, message_count)
     assert second.message_ids == (message_id(1),)
     assert second.cursor == cursor(message_count)
@@ -1228,9 +1396,7 @@ def test_oversized_message_is_a_permanent_message_failure() -> None:
                     + str(MAX_MESSAGE_BYTES + 1).encode()
                     + b" 1 NIL NIL NIL NIL)"
                 )
-                return "OK", [
-                    f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + structure + b")"
-                ]
+                return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + structure + b")"]
             return super().uid(command, *args)
 
     gateway = ImapGateway(
