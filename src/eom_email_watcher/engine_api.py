@@ -61,6 +61,7 @@ from .gmail import (
 from .imap import (
     IMAP_CONNECTION_METHOD,
     IMAP_PROVIDER,
+    MAX_MESSAGE_BYTES,
     ImapError,
     ImapGateway,
     credentials_from_connection,
@@ -1872,6 +1873,10 @@ def _attachment_contract_size(provider: str, byte_size: int) -> int:
     return 1 if provider == IMAP_PROVIDER else byte_size
 
 
+def _attachment_is_locally_fetchable(provider: str, byte_size: int) -> bool:
+    return provider != IMAP_PROVIDER or byte_size <= MAX_MESSAGE_BYTES
+
+
 def _attachment_download_matches(provider: str, byte_size: int, content: bytes) -> bool:
     return provider == IMAP_PROVIDER or len(content) == byte_size
 
@@ -1989,9 +1994,13 @@ def _connect_attachment_capabilities(request: dict[str, object]) -> dict[str, ob
         raise ApiError("not_found", "Attachment was not found") from exc
     source = _configured_message_source(runtime, message_id)
     catalog = connect.discover_capabilities()
-    items = catalog.compatible(
-        attachment.media_type,
-        _attachment_contract_size(source.provider, attachment.byte_size),
+    items = (
+        catalog.compatible(
+            attachment.media_type,
+            _attachment_contract_size(source.provider, attachment.byte_size),
+        )
+        if _attachment_is_locally_fetchable(source.provider, attachment.byte_size)
+        else ()
     )
     return {
         "items": [capability.public_dict() for capability in items],
@@ -3240,6 +3249,14 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         if existing.status == "failed":
             raise _stored_connect_failure(existing)
 
+    if existing is None and not _attachment_is_locally_fetchable(
+        source.provider, attachment.byte_size
+    ):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment exceeds the local mailbox fetch limit.",
+        )
+
     connect.require_connect_entitlement()
 
     capability, parameters = _discover_selected_generic_capability(
@@ -3254,6 +3271,13 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         except KeyError as exc:
             raise ApiError("not_found", "Attachment was not found") from exc
         current_source = _retained_connect_message_source(runtime, message_id)
+        if not _attachment_is_locally_fetchable(
+            current_source.provider, current_attachment.byte_size
+        ):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment exceeds the local mailbox fetch limit.",
+            )
         gateway = _configured_mailbox_gateway(runtime, current_source)
         content = gateway.attachment_bytes(
             current_source.provider_message_id,
@@ -3302,7 +3326,9 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             locked_attachment = runtime.store.attachment(message_id, part_id)
         except KeyError as exc:
             raise ApiError("connect_source_unavailable", "Attachment was not found") from exc
-        if not capability.accepts_artifact(
+        if not _attachment_is_locally_fetchable(
+            locked_source.provider, locked_attachment.byte_size
+        ) or not capability.accepts_artifact(
             locked_attachment.media_type,
             _attachment_contract_size(
                 locked_source.provider,
@@ -3430,6 +3456,9 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
     )
     if completed is not None:
         return _connect_result(completed)
+
+    if not _attachment_is_locally_fetchable(source.provider, attachment.byte_size):
+        raise ApiError("unsupported_attachment", "This attachment is not a supported PDF")
 
     connect.require_connect_entitlement()
 

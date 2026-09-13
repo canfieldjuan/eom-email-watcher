@@ -557,6 +557,28 @@ def test_metadata_and_content_skip_attachment_payload_sections() -> None:
     assert all("BODY.PEEK[2]" not in str(call[-1]) for call in fetches)
 
 
+def test_bodystructure_size_accepts_sqlite_maximum_and_rejects_next_integer() -> None:
+    maximum = (1 << 63) - 1
+
+    class SizedAttachment(FakeImap):
+        def __init__(self, size: int) -> None:
+            super().__init__()
+            self.bodystructure = RAW_BODYSTRUCTURE.replace(
+                b'"BASE64" 14 ', f'"BASE64" {size} '.encode("ascii")
+            )
+
+    accepted = ImapGateway(credentials(), lambda _credentials, _context: SizedAttachment(maximum))
+    assert accepted.content(message_id(), 1000).attachments[0].byte_size == maximum
+
+    rejected = ImapGateway(
+        credentials(), lambda _credentials, _context: SizedAttachment(maximum + 1)
+    )
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        rejected.content(message_id(), 1000)
+
+    assert raised.value.code == "imap_bodystructure_invalid"
+
+
 def test_zone_less_internaldate_is_interpreted_as_utc() -> None:
     class ZoneLessInternalDate(FakeImap):
         def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
@@ -894,6 +916,77 @@ def test_section_fetch_rejects_a_different_returned_section() -> None:
             return status, response
 
     gateway = ImapGateway(credentials(), lambda _credentials, _context: WrongSection())
+
+    with pytest.raises(MailboxMessageUnavailable):
+        gateway.content(message_id(), 1000)
+
+
+@pytest.mark.parametrize(
+    ("wire_value", "expected"),
+    [
+        (b'"hello"', "hello"),
+        (b'"a\\"b\\\\c"', 'a"b\\c'),
+        (b'""', ""),
+    ],
+)
+def test_section_fetch_accepts_quoted_nstrings(wire_value: bytes, expected: str) -> None:
+    class QuotedSection(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            if command == "FETCH" and "BODY.PEEK[1]" in str(args[-1]):
+                uid = str(args[0])
+                return "OK", [f"{uid} (UID {uid} BODY[1]<0> ".encode() + wire_value + b")"]
+            return super().uid(command, *args)
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: QuotedSection())
+
+    assert gateway.content(message_id(), 1000).body == expected
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        [b'7 (UID 7 BODY[2]<0> "hello")'],
+        [b'7 (UID 8 BODY[1]<0> "hello")'],
+        [b"7 (UID 7 BODY[1]<0> NIL)"],
+        [b"7 (UID 7 BODY[1]<0> hello)"],
+        [b'7 (UID 7 BODY[1]<0> "first" BODY[1]<0> "second")'],
+    ],
+)
+def test_section_fetch_rejects_unmatched_or_ambiguous_quoted_nstrings(
+    response: list[bytes],
+) -> None:
+    class QuotedResponse(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            return "OK", list(response)
+
+    with pytest.raises(MailboxMessageUnavailable):
+        ImapGateway._fetch_section_bytes(QuotedResponse(), "7", "1", 10)
+
+
+def test_quoted_section_fetch_enforces_the_requested_byte_boundary() -> None:
+    class QuotedResponse(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            return "OK", [b'7 (UID 7 BODY[1]<0> "abc")']
+
+    client = QuotedResponse()
+
+    assert ImapGateway._fetch_section_bytes(client, "7", "1", 3) == b"abc"
+    with pytest.raises(MailboxMessageInvalid) as raised:
+        ImapGateway._fetch_section_bytes(client, "7", "1", 2)
+
+    assert raised.value.code == "imap_message_too_large"
+
+
+def test_section_fetch_rejects_a_mismatched_literal_length() -> None:
+    class InvalidLiteralLength(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            status, response = super().uid(command, *args)
+            if command == "FETCH" and "BODY.PEEK[1]" in str(args[-1]):
+                metadata, payload = response[0]
+                response[0] = (metadata.replace(b"{26}", b"{25}"), payload)
+            return status, response
+
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: InvalidLiteralLength())
 
     with pytest.raises(MailboxMessageUnavailable):
         gateway.content(message_id(), 1000)

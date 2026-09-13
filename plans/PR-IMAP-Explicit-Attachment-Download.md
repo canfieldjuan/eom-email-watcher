@@ -7,8 +7,8 @@ Issue #133 identifies a first-release privacy contradiction: the README says att
 ### Problem-derived contract
 
 - Root cause: IMAP body analysis and attachment discovery share one whole-message fetch and one parser result, so descriptor creation depends on already-downloaded attachment payloads.
-- Review-follow-up root cause: the first selective implementation treated BODYSTRUCTURE parameter values and section bodies as equivalent to the prior parsed MIME entity. That loses multipart wrapper headers, RFC 2231/2047 filename decoding, unknown-charset fallback, and the unavailable classification for an empty successful UID FETCH.
-- Correct fix: normal analysis must derive a bounded MIME catalog from server metadata, fetch only non-attachment text sections needed for the analysis body, and build attachment descriptors without requesting or decoding attachment sections. Explicit retrieval must resolve the same stable attachment identity and fetch its bytes on demand, including a bounded MIME-header fetch when a non-root multipart attachment needs its wrapper. Catalog decoding must preserve RFC 2231/2047 filenames, text decoding must preserve the UTF-8 replacement fallback, and empty successful UID FETCH results must remain unavailable rather than permanent failures. Export and Connect callers must treat IMAP BODYSTRUCTURE size as provider-reported metadata, validate actual bytes after explicit retrieval, and retain exact descriptor-size equality for Gmail and Microsoft 365.
+- Review-follow-up root cause: the selective implementation did not close three representation boundaries. BODYSTRUCTURE sizes were accepted beyond SQLite's signed 64-bit range, section fetches accepted only literal-backed nstrings even though IMAP also permits quoted strings, and Connect treated every IMAP descriptor as pre-fetch-compatible even when the adapter's local safety ceiling made retrieval impossible.
+- Correct fix: normal analysis must derive a bounded MIME catalog from server metadata, fetch only non-attachment text sections needed for the analysis body, and build attachment descriptors without requesting or decoding attachment sections. Explicit retrieval must resolve the same stable attachment identity and fetch its bytes on demand, including a bounded MIME-header fetch when a non-root multipart attachment needs its wrapper. Catalog decoding must preserve RFC 2231/2047 filenames, text decoding must preserve the UTF-8 replacement fallback, and empty successful UID FETCH results must remain unavailable rather than permanent failures. BODYSTRUCTURE sizes must fit the persistence range; section responses must accept exactly one identity-matched literal or quoted nstring and reject malformed, ambiguous, oversized, or wrong-section data. Export and Connect callers must treat IMAP BODYSTRUCTURE size as provider-reported metadata, exclude locally unfetchable descriptors from capability results and before new invocation provider selection, reject a descriptor that crosses the ceiling under the source lock, block an active job before any required local refetch, validate actual bytes after explicit retrieval, and retain exact descriptor-size equality for Gmail and Microsoft 365.
 - Must not change: Gmail or Microsoft 365 adapters, their exact descriptor-size checks, read-only IMAP selection and PEEK semantics, descriptor-only SQLite persistence, sender admission, Connect job artifact integrity, or the existing `mime-<position>` identity presented to callers.
 - Root versus symptom: this fixes the coupling at its source; changing README copy alone or discarding decoded bytes after the whole-message fetch would treat only the visible symptom.
 
@@ -23,17 +23,21 @@ Slice phase: First Public Release blocker
 3. Add positive, negative, mixed-MIME, and malformed-response regression coverage.
 4. Correct the provider overview and attachment-fetch wording to describe verified Gmail, Microsoft 365, and IMAP behavior.
 5. Normalize IMAP’s non-exact descriptor size at explicit export and Connect admission boundaries, then validate the fetched bytes against the destination capability’s real limit.
+6. Close persistence-range, quoted-section, and local-fetchability boundaries raised by the current-head review.
 
 ### Review Contract
 
 - Ordinary `ImapGateway.content` never issues `BODY.PEEK[]` or any fetch for a catalogued attachment section; settled by `tests/test_imap.py::test_metadata_and_content_skip_attachment_payload_sections` and inspection of `src/eom_email_watcher/imap.py`.
 - BODYSTRUCTURE is the single descriptor catalog, is bounded by MIME depth/part/metadata limits, and fails closed on malformed or unrecognized structure; settled by focused parser boundary tests in `tests/test_imap.py`.
+- BODYSTRUCTURE sizes at SQLite's signed 64-bit maximum are admitted while the next integer is rejected as `imap_bodystructure_invalid`; settled by a boundary test in `tests/test_imap.py`.
 - Mixed messages fetch admitted text sections and retain stable `mime-<position>` attachment descriptors from server-reported type, filename, and size; settled by the normal-content tests.
 - `ImapGateway.attachment_bytes` resolves the stable descriptor position against a fresh catalog and returns decoded bytes only after the explicit call; settled by `tests/test_imap.py::test_attachment_bytes_reuses_stable_mime_position` plus attachment-shape controls.
 - A non-root multipart attachment remains a parseable MIME entity with its Content-Type boundary wrapper, and its MIME headers are fetched only during explicit retrieval; settled by `tests/test_imap.py::test_non_root_multipart_attachment_export_preserves_wrapper_and_boundaries`.
 - RFC 2231 single/continued filename parameters and RFC 2047 encoded words produce decoded attachment names without fetching attachment bodies; settled by `tests/test_imap.py::test_bodystructure_decodes_extended_and_encoded_attachment_filenames`.
 - An unknown declared text charset falls back to UTF-8 replacement, while an empty successful BODYSTRUCTURE UID FETCH raises `MailboxMessageUnavailable`; settled by focused tests in `tests/test_imap.py`.
+- Section fetches accept identity-matched literal and quoted nstrings, including escaped and empty quoted values, while wrong-section, ambiguous, NIL, and over-limit responses fail closed; settled by focused tests in `tests/test_imap.py`.
 - IMAP export and Connect admission do not compare decoded bytes to non-exact BODYSTRUCTURE size; they use actual bytes for final capability limits and job artifacts, while Gmail/Microsoft mismatches still fail closed; settled by focused `tests/test_engine_api.py`, `tests/test_connect_engine_api.py`, and `tests/test_connect_v2_engine_api.py` controls.
+- Connect capability discovery returns no compatible items for an IMAP descriptor above the adapter's local fetch ceiling, and new generic and legacy invocations reject it before opening the mailbox or selecting a provider; the exact ceiling remains admitted and uses the explicit-fetch path. The generic source-lock recheck rejects a descriptor that crosses the ceiling before fetch or queueing. Settled by focused `tests/test_connect_v2_engine_api.py` and `tests/test_connect_engine_api.py` controls.
 - IMAP remains read-only and uses PEEK; settled by existing session and source-flag tests plus `tests/test_imap.py` query assertions.
 - README provider and attachment claims match the resulting code paths; settled by direct README/code comparison.
 - Reachability proof: the public mailbox gateway `content` and `attachment_bytes` entrypoints are exercised, with analysis text/descriptors and explicit bytes as the observable results.
@@ -63,7 +67,7 @@ Slice phase: First Public Release blocker
 
 ## Mechanism
 
-The adapter requests UID plus bounded BODYSTRUCTURE metadata, parses its IMAP data items into a validated MIME catalog, decodes standards-based filename parameters, and records server section selectors internally. Normal content retrieval requests only selected text sections with `BODY.PEEK`, decodes them according to catalogued transfer metadata with the prior unknown-charset fallback, and builds descriptors without payload bytes. Explicit attachment retrieval repeats the catalog lookup for the message, selects the stored attachment position, and requests that section before decoding it; non-root multipart attachments additionally fetch their bounded `.MIME` header section and reassemble the MIME entity. Engine callers use the smallest admissible attachment size only for the pre-fetch IMAP compatibility probe, then apply capability limits and artifact identity to the actual fetched bytes; other providers retain exact descriptor equality.
+The adapter requests UID plus bounded BODYSTRUCTURE metadata, parses its IMAP data items into a validated MIME catalog, decodes standards-based filename parameters, and records server section selectors internally. The catalog admits only sizes that SQLite can persist. Normal content retrieval requests only selected text sections with `BODY.PEEK`, decodes one exact UID-and-section-matched literal or quoted nstring according to catalogued transfer metadata with the prior unknown-charset fallback, and builds descriptors without payload bytes. Explicit attachment retrieval repeats the catalog lookup for the message, selects the stored attachment position, and requests that section before decoding it; non-root multipart attachments additionally fetch their bounded `.MIME` header section and reassemble the MIME entity. Engine callers first exclude an IMAP descriptor that exceeds the adapter's local fetch ceiling, use the smallest admissible size only for the remaining pre-fetch capability probe, then apply capability limits and artifact identity to the actual fetched bytes; other providers retain exact descriptor equality.
 
 ## Intentional
 
@@ -72,6 +76,7 @@ The adapter requests UID plus bounded BODYSTRUCTURE metadata, parses its IMAP da
 - Unknown non-text leaves stay out of analysis; they are not speculative body fallbacks.
 - Gmail, Microsoft 365, database persistence, and provider-side Connect protocol code are outside this fix.
 - Connect job construction and cryptographic artifact checks remain unchanged; only pre-job IMAP size interpretation changes.
+- Completed and active Connect job reconciliation semantics remain unchanged; an active job may query its selected provider, but cannot refetch an attachment that exceeds the local IMAP ceiling.
 
 ## Deferred
 
@@ -90,6 +95,12 @@ Parked hardening: none.
 - Diff: `git diff --check`
 - Real-server proof: `bash scripts/test-imap-greenmail.sh`
 - Review follow-up: focused multipart-wrapper, filename-decoding, unknown-charset, and expunged-message regressions in `tests/test_imap.py`
+- Current-head fail-first: persistence maximum-plus-one, quoted section nstrings, over-limit discovery, generic invocation, and legacy invocation all reproduced before the fixes.
+- Current-head focused: `uv run pytest -q tests/test_imap.py tests/test_connect_v2_engine_api.py tests/test_connect_engine_api.py -k 'sqlite_maximum or quoted_nstrings or quoted_section_fetch or mismatched_literal_length or local_fetch_ceiling'`
+- Current-head consumer suites: `uv run pytest -q tests/test_imap.py tests/test_connect_engine_api.py tests/test_connect_v2_engine_api.py tests/test_engine_api.py`
+- Current-head full Python suite: `uv run pytest -q`
+- Current-head static: `uv run ruff check .`
+- Current-head real-server proof: `bash scripts/test-imap-greenmail.sh`
 - Format: `uv run ruff format --check src/eom_email_watcher/imap.py tests/test_imap.py tests/test_imap_greenmail_integration.py`
 
 ## Estimated diff size
@@ -97,8 +108,8 @@ Parked hardening: none.
 | Metric | Estimate |
 |---|---:|
 | Files changed | 9 |
-| Added lines | 1,529 |
-| Deleted lines | 106 |
-| Total changed LOC | 1,635 |
+| Added lines | 1,975 |
+| Deleted lines | 107 |
+| Total changed LOC | 2,082 |
 
 This exceeds the 400-line target because standard-library IMAP does not parse BODYSTRUCTURE: the bounded parser, selective fetch consumer, MIME compatibility behavior, exact export and Connect caller correction, adversarial unit probes, and real-server proof form one release-blocking privacy boundary. Splitting parser admission, retrieval, compatibility, or caller semantics would leave an intermediate PR that either still downloads attachments during analysis or breaks explicit export and Connect for IMAP.

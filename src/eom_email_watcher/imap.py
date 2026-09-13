@@ -46,6 +46,7 @@ MAX_MIME_PARTS = 1000
 MAX_BODYSTRUCTURE_TOKENS = MAX_MIME_PARTS * 32
 MAX_ATTACHMENT_FILENAME_BYTES = 1024
 MAX_ATTACHMENT_FILENAME_TOTAL_BYTES = 64 * 1024
+MAX_PERSISTED_ATTACHMENT_BYTES = (1 << 63) - 1
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v2:"
@@ -505,6 +506,10 @@ def _response_metadata(response: list[Any] | None) -> bytes:
     raise MailboxMessageUnavailable("The mail server message is no longer available")
 
 
+class _ImapQuoted(bytes):
+    """Marker that distinguishes an IMAP quoted string from an atom."""
+
+
 type _ImapValue = bytes | None | list[_ImapValue]
 
 
@@ -573,14 +578,14 @@ class _ImapValueParser:
         atom = self.data[start : self.position]
         return None if atom.upper() == b"NIL" else atom
 
-    def _quoted(self) -> bytes:
+    def _quoted(self) -> _ImapQuoted:
         self.position += 1
         value = bytearray()
         while self.position < len(self.data):
             current = self.data[self.position]
             self.position += 1
             if current == ord('"'):
-                return bytes(value)
+                return _ImapQuoted(value)
             if current == ord("\\"):
                 if self.position >= len(self.data):
                     raise ValueError("IMAP quoted string ended early")
@@ -675,9 +680,103 @@ def _imap_size(value: _ImapValue) -> int:
     if not isinstance(value, bytes) or not value.isdigit():
         raise ValueError("IMAP body size is invalid")
     size = int(value)
-    if size < 0:
+    if size < 0 or size > MAX_PERSISTED_ATTACHMENT_BYTES:
         raise ValueError("IMAP body size is invalid")
     return size
+
+
+def _section_payload(
+    response: list[Any] | None,
+    expected_uid: str,
+    expected_section: str,
+    byte_limit: int,
+) -> bytes:
+    expected_uid_bytes = expected_uid.encode("ascii")
+    expected_selector = f"BODY[{expected_section}]".encode("ascii").upper()
+    literal_items = [item for item in response or [] if isinstance(item, tuple) and len(item) == 2]
+    if literal_items:
+        if len(literal_items) != 1:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        metadata, payload = literal_items[0]
+        if not isinstance(metadata, bytes) or not isinstance(payload, bytes):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        returned_uids = [match.group(1) for match in _FETCH_UID.finditer(metadata)]
+        returned_section = re.compile(
+            rb"BODY\["
+            + re.escape(expected_section.encode("ascii"))
+            + rb"\](?:<0>)?\s*\{([0-9]+)\+?\}\r?\n?\Z",
+            re.IGNORECASE,
+        )
+        section_match = returned_section.search(metadata)
+        if (
+            returned_uids != [expected_uid_bytes]
+            or section_match is None
+            or int(section_match.group(1)) != len(payload)
+        ):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        extra_section = re.compile(
+            rb"BODY\[" + re.escape(expected_section.encode("ascii")) + rb"\]",
+            re.IGNORECASE,
+        )
+        if any(
+            isinstance(item, bytes) and extra_section.search(item) is not None
+            for item in response or []
+        ):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        selected = payload
+    else:
+        encoded = bytearray()
+        for item in response or []:
+            if item is None:
+                continue
+            if not isinstance(item, bytes):
+                raise MailboxMessageUnavailable("The mail server message is no longer available")
+            if len(encoded) + len(item) + 1 > byte_limit + MAX_HEADER_BYTES:
+                raise MailboxMessageInvalid(
+                    "imap_message_too_large", "Message content exceeds the safe size limit"
+                )
+            encoded.extend(item)
+            encoded.extend(b" ")
+        if not encoded:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        try:
+            parsed = _ImapValueParser(bytes(encoded)).parse()
+        except ValueError as exc:
+            raise MailboxMessageUnavailable(
+                "The mail server message is no longer available"
+            ) from exc
+        selected_values: list[bytes] = []
+        for value in parsed:
+            if not isinstance(value, list):
+                continue
+            returned_uids = [
+                value[index + 1]
+                for index, item in enumerate(value[:-1])
+                if isinstance(item, bytes) and item.upper() == b"UID"
+            ]
+            returned_sections = [
+                value[index + 1]
+                for index, item in enumerate(value[:-1])
+                if isinstance(item, bytes)
+                and item.upper() in {expected_selector, expected_selector + b"<0>"}
+            ]
+            if not returned_sections:
+                continue
+            if (
+                returned_uids != [expected_uid_bytes]
+                or len(returned_sections) != 1
+                or not isinstance(returned_sections[0], _ImapQuoted)
+            ):
+                raise MailboxMessageUnavailable("The mail server message is no longer available")
+            selected_values.append(bytes(returned_sections[0]))
+        if len(selected_values) != 1:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        selected = selected_values[0]
+    if len(selected) > byte_limit:
+        raise MailboxMessageInvalid(
+            "imap_message_too_large", "Message content exceeds the safe size limit"
+        )
+    return selected
 
 
 def _imap_params(value: _ImapValue) -> dict[str, str]:
@@ -1495,21 +1594,7 @@ class ImapGateway:
         )
         if status != "OK":
             raise ImapError("imap_protocol_error", "Mail server content fetch failed; retry")
-        metadata, payload = _literal(response)
-        returned_uids = [match.group(1).decode("ascii") for match in _FETCH_UID.finditer(metadata)]
-        if returned_uids != [uid]:
-            raise MailboxMessageUnavailable("The mail server message is no longer available")
-        returned_section = re.compile(
-            rb"BODY\[" + re.escape(section.encode("ascii")) + rb"\](?:<0>)?\s*\{",
-            re.IGNORECASE,
-        )
-        if returned_section.search(metadata) is None:
-            raise MailboxMessageUnavailable("The mail server message is no longer available")
-        if len(payload) > byte_limit:
-            raise MailboxMessageInvalid(
-                "imap_message_too_large", "Message content exceeds the safe size limit"
-            )
-        return payload
+        return _section_payload(response, uid, section, byte_limit)
 
     @classmethod
     def _section_bytes(

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher import connect, engine_api, entitlement
+from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime, mail_account_token_file
 
@@ -401,6 +402,103 @@ def test_imap_attachment_summary_uses_actual_download_size(
     )
     assert stored is not None
     assert stored.input_byte_size == len(pdf)
+
+    runtime.store.replace_attachments(
+        "message-1",
+        (
+            AttachmentDescriptor(
+                "mime-0",
+                None,
+                "invoice.pdf",
+                "application/pdf",
+                MAX_IMAP_MESSAGE_BYTES + 1,
+                0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda **kwargs: pytest.fail("completed result reached discovery"),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: pytest.fail(f"completed result opened {path}"),
+    )
+    reused = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "mime-0"},
+        )
+    )
+
+    assert reused == response
+
+
+def test_imap_attachment_summary_rejects_descriptor_over_local_fetch_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'a' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    credentials_file = mail_account_token_file(runtime.config, account)
+    credentials_file.parent.mkdir(parents=True)
+    credentials_file.write_text("private credentials", encoding="utf-8")
+    runtime.store.add_message(
+        message_id="message-1",
+        provider="imap",
+        account_id=account.account_id,
+        provider_message_id="provider-message",
+        thread_id=None,
+        sender="private@example.com",
+        sender_name="Private Sender",
+        subject="Private subject",
+        received_at="2026-09-12T12:00:00+00:00",
+    )
+    runtime.store.replace_attachments(
+        "message-1",
+        (
+            AttachmentDescriptor(
+                "mime-0",
+                None,
+                "invoice.pdf",
+                "application/pdf",
+                MAX_IMAP_MESSAGE_BYTES + 1,
+                0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_summary_capability",
+        lambda **kwargs: pytest.fail("oversized descriptor reached discovery"),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: pytest.fail(f"oversized descriptor opened {path}"),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.summarize",
+            {"message_id": "message-1", "part_id": "mime-0"},
+        )
+    )
+
+    assert response["error"]["code"] == "unsupported_attachment"
+    assert credentials_file.exists()
 
 
 def test_provider_failure_is_durable_and_never_masquerades_as_success(
