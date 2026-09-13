@@ -116,7 +116,11 @@ def write_config(
     timezone: str = "America/Chicago",
     include_senders: bool = True,
 ) -> None:
-    ntfy_setting = f'ntfy_topic = "{ntfy_topic}"\n' if ntfy_topic else ""
+    ntfy_setting = (
+        f'ntfy_topic = "{ntfy_topic}"\nntfy_content_disclosure_acknowledged = true\n'
+        if ntfy_topic
+        else ""
+    )
     notifications_setting = str(notifications_enabled).lower()
     credentials_file = (path.parent / "credentials.json").as_posix()
     microsoft_credentials_file = (path.parent / "microsoft-oauth-client.json").as_posix()

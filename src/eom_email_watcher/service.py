@@ -1069,6 +1069,7 @@ def _deliver_automation_review_intent(
             intent.summary or "A scheduling mention needs manual review.",
             ntfy_topic=config.ntfy_topic,
             ntfy_url=config.ntfy_url,
+            ntfy_content_disclosure_acknowledged=(config.ntfy_content_disclosure_acknowledged),
             dry_run=dry_run,
         )
         if not dry_run:
@@ -1378,6 +1379,9 @@ class Watcher:
                 message.subject,
                 ntfy_topic=self.config.ntfy_topic,
                 ntfy_url=self.config.ntfy_url,
+                ntfy_content_disclosure_acknowledged=(
+                    self.config.ntfy_content_disclosure_acknowledged
+                ),
                 dry_run=dry_run,
             )
             if not dry_run:
@@ -1416,6 +1420,9 @@ class Watcher:
                 analysis,
                 ntfy_topic=self.config.ntfy_topic,
                 ntfy_url=self.config.ntfy_url,
+                ntfy_content_disclosure_acknowledged=(
+                    self.config.ntfy_content_disclosure_acknowledged
+                ),
                 dry_run=dry_run,
             )
         except NotificationError as exc:

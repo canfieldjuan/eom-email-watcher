@@ -95,6 +95,7 @@ class Config:
     notifications_enabled: bool
     ntfy_topic: str | None
     ntfy_url: str
+    ntfy_content_disclosure_acknowledged: bool
     senders: tuple[Sender, ...]
 
     @property
@@ -340,6 +341,14 @@ def load_config(path: Path | None = None) -> Config:
     ntfy_url = str(data.get("ntfy_url", "https://ntfy.sh")).rstrip("/")
     if not ntfy_url.startswith("https://"):
         raise ConfigError("ntfy_url must use https://")
+    raw_ntfy_disclosure = data.get("ntfy_content_disclosure_acknowledged", False)
+    if not isinstance(raw_ntfy_disclosure, bool):
+        raise ConfigError("ntfy_content_disclosure_acknowledged must be true or false")
+    if ntfy_topic and raw_ntfy_disclosure is not True:
+        raise ConfigError(
+            "ntfy_topic requires ntfy_content_disclosure_acknowledged = true "
+            "because ntfy receives email-derived content"
+        )
 
     return Config(
         path=config_path,
@@ -385,6 +394,7 @@ def load_config(path: Path | None = None) -> Config:
         notifications_enabled=bool(data.get("notifications_enabled", True)),
         ntfy_topic=ntfy_topic,
         ntfy_url=ntfy_url,
+        ntfy_content_disclosure_acknowledged=raw_ntfy_disclosure,
         senders=tuple(senders),
     )
 

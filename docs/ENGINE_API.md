@@ -368,7 +368,9 @@ a delayed fallback acknowledgement cannot consume a newer analysis notification.
 Host-deferred checks fail with `unsupported_configuration` when an ntfy topic is configured. The
 existing CLI remains the canonical path for ntfy delivery; silently bypassing that configured
 channel would lose its delivery contract. `health.get` reports `host_delivery_ready` and whether
-ntfy is configured without exposing the topic.
+ntfy is configured without exposing the topic. Config loading also requires the literal
+`ntfy_content_disclosure_acknowledged = true` beside any topic; the exact content-bearing payload
+and privacy boundary are documented in the main README and next to the example setting.
 
 Acknowledgement is idempotent. Delivery is at-least-once: if the host exits after platform
 acceptance but before acknowledgement, the durable intent remains and may be delivered again after
