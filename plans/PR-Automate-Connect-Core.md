@@ -67,7 +67,7 @@ queue.
 
 Ownership lane: email-watcher-automate-connect-engine-core
 
-Slice phase: schema-20 vertical runtime
+Slice phase: vertical slice
 
 1. Add the strict Connect-only rule model, canonical bytes, and pure matcher.
 2. Install schema 20 rule authority, mailbox/source identity, immutable fire,
@@ -291,11 +291,11 @@ format gate reports `25 files already formatted`.
 
 ## Estimated diff size
 
-| Surface | Budget |
+| Surface | LOC |
 |---|---:|
-| Tracked runtime, scripts, and tests | +4,631 / -453 |
-| Plan | +301 / -0 |
-| Total | 27 files, +4,932 / -453 |
+| Tracked runtime, scripts, and tests | 5,084 |
+| Plan | 301 |
+| **Total** | **5,385** |
 
 The overage is justified by the indivisible schema-20 vertical boundary stated
 above; dispatch and every UI/product surface remain excluded.
