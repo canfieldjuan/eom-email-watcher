@@ -5,10 +5,11 @@ A private, local-first watched-sender email application. It checks one selected 
 model for a short structured summary, and sends a desktop notification (and, optionally, a phone
 push via [ntfy](https://ntfy.sh)).
 
-Email content is never sent to a cloud model. Mailbox grants are read-only, attachment content is
-downloaded only when the user explicitly opens it or requests an available local capability,
-non-matching message metadata is not stored, and message bodies are discarded after each local
-inference request.
+Email content is never sent to a cloud model. Optional ntfy phone notifications are a separate,
+explicitly acknowledged disclosure to the configured ntfy service, described below. Mailbox grants
+are read-only, attachment content is downloaded only when the user explicitly opens it or requests
+an available local capability, non-matching message metadata is not stored, and message bodies are
+discarded after each local inference request.
 
 ## Behavior
 
@@ -43,7 +44,8 @@ inference request.
   school account with an Entra public desktop-client registration, or an IMAP account using TLS or
   STARTTLS
 - Optional: an [ntfy](https://ntfy.sh) topic for phone push notifications alongside the desktop
-  one -- set `ntfy_topic`/`ntfy_url` in `config.toml` (see `config.example.toml`)
+  one -- read [Optional ntfy phone push and privacy](#optional-ntfy-phone-push-and-privacy)
+  before enabling it
 
 ## Install
 
@@ -57,6 +59,36 @@ chmod 600 ~/.config/eom-email-watcher/config.toml
 
 Edit the private config with the real exact sender list and one of the inference configurations
 below. Never commit that config; the repository example intentionally contains placeholders.
+
+### Optional ntfy phone push and privacy
+
+ntfy is disabled by default. Enabling it requires both a valid `ntfy_topic` and the literal
+`ntfy_content_disclosure_acknowledged = true` in the private `config.toml`. Email Watcher refuses
+to start with a topic but without that acknowledgement.
+
+For every phone notification, Email Watcher sends one HTTPS JSON request to the configured
+`ntfy_url` containing exactly:
+
+- `topic`: the configured topic;
+- `title`: the watched sender's configured label; otherwise the message-supplied display name;
+  otherwise the email address; followed by the email subject;
+- `message`: for a completed analysis, the local model summary plus any suggested action and
+  normalized deadline; for a fallback, fixed retry text; for scheduling review, review text that may
+  contain an email-derived summary; and
+- `priority`: a numeric value derived from the local analysis, or the normal priority for fallback
+  and review notifications.
+
+The application does not redact or encrypt these fields at the application layer. HTTPS protects
+the request while it travels to the server, but the configured ntfy service can read the topic,
+configured sender label, message-supplied display name, email address, subject, summary, suggested
+action, deadline, and review text. A long random
+topic limits who can subscribe or publish; it does not hide content from the service. The service may
+also retain this content in logs, storage, or backups according to its own policy.
+
+For legal, medical, financial, or other confidentiality-sensitive mail, leave `ntfy_topic` unset
+unless that disclosure is acceptable. Desktop notifications remain available independently. A
+future opaque/wake-only mode is tracked in
+[issue #137](https://github.com/canfieldjuan/eom-email-watcher/issues/137).
 
 ### Secure shared inference gateway
 

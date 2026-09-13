@@ -639,20 +639,52 @@ def test_ntfy_defaults_to_disabled(tmp_path: Path) -> None:
     config = load_config(path)
     assert config.ntfy_topic is None
     assert config.ntfy_url == "https://ntfy.sh"
+    assert config.ntfy_content_disclosure_acknowledged is False
 
 
 def test_short_ntfy_topic_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    write_config(path, extra='ntfy_topic = "too-short"')
+    write_config(
+        path,
+        extra=('ntfy_topic = "too-short"\nntfy_content_disclosure_acknowledged = true'),
+    )
     with pytest.raises(ConfigError, match="ntfy_topic"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "acknowledgement",
+    [
+        "",
+        "ntfy_content_disclosure_acknowledged = false",
+        'ntfy_content_disclosure_acknowledged = "true"',
+    ],
+)
+def test_ntfy_topic_requires_literal_true_disclosure_acknowledgement(
+    tmp_path: Path,
+    acknowledgement: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(
+        path,
+        extra=(f'ntfy_topic = "eom-email-watch-0123456789ab"\n{acknowledgement}'),
+    )
+    with pytest.raises(ConfigError, match="ntfy_content_disclosure_acknowledged"):
         load_config(path)
 
 
 def test_valid_ntfy_topic_is_accepted(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
-    write_config(path, extra='ntfy_topic = "eom-email-watch-0123456789ab"')
+    write_config(
+        path,
+        extra=(
+            'ntfy_topic = "eom-email-watch-0123456789ab"\n'
+            "ntfy_content_disclosure_acknowledged = true"
+        ),
+    )
     config = load_config(path)
     assert config.ntfy_topic == "eom-email-watch-0123456789ab"
+    assert config.ntfy_content_disclosure_acknowledged is True
 
 
 def test_ntfy_url_must_be_https(tmp_path: Path) -> None:
@@ -661,6 +693,7 @@ def test_ntfy_url_must_be_https(tmp_path: Path) -> None:
         path,
         extra=(
             'ntfy_topic = "eom-email-watch-0123456789ab"\n'
+            "ntfy_content_disclosure_acknowledged = true\n"
             'ntfy_url = "http://ntfy.sh"'
         ),
     )

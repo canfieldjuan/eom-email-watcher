@@ -23,28 +23,32 @@ def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch,
         notifications_enabled=True,
         ntfy_topic="eom-email-watch-0123456789ab",
         ntfy_url="https://ntfy.sh",
+        ntfy_content_disclosure_acknowledged=True,
     )
     monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
     monkeypatch.setattr(
         "eom_email_watcher.engine_api.dispatch",
         lambda request: {"baseline_initialized": True, "connected": True},
     )
-    monkeypatch.setattr(
-        cli,
-        "send_fallback",
-        lambda *args, **kwargs: DeliveryResult(
+    delivered = []
+
+    def capture_fallback(*args, **kwargs):
+        delivered.append(kwargs)
+        return DeliveryResult(
             desktop=ChannelResult(attempted=True, delivered=True),
             ntfy=ChannelResult(
                 attempted=True,
                 delivered=False,
                 error="ntfy delivery failed: ConnectError",
             ),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(cli, "send_fallback", capture_fallback)
 
     assert cli._setup(tmp_path / "config.toml") == 0
 
     output = capsys.readouterr()
+    assert delivered[0]["ntfy_content_disclosure_acknowledged"] is True
     assert "ntfy delivery failed: ConnectError" in output.err
     assert "Baseline initialized" in output.out
 

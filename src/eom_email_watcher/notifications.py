@@ -96,8 +96,11 @@ def _deliver(
     ntfy_topic: str | None,
     ntfy_url: str,
     ntfy_priority: int,
+    ntfy_content_disclosure_acknowledged: bool,
     dry_run: bool,
 ) -> DeliveryResult:
+    if ntfy_topic and ntfy_content_disclosure_acknowledged is not True:
+        raise NotificationError("ntfy content disclosure must be acknowledged before delivery")
     # Each configured channel is independent: a down phone-push endpoint should
     # not silence the desktop popup, and vice versa. Only raise -- which the
     # caller treats as "nothing got through" and triggers a retry/fallback --
@@ -130,6 +133,7 @@ def send_analysis(
     *,
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
+    ntfy_content_disclosure_acknowledged: bool = False,
     dry_run: bool = False,
 ) -> DeliveryResult:
     urgency = "critical" if analysis.priority == "urgent" else "normal"
@@ -145,6 +149,7 @@ def send_analysis(
         ntfy_topic=ntfy_topic,
         ntfy_url=ntfy_url,
         ntfy_priority=_NTFY_PRIORITY.get(analysis.priority, 3),
+        ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
     )
 
@@ -155,6 +160,7 @@ def send_fallback(
     *,
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
+    ntfy_content_disclosure_acknowledged: bool = False,
     dry_run: bool = False,
 ) -> DeliveryResult:
     return _deliver(
@@ -164,6 +170,7 @@ def send_fallback(
         ntfy_topic=ntfy_topic,
         ntfy_url=ntfy_url,
         ntfy_priority=3,
+        ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
     )
 
@@ -175,6 +182,7 @@ def send_review(
     *,
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
+    ntfy_content_disclosure_acknowledged: bool = False,
     dry_run: bool = False,
 ) -> DeliveryResult:
     return _deliver(
@@ -184,5 +192,6 @@ def send_review(
         ntfy_topic=ntfy_topic,
         ntfy_url=ntfy_url,
         ntfy_priority=3,
+        ntfy_content_disclosure_acknowledged=ntfy_content_disclosure_acknowledged,
         dry_run=dry_run,
     )

@@ -374,6 +374,7 @@ def config(tmp_path: Path) -> Config:
         notifications_enabled=False,
         ntfy_topic=None,
         ntfy_url="https://ntfy.sh",
+        ntfy_content_disclosure_acknowledged=False,
         senders=(Sender("trusted@example.com", "Trusted"),),
     )
 
@@ -1996,7 +1997,13 @@ def test_canonical_check_resumes_nonactive_account_with_empty_watchlist(
 def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
+    cfg = replace(
+        config(tmp_path),
+        senders=(),
+        notifications_enabled=True,
+        ntfy_topic="eom-email-watch-0123456789ab",
+        ntfy_content_disclosure_acknowledged=True,
+    )
     store = Store(cfg.database_file)
     store.initialize()
     _account_id, admitted = admit_scheduling_run(store, monkeypatch)
@@ -2027,17 +2034,19 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
                 )""",
             [(f"backlog-{index}", older) for index in range(25)],
         )
-    delivered: list[str] = []
+    delivered: list[tuple[str, bool]] = []
     monkeypatch.setattr(
         service_module,
         "send_review",
-        lambda *args, **kwargs: delivered.append(args[1]),
+        lambda *args, **kwargs: delivered.append(
+            (args[1], kwargs["ntfy_content_disclosure_acknowledged"])
+        ),
     )
 
     run_watcher_check(cfg, store, ExtractionModel([]), deliver_notifications=True)
 
     current = store.automation_run(admitted.run_id)
-    assert delivered == ["Meeting request"]
+    assert delivered == [("Meeting request", True)]
     assert current is not None
     assert current.review_notified_at is not None
     assert current.state_version == reviewed.state_version
@@ -2824,21 +2833,29 @@ def _make_retries_due(store: Store) -> None:
 
 
 def test_notification_retry_uses_persisted_analysis(tmp_path: Path, monkeypatch) -> None:
-    cfg = replace(config(tmp_path), notifications_enabled=True)
+    cfg = replace(
+        config(tmp_path),
+        notifications_enabled=True,
+        ntfy_topic="eom-email-watch-0123456789ab",
+        ntfy_content_disclosure_acknowledged=True,
+    )
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     gmail = FakeGmail()
     model = FakeModel()
     analysis_attempts = 0
+    acknowledged: list[bool] = []
 
     def flaky_analysis_notification(*args, **kwargs) -> None:
         nonlocal analysis_attempts
         analysis_attempts += 1
+        acknowledged.append(kwargs["ntfy_content_disclosure_acknowledged"])
         if analysis_attempts == 1:
             raise NotificationError("all channels unavailable")
 
     def unavailable_fallback(*args, **kwargs) -> None:
+        acknowledged.append(kwargs["ntfy_content_disclosure_acknowledged"])
         raise NotificationError("all channels unavailable")
 
     monkeypatch.setattr(service_module, "send_analysis", flaky_analysis_notification)
@@ -2856,6 +2873,7 @@ def test_notification_retry_uses_persisted_analysis(tmp_path: Path, monkeypatch)
     assert second["summarized"] == 0
     assert store.recent(1)[0]["status"] == "summarized"
     assert analysis_attempts == 2
+    assert acknowledged == [True, True, True]
     assert gmail.full_payload_calls == 1
     assert model.calls == 1
 

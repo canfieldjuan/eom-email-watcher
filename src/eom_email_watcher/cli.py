@@ -161,6 +161,7 @@ def _setup(config_path: Path) -> int:
                 "Setup complete",
                 ntfy_topic=config.ntfy_topic,
                 ntfy_url=config.ntfy_url,
+                ntfy_content_disclosure_acknowledged=(config.ntfy_content_disclosure_acknowledged),
                 dry_run=False,
             )
             if delivery.failures:
