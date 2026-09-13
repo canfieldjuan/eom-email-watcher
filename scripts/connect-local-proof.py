@@ -34,6 +34,7 @@ from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_
 
 FIXTURE_PART_ID = "fixture-mime-part"
 FIXTURE_MODEL_DIGEST = "b8693e6b4f5f228844ef5a842c7e7a332d9b2fa9e1241a423ef1de7928065b79"
+FIXTURE_MAILBOX_IDENTITY_KEY = hashlib.sha256(b"connect-local-proof-mailbox-v1").hexdigest()
 
 
 class FixtureModelHandler(BaseHTTPRequestHandler):
@@ -279,6 +280,9 @@ class FixtureGmail:
     def __init__(self, content: bytes):
         self.content = content
 
+    def mailbox_identity_key(self) -> str:
+        return FIXTURE_MAILBOX_IDENTITY_KEY
+
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if (message_id, part_id, attachment_id) != (
             "fixture-message",
@@ -320,7 +324,12 @@ def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
     token_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     token_file.write_bytes(b"fixture-only")
     token_file.chmod(0o600)
-    return account
+    return runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        FIXTURE_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
 
 
 def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
@@ -566,6 +575,7 @@ def main() -> None:
                 received_at="2026-08-29T12:00:00+00:00",
                 provider=fixture_account.provider,
                 account_id=fixture_account.account_id,
+                mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
             )
             runtime.store.replace_attachments(
                 "fixture-message",
@@ -657,9 +667,7 @@ def main() -> None:
             entitlement_path.chmod(0o600)
             expired_decision = proof_entitlement.decision()
             while_expired = wait_for_capability(False)
-            registration_paths = sorted(
-                (runtime_dir / "local-connect/v2/providers").glob("*.json")
-            )
+            registration_paths = sorted((runtime_dir / "local-connect/v2/providers").glob("*.json"))
             if len(registration_paths) != 1:
                 raise RuntimeError("Expected one provider registration during entitlement denial")
             registration = json.loads(registration_paths[0].read_bytes())
@@ -984,9 +992,7 @@ def main() -> None:
             try:
                 reconciliation_deadline = time.monotonic() + 15
                 while True:
-                    reconciled_job = runtime.store.connect_job(
-                        interrupted_invocation["request_id"]
-                    )
+                    reconciled_job = runtime.store.connect_job(interrupted_invocation["request_id"])
                     if reconciled_job is not None and reconciled_job.status in {
                         "completed",
                         "failed",
@@ -996,9 +1002,7 @@ def main() -> None:
                         raise RuntimeError(
                             "Interrupted Connect job did not reach a terminal queue state"
                         )
-                    queue_pump = engine_api._response(
-                        request(config_path, "connect.queue.pump")
-                    )
+                    queue_pump = engine_api._response(request(config_path, "connect.queue.pump"))
                     if not queue_pump["ok"]:
                         raise RuntimeError(
                             f"Interrupted Connect queue reconciliation failed: {queue_pump}"

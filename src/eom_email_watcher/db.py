@@ -14,12 +14,23 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .automation.rules import (
+    MAX_AUTOMATION_ATTACHMENTS,
+    MAX_AUTOMATION_RULES,
+    AutomationFanoutLimit,
+    MatchRule,
+    RuleDefinition,
+    RuleValidationError,
+    canonical_rule_definition,
+    match_rules,
+    parse_rule_definition,
+)
 from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -56,8 +67,18 @@ def _sqlite_aware_iso_epoch(value: object) -> float | None:
         return None
 
 
-def _message_suppression_key(provider: str, account_id: str, provider_message_id: str) -> str:
-    encoded = "\0".join((provider, account_id, provider_message_id)).encode("utf-8")
+def _message_suppression_key(
+    provider: str,
+    account_id: str,
+    provider_message_id: str,
+    mailbox_identity_key: str | None = None,
+) -> str:
+    identity = (
+        (provider, account_id, mailbox_identity_key, provider_message_id)
+        if mailbox_identity_key is not None
+        else (provider, account_id, provider_message_id)
+    )
+    encoded = "\0".join(identity).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -314,6 +335,127 @@ BEGIN
         SELECT job_id FROM connect_attachment_jobs WHERE message_id = OLD.message_id
     );
 END
+"""
+
+_AUTOMATE_CORE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS automation_rule_set (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+);
+INSERT OR IGNORE INTO automation_rule_set(id, revision) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS legacy_mailbox_markers (
+    provider TEXT NOT NULL CHECK (provider <> ''),
+    account_id TEXT NOT NULL CHECK (account_id <> ''),
+    message_key TEXT NOT NULL CHECK (length(message_key) = 64),
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id, message_key)
+);
+CREATE TABLE IF NOT EXISTS automation_rules (
+    rule_id TEXT PRIMARY KEY CHECK (length(rule_id) = 36),
+    current_version INTEGER NOT NULL CHECK (current_version >= 1),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    system INTEGER NOT NULL DEFAULT 0 CHECK (system IN (0, 1)),
+    deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS automation_rule_versions (
+    rule_id TEXT NOT NULL CHECK (length(rule_id) = 36),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    kind TEXT NOT NULL CHECK (kind IN ('definition', 'deleted')),
+    definition_json BLOB CHECK (
+        (kind = 'deleted' AND definition_json IS NULL)
+        OR (kind = 'definition' AND typeof(definition_json) = 'blob'
+            AND length(definition_json) BETWEEN 1 AND 16384)
+    ),
+    definition_sha256 TEXT CHECK (
+        (kind = 'deleted' AND definition_sha256 IS NULL)
+        OR (kind = 'definition' AND length(definition_sha256) = 64)
+    ),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    scope_mailbox_identity_key TEXT CHECK (
+        scope_mailbox_identity_key IS NULL OR length(scope_mailbox_identity_key) = 64
+    ),
+    global_revision INTEGER NOT NULL UNIQUE CHECK (global_revision >= 1),
+    accepted_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_automation_rule_versions_revision
+    ON automation_rule_versions(rule_id, global_revision);
+CREATE TRIGGER IF NOT EXISTS automation_rule_versions_immutable_update
+BEFORE UPDATE ON automation_rule_versions
+BEGIN
+    SELECT RAISE(ABORT, 'automation rule versions are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS automation_rule_versions_immutable_delete
+BEFORE DELETE ON automation_rule_versions
+BEGIN
+    SELECT RAISE(ABORT, 'automation rule versions are immutable');
+END;
+CREATE TABLE IF NOT EXISTS automation_fires (
+    fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
+    event_id TEXT NOT NULL CHECK (length(event_id) = 64),
+    rule_id TEXT NOT NULL CHECK (length(rule_id) = 36),
+    rule_version INTEGER NOT NULL CHECK (rule_version >= 1),
+    message_id TEXT NOT NULL CHECK (message_id <> ''),
+    part_id TEXT NOT NULL,
+    action_kind TEXT NOT NULL CHECK (action_kind = 'connect.invoke'),
+    state TEXT NOT NULL CHECK (state = 'pending_dispatch'),
+    state_version INTEGER NOT NULL CHECK (state_version = 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (message_id, part_id, rule_id, rule_version)
+);
+CREATE INDEX IF NOT EXISTS idx_automation_fires_state
+    ON automation_fires(state, created_at, fire_id);
+CREATE INDEX IF NOT EXISTS idx_automation_fires_message
+    ON automation_fires(message_id, part_id);
+CREATE TRIGGER IF NOT EXISTS automation_fires_require_sources
+BEFORE INSERT ON automation_fires
+WHEN NOT EXISTS (
+        SELECT 1 FROM automation_rule_versions
+        WHERE rule_id = NEW.rule_id AND version = NEW.rule_version
+          AND kind = 'definition'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM message_attachments
+        WHERE message_id = NEW.message_id AND part_id = NEW.part_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'automation fire source is invalid');
+END;
+CREATE TABLE IF NOT EXISTS automation_fire_attempts (
+    fire_id TEXT NOT NULL CHECK (length(fire_id) = 36),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no = 1),
+    dispatch_request_id TEXT NOT NULL UNIQUE CHECK (length(dispatch_request_id) = 36),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (fire_id, attempt_no)
+);
+CREATE TRIGGER IF NOT EXISTS automation_fire_attempts_immutable_update
+BEFORE UPDATE ON automation_fire_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'automation fire attempts are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS automation_fire_attempts_require_fire
+BEFORE INSERT ON automation_fire_attempts
+WHEN NOT EXISTS (SELECT 1 FROM automation_fires WHERE fire_id = NEW.fire_id)
+BEGIN
+    SELECT RAISE(ABORT, 'automation fire attempt source is invalid');
+END;
+CREATE TABLE IF NOT EXISTS automation_run_source_identities (
+    run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
+    mailbox_identity_key TEXT NOT NULL CHECK (length(mailbox_identity_key) = 64)
+);
+CREATE TRIGGER IF NOT EXISTS messages_delete_pending_automation_fires
+BEFORE DELETE ON messages
+BEGIN
+    DELETE FROM automation_fire_attempts
+    WHERE fire_id IN (
+        SELECT fire_id FROM automation_fires
+        WHERE message_id = OLD.message_id AND state = 'pending_dispatch'
+    );
+    DELETE FROM automation_fires
+    WHERE message_id = OLD.message_id AND state = 'pending_dispatch';
+END;
 """
 
 _AUTOMATION_TABLES_SQL = """
@@ -586,9 +728,7 @@ def _migrate_microsoft_principal_keys_v2(db: sqlite3.Connection) -> None:
         source = (account_id, legacy_key)
         previous = migrations.setdefault(source, new_key)
         if previous != new_key:
-            raise RuntimeError(
-                "Microsoft calendar grants contain conflicting principal identities"
-            )
+            raise RuntimeError("Microsoft calendar grants contain conflicting principal identities")
 
     _rewrite_microsoft_principal_keys(db, migrations)
 
@@ -808,6 +948,7 @@ class AutomationWork:
     received_at: str
     organizer_address: str
     extraction_organizer_address: str | None
+    source_mailbox_identity_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -844,6 +985,68 @@ class AutomationCalendarWriteWork:
     run: AutomationRun
     proposal: AutomationProposalPayload | None
     write: AutomationCalendarWrite
+
+
+@dataclass(frozen=True)
+class AutomationRuleSummary:
+    rule_id: str
+    version: int
+    enabled: bool
+    system: bool
+    valid: bool
+    name: str | None
+    invalid_reason: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AutomationRuleDetail:
+    summary: AutomationRuleSummary
+    definition: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class AutomationFire:
+    fire_id: str
+    event_id: str
+    rule_id: str
+    rule_version: int
+    message_id: str
+    part_id: str
+    action_kind: str
+    state: str
+    state_version: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AutomationFireAttempt:
+    fire_id: str
+    attempt_no: int
+    dispatch_request_id: str
+    created_at: str
+
+
+class AutomationRuleNotFound(KeyError):
+    """The requested live rule identity does not exist."""
+
+
+class AutomationRuleStale(RuntimeError):
+    """A mutation did not name the current rule version."""
+
+
+class AutomationRuleLimitExceeded(RuntimeError):
+    """The live non-deleted rule cap has been reached."""
+
+
+class AutomationRuleSystemProtected(RuntimeError):
+    """A system-owned rule cannot be edited or deleted."""
+
+
+class MailboxIdentityChanged(RuntimeError):
+    """A polling or mutation session no longer owns the active mailbox key."""
 
 
 class AutomationSourceChanged(RuntimeError):
@@ -928,10 +1131,16 @@ def _admit_scheduling_automation(
     account_id: str,
     calendar_principal_key: str,
     provider_message_id: str,
+    mailbox_identity_key: str,
     created_at: str,
     expires_at: str,
 ) -> None:
-    source_message_key = _message_suppression_key(provider, account_id, provider_message_id)
+    source_message_key = _message_suppression_key(
+        provider,
+        account_id,
+        provider_message_id,
+        mailbox_identity_key,
+    )
     run_id = str(uuid.uuid4())
     inserted = db.execute(
         """INSERT INTO automation_runs(
@@ -958,6 +1167,11 @@ def _admit_scheduling_automation(
     )
     if inserted.rowcount != 1:
         return
+    db.execute(
+        """INSERT INTO automation_run_source_identities(run_id, mailbox_identity_key)
+        VALUES (?, ?)""",
+        (run_id, mailbox_identity_key),
+    )
     _append_automation_event(
         db,
         run_id=run_id,
@@ -994,12 +1208,23 @@ def _mark_automation_sources_unavailable(
                 w.transaction_id
             FROM automation_runs AS r
             LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
+            LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
             JOIN messages AS m
               ON m.provider = r.provider
              AND m.account_id = r.account_id
-             AND message_source_key(
-                    m.provider, m.account_id, m.provider_message_id
-                 ) = r.source_message_key
+             AND (
+                 (i.mailbox_identity_key IS NOT NULL
+                  AND m.mailbox_identity_key = i.mailbox_identity_key
+                  AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id,
+                        m.mailbox_identity_key
+                      ) = r.source_message_key)
+                 OR (i.mailbox_identity_key IS NULL
+                     AND m.mailbox_identity_key IS NULL
+                     AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id
+                         ) = r.source_message_key)
+             )
             WHERE m.message_id IN ({placeholders})
             ORDER BY r.run_id""",
             tuple(chunk),
@@ -1070,9 +1295,7 @@ def _mark_automation_sources_unavailable(
                     else None
                 ),
                 transaction_id=(
-                    str(row["transaction_id"])
-                    if row["transaction_id"] is not None
-                    else None
+                    str(row["transaction_id"]) if row["transaction_id"] is not None else None
                 ),
             )
     return transitioned
@@ -1123,6 +1346,7 @@ class PendingMessage:
     analysis_request_id: str | None
     analysis_context_at: str | None
     analysis_body_char_limit: int | None
+    mailbox_identity_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1394,7 @@ class MessageSource:
     provider_message_id: str
     received_at: str
     discovered_at: str
+    mailbox_identity_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1406,28 @@ class MailAccount:
     active: bool
     created_at: str
     updated_at: str
+    mailbox_identity_key: str | None = None
+    legacy_identity_status: str = "unresolved"
+    legacy_identity_key: str | None = None
+
+
+def _mail_account(row: sqlite3.Row) -> MailAccount:
+    return MailAccount(
+        provider=str(row["provider"]),
+        account_id=str(row["account_id"]),
+        display_name=str(row["display_name"]),
+        address=str(row["address"]) if row["address"] is not None else None,
+        active=bool(row["active"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        mailbox_identity_key=(
+            str(row["mailbox_identity_key"]) if row["mailbox_identity_key"] is not None else None
+        ),
+        legacy_identity_status=str(row["legacy_identity_status"]),
+        legacy_identity_key=(
+            str(row["legacy_identity_key"]) if row["legacy_identity_key"] is not None else None
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1372,6 +1619,107 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
     db.execute(_CONNECT_DISPATCH_DELETE_TRIGGER_SQL)
     db.execute("DROP TRIGGER IF EXISTS messages_delete_connect_attachment_jobs")
     db.execute(_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL)
+
+
+def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
+    """Execute complete SQL statements without executescript's implicit commit."""
+    pending: list[str] = []
+    for line in script.splitlines():
+        pending.append(line)
+        statement = "\n".join(pending).strip()
+        if statement and sqlite3.complete_statement(statement):
+            db.execute(statement)
+            pending.clear()
+    if "\n".join(pending).strip():
+        raise RuntimeError("automation schema script ended with an incomplete statement")
+
+
+def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -> None:
+    """Install schema-20 authority and cross-version completion fences."""
+    _execute_transactional_script(db, _AUTOMATE_CORE_TABLES_SQL)
+
+    account_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(mail_accounts)").fetchall()
+    }
+    for column, definition in {
+        "mailbox_identity_key": (
+            "TEXT CHECK (mailbox_identity_key IS NULL OR length(mailbox_identity_key) = 64)"
+        ),
+        "legacy_identity_status": (
+            "TEXT NOT NULL DEFAULT 'unresolved' CHECK "
+            "(legacy_identity_status IN ('continuity_proven', 'replacement', 'unresolved'))"
+        ),
+        "legacy_identity_key": (
+            "TEXT CHECK (legacy_identity_key IS NULL OR length(legacy_identity_key) = 64)"
+        ),
+    }.items():
+        if column not in account_columns:
+            db.execute(f"ALTER TABLE mail_accounts ADD COLUMN {column} {definition}")
+
+    message_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    for column, definition in {
+        "mailbox_identity_key": (
+            "TEXT CHECK (mailbox_identity_key IS NULL OR length(mailbox_identity_key) = 64)"
+        ),
+        "rules_revision_at_analysis": (
+            "INTEGER CHECK (rules_revision_at_analysis IS NULL OR rules_revision_at_analysis >= 0)"
+        ),
+        "rules_evaluation_error": (
+            "TEXT CHECK (rules_evaluation_error IS NULL OR rules_evaluation_error = "
+            "'automation_fanout_limit')"
+        ),
+    }.items():
+        if column not in message_columns:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+
+    attachment_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(message_attachments)").fetchall()
+    }
+    if "byte_size_known" not in attachment_columns:
+        db.execute(
+            "ALTER TABLE message_attachments ADD COLUMN byte_size_known "
+            "INTEGER NOT NULL DEFAULT 1 CHECK (byte_size_known IN (0, 1))"
+        )
+
+    if current_version < 20:
+        analyzed_predicate = (
+            "status <> 'pending' OR analysis_at IS NOT NULL"
+            if "analysis_at" in message_columns
+            else "status <> 'pending'"
+        )
+        db.execute(f"UPDATE messages SET rules_revision_at_analysis = 0 WHERE {analyzed_predicate}")
+        db.execute(
+            """INSERT OR IGNORE INTO legacy_mailbox_markers(
+                provider, account_id, message_key, expires_at
+            ) SELECT provider, account_id, message_key, expires_at
+            FROM suppressed_messages"""
+        )
+
+    db.execute("DROP INDEX IF EXISTS idx_messages_source_identity")
+    db.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_source_identity_v20
+        ON messages(provider, account_id, mailbox_identity_key, provider_message_id)"""
+    )
+    _execute_transactional_script(
+        db,
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_require_mailbox_identity_insert
+        BEFORE INSERT ON messages
+        WHEN NEW.mailbox_identity_key IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'message mailbox identity is required');
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_require_rule_revision_completion
+        BEFORE UPDATE OF status ON messages
+        WHEN OLD.status = 'pending' AND NEW.status = 'analyzed'
+          AND NEW.rules_revision_at_analysis IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'analysis rule revision is required');
+        END;
+        """,
+    )
 
 
 def _valid_uuid_v4(value: object) -> bool:
@@ -1832,6 +2180,12 @@ class Store:
             _message_suppression_key,
             deterministic=True,
         )
+        connection.create_function(
+            "message_source_key",
+            4,
+            _message_suppression_key,
+            deterministic=True,
+        )
         try:
             yield connection
         except Exception:
@@ -2038,6 +2392,7 @@ class Store:
             _ensure_mailbox_scope_schema(db)
             _ensure_connect_jobs_schema(db, version)
             _ensure_connect_dispatch_schema(db)
+            _ensure_automate_core_schema(db, version)
             if version < 18:
                 _migrate_microsoft_principal_keys_v2(db)
             automation_run_columns = {
@@ -2069,9 +2424,7 @@ class Store:
             }
             for column, definition in automation_event_migrations.items():
                 if column not in automation_event_columns:
-                    db.execute(
-                        f"ALTER TABLE automation_events ADD COLUMN {column} {definition}"
-                    )
+                    db.execute(f"ALTER TABLE automation_events ADD COLUMN {column} {definition}")
             if version < 17:
                 db.execute("DROP TRIGGER IF EXISTS automation_runs_delete_proposal_payloads")
                 db.execute(
@@ -2186,62 +2539,38 @@ class Store:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT provider, account_id, display_name, address, active,
-                    created_at, updated_at
+                    created_at, updated_at, mailbox_identity_key,
+                    legacy_identity_status, legacy_identity_key
                 FROM mail_accounts
                 ORDER BY active DESC, casefold(display_name), provider, account_id"""
             ).fetchall()
-        return [
-            MailAccount(
-                provider=str(row["provider"]),
-                account_id=str(row["account_id"]),
-                display_name=str(row["display_name"]),
-                address=str(row["address"]) if row["address"] is not None else None,
-                active=bool(row["active"]),
-                created_at=str(row["created_at"]),
-                updated_at=str(row["updated_at"]),
-            )
-            for row in rows
-        ]
+        return [_mail_account(row) for row in rows]
 
     def mail_account(self, provider: str, account_id: str) -> MailAccount | None:
         with self.connection() as db:
             row = db.execute(
                 """SELECT provider, account_id, display_name, address, active,
-                    created_at, updated_at
+                    created_at, updated_at, mailbox_identity_key,
+                    legacy_identity_status, legacy_identity_key
                 FROM mail_accounts WHERE provider = ? AND account_id = ?""",
                 (provider, account_id),
             ).fetchone()
         if row is None:
             return None
-        return MailAccount(
-            provider=str(row["provider"]),
-            account_id=str(row["account_id"]),
-            display_name=str(row["display_name"]),
-            address=str(row["address"]) if row["address"] is not None else None,
-            active=bool(row["active"]),
-            created_at=str(row["created_at"]),
-            updated_at=str(row["updated_at"]),
-        )
+        return _mail_account(row)
 
     def mail_account_by_address(self, provider: str, address: str) -> MailAccount | None:
         with self.connection() as db:
             row = db.execute(
                 """SELECT provider, account_id, display_name, address, active,
-                    created_at, updated_at
+                    created_at, updated_at, mailbox_identity_key,
+                    legacy_identity_status, legacy_identity_key
                 FROM mail_accounts WHERE provider = ? AND address = ?""",
                 (provider, address),
             ).fetchone()
         if row is None:
             return None
-        return MailAccount(
-            provider=str(row["provider"]),
-            account_id=str(row["account_id"]),
-            display_name=str(row["display_name"]),
-            address=str(row["address"]),
-            active=bool(row["active"]),
-            created_at=str(row["created_at"]),
-            updated_at=str(row["updated_at"]),
-        )
+        return _mail_account(row)
 
     def mail_account_has_history(self, provider: str, account_id: str) -> bool:
         with self.connection() as db:
@@ -2262,20 +2591,13 @@ class Store:
         with self.connection() as db:
             row = db.execute(
                 """SELECT provider, account_id, display_name, address, active,
-                    created_at, updated_at
+                    created_at, updated_at, mailbox_identity_key,
+                    legacy_identity_status, legacy_identity_key
                 FROM mail_accounts WHERE active = 1"""
             ).fetchone()
         if row is None:
             return None
-        return MailAccount(
-            provider=str(row["provider"]),
-            account_id=str(row["account_id"]),
-            display_name=str(row["display_name"]),
-            address=str(row["address"]) if row["address"] is not None else None,
-            active=bool(row["active"]),
-            created_at=str(row["created_at"]),
-            updated_at=str(row["updated_at"]),
-        )
+        return _mail_account(row)
 
     def register_mail_account(
         self,
@@ -2328,6 +2650,454 @@ class Store:
         account = self.mail_account(provider, account_id)
         assert account is not None
         return account
+
+    def reconcile_mailbox_identity(
+        self,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        legacy_status: str | None = None,
+        preserve_cursor: bool = False,
+    ) -> MailAccount:
+        if len(mailbox_identity_key) != 64 or any(
+            character not in "0123456789abcdef" for character in mailbox_identity_key
+        ):
+            raise ValueError("mailbox identity key must be a lower-case SHA-256 digest")
+        if legacy_status not in {None, "continuity_proven", "replacement", "unresolved"}:
+            raise ValueError("legacy mailbox identity status is invalid")
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT mailbox_identity_key, legacy_identity_status,
+                    legacy_identity_key FROM mail_accounts
+                WHERE provider = ? AND account_id = ?""",
+                (provider, account_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((provider, account_id))
+            previous = (
+                str(row["mailbox_identity_key"])
+                if row["mailbox_identity_key"] is not None
+                else None
+            )
+            status = legacy_status or str(row["legacy_identity_status"])
+            legacy_key = (
+                str(row["legacy_identity_key"]) if row["legacy_identity_key"] is not None else None
+            )
+            if previous is not None and previous != mailbox_identity_key:
+                status = "replacement"
+                legacy_key = previous
+            elif previous is None and status == "continuity_proven":
+                legacy_key = mailbox_identity_key
+            db.execute(
+                """UPDATE mail_accounts
+                SET mailbox_identity_key = ?, legacy_identity_status = ?,
+                    legacy_identity_key = ?, updated_at = ?
+                WHERE provider = ? AND account_id = ?""",
+                (mailbox_identity_key, status, legacy_key, stamp, provider, account_id),
+            )
+            if previous != mailbox_identity_key and not preserve_cursor:
+                db.execute(
+                    "DELETE FROM mailbox_state WHERE provider = ? AND account_id = ?",
+                    (provider, account_id),
+                )
+            if previous is None and status == "continuity_proven":
+                db.execute(
+                    """UPDATE messages SET mailbox_identity_key = ?
+                    WHERE provider = ? AND account_id = ?
+                      AND mailbox_identity_key IS NULL AND status = 'pending'""",
+                    (mailbox_identity_key, provider, account_id),
+                )
+        account = self.mail_account(provider, account_id)
+        assert account is not None
+        return account
+
+    def require_mailbox_identity(
+        self, provider: str, account_id: str, mailbox_identity_key: str
+    ) -> None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1 FROM mail_accounts
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?""",
+                (provider, account_id, mailbox_identity_key),
+            ).fetchone()
+        if row is None:
+            raise MailboxIdentityChanged("mailbox identity changed")
+
+    @staticmethod
+    def _automation_rule_detail(row: sqlite3.Row) -> AutomationRuleDetail:
+        definition: dict[str, object] | None = None
+        name: str | None = None
+        invalid_reason: str | None = None
+        try:
+            if str(row["kind"]) != "definition":
+                raise RuleValidationError("current rule version is not a definition")
+            encoded = bytes(row["definition_json"])
+            if hashlib.sha256(encoded).hexdigest() != str(row["definition_sha256"]):
+                raise RuleValidationError("stored definition digest does not match")
+            decoded = json.loads(encoded)
+            parsed = parse_rule_definition(decoded)
+            if canonical_rule_definition(parsed) != encoded:
+                raise RuleValidationError("stored definition is not canonical")
+            definition = parsed.model_dump(mode="json", exclude_defaults=False)
+            name = parsed.name
+        except (
+            AttributeError,
+            json.JSONDecodeError,
+            TypeError,
+            UnicodeDecodeError,
+            UnicodeEncodeError,
+            RuleValidationError,
+        ) as exc:
+            invalid_reason = str(exc)[:128] or "stored definition is invalid"
+        summary = AutomationRuleSummary(
+            rule_id=str(row["rule_id"]),
+            version=int(row["current_version"]),
+            enabled=bool(row["enabled"]),
+            system=bool(row["system"]),
+            valid=invalid_reason is None,
+            name=name,
+            invalid_reason=invalid_reason,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+        return AutomationRuleDetail(summary=summary, definition=definition)
+
+    @staticmethod
+    def _next_automation_rules_revision(db: sqlite3.Connection) -> int:
+        row = db.execute("SELECT revision FROM automation_rule_set WHERE id = 1").fetchone()
+        if row is None:
+            raise RuntimeError("automation rule-set authority is missing")
+        current = int(row["revision"])
+        changed = db.execute(
+            "UPDATE automation_rule_set SET revision = ? WHERE id = 1 AND revision = ?",
+            (current + 1, current),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("automation rule-set revision lost its transaction race")
+        return current + 1
+
+    @staticmethod
+    def _automation_rule_scope_identity(
+        db: sqlite3.Connection,
+        definition: RuleDefinition,
+        expected_account_identity: str | None,
+    ) -> str | None:
+        scope = definition.scope
+        if scope.account_id is None:
+            if expected_account_identity is not None:
+                raise ValueError("mailbox identity is only valid for account-scoped rules")
+            return None
+        if expected_account_identity is None:
+            raise MailboxIdentityChanged("account-scoped rule requires a mailbox identity")
+        row = db.execute(
+            """SELECT mailbox_identity_key FROM mail_accounts
+            WHERE provider = ? AND account_id = ?""",
+            (scope.provider, scope.account_id),
+        ).fetchone()
+        if row is None or row["mailbox_identity_key"] != expected_account_identity:
+            raise MailboxIdentityChanged("mailbox identity changed")
+        return expected_account_identity
+
+    def automation_rules_snapshot(self) -> tuple[int, list[AutomationRuleSummary]]:
+        with self.connection() as db:
+            db.execute("BEGIN")
+            revision = db.execute(
+                "SELECT revision FROM automation_rule_set WHERE id = 1"
+            ).fetchone()
+            rows = db.execute(
+                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                    v.scope_mailbox_identity_key, v.global_revision
+                FROM automation_rules AS r
+                JOIN automation_rule_versions AS v
+                  ON v.rule_id = r.rule_id AND v.version = r.current_version
+                WHERE r.deleted = 0
+                ORDER BY r.created_at, r.rule_id"""
+            ).fetchall()
+        if revision is None:
+            raise RuntimeError("automation rule-set authority is missing")
+        return int(revision["revision"]), [
+            self._automation_rule_detail(row).summary for row in rows
+        ]
+
+    def require_automation_rule_create_capacity(self) -> None:
+        """Reject a full live rule set without mutating mailbox or rule state."""
+        with self.connection() as db:
+            count = db.execute(
+                "SELECT COUNT(*) AS count FROM automation_rules WHERE deleted = 0"
+            ).fetchone()
+        if count is None or int(count["count"]) >= MAX_AUTOMATION_RULES:
+            raise AutomationRuleLimitExceeded("automation rule limit exceeded")
+
+    def automation_rule(self, rule_id: str) -> AutomationRuleDetail:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                    v.scope_mailbox_identity_key, v.global_revision
+                FROM automation_rules AS r
+                JOIN automation_rule_versions AS v
+                  ON v.rule_id = r.rule_id AND v.version = r.current_version
+                WHERE r.rule_id = ? AND r.deleted = 0""",
+                (rule_id,),
+            ).fetchone()
+        if row is None:
+            raise AutomationRuleNotFound(rule_id)
+        return self._automation_rule_detail(row)
+
+    def put_automation_rule(
+        self,
+        definition: RuleDefinition | object,
+        *,
+        rule_id: str | None = None,
+        expected_version: int | None = None,
+        expected_account_identity: str | None = None,
+        now: datetime | None = None,
+    ) -> AutomationRuleDetail:
+        parsed = parse_rule_definition(
+            definition.model_dump(mode="python", exclude_defaults=False)
+            if isinstance(definition, RuleDefinition)
+            else definition
+        )
+        encoded = canonical_rule_definition(parsed)
+        digest = hashlib.sha256(encoded).hexdigest()
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        identity = rule_id or str(uuid.uuid4())
+        if not _valid_uuid_v4(identity):
+            raise ValueError("automation rule id must be a lower-case UUIDv4")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                "SELECT * FROM automation_rules WHERE rule_id = ?", (identity,)
+            ).fetchone()
+            scope_identity = self._automation_rule_scope_identity(
+                db, parsed, expected_account_identity
+            )
+            if existing is None:
+                if expected_version is not None:
+                    raise AutomationRuleNotFound(identity)
+                count = db.execute(
+                    "SELECT COUNT(*) AS count FROM automation_rules WHERE deleted = 0"
+                ).fetchone()
+                if count is None or int(count["count"]) >= MAX_AUTOMATION_RULES:
+                    raise AutomationRuleLimitExceeded("automation rule limit exceeded")
+                version = 1
+                version_enabled = 1
+                global_revision = self._next_automation_rules_revision(db)
+                db.execute(
+                    """INSERT INTO automation_rules(
+                        rule_id, current_version, enabled, system, deleted,
+                        created_at, updated_at
+                    ) VALUES (?, 1, 1, 0, 0, ?, ?)""",
+                    (identity, stamp, stamp),
+                )
+            else:
+                if bool(existing["deleted"]):
+                    raise AutomationRuleNotFound(identity)
+                current_version = int(existing["current_version"])
+                if expected_version is None or expected_version != current_version:
+                    raise AutomationRuleStale("automation rule version is stale")
+                if bool(existing["system"]):
+                    raise AutomationRuleSystemProtected("system automation rule is protected")
+                version = current_version + 1
+                version_enabled = int(existing["enabled"])
+                global_revision = self._next_automation_rules_revision(db)
+                changed = db.execute(
+                    """UPDATE automation_rules
+                    SET current_version = ?, updated_at = ?
+                    WHERE rule_id = ? AND current_version = ? AND deleted = 0""",
+                    (version, stamp, identity, current_version),
+                )
+                if changed.rowcount != 1:
+                    raise AutomationRuleStale("automation rule version is stale")
+            db.execute(
+                """INSERT INTO automation_rule_versions(
+                    rule_id, version, kind, definition_json, definition_sha256,
+                    enabled, scope_mailbox_identity_key, global_revision, accepted_at
+                ) VALUES (?, ?, 'definition', ?, ?, ?, ?, ?, ?)""",
+                (
+                    identity,
+                    version,
+                    encoded,
+                    digest,
+                    version_enabled,
+                    scope_identity,
+                    global_revision,
+                    stamp,
+                ),
+            )
+        return self.automation_rule(identity)
+
+    def set_automation_rule_enabled(
+        self,
+        rule_id: str,
+        expected_version: int,
+        enabled: bool,
+        *,
+        now: datetime | None = None,
+    ) -> AutomationRuleDetail:
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT r.*, v.kind, v.definition_json, v.definition_sha256,
+                    v.scope_mailbox_identity_key
+                FROM automation_rules AS r
+                JOIN automation_rule_versions AS v
+                  ON v.rule_id = r.rule_id AND v.version = r.current_version
+                WHERE r.rule_id = ?""",
+                (rule_id,),
+            ).fetchone()
+            if row is None or bool(row["deleted"]):
+                raise AutomationRuleNotFound(rule_id)
+            current_version = int(row["current_version"])
+            if expected_version != current_version:
+                raise AutomationRuleStale("automation rule version is stale")
+            if bool(row["system"]):
+                raise AutomationRuleSystemProtected("system automation rule is protected")
+            if str(row["kind"]) != "definition":
+                raise RuntimeError("live automation rule is not a definition")
+            encoded = bytes(row["definition_json"])
+            if hashlib.sha256(encoded).hexdigest() != str(row["definition_sha256"]):
+                raise RuleValidationError("stored definition digest does not match")
+            definition = parse_rule_definition(json.loads(encoded))
+            if canonical_rule_definition(definition) != encoded:
+                raise RuleValidationError("stored definition is not canonical")
+            scope_identity = (
+                str(row["scope_mailbox_identity_key"])
+                if row["scope_mailbox_identity_key"] is not None
+                else None
+            )
+            if bool(row["enabled"]) == enabled:
+                return self._automation_rule_detail(row)
+            version = current_version + 1
+            global_revision = self._next_automation_rules_revision(db)
+            changed = db.execute(
+                """UPDATE automation_rules SET current_version = ?, enabled = ?, updated_at = ?
+                WHERE rule_id = ? AND current_version = ? AND deleted = 0""",
+                (version, int(enabled), stamp, rule_id, current_version),
+            )
+            if changed.rowcount != 1:
+                raise AutomationRuleStale("automation rule version is stale")
+            db.execute(
+                """INSERT INTO automation_rule_versions(
+                    rule_id, version, kind, definition_json, definition_sha256,
+                    enabled, scope_mailbox_identity_key, global_revision, accepted_at
+                ) VALUES (?, ?, 'definition', ?, ?, ?, ?, ?, ?)""",
+                (
+                    rule_id,
+                    version,
+                    encoded,
+                    str(row["definition_sha256"]),
+                    int(enabled),
+                    scope_identity,
+                    global_revision,
+                    stamp,
+                ),
+            )
+        return self.automation_rule(rule_id)
+
+    def delete_automation_rule(
+        self,
+        rule_id: str,
+        expected_version: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_rules WHERE rule_id = ?", (rule_id,)
+            ).fetchone()
+            if row is None or bool(row["deleted"]):
+                raise AutomationRuleNotFound(rule_id)
+            current_version = int(row["current_version"])
+            if expected_version != current_version:
+                raise AutomationRuleStale("automation rule version is stale")
+            if bool(row["system"]):
+                raise AutomationRuleSystemProtected("system automation rule is protected")
+            version = current_version + 1
+            global_revision = self._next_automation_rules_revision(db)
+            changed = db.execute(
+                """UPDATE automation_rules
+                SET current_version = ?, enabled = 0, deleted = 1, updated_at = ?
+                WHERE rule_id = ? AND current_version = ? AND deleted = 0""",
+                (version, stamp, rule_id, current_version),
+            )
+            if changed.rowcount != 1:
+                raise AutomationRuleStale("automation rule version is stale")
+            db.execute(
+                """INSERT INTO automation_rule_versions(
+                    rule_id, version, kind, definition_json, definition_sha256,
+                    enabled, scope_mailbox_identity_key, global_revision, accepted_at
+                ) VALUES (?, ?, 'deleted', NULL, NULL, 0, NULL, ?, ?)""",
+                (rule_id, version, global_revision, stamp),
+            )
+        return version
+
+    @staticmethod
+    def _current_match_rules(db: sqlite3.Connection) -> list[MatchRule]:
+        rows = db.execute(
+            """SELECT r.rule_id, r.current_version, r.created_at,
+                v.definition_json, v.definition_sha256, v.scope_mailbox_identity_key
+            FROM automation_rules AS r
+            JOIN automation_rule_versions AS v
+              ON v.rule_id = r.rule_id AND v.version = r.current_version
+            WHERE r.deleted = 0 AND r.enabled = 1 AND v.kind = 'definition'
+            ORDER BY r.created_at, r.rule_id"""
+        ).fetchall()
+        rules: list[MatchRule] = []
+        for row in rows:
+            try:
+                encoded = bytes(row["definition_json"])
+                if hashlib.sha256(encoded).hexdigest() != str(row["definition_sha256"]):
+                    continue
+                definition = parse_rule_definition(json.loads(encoded))
+                if canonical_rule_definition(definition) != encoded:
+                    continue
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                UnicodeDecodeError,
+                UnicodeEncodeError,
+                RuleValidationError,
+            ):
+                continue
+            rules.append(
+                MatchRule(
+                    rule_id=str(row["rule_id"]),
+                    version=int(row["current_version"]),
+                    scope_mailbox_identity_key=(
+                        str(row["scope_mailbox_identity_key"])
+                        if row["scope_mailbox_identity_key"] is not None
+                        else None
+                    ),
+                    definition=definition,
+                )
+            )
+        return rules
+
+    def automation_fires_for_message(self, message_id: str) -> list[AutomationFire]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM automation_fires
+                WHERE message_id = ? ORDER BY created_at, fire_id""",
+                (message_id,),
+            ).fetchall()
+        return [AutomationFire(**dict(row)) for row in rows]
+
+    def automation_fire_attempts(self, fire_id: str) -> list[AutomationFireAttempt]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM automation_fire_attempts
+                WHERE fire_id = ? ORDER BY attempt_no""",
+                (fire_id,),
+            ).fetchall()
+        return [AutomationFireAttempt(**dict(row)) for row in rows]
 
     def activate_mail_account(self, provider: str, account_id: str) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
@@ -2667,9 +3437,19 @@ class Store:
         *,
         provider: str = DEFAULT_MAIL_PROVIDER,
         account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key: str | None = None,
     ) -> None:
         stamp = (at or datetime.now(UTC)).isoformat()
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if mailbox_identity_key is not None:
+                current = db.execute(
+                    """SELECT mailbox_identity_key FROM mail_accounts
+                    WHERE provider = ? AND account_id = ?""",
+                    (provider, account_id),
+                ).fetchone()
+                if current is None or current["mailbox_identity_key"] != mailbox_identity_key:
+                    raise MailboxIdentityChanged("mailbox identity changed")
             db.execute(
                 """INSERT INTO mailbox_state(
                     provider, account_id, cursor, last_success_at
@@ -2686,11 +3466,47 @@ class Store:
                 is not None
             )
 
+    def has_unexpired_legacy_mailbox_markers(
+        self,
+        provider: str,
+        account_id: str,
+        *,
+        retention_cutoff: datetime,
+        now: datetime | None = None,
+    ) -> bool:
+        cutoff = retention_cutoff.astimezone(UTC)
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        cutoff_epoch = (cutoff - epoch).total_seconds()
+        observed_epoch = (observed_at - epoch).total_seconds()
+        with self.connection() as db:
+            return (
+                db.execute(
+                    """SELECT 1 FROM messages
+                    WHERE provider = ?1 AND account_id = ?2
+                      AND mailbox_identity_key IS NULL
+                      AND (
+                          aware_iso_epoch(received_at) IS NULL
+                          OR aware_iso_epoch(received_at) >= ?3
+                      )
+                    UNION ALL
+                    SELECT 1 FROM legacy_mailbox_markers
+                    WHERE provider = ?1 AND account_id = ?2
+                      AND (
+                          aware_iso_epoch(expires_at) IS NULL
+                          OR aware_iso_epoch(expires_at) >= ?4
+                      )
+                    LIMIT 1""",
+                    (provider, account_id, cutoff_epoch, observed_epoch),
+                ).fetchone()
+                is not None
+            )
+
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
             row = db.execute(
                 """SELECT message_id, provider, account_id, provider_message_id,
-                    received_at, discovered_at
+                    received_at, discovered_at, mailbox_identity_key
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -2704,10 +3520,44 @@ class Store:
         *,
         provider: str = DEFAULT_MAIL_PROVIDER,
         account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key: str | None = None,
     ) -> bool:
-        message_key = _message_suppression_key(provider, account_id, provider_message_id)
+        message_key = _message_suppression_key(
+            provider, account_id, provider_message_id, mailbox_identity_key
+        )
         legacy_message_key = _legacy_message_suppression_key(provider_message_id)
         with self.connection() as db:
+            if mailbox_identity_key is not None:
+                return (
+                    db.execute(
+                        """SELECT 1 FROM messages
+                        WHERE provider = ?1 AND account_id = ?2
+                          AND mailbox_identity_key = ?3 AND provider_message_id = ?4
+                        UNION ALL
+                        SELECT 1 FROM suppressed_messages
+                        WHERE provider = ?1 AND account_id = ?2 AND message_key = ?5
+                        UNION ALL
+                        SELECT 1 FROM suppressed_messages
+                        WHERE provider = ?1 AND account_id = ?2 AND message_key IN (?6, ?7)
+                          AND EXISTS (
+                              SELECT 1 FROM mail_accounts
+                              WHERE provider = ?1 AND account_id = ?2
+                                AND legacy_identity_status = 'continuity_proven'
+                                AND legacy_identity_key = ?3
+                          )
+                        LIMIT 1""",
+                        (
+                            provider,
+                            account_id,
+                            mailbox_identity_key,
+                            provider_message_id,
+                            message_key,
+                            _message_suppression_key(provider, account_id, provider_message_id),
+                            legacy_message_key,
+                        ),
+                    ).fetchone()
+                    is not None
+                )
             return (
                 db.execute(
                     """SELECT 1 FROM messages
@@ -2741,24 +3591,50 @@ class Store:
         provider: str = DEFAULT_MAIL_PROVIDER,
         account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
         provider_message_id: str | None = None,
+        mailbox_identity_key: str | None = None,
     ) -> bool:
+        if mailbox_identity_key is None:
+            raise ValueError("mailbox identity key is required")
         source_message_id = provider_message_id or message_id
-        message_key = _message_suppression_key(provider, account_id, source_message_id)
-        legacy_message_key = _legacy_message_suppression_key(source_message_id)
+        message_key = _message_suppression_key(
+            provider, account_id, source_message_id, mailbox_identity_key
+        )
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            account = db.execute(
+                """SELECT mailbox_identity_key, legacy_identity_status, legacy_identity_key
+                FROM mail_accounts WHERE provider = ? AND account_id = ?""",
+                (provider, account_id),
+            ).fetchone()
+            if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
+                raise MailboxIdentityChanged("mailbox identity changed")
+            suppression_keys = [message_key]
+            if (
+                account["legacy_identity_status"] == "continuity_proven"
+                and account["legacy_identity_key"] == mailbox_identity_key
+            ):
+                suppression_keys.extend(
+                    (
+                        _message_suppression_key(provider, account_id, source_message_id),
+                        _legacy_message_suppression_key(source_message_id),
+                    )
+                )
+            placeholders = ", ".join("?" for _ in suppression_keys)
             cursor = db.execute(
-                """INSERT OR IGNORE INTO messages(
-                    message_id, provider, account_id, provider_message_id,
+                f"""INSERT OR IGNORE INTO messages(
+                    message_id, provider, account_id, mailbox_identity_key, provider_message_id,
                     thread_id, sender, sender_name, subject, received_at, discovered_at
-                ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 WHERE NOT EXISTS (
                     SELECT 1 FROM suppressed_messages
-                    WHERE provider = ? AND account_id = ? AND message_key IN (?, ?)
+                    WHERE provider = ? AND account_id = ?
+                      AND message_key IN ({placeholders})
                 )""",
                 (
                     message_id,
                     provider,
                     account_id,
+                    mailbox_identity_key,
                     source_message_id,
                     thread_id,
                     sender,
@@ -2768,8 +3644,7 @@ class Store:
                     datetime.now(UTC).isoformat(),
                     provider,
                     account_id,
-                    message_key,
-                    legacy_message_key,
+                    *suppression_keys,
                 ),
             )
         return cursor.rowcount == 1
@@ -2779,7 +3654,8 @@ class Store:
         with self._source_cleanup_locks((message_id,)), self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT provider, account_id, provider_message_id, received_at
+                """SELECT provider, account_id, mailbox_identity_key,
+                    provider_message_id, received_at
                     FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -2798,6 +3674,11 @@ class Store:
                         str(row["provider"]),
                         str(row["account_id"]),
                         str(row["provider_message_id"]),
+                        (
+                            str(row["mailbox_identity_key"])
+                            if row["mailbox_identity_key"] is not None
+                            else None
+                        ),
                     ),
                     _suppression_expiry(str(row["received_at"]), stamp),
                 ),
@@ -2827,7 +3708,7 @@ class Store:
                 db.execute("BEGIN IMMEDIATE")
                 placeholders = ", ".join("?" for _ in chunk)
                 rows = db.execute(
-                    f"""SELECT message_id, provider, account_id,
+                    f"""SELECT message_id, provider, account_id, mailbox_identity_key,
                         provider_message_id, received_at FROM messages
                         WHERE message_id IN ({placeholders})""",
                     tuple(chunk),
@@ -2846,6 +3727,11 @@ class Store:
                                 str(row["provider"]),
                                 str(row["account_id"]),
                                 str(row["provider_message_id"]),
+                                (
+                                    str(row["mailbox_identity_key"])
+                                    if row["mailbox_identity_key"] is not None
+                                    else None
+                                ),
                             ),
                             _suppression_expiry(str(row["received_at"]), stamp),
                         )
@@ -2885,8 +3771,8 @@ class Store:
             db.executemany(
                 """INSERT INTO message_attachments(
                         message_id, part_id, attachment_id, filename,
-                        media_type, byte_size, position
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        media_type, byte_size, position, byte_size_known
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         message_id,
@@ -2896,6 +3782,7 @@ class Store:
                         item.media_type,
                         item.byte_size,
                         item.position,
+                        int(item.byte_size_known),
                     )
                     for item in items
                 ],
@@ -2904,7 +3791,8 @@ class Store:
     def attachment(self, message_id: str, part_id: str) -> AttachmentDescriptor:
         with self.connection() as db:
             row = db.execute(
-                """SELECT part_id, attachment_id, filename, media_type, byte_size, position
+                """SELECT part_id, attachment_id, filename, media_type, byte_size, position,
+                    byte_size_known
                 FROM message_attachments WHERE message_id = ? AND part_id = ?""",
                 (message_id, part_id),
             ).fetchone()
@@ -2917,6 +3805,7 @@ class Store:
             media_type=str(row["media_type"]),
             byte_size=int(row["byte_size"]),
             position=int(row["position"]),
+            byte_size_known=bool(row["byte_size_known"]),
         )
 
     @staticmethod
@@ -3121,8 +4010,7 @@ class Store:
             if row["status"] not in {"requested", "accepted", "processing"}:
                 raise RuntimeError("Only active Connect jobs can be deferred")
             if next_dispatch_state == "waiting" and (
-                row["status"] != "requested"
-                or row["highest_provider_state"] != "requested"
+                row["status"] != "requested" or row["highest_provider_state"] != "requested"
             ):
                 raise RuntimeError("Provider-owned Connect work cannot return to waiting")
             if next_dispatch_state == "provider_owned" and row["status"] == "requested":
@@ -3879,7 +4767,7 @@ class Store:
         with self.connection() as db:
             rows = db.execute(
                 f"""SELECT message_id, provider, account_id, provider_message_id,
-                thread_id, sender, sender_name, subject, received_at,
+                mailbox_identity_key, thread_id, sender, sender_name, subject, received_at,
                 attempts, fallback_notified_at, analysis_request_id, analysis_context_at,
                 analysis_body_char_limit FROM messages
                 WHERE status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
@@ -3914,14 +4802,26 @@ class Store:
                     m.sender AS work_sender, m.sender_name AS work_sender_name,
                     m.subject AS work_subject, m.received_at AS work_received_at,
                     a.address AS organizer_address,
-                    p.organizer_address AS extraction_organizer_address
+                    p.organizer_address AS extraction_organizer_address,
+                    i.mailbox_identity_key AS source_mailbox_identity_key
                 FROM automation_runs AS r
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key
+                 AND (
+                     (i.mailbox_identity_key IS NOT NULL
+                      AND m.mailbox_identity_key = i.mailbox_identity_key
+                      AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                          ) = r.source_message_key)
+                     OR (i.mailbox_identity_key IS NULL
+                         AND m.mailbox_identity_key IS NULL
+                         AND message_source_key(
+                                m.provider, m.account_id, m.provider_message_id
+                             ) = r.source_message_key)
+                 )
                 JOIN mail_accounts AS a
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 LEFT JOIN automation_extraction_payloads AS p
@@ -3953,6 +4853,11 @@ class Store:
                 extraction_organizer_address=(
                     str(row["extraction_organizer_address"])
                     if row["extraction_organizer_address"] is not None
+                    else None
+                ),
+                source_mailbox_identity_key=(
+                    str(row["source_mailbox_identity_key"])
+                    if row["source_mailbox_identity_key"] is not None
                     else None
                 ),
             )
@@ -3995,12 +4900,23 @@ class Store:
                     p.result_sha256, p.result_json, p.violations_json,
                     p.created_at AS extraction_created_at, p.completed_at
                 FROM automation_runs AS r
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key
+                 AND (
+                     (i.mailbox_identity_key IS NOT NULL
+                      AND m.mailbox_identity_key = i.mailbox_identity_key
+                      AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                          ) = r.source_message_key)
+                     OR (i.mailbox_identity_key IS NULL
+                         AND m.mailbox_identity_key IS NULL
+                         AND message_source_key(
+                                m.provider, m.account_id, m.provider_message_id
+                             ) = r.source_message_key)
+                 )
                 JOIN mail_accounts AS a
                   ON a.provider = r.provider AND a.account_id = r.account_id
                 JOIN automation_extraction_payloads AS p
@@ -4036,24 +4952,16 @@ class Store:
                     ),
                     failure_count=int(row["failure_count"]),
                     next_retry_at=(
-                        str(row["next_retry_at"])
-                        if row["next_retry_at"] is not None
-                        else None
+                        str(row["next_retry_at"]) if row["next_retry_at"] is not None else None
                     ),
                     last_error_code=(
-                        str(row["last_error_code"])
-                        if row["last_error_code"] is not None
-                        else None
+                        str(row["last_error_code"]) if row["last_error_code"] is not None else None
                     ),
                     result_sha256=(
-                        str(row["result_sha256"])
-                        if row["result_sha256"] is not None
-                        else None
+                        str(row["result_sha256"]) if row["result_sha256"] is not None else None
                     ),
                     result_json=(
-                        bytes(row["result_json"])
-                        if row["result_json"] is not None
-                        else None
+                        bytes(row["result_json"]) if row["result_json"] is not None else None
                     ),
                     violations_json=(
                         bytes(row["violations_json"])
@@ -4062,9 +4970,7 @@ class Store:
                     ),
                     created_at=str(row["extraction_created_at"]),
                     completed_at=(
-                        str(row["completed_at"])
-                        if row["completed_at"] is not None
-                        else None
+                        str(row["completed_at"]) if row["completed_at"] is not None else None
                     ),
                 ),
             )
@@ -4082,20 +4988,29 @@ class Store:
             ).fetchone()
         return _automation_proposal_payload(row) if row is not None else None
 
-    def automation_proposal_for_message(
-        self, message_id: str
-    ) -> AutomationProposalPayload | None:
+    def automation_proposal_for_message(self, message_id: str) -> AutomationProposalPayload | None:
         with self.connection() as db:
             row = db.execute(
                 """SELECT p.* FROM automation_proposal_payloads AS p
                 JOIN automation_runs AS r
                   ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key
+                 AND (
+                     (i.mailbox_identity_key IS NOT NULL
+                      AND m.mailbox_identity_key = i.mailbox_identity_key
+                      AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                          ) = r.source_message_key)
+                     OR (i.mailbox_identity_key IS NULL
+                         AND m.mailbox_identity_key IS NULL
+                         AND message_source_key(
+                                m.provider, m.account_id, m.provider_message_id
+                             ) = r.source_message_key)
+                 )
                 WHERE m.message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -4155,9 +5070,11 @@ class Store:
                         raise ValueError("automation proposal content is not bounded")
                 except (AttributeError, UnicodeEncodeError) as exc:
                     raise ValueError("automation proposal content is invalid") from exc
-        accepted = all(
-            value is not None for value in (start, end, timezone, suggestion_reason)
-        ) and bool(suggestion_reason) and empty_reason is None
+        accepted = (
+            all(value is not None for value in (start, end, timezone, suggestion_reason))
+            and bool(suggestion_reason)
+            and empty_reason is None
+        )
         no_suggestions = (
             all(value is None for value in (start, end, timezone, suggestion_reason))
             and isinstance(empty_reason, str)
@@ -4213,9 +5130,7 @@ class Store:
         created_at = stamp.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             extraction = db.execute(
                 """SELECT status FROM automation_extraction_payloads
                 WHERE payload_id = ? AND run_id = ?""",
@@ -4333,9 +5248,7 @@ class Store:
         stamp = selected_now.astimezone(UTC)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             proposal = db.execute(
                 """SELECT * FROM automation_proposal_payloads
                 WHERE run_id = ? AND proposal_version = ? AND proposal_sha256 = ?""",
@@ -4554,9 +5467,7 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             write = db.execute(
                 "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -4569,9 +5480,28 @@ class Store:
             ):
                 raise RuntimeError("Automation write lost its expected-state race")
             source_exists = db.execute(
-                """SELECT 1 FROM messages AS m WHERE m.provider = ? AND m.account_id = ?
-                AND message_source_key(m.provider, m.account_id, m.provider_message_id) = ?""",
-                (row["provider"], row["account_id"], row["source_message_key"]),
+                """SELECT 1 FROM messages AS m
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = ?
+                WHERE m.provider = ? AND m.account_id = ? AND (
+                    (i.mailbox_identity_key IS NOT NULL
+                     AND m.mailbox_identity_key = i.mailbox_identity_key
+                     AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                         ) = ?)
+                    OR (i.mailbox_identity_key IS NULL
+                        AND m.mailbox_identity_key IS NULL
+                        AND message_source_key(
+                               m.provider, m.account_id, m.provider_message_id
+                            ) = ?)
+                )""",
+                (
+                    run_id,
+                    row["provider"],
+                    row["account_id"],
+                    row["source_message_key"],
+                    row["source_message_key"],
+                ),
             ).fetchone()
             proposal_exists = db.execute(
                 """SELECT 1 FROM automation_proposal_payloads
@@ -4655,24 +5585,22 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
+            row = db.execute("SELECT * FROM automation_runs WHERE run_id = ?", (run_id,)).fetchone()
             write = db.execute(
                 "SELECT * FROM automation_calendar_writes WHERE run_id = ?", (run_id,)
             ).fetchone()
             if row is None or write is None:
                 raise KeyError(run_id)
             previous_state = str(row["state"])
-            if (
-                (previous_state, next_state) not in allowed
-                or int(row["state_version"]) != expected_state_version
-            ):
+            if (previous_state, next_state) not in allowed or int(
+                row["state_version"]
+            ) != expected_state_version:
                 raise RuntimeError("Automation write transition lost its expected-state race")
             if next_state == "completed":
-                if not isinstance(graph_event_id, str) or not 1 <= len(
-                    graph_event_id.encode("utf-8")
-                ) <= 512:
+                if (
+                    not isinstance(graph_event_id, str)
+                    or not 1 <= len(graph_event_id.encode("utf-8")) <= 512
+                ):
                     raise ValueError("Graph event identity is invalid")
                 write_status = "completed"
                 completed_at = stamp
@@ -5231,12 +6159,23 @@ class Store:
         with self.connection() as db:
             row = db.execute(
                 """SELECT r.* FROM automation_runs AS r
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key
+                 AND (
+                     (i.mailbox_identity_key IS NOT NULL
+                      AND m.mailbox_identity_key = i.mailbox_identity_key
+                      AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                          ) = r.source_message_key)
+                     OR (i.mailbox_identity_key IS NULL
+                         AND m.mailbox_identity_key IS NULL
+                         AND message_source_key(
+                                m.provider, m.account_id, m.provider_message_id
+                             ) = r.source_message_key)
+                 )
                 WHERE m.message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -5407,9 +6346,14 @@ class Store:
         message_id: str,
         result: dict[str, object],
         *,
+        mailbox_identity_key: str,
         scheduling_automation_principal_key: str | None = None,
         now: datetime | None = None,
     ) -> None:
+        if len(mailbox_identity_key) != 64 or any(
+            character not in "0123456789abcdef" for character in mailbox_identity_key
+        ):
+            raise ValueError("mailbox identity key must be a lower-case SHA-256 digest")
         if scheduling_automation_principal_key is not None and (
             not isinstance(scheduling_automation_principal_key, str)
             or len(scheduling_automation_principal_key) != 64
@@ -5420,7 +6364,8 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             source = db.execute(
-                """SELECT status, provider, account_id, provider_message_id, discovered_at
+                """SELECT status, provider, account_id, provider_message_id, discovered_at,
+                    mailbox_identity_key, sender, sender_name, subject
                 FROM messages WHERE message_id = ?""",
                 (message_id,),
             ).fetchone()
@@ -5428,6 +6373,75 @@ class Store:
                 raise KeyError(message_id)
             if source["status"] != "pending":
                 raise RuntimeError("Analysis can only complete for a pending message")
+            current_identity = db.execute(
+                """SELECT mailbox_identity_key FROM mail_accounts
+                WHERE provider = ? AND account_id = ?""",
+                (source["provider"], source["account_id"]),
+            ).fetchone()
+            if (
+                current_identity is None
+                or current_identity["mailbox_identity_key"] != mailbox_identity_key
+                or source["mailbox_identity_key"] != mailbox_identity_key
+            ):
+                raise MailboxIdentityChanged("mailbox identity changed")
+            revision_row = db.execute(
+                "SELECT revision FROM automation_rule_set WHERE id = 1"
+            ).fetchone()
+            if revision_row is None:
+                raise RuntimeError("automation rule-set authority is missing")
+            rules_revision = int(revision_row["revision"])
+            rules = self._current_match_rules(db)
+            attachment_count = db.execute(
+                """SELECT COUNT(*) AS count FROM message_attachments
+                WHERE message_id = ?""",
+                (message_id,),
+            ).fetchone()
+            if attachment_count is None:
+                raise RuntimeError("automation attachment count is unavailable")
+            evaluation_error: str | None = None
+            matched = []
+            if int(attachment_count["count"]) > MAX_AUTOMATION_ATTACHMENTS:
+                evaluation_error = "automation_fanout_limit"
+            else:
+                attachment_rows = db.execute(
+                    """SELECT part_id, attachment_id, filename, media_type, byte_size,
+                        position, byte_size_known
+                    FROM message_attachments WHERE message_id = ?
+                    ORDER BY position, part_id""",
+                    (message_id,),
+                ).fetchall()
+                attachments = [
+                    AttachmentDescriptor(
+                        part_id=str(row["part_id"]),
+                        attachment_id=(
+                            str(row["attachment_id"]) if row["attachment_id"] is not None else None
+                        ),
+                        filename=str(row["filename"]),
+                        media_type=str(row["media_type"]),
+                        byte_size=int(row["byte_size"]),
+                        position=int(row["position"]),
+                        byte_size_known=bool(row["byte_size_known"]),
+                    )
+                    for row in attachment_rows
+                ]
+                try:
+                    matched = match_rules(
+                        rules,
+                        provider=str(source["provider"]),
+                        account_id=str(source["account_id"]),
+                        mailbox_identity_key=mailbox_identity_key,
+                        sender=str(source["sender"]),
+                        sender_name=(
+                            str(source["sender_name"])
+                            if source["sender_name"] is not None
+                            else None
+                        ),
+                        subject=str(source["subject"]),
+                        result=result,
+                        attachments=attachments,
+                    )
+                except AutomationFanoutLimit:
+                    evaluation_error = "automation_fanout_limit"
             updated = db.execute(
                 """UPDATE messages SET status='analyzed', analysis_at=?, attempts=0,
                 next_retry_at=NULL, last_error=NULL, analysis_request_id=NULL,
@@ -5435,7 +6449,8 @@ class Store:
                 analysis_retryable=NULL, analysis_error_code=NULL,
                 analysis_retry_after_seconds=NULL,
                 category=?, priority=?, summary=?, action_required=?, suggested_action=?,
-                deadline_text=?, deadline_iso=?, confidence=?
+                deadline_text=?, deadline_iso=?, confidence=?,
+                rules_revision_at_analysis=?, rules_evaluation_error=?
                 WHERE message_id=? AND status='pending'""",
                 (
                     stamp,
@@ -5447,11 +6462,45 @@ class Store:
                     result.get("deadline_text"),
                     result.get("deadline_iso"),
                     result["confidence"],
+                    rules_revision,
+                    evaluation_error,
                     message_id,
                 ),
             )
             if updated.rowcount != 1:
                 raise RuntimeError("Analysis completion lost its expected-state race")
+            if evaluation_error is None:
+                event_id = _message_suppression_key(
+                    str(source["provider"]),
+                    str(source["account_id"]),
+                    str(source["provider_message_id"]),
+                    mailbox_identity_key,
+                )
+                for fire in matched:
+                    fire_id = str(uuid.uuid4())
+                    db.execute(
+                        """INSERT INTO automation_fires(
+                            fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                            action_kind, state, state_version, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'connect.invoke',
+                            'pending_dispatch', 1, ?, ?)""",
+                        (
+                            fire_id,
+                            event_id,
+                            fire.rule_id,
+                            fire.rule_version,
+                            message_id,
+                            fire.part_id,
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                    db.execute(
+                        """INSERT INTO automation_fire_attempts(
+                            fire_id, attempt_no, dispatch_request_id, created_at
+                        ) VALUES (?, 1, ?, ?)""",
+                        (fire_id, str(uuid.uuid4()), stamp),
+                    )
             if (
                 scheduling_automation_principal_key is not None
                 and result["category"] == "scheduling"
@@ -5462,6 +6511,7 @@ class Store:
                     account_id=str(source["account_id"]),
                     calendar_principal_key=scheduling_automation_principal_key,
                     provider_message_id=str(source["provider_message_id"]),
+                    mailbox_identity_key=mailbox_identity_key,
                     created_at=stamp,
                     expires_at=_automation_expiry(str(source["discovered_at"]), admitted_at),
                 )
@@ -5521,12 +6571,23 @@ class Store:
                     NULL AS suggested_action, NULL AS deadline_iso,
                     r.failure_code AS last_error, r.updated_at AS sort_at
                 FROM automation_runs AS r
+                LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 LEFT JOIN messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
-                 AND message_source_key(
-                        m.provider, m.account_id, m.provider_message_id
-                     ) = r.source_message_key
+                 AND (
+                     (i.mailbox_identity_key IS NOT NULL
+                      AND m.mailbox_identity_key = i.mailbox_identity_key
+                      AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id,
+                            m.mailbox_identity_key
+                          ) = r.source_message_key)
+                     OR (i.mailbox_identity_key IS NULL
+                         AND m.mailbox_identity_key IS NULL
+                         AND message_source_key(
+                                m.provider, m.account_id, m.provider_message_id
+                             ) = r.source_message_key)
+                 )
                 WHERE r.state IN ('ambiguous', 'manual_review', 'source_unavailable')
                   AND r.review_notified_at IS NULL
                 ) AS intents
@@ -5731,7 +6792,8 @@ class Store:
         message_ids = [str(item["message_id"]) for item in items]
         placeholders = ",".join("?" for _ in message_ids)
         attachment_rows = db.execute(
-            f"""SELECT message_id, part_id, attachment_id, filename, media_type, byte_size
+            f"""SELECT message_id, part_id, attachment_id, filename, media_type, byte_size,
+                byte_size_known
             FROM message_attachments WHERE message_id IN ({placeholders})
             ORDER BY message_id, position""",
             message_ids,
@@ -5815,12 +6877,23 @@ class Store:
             JOIN automation_runs AS r
               ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
             LEFT JOIN automation_calendar_writes AS w ON w.run_id = r.run_id
+            LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
             JOIN messages AS m
               ON m.provider = r.provider
              AND m.account_id = r.account_id
-             AND message_source_key(
-                    m.provider, m.account_id, m.provider_message_id
-                 ) = r.source_message_key
+             AND (
+                 (i.mailbox_identity_key IS NOT NULL
+                  AND m.mailbox_identity_key = i.mailbox_identity_key
+                  AND message_source_key(
+                        m.provider, m.account_id, m.provider_message_id,
+                        m.mailbox_identity_key
+                      ) = r.source_message_key)
+                 OR (i.mailbox_identity_key IS NULL
+                     AND m.mailbox_identity_key IS NULL
+                     AND message_source_key(
+                            m.provider, m.account_id, m.provider_message_id
+                         ) = r.source_message_key)
+             )
             JOIN mail_accounts AS a
               ON a.provider = r.provider AND a.account_id = r.account_id
             WHERE m.message_id IN ({placeholders})
@@ -5839,6 +6912,7 @@ class Store:
         for row in attachment_rows:
             attachment = dict(row)
             message_id = str(attachment.pop("message_id"))
+            attachment.pop("byte_size_known", None)
             attachments_by_message[message_id].append(attachment)
         connect_by_attachment: dict[tuple[str, str], list[dict[str, object]]] = {}
         for row in connect_rows:
@@ -5907,9 +6981,7 @@ class Store:
         proposal_by_message: dict[str, dict[str, object]] = {}
         proposal_fields = AutomationProposalPayload.__dataclass_fields__
         for row in proposal_rows:
-            proposal = AutomationProposalPayload(
-                **{name: row[name] for name in proposal_fields}
-            )
+            proposal = AutomationProposalPayload(**{name: row[name] for name in proposal_fields})
             proposal_by_message[str(row["message_id"])] = {
                 "run_id": proposal.run_id,
                 "state": str(row["run_state"]),
@@ -5921,9 +6993,7 @@ class Store:
                 "account_id": str(row["account_id"]),
                 "account_display_name": str(row["account_display_name"]),
                 "account_address": (
-                    str(row["account_address"])
-                    if row["account_address"] is not None
-                    else None
+                    str(row["account_address"]) if row["account_address"] is not None else None
                 ),
                 "subject": proposal.subject,
                 "attendees": list(proposal.attendees),
@@ -5938,9 +7008,7 @@ class Store:
                     str(row["write_status"]) if row["write_status"] is not None else None
                 ),
                 "graph_event_id": (
-                    str(row["graph_event_id"])
-                    if row["graph_event_id"] is not None
-                    else None
+                    str(row["graph_event_id"]) if row["graph_event_id"] is not None else None
                 ),
             }
         for message_id, attachments in attachments_by_message.items():

@@ -6,10 +6,12 @@ import pytest
 
 from eom_email_watcher import connect, engine_api, entitlement
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
+from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime, mail_account_token_file
 
 INSTANCE = "11111111-1111-4111-8111-111111111111"
+TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
 @pytest.fixture(autouse=True)
@@ -80,9 +82,7 @@ def test_entitlement_install_forwards_only_an_absolute_source_and_preserves_erro
 
     def install(path: Path) -> entitlement.EntitlementStatus:
         captured.append(path)
-        return entitlement.EntitlementStatus.from_decision(
-            entitlement.EntitlementDecision.ACTIVE
-        )
+        return entitlement.EntitlementStatus.from_decision(entitlement.EntitlementDecision.ACTIVE)
 
     monkeypatch.setattr(entitlement, "install_connect_entitlement", install)
     response = engine_api._response(
@@ -145,6 +145,12 @@ def seeded_runtime(tmp_path: Path):
     write_config(config_path)
     runtime = load_runtime(config_path)
     runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
+    runtime.store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     runtime.store.add_message(
         message_id="message-1",
         thread_id=None,
@@ -152,14 +158,11 @@ def seeded_runtime(tmp_path: Path):
         sender_name="Private Sender",
         subject="Private subject",
         received_at="2026-08-29T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "message-1",
-        (
-            AttachmentDescriptor(
-                "2", "gmail-attachment", "invoice.pdf", "application/pdf", 28, 0
-            ),
-        ),
+        (AttachmentDescriptor("2", "gmail-attachment", "invoice.pdf", "application/pdf", 28, 0),),
     )
     return config_path, runtime
 
@@ -232,9 +235,7 @@ def test_attachment_summary_persists_terminal_result_and_reuses_it(
         def __init__(self, selected: connect.ProviderCapability):
             assert selected.app_id == "alternate-provider"
 
-        def submit(
-            self, job: connect.PreparedSummaryJob, content: bytes
-        ) -> connect.JobUpdate:
+        def submit(self, job: connect.PreparedSummaryJob, content: bytes) -> connect.JobUpdate:
             captured["request"] = job.request
             captured["content"] = content
             return update(job, "accepted")
@@ -322,6 +323,12 @@ def test_imap_attachment_summary_uses_actual_download_size(
         address="owner@example.com",
         active=True,
     )
+    runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     credentials_file = mail_account_token_file(runtime.config, account)
     credentials_file.parent.mkdir(parents=True)
     credentials_file.write_text("private credentials", encoding="utf-8")
@@ -335,14 +342,11 @@ def test_imap_attachment_summary_uses_actual_download_size(
         sender_name="Private Sender",
         subject="Private subject",
         received_at="2026-09-12T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "message-1",
-        (
-            AttachmentDescriptor(
-                "mime-0", None, "invoice.pdf", "application/pdf", 4096, 0
-            ),
-        ),
+        (AttachmentDescriptor("mime-0", None, "invoice.pdf", "application/pdf", 4096, 0),),
     )
     pdf = b"%PDF-1.4\nreal attachment\nEOF"
 
@@ -450,6 +454,12 @@ def test_imap_attachment_summary_rejects_descriptor_over_local_fetch_ceiling(
         address="owner@example.com",
         active=True,
     )
+    runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     credentials_file = mail_account_token_file(runtime.config, account)
     credentials_file.parent.mkdir(parents=True)
     credentials_file.write_text("private credentials", encoding="utf-8")
@@ -463,6 +473,7 @@ def test_imap_attachment_summary_rejects_descriptor_over_local_fetch_ceiling(
         sender_name="Private Sender",
         subject="Private subject",
         received_at="2026-09-12T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -555,12 +566,15 @@ def test_provider_failure_is_durable_and_never_masquerades_as_success(
             },
         }
     ]
-    assert runtime.store.completed_connect_job(
-        message_id="message-1",
-        part_id="2",
-        capability_id="document.summarize",
-        capability_version="1.0",
-    ) is None
+    assert (
+        runtime.store.completed_connect_job(
+            message_id="message-1",
+            part_id="2",
+            capability_id="document.summarize",
+            capability_version="1.0",
+        )
+        is None
+    )
 
 
 def test_provider_crash_after_acceptance_remains_active_for_reconciliation(
@@ -750,9 +764,7 @@ def test_active_job_is_not_handed_to_a_different_provider_instance(
         "code": "provider_unavailable",
         "message": "The provider for the active local capability job is unavailable.",
     }
-    assert runtime.store.connect_job("33333333-3333-4333-8333-333333333333").status == (
-        "requested"
-    )
+    assert runtime.store.connect_job("33333333-3333-4333-8333-333333333333").status == ("requested")
 
 
 def test_poll_not_found_reloads_processing_state_before_same_identity_resubmission(
@@ -797,9 +809,7 @@ def test_poll_not_found_reloads_processing_state_before_same_identity_resubmissi
             assert initial.status == "accepted"
             if not submitted:
                 on_update(update(job, "processing"))
-                raise connect.ConnectError(
-                    "JOB_NOT_FOUND", "The provider lost the accepted job."
-                )
+                raise connect.ConnectError("JOB_NOT_FOUND", "The provider lost the accepted job.")
             completed = update(job, "completed", result=summary(job))
             on_update(completed)
             return completed

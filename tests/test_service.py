@@ -1,3 +1,4 @@
+import hashlib
 import json
 from contextlib import contextmanager
 from dataclasses import replace
@@ -9,17 +10,20 @@ import pytest
 from eom_email_watcher import db as db_module
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
-from eom_email_watcher.db import Store
+from eom_email_watcher.db import MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
     MessageMetadata,
     MessageUnavailable,
     StaleHistoryCursor,
 )
+from eom_email_watcher.imap import ImapGateway
 from eom_email_watcher.mailbox import (
     MailboxChanges,
+    MailboxError,
     MailboxMessageInvalid,
     MailboxSession,
     MessageContent,
+    StaleMailboxCursor,
     scoped_message_id,
 )
 from eom_email_watcher.microsoft365 import (
@@ -33,7 +37,7 @@ from eom_email_watcher.microsoft_calendar import (
     CalendarWriteResult,
     MicrosoftCalendarProposalRejected,
 )
-from eom_email_watcher.mime import extract_body
+from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import (
     MAX_GATEWAY_ATTACHMENT_COUNT,
     MAX_GATEWAY_ATTACHMENT_NAME_CHARS,
@@ -55,8 +59,11 @@ from eom_email_watcher.service import (
     process_scheduling_automations,
     process_scheduling_proposals,
     process_scheduling_writes,
+    reconcile_mailbox_session_identity,
     run_watcher_check,
 )
+
+TEST_MAILBOX_IDENTITY_KEY = "f" * 64
 
 
 class FakeGmail:
@@ -64,6 +71,9 @@ class FakeGmail:
         self.stale = stale
         self.full_payload_calls = 0
         self.search_since_value: datetime | None = None
+
+    def mailbox_identity_key(self) -> str:
+        return TEST_MAILBOX_IDENTITY_KEY
 
     def profile_history_id(self) -> str:
         return "200"
@@ -115,6 +125,32 @@ class FreshGmail(FakeGmail):
         return replace(super().metadata(message_id), received_at=datetime.now(UTC).isoformat())
 
 
+def _scoped_invoice_rule(provider: str, account_id: str) -> dict[str, object]:
+    return {
+        "name": "Invoice PDFs",
+        "scope": {"provider": provider, "account_id": account_id},
+        "trigger": {"source_kind": "mail.message"},
+        "conditions": [
+            {
+                "field": "attachment.media_type",
+                "op": "equals",
+                "value": "application/pdf",
+            }
+        ],
+        "action": {
+            "kind": "connect.invoke",
+            "capability": {"id": "invoice.extract", "version": "1.0"},
+            "provider": {
+                "app_id": "invoice-processor",
+                "version": "1.0.0",
+                "instance_id": "11111111-1111-4111-8111-111111111111",
+            },
+            "parameters": {},
+        },
+        "confirm_each": False,
+    }
+
+
 class FutureDatedGmail(FakeGmail):
     def metadata(self, message_id: str) -> MessageMetadata:
         future = datetime.now(UTC) + service_module.timedelta(days=3650)
@@ -161,6 +197,9 @@ class SchedulingModel(FakeModel):
 
 class AutomationGateway:
     body = "Meet jane@example.com on September 8, 2026 from 10:00 to 10:30 AM."
+
+    def mailbox_identity_key(self) -> str:
+        return TEST_MAILBOX_IDENTITY_KEY
 
     def metadata(self, message_id: str) -> MessageMetadata:
         return MessageMetadata(
@@ -406,10 +445,18 @@ def admit_scheduling_run(
             address="owner@example.com",
             active=active,
         )
+    store.reconcile_mailbox_identity(
+        MICROSOFT365_PROVIDER,
+        account_id,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
     message_id = scoped_message_id(
         MICROSOFT365_PROVIDER,
         account_id,
         provider_message_id,
+        TEST_MAILBOX_IDENTITY_KEY,
     )
     store.add_message(
         message_id=message_id,
@@ -421,10 +468,12 @@ def admit_scheduling_run(
         sender_name="Trusted",
         subject="Meeting request",
         received_at=received_at or SCHEDULING_FIXTURE_RECEIVED_AT,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     store.mark_analyzed(
         message_id,
         SchedulingModel().analyze().model_dump(),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
         scheduling_automation_principal_key=principal_key,
     )
     run = store.automation_run_for_message(message_id)
@@ -620,7 +669,7 @@ def test_watcher_requires_full_scheduling_automation_authorization(
     result = Watcher(cfg, store, session, SchedulingModel()).check()
 
     assert result["summarized"] == 1
-    message_id = scoped_message_id(provider, account_id, "allowed")
+    message_id = scoped_message_id(provider, account_id, "allowed", TEST_MAILBOX_IDENTITY_KEY)
     run = store.automation_run_for_message(message_id)
     assert (run is not None) is expected
     if run is not None:
@@ -680,7 +729,9 @@ def test_watcher_skips_calendar_authorization_for_non_scheduling_analysis(
     ).check()
 
     assert result["summarized"] == 1
-    message_id = scoped_message_id(MICROSOFT365_PROVIDER, account_id, "allowed")
+    message_id = scoped_message_id(
+        MICROSOFT365_PROVIDER, account_id, "allowed", TEST_MAILBOX_IDENTITY_KEY
+    )
     assert store.automation_run_for_message(message_id) is None
 
 
@@ -735,7 +786,9 @@ def test_watcher_rechecks_entitlements_after_live_calendar_authorization(
     ).check()
 
     assert result["summarized"] == 1
-    message_id = scoped_message_id(MICROSOFT365_PROVIDER, account_id, "allowed")
+    message_id = scoped_message_id(
+        MICROSOFT365_PROVIDER, account_id, "allowed", TEST_MAILBOX_IDENTITY_KEY
+    )
     assert store.automation_run_for_message(message_id) is None
 
 
@@ -881,8 +934,7 @@ def test_scheduling_proposal_pages_past_unattempted_oldest_run(
         "_scheduling_proposal_authorization",
         lambda *args, **kwargs: (
             None
-            if blocked_mode == "unauthorized"
-            and kwargs["expected_principal_key"] == "b" * 64
+            if blocked_mode == "unauthorized" and kwargs["expected_principal_key"] == "b" * 64
             else ProposalAuthorization()
         ),
     )
@@ -1070,9 +1122,7 @@ def test_confirmed_scheduling_proposal_writes_once_after_durable_reservation(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, awaiting, proposal = awaiting_confirmation_run(
-        cfg, store, monkeypatch
-    )
+    _account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "feature_entitlements_active",
@@ -1109,9 +1159,7 @@ def test_confirmed_scheduling_proposal_writes_once_after_durable_reservation(
     monkeypatch.setattr(
         service_module,
         "_scheduling_write_authorization",
-        lambda *args, **kwargs: pytest.fail(
-            "repeated confirmation reloaded write authorization"
-        ),
+        lambda *args, **kwargs: pytest.fail("repeated confirmation reloaded write authorization"),
     )
     repeated = decide_scheduling_proposal(
         cfg,
@@ -1136,9 +1184,7 @@ def test_expired_scheduling_proposal_requeues_without_write_authorization(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, awaiting, proposal = awaiting_confirmation_run(
-        cfg, store, monkeypatch
-    )
+    _account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "feature_entitlements_active",
@@ -1175,9 +1221,7 @@ def test_ambiguous_calendar_write_reconciles_without_resubmission(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, awaiting, proposal = awaiting_confirmation_run(
-        cfg, store, monkeypatch
-    )
+    _account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "feature_entitlements_active",
@@ -1332,9 +1376,7 @@ def test_calendar_write_authorization_rejection_fails_and_revokes_grant(
     monkeypatch.setattr(
         service_module,
         "create_calendar_event",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            MicrosoftAuthorizationRejected("revoked")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(MicrosoftAuthorizationRejected("revoked")),
     )
 
     result = decide_scheduling_proposal(
@@ -1403,9 +1445,7 @@ def test_calendar_reconciliation_authorization_rejection_remains_unresolved(
     monkeypatch.setattr(
         service_module,
         "find_calendar_event_by_transaction",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            MicrosoftAuthorizationRejected("revoked")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(MicrosoftAuthorizationRejected("revoked")),
     )
 
     process_scheduling_writes(
@@ -1433,9 +1473,7 @@ def test_decline_never_loads_write_authorization_or_calls_graph(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
-    _account_id, awaiting, proposal = awaiting_confirmation_run(
-        cfg, store, monkeypatch
-    )
+    _account_id, awaiting, proposal = awaiting_confirmation_run(cfg, store, monkeypatch)
     monkeypatch.setattr(
         service_module,
         "feature_entitlements_active",
@@ -1969,13 +2007,22 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
         failure_code="source_invalid",
     )
     older = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages (
-                    message_id, provider, account_id, provider_message_id,
+                    message_id, provider, account_id, mailbox_identity_key,
+                    provider_message_id,
                     sender, subject, received_at, discovered_at, status, last_error
                 ) VALUES (
-                    ?1, 'gmail', 'gmail-default', ?1,
+                    ?1, 'gmail', 'gmail-default',
+                    (SELECT mailbox_identity_key FROM mail_accounts
+                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
                     'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable'
                 )""",
             [(f"backlog-{index}", older) for index in range(25)],
@@ -2139,8 +2186,7 @@ def test_scheduling_source_bounds_attachment_metadata_before_reservation(
     assert result.processed == 1
     assert len(bounded_source.attachment_names) == MAX_GATEWAY_ATTACHMENT_COUNT
     assert all(
-        len(name) <= MAX_GATEWAY_ATTACHMENT_NAME_CHARS
-        for name in bounded_source.attachment_names
+        len(name) <= MAX_GATEWAY_ATTACHMENT_NAME_CHARS for name in bounded_source.attachment_names
     )
     assert current is not None
     assert current.source_content_sha256 == scheduling_source_sha256(bounded_source)
@@ -2321,13 +2367,19 @@ def test_watcher_scopes_sync_and_source_fetch_to_mailbox_session(
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
     store.initialize()
+    store.register_mail_account(
+        "microsoft365",
+        "account-2",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+    )
     store.set_state("100", provider="microsoft365", account_id="account-2")
     gateway = FakeGmail()
     session = MailboxSession("microsoft365", "account-2", gateway)
 
     result = Watcher(cfg, store, session, FakeModel()).check()
 
-    local_id = scoped_message_id("microsoft365", "account-2", "allowed")
+    local_id = scoped_message_id("microsoft365", "account-2", "allowed", TEST_MAILBOX_IDENTITY_KEY)
     item = store.recent(1)[0]
     assert result["discovered"] == 1
     assert item["message_id"] == local_id
@@ -2346,7 +2398,21 @@ def test_watcher_does_not_fetch_pending_content_from_another_account(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100")
-    other_local_id = scoped_message_id("microsoft365", "account-2", "other-message")
+    store.register_mail_account(
+        "microsoft365",
+        "account-2",
+        display_name="Microsoft 365",
+        address="owner@example.com",
+    )
+    store.reconcile_mailbox_identity(
+        "microsoft365",
+        "account-2",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
+    other_local_id = scoped_message_id(
+        "microsoft365", "account-2", "other-message", TEST_MAILBOX_IDENTITY_KEY
+    )
     store.add_message(
         message_id=other_local_id,
         provider="microsoft365",
@@ -2357,6 +2423,7 @@ def test_watcher_does_not_fetch_pending_content_from_another_account(
         sender_name="Trusted",
         subject="Other account",
         received_at=datetime.now(UTC).isoformat(),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     gateway = FakeGmail()
     gateway.history_message_ids = lambda cursor: ([], "200")
@@ -2439,6 +2506,12 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
     cfg = replace(config(tmp_path), senders=(), notifications_enabled=True)
     store = Store(cfg.database_file)
     store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     for message_id in ("expired", "queued"):
         store.add_message(
             message_id=message_id,
@@ -2447,9 +2520,14 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
             sender_name="Former",
             subject=message_id,
             received_at="2020-01-01T00:00:00+00:00",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
         )
     store.mark_skipped("expired")
-    store.mark_analyzed("queued", FakeModel().analyze().model_dump())
+    store.mark_analyzed(
+        "queued",
+        FakeModel().analyze().model_dump(),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
     with store.connection() as db:
         db.execute(
             "UPDATE messages SET discovered_at = ?",
@@ -2482,6 +2560,50 @@ def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
     result = Watcher(cfg, store, FakeGmail(stale=True), FakeModel()).check()
     assert result["stale_cursor_recovered"] is True
     assert store.state()[0] == "200"
+
+
+@pytest.mark.parametrize(
+    ("received_offset", "blocked"),
+    [(timedelta(0), True), (-timedelta(days=2), False)],
+)
+def test_unresolved_legacy_identity_blocks_stale_recovery_only_for_retained_markers(
+    tmp_path: Path,
+    received_offset: timedelta,
+    blocked: bool,
+) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    observed_at = datetime.now(UTC)
+    store.set_state("old", observed_at - timedelta(minutes=10))
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
+        db.execute(
+            """INSERT INTO messages(
+                message_id, provider, account_id, provider_message_id,
+                sender, subject, received_at, discovered_at, mailbox_identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                "legacy-marker",
+                "gmail",
+                "gmail-default",
+                "legacy-marker",
+                "trusted@example.com",
+                "Legacy marker",
+                (observed_at + received_offset).isoformat(),
+                observed_at.isoformat(),
+            ),
+        )
+    gmail = FakeGmail(stale=True)
+
+    if blocked:
+        with pytest.raises(MailboxError, match="legacy mailbox identity"):
+            Watcher(cfg, store, gmail, FakeModel()).check()
+        assert gmail.search_since_value is None
+    else:
+        result = Watcher(cfg, store, gmail, FakeModel()).check()
+        assert result["stale_cursor_recovered"] is True
+        assert gmail.search_since_value is not None
 
 
 def test_stale_cursor_recovery_is_bounded_by_retention_before_content_fetch(
@@ -2570,6 +2692,13 @@ def test_expired_pending_message_is_excluded_before_content_fetch(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime.now(UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
     store.add_message(
         message_id="expired-pending",
         thread_id=None,
@@ -2577,6 +2706,7 @@ def test_expired_pending_message_is_excluded_before_content_fetch(
         sender_name="Trusted",
         subject="Expired",
         received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -2597,6 +2727,13 @@ def test_dry_run_ignores_pending_source_time_that_overflows_utc(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime.now(UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
     store.add_message(
         message_id="overflowing-source-time",
         thread_id=None,
@@ -2604,6 +2741,7 @@ def test_dry_run_ignores_pending_source_time_that_overflows_utc(
         sender_name="Trusted",
         subject="Malformed",
         received_at="0001-01-01T00:00:00+23:59",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -2622,6 +2760,13 @@ def test_dry_run_does_not_advance_cursor_or_store_messages(tmp_path: Path) -> No
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
     result = Watcher(cfg, store, FakeGmail(), FakeModel()).check(dry_run=True)
     assert result["discovered"] == 1
     assert store.state()[0] == "100"
@@ -2884,7 +3029,9 @@ def test_gateway_permanent_failure_waits_for_explicit_requeue(tmp_path: Path) ->
     assert watcher.check()["summarized"] == 0
     assert model.calls == 1
 
-    store.requeue_analysis("allowed")
+    store.requeue_analysis(
+        scoped_message_id("gmail", "gmail-default", "allowed", TEST_MAILBOX_IDENTITY_KEY)
+    )
     assert watcher.check()["summarized"] == 0
     assert model.calls == 2
     assert model.requests[1][0] != first_request_id
@@ -2964,6 +3111,13 @@ def test_expired_notification_intent_is_removed_before_cli_delivery(
     store = Store(cfg.database_file)
     store.initialize()
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
     store.add_message(
         message_id="old-analysis",
         thread_id=None,
@@ -2971,6 +3125,7 @@ def test_expired_notification_intent_is_removed_before_cli_delivery(
         sender_name="Trusted",
         subject="Action needed",
         received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     store.mark_analyzed(
         "old-analysis",
@@ -2984,6 +3139,7 @@ def test_expired_notification_intent_is_removed_before_cli_delivery(
             "deadline_iso": None,
             "confidence": 0.9,
         },
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -3027,8 +3183,12 @@ def test_deferred_fallback_ack_preserves_eventual_analysis_intent(
 
     first = watcher.check(deliver_notifications=False)
     assert first["fallback_notified"] == 0
-    assert store.notification_intents()[0].kind == "fallback"
-    assert store.acknowledge_notification(message_id="allowed", kind="fallback") == "acknowledged"
+    intent = store.notification_intents()[0]
+    assert intent.kind == "fallback"
+    assert (
+        store.acknowledge_notification(message_id=intent.message_id, kind="fallback")
+        == "acknowledged"
+    )
 
     _make_retries_due(store)
     second = watcher.check(deliver_notifications=False)
@@ -3048,3 +3208,297 @@ def test_deferred_delivery_completes_without_intent_when_notifications_disabled(
 
     assert store.recent(1)[0]["status"] == "summarized"
     assert store.notification_intents() == []
+
+
+def test_replacement_mailbox_fails_stale_pending_before_provider_fetch(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    old_identity = "a" * 64
+    new_identity = "b" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC),
+        mailbox_identity_key=old_identity,
+    )
+    assert store.add_message(
+        message_id="old-pending",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="provider-message",
+        mailbox_identity_key=old_identity,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Old source",
+        received_at=datetime.now(UTC).isoformat(),
+    )
+
+    class ReplacementGateway(FakeGmail):
+        def mailbox_identity_key(self) -> str:
+            return new_identity
+
+        def history_message_ids(self, cursor: str):
+            return [], "201"
+
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            pytest.fail("a stale pending source reached the replacement mailbox")
+
+    result = Watcher(cfg, store, ReplacementGateway(), FakeModel()).check()
+
+    assert result["summarized"] == 0
+    account = store.mail_account("gmail", "gmail-default")
+    assert account is not None
+    assert account.mailbox_identity_key == new_identity
+    with store.connection() as db:
+        row = db.execute(
+            """SELECT mailbox_identity_key, analysis_retryable, analysis_error_code
+            FROM messages WHERE message_id = 'old-pending'"""
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == (old_identity, 0, "mailbox_identity_unverified")
+
+
+def test_dry_run_identity_mismatch_is_read_only_and_stops_before_polling(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    old_identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 12, 12, tzinfo=UTC),
+        mailbox_identity_key=old_identity,
+    )
+
+    class MismatchedGateway(FakeGmail):
+        def mailbox_identity_key(self) -> str:
+            return "b" * 64
+
+        def history_message_ids(self, cursor: str):
+            pytest.fail("dry-run mismatch reached mailbox polling")
+
+    before_account = store.mail_account("gmail", "gmail-default")
+    before_state = store.state()
+    with pytest.raises(MailboxIdentityChanged):
+        Watcher(cfg, store, MismatchedGateway(), FakeModel()).check(dry_run=True)
+
+    assert store.mail_account("gmail", "gmail-default") == before_account
+    assert store.state() == before_state
+    assert store.recent(10) == []
+    assert store.automation_rules_snapshot() == (0, [])
+
+
+def test_mailbox_address_mismatch_stops_before_identity_key_reconciliation(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    old_identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+    )
+    store.set_state("100", mailbox_identity_key=old_identity)
+
+    class DifferentMailbox(FakeGmail):
+        def mailbox_address(self) -> str:
+            return "other@example.com"
+
+        def mailbox_identity_key(self) -> str:
+            pytest.fail("address mismatch reached identity-key reconciliation")
+
+    before_account = store.mail_account("gmail", "gmail-default")
+    before_state = store.state()
+    with pytest.raises(MailboxIdentityChanged, match="mailbox address changed"):
+        reconcile_mailbox_session_identity(
+            store,
+            MailboxSession("gmail", "gmail-default", DifferentMailbox()),
+            dry_run=False,
+        )
+
+    assert store.mail_account("gmail", "gmail-default") == before_account
+    assert store.state() == before_state
+
+
+def test_matching_mailbox_address_preserves_identity_verification(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        identity,
+        legacy_status="replacement",
+    )
+
+    class SameMailbox(FakeGmail):
+        def mailbox_address(self) -> str:
+            return "owner@example.com"
+
+        def mailbox_identity_key(self) -> str:
+            return identity
+
+    assert (
+        reconcile_mailbox_session_identity(
+            store,
+            MailboxSession("gmail", "gmail-default", SameMailbox()),
+            dry_run=True,
+        )
+        == identity
+    )
+
+
+def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped_rule(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = "imap-" + "c" * 32
+    store.register_mail_account(
+        "imap",
+        account_id,
+        display_name="IMAP",
+        address="trusted@example.com",
+        active=True,
+    )
+    credential_identity = "c" * 64
+
+    def identity_for(uid_validity: int) -> str:
+        value = f"imap-mailbox-v2\0{credential_identity}\0{uid_validity}".encode()
+        return hashlib.sha256(value).hexdigest()
+
+    old_identity = identity_for(44)
+    new_identity = identity_for(55)
+    old_cursor = f"eom-imap-v2:{credential_identity}:44:7"
+    new_cursor = f"eom-imap-v2:{credential_identity}:55:9"
+    store.reconcile_mailbox_identity(
+        "imap",
+        account_id,
+        old_identity,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    store.set_state(
+        old_cursor,
+        datetime.now(UTC) - timedelta(minutes=10),
+        provider="imap",
+        account_id=account_id,
+        mailbox_identity_key=old_identity,
+    )
+    store.put_automation_rule(
+        _scoped_invoice_rule("imap", account_id),
+        expected_account_identity=old_identity,
+    )
+
+    class ChangedEpochGateway(ImapGateway):
+        def __init__(self) -> None:
+            self.recovery_since: datetime | None = None
+
+        @contextmanager
+        def polling_session(self):
+            yield
+
+        def mailbox_epoch(self) -> tuple[str, int]:
+            return credential_identity, 55
+
+        def mailbox_identity_key(self) -> str:
+            return new_identity
+
+        def mailbox_address(self) -> str:
+            return "trusted@example.com"
+
+        def initial_cursor(self) -> str:
+            return new_cursor
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            assert cursor == old_cursor
+            raise StaleMailboxCursor("UIDVALIDITY changed")
+
+        def recover_since(
+            self,
+            addresses: frozenset[str],
+            since: datetime,
+        ) -> MailboxChanges:
+            self.recovery_since = since
+            return MailboxChanges(("new-epoch-message",), new_cursor)
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            return MessageMetadata(
+                message_id,
+                None,
+                "trusted@example.com",
+                "Trusted",
+                "Invoice",
+                datetime.now(UTC).isoformat(),
+                frozenset({"INBOX"}),
+            )
+
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            return MessageContent(
+                "invoice",
+                ("invoice.pdf",),
+                (
+                    AttachmentDescriptor(
+                        "2",
+                        "attachment-2",
+                        "invoice.pdf",
+                        "application/pdf",
+                        42,
+                        0,
+                    ),
+                ),
+            )
+
+    gateway = ChangedEpochGateway()
+    result = Watcher(
+        cfg,
+        store,
+        MailboxSession("imap", account_id, gateway),
+        FakeModel(),
+    ).check()
+
+    assert result["stale_cursor_recovered"] is True
+    assert result["summarized"] == 1
+    assert gateway.recovery_since is not None
+    assert store.state(provider="imap", account_id=account_id)[0] == new_cursor  # type: ignore[index]
+    message_id = scoped_message_id(
+        "imap",
+        account_id,
+        "new-epoch-message",
+        new_identity,
+    )
+    assert store.message_source(message_id).mailbox_identity_key == new_identity
+    assert store.automation_fires_for_message(message_id) == []

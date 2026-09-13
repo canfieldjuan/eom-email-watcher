@@ -71,6 +71,7 @@ class AttachmentDescriptor:
     media_type: str
     byte_size: int
     position: int
+    byte_size_known: bool = True
 
 
 def _decode(data: str) -> str:
@@ -103,14 +104,11 @@ def extract_body(
                     if isinstance(raw_attachment_id, str) and raw_attachment_id.strip()
                     else None
                 )
-                raw_size = body.get("size", 0)
-                byte_size = (
-                    raw_size
-                    if isinstance(raw_size, int)
-                    and not isinstance(raw_size, bool)
-                    and raw_size >= 0
-                    else 0
+                raw_size = body.get("size")
+                byte_size_known = (
+                    isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
                 )
+                byte_size = raw_size if byte_size_known else 0
                 attachments_by_part_id[part_id] = AttachmentDescriptor(
                     part_id=part_id,
                     attachment_id=attachment_id,
@@ -118,6 +116,7 @@ def extract_body(
                     media_type=str(part.get("mimeType", "")).casefold(),
                     byte_size=byte_size,
                     position=len(attachments_by_part_id),
+                    byte_size_known=byte_size_known,
                 )
             return
         mime_type = str(part.get("mimeType", "")).casefold()

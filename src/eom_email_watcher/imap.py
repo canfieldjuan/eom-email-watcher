@@ -283,6 +283,16 @@ def imap_cursor_mailbox_identity(cursor: str) -> str:
     return _decode_cursor(cursor)[0]
 
 
+def imap_cursor_epoch(cursor: str) -> tuple[str, int]:
+    """Return the credential identity and UIDVALIDITY captured by a saved cursor."""
+    decoded = (
+        _decode_recovery_cursor(cursor)
+        if cursor.startswith(RECOVERY_CURSOR_PREFIX)
+        else _decode_cursor(cursor)
+    )
+    return decoded[0], decoded[1]
+
+
 def _cursor(mailbox_id: str, uid_validity: int, last_uid: int) -> str:
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{last_uid}"
 
@@ -1359,6 +1369,22 @@ class ImapGateway:
                 yield
             finally:
                 self._active_client = None
+
+    def mailbox_epoch(self) -> tuple[str, int]:
+        if self._active_client is None:
+            raise ImapError(
+                "imap_protocol_error",
+                "Mail server identity requires an active polling session",
+            )
+        return self._mailbox_id, _selected_uid_validity(self._active_client)
+
+    def mailbox_identity_key(self) -> str:
+        mailbox_id, uid_validity = self.mailbox_epoch()
+        value = "\0".join(("imap-mailbox-v2", mailbox_id, str(uid_validity))).encode("utf-8")
+        return hashlib.sha256(value).hexdigest()
+
+    def mailbox_address(self) -> str:
+        return self.credentials.email_address
 
     @contextlib.contextmanager
     def _mailbox(self) -> Iterator[imaplib.IMAP4]:

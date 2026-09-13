@@ -17,6 +17,7 @@ from .db import (
     AutomationSourceChanged,
     AutomationWork,
     CalendarGrant,
+    MailboxIdentityChanged,
     NotificationIntent,
     PendingMessage,
     Store,
@@ -26,6 +27,7 @@ from .entitlement import (
     CONNECT_FEATURE_ID,
     feature_entitlements_active,
 )
+from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
     MailboxAccountUnavailable,
     MailboxError,
@@ -36,6 +38,8 @@ from .mailbox import (
     StaleMailboxCursor,
     default_mailbox_session,
     mailbox_polling_session,
+    mailbox_session_address,
+    mailbox_session_identity_key,
     scoped_message_id,
 )
 from .microsoft365 import (
@@ -82,6 +86,10 @@ from .scheduling import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class LegacyMailboxIdentityUnverified(MailboxError):
+    """Stale recovery cannot safely cross retained pre-identity markers."""
 
 
 def _acknowledge_gateway_result(
@@ -155,10 +163,7 @@ def _scheduling_proposal_authorization(
         return None
     if not feature_entitlements_active(CONNECT_FEATURE_ID, AUTOMATIONS_FEATURE_ID):
         return None
-    if (
-        expected_principal_key is not None
-        and authorization.principal.key != expected_principal_key
-    ):
+    if expected_principal_key is not None and authorization.principal.key != expected_principal_key:
         return None
     return SchedulingProposalAccess(authorization, proposal_grant)
 
@@ -383,6 +388,32 @@ def process_scheduling_automations(
                 continue
             try:
                 with mailbox_polling_session(mailbox.gateway):
+                    source_identity_key = mailbox_session_identity_key(mailbox)
+                    account = store.mail_account(run.provider, run.account_id)
+                    legacy_identity_matches = bool(
+                        account is not None
+                        and account.legacy_identity_status == "continuity_proven"
+                        and account.legacy_identity_key == source_identity_key
+                    )
+                    microsoft_run_witness = bool(
+                        run.provider == MICROSOFT365_PROVIDER
+                        and run.calendar_principal_key == source_identity_key
+                    )
+                    if (
+                        work.source_mailbox_identity_key != source_identity_key
+                        if work.source_mailbox_identity_key is not None
+                        else not (legacy_identity_matches or microsoft_run_witness)
+                    ):
+                        capacity_used += 1
+                        _transition_source_problem(
+                            store,
+                            work,
+                            next_state="source_unavailable",
+                            failure_code="mailbox_identity_unverified",
+                        )
+                        processed += 1
+                        review_required += 1
+                        continue
                     metadata = mailbox.gateway.metadata(work.provider_message_id)
                     if (
                         metadata.message_id != work.provider_message_id
@@ -544,8 +575,7 @@ def _proposal_request_sha256(
     document = {
         "attendees": list(attendees),
         "candidates": [
-            {"start": item.start, "end": item.end, "timezone": item.timezone}
-            for item in candidates
+            {"start": item.start, "end": item.end, "timezone": item.timezone} for item in candidates
         ],
         "minimum_attendee_percentage": 100,
         "version": 1,
@@ -593,10 +623,7 @@ def _proposal_candidates(
         starts = tuple(datetime.fromisoformat(candidate.start) for candidate in candidates)
     except (OverflowError, ValueError) as exc:
         raise ValueError("Calendar proposal time is invalid") from exc
-    if any(
-        start.tzinfo is None or start.astimezone(UTC) <= observed_at
-        for start in starts
-    ):
+    if any(start.tzinfo is None or start.astimezone(UTC) <= observed_at for start in starts):
         raise ValueError("Calendar proposal time has passed")
     return candidates
 
@@ -693,9 +720,7 @@ def process_scheduling_proposals(
                     work.run.run_id,
                     exc,
                 )
-                if _transition_proposal_to_review(
-                    store, work, observed_at=current_time()
-                ):
+                if _transition_proposal_to_review(store, work, observed_at=current_time()):
                     processed += 1
                     review_required += 1
                 continue
@@ -712,9 +737,7 @@ def process_scheduling_proposals(
                     work.run.run_id,
                     exc,
                 )
-                if _transition_proposal_to_review(
-                    store, work, observed_at=current_time()
-                ):
+                if _transition_proposal_to_review(store, work, observed_at=current_time()):
                     processed += 1
                     review_required += 1
                 continue
@@ -744,9 +767,7 @@ def process_scheduling_proposals(
                     work.run.run_id,
                     exc,
                 )
-                if _transition_proposal_to_review(
-                    store, work, observed_at=result_time
-                ):
+                if _transition_proposal_to_review(store, work, observed_at=result_time):
                     processed += 1
                     review_required += 1
                 continue
@@ -973,9 +994,7 @@ def decide_scheduling_proposal(
         raise KeyError(run_id)
     if current.provider != MICROSOFT365_PROVIDER:
         raise ValueError("Scheduling automation requires a Microsoft 365 account")
-    existing_write = (
-        store.automation_calendar_write(run_id) if decision == "confirm" else None
-    )
+    existing_write = store.automation_calendar_write(run_id) if decision == "confirm" else None
     decision_args = {
         "proposal_version": proposal_version,
         "proposal_sha256": proposal_sha256,
@@ -1067,6 +1086,54 @@ def _deliver_automation_review_intent(
         return False
 
 
+def reconcile_mailbox_session_identity(
+    store: Store,
+    mailbox: MailboxSession,
+    *,
+    dry_run: bool,
+) -> str:
+    """Verify or atomically reconcile the identity of an open mailbox session."""
+    account = store.mail_account(mailbox.provider, mailbox.account_id)
+    if account is None:
+        raise MailboxAccountUnavailable("The selected email account is not configured")
+    authenticated_address = mailbox_session_address(mailbox)
+    if authenticated_address is not None and authenticated_address != account.address:
+        raise MailboxIdentityChanged("mailbox address changed")
+    mailbox_identity_key = mailbox_session_identity_key(mailbox)
+    if dry_run:
+        store.require_mailbox_identity(
+            mailbox.provider,
+            mailbox.account_id,
+            mailbox_identity_key,
+        )
+        return mailbox_identity_key
+
+    state = store.state(provider=mailbox.provider, account_id=mailbox.account_id)
+    legacy_status: str | None = None
+    if account.mailbox_identity_key is None:
+        legacy_status = "unresolved"
+        if (
+            mailbox.provider == IMAP_PROVIDER
+            and isinstance(mailbox.gateway, ImapGateway)
+            and state is not None
+        ):
+            try:
+                legacy_epoch = imap_cursor_epoch(state[0])
+            except MailboxError:
+                legacy_epoch = None
+            if legacy_epoch == mailbox.gateway.mailbox_epoch():
+                legacy_status = "continuity_proven"
+    preserve_cursor = account.mailbox_identity_key is None or mailbox.provider == IMAP_PROVIDER
+    store.reconcile_mailbox_identity(
+        mailbox.provider,
+        mailbox.account_id,
+        mailbox_identity_key,
+        legacy_status=legacy_status,
+        preserve_cursor=preserve_cursor,
+    )
+    return mailbox_identity_key
+
+
 class Watcher:
     def __init__(
         self,
@@ -1085,12 +1152,22 @@ class Watcher:
         self.sender_names = {sender.email: sender.name for sender in config.senders}
 
     def bootstrap(self) -> str:
-        cursor = self.gateway.initial_cursor()
-        self.store.set_state(
-            cursor,
-            provider=self.mailbox.provider,
-            account_id=self.mailbox.account_id,
-        )
+        with mailbox_polling_session(self.gateway):
+            mailbox_identity_key = mailbox_session_identity_key(self.mailbox)
+            self.store.reconcile_mailbox_identity(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                legacy_status="replacement",
+                preserve_cursor=self.mailbox.provider == IMAP_PROVIDER,
+            )
+            cursor = self.gateway.initial_cursor()
+            self.store.set_state(
+                cursor,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
         return cursor
 
     @staticmethod
@@ -1111,12 +1188,38 @@ class Watcher:
         if not self.config.senders:
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
+            mailbox_identity_key = reconcile_mailbox_session_identity(
+                self.store,
+                self.mailbox,
+                dry_run=dry_run,
+            )
+            if (
+                not dry_run
+                and self.store.state(
+                    provider=self.mailbox.provider,
+                    account_id=self.mailbox.account_id,
+                )
+                is None
+            ):
+                self.store.set_state(
+                    self.gateway.initial_cursor(),
+                    provider=self.mailbox.provider,
+                    account_id=self.mailbox.account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                )
             return self._check_active(
                 dry_run=dry_run,
                 deliver_notifications=deliver_notifications,
+                mailbox_identity_key=mailbox_identity_key,
             )
 
-    def _check_active(self, *, dry_run: bool, deliver_notifications: bool) -> dict[str, int | bool]:
+    def _check_active(
+        self,
+        *,
+        dry_run: bool,
+        deliver_notifications: bool,
+        mailbox_identity_key: str,
+    ) -> dict[str, int | bool]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
@@ -1130,7 +1233,24 @@ class Watcher:
         recovered = False
         try:
             changes = self.gateway.changes_since(cursor)
-        except StaleMailboxCursor:
+        except StaleMailboxCursor as exc:
+            account = self.store.mail_account(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+            )
+            if (
+                account is not None
+                and account.legacy_identity_status == "unresolved"
+                and self.store.has_unexpired_legacy_mailbox_markers(
+                    self.mailbox.provider,
+                    self.mailbox.account_id,
+                    retention_cutoff=retention_cutoff,
+                    now=checked_at,
+                )
+            ):
+                raise LegacyMailboxIdentityUnverified(
+                    "Stale recovery is blocked by unresolved legacy mailbox identity markers"
+                ) from exc
             recovered = True
             since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
             since = max(since, retention_cutoff)
@@ -1143,6 +1263,7 @@ class Watcher:
                 provider_message_id,
                 provider=self.mailbox.provider,
                 account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
             ):
                 continue
             try:
@@ -1177,6 +1298,7 @@ class Watcher:
                     self.mailbox.provider,
                     self.mailbox.account_id,
                     metadata.message_id,
+                    mailbox_identity_key,
                 ),
                 "provider": self.mailbox.provider,
                 "account_id": self.mailbox.account_id,
@@ -1186,6 +1308,7 @@ class Watcher:
                 "sender_name": metadata.sender_name or self.sender_names.get(metadata.sender),
                 "subject": metadata.subject,
                 "received_at": received_at.isoformat(),
+                "mailbox_identity_key": mailbox_identity_key,
             }
             if dry_run:
                 dry_run_messages.append(
@@ -1207,6 +1330,7 @@ class Watcher:
                 changes.cursor,
                 provider=self.mailbox.provider,
                 account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
             )
         summarized, fallback = self._process_pending(
             dry_run=dry_run,
@@ -1214,6 +1338,7 @@ class Watcher:
             extra=dry_run_messages,
             retention_cutoff=retention_cutoff,
             retention_observed_at=checked_at,
+            mailbox_identity_key=mailbox_identity_key,
         )
         if not dry_run:
             purged += self.store.purge(self.config.retention_days, now=checked_at)
@@ -1315,6 +1440,7 @@ class Watcher:
         extra: list[PendingMessage] | None = None,
         retention_cutoff: datetime,
         retention_observed_at: datetime,
+        mailbox_identity_key: str,
     ) -> tuple[int, int]:
         summarized = 0
         fallback = 0
@@ -1346,6 +1472,19 @@ class Watcher:
             if received_at is None or received_at < retention_cutoff:
                 continue
             try:
+                if (
+                    message.mailbox_identity_key is None
+                    or message.mailbox_identity_key != mailbox_identity_key
+                ):
+                    if not dry_run:
+                        self.store.record_analysis_failure(
+                            message.message_id,
+                            "Message mailbox identity could not be verified",
+                            message.attempts,
+                            retryable=False,
+                            error_code="mailbox_identity_unverified",
+                        )
+                    continue
                 if dry_run:
                     request_id = None
                     body_char_limit = self.config.body_char_limit
@@ -1379,6 +1518,7 @@ class Watcher:
                     self.store.mark_analyzed(
                         message.message_id,
                         analysis.model_dump(),
+                        mailbox_identity_key=mailbox_identity_key,
                         scheduling_automation_principal_key=scheduling_principal_key,
                     )
                     assert request_id is not None

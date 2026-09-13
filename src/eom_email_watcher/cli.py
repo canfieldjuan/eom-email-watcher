@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .config import DEFAULT_CONFIG, ConfigError
+from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .db import Store
 from .locking import operation_lock
 from .mailbox import MailboxError
@@ -178,7 +178,7 @@ def _setup(config_path: Path) -> int:
 
 
 def _check(config_path: Path, dry_run: bool) -> int:
-    config, store, model = _runtime(config_path)
+    config = load_config(config_path)
 
     def run(active_config, active_store, active_model):
         return run_watcher_check(
@@ -188,11 +188,8 @@ def _check(config_path: Path, dry_run: bool) -> int:
             dry_run=dry_run,
         )
 
-    if dry_run:
-        result = run(config, store, model)
-    else:
-        with _production_check_lock(config.database_file):
-            result = run(*_runtime(config_path))
+    with _production_check_lock(config.database_file):
+        result = run(*_runtime(config_path))
     print(json.dumps(result, indent=2))
     return 0
 

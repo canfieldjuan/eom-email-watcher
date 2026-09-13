@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -334,6 +335,7 @@ class Microsoft365Gateway:
         access_token: str,
         email_address: str,
         client: httpx.Client | None = None,
+        mailbox_identity_key: str | None = None,
     ):
         # These clients log full URLs at INFO/DEBUG; Graph cursor URLs contain opaque
         # mailbox tokens. Scope suppression to processes that actually open Graph.
@@ -341,10 +343,41 @@ class Microsoft365Gateway:
         logging.getLogger("httpcore").setLevel(logging.WARNING)
         self._access_token = access_token
         self._email_address = email_address
+        self._mailbox_identity_key = mailbox_identity_key
         self._client = client or httpx.Client(
             timeout=GRAPH_TIMEOUT_SECONDS,
             follow_redirects=False,
         )
+
+    @staticmethod
+    def _principal_identity(account: object) -> str:
+        if not isinstance(account, dict):
+            raise MicrosoftAuthorizationRejected(
+                "Microsoft authorization did not identify one immutable principal"
+            )
+        home_account_id = account.get("home_account_id")
+        object_id = account.get("local_account_id")
+        if (
+            not isinstance(home_account_id, str)
+            or not home_account_id
+            or not isinstance(object_id, str)
+            or not object_id
+        ):
+            raise MicrosoftAuthorizationRejected(
+                "Microsoft authorization did not identify one immutable principal"
+            )
+        value = "\0".join(("msal-principal-v2", home_account_id, object_id.casefold())).encode(
+            "utf-8"
+        )
+        return hashlib.sha256(value).hexdigest()
+
+    def mailbox_identity_key(self) -> str:
+        if self._mailbox_identity_key is None:
+            raise MicrosoftAuthorizationRejected("Microsoft mailbox identity is unavailable")
+        return self._mailbox_identity_key
+
+    def mailbox_address(self) -> str:
+        return self._email_address
 
     @classmethod
     def from_token(
@@ -386,7 +419,12 @@ class Microsoft365Gateway:
                     _write_private_cache(token_file, cache)
         except FileLockTimeout as exc:
             raise Microsoft365Error("Microsoft authorization cache is busy; retry") from exc
-        return cls(str(result["access_token"]), email_address, client)
+        return cls(
+            str(result["access_token"]),
+            email_address,
+            client,
+            cls._principal_identity(accounts[0]),
+        )
 
     @classmethod
     def authorize_with_status(
@@ -428,7 +466,15 @@ class Microsoft365Gateway:
                 _write_private_cache(token_file, cache)
         except FileLockTimeout as exc:
             raise Microsoft365Error("Microsoft authorization cache is busy; retry") from exc
-        return cls(str(result["access_token"]), email_address, client), True
+        return (
+            cls(
+                str(result["access_token"]),
+                email_address,
+                client,
+                cls._principal_identity(accounts[0]),
+            ),
+            True,
+        )
 
     def profile(self) -> Microsoft365Profile:
         return Microsoft365Profile(email_address=self._email_address)
@@ -584,14 +630,11 @@ class Microsoft365Gateway:
                 filename = item.get("name")
                 if not isinstance(filename, str) or not filename.strip():
                     continue
-                raw_size = item.get("size", 0)
-                byte_size = (
-                    raw_size
-                    if isinstance(raw_size, int)
-                    and not isinstance(raw_size, bool)
-                    and raw_size >= 0
-                    else 0
+                raw_size = item.get("size")
+                byte_size_known = (
+                    isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
                 )
+                byte_size = raw_size if byte_size_known else 0
                 descriptors.append(
                     AttachmentDescriptor(
                         part_id=attachment_id,
@@ -600,6 +643,7 @@ class Microsoft365Gateway:
                         media_type=str(item.get("contentType", "")).casefold(),
                         byte_size=byte_size,
                         position=len(descriptors),
+                        byte_size_known=byte_size_known,
                     )
                 )
             next_link = document.get("@odata.nextLink")

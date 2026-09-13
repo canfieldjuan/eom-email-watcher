@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
+from eom_email_watcher.db import Store
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
@@ -28,6 +30,7 @@ from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
     MailboxChanges,
+    MailboxSession,
     MessageContent,
     scoped_message_id,
 )
@@ -55,6 +58,53 @@ from eom_email_watcher.runtime import (
 
 IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
 REPLACEMENT_IMAP_CURSOR = f"eom-imap-v2:{'b' * 64}:55:99"
+
+
+def _test_mailbox_identity(provider: str, account_id: str) -> str:
+    return hashlib.sha256(f"test-mailbox\0{provider}\0{account_id}".encode()).hexdigest()
+
+
+def _bind_test_mailbox(store: Store, provider: str, account_id: str) -> str:
+    account = store.mail_account(provider, account_id)
+    if account is None:
+        account = store.register_mail_account(
+            provider,
+            account_id,
+            display_name=provider,
+            address="owner@example.com",
+        )
+    identity_key = account.mailbox_identity_key or _test_mailbox_identity(provider, account_id)
+    if account.mailbox_identity_key is None:
+        store.reconcile_mailbox_identity(
+            provider,
+            account_id,
+            identity_key,
+            legacy_status="replacement",
+            preserve_cursor=True,
+        )
+    return identity_key
+
+
+def _add_test_message(store: Store, **values: object) -> bool:
+    provider = str(values.get("provider", DEFAULT_MAIL_PROVIDER))
+    account_id = str(values.get("account_id", DEFAULT_MAIL_ACCOUNT_ID))
+    values.setdefault(
+        "mailbox_identity_key",
+        _bind_test_mailbox(store, provider, account_id),
+    )
+    return store.add_message(**values)  # type: ignore[arg-type]
+
+
+def _mark_test_analyzed(
+    store: Store,
+    message_id: str,
+    result: dict[str, object],
+    **values: object,
+) -> None:
+    source = store.message_source(message_id)
+    assert source.mailbox_identity_key is not None
+    values.setdefault("mailbox_identity_key", source.mailbox_identity_key)
+    store.mark_analyzed(message_id, result, **values)  # type: ignore[arg-type]
 
 
 def write_config(
@@ -176,7 +226,8 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert health["data"]["production_check_supported"] is True
 
     runtime = load_runtime(config_path)
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="m1",
         thread_id=None,
         sender="a@example.com",
@@ -198,7 +249,8 @@ def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
     write_config(config_path)
     runtime = load_runtime(config_path)
     for message_id in ("message-1", "message-2"):
-        runtime.store.add_message(
+        _add_test_message(
+            runtime.store,
             message_id=message_id,
             thread_id=None,
             sender="billing@example.com",
@@ -206,7 +258,8 @@ def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
             subject="Invoice status",
             received_at="2026-08-31T12:00:00+00:00",
         )
-    runtime.store.mark_analyzed(
+    _mark_test_analyzed(
+        runtime.store,
         "message-2",
         {
             "category": "invoice",
@@ -289,9 +342,7 @@ def test_inbox_exposes_calendar_proposal_only_with_automation_entitlement(
     response = engine_api._response(request(config_path, operation, {"limit": 25}))
 
     assert response["ok"] is True
-    assert response["data"]["items"][0]["calendar_proposal"] == (
-        proposal if entitled else None
-    )
+    assert response["data"]["items"][0]["calendar_proposal"] == (proposal if entitled else None)
 
 
 @pytest.mark.parametrize("operation", ["inbox.query", "inbox.recent"])
@@ -409,9 +460,7 @@ def test_calendar_proposal_decision_rejects_cross_message_run_binding(
     monkeypatch.setattr(
         runtime.store,
         "automation_run_for_message",
-        lambda message_id: SimpleNamespace(
-            run_id="11111111-1111-4111-8111-111111111111"
-        ),
+        lambda message_id: SimpleNamespace(run_id="11111111-1111-4111-8111-111111111111"),
     )
     monkeypatch.setattr(
         engine_api,
@@ -517,7 +566,8 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
     runtime = load_runtime(config_path)
     runtime.store.set_state("100", datetime.now(UTC))
     for message_id in ("message-1", "message-2"):
-        runtime.store.add_message(
+        _add_test_message(
+            runtime.store,
             message_id=message_id,
             thread_id=None,
             sender="billing@example.com",
@@ -1362,9 +1412,7 @@ def test_calendar_connect_handles_grantless_legacy_automation_run(
     )
     identity = microsoft_principal()
     legacy_key = hashlib.sha256(
-        "\0".join(
-            (identity.home_account_id, identity.tenant_id, identity.object_id)
-        ).encode()
+        "\0".join((identity.home_account_id, identity.tenant_id, identity.object_id)).encode()
     ).hexdigest()
     selected_principal = MicrosoftPrincipal(
         home_account_id=identity.home_account_id,
@@ -1384,7 +1432,8 @@ def test_calendar_connect_handles_grantless_legacy_automation_run(
         email_address=selected_principal.email_address,
     )
     message_id = scoped_message_id("microsoft365", account.account_id, "schedule-upgrade")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id=message_id,
         provider="microsoft365",
         account_id=account.account_id,
@@ -1395,7 +1444,8 @@ def test_calendar_connect_handles_grantless_legacy_automation_run(
         subject="Can we meet?",
         received_at="2026-09-07T12:00:00+00:00",
     )
-    runtime.store.mark_analyzed(
+    _mark_test_analyzed(
+        runtime.store,
         message_id,
         {
             "category": "scheduling",
@@ -3220,7 +3270,8 @@ def test_mail_account_disconnect_preserves_history_and_send_authorization(
     runtime.config.gmail_token_file.write_text("readonly token", encoding="utf-8")
     runtime.config.gmail_send_token_file.write_text("send token", encoding="utf-8")
     runtime.store.set_state("preserved-cursor", datetime(2026, 9, 1, tzinfo=UTC))
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="retained",
         thread_id=None,
         sender="owner@example.com",
@@ -3457,7 +3508,8 @@ def test_mail_account_connect_keeps_unidentified_legacy_history_separate(
     write_config(config_path)
     runtime = load_runtime(config_path)
     runtime.store.set_state("legacy-cursor", datetime(2026, 8, 1, tzinfo=UTC))
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="legacy-message",
         thread_id=None,
         sender="legacy@example.com",
@@ -3627,7 +3679,8 @@ def test_settings_update_applies_shortened_retention_immediately(
         ("expired", datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)),
         ("current", datetime.now(UTC).replace(microsecond=0)),
     ):
-        runtime.store.add_message(
+        _add_test_message(
+            runtime.store,
             message_id=message_id,
             thread_id=None,
             sender="billing@example.com",
@@ -3654,6 +3707,9 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
     expired_at = (datetime.now(UTC) - timedelta(days=2)).isoformat()
 
     class ExpiredGmail:
+        def mailbox_identity_key(self) -> str:
+            return _test_mailbox_identity("gmail", "gmail-default")
+
         def history_message_ids(self, cursor: str):
             return ["expired"], "200"
 
@@ -3677,21 +3733,23 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
 
     real_load_runtime = engine_api.load_runtime
     load_count = 0
+    lock_entered = False
 
-    def load_runtime_with_stale_first(path: Path) -> Runtime:
+    def load_runtime_after_lock(path: Path) -> Runtime:
         nonlocal load_count
+        assert lock_entered is True
         load_count += 1
-        if load_count == 1:
-            return stale_runtime
         return real_load_runtime(path)
 
     @contextmanager
     def shorten_retention_before_lock_entry(lock_path: Path, busy_message: str):
+        nonlocal lock_entered
         engine_api.update_settings(config_path, {"retention_days": 1})
         stale_runtime.store.purge(1)
+        lock_entered = True
         yield
 
-    monkeypatch.setattr(engine_api, "load_runtime", load_runtime_with_stale_first)
+    monkeypatch.setattr(engine_api, "load_runtime", load_runtime_after_lock)
     monkeypatch.setattr(engine_api, "operation_lock", shorten_retention_before_lock_entry)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiredGmail())
 
@@ -3699,7 +3757,7 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
 
     assert response["ok"] is True
     assert response["data"]["discovered"] == 0
-    assert load_count == 2
+    assert load_count == 1
     assert load_config(config_path).retention_days == 1
     assert stale_runtime.store.recent(10) == []
 
@@ -3714,7 +3772,8 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
     config_path = tmp_path / "config.toml"
     write_config(config_path, extra_settings="retention_days = 1")
     runtime = load_runtime(config_path)
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="expired",
         thread_id=None,
         sender="a@example.com",
@@ -3722,7 +3781,8 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
         subject="Expired message",
         received_at=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
     )
-    runtime.store.mark_analyzed(
+    _mark_test_analyzed(
+        runtime.store,
         "expired",
         {
             "category": "customer_request",
@@ -3891,7 +3951,8 @@ def test_permanent_analysis_failure_is_visible_and_explicitly_requeueable(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="m1",
         thread_id=None,
         sender="a@example.com",
@@ -3979,7 +4040,8 @@ def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     active_token.parent.mkdir(parents=True)
     active_token.write_text("active token", encoding="utf-8")
     local_message_id = scoped_message_id("gmail", "gmail-default", "provider-message")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id=local_message_id,
         provider="gmail",
         account_id="gmail-default",
@@ -4064,6 +4126,13 @@ def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
         address="owner@example.com",
         active=True,
     )
+    mailbox_identity_key = "a" * 64
+    runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        mailbox_identity_key,
+        legacy_status="replacement",
+    )
     credentials_file = mail_account_token_file(runtime.config, account)
     credentials_file.parent.mkdir(parents=True)
     credentials_file.write_text("private credentials", encoding="utf-8")
@@ -4078,14 +4147,11 @@ def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
         sender_name=None,
         subject="Attachment",
         received_at="2026-09-12T14:00:00+00:00",
+        mailbox_identity_key=mailbox_identity_key,
     )
     runtime.store.replace_attachments(
         local_message_id,
-        (
-            AttachmentDescriptor(
-                "mime-0", None, "invoice.pdf", "application/pdf", 198, 0
-            ),
-        ),
+        (AttachmentDescriptor("mime-0", None, "invoice.pdf", "application/pdf", 198, 0),),
     )
     destination = tmp_path / "exports"
     destination.mkdir()
@@ -4132,7 +4198,8 @@ def test_attachment_export_rejects_an_unconfigured_account_before_provider_acces
     write_config(config_path)
     runtime = load_runtime(config_path)
     local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id=local_message_id,
         provider="microsoft365",
         account_id="account-2",
@@ -4211,7 +4278,8 @@ def test_connect_paths_reject_an_unconfigured_account_before_provider_interactio
     write_config(config_path)
     runtime = load_runtime(config_path)
     local_message_id = scoped_message_id("microsoft365", "account-2", "provider-message")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id=local_message_id,
         provider="microsoft365",
         account_id="account-2",
@@ -4299,7 +4367,8 @@ def test_attachment_export_reports_provider_neutral_byte_count_mismatch(
     write_config(config_path)
     runtime = load_runtime(config_path)
     runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="m1",
         thread_id=None,
         sender="a@example.com",
@@ -4397,7 +4466,8 @@ def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
     config_path = tmp_path / "config.toml"
     write_config(config_path, include_senders=False)
     runtime = load_runtime(config_path)
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="queued",
         thread_id=None,
         sender="former@example.com",
@@ -4405,7 +4475,7 @@ def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
         subject="Queued before removal",
         received_at="2026-07-18T14:00:00+00:00",
     )
-    runtime.store.mark_analyzed("queued", FakeModel().analyze().model_dump())
+    _mark_test_analyzed(runtime.store, "queued", FakeModel().analyze().model_dump())
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
@@ -4462,6 +4532,9 @@ def test_zero_sender_check_still_rejects_incompatible_host_delivery(
 
 
 class FakeGmail:
+    def mailbox_identity_key(self) -> str:
+        return _test_mailbox_identity("gmail", "gmail-default")
+
     def history_message_ids(self, cursor: str):
         return ["m1"], "200"
 
@@ -4535,7 +4608,7 @@ def test_check_defers_delivery_until_state_checked_ack(
         request(
             config_path,
             "notifications.ack",
-            {"message_id": "m1", "kind": "analysis", "analysis_at": "stale"},
+            {"message_id": intent["message_id"], "kind": "analysis", "analysis_at": "stale"},
         )
     )
     assert stale["error"]["code"] == "stale_notification"
@@ -4569,6 +4642,130 @@ def test_check_defers_delivery_until_state_checked_ack(
     assert duplicate["data"]["status"] == "already_acknowledged"
 
 
+def test_check_maps_unresolved_legacy_recovery_to_retryable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            engine_api.LegacyMailboxIdentityUnverified("legacy identity remains unresolved")
+        ),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["error"] == {
+        "code": "legacy_mailbox_identity_unverified",
+        "message": "legacy identity remains unresolved",
+        "retryable": True,
+    }
+
+
+def test_check_maps_mailbox_identity_change_to_domain_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            engine_api.MailboxIdentityChanged("mailbox identity changed")
+        ),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
+
+    assert response["error"] == {
+        "code": "mailbox_identity_changed",
+        "message": "mailbox identity changed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("sender", "expected_messages", "expected_fires"),
+    [
+        ("a@example.com", 1, 1),
+        ("not-allowed@example.com", 0, 0),
+    ],
+)
+def test_rule_put_then_real_watcher_check_creates_only_durable_connect_fire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sender: str,
+    expected_messages: int,
+    expected_fires: int,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    loaded = load_runtime(config_path)
+    loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+
+    class InvoiceGmail(FakeGmail):
+        def metadata(self, message_id: str) -> MessageMetadata:
+            return MessageMetadata(
+                message_id,
+                None,
+                sender,
+                "Invoice Sender",
+                "Invoice attached",
+                "2026-07-18T14:00:00+00:00",
+                frozenset({"INBOX"}),
+            )
+
+        def full_payload(self, message_id: str) -> dict[str, object]:
+            return {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "application/pdf",
+                        "partId": "2",
+                        "filename": "invoice.pdf",
+                        "body": {"attachmentId": "attachment-2", "size": 42},
+                    }
+                ],
+            }
+
+    def unexpected_connect_job(*args: object, **kwargs: object) -> None:
+        pytest.fail("analysis-time rule evaluation must not create or submit a Connect job")
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: InvoiceGmail())
+    monkeypatch.setattr(runtime.store, "create_connect_job", unexpected_connect_job)
+
+    created = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {"definition": _automation_definition()},
+        )
+    )
+    checked = engine_api._response(request(config_path, "watcher.check"))
+
+    assert created["ok"] is True
+    assert checked["ok"] is True
+    assert checked["data"]["summarized"] == expected_messages
+    with loaded.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == expected_messages
+        assert db.execute("SELECT COUNT(*) FROM automation_fires").fetchone()[0] == expected_fires
+        assert (
+            db.execute("SELECT COUNT(*) FROM automation_fire_attempts").fetchone()[0]
+            == expected_fires
+        )
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
+
+
 def test_host_notification_contract_delivers_and_state_checks_automation_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4584,7 +4781,8 @@ def test_host_notification_contract_delivers_and_state_checks_automation_review(
         active=False,
     )
     message_id = scoped_message_id("microsoft365", account_id, "schedule-1")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id=message_id,
         provider="microsoft365",
         account_id=account_id,
@@ -4595,7 +4793,8 @@ def test_host_notification_contract_delivers_and_state_checks_automation_review(
         subject="Meeting request",
         received_at=datetime.now(UTC).isoformat(),
     )
-    runtime.store.mark_analyzed(
+    _mark_test_analyzed(
+        runtime.store,
         message_id,
         {
             "category": "scheduling",
@@ -4674,7 +4873,8 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
     loaded = load_runtime(config_path)
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
-    loaded.store.add_message(
+    _add_test_message(
+        loaded.store,
         message_id="queued",
         thread_id=None,
         sender="a@example.com",
@@ -4770,7 +4970,8 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
     write_config(config_path, notifications_enabled=False)
     runtime = load_runtime(config_path)
     runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="m1",
         thread_id=None,
         sender="a@example.com",
@@ -4779,7 +4980,8 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
         received_at="2026-07-18T14:00:00+00:00",
     )
     runtime.store.record_failure("m1", "local model unavailable", 0)
-    runtime.store.add_message(
+    _add_test_message(
+        runtime.store,
         message_id="m2",
         thread_id=None,
         sender="a@example.com",
@@ -4787,7 +4989,8 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
         subject="Analyzed action",
         received_at="2026-07-18T15:00:00+00:00",
     )
-    runtime.store.mark_analyzed(
+    _mark_test_analyzed(
+        runtime.store,
         "m2",
         {
             "category": "customer_request",
@@ -4823,6 +5026,7 @@ def test_check_reports_complete_notification_backlog(
     loaded = load_runtime(config_path)
     loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    _bind_test_mailbox(loaded.store, "gmail", "gmail-default")
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -4996,7 +5200,7 @@ def test_main_converts_bounded_json_parse_failures_to_one_error(
 ) -> None:
     decode = json.loads
 
-    def fail_parse(raw: bytes):
+    def fail_parse(raw: bytes, **kwargs: object):
         raise parse_error
 
     monkeypatch.setattr(engine_api.json, "loads", fail_parse)
@@ -5014,3 +5218,431 @@ def test_main_converts_bounded_json_parse_failures_to_one_error(
         "operation": None,
         "protocol": 1,
     }
+
+
+def _automation_definition() -> dict[str, object]:
+    return {
+        "name": "Invoice PDFs",
+        "scope": {},
+        "trigger": {"source_kind": "mail.message"},
+        "conditions": [
+            {
+                "field": "attachment.media_type",
+                "op": "equals",
+                "value": "application/pdf",
+            }
+        ],
+        "action": {
+            "kind": "connect.invoke",
+            "capability": {"id": "invoice.extract", "version": "1.0"},
+            "provider": {
+                "app_id": "invoice-processor",
+                "version": "1.0.0",
+                "instance_id": "11111111-1111-4111-8111-111111111111",
+            },
+            "parameters": {},
+        },
+        "confirm_each": False,
+    }
+
+
+def test_automation_rule_operations_expose_one_cas_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    created = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {"definition": _automation_definition()},
+        )
+    )
+    assert created["ok"] is True
+    summary = created["data"]["rule"]["summary"]
+    assert summary["version"] == 1
+    assert summary["enabled"] is True
+    assert summary["system"] is False
+    assert summary["valid"] is True
+
+    listed = engine_api._response(request(config_path, "automation.rules.list"))
+    assert listed["data"] == {"revision": 1, "rules": [summary]}
+    rule_id = summary["rule_id"]
+    fetched = engine_api._response(
+        request(config_path, "automation.rules.get", {"rule_id": rule_id})
+    )
+    canonical_definition = _automation_definition()
+    canonical_definition["scope"] = {"account_id": None, "provider": None}
+    assert fetched["data"]["rule"]["definition"] == canonical_definition
+
+    disabled = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.set_enabled",
+            {"rule_id": rule_id, "expected_version": 1, "enabled": False},
+        )
+    )
+    assert disabled["data"]["rule"]["summary"]["version"] == 2
+    no_op = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.set_enabled",
+            {"rule_id": rule_id, "expected_version": 2, "enabled": False},
+        )
+    )
+    assert no_op["data"] == disabled["data"]
+    stale = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.set_enabled",
+            {"rule_id": rule_id, "expected_version": 1, "enabled": False},
+        )
+    )
+    assert stale["error"]["code"] == "stale_rule"
+
+    deleted = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.delete",
+            {"rule_id": rule_id, "expected_version": 2},
+        )
+    )
+    assert deleted["data"] == {"rule_id": rule_id, "version": 3, "deleted": True}
+    missing = engine_api._response(
+        request(config_path, "automation.rules.get", {"rule_id": rule_id})
+    )
+    assert missing["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize("expected_version", [True, 0, -1, 2**63, "1", None])
+def test_automation_rule_mutation_rejects_non_strict_versions(
+    tmp_path: Path,
+    expected_version: object,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    response = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.delete",
+            {
+                "rule_id": "11111111-1111-4111-8111-111111111111",
+                "expected_version": expected_version,
+            },
+        )
+    )
+    assert response["error"]["code"] == "invalid_request"
+
+
+def test_automation_rule_lock_contention_is_retryable_mailbox_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+
+    @contextmanager
+    def busy_lock(path: Path, busy_message: str):
+        raise engine_api.OperationLockBusy(busy_message)
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", busy_lock)
+    response = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {"definition": _automation_definition()},
+        )
+    )
+    assert response["error"] == {
+        "code": "mailbox_busy",
+        "message": "Another mailbox operation is already running",
+        "retryable": True,
+    }
+
+
+def test_automation_rule_mutation_rejects_unsupported_lock_before_runtime_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: False)
+    monkeypatch.setattr(
+        engine_api,
+        "load_runtime",
+        lambda path: pytest.fail("unsupported locking reached Store construction"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {"definition": _automation_definition()},
+        )
+    )
+
+    assert response["error"]["code"] == "unsupported_platform"
+
+
+def test_automation_rule_put_rejects_oversized_canonical_bytes_before_runtime_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    definition = _automation_definition()
+    definition["scope"] = {"provider": "gmail", "account_id": "gmail-default"}
+    definition["action"]["parameters"] = {
+        **{f"k{index}": "x" * 1000 for index in range(1, 16)},
+        "k0": "x" * 816,
+    }
+    monkeypatch.setattr(
+        engine_api,
+        "load_runtime",
+        lambda path: pytest.fail("oversized rule reached runtime construction"),
+    )
+
+    response = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+
+    assert response["error"]["code"] == "invalid_rule"
+    assert "16384 bytes" in response["error"]["message"]
+
+
+def test_account_scoped_rule_create_rejects_limit_before_mailbox_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    for _index in range(MAX_AUTOMATION_RULES):
+        runtime.store.put_automation_rule(_automation_definition())
+    definition = _automation_definition()
+    definition["scope"] = {
+        "provider": DEFAULT_MAIL_PROVIDER,
+        "account_id": DEFAULT_MAIL_ACCOUNT_ID,
+    }
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("rule-limit rejection reached mailbox reconciliation"),
+    )
+
+    response = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+
+    assert response["error"]["code"] == "rule_limit"
+
+
+def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    definition = _automation_definition()
+    definition["scope"] = {"provider": "gmail", "account_id": "missing"}
+
+    unknown = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+    assert unknown["error"]["code"] == "invalid_rule"
+
+    definition["scope"] = {"provider": "gmail", "account_id": "gmail-default"}
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: (_ for _ in ()).throw(GmailError("token lock is busy")),
+    )
+    transient = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+    assert transient["error"] == {
+        "code": "mailbox_identity_unavailable",
+        "message": "Mailbox identity could not be verified; retry",
+        "retryable": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("edit_state", "expected_code"),
+    [
+        ("missing", "not_found"),
+        ("stale", "stale_rule"),
+        ("system", "system_rule_protected"),
+    ],
+)
+def test_account_scoped_rule_edit_rejects_before_mailbox_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit_state: str,
+    expected_code: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    mailbox_identity_key = _bind_test_mailbox(
+        runtime.store,
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+    )
+    definition = _automation_definition()
+    definition["scope"] = {
+        "provider": DEFAULT_MAIL_PROVIDER,
+        "account_id": DEFAULT_MAIL_ACCOUNT_ID,
+    }
+    expected_version = 1
+    if edit_state == "missing":
+        rule_id = "33333333-3333-4333-8333-333333333333"
+    else:
+        created = runtime.store.put_automation_rule(
+            definition,
+            expected_account_identity=mailbox_identity_key,
+        )
+        rule_id = created.summary.rule_id
+        if edit_state == "stale":
+            expected_version = 2
+        else:
+            with runtime.store.connection() as db:
+                db.execute("UPDATE automation_rules SET system = 1 WHERE rule_id = ?", (rule_id,))
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("rejected edit reached mailbox reconciliation"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {
+                "rule_id": rule_id,
+                "expected_version": expected_version,
+                "definition": definition,
+            },
+        )
+    )
+
+    assert response["error"]["code"] == expected_code
+
+
+def test_account_scoped_rule_verification_and_commit_share_operation_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    lock_held = False
+    mailbox_identity_key = "a" * 64
+
+    class ScopedGateway:
+        @contextmanager
+        def polling_session(self):
+            assert lock_held
+            yield
+
+        def mailbox_identity_key(self) -> str:
+            assert lock_held
+            return mailbox_identity_key
+
+    @contextmanager
+    def operation_lock(path: Path, busy_message: str):
+        nonlocal lock_held
+        assert not lock_held
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    original_put = runtime.store.put_automation_rule
+
+    def guarded_put(*args, **kwargs):
+        assert lock_held
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", operation_lock)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: MailboxSession(
+            DEFAULT_MAIL_PROVIDER,
+            DEFAULT_MAIL_ACCOUNT_ID,
+            ScopedGateway(),
+        ),
+    )
+    monkeypatch.setattr(runtime.store, "put_automation_rule", guarded_put)
+    definition = _automation_definition()
+    definition["scope"] = {
+        "provider": DEFAULT_MAIL_PROVIDER,
+        "account_id": DEFAULT_MAIL_ACCOUNT_ID,
+    }
+
+    response = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+
+    assert response["ok"] is True
+    assert lock_held is False
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"protocol":1,"protocol":1}',
+        b'{"protocol":1,"operation":"automation.rules.put","config_path":"x",'
+        b'"payload":{"definition":{"name":"one","name":"two"}}}',
+        b'{"protocol":1,"operation":"automation.rules.put","config_path":"x",'
+        b'"payload":{"definition":{"action":{"kind":"connect.invoke",'
+        b'"kind":"connect.invoke"}}}}',
+        b'{"protocol":1,"operation":"automation.rules.put","config_path":"x",'
+        b'"payload":{"definition":{"conditions":[{"field":"sender",'
+        b'"field":"subject"}]}}}',
+    ],
+)
+def test_main_rejects_duplicate_json_members_at_every_rule_depth(
+    raw: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(engine_api.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(raw)))
+
+    with pytest.raises(SystemExit) as exit_info:
+        engine_api.main()
+
+    assert exit_info.value.code == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "invalid_json"

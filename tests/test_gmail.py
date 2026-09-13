@@ -80,6 +80,19 @@ def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> No
     assert content.attachments == ()
 
 
+def test_mailbox_identity_tracks_refresh_token_without_exposing_it() -> None:
+    first_token = "first-private-refresh-token"
+    second_token = "second-private-refresh-token"
+
+    first_key = GmailGateway._credential_identity(SimpleNamespace(refresh_token=first_token))
+    second_key = GmailGateway._credential_identity(SimpleNamespace(refresh_token=second_token))
+
+    assert len(first_key) == 64
+    assert first_key != second_key
+    assert first_token not in first_key
+    assert second_token not in second_key
+
+
 class FakeRequest:
     def __init__(self, response: dict[str, object]):
         self.response = response
@@ -121,8 +134,7 @@ def history_response(message_count: int) -> dict[str, object]:
         "history": [
             {
                 "messagesAdded": [
-                    {"message": {"id": f"message-{index}"}}
-                    for index in range(message_count)
+                    {"message": {"id": f"message-{index}"}} for index in range(message_count)
                 ]
             }
         ],
@@ -141,9 +153,7 @@ def test_gmail_history_accepts_exact_incremental_metadata_limit() -> None:
 
 
 def test_gmail_history_resumes_limit_plus_one_in_next_chunk() -> None:
-    service = FakeHistoryService(
-        history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1)
-    )
+    service = FakeHistoryService(history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1))
     gateway = GmailGateway(service)
 
     first_ids, continuation = gateway.history_message_ids("saved-cursor")
@@ -299,7 +309,11 @@ def test_authorize_uses_bundled_client_without_copying_it_to_local_state(
     bundled_file.parent.mkdir(parents=True)
     bundled_file.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(gmail_module.sys, "_MEIPASS", str(bundle_root), raising=False)
-    credentials = SimpleNamespace(valid=True, to_json=lambda: "local account token")
+    credentials = SimpleNamespace(
+        valid=True,
+        refresh_token="browser-flow-refresh-token",
+        to_json=lambda: "local account token",
+    )
     flow = SimpleNamespace(run_local_server=lambda **kwargs: credentials)
     opened_client_files: list[str] = []
 
@@ -467,7 +481,11 @@ def test_authorize_reuses_a_token_found_after_lock_acquisition(
     token_file = tmp_path / "token.json"
     credentials_file.write_text("{}", encoding="utf-8")
     token_file.write_text("existing token", encoding="utf-8")
-    credentials = SimpleNamespace(valid=True, expired=False, refresh_token=None)
+    credentials = SimpleNamespace(
+        valid=True,
+        expired=False,
+        refresh_token="stored-refresh-token",
+    )
     service = object()
     monkeypatch.setattr(
         gmail_module.Credentials,
@@ -524,7 +542,11 @@ def test_authorize_replaces_an_unusable_existing_token(
         def load_credentials(path, scopes):
             return stored_credentials
 
-    replacement = SimpleNamespace(valid=True, to_json=lambda: "replacement token")
+    replacement = SimpleNamespace(
+        valid=True,
+        refresh_token="replacement-refresh-token",
+        to_json=lambda: "replacement token",
+    )
     browser_calls: list[dict[str, object]] = []
 
     def run_local_server(**kwargs):
@@ -606,6 +628,7 @@ def test_profile_returns_normalized_mailbox_identity_and_cursor() -> None:
 
     assert profile.email_address == "owner@example.com"
     assert profile.history_id == "12345"
+    assert gateway.mailbox_address() == "owner@example.com"
     assert gateway.profile_history_id() == "12345"
 
 

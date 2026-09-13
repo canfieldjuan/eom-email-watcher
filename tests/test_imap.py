@@ -440,6 +440,12 @@ def test_uid_validity_change_requires_recovery() -> None:
         gateway.changes_since(cursor())
 
 
+def test_mailbox_address_is_bound_to_credentials() -> None:
+    gateway = ImapGateway(credentials())
+
+    assert gateway.mailbox_address() == "owner@example.com"
+
+
 def test_incremental_page_crosses_large_sparse_uid_gap_in_one_poll() -> None:
     clients: list[FakeImap] = []
     sparse_uid = 1_000_000_000

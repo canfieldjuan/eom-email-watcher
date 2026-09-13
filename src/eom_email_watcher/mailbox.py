@@ -42,6 +42,7 @@ class MailboxSession:
     provider: str
     account_id: str
     gateway: MailboxGateway
+    identity_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,10 @@ class MessageContent:
 
 
 class MailboxGateway(Protocol):
+    def mailbox_address(self) -> str: ...
+
+    def mailbox_identity_key(self) -> str: ...
+
     def initial_cursor(self) -> str: ...
 
     def changes_since(self, cursor: str) -> MailboxChanges: ...
@@ -96,13 +101,61 @@ def default_mailbox_session(gateway: MailboxGateway) -> MailboxSession:
     return MailboxSession(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID, gateway)
 
 
-def scoped_message_id(provider: str, account_id: str, provider_message_id: str) -> str:
+def mailbox_session_identity_key(session: MailboxSession) -> str:
+    """Resolve and validate the credential-backed identity of an open gateway."""
+    key = session.identity_key
+    if key is None:
+        resolver = getattr(session.gateway, "mailbox_identity_key", None)
+        if not callable(resolver):
+            raise MailboxAccountUnavailable(
+                "The selected email provider cannot prove its mailbox identity"
+            )
+        key = resolver()
+    if (
+        not isinstance(key, str)
+        or len(key) != 64
+        or any(character not in "0123456789abcdef" for character in key)
+    ):
+        raise MailboxAccountUnavailable(
+            "The selected email provider returned an invalid mailbox identity"
+        )
+    return key
+
+
+def mailbox_session_address(session: MailboxSession) -> str | None:
+    """Return a supported adapter's authenticated mailbox address when exposed."""
+    resolver = getattr(session.gateway, "mailbox_address", None)
+    if not callable(resolver):
+        return None
+    address = resolver()
+    if not isinstance(address, str) or not address.strip():
+        raise MailboxAccountUnavailable(
+            "The selected email provider returned an invalid mailbox address"
+        )
+    return address.strip().casefold()
+
+
+def scoped_message_id(
+    provider: str,
+    account_id: str,
+    provider_message_id: str,
+    mailbox_identity_key: str | None = None,
+) -> str:
     """Return a stable local identifier for a provider-owned message."""
     if not provider or not account_id or not provider_message_id:
         raise ValueError("Mailbox message identity must be complete")
     # Preserve the public/local identifiers already emitted by the single-account
     # Gmail application. Additional accounts receive a namespaced local identity.
-    if provider == DEFAULT_MAIL_PROVIDER and account_id == DEFAULT_MAIL_ACCOUNT_ID:
+    if (
+        mailbox_identity_key is None
+        and provider == DEFAULT_MAIL_PROVIDER
+        and account_id == DEFAULT_MAIL_ACCOUNT_ID
+    ):
         return provider_message_id
-    encoded = "\0".join((provider, account_id, provider_message_id)).encode("utf-8")
+    identity = (
+        (provider, account_id, mailbox_identity_key, provider_message_id)
+        if mailbox_identity_key is not None
+        else (provider, account_id, provider_message_id)
+    )
+    encoded = "\0".join(identity).encode("utf-8")
     return f"mail-{hashlib.sha256(encoded).hexdigest()}"

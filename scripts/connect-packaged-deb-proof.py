@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from eom_email_watcher.db import Store
+from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
 
 PROTOCOL_VERSION = 1
@@ -26,6 +28,7 @@ PROVIDER_APP_ID = "document-summarizer"
 MESSAGE_ID = "packaged-connect-proof-message"
 PART_ID = "packaged-connect-proof-pdf"
 ENGINE_TIMEOUT_SECONDS = 30
+FIXTURE_MAILBOX_IDENTITY_KEY = hashlib.sha256(b"connect-packaged-proof-mailbox-v1").hexdigest()
 
 
 class PackagedConnectProofError(RuntimeError):
@@ -135,6 +138,12 @@ def write_isolated_config(config_path: Path, state_directory: Path) -> Path:
 def seed_attachment(database_path: Path) -> None:
     store = Store(database_path)
     store.initialize()
+    store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        FIXTURE_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     inserted = store.add_message(
         message_id=MESSAGE_ID,
         thread_id=None,
@@ -142,6 +151,7 @@ def seed_attachment(database_path: Path) -> None:
         sender_name="Packaged proof",
         subject="Packaged Local Connect proof",
         received_at="2026-01-01T00:00:00+00:00",
+        mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
     )
     if not inserted:
         raise PackagedConnectProofError("Packaged proof fixture message already exists")
@@ -186,9 +196,7 @@ def engine_request(
     except subprocess.TimeoutExpired as exc:
         raise PackagedConnectProofError(f"Packaged engine {operation} timed out") from exc
     if result.returncode != 0:
-        raise PackagedConnectProofError(
-            f"Packaged engine {operation} exited {result.returncode}"
-        )
+        raise PackagedConnectProofError(f"Packaged engine {operation} exited {result.returncode}")
     try:
         response = json.loads(result.stdout)
     except json.JSONDecodeError as exc:

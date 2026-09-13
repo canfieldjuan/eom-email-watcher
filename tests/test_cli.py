@@ -8,7 +8,10 @@ import pytest
 from eom_email_watcher import cli
 from eom_email_watcher.db import Store
 from eom_email_watcher.engine_api import ApiError
+from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
+
+TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
 def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -161,7 +164,12 @@ def test_second_production_check_stops_before_gmail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _check_config(tmp_path)
-    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr(cli, "load_config", lambda path: config, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_runtime",
+        lambda path: pytest.fail("contended check must not construct runtime"),
+    )
     monkeypatch.setattr(
         cli,
         "run_watcher_check",
@@ -175,7 +183,7 @@ def test_second_production_check_stops_before_gmail(
         cli._check(tmp_path / "config.toml", dry_run=False)
 
 
-def test_production_check_reloads_runtime_after_acquiring_lock(
+def test_production_check_loads_runtime_after_acquiring_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stale_config = SimpleNamespace(
@@ -192,18 +200,24 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
             "retention_days": 1,
         }
     )
-    runtimes = iter(
-        (
-            (stale_config, object(), object()),
-            (fresh_config, object(), object()),
-        )
-    )
-    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return fresh_config, object(), object()
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
 
     @contextmanager
     def acquired_lock(database_file: Path):
+        nonlocal lock_held
         assert database_file == stale_config.database_file
-        yield
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 
@@ -217,19 +231,37 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
 
 
-def test_dry_run_does_not_take_production_lock(
+def test_dry_run_loads_runtime_after_acquiring_production_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _check_config(tmp_path)
-    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return config, object(), object()
+
+    @contextmanager
+    def acquired_lock(database_file: Path):
+        nonlocal lock_held
+        assert database_file == config.database_file
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
+    monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
     monkeypatch.setattr(
         cli,
         "run_watcher_check",
         lambda config, store, model, *, dry_run: {"dry_run": dry_run},
     )
 
-    with cli._production_check_lock(config.database_file):
-        assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
+    assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
+    assert lock_held is False
 
 
 def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
@@ -255,20 +287,27 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
             assert retention_days == 1
             return 2
 
-    runtimes = iter(
-        (
-            (stale_config, object(), object()),
-            (fresh_config, FakeStore(), object()),
-        )
-    )
-    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return fresh_config, FakeStore(), object()
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
 
     @contextmanager
     def acquired_lock(database_file: Path):
+        nonlocal lock_held
         assert database_file == stale_config.database_file
-        yield
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
+
     def run_watcher_check(config, store, model, *, dry_run: bool):
         assert config is fresh_config
         assert dry_run is False
@@ -303,6 +342,12 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
 ) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
     store.initialize()
+    store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     store.add_message(
         message_id="message-1",
         thread_id=None,
@@ -310,6 +355,7 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
         sender_name=None,
         subject="Subject",
         received_at="2026-08-29T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     store.reserve_analysis_request("message-1", 20_000)
     store.record_analysis_failure(
