@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -161,8 +162,24 @@ def _find_part(payload: dict[str, Any], part_id: str) -> dict[str, Any] | None:
 
 
 class GmailGateway:
-    def __init__(self, service: Any):
+    def __init__(self, service: Any, mailbox_identity_key: str | None = None):
         self.service = service
+        self._mailbox_identity_key = mailbox_identity_key
+
+    @staticmethod
+    def _credential_identity(credentials: Credentials) -> str:
+        refresh_token = credentials.refresh_token
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise GmailAuthorizationRejected(
+                "Gmail authorization does not contain a durable refresh token"
+            )
+        value = "\0".join(("gmail-credential-v1", refresh_token)).encode("utf-8")
+        return hashlib.sha256(value).hexdigest()
+
+    def mailbox_identity_key(self) -> str:
+        if self._mailbox_identity_key is None:
+            raise GmailAuthorizationRejected("Gmail mailbox identity is unavailable")
+        return self._mailbox_identity_key
 
     @classmethod
     def from_token(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
@@ -200,7 +217,12 @@ class GmailGateway:
                     )
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry the operation") from exc
-        return cls(build("gmail", "v1", credentials=credentials, cache_discovery=False))
+        assert credentials is not None
+        identity_key = cls._credential_identity(credentials)
+        return cls(
+            build("gmail", "v1", credentials=credentials, cache_discovery=False),
+            identity_key,
+        )
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
@@ -258,8 +280,13 @@ class GmailGateway:
                     token_file.chmod(0o600)
         except FileLockTimeout as exc:
             raise GmailError("Gmail token is busy; retry setup") from exc
+        assert credentials is not None
+        identity_key = cls._credential_identity(credentials)
         return (
-            cls(build("gmail", "v1", credentials=credentials, cache_discovery=False)),
+            cls(
+                build("gmail", "v1", credentials=credentials, cache_discovery=False),
+                identity_key,
+            ),
             authorization_changed,
         )
 

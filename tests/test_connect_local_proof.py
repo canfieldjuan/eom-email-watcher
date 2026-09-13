@@ -26,6 +26,7 @@ require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
 request = PROOF_SCRIPT["request"]
 write_config = PROOF_SCRIPT["write_config"]
+TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
 def test_fixture_model_serves_native_identity_and_stream() -> None:
@@ -107,6 +108,12 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
+    runtime.store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     runtime.store.add_message(
         message_id="fixture-message",
         thread_id=None,
@@ -116,6 +123,7 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         received_at="2026-08-29T12:00:00+00:00",
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "fixture-message",

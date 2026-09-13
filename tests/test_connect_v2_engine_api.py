@@ -9,7 +9,12 @@ import pytest
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.db import ConnectQueueFull, MessageSource
-from eom_email_watcher.mailbox import MailboxError, MailboxMessageUnavailable
+from eom_email_watcher.mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    MailboxError,
+    MailboxMessageUnavailable,
+)
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime
 
@@ -20,6 +25,7 @@ INPUT_ARTIFACT_ID = "55555555-5555-4555-8555-555555555555"
 REQUEST_ID = "66666666-6666-4666-8666-666666666666"
 SECOND_REQUEST_ID = "77777777-7777-4777-8777-777777777777"
 TOKEN = "A" * 43
+TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 PDF = b"%PDF-1.4\nreal attachment\nEOF"
 LOCK_HOLDER = """
 import sys
@@ -382,6 +388,12 @@ def seeded_runtime(tmp_path: Path):
     write_config(config_path)
     runtime = load_runtime(config_path)
     runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
+    runtime.store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     runtime.store.add_message(
         message_id="message-1",
         thread_id=None,
@@ -389,6 +401,7 @@ def seeded_runtime(tmp_path: Path):
         sender_name="Private Sender",
         subject="Private subject",
         received_at="2026-08-30T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -414,6 +427,7 @@ def seed_second_attachment(runtime: Runtime) -> None:
         sender_name="Second Sender",
         subject="Second private subject",
         received_at="2026-08-30T12:01:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "message-2",
@@ -637,9 +651,7 @@ def test_unentitled_invoke_stops_before_discovery_gmail_or_persistence(
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
-        lambda *args: (_ for _ in ()).throw(
-            AssertionError("unentitled invocation reached Gmail")
-        ),
+        lambda *args: (_ for _ in ()).throw(AssertionError("unentitled invocation reached Gmail")),
     )
 
     response = engine_api._response(
@@ -991,9 +1003,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
     malformed = engine_api._response(
         api_request(config_path, "connect.attachment.invoke", missing_provider)
     )
-    missing_request_id = invocation_payload(
-        selected, parameters={"target-language": "es"}
-    )
+    missing_request_id = invocation_payload(selected, parameters={"target-language": "es"})
     missing_request_id.pop("request_id")
     unidentified = engine_api._response(
         api_request(config_path, "connect.attachment.invoke", missing_request_id)

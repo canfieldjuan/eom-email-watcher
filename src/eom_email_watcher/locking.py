@@ -11,6 +11,10 @@ from filelock import FileLock, SoftFileLock
 from filelock import Timeout as FileLockTimeout
 
 
+class OperationLockBusy(RuntimeError):
+    """A supported native operation lock is currently held by another process."""
+
+
 def _connect_lock_path(database_path: Path, kind: str, identity: tuple[str, ...]) -> Path:
     if any(not value for value in identity):
         raise ValueError("Connect lock identity cannot be empty")
@@ -115,7 +119,7 @@ def operation_lock(
     try:
         lock.acquire()
     except FileLockTimeout as exc:
-        raise RuntimeError(busy_message) from exc
+        raise OperationLockBusy(busy_message) from exc
     if isinstance(lock, SoftFileLock):
         lock.release()
         raise RuntimeError("Production operation locking is not available on this platform")

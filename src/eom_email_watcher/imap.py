@@ -276,6 +276,16 @@ def imap_cursor_mailbox_identity(cursor: str) -> str:
     return _decode_cursor(cursor)[0]
 
 
+def imap_cursor_epoch(cursor: str) -> tuple[str, int]:
+    """Return the credential identity and UIDVALIDITY captured by a saved cursor."""
+    decoded = (
+        _decode_recovery_cursor(cursor)
+        if cursor.startswith(RECOVERY_CURSOR_PREFIX)
+        else _decode_cursor(cursor)
+    )
+    return decoded[0], decoded[1]
+
+
 def _cursor(mailbox_id: str, uid_validity: int, last_uid: int) -> str:
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{last_uid}"
 
@@ -478,9 +488,7 @@ def _last_sequence_at_or_before_uid(
 def _reject_recovery_expunge(client: imaplib.IMAP4) -> None:
     _status, values = client.response("EXPUNGE")
     if any(value is not None for value in values or []):
-        raise ImapError(
-            "imap_mailbox_changed", "Mail server changed during recovery; retry"
-        )
+        raise ImapError("imap_mailbox_changed", "Mail server changed during recovery; retry")
 
 
 def _literal(response: list[Any] | None) -> tuple[bytes, bytes]:
@@ -808,6 +816,19 @@ class ImapGateway:
             finally:
                 self._active_client = None
 
+    def mailbox_epoch(self) -> tuple[str, int]:
+        if self._active_client is None:
+            raise ImapError(
+                "imap_protocol_error",
+                "Mail server identity requires an active polling session",
+            )
+        return self._mailbox_id, _selected_uid_validity(self._active_client)
+
+    def mailbox_identity_key(self) -> str:
+        mailbox_id, uid_validity = self.mailbox_epoch()
+        value = "\0".join(("imap-mailbox-v2", mailbox_id, str(uid_validity))).encode("utf-8")
+        return hashlib.sha256(value).hexdigest()
+
     @contextlib.contextmanager
     def _mailbox(self) -> Iterator[imaplib.IMAP4]:
         if self._active_client is not None:
@@ -864,9 +885,7 @@ class ImapGateway:
                     current_validity, current_snapshot_uid = self._snapshot(client)
                     _reject_recovery_expunge(client)
                     if current_snapshot_uid == 0:
-                        return MailboxChanges(
-                            (), _cursor(self._mailbox_id, current_validity, 0)
-                        )
+                        return MailboxChanges((), _cursor(self._mailbox_id, current_validity, 0))
                     return self._recovery_page(
                         client,
                         uid_validity=current_validity,
@@ -918,15 +937,11 @@ class ImapGateway:
         _reject_recovery_expunge(client)
         message_count = _selected_message_count(client)
         if message_count == 0:
-            return MailboxChanges(
-                (), _cursor(self._mailbox_id, uid_validity, snapshot_uid)
-            )
+            return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
         last_sequence = _last_sequence_at_or_before_uid(client, message_count, upper_uid)
         _reject_recovery_expunge(client)
         if last_sequence == 0:
-            return MailboxChanges(
-                (), _cursor(self._mailbox_id, uid_validity, snapshot_uid)
-            )
+            return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
         first_sequence = max(1, last_sequence - MAX_UID_SEARCH_SPAN + 1)
         status, response = client.search(
             None,
@@ -938,9 +953,7 @@ class ImapGateway:
             raise ImapError("imap_protocol_error", "Mail server recovery search failed")
         _reject_recovery_expunge(client)
         matching_sequences = [
-            sequence
-            for sequence in _uids(response)
-            if first_sequence <= sequence <= last_sequence
+            sequence for sequence in _uids(response) if first_sequence <= sequence <= last_sequence
         ]
         selected_sequences = matching_sequences[-MAX_INCREMENTAL_MESSAGE_IDS:]
         candidates = _fetch_sequence_uids(client, selected_sequences)

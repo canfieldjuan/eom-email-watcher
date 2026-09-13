@@ -133,8 +133,24 @@ def test_nested_attachment_names_survive_when_descriptor_identity_is_missing() -
             media_type="application/pdf",
             byte_size=0,
             position=0,
+            byte_size_known=False,
         ),
     )
+
+
+def test_zero_attachment_size_remains_known() -> None:
+    _body, _attachment_names, attachments = extract_body(
+        {
+            "mimeType": "application/pdf",
+            "partId": "zero",
+            "filename": "empty.pdf",
+            "body": {"attachmentId": "empty", "size": 0},
+        },
+        20_000,
+    )
+
+    assert attachments[0].byte_size == 0
+    assert attachments[0].byte_size_known is True
 
 
 def test_duplicate_part_ids_keep_first_descriptor_and_stable_positions() -> None:

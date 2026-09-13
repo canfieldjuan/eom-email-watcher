@@ -24,13 +24,84 @@ from eom_email_watcher.db import (
     CalendarEventMutation,
     CalendarEventProjection,
     ConnectQueueFull,
-    Store,
+)
+from eom_email_watcher.db import (
+    Store as ProductionStore,
 )
 from eom_email_watcher.mailbox import scoped_message_id
 from eom_email_watcher.microsoft_calendar import MicrosoftPrincipal
 from eom_email_watcher.mime import AttachmentDescriptor
 
 CALENDAR_PRINCIPAL_KEY = "a" * 64
+
+
+class Store(ProductionStore):
+    """Legacy DB-test adapter that makes the mailbox epoch explicit."""
+
+    @staticmethod
+    def _test_mailbox_identity(provider: str, account_id: str) -> str:
+        return hashlib.sha256(f"test-mailbox\0{provider}\0{account_id}".encode()).hexdigest()
+
+    def add_message(self, **values: object) -> bool:
+        provider = str(values.get("provider", "gmail"))
+        account_id = str(values.get("account_id", "gmail-default"))
+        account = self.mail_account(provider, account_id)
+        if account is None:
+            account = self.register_mail_account(
+                provider,
+                account_id,
+                display_name=provider,
+                address="owner@example.com",
+            )
+        if "mailbox_identity_key" not in values:
+            identity_key = account.mailbox_identity_key or self._test_mailbox_identity(
+                provider, account_id
+            )
+            if account.mailbox_identity_key is None:
+                self.reconcile_mailbox_identity(
+                    provider,
+                    account_id,
+                    identity_key,
+                    legacy_status="replacement",
+                    preserve_cursor=True,
+                )
+            values["mailbox_identity_key"] = identity_key
+        return super().add_message(**values)  # type: ignore[arg-type]
+
+    def mark_analyzed(
+        self,
+        message_id: str,
+        result: dict[str, object],
+        **values: object,
+    ) -> None:
+        source = self.message_source(message_id)
+        if source.mailbox_identity_key is not None:
+            values.setdefault("mailbox_identity_key", source.mailbox_identity_key)
+        super().mark_analyzed(message_id, result, **values)  # type: ignore[arg-type]
+
+    def has_seen_message(
+        self,
+        provider_message_id: str,
+        *,
+        provider: str = "gmail",
+        account_id: str = "gmail-default",
+        mailbox_identity_key: str | None = None,
+    ) -> bool:
+        account = self.mail_account(provider, account_id)
+        return super().has_seen_message(
+            provider_message_id,
+            provider=provider,
+            account_id=account_id,
+            mailbox_identity_key=(
+                mailbox_identity_key
+                if mailbox_identity_key is not None
+                else account.mailbox_identity_key
+                if account is not None
+                else None
+            ),
+        )
+
+
 DELETE_MESSAGE_PROBE = """
 import sys
 from pathlib import Path
@@ -235,10 +306,21 @@ def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -
 
     run = store.automation_run_for_message("local-1")
     assert run is not None
+    mailbox_identity_key = Store._test_mailbox_identity("microsoft365", "account-1")
     assert (
         run.source_message_key
-        == hashlib.sha256(b"microsoft365\0account-1\0provider-message-1").hexdigest()
+        == hashlib.sha256(
+            f"microsoft365\0account-1\0{mailbox_identity_key}\0provider-message-1".encode()
+        ).hexdigest()
     )
+    with store.connection() as connection:
+        companion = connection.execute(
+            """SELECT mailbox_identity_key FROM automation_run_source_identities
+            WHERE run_id = ?""",
+            (run.run_id,),
+        ).fetchone()
+    assert companion is not None
+    assert companion["mailbox_identity_key"] == mailbox_identity_key
     assert (run.automation_id, run.automation_version, run.extraction_schema_version) == (
         SCHEDULING_AUTOMATION_ID,
         SCHEDULING_AUTOMATION_VERSION,
@@ -792,10 +874,13 @@ def test_calendar_proposal_compare_and_swap_prevents_duplicate_payloads(
         )
 
     with store.connection() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM automation_proposal_payloads WHERE run_id = ?",
-            (proposing.run_id,),
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM automation_proposal_payloads WHERE run_id = ?",
+                (proposing.run_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_calendar_proposal_and_state_transition_roll_back_together(tmp_path: Path) -> None:
@@ -1030,10 +1115,13 @@ def test_calendar_confirmation_persists_one_transaction_before_write(tmp_path: P
         write.transaction_id,
     )
     with store.connection() as db:
-        assert db.execute(
-            "SELECT COUNT(*) FROM automation_calendar_writes WHERE run_id = ?",
-            (proposing.run_id,),
-        ).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM automation_calendar_writes WHERE run_id = ?",
+                (proposing.run_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_expired_confirmation_reproposes_with_a_new_version(tmp_path: Path) -> None:
@@ -1246,14 +1334,20 @@ def test_schema_17_migrates_every_durable_microsoft_principal_reference(
                 (account_id,),
             ).fetchall()
         } == {current_key}
-        assert db.execute(
-            "SELECT principal_key FROM microsoft_calendar_windows WHERE account_id = ?",
-            (account_id,),
-        ).fetchone()[0] == current_key
-        assert db.execute(
-            "SELECT calendar_principal_key FROM automation_runs WHERE run_id = ?",
-            (run.run_id,),
-        ).fetchone()[0] == current_key
+        assert (
+            db.execute(
+                "SELECT principal_key FROM microsoft_calendar_windows WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+            == current_key
+        )
+        assert (
+            db.execute(
+                "SELECT calendar_principal_key FROM automation_runs WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchone()[0]
+            == current_key
+        )
         assert {
             str(row[0])
             for row in db.execute(
@@ -1261,10 +1355,13 @@ def test_schema_17_migrates_every_durable_microsoft_principal_reference(
                 (run.run_id,),
             ).fetchall()
         } == {current_key}
-        assert db.execute(
-            "SELECT calendar_principal_key FROM automation_calendar_writes WHERE run_id = ?",
-            (run.run_id,),
-        ).fetchone()[0] == current_key
+        assert (
+            db.execute(
+                "SELECT calendar_principal_key FROM automation_calendar_writes WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchone()[0]
+            == current_key
+        )
         with pytest.raises(sqlite3.IntegrityError, match="automation_events are immutable"):
             db.execute(
                 "UPDATE automation_events SET calendar_principal_key = ? WHERE run_id = ?",
@@ -2201,13 +2298,22 @@ def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     stamp = "2026-08-31T12:00:00+00:00"
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        Store._test_mailbox_identity("gmail", "gmail-default"),
+        legacy_status="replacement",
+    )
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages(
-                    message_id, provider, account_id, provider_message_id,
+                    message_id, provider, account_id, mailbox_identity_key,
+                    provider_message_id,
                     sender, subject, received_at, discovered_at, category
                 ) VALUES (
-                    ?1, 'gmail', 'gmail-default', ?1,
+                    ?1, 'gmail', 'gmail-default',
+                    (SELECT mailbox_identity_key FROM mail_accounts
+                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
                     'sender@example.com', 'Update', ?2, ?3, 'informational'
                 )""",
             [(f"message-{index:03}", stamp, stamp) for index in range(55)],
@@ -2231,14 +2337,23 @@ def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
 ) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        Store._test_mailbox_identity("gmail", "gmail-default"),
+        legacy_status="replacement",
+    )
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages(
-                    message_id, provider, account_id, provider_message_id,
+                    message_id, provider, account_id, mailbox_identity_key,
+                    provider_message_id,
                     sender, sender_name, subject, received_at, discovered_at,
                     status, category, priority, summary
                 ) VALUES (
-                    ?1, 'gmail', 'gmail-default', ?1,
+                    ?1, 'gmail', 'gmail-default',
+                    (SELECT mailbox_identity_key FROM mail_accounts
+                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
                     ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
                 )""",
             [
@@ -2416,13 +2531,22 @@ def test_notification_intent_count_is_not_limited_to_retrieval_page(
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     stamp = datetime.now(UTC).isoformat()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        Store._test_mailbox_identity("gmail", "gmail-default"),
+        legacy_status="replacement",
+    )
     with store.connection() as db:
         db.executemany(
             """INSERT INTO messages (
-                    message_id, provider, account_id, provider_message_id,
+                    message_id, provider, account_id, mailbox_identity_key,
+                    provider_message_id,
                     sender, subject, received_at, discovered_at, status, last_error
                 ) VALUES (
-                    ?1, 'gmail', 'gmail-default', ?1,
+                    ?1, 'gmail', 'gmail-default',
+                    (SELECT mailbox_identity_key FROM mail_accounts
+                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
                     'a@b.com', 'Update', ?2, ?3, 'pending', 'model unavailable'
                 )""",
             [(f"m{index}", stamp, stamp) for index in range(501)],
@@ -2620,7 +2744,11 @@ def test_delete_message_cascades_local_state_and_prevents_rediscovery(
         assert db.execute("SELECT COUNT(*) FROM message_attachments").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
         suppression = db.execute("SELECT message_key FROM suppressed_messages").fetchone()[0]
-    assert suppression == hashlib.sha256(b"gmail\0gmail-default\0m1").hexdigest()
+    identity_key = Store._test_mailbox_identity("gmail", "gmail-default")
+    assert (
+        suppression
+        == hashlib.sha256(f"gmail\0gmail-default\0{identity_key}\0m1".encode()).hexdigest()
+    )
     assert "m1" not in suppression
 
 
@@ -3336,6 +3464,92 @@ def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
         )
 
 
+def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "watcher.sqlite3")
+    store.initialize()
+    assert store.add_message(
+        message_id="already-analyzed",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Historical",
+        received_at="2026-09-01T00:00:00+00:00",
+    )
+    store.mark_analyzed("already-analyzed", scheduling_analysis())
+    assert store.add_message(
+        message_id="still-pending",
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name=None,
+        subject="Pending",
+        received_at="2026-09-01T00:01:00+00:00",
+    )
+
+    with store.connection() as db:
+        scheduling_columns_before = [
+            row["name"] for row in db.execute("PRAGMA table_info(automation_runs)")
+        ]
+        db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
+        db.execute("DROP TRIGGER messages_require_rule_revision_completion")
+        db.execute("DROP TRIGGER messages_delete_pending_automation_fires")
+        db.execute("DROP TABLE automation_fire_attempts")
+        db.execute("DROP TABLE automation_fires")
+        db.execute("DROP TABLE automation_rule_versions")
+        db.execute("DROP TABLE automation_rules")
+        db.execute("DROP TABLE automation_rule_set")
+        db.execute("DROP TABLE automation_run_source_identities")
+        db.execute("DROP INDEX idx_messages_source_identity_v20")
+        db.execute(
+            """CREATE UNIQUE INDEX idx_messages_source_identity
+            ON messages(provider, account_id, provider_message_id)"""
+        )
+        db.execute(
+            """UPDATE messages
+            SET mailbox_identity_key = NULL, rules_revision_at_analysis = NULL,
+                rules_evaluation_error = NULL"""
+        )
+        db.execute(
+            """UPDATE mail_accounts
+            SET mailbox_identity_key = NULL, legacy_identity_status = 'unresolved',
+                legacy_identity_key = NULL"""
+        )
+        db.execute("PRAGMA user_version = 19")
+
+    store.initialize()
+
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        markers = db.execute(
+            """SELECT message_id, status, mailbox_identity_key,
+                rules_revision_at_analysis
+            FROM messages ORDER BY message_id"""
+        ).fetchall()
+        assert [tuple(row) for row in markers] == [
+            ("already-analyzed", "analyzed", None, 0),
+            ("still-pending", "pending", None, None),
+        ]
+        assert [row["name"] for row in db.execute("PRAGMA table_info(automation_runs)")] == (
+            scheduling_columns_before
+        )
+        assert db.execute("SELECT revision FROM automation_rule_set").fetchone()[0] == 0
+        with pytest.raises(sqlite3.IntegrityError, match="mailbox identity"):
+            db.execute(
+                """INSERT INTO messages(
+                    message_id, provider, account_id, provider_message_id,
+                    sender, subject, received_at, discovered_at
+                ) VALUES (
+                    'late-v19', 'gmail', 'gmail-default', 'late-v19',
+                    'trusted@example.com', 'Late',
+                    '2026-09-01T00:02:00+00:00',
+                    '2026-09-01T00:02:00+00:00'
+                )"""
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="rule revision"):
+            db.execute("UPDATE messages SET status = 'analyzed' WHERE message_id = 'still-pending'")
+
+
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)
@@ -3718,8 +3932,7 @@ def test_deferred_lane_head_is_not_due_early_and_preserves_bounded_diagnostic(
     assert deferred.last_error_message == "busy"
     assert store.due_connect_lane_heads(now=created_at + timedelta(seconds=1)) == ()
     assert [
-        job.job_id
-        for job in store.due_connect_lane_heads(now=created_at + timedelta(seconds=2))
+        job.job_id for job in store.due_connect_lane_heads(now=created_at + timedelta(seconds=2))
     ] == [job_id]
     near_deadline = created_at + CONNECT_QUEUE_ADMISSION_WINDOW - timedelta(seconds=1)
     claimed_again = store.claim_connect_lane_head(
@@ -3916,8 +4129,7 @@ def test_initialize_preserves_legacy_active_v2_duplicates_until_reconciled(
         columns = tuple(row)
         placeholders = ", ".join("?" for _ in columns)
         db.execute(
-            f"INSERT INTO connect_attachment_jobs ({', '.join(columns)}) "
-            f"VALUES ({placeholders})",
+            f"INSERT INTO connect_attachment_jobs ({', '.join(columns)}) VALUES ({placeholders})",
             tuple(row[column] for column in columns),
         )
         db.execute("DROP TRIGGER connect_jobs_delete_dispatch")

@@ -157,6 +157,26 @@ class FakeCache:
         return self.serialized
 
 
+def test_mailbox_identity_tracks_immutable_principal_without_exposing_it() -> None:
+    first_account = {
+        "username": "owner@example.com",
+        "home_account_id": "first-home.tenant",
+        "local_account_id": "FIRST-OBJECT-ID",
+    }
+    second_account = {
+        **first_account,
+        "home_account_id": "second-home.tenant",
+    }
+
+    first_key = Microsoft365Gateway._principal_identity(first_account)
+    second_key = Microsoft365Gateway._principal_identity(second_account)
+
+    assert len(first_key) == 64
+    assert first_key != second_key
+    assert first_account["home_account_id"] not in first_key
+    assert first_account["local_account_id"] not in first_key
+
+
 def test_interactive_authorization_uses_only_mail_read_and_writes_private_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -178,7 +198,13 @@ def test_interactive_authorization_uses_only_mail_read_and_writes_private_cache(
             }
 
         def get_accounts(self):
-            return [{"username": "owner@example.com"}]
+            return [
+                {
+                    "username": "owner@example.com",
+                    "home_account_id": "home.tenant",
+                    "local_account_id": "object-id",
+                }
+            ]
 
     monkeypatch.setattr(microsoft365.msal, "SerializableTokenCache", lambda: cache)
     monkeypatch.setattr(
@@ -218,11 +244,21 @@ def test_silent_refresh_persists_updated_cache(
 
     class FakeApplication:
         def get_accounts(self):
-            return [{"username": "owner@example.com"}]
+            return [
+                {
+                    "username": "owner@example.com",
+                    "home_account_id": "home.tenant",
+                    "local_account_id": "object-id",
+                }
+            ]
 
         def acquire_token_silent_with_error(self, scopes: list[str], *, account: object):
             calls.append(scopes)
-            assert account == {"username": "owner@example.com"}
+            assert account == {
+                "username": "owner@example.com",
+                "home_account_id": "home.tenant",
+                "local_account_id": "object-id",
+            }
             cache.serialized = "refreshed-cache"
             cache.has_state_changed = True
             return {"access_token": "refreshed-access"}

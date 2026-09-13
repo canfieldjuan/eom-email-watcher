@@ -64,9 +64,12 @@ def test_isolated_config_pins_every_private_state_path(tmp_path: Path) -> None:
     assert config.database_file == database_path
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
-    assert Store(database_path).attachment(
-        "packaged-connect-proof-message", "packaged-connect-proof-pdf"
-    ).media_type == "application/pdf"
+    assert (
+        Store(database_path)
+        .attachment("packaged-connect-proof-message", "packaged-connect-proof-pdf")
+        .media_type
+        == "application/pdf"
+    )
 
 
 def test_isolated_environment_does_not_forward_home_or_secret_values(

@@ -8,7 +8,10 @@ import pytest
 from eom_email_watcher import cli
 from eom_email_watcher.db import Store
 from eom_email_watcher.engine_api import ApiError
+from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
+
+TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
 def test_setup_reports_partial_notification_failure(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -269,6 +272,7 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
         yield
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
+
     def run_watcher_check(config, store, model, *, dry_run: bool):
         assert config is fresh_config
         assert dry_run is False
@@ -303,6 +307,12 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
 ) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
     store.initialize()
+    store.reconcile_mailbox_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
     store.add_message(
         message_id="message-1",
         thread_id=None,
@@ -310,6 +320,7 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
         sender_name=None,
         subject="Subject",
         received_at="2026-08-29T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
     store.reserve_analysis_request("message-1", 20_000)
     store.record_analysis_failure(

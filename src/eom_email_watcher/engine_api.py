@@ -19,6 +19,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from . import connect, entitlement
+from .automation.rules import RuleDefinition, RuleValidationError, parse_rule_definition
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
@@ -39,6 +40,12 @@ from .config import (
 from .db import (
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
     CONNECT_RETRY_DELAYS_SECONDS,
+    AutomationRuleDetail,
+    AutomationRuleLimitExceeded,
+    AutomationRuleNotFound,
+    AutomationRuleStale,
+    AutomationRuleSummary,
+    AutomationRuleSystemProtected,
     CalendarEventMutation,
     CalendarEventProjection,
     CalendarGrant,
@@ -47,6 +54,7 @@ from .db import (
     ConnectOutput,
     ConnectQueueFull,
     MailAccount,
+    MailboxIdentityChanged,
     MessageSource,
     NotificationIntent,
     Store,
@@ -70,6 +78,7 @@ from .imap import (
     write_credentials,
 )
 from .locking import (
+    OperationLockBusy,
     connect_lane_lock_path,
     connect_operation_lock,
     connect_source_lock_path,
@@ -84,6 +93,7 @@ from .mailbox import (
     MailboxError,
     MailboxGateway,
     MailboxMessageUnavailable,
+    mailbox_polling_session,
 )
 from .microsoft365 import (
     MICROSOFT365_PROVIDER,
@@ -119,7 +129,11 @@ from .runtime import (
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
 )
-from .service import decide_scheduling_proposal, run_watcher_check
+from .service import (
+    decide_scheduling_proposal,
+    reconcile_mailbox_session_identity,
+    run_watcher_check,
+)
 
 PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 1_000_000
@@ -146,9 +160,23 @@ SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
 
 
 class ApiError(RuntimeError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, retryable: bool | None = None):
         super().__init__(message)
         self.code = code
+        self.retryable = retryable
+
+
+class DuplicateJsonMember(ValueError):
+    """One JSON object repeated a member name at the same depth."""
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for name, member in pairs:
+        if name in value:
+            raise DuplicateJsonMember(name)
+        value[name] = member
+    return value
 
 
 def _payload(request: dict[str, object], allowed: set[str] | None = None) -> dict[str, object]:
@@ -1566,9 +1594,6 @@ def _check(request: dict[str, object]) -> dict[str, object]:
     if not isinstance(dry_run, bool):
         raise ApiError("invalid_request", "dry_run must be a boolean")
 
-    runtime = _runtime(request)
-    _require_host_delivery_compatible(runtime)
-
     def run(active_runtime: Runtime) -> dict[str, object]:
         _require_host_delivery_compatible(active_runtime)
         result = run_watcher_check(
@@ -1583,17 +1608,218 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "pending_notifications": _host_notification_intent_count(active_runtime),
         }
 
-    if dry_run:
-        return run(runtime)
-
-    lock_path = _production_check_lock_path(runtime.config)
+    config = load_config(_config_path(request))
+    lock_path = _production_check_lock_path(config)
     if not operation_lock_supported(lock_path):
         raise ApiError(
             "unsupported_platform",
             "Production watcher checks require native operation locking",
         )
-    with operation_lock(lock_path, "Another production check is already running"):
-        return run(_runtime(request))
+    try:
+        with operation_lock(lock_path, "Another production check is already running"):
+            return run(_runtime(request))
+    except OperationLockBusy as exc:
+        raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
+
+
+def _automation_rule_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise ApiError("invalid_request", "rule_id must be a lower-case UUIDv4")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise ApiError("invalid_request", "rule_id must be a lower-case UUIDv4") from exc
+    if parsed.version != 4 or str(parsed) != value:
+        raise ApiError("invalid_request", "rule_id must be a lower-case UUIDv4")
+    return value
+
+
+def _automation_expected_version(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 2**63 - 1:
+        raise ApiError(
+            "invalid_request",
+            "expected_version must be an integer between 1 and 9223372036854775807",
+        )
+    return value
+
+
+def _automation_rule_summary_data(summary: AutomationRuleSummary) -> dict[str, object]:
+    return {
+        "rule_id": summary.rule_id,
+        "version": summary.version,
+        "enabled": summary.enabled,
+        "system": summary.system,
+        "valid": summary.valid,
+        "name": summary.name,
+        "invalid_reason": summary.invalid_reason,
+        "created_at": summary.created_at,
+        "updated_at": summary.updated_at,
+    }
+
+
+def _automation_rule_detail_data(detail: AutomationRuleDetail) -> dict[str, object]:
+    return {
+        "summary": _automation_rule_summary_data(detail.summary),
+        "definition": detail.definition,
+    }
+
+
+def _with_automation_rule_mutation(
+    request: dict[str, object],
+    operation: Callable[[Runtime], dict[str, object]],
+) -> dict[str, object]:
+    config = load_config(_config_path(request))
+    lock_path = _production_check_lock_path(config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Automation rule changes require native operation locking",
+        )
+    try:
+        with operation_lock(lock_path, "Another mailbox operation is already running"):
+            return operation(_runtime(request))
+    except OperationLockBusy as exc:
+        raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
+
+
+def _automation_rule_scope_identity(
+    runtime: Runtime,
+    definition: RuleDefinition,
+) -> str | None:
+    scope = definition.scope
+    if scope.account_id is None:
+        return None
+    assert scope.provider is not None
+    account = runtime.store.mail_account(scope.provider, scope.account_id)
+    if account is None:
+        raise RuleValidationError("account-scoped rule names an unknown mailbox")
+    try:
+        mailbox = load_mailbox_account(
+            runtime.config,
+            runtime.store,
+            scope.provider,
+            scope.account_id,
+        )
+        with mailbox_polling_session(mailbox.gateway):
+            identity_key = reconcile_mailbox_session_identity(
+                runtime.store,
+                mailbox,
+                dry_run=False,
+            )
+    except MailboxError as exc:
+        raise ApiError(
+            "mailbox_identity_unavailable",
+            "Mailbox identity could not be verified; retry",
+            retryable=True,
+        ) from exc
+    return identity_key
+
+
+def _automation_rules_list(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    revision, rules = _runtime(request).store.automation_rules_snapshot()
+    return {
+        "revision": revision,
+        "rules": [_automation_rule_summary_data(rule) for rule in rules],
+    }
+
+
+def _automation_rules_get(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"rule_id"})
+    rule_id = _automation_rule_id(payload.get("rule_id"))
+    try:
+        rule = _runtime(request).store.automation_rule(rule_id)
+    except AutomationRuleNotFound as exc:
+        raise ApiError("not_found", "Automation rule was not found") from exc
+    return {"rule": _automation_rule_detail_data(rule)}
+
+
+def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"rule_id", "expected_version", "definition"})
+    fields = set(payload)
+    create = fields == {"definition"}
+    if not create and fields != {"rule_id", "expected_version", "definition"}:
+        raise ApiError("invalid_request", "automation.rules.put payload shape is invalid")
+    rule_id = None if create else _automation_rule_id(payload["rule_id"])
+    expected_version = None if create else _automation_expected_version(payload["expected_version"])
+    try:
+        definition = parse_rule_definition(payload["definition"])
+    except RuleValidationError as exc:
+        raise ApiError("invalid_rule", exc.reason) from exc
+
+    def put(runtime: Runtime) -> dict[str, object]:
+        try:
+            scope_identity = _automation_rule_scope_identity(runtime, definition)
+            rule = runtime.store.put_automation_rule(
+                payload["definition"],
+                rule_id=rule_id,
+                expected_version=expected_version,
+                expected_account_identity=scope_identity,
+            )
+        except (MailboxIdentityChanged, RuleValidationError, ValueError) as exc:
+            raise ApiError("invalid_rule", str(exc)) from exc
+        except AutomationRuleNotFound as exc:
+            raise ApiError("not_found", "Automation rule was not found") from exc
+        except AutomationRuleStale as exc:
+            raise ApiError("stale_rule", str(exc)) from exc
+        except AutomationRuleLimitExceeded as exc:
+            raise ApiError("rule_limit", str(exc)) from exc
+        except AutomationRuleSystemProtected as exc:
+            raise ApiError("system_rule_protected", str(exc)) from exc
+        return {"rule": _automation_rule_detail_data(rule)}
+
+    return _with_automation_rule_mutation(request, put)
+
+
+def _automation_rules_delete(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"rule_id", "expected_version"})
+    if set(payload) != {"rule_id", "expected_version"}:
+        raise ApiError("invalid_request", "automation.rules.delete payload shape is invalid")
+    rule_id = _automation_rule_id(payload["rule_id"])
+    expected_version = _automation_expected_version(payload["expected_version"])
+
+    def delete(runtime: Runtime) -> dict[str, object]:
+        try:
+            version = runtime.store.delete_automation_rule(rule_id, expected_version)
+        except AutomationRuleNotFound as exc:
+            raise ApiError("not_found", "Automation rule was not found") from exc
+        except AutomationRuleStale as exc:
+            raise ApiError("stale_rule", str(exc)) from exc
+        except AutomationRuleSystemProtected as exc:
+            raise ApiError("system_rule_protected", str(exc)) from exc
+        return {"rule_id": rule_id, "version": version, "deleted": True}
+
+    return _with_automation_rule_mutation(request, delete)
+
+
+def _automation_rules_set_enabled(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"rule_id", "expected_version", "enabled"})
+    if set(payload) != {"rule_id", "expected_version", "enabled"}:
+        raise ApiError("invalid_request", "automation.rules.set_enabled payload shape is invalid")
+    rule_id = _automation_rule_id(payload["rule_id"])
+    expected_version = _automation_expected_version(payload["expected_version"])
+    enabled = payload["enabled"]
+    if type(enabled) is not bool:
+        raise ApiError("invalid_request", "enabled must be a boolean")
+
+    def set_enabled(runtime: Runtime) -> dict[str, object]:
+        try:
+            rule = runtime.store.set_automation_rule_enabled(
+                rule_id,
+                expected_version,
+                enabled,
+            )
+        except AutomationRuleNotFound as exc:
+            raise ApiError("not_found", "Automation rule was not found") from exc
+        except AutomationRuleStale as exc:
+            raise ApiError("stale_rule", str(exc)) from exc
+        except AutomationRuleSystemProtected as exc:
+            raise ApiError("system_rule_protected", str(exc)) from exc
+        except RuleValidationError as exc:
+            raise ApiError("invalid_rule", str(exc)) from exc
+        return {"rule": _automation_rule_detail_data(rule)}
+
+    return _with_automation_rule_mutation(request, set_enabled)
 
 
 def _hide_locked_automation_previews(rows: list[dict[str, object]]) -> None:
@@ -1747,9 +1973,7 @@ def _calendar_automation_decide(request: dict[str, object]) -> dict[str, object]
             "state": outcome.run.state,
             "state_version": outcome.run.state_version,
             "failure_code": outcome.run.failure_code,
-            "graph_event_id": (
-                outcome.write.graph_event_id if outcome.write is not None else None
-            ),
+            "graph_event_id": (outcome.write.graph_event_id if outcome.write is not None else None),
         }
 
 
@@ -2503,9 +2727,7 @@ def _finish_generic_connect_job(
 def _connect_retry_delay(failure_count: int) -> int:
     if failure_count < 0:
         raise ValueError("Connect retry failure count cannot be negative")
-    return CONNECT_RETRY_DELAYS_SECONDS[
-        min(failure_count, len(CONNECT_RETRY_DELAYS_SECONDS) - 1)
-    ]
+    return CONNECT_RETRY_DELAYS_SECONDS[min(failure_count, len(CONNECT_RETRY_DELAYS_SECONDS) - 1)]
 
 
 def _defer_generic_connect_error(
@@ -2517,11 +2739,16 @@ def _defer_generic_connect_error(
 ) -> None:
     dispatch = runtime.store.connect_dispatch(job_id)
     current = runtime.store.connect_job(job_id)
-    if dispatch is None or current is None or current.status not in {
-        "requested",
-        "accepted",
-        "processing",
-    }:
+    if (
+        dispatch is None
+        or current is None
+        or current.status
+        not in {
+            "requested",
+            "accepted",
+            "processing",
+        }
+    ):
         return
     if (
         submitted
@@ -2989,10 +3216,7 @@ def _next_connect_queue_wakeup(
     items: list[dict[str, object]],
     observed_at: datetime,
 ) -> datetime | None:
-    attempted = {
-        str(item["job_id"]): str(item["outcome"])
-        for item in items
-    }
+    attempted = {str(item["job_id"]): str(item["outcome"]) for item in items}
     wakeups = []
     for job_id, wakeup in runtime.store.connect_queue_wakeups(now=observed_at):
         outcome = attempted.get(job_id)
@@ -3773,6 +3997,11 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "analysis.requeue": _analysis_requeue,
+    "automation.rules.delete": _automation_rules_delete,
+    "automation.rules.get": _automation_rules_get,
+    "automation.rules.list": _automation_rules_list,
+    "automation.rules.put": _automation_rules_put,
+    "automation.rules.set_enabled": _automation_rules_set_enabled,
     "attachment.export": _attachment_export,
     "calendar.read.connect": _calendar_read_connect,
     "calendar.read.disconnect": _calendar_read_disconnect,
@@ -3849,8 +4078,11 @@ def _response(request: object) -> dict[str, object]:
             "protocol": PROTOCOL_VERSION,
         }
     except ApiError as exc:
+        error: dict[str, object] = {"code": exc.code, "message": str(exc)}
+        if exc.retryable is not None:
+            error["retryable"] = exc.retryable
         return {
-            "error": {"code": exc.code, "message": str(exc)},
+            "error": error,
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
@@ -3938,7 +4170,7 @@ def main() -> None:
         }
     else:
         try:
-            request = json.loads(raw)
+            request = json.loads(raw, object_pairs_hook=_unique_json_object)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
             request = None
             response = {
