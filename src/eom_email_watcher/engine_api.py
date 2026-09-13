@@ -19,7 +19,12 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from . import connect, entitlement
-from .automation.rules import RuleDefinition, RuleValidationError, parse_rule_definition
+from .automation.rules import (
+    RuleDefinition,
+    RuleValidationError,
+    canonical_rule_definition,
+    parse_rule_definition,
+)
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
@@ -1605,6 +1610,8 @@ def _check(request: dict[str, object]) -> dict[str, object]:
                 dry_run=dry_run,
                 deliver_notifications=False,
             )
+        except MailboxIdentityChanged as exc:
+            raise ApiError("mailbox_identity_changed", str(exc)) from exc
         except LegacyMailboxIdentityUnverified as exc:
             raise ApiError(
                 "legacy_mailbox_identity_unverified",
@@ -1752,6 +1759,7 @@ def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
     expected_version = None if create else _automation_expected_version(payload["expected_version"])
     try:
         definition = parse_rule_definition(payload["definition"])
+        canonical_rule_definition(definition)
     except RuleValidationError as exc:
         raise ApiError("invalid_rule", exc.reason) from exc
 

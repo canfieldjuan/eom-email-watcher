@@ -4588,6 +4588,30 @@ def test_check_maps_unresolved_legacy_recovery_to_retryable_error(
     }
 
 
+def test_check_maps_mailbox_identity_change_to_domain_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            engine_api.MailboxIdentityChanged("mailbox identity changed")
+        ),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
+
+    assert response["error"] == {
+        "code": "mailbox_identity_changed",
+        "message": "mailbox identity changed",
+    }
+
+
 @pytest.mark.parametrize(
     ("sender", "expected_messages", "expected_fires"),
     [
@@ -5289,6 +5313,32 @@ def test_automation_rule_mutation_rejects_unsupported_lock_before_runtime_access
     )
 
     assert response["error"]["code"] == "unsupported_platform"
+
+
+def test_automation_rule_put_rejects_oversized_canonical_bytes_before_runtime_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    definition = _automation_definition()
+    definition["scope"] = {"provider": "gmail", "account_id": "gmail-default"}
+    definition["action"]["parameters"] = {
+        **{f"k{index}": "x" * 1000 for index in range(1, 16)},
+        "k0": "x" * 816,
+    }
+    monkeypatch.setattr(
+        engine_api,
+        "load_runtime",
+        lambda path: pytest.fail("oversized rule reached runtime construction"),
+    )
+
+    response = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+
+    assert response["error"]["code"] == "invalid_rule"
+    assert "16384 bytes" in response["error"]["message"]
 
 
 def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failure(

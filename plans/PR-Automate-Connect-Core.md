@@ -24,14 +24,16 @@ definitions the parser never accepted, stale overwrites, evaluated revisions
 chosen by callers, and fires referring to rule versions or attachments outside
 the analysis transaction.
 
-Exact-head review exposed four additional boundary splits in the first runtime
+Exact-head review exposed six additional boundary splits in the first runtime
 implementation: stale mailbox recovery could cross an unresolved migrated
 identity; missing provider size metadata was collapsed into verified zero;
 account-scoped stale edits performed credential reconciliation before their
 version could reject; and CLI dry-runs constructed mailbox runtime state before
-acquiring the production operation lock. These are reachable violations of the
-accepted identity, matching, CAS, and locking contracts rather than optional
-hardening.
+acquiring the production operation lock. A later exact-head pass also proved
+that canonical byte-size rejection still occurred after account reconciliation
+and that dry-run identity mismatch fell through as a generic runtime error.
+These are reachable violations of the accepted identity, matching, CAS,
+admission, error-envelope, and locking contracts rather than optional hardening.
 
 The correct fix must:
 
@@ -56,7 +58,11 @@ The correct fix must:
    mailbox-state side effect while retaining the Store's final transactional
    CAS; and
 10. acquire the production mailbox lock before CLI dry-run runtime construction,
-    matching production checks.
+    matching production checks;
+11. reject a definition that exceeds the canonical byte limit before any
+    mailbox/account access while retaining Store-side revalidation; and
+12. return the contract's `mailbox_identity_changed` domain error for dry-run
+    credential mismatch without changing the fail-closed identity check.
 
 This change fixes the root boundary split. It must not add provider dispatch,
 provider-side queueing, an Invoice Processor change, UI, timers, notification
@@ -83,7 +89,8 @@ Slice phase: vertical slice
    reachability tests.
 8. Carry the migrated unresolved-marker horizon until it expires, preserve
    omitted size metadata as unknown, preflight edits before credential
-   reconciliation, and route CLI dry-runs through the production lock.
+   reconciliation, route CLI dry-runs through the production lock, validate
+   canonical bytes before mailbox access, and preserve the identity error code.
 
 ### Files touched
 
@@ -153,6 +160,9 @@ Acceptance criteria:
    only through their inherited horizon, omitted size differs from explicit
    zero, stale edits fail before account reconciliation, and CLI dry-runs load
    runtime only after acquiring the mailbox operation lock.
+10. Engine API tests prove a canonical-size failure performs no mailbox access
+    and a dry-run credential mismatch returns `mailbox_identity_changed` rather
+    than `runtime_error`.
 
 Affected surfaces: SQLite schema/migration; mailbox polling identity; pending
 message fetch; scheduling source joins/fetch; `mark_analyzed`; engine request
@@ -224,7 +234,9 @@ credential identity under that lock and Store verifies it again before commit.
 Existing-rule edits first perform a side-effect-free current-version/protection
 preflight inside that lock, then retain the Store CAS as the final authority.
 CLI dry-run and production checks both acquire the lock before constructing the
-runtime or reading mailbox identity.
+runtime or reading mailbox identity. Canonical bytes are validated before the
+mutation acquires mailbox authority and are revalidated by Store; watcher checks
+map the existing identity fence to its explicit domain error.
 
 ## Intentional
 
@@ -268,11 +280,16 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 
 ## Verification
 
-- `uv run ruff check .`
+- `uv run ruff check .` — `All checks passed!`
+- `uv run ruff format --check src/eom_email_watcher/engine_api.py tests/test_engine_api.py`
+  — `2 files already formatted`
 - `uv run ruff format --check <12 review-fix Python paths>` — `12 files already formatted`
 - review-fix boundary probes across retained/expired legacy markers,
   omitted/explicit-zero sizes, missing/stale/system edits, and CLI lock ordering
   — `13 passed`
+- exact-head boundary probes across the canonical exact byte limit, oversized
+  pre-runtime rejection, valid account-scoped commit, changed mailbox identity,
+  and unresolved legacy identity — `5 passed`
 - affected DB/service/provider/API/CLI suites — `443 passed in 48.75s`
 - focused parser/matcher tests in `tests/test_automation_rules.py`
 - focused Store/migration/atomicity tests in `tests/test_db.py`
@@ -281,7 +298,7 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 - focused concurrency probes for rule-write/analysis serialization, stale
   mailbox-session CAS rejection, and scoped verification/commit lock coverage —
   `3 passed`
-- `uv run pytest -o addopts='' --tb=short` — `1254 passed, 16 skipped in 66.59s`
+- `uv run pytest -o addopts='' --tb=short` — `1256 passed, 16 skipped in 77.21s`
 - `git diff --check` — clean
 - cold diff reconstruction against this Problem-derived contract before push
 
@@ -293,9 +310,9 @@ format gate reports `25 files already formatted`.
 
 | Surface | LOC |
 |---|---:|
-| Tracked runtime, scripts, and tests | 5,084 |
-| Plan | 301 |
-| **Total** | **5,385** |
+| Tracked runtime, scripts, and tests | 5,142 |
+| Plan | 318 |
+| **Total** | **5,460** |
 
 The overage is justified by the indivisible schema-20 vertical boundary stated
 above; dispatch and every UI/product surface remain excluded.
