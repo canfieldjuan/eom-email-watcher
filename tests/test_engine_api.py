@@ -4112,6 +4112,84 @@ def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     }
 
 
+def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'a' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    mailbox_identity_key = "a" * 64
+    runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        mailbox_identity_key,
+        legacy_status="replacement",
+    )
+    credentials_file = mail_account_token_file(runtime.config, account)
+    credentials_file.parent.mkdir(parents=True)
+    credentials_file.write_text("private credentials", encoding="utf-8")
+    local_message_id = scoped_message_id("imap", account.account_id, "provider-message")
+    runtime.store.add_message(
+        message_id=local_message_id,
+        provider="imap",
+        account_id=account.account_id,
+        provider_message_id="provider-message",
+        thread_id=None,
+        sender="a@example.com",
+        sender_name=None,
+        subject="Attachment",
+        received_at="2026-09-12T14:00:00+00:00",
+        mailbox_identity_key=mailbox_identity_key,
+    )
+    runtime.store.replace_attachments(
+        local_message_id,
+        (AttachmentDescriptor("mime-0", None, "invoice.pdf", "application/pdf", 198, 0),),
+    )
+    destination = tmp_path / "exports"
+    destination.mkdir()
+
+    class FakeAttachmentImap:
+        def attachment_bytes(
+            self, message_id: str, part_id: str, attachment_id: str | None
+        ) -> bytes:
+            assert (message_id, part_id, attachment_id) == (
+                "provider-message",
+                "mime-0",
+                None,
+            )
+            return b"%PDF"
+
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: FakeAttachmentImap() if path == credentials_file else pytest.fail(path),
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "attachment.export",
+            {
+                "message_id": local_message_id,
+                "part_id": "mime-0",
+                "destination_dir": str(destination),
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["byte_size"] == 4
+    assert Path(response["data"]["path"]).read_bytes() == b"%PDF"
+
+
 def test_attachment_export_rejects_an_unconfigured_account_before_provider_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

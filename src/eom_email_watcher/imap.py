@@ -11,12 +11,15 @@ from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from email import policy
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import decode_rfc2231, parseaddr, parsedate_to_datetime
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import unquote_to_bytes
 
 from .config import normalize_address
 from .mailbox import (
@@ -37,10 +40,13 @@ MAX_CA_FILE_BYTES = 256 * 1024
 MAX_CREDENTIAL_FILE_BYTES = MAX_CA_FILE_BYTES + 16 * 1024
 MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024
+MAX_BODYSTRUCTURE_BYTES = 1024 * 1024
 MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
+MAX_BODYSTRUCTURE_TOKENS = MAX_MIME_PARTS * 32
 MAX_ATTACHMENT_FILENAME_BYTES = 1024
 MAX_ATTACHMENT_FILENAME_TOTAL_BYTES = 64 * 1024
+MAX_PERSISTED_ATTACHMENT_BYTES = (1 << 63) - 1
 MAX_INCREMENTAL_MESSAGE_IDS = 200
 MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v2:"
@@ -51,8 +57,9 @@ _UID = re.compile(r"[1-9][0-9]*\Z")
 _MAILBOX_ID = re.compile(r"[0-9a-f]{64}\Z")
 _SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
 _INTERNAL_DATE = re.compile(rb'INTERNALDATE "([^"]+)"', re.IGNORECASE)
-_RFC822_SIZE = re.compile(rb"RFC822\.SIZE ([0-9]+)", re.IGNORECASE)
 _FETCH_UID = re.compile(rb"(?:^|[ (])UID ([1-9][0-9]*)(?:[ )]|$)", re.IGNORECASE)
+_IMAP_LITERAL_SUFFIX = re.compile(rb"\{([0-9]+)\+?\}\r?\n?\Z")
+_IMAP_SECTION = re.compile(r"(?:[1-9][0-9]*)(?:\.[1-9][0-9]*)*\Z")
 _ENGLISH_MONTHS = (
     "Jan",
     "Feb",
@@ -507,6 +514,553 @@ def _response_metadata(response: list[Any] | None) -> bytes:
         if isinstance(item, bytes):
             return item
     raise MailboxMessageUnavailable("The mail server message is no longer available")
+
+
+class _ImapQuoted(bytes):
+    """Marker that distinguishes an IMAP quoted string from an atom."""
+
+
+type _ImapValue = bytes | None | list[_ImapValue]
+
+
+@dataclass(frozen=True)
+class _ImapBodyPart:
+    section: str
+    media_type: str
+    transfer_encoding: str
+    charset: str | None
+    byte_size: int
+
+
+@dataclass(frozen=True)
+class _ImapAttachment:
+    section: str
+    transfer_encoding: str
+    is_multipart: bool
+    descriptor: AttachmentDescriptor
+
+
+@dataclass(frozen=True)
+class _ImapCatalog:
+    plain: tuple[_ImapBodyPart, ...]
+    html: tuple[_ImapBodyPart, ...]
+    attachments: tuple[_ImapAttachment, ...]
+
+
+class _ImapValueParser:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.position = 0
+        self.tokens = 0
+
+    def parse(self) -> list[_ImapValue]:
+        values: list[_ImapValue] = []
+        self._skip_spaces()
+        while self.position < len(self.data):
+            values.append(self._value(0))
+            self._skip_spaces()
+        return values
+
+    def _value(self, depth: int) -> _ImapValue:
+        self.tokens += 1
+        if self.tokens > MAX_BODYSTRUCTURE_TOKENS or depth > MAX_MIME_DEPTH + 8:
+            raise ValueError("IMAP data exceeds structural limits")
+        if self.position >= len(self.data):
+            raise ValueError("IMAP data ended early")
+        if self.data[self.position] == ord("("):
+            self.position += 1
+            values: list[_ImapValue] = []
+            self._skip_spaces()
+            while self.position < len(self.data) and self.data[self.position] != ord(")"):
+                values.append(self._value(depth + 1))
+                self._skip_spaces()
+            if self.position >= len(self.data):
+                raise ValueError("IMAP list ended early")
+            self.position += 1
+            return values
+        if self.data[self.position] == ord('"'):
+            return self._quoted()
+        start = self.position
+        while self.position < len(self.data) and self.data[self.position] not in b" ()\r\n\t":
+            self.position += 1
+        if start == self.position:
+            raise ValueError("IMAP atom is invalid")
+        atom = self.data[start : self.position]
+        return None if atom.upper() == b"NIL" else atom
+
+    def _quoted(self) -> _ImapQuoted:
+        self.position += 1
+        value = bytearray()
+        while self.position < len(self.data):
+            current = self.data[self.position]
+            self.position += 1
+            if current == ord('"'):
+                return _ImapQuoted(value)
+            if current == ord("\\"):
+                if self.position >= len(self.data):
+                    raise ValueError("IMAP quoted string ended early")
+                current = self.data[self.position]
+                self.position += 1
+            value.append(current)
+        raise ValueError("IMAP quoted string ended early")
+
+    def _skip_spaces(self) -> None:
+        while self.position < len(self.data) and self.data[self.position] in b" \r\n\t":
+            self.position += 1
+
+
+def _bodystructure_response_bytes(response: list[Any] | None) -> bytes:
+    output = bytearray()
+    for item in response or []:
+        if item is None:
+            continue
+        if isinstance(item, tuple) and len(item) == 2:
+            metadata, literal = item
+            if not isinstance(metadata, bytes) or not isinstance(literal, bytes):
+                raise ValueError("IMAP literal is invalid")
+            match = _IMAP_LITERAL_SUFFIX.search(metadata)
+            if match is None or int(match.group(1)) != len(literal):
+                raise ValueError("IMAP literal length is invalid")
+            output.extend(metadata[: match.start()])
+            output.extend(b'"')
+            output.extend(literal.replace(b"\\", b"\\\\").replace(b'"', b'\\"'))
+            output.extend(b'"')
+        elif isinstance(item, bytes):
+            output.extend(item)
+        else:
+            raise ValueError("IMAP response item is invalid")
+        output.extend(b" ")
+        if len(output) > MAX_BODYSTRUCTURE_BYTES:
+            raise ValueError("IMAP response exceeds the metadata limit")
+    if not output:
+        raise MailboxMessageUnavailable("The mail server message is no longer available")
+    return bytes(output)
+
+
+def _bodystructure(response: list[Any] | None, expected_uid: str) -> list[_ImapValue]:
+    try:
+        parsed = _ImapValueParser(_bodystructure_response_bytes(response)).parse()
+        candidates = [
+            value
+            for value in parsed
+            if isinstance(value, list)
+            and any(isinstance(item, bytes) and item.upper() == b"BODYSTRUCTURE" for item in value)
+        ]
+        if len(candidates) != 1:
+            raise ValueError("IMAP body structure response is ambiguous")
+        fetch_data = candidates[0]
+        uid_values = [
+            fetch_data[index + 1]
+            for index, value in enumerate(fetch_data[:-1])
+            if isinstance(value, bytes) and value.upper() == b"UID"
+        ]
+        structures = [
+            fetch_data[index + 1]
+            for index, value in enumerate(fetch_data[:-1])
+            if isinstance(value, bytes) and value.upper() == b"BODYSTRUCTURE"
+        ]
+        if uid_values != [expected_uid.encode("ascii")] or len(structures) != 1:
+            raise ValueError("IMAP fetch identity is invalid")
+        structure = structures[0]
+        if not isinstance(structure, list):
+            raise ValueError("IMAP body structure is invalid")
+        return structure
+    except MailboxMessageUnavailable:
+        raise
+    except (StopIteration, TypeError, ValueError) as exc:
+        raise MailboxMessageInvalid(
+            "imap_bodystructure_invalid", "Message MIME metadata is invalid"
+        ) from exc
+
+
+def _imap_text(value: _ImapValue) -> str | None:
+    if not isinstance(value, bytes):
+        return None
+    return value.decode("utf-8", errors="replace")
+
+
+def _imap_atom(value: _ImapValue, field: str) -> str:
+    decoded = _imap_text(value)
+    if decoded is None or not decoded or any(character.isspace() for character in decoded):
+        raise ValueError(f"IMAP {field} is invalid")
+    return decoded.casefold()
+
+
+def _imap_size(value: _ImapValue) -> int:
+    if not isinstance(value, bytes) or not value.isdigit():
+        raise ValueError("IMAP body size is invalid")
+    size = int(value)
+    if size < 0 or size > MAX_PERSISTED_ATTACHMENT_BYTES:
+        raise ValueError("IMAP body size is invalid")
+    return size
+
+
+def _section_payload(
+    response: list[Any] | None,
+    expected_uid: str,
+    expected_section: str,
+    byte_limit: int,
+) -> bytes:
+    expected_uid_bytes = expected_uid.encode("ascii")
+    expected_selector = f"BODY[{expected_section}]".encode("ascii").upper()
+    literal_items = [item for item in response or [] if isinstance(item, tuple) and len(item) == 2]
+    if literal_items:
+        if len(literal_items) != 1:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        metadata, payload = literal_items[0]
+        if not isinstance(metadata, bytes) or not isinstance(payload, bytes):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        returned_uids = [match.group(1) for match in _FETCH_UID.finditer(metadata)]
+        returned_section = re.compile(
+            rb"BODY\["
+            + re.escape(expected_section.encode("ascii"))
+            + rb"\](?:<0>)?\s*\{([0-9]+)\+?\}\r?\n?\Z",
+            re.IGNORECASE,
+        )
+        section_match = returned_section.search(metadata)
+        if (
+            returned_uids != [expected_uid_bytes]
+            or section_match is None
+            or int(section_match.group(1)) != len(payload)
+        ):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        extra_section = re.compile(
+            rb"BODY\[" + re.escape(expected_section.encode("ascii")) + rb"\]",
+            re.IGNORECASE,
+        )
+        if any(
+            isinstance(item, bytes) and extra_section.search(item) is not None
+            for item in response or []
+        ):
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        selected = payload
+    else:
+        encoded = bytearray()
+        for item in response or []:
+            if item is None:
+                continue
+            if not isinstance(item, bytes):
+                raise MailboxMessageUnavailable("The mail server message is no longer available")
+            if len(encoded) + len(item) + 1 > byte_limit + MAX_HEADER_BYTES:
+                raise MailboxMessageInvalid(
+                    "imap_message_too_large", "Message content exceeds the safe size limit"
+                )
+            encoded.extend(item)
+            encoded.extend(b" ")
+        if not encoded:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        try:
+            parsed = _ImapValueParser(bytes(encoded)).parse()
+        except ValueError as exc:
+            raise MailboxMessageUnavailable(
+                "The mail server message is no longer available"
+            ) from exc
+        selected_values: list[bytes] = []
+        for value in parsed:
+            if not isinstance(value, list):
+                continue
+            returned_uids = [
+                value[index + 1]
+                for index, item in enumerate(value[:-1])
+                if isinstance(item, bytes) and item.upper() == b"UID"
+            ]
+            returned_sections = [
+                value[index + 1]
+                for index, item in enumerate(value[:-1])
+                if isinstance(item, bytes)
+                and item.upper() in {expected_selector, expected_selector + b"<0>"}
+            ]
+            if not returned_sections:
+                continue
+            if (
+                returned_uids != [expected_uid_bytes]
+                or len(returned_sections) != 1
+                or not isinstance(returned_sections[0], _ImapQuoted)
+            ):
+                raise MailboxMessageUnavailable("The mail server message is no longer available")
+            selected_values.append(bytes(returned_sections[0]))
+        if len(selected_values) != 1:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        selected = selected_values[0]
+    if len(selected) > byte_limit:
+        raise MailboxMessageInvalid(
+            "imap_message_too_large", "Message content exceeds the safe size limit"
+        )
+    return selected
+
+
+def _imap_params(value: _ImapValue) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, list) or len(value) % 2:
+        raise ValueError("IMAP parameter list is invalid")
+    params: dict[str, str] = {}
+    for index in range(0, len(value), 2):
+        name = _imap_atom(value[index], "parameter name")
+        parameter_value = _imap_text(value[index + 1])
+        if parameter_value is None:
+            raise ValueError("IMAP parameter value is invalid")
+        params.setdefault(name, parameter_value)
+    return params
+
+
+def _decode_mime_words(value: str) -> str:
+    try:
+        return str(make_header(decode_header(value)))
+    except (HeaderParseError, LookupError, UnicodeError, ValueError):
+        return value
+
+
+def _decode_rfc2231_bytes(value: str) -> tuple[str | None, bytes]:
+    charset, _language, encoded = decode_rfc2231(value)
+    return charset, unquote_to_bytes(encoded)
+
+
+def _decode_parameter_bytes(value: bytes, charset: str | None) -> str:
+    try:
+        return value.decode(charset or "utf-8", errors="replace")
+    except LookupError:
+        return value.decode("utf-8", errors="replace")
+
+
+def _extended_parameter(params: dict[str, str], name: str) -> tuple[bool, str | None]:
+    exact = params.get(name)
+    single_extended = params.get(f"{name}*")
+    segment_pattern = re.compile(rf"{re.escape(name)}\*([0-9]+)(\*)?\Z")
+    segments: dict[int, tuple[bool, str]] = {}
+    marker = exact is not None or single_extended is not None
+    ambiguous = False
+    for key, value in params.items():
+        match = segment_pattern.fullmatch(key)
+        if match is None:
+            continue
+        marker = True
+        try:
+            index = int(match.group(1))
+        except ValueError:
+            ambiguous = True
+            continue
+        if index >= MAX_MIME_PARTS or index in segments:
+            ambiguous = True
+            continue
+        segments[index] = (match.group(2) is not None, value)
+
+    if segments:
+        if single_extended is not None or set(segments) != set(range(len(segments))):
+            ambiguous = True
+        if not ambiguous:
+            charset: str | None = None
+            output = bytearray()
+            for index in range(len(segments)):
+                encoded, value = segments[index]
+                if index == 0 and encoded:
+                    charset, decoded = _decode_rfc2231_bytes(value)
+                    output.extend(decoded)
+                elif encoded:
+                    output.extend(unquote_to_bytes(value))
+                else:
+                    output.extend(value.encode("utf-8", errors="replace"))
+            return True, _decode_mime_words(_decode_parameter_bytes(bytes(output), charset))
+        return True, None
+
+    if single_extended is not None:
+        charset, decoded = _decode_rfc2231_bytes(single_extended)
+        return True, _decode_mime_words(_decode_parameter_bytes(decoded, charset))
+    if exact is not None:
+        return True, _decode_mime_words(exact)
+    return marker, None
+
+
+def _imap_disposition(value: _ImapValue) -> tuple[str | None, dict[str, str]]:
+    if value is None:
+        return None, {}
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError("IMAP disposition is invalid")
+    return _imap_atom(value[0], "disposition"), _imap_params(value[1])
+
+
+def _catalog_from_bodystructure(structure: list[_ImapValue]) -> _ImapCatalog:
+    plain: list[_ImapBodyPart] = []
+    html: list[_ImapBodyPart] = []
+    attachments: list[_ImapAttachment] = []
+    filename_bytes = 0
+    visited = 0
+
+    def record_attachment(
+        *,
+        section: str,
+        media_type: str,
+        transfer_encoding: str,
+        byte_size: int,
+        filename: str | None,
+        is_multipart: bool = False,
+    ) -> None:
+        nonlocal filename_bytes
+        position = len(attachments)
+        selected_name = filename or _synthesized_attachment_name(position, media_type)
+        selected_bytes = len(selected_name.encode("utf-8", errors="replace"))
+        filename_bytes += selected_bytes
+        if (
+            selected_bytes > MAX_ATTACHMENT_FILENAME_BYTES
+            or filename_bytes > MAX_ATTACHMENT_FILENAME_TOTAL_BYTES
+        ):
+            raise MailboxMessageInvalid(
+                "imap_attachment_metadata_too_large",
+                "Message attachment metadata exceeds the safe size limit",
+            )
+        attachments.append(
+            _ImapAttachment(
+                section=section,
+                transfer_encoding=transfer_encoding,
+                is_multipart=is_multipart,
+                descriptor=AttachmentDescriptor(
+                    part_id=f"mime-{position}",
+                    attachment_id=None,
+                    filename=selected_name,
+                    media_type=media_type,
+                    byte_size=byte_size,
+                    position=position,
+                ),
+            )
+        )
+
+    def visit(value: list[_ImapValue], section: str, depth: int) -> None:
+        nonlocal visited
+        visited += 1
+        if visited > MAX_MIME_PARTS or depth > MAX_MIME_DEPTH or not value:
+            raise ValueError("IMAP MIME structure exceeds limits")
+        multipart = isinstance(value[0], list)
+        if multipart:
+            child_count = 0
+            while child_count < len(value) and isinstance(value[child_count], list):
+                child_count += 1
+            if child_count == 0 or child_count >= len(value):
+                raise ValueError("IMAP multipart structure is invalid")
+            subtype = _imap_atom(value[child_count], "multipart subtype")
+            params_index = child_count + 1
+            params = _imap_params(value[params_index]) if params_index < len(value) else {}
+            disposition_index = child_count + 2
+            disposition, disposition_params = (
+                _imap_disposition(value[disposition_index])
+                if disposition_index < len(value)
+                else (None, {})
+            )
+            disposition_marker, disposition_filename = _extended_parameter(
+                disposition_params, "filename"
+            )
+            type_marker, type_filename = _extended_parameter(params, "name")
+            filename = disposition_filename or type_filename
+            attachment = disposition == "attachment" or disposition_marker or type_marker
+            if attachment:
+                record_attachment(
+                    section=section,
+                    media_type=f"multipart/{subtype}",
+                    transfer_encoding="binary",
+                    byte_size=0,
+                    filename=filename,
+                    is_multipart=True,
+                )
+                return
+            for index, child in enumerate(value[:child_count], start=1):
+                if not isinstance(child, list):
+                    raise ValueError("IMAP multipart child is invalid")
+                child_section = f"{section}.{index}" if section else str(index)
+                visit(child, child_section, depth + 1)
+            return
+
+        if len(value) < 7:
+            raise ValueError("IMAP single-part structure is incomplete")
+        maintype = _imap_atom(value[0], "media type")
+        subtype = _imap_atom(value[1], "media subtype")
+        params = _imap_params(value[2])
+        transfer_encoding = _imap_atom(value[5], "transfer encoding")
+        if transfer_encoding not in {"7bit", "8bit", "binary", "base64", "quoted-printable"}:
+            raise ValueError("IMAP transfer encoding is unsupported")
+        byte_size = _imap_size(value[6])
+        if maintype == "message" and subtype == "rfc822":
+            disposition_index = 11
+        elif maintype == "text":
+            disposition_index = 9
+        else:
+            disposition_index = 8
+        disposition, disposition_params = (
+            _imap_disposition(value[disposition_index])
+            if disposition_index < len(value)
+            else (None, {})
+        )
+        disposition_marker, disposition_filename = _extended_parameter(
+            disposition_params, "filename"
+        )
+        type_marker, type_filename = _extended_parameter(params, "name")
+        filename = disposition_filename or type_filename
+        media_type = f"{maintype}/{subtype}"
+        attachment = disposition == "attachment" or disposition_marker or type_marker
+        if attachment:
+            record_attachment(
+                section=section,
+                media_type=media_type,
+                transfer_encoding=transfer_encoding,
+                byte_size=byte_size,
+                filename=filename,
+            )
+            return
+        if maintype == "message" and subtype == "rfc822":
+            if len(value) < 10 or not isinstance(value[8], list):
+                raise ValueError("IMAP message body structure is invalid")
+            nested = value[8]
+            nested_section = section if nested and isinstance(nested[0], list) else f"{section}.1"
+            visit(nested, nested_section, depth + 1)
+            return
+        if maintype != "text" or subtype not in {"plain", "html"}:
+            return
+        part = _ImapBodyPart(
+            section=section,
+            media_type=media_type,
+            transfer_encoding=transfer_encoding,
+            charset=params.get("charset"),
+            byte_size=byte_size,
+        )
+        (plain if subtype == "plain" else html).append(part)
+
+    try:
+        root_section = "" if structure and isinstance(structure[0], list) else "1"
+        visit(structure, root_section, 0)
+    except MailboxMessageInvalid:
+        raise
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise MailboxMessageInvalid(
+            "imap_bodystructure_invalid", "Message MIME metadata is invalid"
+        ) from exc
+    return _ImapCatalog(tuple(plain), tuple(html), tuple(attachments))
+
+
+def _decoded_section(payload: bytes, transfer_encoding: str) -> bytes:
+    synthetic = f"Content-Transfer-Encoding: {transfer_encoding}\r\n\r\n".encode("ascii") + payload
+    try:
+        parsed = BytesParser(policy=policy.default).parsebytes(synthetic)
+        decoded = parsed.get_payload(decode=True)
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid") from exc
+    if not isinstance(decoded, bytes):
+        raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid")
+    return decoded
+
+
+def _multipart_attachment_prefix(headers: bytes, expected_media_type: str) -> bytes:
+    normalized = headers.rstrip(b"\r\n") + b"\r\n\r\n"
+    try:
+        parsed = BytesParser(policy=policy.default).parsebytes(normalized, headersonly=True)
+        content_type = parsed.get_content_type().casefold()
+        boundary = parsed.get_boundary()
+    except (HeaderParseError, RecursionError, TypeError, UnicodeError, ValueError) as exc:
+        raise MailboxMessageInvalid(
+            "imap_message_invalid", "Message attachment headers are invalid"
+        ) from exc
+    if content_type != expected_media_type or not boundary:
+        raise MailboxMessageInvalid(
+            "imap_message_invalid", "Message attachment headers are invalid"
+        )
+    return normalized
 
 
 def _message_date(metadata: bytes, message: Message) -> str:
@@ -1032,40 +1586,100 @@ class ImapGateway:
             labels=frozenset({"INBOX"}),
         )
 
-    def _raw_message(self, message_id: str) -> EmailMessage:
-        with self._mailbox() as client:
-            uid = self._checked_uid(client, message_id)
-            status, size_response = client.uid("FETCH", uid, "(UID RFC822.SIZE)")
-            if status != "OK":
-                raise ImapError("imap_protocol_error", "Mail server size fetch failed; retry")
-            size_metadata = _response_metadata(size_response)
-            size_match = _RFC822_SIZE.search(size_metadata)
-            if size_match is None:
-                raise ImapError("imap_protocol_error", "Mail server omitted message size")
-            if int(size_match.group(1)) > MAX_MESSAGE_BYTES:
-                raise MailboxMessageInvalid(
-                    "imap_message_too_large", "Message exceeds the safe size limit"
-                )
-            status, response = client.uid("FETCH", uid, "(UID BODY.PEEK[])")
-            if status != "OK":
-                raise ImapError("imap_protocol_error", "Mail server content fetch failed; retry")
-            _metadata, payload = _literal(response)
-        if len(payload) > MAX_MESSAGE_BYTES:
+    @staticmethod
+    def _catalog(client: imaplib.IMAP4, uid: str) -> _ImapCatalog:
+        status, response = client.uid("FETCH", uid, "(UID BODYSTRUCTURE)")
+        if status != "OK":
+            raise ImapError("imap_protocol_error", "Mail server MIME metadata fetch failed; retry")
+        return _catalog_from_bodystructure(_bodystructure(response, uid))
+
+    @staticmethod
+    def _fetch_section_bytes(
+        client: imaplib.IMAP4,
+        uid: str,
+        section: str,
+        byte_limit: int,
+    ) -> bytes:
+        numbered_section = _IMAP_SECTION.fullmatch(section)
+        mime_section = section.endswith(".MIME") and _IMAP_SECTION.fullmatch(section[:-5])
+        if section and numbered_section is None and not mime_section:
             raise MailboxMessageInvalid(
-                "imap_message_too_large", "Message exceeds the safe size limit"
+                "imap_bodystructure_invalid", "Message MIME metadata is invalid"
             )
-        try:
-            parsed = BytesParser(policy=policy.default).parsebytes(payload)
-        except RecursionError as exc:
+        if byte_limit < 0 or byte_limit > MAX_MESSAGE_BYTES:
             raise MailboxMessageInvalid(
-                "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
-            ) from exc
-        if not isinstance(parsed, EmailMessage):
-            raise MailboxMessageInvalid("imap_message_invalid", "Message content is invalid")
-        return parsed
+                "imap_message_too_large", "Message content exceeds the safe size limit"
+            )
+        status, response = client.uid(
+            "FETCH",
+            uid,
+            f"(UID BODY.PEEK[{section}]<0.{byte_limit + 1}>)",
+        )
+        if status != "OK":
+            raise ImapError("imap_protocol_error", "Mail server content fetch failed; retry")
+        return _section_payload(response, uid, section, byte_limit)
+
+    @classmethod
+    def _section_bytes(
+        cls,
+        client: imaplib.IMAP4,
+        uid: str,
+        part: _ImapBodyPart | _ImapAttachment,
+        *,
+        byte_limit: int = MAX_MESSAGE_BYTES,
+    ) -> bytes:
+        root_attachment = isinstance(part, _ImapAttachment) and not part.section
+        if not root_attachment and _IMAP_SECTION.fullmatch(part.section) is None:
+            raise MailboxMessageInvalid(
+                "imap_bodystructure_invalid", "Message MIME metadata is invalid"
+            )
+        expected_size = (
+            part.byte_size if isinstance(part, _ImapBodyPart) else part.descriptor.byte_size
+        )
+        if expected_size > MAX_MESSAGE_BYTES:
+            raise MailboxMessageInvalid(
+                "imap_message_too_large", "Message content exceeds the safe size limit"
+            )
+        if isinstance(part, _ImapAttachment) and part.is_multipart and part.section:
+            headers = cls._fetch_section_bytes(
+                client, uid, f"{part.section}.MIME", MAX_HEADER_BYTES
+            )
+            prefix = _multipart_attachment_prefix(headers, part.descriptor.media_type)
+            remaining = MAX_MESSAGE_BYTES - len(prefix)
+            body = cls._fetch_section_bytes(client, uid, part.section, remaining)
+            return prefix + body
+        return cls._fetch_section_bytes(client, uid, part.section, byte_limit)
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        return _content(self._raw_message(message_id), body_char_limit)
+        with self._mailbox() as client:
+            uid = self._checked_uid(client, message_id)
+            catalog = self._catalog(client, uid)
+            selected_parts = catalog.plain if catalog.plain else catalog.html
+            if sum(part.byte_size for part in selected_parts) > MAX_MESSAGE_BYTES:
+                raise MailboxMessageInvalid(
+                    "imap_message_too_large", "Message content exceeds the safe size limit"
+                )
+            rendered: list[str] = []
+            remaining_bytes = MAX_MESSAGE_BYTES
+            for part in selected_parts:
+                section = self._section_bytes(
+                    client,
+                    uid,
+                    part,
+                    byte_limit=remaining_bytes,
+                )
+                remaining_bytes -= len(section)
+                decoded = _decoded_section(section, part.transfer_encoding)
+                try:
+                    text = decoded.decode(part.charset or "utf-8", errors="replace")
+                except LookupError:
+                    text = decoded.decode("utf-8", errors="replace")
+                rendered.append(html_to_text(text) if part.media_type == "text/html" else text)
+        selected = "\n\n".join(rendered)
+        body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
+        descriptors = tuple(attachment.descriptor for attachment in catalog.attachments)
+        names = tuple(dict.fromkeys(item.filename for item in descriptors))
+        return MessageContent(body[:body_char_limit], names, descriptors)
 
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if attachment_id is not None or not part_id.startswith("mime-"):
@@ -1076,9 +1690,13 @@ class ImapGateway:
             raise MailboxMessageUnavailable(
                 "The mail server attachment identity is invalid"
             ) from exc
-        _message_content, attachments = _content_and_attachment_payloads(
-            self._raw_message(message_id), 0
-        )
-        if selected < 0 or selected >= len(attachments):
-            raise MailboxMessageUnavailable("The mail server attachment is no longer available")
-        return attachments[selected]
+        with self._mailbox() as client:
+            uid = self._checked_uid(client, message_id)
+            catalog = self._catalog(client, uid)
+            if selected < 0 or selected >= len(catalog.attachments):
+                raise MailboxMessageUnavailable("The mail server attachment is no longer available")
+            attachment = catalog.attachments[selected]
+            payload = self._section_bytes(client, uid, attachment)
+        if attachment.is_multipart:
+            return payload
+        return _decoded_section(payload, attachment.transfer_encoding)

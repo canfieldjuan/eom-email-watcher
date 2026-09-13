@@ -9,6 +9,7 @@ import pytest
 
 from eom_email_watcher import connect, engine_api
 from eom_email_watcher.db import ConnectQueueFull, MessageSource
+from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
@@ -16,7 +17,7 @@ from eom_email_watcher.mailbox import (
     MailboxMessageUnavailable,
 )
 from eom_email_watcher.mime import AttachmentDescriptor
-from eom_email_watcher.runtime import Runtime, load_runtime
+from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
 
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
 INSTANCE_B = "22222222-2222-4222-8222-222222222222"
@@ -419,6 +420,54 @@ def seeded_runtime(tmp_path: Path):
     return config_path, runtime
 
 
+def seeded_imap_runtime(tmp_path: Path, *, descriptor_size: int):
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    account = runtime.store.register_mail_account(
+        "imap",
+        f"imap-{'a' * 32}",
+        display_name="Other mail server",
+        address="owner@example.com",
+        active=True,
+    )
+    runtime.store.reconcile_mailbox_identity(
+        account.provider,
+        account.account_id,
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+    )
+    credentials_file = mail_account_token_file(runtime.config, account)
+    credentials_file.parent.mkdir(parents=True)
+    credentials_file.write_text("private credentials", encoding="utf-8")
+    runtime.store.add_message(
+        message_id="message-1",
+        provider="imap",
+        account_id=account.account_id,
+        provider_message_id="provider-message",
+        thread_id=None,
+        sender="private@example.com",
+        sender_name="Private Sender",
+        subject="Private subject",
+        received_at="2026-09-12T12:00:00+00:00",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    runtime.store.replace_attachments(
+        "message-1",
+        (
+            AttachmentDescriptor(
+                "mime-0",
+                None,
+                "invoice.pdf",
+                "application/pdf",
+                descriptor_size,
+                0,
+            ),
+        ),
+    )
+    return config_path, runtime, credentials_file
+
+
 def seed_second_attachment(runtime: Runtime) -> None:
     runtime.store.add_message(
         message_id="message-2",
@@ -596,6 +645,223 @@ def test_attachment_capabilities_are_contextual_and_do_not_expose_transport_secr
     assert response["data"]["items"][0]["capability"]["id"] == "document.translate"
     assert TOKEN not in str(response)
     assert "127.0.0.1" not in str(response)
+
+
+@pytest.mark.parametrize(
+    ("descriptor_size", "expected_items"),
+    [(MAX_IMAP_MESSAGE_BYTES, 1), (MAX_IMAP_MESSAGE_BYTES + 1, 0)],
+)
+def test_imap_capability_discovery_respects_the_local_fetch_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor_size: int,
+    expected_items: int,
+) -> None:
+    config_path, runtime, _credentials_file = seeded_imap_runtime(
+        tmp_path, descriptor_size=descriptor_size
+    )
+    accepted = capability()
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((accepted,)),
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.capabilities",
+            {"message_id": "message-1", "part_id": "mime-0"},
+        )
+    )
+
+    assert response["ok"] is True
+    assert len(response["data"]["items"]) == expected_items
+
+
+@pytest.mark.parametrize("descriptor_size", [4096, MAX_IMAP_MESSAGE_BYTES])
+def test_imap_generic_invoke_uses_actual_download_size_for_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, descriptor_size: int
+) -> None:
+    config_path, runtime, credentials_file = seeded_imap_runtime(
+        tmp_path, descriptor_size=descriptor_size
+    )
+    selected = capability()
+    payload = invocation_payload(selected)
+    payload["part_id"] = "mime-0"
+
+    class FakeImap:
+        def attachment_bytes(self, *args: object) -> bytes:
+            assert args == ("provider-message", "mime-0", None)
+            return PDF
+
+    class CompletingClient:
+        def __init__(self, capability_value: connect.DiscoveredCapability):
+            assert capability_value == selected
+
+        def submit(
+            self, job: connect.PreparedCapabilityJob, content: bytes
+        ) -> connect.CapabilityJobUpdate:
+            assert job.artifact.byte_size == len(PDF)
+            assert content == PDF
+            return update(job, "accepted")
+
+        def wait_for_terminal(
+            self,
+            job: connect.PreparedCapabilityJob,
+            initial: connect.CapabilityJobUpdate,
+            on_update,
+        ) -> connect.CapabilityJobUpdate:
+            assert initial.status == "accepted"
+            completed = update(job, "completed", payload=b"done")
+            on_update(completed)
+            return completed
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: FakeImap() if path == credentials_file else pytest.fail(path),
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
+
+    response = engine_api._response(api_request(config_path, "connect.attachment.invoke", payload))
+
+    assert response["ok"] is True
+    job = runtime.store.connect_job(REQUEST_ID)
+    assert job is not None
+    assert job.input_byte_size == len(PDF)
+
+
+def test_imap_generic_invoke_rejects_descriptor_over_local_fetch_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime, credentials_file = seeded_imap_runtime(
+        tmp_path, descriptor_size=MAX_IMAP_MESSAGE_BYTES + 1
+    )
+    selected = capability()
+    payload = invocation_payload(selected)
+    payload["part_id"] = "mime-0"
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: pytest.fail(f"oversized descriptor opened {path}"),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("oversized descriptor reached the provider"),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.attachment.invoke", payload))
+
+    assert response["error"]["code"] == "unsupported_attachment"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert credentials_file.exists()
+
+
+def test_imap_generic_invoke_rechecks_local_fetch_ceiling_under_source_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime, credentials_file = seeded_imap_runtime(tmp_path, descriptor_size=1)
+    selected = capability()
+    payload = invocation_payload(selected)
+    payload["part_id"] = "mime-0"
+
+    class MutatingSourceLock:
+        def __enter__(self) -> None:
+            runtime.store.replace_attachments(
+                "message-1",
+                (
+                    AttachmentDescriptor(
+                        "mime-0",
+                        None,
+                        "invoice.pdf",
+                        "application/pdf",
+                        MAX_IMAP_MESSAGE_BYTES + 1,
+                        0,
+                    ),
+                ),
+            )
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "connect_operation_lock",
+        lambda *_args: MutatingSourceLock(),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: pytest.fail(f"changed descriptor opened {path}"),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("changed descriptor reached the provider"),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.attachment.invoke", payload))
+
+    assert response["error"]["code"] == "connect_source_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
+    assert credentials_file.exists()
+
+
+def test_imap_generic_invoke_rejects_actual_bytes_over_capability_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime, credentials_file = seeded_imap_runtime(tmp_path, descriptor_size=1)
+    selected = capability()
+    payload = invocation_payload(selected)
+    payload["part_id"] = "mime-0"
+
+    class OversizedImap:
+        def attachment_bytes(self, *args: object) -> bytes:
+            return b"X" * 1025
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api.ImapGateway,
+        "from_credentials_file",
+        lambda path: OversizedImap() if path == credentials_file else pytest.fail(path),
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "ConnectV2Client",
+        lambda *_args: pytest.fail("oversized IMAP content reached the provider"),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.attachment.invoke", payload))
+
+    assert response["error"]["code"] == "connect_source_unavailable"
+    assert runtime.store.connect_job(REQUEST_ID) is None
 
 
 def test_invoke_rejects_stale_capability_version_before_handoff(
