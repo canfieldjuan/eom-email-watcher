@@ -19,6 +19,7 @@ from eom_email_watcher.gmail import (
 from eom_email_watcher.imap import ImapGateway
 from eom_email_watcher.mailbox import (
     MailboxChanges,
+    MailboxError,
     MailboxMessageInvalid,
     MailboxSession,
     MessageContent,
@@ -2558,6 +2559,50 @@ def test_stale_cursor_recovers_with_search(tmp_path: Path) -> None:
     result = Watcher(cfg, store, FakeGmail(stale=True), FakeModel()).check()
     assert result["stale_cursor_recovered"] is True
     assert store.state()[0] == "200"
+
+
+@pytest.mark.parametrize(
+    ("received_offset", "blocked"),
+    [(timedelta(0), True), (-timedelta(days=2), False)],
+)
+def test_unresolved_legacy_identity_blocks_stale_recovery_only_for_retained_markers(
+    tmp_path: Path,
+    received_offset: timedelta,
+    blocked: bool,
+) -> None:
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    observed_at = datetime.now(UTC)
+    store.set_state("old", observed_at - timedelta(minutes=10))
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
+        db.execute(
+            """INSERT INTO messages(
+                message_id, provider, account_id, provider_message_id,
+                sender, subject, received_at, discovered_at, mailbox_identity_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                "legacy-marker",
+                "gmail",
+                "gmail-default",
+                "legacy-marker",
+                "trusted@example.com",
+                "Legacy marker",
+                (observed_at + received_offset).isoformat(),
+                observed_at.isoformat(),
+            ),
+        )
+    gmail = FakeGmail(stale=True)
+
+    if blocked:
+        with pytest.raises(MailboxError, match="legacy mailbox identity"):
+            Watcher(cfg, store, gmail, FakeModel()).check()
+        assert gmail.search_since_value is None
+    else:
+        result = Watcher(cfg, store, gmail, FakeModel()).check()
+        assert result["stale_cursor_recovered"] is True
+        assert gmail.search_since_value is not None
 
 
 def test_stale_cursor_recovery_is_bounded_by_retention_before_content_fetch(

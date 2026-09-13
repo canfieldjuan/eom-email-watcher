@@ -627,7 +627,7 @@ class Microsoft365Gateway:
                 filename = item.get("name")
                 if not isinstance(filename, str) or not filename.strip():
                     continue
-                raw_size = item.get("size", 0)
+                raw_size = item.get("size")
                 byte_size_known = (
                     isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
                 )

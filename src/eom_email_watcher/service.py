@@ -86,6 +86,10 @@ from .scheduling import (
 logger = logging.getLogger(__name__)
 
 
+class LegacyMailboxIdentityUnverified(MailboxError):
+    """Stale recovery cannot safely cross retained pre-identity markers."""
+
+
 def _acknowledge_gateway_result(
     model: ModelRuntime,
     request_id: str,
@@ -1224,7 +1228,24 @@ class Watcher:
         recovered = False
         try:
             changes = self.gateway.changes_since(cursor)
-        except StaleMailboxCursor:
+        except StaleMailboxCursor as exc:
+            account = self.store.mail_account(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+            )
+            if (
+                account is not None
+                and account.legacy_identity_status == "unresolved"
+                and self.store.has_unexpired_legacy_mailbox_markers(
+                    self.mailbox.provider,
+                    self.mailbox.account_id,
+                    retention_cutoff=retention_cutoff,
+                    now=checked_at,
+                )
+            ):
+                raise LegacyMailboxIdentityUnverified(
+                    "Stale recovery is blocked by unresolved legacy mailbox identity markers"
+                ) from exc
             recovered = True
             since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
             since = max(since, retention_cutoff)

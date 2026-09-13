@@ -3491,6 +3491,11 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
         scheduling_columns_before = [
             row["name"] for row in db.execute("PRAGMA table_info(automation_runs)")
         ]
+        db.execute(
+            """INSERT INTO suppressed_messages(provider, account_id, message_key, expires_at)
+            VALUES ('gmail', 'gmail-default', ?, '2026-10-01T00:00:00+00:00')""",
+            ("a" * 64,),
+        )
         db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
         db.execute("DROP TRIGGER messages_require_rule_revision_completion")
         db.execute("DROP TRIGGER messages_delete_pending_automation_fires")
@@ -3500,6 +3505,7 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
         db.execute("DROP TABLE automation_rules")
         db.execute("DROP TABLE automation_rule_set")
         db.execute("DROP TABLE automation_run_source_identities")
+        db.execute("DROP TABLE legacy_mailbox_markers")
         db.execute("DROP INDEX idx_messages_source_identity_v20")
         db.execute(
             """CREATE UNIQUE INDEX idx_messages_source_identity
@@ -3518,6 +3524,20 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
         db.execute("PRAGMA user_version = 19")
 
     store.initialize()
+
+    retention_cutoff = datetime(2026, 9, 2, tzinfo=UTC)
+    assert store.has_unexpired_legacy_mailbox_markers(
+        "gmail",
+        "gmail-default",
+        retention_cutoff=retention_cutoff,
+        now=datetime(2026, 9, 15, tzinfo=UTC),
+    )
+    assert not store.has_unexpired_legacy_mailbox_markers(
+        "gmail",
+        "gmail-default",
+        retention_cutoff=retention_cutoff,
+        now=datetime(2026, 10, 2, tzinfo=UTC),
+    )
 
     with store.connection() as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION

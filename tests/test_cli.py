@@ -164,7 +164,12 @@ def test_second_production_check_stops_before_gmail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _check_config(tmp_path)
-    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    monkeypatch.setattr(cli, "load_config", lambda path: config, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "_runtime",
+        lambda path: pytest.fail("contended check must not construct runtime"),
+    )
     monkeypatch.setattr(
         cli,
         "run_watcher_check",
@@ -178,7 +183,7 @@ def test_second_production_check_stops_before_gmail(
         cli._check(tmp_path / "config.toml", dry_run=False)
 
 
-def test_production_check_reloads_runtime_after_acquiring_lock(
+def test_production_check_loads_runtime_after_acquiring_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stale_config = SimpleNamespace(
@@ -195,18 +200,24 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
             "retention_days": 1,
         }
     )
-    runtimes = iter(
-        (
-            (stale_config, object(), object()),
-            (fresh_config, object(), object()),
-        )
-    )
-    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return fresh_config, object(), object()
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
 
     @contextmanager
     def acquired_lock(database_file: Path):
+        nonlocal lock_held
         assert database_file == stale_config.database_file
-        yield
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 
@@ -220,19 +231,37 @@ def test_production_check_reloads_runtime_after_acquiring_lock(
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
 
 
-def test_dry_run_does_not_take_production_lock(
+def test_dry_run_loads_runtime_after_acquiring_production_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _check_config(tmp_path)
-    monkeypatch.setattr(cli, "_runtime", lambda path: (config, object(), object()))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return config, object(), object()
+
+    @contextmanager
+    def acquired_lock(database_file: Path):
+        nonlocal lock_held
+        assert database_file == config.database_file
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
+    monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
     monkeypatch.setattr(
         cli,
         "run_watcher_check",
         lambda config, store, model, *, dry_run: {"dry_run": dry_run},
     )
 
-    with cli._production_check_lock(config.database_file):
-        assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
+    assert cli._check(tmp_path / "config.toml", dry_run=True) == 0
+    assert lock_held is False
 
 
 def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
@@ -258,18 +287,24 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
             assert retention_days == 1
             return 2
 
-    runtimes = iter(
-        (
-            (stale_config, object(), object()),
-            (fresh_config, FakeStore(), object()),
-        )
-    )
-    monkeypatch.setattr(cli, "_runtime", lambda path: next(runtimes))
+    lock_held = False
+    monkeypatch.setattr(cli, "load_config", lambda path: stale_config, raising=False)
+
+    def runtime(path: Path):
+        assert lock_held is True
+        return fresh_config, FakeStore(), object()
+
+    monkeypatch.setattr(cli, "_runtime", runtime)
 
     @contextmanager
     def acquired_lock(database_file: Path):
+        nonlocal lock_held
         assert database_file == stale_config.database_file
-        yield
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
 
     monkeypatch.setattr(cli, "_production_check_lock", acquired_lock)
 

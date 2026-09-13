@@ -343,6 +343,13 @@ CREATE TABLE IF NOT EXISTS automation_rule_set (
     revision INTEGER NOT NULL CHECK (revision >= 0)
 );
 INSERT OR IGNORE INTO automation_rule_set(id, revision) VALUES (1, 0);
+CREATE TABLE IF NOT EXISTS legacy_mailbox_markers (
+    provider TEXT NOT NULL CHECK (provider <> ''),
+    account_id TEXT NOT NULL CHECK (account_id <> ''),
+    message_key TEXT NOT NULL CHECK (length(message_key) = 64),
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id, message_key)
+);
 CREATE TABLE IF NOT EXISTS automation_rules (
     rule_id TEXT PRIMARY KEY CHECK (length(rule_id) = 36),
     current_version INTEGER NOT NULL CHECK (current_version >= 1),
@@ -1683,6 +1690,12 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
             else "status <> 'pending'"
         )
         db.execute(f"UPDATE messages SET rules_revision_at_analysis = 0 WHERE {analyzed_predicate}")
+        db.execute(
+            """INSERT OR IGNORE INTO legacy_mailbox_markers(
+                provider, account_id, message_key, expires_at
+            ) SELECT provider, account_id, message_key, expires_at
+            FROM suppressed_messages"""
+        )
 
     db.execute("DROP INDEX IF EXISTS idx_messages_source_identity")
     db.execute(
@@ -3441,6 +3454,42 @@ class Store:
         with self.connection() as db:
             return (
                 db.execute("SELECT 1 FROM messages WHERE message_id = ?", (message_id,)).fetchone()
+                is not None
+            )
+
+    def has_unexpired_legacy_mailbox_markers(
+        self,
+        provider: str,
+        account_id: str,
+        *,
+        retention_cutoff: datetime,
+        now: datetime | None = None,
+    ) -> bool:
+        cutoff = retention_cutoff.astimezone(UTC)
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        cutoff_epoch = (cutoff - epoch).total_seconds()
+        observed_epoch = (observed_at - epoch).total_seconds()
+        with self.connection() as db:
+            return (
+                db.execute(
+                    """SELECT 1 FROM messages
+                    WHERE provider = ?1 AND account_id = ?2
+                      AND mailbox_identity_key IS NULL
+                      AND (
+                          aware_iso_epoch(received_at) IS NULL
+                          OR aware_iso_epoch(received_at) >= ?3
+                      )
+                    UNION ALL
+                    SELECT 1 FROM legacy_mailbox_markers
+                    WHERE provider = ?1 AND account_id = ?2
+                      AND (
+                          aware_iso_epoch(expires_at) IS NULL
+                          OR aware_iso_epoch(expires_at) >= ?4
+                      )
+                    LIMIT 1""",
+                    (provider, account_id, cutoff_epoch, observed_epoch),
+                ).fetchone()
                 is not None
             )
 

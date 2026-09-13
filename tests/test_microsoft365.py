@@ -469,6 +469,12 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
                             "size": 1234,
                         },
                         {
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "id": "attachment-unknown",
+                            "name": "unknown.pdf",
+                            "contentType": "application/pdf",
+                        },
+                        {
                             "@odata.type": "#microsoft.graph.itemAttachment",
                             "id": "ignored-item",
                             "name": "forwarded.eml",
@@ -506,8 +512,12 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
     assert metadata.subject == "Invoice"
     assert metadata.labels == frozenset({"INBOX"})
     assert content.body == "First line\nSecond line"
-    assert content.attachment_names == ("invoice.pdf",)
+    assert content.attachment_names == ("invoice.pdf", "unknown.pdf")
     assert attachment.media_type == "application/pdf"
+    assert attachment.byte_size == 1234
+    assert attachment.byte_size_known is True
+    assert content.attachments[1].byte_size == 0
+    assert content.attachments[1].byte_size_known is False
     assert payload == b"pdf-bytes"
     assert all('IdType="ImmutableId"' in request.headers["prefer"] for request in requests)
     content_request = next(

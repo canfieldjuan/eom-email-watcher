@@ -130,6 +130,7 @@ from .runtime import (
     microsoft_calendar_token_file,
 )
 from .service import (
+    LegacyMailboxIdentityUnverified,
     decide_scheduling_proposal,
     reconcile_mailbox_session_identity,
     run_watcher_check,
@@ -1596,13 +1597,20 @@ def _check(request: dict[str, object]) -> dict[str, object]:
 
     def run(active_runtime: Runtime) -> dict[str, object]:
         _require_host_delivery_compatible(active_runtime)
-        result = run_watcher_check(
-            active_runtime.config,
-            active_runtime.store,
-            active_runtime.model,
-            dry_run=dry_run,
-            deliver_notifications=False,
-        )
+        try:
+            result = run_watcher_check(
+                active_runtime.config,
+                active_runtime.store,
+                active_runtime.model,
+                dry_run=dry_run,
+                deliver_notifications=False,
+            )
+        except LegacyMailboxIdentityUnverified as exc:
+            raise ApiError(
+                "legacy_mailbox_identity_unverified",
+                str(exc),
+                retryable=True,
+            ) from exc
         return {
             **result,
             "pending_notifications": _host_notification_intent_count(active_runtime),
@@ -1749,6 +1757,13 @@ def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
 
     def put(runtime: Runtime) -> dict[str, object]:
         try:
+            if rule_id is not None:
+                assert expected_version is not None
+                current = runtime.store.automation_rule(rule_id)
+                if current.summary.version != expected_version:
+                    raise AutomationRuleStale("automation rule version is stale")
+                if current.summary.system:
+                    raise AutomationRuleSystemProtected("system automation rule is protected")
             scope_identity = _automation_rule_scope_identity(runtime, definition)
             rule = runtime.store.put_automation_rule(
                 payload["definition"],

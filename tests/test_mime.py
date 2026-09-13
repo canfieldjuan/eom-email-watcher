@@ -153,6 +153,21 @@ def test_zero_attachment_size_remains_known() -> None:
     assert attachments[0].byte_size_known is True
 
 
+def test_omitted_attachment_size_remains_unknown() -> None:
+    _body, _attachment_names, attachments = extract_body(
+        {
+            "mimeType": "application/pdf",
+            "partId": "unknown",
+            "filename": "unknown.pdf",
+            "body": {"attachmentId": "unknown"},
+        },
+        20_000,
+    )
+
+    assert attachments[0].byte_size == 0
+    assert attachments[0].byte_size_known is False
+
+
 def test_duplicate_part_ids_keep_first_descriptor_and_stable_positions() -> None:
     _, attachment_names, attachments = extract_body(
         {

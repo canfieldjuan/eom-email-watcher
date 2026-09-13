@@ -104,7 +104,7 @@ def extract_body(
                     if isinstance(raw_attachment_id, str) and raw_attachment_id.strip()
                     else None
                 )
-                raw_size = body.get("size", 0)
+                raw_size = body.get("size")
                 byte_size_known = (
                     isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
                 )

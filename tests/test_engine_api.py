@@ -4563,6 +4563,31 @@ def test_check_defers_delivery_until_state_checked_ack(
     assert duplicate["data"]["status"] == "already_acknowledged"
 
 
+def test_check_maps_unresolved_legacy_recovery_to_retryable_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            engine_api.LegacyMailboxIdentityUnverified("legacy identity remains unresolved")
+        ),
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["error"] == {
+        "code": "legacy_mailbox_identity_unverified",
+        "message": "legacy identity remains unresolved",
+        "retryable": True,
+    }
+
+
 @pytest.mark.parametrize(
     ("sender", "expected_messages", "expected_fires"),
     [
@@ -5296,6 +5321,76 @@ def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failur
         "message": "Mailbox identity could not be verified; retry",
         "retryable": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("edit_state", "expected_code"),
+    [
+        ("missing", "not_found"),
+        ("stale", "stale_rule"),
+        ("system", "system_rule_protected"),
+    ],
+)
+def test_account_scoped_rule_edit_rejects_before_mailbox_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit_state: str,
+    expected_code: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    mailbox_identity_key = _bind_test_mailbox(
+        runtime.store,
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+    )
+    definition = _automation_definition()
+    definition["scope"] = {
+        "provider": DEFAULT_MAIL_PROVIDER,
+        "account_id": DEFAULT_MAIL_ACCOUNT_ID,
+    }
+    expected_version = 1
+    if edit_state == "missing":
+        rule_id = "33333333-3333-4333-8333-333333333333"
+    else:
+        created = runtime.store.put_automation_rule(
+            definition,
+            expected_account_identity=mailbox_identity_key,
+        )
+        rule_id = created.summary.rule_id
+        if edit_state == "stale":
+            expected_version = 2
+        else:
+            with runtime.store.connection() as db:
+                db.execute("UPDATE automation_rules SET system = 1 WHERE rule_id = ?", (rule_id,))
+
+    @contextmanager
+    def available_lock(path: Path, busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args: pytest.fail("rejected edit reached mailbox reconciliation"),
+    )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "automation.rules.put",
+            {
+                "rule_id": rule_id,
+                "expected_version": expected_version,
+                "definition": definition,
+            },
+        )
+    )
+
+    assert response["error"]["code"] == expected_code
 
 
 def test_account_scoped_rule_verification_and_commit_share_operation_lock(

@@ -24,6 +24,15 @@ definitions the parser never accepted, stale overwrites, evaluated revisions
 chosen by callers, and fires referring to rule versions or attachments outside
 the analysis transaction.
 
+Exact-head review exposed four additional boundary splits in the first runtime
+implementation: stale mailbox recovery could cross an unresolved migrated
+identity; missing provider size metadata was collapsed into verified zero;
+account-scoped stale edits performed credential reconciliation before their
+version could reject; and CLI dry-runs constructed mailbox runtime state before
+acquiring the production operation lock. These are reachable violations of the
+accepted identity, matching, CAS, and locking contracts rather than optional
+hardening.
+
 The correct fix must:
 
 1. make strict Connect-only parsing and canonical serialization part of the
@@ -38,7 +47,16 @@ The correct fix must:
 5. expose the five strict `automation.rules.*` operations through the real
    engine dispatcher; and
 6. prove the path from rule creation through a real `watcher.check` request to a
-   durable pending fire and attempt-one identity with zero provider submission.
+   durable pending fire and attempt-one identity with zero provider submission;
+7. keep unresolved migrated mailbox markers fail-closed through their existing
+   retention horizon without extending that horizon for schema-20 data;
+8. preserve omitted provider attachment sizes as unknown while retaining an
+   explicit numeric zero as known;
+9. reject missing, protected, and stale rule edits before any credential or
+   mailbox-state side effect while retaining the Store's final transactional
+   CAS; and
+10. acquire the production mailbox lock before CLI dry-run runtime construction,
+    matching production checks.
 
 This change fixes the root boundary split. It must not add provider dispatch,
 provider-side queueing, an Invoice Processor change, UI, timers, notification
@@ -63,6 +81,9 @@ Slice phase: schema-20 vertical runtime
    pending/scheduling provider fetches against replacement credentials.
 7. Add focused parser, Store, service, migration, race, and real-dispatcher
    reachability tests.
+8. Carry the migrated unresolved-marker horizon until it expires, preserve
+   omitted size metadata as unknown, preflight edits before credential
+   reconciliation, and route CLI dry-runs through the production lock.
 
 ### Files touched
 
@@ -71,6 +92,7 @@ Slice phase: schema-20 vertical runtime
 - `plans/PR-Automate-Connect-Core.md`
 - `src/eom_email_watcher/automation/__init__.py`
 - `src/eom_email_watcher/automation/rules.py`
+- `src/eom_email_watcher/cli.py`
 - `src/eom_email_watcher/db.py`
 - `src/eom_email_watcher/engine_api.py`
 - `src/eom_email_watcher/gmail.py`
@@ -127,6 +149,10 @@ Acceptance criteria:
    a non-allowlisted sender is the opposite control.
 8. Existing scheduling, Connect queue, Ruff, formatting, and the full pytest
    suite remain green.
+9. Opposite-side tests prove unresolved migrated markers block stale recovery
+   only through their inherited horizon, omitted size differs from explicit
+   zero, stale edits fail before account reconciliation, and CLI dry-runs load
+   runtime only after acquiring the mailbox operation lock.
 
 Affected surfaces: SQLite schema/migration; mailbox polling identity; pending
 message fetch; scheduling source joins/fetch; `mark_analyzed`; engine request
@@ -172,6 +198,11 @@ one-to-one companion table so existing `automation_runs` row shape is unchanged.
 Triggers fence schema-19 null-key message inserts and completions without rule
 revision capture.
 
+Migration records one provider/account horizon derived only from pre-schema-20
+suppression markers. Stale recovery for an unresolved legacy identity remains
+retryably blocked while retained null-key messages or that fixed horizon remain;
+new schema-20 suppression activity cannot extend the legacy fence.
+
 Production checks derive a gateway key under the mailbox operation lock,
 reconcile it with the account using provider-specific cursor behavior, and pass
 that captured key through message admission, cursor updates, pre-fetch checks,
@@ -190,6 +221,10 @@ automation subset while preserving analysis and scheduling admission.
 The engine API uses exact strict payload models. Rule mutations acquire the same
 production mailbox lock as production checks; scoped create/edit resolves the
 credential identity under that lock and Store verifies it again before commit.
+Existing-rule edits first perform a side-effect-free current-version/protection
+preflight inside that lock, then retain the Store CAS as the final authority.
+CLI dry-run and production checks both acquire the lock before constructing the
+runtime or reading mailbox identity.
 
 ## Intentional
 
@@ -208,7 +243,7 @@ credential identity under that lock and Store verifies it again before commit.
 - The donor branch is never merged or mutated; accepted patterns are rewritten
   against current schema-19 code and this contract.
 - Ruff's repository-wide format check currently names 27 untouched baseline
-  files. This slice formats and checks all 25 changed Python paths rather than
+  files. This slice formats and checks all 26 changed Python paths rather than
   widening into an unrelated repository reformat.
 
 ## Deferred
@@ -234,7 +269,11 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 ## Verification
 
 - `uv run ruff check .`
-- `uv run ruff format --check <all 25 changed Python paths>` — `25 files already formatted`
+- `uv run ruff format --check <12 review-fix Python paths>` — `12 files already formatted`
+- review-fix boundary probes across retained/expired legacy markers,
+  omitted/explicit-zero sizes, missing/stale/system edits, and CLI lock ordering
+  — `13 passed`
+- affected DB/service/provider/API/CLI suites — `443 passed in 48.75s`
 - focused parser/matcher tests in `tests/test_automation_rules.py`
 - focused Store/migration/atomicity tests in `tests/test_db.py`
 - focused polling/scheduling identity tests in `tests/test_service.py`
@@ -242,7 +281,7 @@ they demonstrate a correctness or safety failure in create-rule-to-durable-fire.
 - focused concurrency probes for rule-write/analysis serialization, stale
   mailbox-session CAS rejection, and scoped verification/commit lock coverage —
   `3 passed`
-- `uv run pytest -o addopts='' --tb=short` — `1247 passed, 16 skipped in 66.49s`
+- `uv run pytest -o addopts='' --tb=short` — `1254 passed, 16 skipped in 66.59s`
 - `git diff --check` — clean
 - cold diff reconstruction against this Problem-derived contract before push
 
@@ -254,9 +293,9 @@ format gate reports `25 files already formatted`.
 
 | Surface | Budget |
 |---|---:|
-| Tracked runtime, scripts, and tests | +2,997 / -413 |
-| New plan, rule module, and focused tests | +1,554 / -0 |
-| Total | 26 files, +4,551 / -413 |
+| Tracked runtime, scripts, and tests | +4,631 / -453 |
+| Plan | +301 / -0 |
+| Total | 27 files, +4,932 / -453 |
 
 The overage is justified by the indivisible schema-20 vertical boundary stated
 above; dispatch and every UI/product surface remain excluded.
