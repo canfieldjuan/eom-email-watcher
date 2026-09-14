@@ -58,6 +58,8 @@ from eom_email_watcher.runtime import (
 
 IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
 REPLACEMENT_IMAP_CURSOR = f"eom-imap-v2:{'b' * 64}:55:99"
+GMAIL_IDENTITY = "a" * 64
+REPLACEMENT_GMAIL_IDENTITY = "b" * 64
 
 
 def _test_mailbox_identity(provider: str, account_id: str) -> str:
@@ -755,6 +757,9 @@ def test_gmail_authorize_creates_current_baseline_without_exposing_identifiers(
     write_config(config_path)
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "private-history-id")
 
@@ -798,6 +803,9 @@ def test_gmail_authorize_compatibility_targets_the_active_generated_account(
     )
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("active@example.com", "active-history-id")
 
@@ -835,6 +843,9 @@ def test_gmail_authorize_preserves_existing_baseline(
     runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
 
     class ExistingGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "current-probe-history-id")
 
@@ -848,6 +859,53 @@ def test_gmail_authorize_preserves_existing_baseline(
 
     assert response["data"] == {"baseline_initialized": False, "connected": True}
     assert load_runtime(config_path).store.state()[0] == "preserved-history-id"
+
+
+def test_gmail_authorize_resets_baseline_for_an_already_installed_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        "gmail",
+        "gmail-default",
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    runtime.store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        GMAIL_IDENTITY,
+        legacy_status="replacement",
+    )
+    runtime.store.set_state(
+        "old-history-id",
+        mailbox_identity_key=GMAIL_IDENTITY,
+    )
+    runtime.config.gmail_token_file.write_text("replacement token", encoding="utf-8")
+
+    class ExistingReplacementGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "replacement-history-id")
+
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda credentials_file, token_file: ExistingReplacementGmail(),
+    )
+
+    response = engine_api._response(request(config_path, "gmail.authorize"))
+
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.mailbox_identity_key == REPLACEMENT_GMAIL_IDENTITY
+    assert runtime.store.state()[0] == "replacement-history-id"
 
 
 def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
@@ -871,6 +929,9 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
             raise GmailAuthorizationRejected("rejected")
 
     class ReauthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "new-history-id")
 
@@ -892,9 +953,9 @@ def test_gmail_authorize_replaces_a_token_rejected_by_gmail(
 
     response = engine_api._response(request(config_path, "gmail.authorize"))
 
-    assert response["data"] == {"baseline_initialized": False, "connected": True}
+    assert response["data"] == {"baseline_initialized": True, "connected": True}
     assert authorization_calls == [True]
-    assert load_runtime(config_path).store.state()[0] == "old-history-id"
+    assert load_runtime(config_path).store.state()[0] == "new-history-id"
 
 
 def test_gmail_authorize_preserves_token_on_transient_profile_failure(
@@ -952,6 +1013,9 @@ def test_gmail_authorize_initializes_missing_baseline_with_existing_token(
     token_file.write_text("existing token", encoding="utf-8")
 
     class ExistingGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "current-history-id")
 
@@ -987,6 +1051,10 @@ def test_gmail_authorize_holds_operation_lock_through_baseline_initialization(
             lock_held = False
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            assert lock_held
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             assert lock_held
             return GmailProfile("owner@example.com", "serialized-history-id")
@@ -1090,6 +1158,9 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
     write_config(config_path)
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "current-cursor")
 
@@ -1125,7 +1196,10 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
     runtime = load_runtime(config_path)
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"
     assert runtime.config.gmail_token_file.stat().st_mode & 0o777 == 0o600
-    assert runtime.store.active_mail_account().address == "owner@example.com"
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.address == "owner@example.com"
+    assert account.mailbox_identity_key == GMAIL_IDENTITY
     assert runtime.store.state()[0] == "current-cursor"
     assert "private readonly token" not in json.dumps(response)
 
@@ -3265,6 +3339,100 @@ def test_mail_account_reconnect_rejects_different_identity_before_replacing_toke
     assert list(tmp_path.glob(".gmail-authorization-*")) == []
 
 
+def test_gmail_reconnect_rebinds_rotated_identity_for_the_next_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.update_mail_account_identity(
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+        display_name="Gmail",
+        address="owner@example.com",
+    )
+    established_identity = _bind_test_mailbox(
+        runtime.store,
+        DEFAULT_MAIL_PROVIDER,
+        DEFAULT_MAIL_ACCOUNT_ID,
+    )
+    runtime.store.set_state(
+        "preserved-cursor",
+        provider=DEFAULT_MAIL_PROVIDER,
+        account_id=DEFAULT_MAIL_ACCOUNT_ID,
+        mailbox_identity_key=established_identity,
+    )
+    runtime.config.gmail_token_file.write_text("established token", encoding="utf-8")
+    rotated_identity = "b" * 64
+
+    class Gmail:
+        def __init__(self, identity_key: str):
+            self.identity_key = identity_key
+
+        def profile(self) -> GmailProfile:
+            return GmailProfile("owner@example.com", "current-cursor")
+
+        def mailbox_address(self) -> str:
+            return self.profile().email_address
+
+        def mailbox_identity_key(self) -> str:
+            return self.identity_key
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            assert cursor == "current-cursor"
+            return MailboxChanges((), cursor)
+
+    established_gmail = Gmail(established_identity)
+    rotated_gmail = Gmail(rotated_identity)
+
+    def from_token(credentials_file: Path, token_file: Path) -> Gmail:
+        assert credentials_file == runtime.config.gmail_credentials_file
+        return (
+            rotated_gmail
+            if token_file.read_text(encoding="utf-8") == "rotated token"
+            else established_gmail
+        )
+
+    def authorize_with_status(
+        credentials_file: Path,
+        token_file: Path,
+        *,
+        force_reauthorize: bool,
+    ) -> tuple[Gmail, bool]:
+        assert credentials_file == runtime.config.gmail_credentials_file
+        assert force_reauthorize is True
+        token_file.write_text("rotated token", encoding="utf-8")
+        return rotated_gmail, True
+
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", from_token)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "authorize_with_status",
+        authorize_with_status,
+    )
+
+    reconnect = engine_api._response(
+        request(
+            config_path,
+            "mail.accounts.reconnect",
+            {"provider": DEFAULT_MAIL_PROVIDER, "account_id": DEFAULT_MAIL_ACCOUNT_ID},
+        )
+    )
+    checked = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
+
+    assert reconnect["ok"] is True
+    assert reconnect["data"]["baseline_initialized"] is True
+    assert checked["ok"] is True
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.mailbox_identity_key == rotated_identity
+    assert runtime.store.state(
+        provider=DEFAULT_MAIL_PROVIDER,
+        account_id=DEFAULT_MAIL_ACCOUNT_ID,
+    )[0] == "current-cursor"
+
+
 def test_mail_account_disconnect_preserves_history_and_send_authorization(
     tmp_path: Path,
 ) -> None:
@@ -3429,6 +3597,9 @@ def test_mail_account_connect_reuses_matching_account_without_duplicate(
     runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "new-cursor")
 
@@ -3452,7 +3623,7 @@ def test_mail_account_connect_reuses_matching_account_without_duplicate(
     assert len(runtime.store.mail_accounts()) == 1
 
 
-def test_mail_account_connect_reuses_verified_legacy_history(
+def test_mail_account_connect_replaces_the_legacy_credential_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3463,10 +3634,16 @@ def test_mail_account_connect_reuses_verified_legacy_history(
     runtime.config.gmail_token_file.write_text("existing token", encoding="utf-8")
 
     class ExistingGmail:
+        def mailbox_identity_key(self) -> str:
+            return GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "current-cursor")
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("owner@example.com", "authorized-cursor")
 
@@ -3496,10 +3673,13 @@ def test_mail_account_connect_reuses_verified_legacy_history(
     )
 
     assert response["ok"] is True
-    assert response["data"]["baseline_initialized"] is False
+    assert response["data"]["baseline_initialized"] is True
     assert response["data"]["account"]["account_id"] == "gmail-default"
-    assert runtime.store.active_mail_account().address == "owner@example.com"
-    assert runtime.store.state()[0] == "legacy-cursor"
+    account = runtime.store.active_mail_account()
+    assert account is not None
+    assert account.address == "owner@example.com"
+    assert account.mailbox_identity_key == REPLACEMENT_GMAIL_IDENTITY
+    assert runtime.store.state()[0] == "authorized-cursor"
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "replacement token"
     assert len(runtime.store.mail_accounts()) == 1
 
@@ -3523,6 +3703,9 @@ def test_mail_account_connect_keeps_unidentified_legacy_history_separate(
     )
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("new-owner@example.com", "new-cursor")
 
@@ -3576,6 +3759,9 @@ def test_mail_account_connect_activates_replacement_for_rejected_legacy_token(
             raise GmailAuthorizationRejected("rejected")
 
     class AuthorizedGmail:
+        def mailbox_identity_key(self) -> str:
+            return REPLACEMENT_GMAIL_IDENTITY
+
         def profile(self) -> GmailProfile:
             return GmailProfile("new-owner@example.com", "new-cursor")
 
