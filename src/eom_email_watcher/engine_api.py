@@ -470,7 +470,13 @@ def _authorize_gmail_account(
                     address=current_profile.email_address,
                 )
             if reuse_valid_token and current_profile.email_address == account.address:
-                return _finish_mail_authorization(runtime, account, current_profile.history_id)
+                return _finish_gmail_authorization(
+                    runtime,
+                    account,
+                    current_profile.history_id,
+                    current_gmail.mailbox_identity_key(),
+                    credential_replaced=False,
+                )
 
     authorization_parent = (
         token_file.parent if token_file is not None else runtime.config.database_file.parent
@@ -534,7 +540,33 @@ def _authorize_gmail_account(
     )
     if activate_after_connect and not account.active:
         account = runtime.store.activate_mail_account(account.provider, account.account_id)
-    return _finish_mail_authorization(runtime, account, profile.history_id)
+    return _finish_gmail_authorization(
+        runtime,
+        account,
+        profile.history_id,
+        gmail.mailbox_identity_key(),
+        credential_replaced=True,
+    )
+
+
+def _finish_gmail_authorization(
+    runtime: Runtime,
+    account: MailAccount,
+    cursor: str,
+    mailbox_identity_key: str,
+    *,
+    credential_replaced: bool,
+) -> dict[str, object]:
+    if account.mailbox_identity_key != mailbox_identity_key:
+        is_replacement = credential_replaced or account.mailbox_identity_key is not None
+        account = runtime.store.reconcile_mailbox_identity(
+            account.provider,
+            account.account_id,
+            mailbox_identity_key,
+            legacy_status="replacement" if is_replacement else None,
+            preserve_cursor=not is_replacement,
+        )
+    return _finish_mail_authorization(runtime, account, cursor)
 
 
 def _finish_mail_authorization(
