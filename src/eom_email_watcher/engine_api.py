@@ -99,7 +99,6 @@ from .mailbox import (
     DEFAULT_MAIL_PROVIDER,
     MailboxAccountUnavailable,
     MailboxError,
-    MailboxGateway,
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
     mailbox_polling_session,
@@ -2258,11 +2257,13 @@ def _retained_connect_message_source(runtime: Runtime, message_id: str) -> Messa
     return source
 
 
-def _configured_mailbox_gateway(
+def _verified_mailbox_attachment_bytes(
     runtime: Runtime,
     source: MessageSource,
+    part_id: str,
+    attachment_id: str | None,
     remaining_timeout: Callable[[], float] | None = None,
-) -> MailboxGateway:
+) -> bytes:
     mailbox = load_mailbox_account(
         runtime.config,
         runtime.store,
@@ -2273,19 +2274,26 @@ def _configured_mailbox_gateway(
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Mailbox identity changed while opening the provider")
     gateway = mailbox.gateway
-    try:
-        live_identity = gateway.mailbox_identity_key()
-    except MailboxError as exc:
-        raise ApiError(
-            "connect_source_unavailable",
-            "The message's live mailbox identity is unavailable.",
-        ) from exc
-    if source.mailbox_identity_key is None or live_identity != source.mailbox_identity_key:
-        raise ApiError(
-            "connect_source_unavailable",
-            "The message's mailbox identity changed while opening the provider.",
+    with mailbox_polling_session(gateway):
+        try:
+            live_identity = gateway.mailbox_identity_key()
+        except MailboxError as exc:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The message's live mailbox identity is unavailable.",
+            ) from exc
+        if source.mailbox_identity_key is None or live_identity != source.mailbox_identity_key:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The message's mailbox identity changed while opening the provider.",
+            )
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(remaining_timeout())
+        return gateway.attachment_bytes(
+            source.provider_message_id,
+            part_id,
+            attachment_id,
         )
-    return gateway
 
 
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
@@ -2303,9 +2311,9 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
     source = _configured_message_source(runtime, message_id)
-    gateway = _configured_mailbox_gateway(runtime, source)
-    content = gateway.attachment_bytes(
-        source.provider_message_id,
+    content = _verified_mailbox_attachment_bytes(
+        runtime,
+        source,
         part_id,
         attachment.attachment_id,
     )
@@ -3726,9 +3734,9 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     runtime,
                     claimed_job.message_id,
                 )
-                gateway = _configured_mailbox_gateway(runtime, source)
-                return gateway.attachment_bytes(
-                    source.provider_message_id,
+                return _verified_mailbox_attachment_bytes(
+                    runtime,
+                    source,
                     claimed_job.part_id,
                     attachment.attachment_id,
                 )
@@ -3902,13 +3910,12 @@ def _generic_attachment_content(
         if operation_deadline is not None
         else None
     )
-    gateway = _configured_mailbox_gateway(runtime, current_source, remaining_timeout)
-    if remaining_timeout is not None:
-        gateway.set_operation_timeout(remaining_timeout())
-    return gateway.attachment_bytes(
-        current_source.provider_message_id,
+    return _verified_mailbox_attachment_bytes(
+        runtime,
+        current_source,
         part_id,
         current_attachment.attachment_id,
+        remaining_timeout,
     )
 
 
@@ -4807,9 +4814,9 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
 
     if source.provider != IMAP_PROVIDER and attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    gateway = _configured_mailbox_gateway(runtime, source)
-    content = gateway.attachment_bytes(
-        source.provider_message_id,
+    content = _verified_mailbox_attachment_bytes(
+        runtime,
+        source,
         part_id,
         attachment.attachment_id,
     )

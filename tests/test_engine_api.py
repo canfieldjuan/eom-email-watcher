@@ -4254,6 +4254,9 @@ def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     destination.mkdir()
 
     class FakeAttachmentGmail:
+        def mailbox_identity_key(self) -> str:
+            return _test_mailbox_identity("gmail", "gmail-default")
+
         def attachment_bytes(
             self, message_id: str, part_id: str, attachment_id: str | None
         ) -> bytes:
@@ -4347,9 +4350,26 @@ def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
     destination.mkdir()
 
     class FakeAttachmentImap:
+        def __init__(self) -> None:
+            self.session_active = False
+
+        @contextmanager
+        def polling_session(self):
+            assert self.session_active is False
+            self.session_active = True
+            try:
+                yield
+            finally:
+                self.session_active = False
+
+        def mailbox_identity_key(self) -> str:
+            assert self.session_active, "identity read outside IMAP session"
+            return mailbox_identity_key
+
         def attachment_bytes(
             self, message_id: str, part_id: str, attachment_id: str | None
         ) -> bytes:
+            assert self.session_active, "attachment read outside IMAP session"
             assert (message_id, part_id, attachment_id) == (
                 "provider-message",
                 "mime-0",
@@ -4574,6 +4594,9 @@ def test_attachment_export_reports_provider_neutral_byte_count_mismatch(
     destination.mkdir()
 
     class TruncatedAttachmentGmail:
+        def mailbox_identity_key(self) -> str:
+            return _test_mailbox_identity("gmail", "gmail-default")
+
         def attachment_bytes(self, *args) -> bytes:
             return b"bad"
 

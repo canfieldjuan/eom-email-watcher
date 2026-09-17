@@ -3,6 +3,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -2000,6 +2001,9 @@ def test_mailbox_gateway_rejects_live_identity_changed_after_open(
         def mailbox_identity_key(self) -> str:
             return "b" * 64
 
+        def attachment_bytes(self, *args: object) -> bytes:
+            raise AssertionError("replacement identity reached the attachment read")
+
     monkeypatch.setattr(
         engine_api,
         "load_mailbox_account",
@@ -2011,7 +2015,7 @@ def test_mailbox_gateway_rejects_live_identity_changed_after_open(
     )
 
     with pytest.raises(engine_api.ApiError) as rejected:
-        engine_api._configured_mailbox_gateway(runtime, source)
+        engine_api._verified_mailbox_attachment_bytes(runtime, source, "2", "attachment-1")
 
     assert rejected.value.code == "connect_source_unavailable"
 
@@ -3795,7 +3799,24 @@ def test_imap_generic_invoke_uses_actual_download_size_for_job(
     payload["part_id"] = "mime-0"
 
     class FakeImap(SeededMailboxGateway):
+        def __init__(self) -> None:
+            self.session_active = False
+
+        @contextmanager
+        def polling_session(self):
+            assert self.session_active is False
+            self.session_active = True
+            try:
+                yield
+            finally:
+                self.session_active = False
+
+        def mailbox_identity_key(self) -> str:
+            assert self.session_active, "identity read outside IMAP session"
+            return TEST_MAILBOX_IDENTITY_KEY
+
         def attachment_bytes(self, *args: object) -> bytes:
+            assert self.session_active, "attachment read outside IMAP session"
             assert args == ("provider-message", "mime-0", None)
             return PDF
 
