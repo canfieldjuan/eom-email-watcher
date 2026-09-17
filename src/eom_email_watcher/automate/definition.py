@@ -132,6 +132,21 @@ class Workflow(_Strict):
                         f"definition {definition.name!r} transitions to unknown stage "
                         f"{effect.to_stage!r}"
                     )
+            # A record.stage condition can only ever be true for a declared stage, so an
+            # operand outside the stage set is a typo that makes the definition dead: it
+            # would silently never fire rather than being rejected here.
+            for condition in definition.conditions:
+                if condition.field != "record.stage":
+                    continue
+                operands = (
+                    [condition.value] if isinstance(condition.value, str) else condition.value
+                )
+                for operand in operands:
+                    if operand not in stage_set:
+                        raise ValueError(
+                            f"definition {definition.name!r} condition references unknown "
+                            f"stage {operand!r}"
+                        )
         return self
 
 
@@ -155,12 +170,19 @@ def canonical_workflow(workflow: Workflow) -> bytes:
 
 
 def parse_workflow(raw: bytes | str) -> Workflow:
-    """Parse and strictly validate a workflow definition from JSON."""
+    """Parse and strictly validate a workflow definition from JSON.
+
+    The canonical-byte size bound is enforced here, the trust boundary for an untrusted
+    definition, so an oversized workflow is rejected before it can reach the engine or the
+    event ledger.
+    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise DefinitionError(f"invalid workflow JSON: {exc}") from exc
     try:
-        return Workflow.model_validate(data)
+        workflow = Workflow.model_validate(data)
     except ValidationError as exc:
         raise DefinitionError(str(exc)) from exc
+    canonical_workflow(workflow)  # raises DefinitionError if it exceeds MAX_DEFINITION_BYTES
+    return workflow

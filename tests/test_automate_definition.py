@@ -135,6 +135,29 @@ def test_invalid_json_is_a_definition_error() -> None:
         parse_workflow("{not json")
 
 
+def test_condition_operand_must_be_a_declared_stage() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["conditions"][0]["value"] = "caputred"  # typo, never fires
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_condition_in_operand_members_must_be_declared_stages() -> None:
+    data = _workflow_data()
+    data["definitions"][1]["conditions"][0]["value"] = ["reviewing", "nowhere"]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_oversized_workflow_is_rejected_at_parse() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["effects"] = [
+        {"kind": "overlay.set", "key": "blob", "value": "x" * 20000}
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
 def _json(data: dict) -> str:
     import json
 

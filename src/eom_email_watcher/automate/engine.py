@@ -21,7 +21,7 @@ from datetime import datetime
 
 from .definition import Condition, Workflow, WorkflowDefinition
 from .host import AutomateHost
-from .store import OperationConflict, RecordView, WorkflowStore, request_fingerprint
+from .store import OperationConflict, RecordView, StaleRecord, WorkflowStore, request_fingerprint
 
 
 class EngineError(RuntimeError):
@@ -124,17 +124,31 @@ class WorkflowEngine:
                 raise OperationConflict(operation_key=operation_key)
             return DecisionOutcome(
                 record=prior.record,
-                matched=True,
+                matched=prior.matched,
                 applied=False,
                 definition_name=None,
                 event_id=prior.event_id,
             )
+        # Bind matching and the compare-and-set to one version: reject a stale caller here,
+        # before matching, so a definition selected against this snapshot cannot be applied
+        # against a version another writer advanced to in between. A concurrent write after
+        # this point is still caught by the store's own compare-and-set.
+        if expected_version != record.state_version:
+            raise StaleRecord(expected=expected_version, actual=record.state_version)
         matches = [
             definition
             for definition in workflow.definitions
             if _definition_matches(definition, decision, record)
         ]
         if not matches:
+            # Reserve the key so a retried no-match stays a no-match across stage changes.
+            self._store.reserve_no_match(
+                record_id,
+                operation_key,
+                operation_name=decision,
+                request=request,
+                now=now,
+            )
             return DecisionOutcome(
                 record=record,
                 matched=False,

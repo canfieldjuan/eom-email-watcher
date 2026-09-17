@@ -17,7 +17,12 @@ from eom_email_watcher.automate import (
     WorkflowEngine,
     WorkflowMismatch,
 )
-from eom_email_watcher.automate.store import OperationConflict, UnknownRecord, WorkflowStore
+from eom_email_watcher.automate.store import (
+    OperationConflict,
+    StaleRecord,
+    UnknownRecord,
+    WorkflowStore,
+)
 
 NOW = datetime(2026, 6, 1, tzinfo=UTC)
 
@@ -318,3 +323,60 @@ def test_decision_refused_when_license_absent_even_for_existing_record(tmp_path:
             expected_version=1,
             now=NOW,
         )
+
+
+def test_stale_expected_version_is_rejected_before_matching(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)  # state_version 1
+    with pytest.raises(StaleRecord):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={},
+            expected_version=2,  # ahead of the record's actual version
+            now=NOW,
+        )
+
+
+def test_no_match_retry_after_advance_stays_a_no_match(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)  # captured, v1
+    # "convert" does not match at captured: a no-match that reserves the key.
+    first = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="convert",
+        operation_key="k",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
+    )
+    assert first.matched is False
+    # Advance to reviewing via a different decision and key.
+    engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="sr",
+        request={},
+        expected_version=1,
+        now=NOW,
+    )
+    # Retrying "convert" with the SAME key must replay the no-match, not apply now that the
+    # record is at reviewing where convert would otherwise match.
+    replay = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="convert",
+        operation_key="k",
+        request={"by": "a"},
+        expected_version=2,
+        now=NOW,
+    )
+    assert replay.matched is False
+    assert replay.applied is False
+    assert engine._store.get_record(record.record_id).stage == "reviewing"

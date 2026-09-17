@@ -83,7 +83,10 @@ CREATE TABLE IF NOT EXISTS workflow_operations (
     operation_key TEXT NOT NULL CHECK (operation_key <> ''),
     operation_name TEXT NOT NULL CHECK (operation_name <> ''),
     request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64),
-    event_id TEXT NOT NULL CHECK (length(event_id) = 36),
+    -- NULL event_id records a no-match: the decision was made under this key but no
+    -- definition applied, so no event exists. Reserving the key keeps a retry idempotent
+    -- across later stage changes instead of re-applying.
+    event_id TEXT CHECK (event_id IS NULL OR length(event_id) = 36),
     created_at TEXT NOT NULL,
     PRIMARY KEY (record_id, operation_key)
 );
@@ -171,15 +174,17 @@ class TransitionOutcome:
 class OperationReplay:
     """The recorded outcome of a prior operation, for replay-before-matching lookups.
 
-    ``record`` reconstructs the state this operation produced (not the current
+    For a matched operation, ``record`` reconstructs the state it produced (not the current
     projection), so a replay after the record has advanced still reports the stage and
-    version this operation yielded.
+    version this operation yielded, and ``event_id`` is its event. For a recorded no-match,
+    ``matched`` is False, ``event_id`` is None, and ``record`` is the current projection.
     """
 
     record: RecordView
-    event_id: str
+    event_id: str | None
     operation_name: str
     request_fingerprint: str
+    matched: bool
 
 
 def request_fingerprint(request: Mapping[str, object]) -> str:
@@ -206,12 +211,19 @@ def _normalize_effects(effects: Sequence[Mapping[str, object]]) -> list[dict[str
     for raw in effects:
         kind = raw.get("kind")
         if kind == RECORD_TRANSITION:
+            # An exact key set: an unrecognized member (e.g. an "overlay.set" key smuggled
+            # onto a transition) is changed or malformed intent and must fail closed rather
+            # than be silently dropped while the operation keeps the same identity.
+            if set(raw.keys()) != {"kind", "to_stage"}:
+                raise InvalidEffect("record.transition accepts only 'kind' and 'to_stage'")
             transition_count += 1
             to_stage = raw.get("to_stage")
             if not isinstance(to_stage, str) or not to_stage:
                 raise InvalidEffect("record.transition requires a non-empty to_stage")
             normalized.append({"kind": RECORD_TRANSITION, "to_stage": to_stage})
         elif kind == OVERLAY_SET:
+            if set(raw.keys()) != {"kind", "key", "value"}:
+                raise InvalidEffect("overlay.set accepts only 'kind', 'key', and 'value'")
             key = raw.get("key")
             if not isinstance(key, str) or not key:
                 raise InvalidEffect("overlay.set requires a non-empty key")
@@ -387,6 +399,15 @@ class WorkflowStore:
             ).fetchone()
             if operation is None:
                 return None
+            if operation["event_id"] is None:
+                # A recorded no-match: no event, current projection, matched=False.
+                return OperationReplay(
+                    record=_record_view(record),
+                    event_id=None,
+                    operation_name=operation["operation_name"],
+                    request_fingerprint=operation["request_fingerprint"],
+                    matched=False,
+                )
             event = db.execute(
                 "SELECT next_stage, state_version, created_at "
                 "FROM workflow_events WHERE event_id = ?",
@@ -397,7 +418,38 @@ class WorkflowStore:
             event_id=operation["event_id"],
             operation_name=operation["operation_name"],
             request_fingerprint=operation["request_fingerprint"],
+            matched=True,
         )
+
+    def reserve_no_match(
+        self,
+        record_id: str,
+        operation_key: str,
+        *,
+        operation_name: str,
+        request: Mapping[str, object],
+        now: datetime,
+    ) -> None:
+        """Bind an operation key to a no-match outcome (no event, no state change).
+
+        This keeps a decision that matched no definition idempotent: a later retry of the
+        same key replays the no-match through :meth:`lookup_operation` instead of applying
+        effects because the record has since moved into a stage where the decision matches.
+        """
+        fingerprint = request_fingerprint(request)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            record = db.execute(
+                "SELECT 1 FROM workflow_records WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            if record is None:
+                raise UnknownRecord(record_id)
+            db.execute(
+                "INSERT INTO workflow_operations "
+                "(record_id, operation_key, operation_name, request_fingerprint, "
+                "event_id, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
+                (record_id, operation_key, operation_name, fingerprint, now.isoformat()),
+            )
 
     def transition(
         self,

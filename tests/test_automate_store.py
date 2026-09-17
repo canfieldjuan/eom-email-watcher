@@ -440,3 +440,35 @@ def test_get_overlays_unknown_record(tmp_path: Path) -> None:
     store = _store(tmp_path)
     with pytest.raises(UnknownRecord):
         store.get_overlays("11111111-1111-4111-8111-111111111111")
+
+
+def test_apply_effects_rejects_extra_member_on_an_effect(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    # A smuggled to_stage on an overlay.set must fail closed, not silently drop.
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "flag", "value": True, "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_reserve_no_match_is_replayed_by_lookup(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.reserve_no_match(
+        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+    )
+    replay = store.lookup_operation(record.record_id, "op-1")
+    assert replay is not None
+    assert replay.matched is False
+    assert replay.event_id is None
+    assert replay.operation_name == "convert"
+    # The record was not changed by a no-match reservation.
+    assert store.get_record(record.record_id).state_version == 1
