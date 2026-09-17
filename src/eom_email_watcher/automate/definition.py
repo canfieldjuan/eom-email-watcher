@@ -21,6 +21,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from .actions import ACTION_KINDS
 from .store import MAX_EFFECTS_PER_BATCH, OVERLAY_SET, RECORD_TRANSITION
 
 MAX_DEFINITION_BYTES = 16 * 1024
@@ -28,6 +29,9 @@ MAX_CONDITIONS = 8
 # The per-definition effect cap is the store's per-batch cap: a definition's effects are
 # applied as one batch, so the two must not drift.
 MAX_EFFECTS = MAX_EFFECTS_PER_BATCH
+# The per-definition cap on emitted actions. Actions are side effects on the outbox, not
+# record-ledger effects, so they have their own bound.
+MAX_ACTIONS = 8
 MAX_DEFINITIONS = 64
 MAX_STAGES = 64
 # The maximum length of a name-like identifier (workflow name, definition name, trigger
@@ -98,11 +102,34 @@ Effect = Annotated[
 ]
 
 
+class ActionEmit(_Strict):
+    """A side-effect action a definition emits when its decision applies.
+
+    ``action`` is an abstract action kind from the shared :data:`ACTION_KINDS` vocabulary
+    (``notify.local``, ``mail.send``, ...), never a vendor; the host resolves it to a
+    configured adapter. ``request`` is the action's payload. Actions are distinct from
+    record-ledger ``effects``: an effect mutates the record under the ledger transaction,
+    while an action is dispatched through the durable outbox (at most once per dedupe key).
+    A static ``request`` is enough for the first pack; rendering the request from record
+    state or operator parameters is a later slice.
+    """
+
+    action: Annotated[str, Field(strict=True, min_length=1, max_length=MAX_NAME_LENGTH)]
+    request: dict[str, str | int | bool] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate(self) -> ActionEmit:
+        if self.action not in ACTION_KINDS:
+            raise ValueError(f"unknown action kind {self.action!r}")
+        return self
+
+
 class WorkflowDefinition(_Strict):
     name: _Name
     trigger: Trigger
     conditions: list[Condition] = Field(default_factory=list, max_length=MAX_CONDITIONS)
     effects: list[Effect] = Field(min_length=1, max_length=MAX_EFFECTS)
+    actions: list[ActionEmit] = Field(default_factory=list, max_length=MAX_ACTIONS)
 
     @model_validator(mode="after")
     def _validate(self) -> WorkflowDefinition:
