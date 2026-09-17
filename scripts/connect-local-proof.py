@@ -200,6 +200,44 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
             )
         if schema_name == "document_general_summary_v1":
             sources = prompt["source_segments"]
+            if any(source.get("contract_clause") for source in sources):
+                maximum_units = int(prompt["maximum_units"])
+                group_size = max(1, (len(sources) + maximum_units - 1) // maximum_units)
+                units = []
+                for start in range(0, len(sources), group_size):
+                    source_ids = []
+                    paragraphs = []
+                    for source in sources[start : start + group_size]:
+                        source_ids.append(source["source_id"])
+                        text = " ".join(str(source["exact_quote"]).split())
+                        clause = source.get("contract_clause")
+                        if clause is None:
+                            agreement_start = text.find("This Agreement")
+                            if agreement_start >= 0:
+                                text = text[agreement_start:]
+                            paragraphs.append(text)
+                            continue
+                        number = str(clause["number"])
+                        clause_prefix = f"{number}."
+                        if text.startswith(clause_prefix):
+                            heading_and_body = text[len(clause_prefix) :].strip()
+                            _, separator, body = heading_and_body.partition(".")
+                            text = (
+                                body.strip()
+                                if separator and body.strip()
+                                else heading_and_body
+                            )
+                        signature_start = text.find(" Customer:")
+                        if signature_start >= 0:
+                            text = text[:signature_start].rstrip()
+                        paragraphs.append(f"Section {number}: {text}")
+                    units.append(
+                        {
+                            "text": " ".join(paragraphs),
+                            "source_ids": source_ids,
+                        }
+                    )
+                return json.dumps({"units": units}, separators=(",", ":"))
             return json.dumps(
                 {
                     "units": [
