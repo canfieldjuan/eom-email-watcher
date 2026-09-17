@@ -7904,6 +7904,10 @@ class Store:
             WHERE j.protocol_version = 2
               AND j.status IN ('requested', 'accepted', 'processing')
               AND d.state IN ('waiting', 'dispatching', 'reconciling', 'provider_owned')
+              AND (
+                  d.automation_paused_at IS NULL
+                  OR d.state IN ('dispatching', 'reconciling', 'provider_owned')
+              )
             ORDER BY j.provider_app_id, j.provider_instance_id,
                 CASE
                     WHEN d.state = 'dispatching' THEN 0

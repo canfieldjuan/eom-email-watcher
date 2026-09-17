@@ -4258,6 +4258,18 @@ def test_connect_queue_wakeup_and_inbox_projection_use_durable_dispatch_state(
     }
     assert by_job_id[second_id]["queue_ahead"] == 1
 
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch SET automation_paused_at = ?
+            WHERE job_id = ?""",
+            (created_at.isoformat(), first_id),
+        )
+
+    assert store.connect_queue_ahead(second_id) == 0
+    results = store.recent(1)[0]["attachments"][0]["capability_results"]
+    by_job_id = {result["job_id"]: result for result in results}
+    assert by_job_id[second_id]["queue_ahead"] == 0
+
 
 def test_due_connect_lane_heads_returns_only_authoritative_head_per_provider(
     tmp_path: Path,
