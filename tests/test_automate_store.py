@@ -1225,3 +1225,19 @@ def test_fail_action_truncates_long_error_text(tmp_path: Path) -> None:
     failed = store.fail_action(admission.view.action_id, error="x" * 900, now=NOW)
     assert failed.last_error is not None
     assert len(failed.last_error) == 500
+
+
+def test_fail_action_bounds_a_long_surrogate_laden_error(tmp_path: Path) -> None:
+    # A large error carrying surrogates: truncation happens before the UTF-8 round trip (so a
+    # pathologically large message is bounded before transcoding), and the surrogates in the
+    # kept prefix are still replaced. The result stays within the 500 cap and does not raise.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    failed = store.fail_action(admission.view.action_id, error="\udce9" * 900, now=NOW)
+    assert failed.status == "failed"
+    assert failed.last_error is not None
+    assert len(failed.last_error) == 500
+    assert "\udce9" not in failed.last_error
