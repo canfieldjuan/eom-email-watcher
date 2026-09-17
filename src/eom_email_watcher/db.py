@@ -30,7 +30,7 @@ from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -330,6 +330,9 @@ CREATE TABLE IF NOT EXISTS connect_job_dispatch (
     capability_confirmation_required INTEGER NOT NULL DEFAULT 0 CHECK (
         capability_confirmation_required IN (0, 1)
     ),
+    capability_authority_known INTEGER NOT NULL DEFAULT 0 CHECK (
+        capability_authority_known IN (0, 1)
+    ),
     automation_paused_at TEXT,
     highest_provider_state TEXT NOT NULL DEFAULT 'requested' CHECK (
         highest_provider_state IN ('requested', 'accepted', 'processing')
@@ -378,7 +381,18 @@ BEGIN
     WHERE message_id = OLD.message_id
       AND (
         protocol_version = 1
-        OR status IN ('completed', 'failed')
+        OR (
+          status IN ('completed', 'failed')
+          AND NOT EXISTS (
+            SELECT 1 FROM automation_fires AS fire
+            WHERE fire.job_id = connect_attachment_jobs.job_id
+              AND fire.state = 'entitlement_paused'
+              AND NOT EXISTS (
+                SELECT 1 FROM automation_fire_attempts AS attempt
+                WHERE attempt.dispatch_request_id = connect_attachment_jobs.job_id
+              )
+          )
+        )
         OR job_id IN (
             SELECT job_id FROM connect_job_dispatch
             WHERE state = 'waiting' AND submission_possible = 0
@@ -558,7 +572,8 @@ BEGIN
         JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
         WHERE job.job_id = automation_fire_attempts.dispatch_request_id
           AND job.protocol_version = 2
-          AND job.status IN ('requested', 'accepted', 'processing')
+          AND job.status IN ('requested', 'accepted', 'processing', 'completed', 'failed')
+          AND dispatch.capability_authority_known = 1
           AND NOT (
             dispatch.state = 'waiting' AND dispatch.submission_possible = 0
           )
@@ -1690,6 +1705,7 @@ class ConnectDispatch:
     source_available: bool
     capability_external_effects: bool
     capability_confirmation_required: bool
+    capability_authority_known: bool
     automation_paused_at: str | None
     highest_provider_state: str
     last_error_code: str | None
@@ -1800,6 +1816,9 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
         "capability_confirmation_required": (
             "INTEGER NOT NULL DEFAULT 0 CHECK (capability_confirmation_required IN (0, 1))"
         ),
+        "capability_authority_known": (
+            "INTEGER NOT NULL DEFAULT 0 CHECK (capability_authority_known IN (0, 1))"
+        ),
         "automation_paused_at": "TEXT",
     }.items():
         if column not in dispatch_columns:
@@ -1867,6 +1886,7 @@ def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
 
 def _migrate_automation_fires_v21(db: sqlite3.Connection) -> None:
     for trigger in (
+        "messages_delete_connect_attachment_jobs",
         "connect_jobs_delete_linked_automation_fires",
         "messages_delete_pending_automation_fires",
         "automation_fire_attempts_immutable_update",
@@ -1904,6 +1924,7 @@ def _migrate_automation_fires_v21(db: sqlite3.Connection) -> None:
 
 def _migrate_automation_fires_v22(db: sqlite3.Connection) -> None:
     for trigger in (
+        "messages_delete_connect_attachment_jobs",
         "connect_jobs_delete_linked_automation_fires",
         "messages_delete_pending_automation_fires",
         "automation_fire_attempts_immutable_update",
@@ -1952,6 +1973,8 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
     db.execute("DROP TRIGGER IF EXISTS messages_delete_pending_automation_fires")
     db.execute("DROP TRIGGER IF EXISTS connect_jobs_delete_linked_automation_fires")
     _execute_transactional_script(db, _AUTOMATION_FIRE_TABLES_SQL)
+    db.execute("DROP TRIGGER IF EXISTS messages_delete_connect_attachment_jobs")
+    db.execute(_CONNECT_JOBS_DELETE_TRIGGER_V19_SQL)
 
     account_columns = {
         str(row["name"]) for row in db.execute("PRAGMA table_info(mail_accounts)").fetchall()
@@ -3671,6 +3694,19 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Automation fire transition lost its expected-state race")
+            if next_state in {"completed", "failed"} and next_job_id is not None:
+                db.execute(
+                    """DELETE FROM connect_attachment_jobs
+                    WHERE job_id = ? AND status IN ('completed', 'failed')
+                      AND job_id IN (
+                        SELECT job_id FROM connect_job_dispatch WHERE source_available = 0
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM automation_fires
+                        WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')
+                      )""",
+                    (next_job_id, next_job_id),
+                )
             updated = db.execute(
                 "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
             ).fetchone()
@@ -4656,6 +4692,7 @@ class Store:
         values["capability_confirmation_required"] = bool(
             values["capability_confirmation_required"]
         )
+        values["capability_authority_known"] = bool(values["capability_authority_known"])
         return ConnectDispatch(**values)
 
     def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
@@ -5345,9 +5382,10 @@ class Store:
                     """INSERT INTO connect_job_dispatch(
                         job_id, state, admission_deadline, submission_possible,
                         source_available, capability_external_effects,
-                        capability_confirmation_required, highest_provider_state,
+                        capability_confirmation_required, capability_authority_known,
+                        highest_provider_state,
                         created_at, updated_at
-                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 'requested', ?, ?)""",
+                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 1, 'requested', ?, ?)""",
                     (
                         job_id,
                         (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat(),
@@ -5481,10 +5519,27 @@ class Store:
                         self.completed_connect_warnings(terminal_job)
                     except RuntimeError as exc:
                         raise ValueError("Completed Connect job result failed validation") from exc
+            deferred_interactive_fire = bool(
+                terminal_job is not None
+                and dispatch_before is not None
+                and not bool(dispatch_before["source_available"])
+                and db.execute(
+                    """SELECT 1 FROM automation_fires AS fire
+                    WHERE fire.job_id = ? AND fire.state = 'entitlement_paused'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM automation_fire_attempts AS attempt
+                        WHERE attempt.dispatch_request_id = ?
+                      )
+                    LIMIT 1""",
+                    (job_id, job_id),
+                ).fetchone()
+                is not None
+            )
             discard_terminal = bool(
                 terminal_job is not None
                 and dispatch_before is not None
                 and not bool(dispatch_before["source_available"])
+                and not deferred_interactive_fire
             )
             if discard_terminal:
                 fire_state = "completed" if next_state == "completed" else "failed"

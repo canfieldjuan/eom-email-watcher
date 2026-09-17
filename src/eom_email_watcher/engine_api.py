@@ -3204,6 +3204,17 @@ def _require_persisted_capability_authority(
     dispatch: ConnectDispatch,
     capability: connect.DiscoveredCapability,
 ) -> None:
+    if not dispatch.capability_authority_known:
+        _fail_generic_connect_record(
+            runtime,
+            job,
+            code="capability_authority_unknown",
+            message="The admitted provider capability authority is unknown.",
+        )
+        raise ApiError(
+            "capability_authority_unknown",
+            "The admitted provider capability authority is unknown.",
+        )
     if (
         dispatch.capability_external_effects == capability.external_effects
         and dispatch.capability_confirmation_required
@@ -3681,11 +3692,21 @@ def _reject_disallowed_effectful_join(
     runtime: Runtime,
     job: ConnectJob,
     *,
+    request_id: str,
+    capability: connect.DiscoveredCapability,
     join_effectful: bool,
 ) -> None:
     dispatch = runtime.store.connect_dispatch(job.job_id)
     if dispatch is None:
         raise RuntimeError("Connect v2 job is missing its durable dispatch authority")
+    if job.job_id == request_id:
+        _require_persisted_capability_authority(runtime, job, dispatch, capability)
+        return
+    if not dispatch.capability_authority_known:
+        raise ApiError(
+            "capability_authority_unknown",
+            "An invocation with unknown capability authority is already active.",
+        )
     if not join_effectful and (
         dispatch.capability_external_effects
         or dispatch.capability_confirmation_required
@@ -3873,6 +3894,8 @@ def _prepare_or_create_generic_connect_job(
             _reject_disallowed_effectful_join(
                 runtime,
                 joined,
+                request_id=request_id,
+                capability=capability,
                 join_effectful=join_effectful,
             )
             return candidate, joined, True, attachment_content
@@ -3916,6 +3939,8 @@ def _prepare_or_create_generic_connect_job(
             _reject_disallowed_effectful_join(
                 runtime,
                 exact,
+                request_id=request_id,
+                capability=capability,
                 join_effectful=join_effectful,
             )
             return candidate, exact, True, attachment_content
@@ -3931,6 +3956,8 @@ def _prepare_or_create_generic_connect_job(
             _reject_disallowed_effectful_join(
                 runtime,
                 created,
+                request_id=request_id,
+                capability=capability,
                 join_effectful=join_effectful,
             )
         return candidate, created, collision, attachment_content
@@ -4106,6 +4133,31 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             capability=capability_ref,
             parameters=requested_parameters,
         )
+        exact_dispatch = runtime.store.connect_dispatch(exact.job_id)
+        if exact_dispatch is None:
+            raise RuntimeError("Recovered automation attempt is missing dispatch authority")
+        if not exact_dispatch.capability_authority_known:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="capability_authority_unknown",
+            )
+            return
+        if (
+            definition.confirm_each
+            or exact_dispatch.capability_external_effects
+            or exact_dispatch.capability_confirmation_required
+        ) and not runtime.store.automation_confirmation_matches(fire):
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="confirmation_receipt_missing",
+            )
+            return
         recovered = runtime.store.transition_automation_fire(
             fire_id=fire.fire_id,
             expected_state=fire.state,
@@ -4279,6 +4331,8 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             "unsupported_attachment",
             "automation_confirmation_stale",
             "effectful_job_active",
+            "capability_authority_changed",
+            "capability_authority_unknown",
             "invalid_request",
         }:
             runtime.store.transition_automation_fire(

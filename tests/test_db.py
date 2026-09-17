@@ -3772,6 +3772,38 @@ def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> 
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
+def test_schema_22_marks_legacy_dispatch_capability_authority_unknown(tmp_path: Path) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    legacy_job_id = "33333333-3333-4333-8333-333333333333"
+    create_v2_connect_job(store, legacy_job_id)
+
+    with store.connection() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(connect_job_dispatch)").fetchall()
+        }
+        if "capability_authority_known" in columns:
+            connection.execute("DROP TRIGGER messages_delete_pending_automation_fires")
+            connection.execute(
+                "ALTER TABLE connect_job_dispatch DROP COLUMN capability_authority_known"
+            )
+        connection.execute("PRAGMA user_version = 22")
+
+    store.initialize()
+
+    legacy = store.connect_dispatch(legacy_job_id)
+    assert legacy is not None
+    assert legacy.capability_authority_known is False
+    new_job_id = "44444444-4444-4444-8444-444444444444"
+    create_v2_connect_job(store, new_job_id, parameters={"target-language": "French"})
+    current = store.connect_dispatch(new_job_id)
+    assert current is not None
+    assert current.capability_authority_known is True
+
+
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)

@@ -385,6 +385,75 @@ def test_source_delete_recovers_provider_owned_unbound_automation_fire(
     assert runtime.store.connect_job(created.job_id) is None
 
 
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_reason"),
+    (("completed", "connect_completed"), ("failed", "PDF_MALFORMED")),
+)
+def test_source_delete_preserves_unbound_terminal_automation_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+    expected_reason: str,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=attempt.dispatch_request_id,
+        message_id=fire.message_id,
+        part_id=fire.part_id,
+        capability=selected,
+        parameters={"mode": "contract"},
+        confirmed=False,
+        artifact_id=engine_api._automation_artifact_id(attempt.dispatch_request_id),
+    )
+    assert created is not None
+    if terminal_status == "completed":
+        output = connect.CapabilityOutput(
+            artifact_id=OUTPUT_ID,
+            media_type="application/vnd.local-connect.cited-summary+json",
+            display_name="contract-summary.json",
+            byte_size=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            payload=b"{}",
+        )
+        runtime.store.transition_connect_job(
+            job_id=created.job_id,
+            expected_state="requested",
+            next_state="completed",
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+            result=connect.CapabilityResult((output,)).store_dict(),
+        )
+    else:
+        runtime.store.transition_connect_job(
+            job_id=created.job_id,
+            expected_state="requested",
+            next_state="failed",
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+            error={"code": "PDF_MALFORMED", "message": "Invalid PDF", "retryable": False},
+        )
+    assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
+
+    assert runtime.store.delete_message(fire.message_id) is True
+
+    retained = runtime.store.automation_fire(fire.fire_id)
+    retained_attempts = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert retained is not None
+    assert retained.state == terminal_status
+    assert retained.reason == expected_reason
+    assert retained.job_id == created.job_id
+    assert len(retained_attempts) == 1
+    assert retained_attempts[0].job_id == created.job_id
+    assert runtime.store.connect_job(created.job_id) is None
+
+
 def test_automation_join_rejects_persisted_effectful_authority_after_manifest_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -422,6 +491,50 @@ def test_automation_join_rejects_persisted_effectful_authority_after_manifest_dr
         )
 
     assert rejected.value.code == "effectful_job_active"
+
+
+def test_unknown_persisted_capability_authority_fails_before_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=REQUEST_ID,
+        message_id="message-1",
+        part_id="2",
+        capability=selected,
+        parameters={},
+        confirmed=False,
+        artifact_id=INPUT_ARTIFACT_ID,
+    )
+    assert created is not None
+    with runtime.store.connection() as db:
+        db.execute(
+            "UPDATE connect_job_dispatch SET capability_authority_known = 0 WHERE job_id = ?",
+            (created.job_id,),
+        )
+    dispatch = runtime.store.connect_dispatch(created.job_id)
+    assert dispatch is not None
+
+    with pytest.raises(engine_api.ApiError) as rejected:
+        engine_api._require_persisted_capability_authority(
+            runtime,
+            created,
+            dispatch,
+            selected,
+        )
+
+    assert rejected.value.code == "capability_authority_unknown"
+    failed = runtime.store.connect_job(created.job_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "capability_authority_unknown"
 
 
 def test_automation_entitlement_is_rechecked_after_source_fetch_before_admission(
@@ -1603,12 +1716,20 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     assert still_paused is not None
     assert still_paused.state == "entitlement_paused"
 
+    assert runtime.store.delete_message(fire.message_id) is True
+    retained = runtime.store.automation_fire(fire.fire_id)
+    assert retained is not None
+    assert retained.state == "entitlement_paused"
+    assert retained.reason == "entitlement_inactive"
+    assert runtime.store.connect_job(REQUEST_ID) is not None
+
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     engine_api._dispatch_automation_fire(runtime, fire.fire_id)
     engine_api._settle_submitted_automation_fires(runtime, limit=25)
     completed = runtime.store.automation_fire(fire.fire_id)
     assert completed is not None
     assert completed.state == "completed"
+    assert runtime.store.connect_job(REQUEST_ID) is None
 
 
 def test_effectful_automation_collision_fails_closed_before_active_job_join(
@@ -1662,6 +1783,44 @@ def test_effectful_automation_collision_fails_closed_before_active_job_join(
     assert collision.job_id is None
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_effectful_exact_automation_attempt_recovers_after_concurrent_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime, external_effects=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    common = {
+        "request_id": attempt.dispatch_request_id,
+        "message_id": fire.message_id,
+        "part_id": fire.part_id,
+        "capability": selected,
+        "parameters": {"mode": "contract"},
+        "confirmed": True,
+        "artifact_id": engine_api._automation_artifact_id(attempt.dispatch_request_id),
+        "join_effectful": False,
+    }
+    _candidate, created, collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime, **common
+    )
+    assert created is not None
+    assert collision is False
+
+    _candidate, recovered, collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime, **common
+    )
+
+    assert recovered is not None
+    assert recovered.job_id == attempt.dispatch_request_id
+    assert collision is True
+    dispatch = runtime.store.connect_dispatch(recovered.job_id)
+    assert dispatch is not None
+    assert dispatch.capability_external_effects is True
 
 
 def test_confirmed_pending_automation_is_deleted_with_its_source_and_receipt(
