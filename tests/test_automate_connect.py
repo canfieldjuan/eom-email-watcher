@@ -57,10 +57,6 @@ def make_capability(
     )
 
 
-def catalog(*capabilities: connect.DiscoveredCapability) -> automate_connect.CapabilityCatalog:
-    return connect.CapabilityCatalog(items=tuple(capabilities))
-
-
 def fake_discover(
     *capabilities: connect.DiscoveredCapability,
 ) -> automate_connect.DiscoverCapabilities:
