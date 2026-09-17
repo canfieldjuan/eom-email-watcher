@@ -1883,6 +1883,120 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
     assert dispatch is not None
     assert dispatch.automation_paused_at is None
 
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    still_paused = runtime.store.automation_fire(fire.fire_id)
+    assert still_paused is not None
+    assert still_paused.state == "entitlement_paused"
+    assert runtime.store.automation_fire_settlement_due() is False
+
+    assert runtime.store.delete_message(fire.message_id) is True
+    retained = runtime.store.automation_fire(fire.fire_id)
+    assert retained is not None
+    assert retained.state == "entitlement_paused"
+    assert retained.reason == "entitlement_inactive"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is not None
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    completed = runtime.store.automation_fire(fire.fire_id)
+    assert completed is not None
+    assert completed.state == "completed"
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_interactive_join_returns_terminal_job_when_authority_race_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, _fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    original_authorize = runtime.store.authorize_connect_job_interactively
+    race_won = False
+
+    def complete_then_authorize(job_id: str, *, now: datetime | None = None) -> object:
+        nonlocal race_won
+        if not race_won:
+            if terminal_status == "completed":
+                output = connect.CapabilityOutput(
+                    artifact_id=OUTPUT_ID,
+                    media_type="application/vnd.local-connect.cited-summary+json",
+                    display_name="contract-summary.json",
+                    byte_size=2,
+                    sha256=hashlib.sha256(b"{}").hexdigest(),
+                    payload=b"{}",
+                )
+                runtime.store.transition_connect_job(
+                    job_id=job_id,
+                    expected_state="requested",
+                    next_state="completed",
+                    provider_app_id=selected.app_id,
+                    provider_instance_id=selected.instance_id,
+                    result=connect.CapabilityResult((output,)).store_dict(),
+                )
+            else:
+                runtime.store.transition_connect_job(
+                    job_id=job_id,
+                    expected_state="requested",
+                    next_state="failed",
+                    provider_app_id=selected.app_id,
+                    provider_instance_id=selected.instance_id,
+                    error={
+                        "code": "PDF_MALFORMED",
+                        "message": "Invalid PDF",
+                        "retryable": False,
+                    },
+                )
+            race_won = True
+        return original_authorize(job_id, now=now)
+
+    monkeypatch.setattr(
+        runtime.store,
+        "authorize_connect_job_interactively",
+        complete_then_authorize,
+    )
+
+    response = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, parameters={"mode": "contract"}),
+        )
+    )
+
+    assert race_won is True
+    if terminal_status == "completed":
+        assert response["ok"] is True
+        assert response["data"]["job_id"] == attempt.dispatch_request_id
+        assert response["data"]["status"] == "completed"
+    else:
+        assert response["ok"] is False
+        assert response["error"]["code"] == "pdf_malformed"
+
 
 def test_inbox_keeps_completed_automation_result_when_newer_retry_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

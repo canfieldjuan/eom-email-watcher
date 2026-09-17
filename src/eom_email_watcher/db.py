@@ -388,9 +388,16 @@ BEGIN
             SELECT 1 FROM automation_fires AS fire
             WHERE fire.job_id = connect_attachment_jobs.job_id
               AND fire.state = 'entitlement_paused'
-              AND NOT EXISTS (
-                SELECT 1 FROM automation_fire_attempts AS attempt
-                WHERE attempt.dispatch_request_id = connect_attachment_jobs.job_id
+              AND (
+                NOT EXISTS (
+                  SELECT 1 FROM automation_fire_attempts AS attempt
+                  WHERE attempt.dispatch_request_id = connect_attachment_jobs.job_id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM connect_job_dispatch AS dispatch
+                  WHERE dispatch.job_id = connect_attachment_jobs.job_id
+                    AND dispatch.interactive_authorized_at IS NOT NULL
+                )
               )
           )
         )
@@ -3837,21 +3844,28 @@ class Store:
         job_id: str,
         *,
         now: datetime | None = None,
-    ) -> None:
+    ) -> ConnectJob:
         observed_at = (now or datetime.now(UTC)).astimezone(UTC)
         stamp = observed_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT job.* FROM connect_attachment_jobs AS job
+                JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+                WHERE job.job_id = ? AND job.protocol_version = 2""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Only persisted Connect v2 jobs can be authorized interactively")
+            current = self._connect_job(row)
+            if current.status in {"completed", "failed"}:
+                return current
+            if current.status not in {"requested", "accepted", "processing"}:
+                raise RuntimeError("Only active Connect v2 jobs can be authorized interactively")
             authorized = db.execute(
                 """UPDATE connect_job_dispatch
                 SET interactive_authorized_at = COALESCE(interactive_authorized_at, ?)
-                WHERE job_id = ?
-                  AND EXISTS (
-                    SELECT 1 FROM connect_attachment_jobs AS job
-                    WHERE job.job_id = connect_job_dispatch.job_id
-                      AND job.protocol_version = 2
-                      AND job.status IN ('requested', 'accepted', 'processing')
-                  )""",
+                WHERE job_id = ?""",
                 (stamp, job_id),
             )
             if authorized.rowcount != 1:
@@ -3862,6 +3876,13 @@ class Store:
                 observed_at=observed_at,
                 stamp=stamp,
             )
+            updated = db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("Connect v2 job disappeared after interactive authorization")
+            return self._connect_job(updated)
 
     def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
         with self.connection() as db:
@@ -3883,6 +3904,7 @@ class Store:
                 """SELECT 1
                 FROM automation_fires AS fire
                 LEFT JOIN connect_attachment_jobs AS job ON job.job_id = fire.job_id
+                LEFT JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = fire.job_id
                 WHERE fire.state IN ('submitted', 'entitlement_paused')
                   AND fire.job_id IS NOT NULL
                   AND (
@@ -3891,9 +3913,12 @@ class Store:
                       job.status IN ('completed', 'failed')
                       AND NOT (
                         fire.state = 'entitlement_paused'
-                        AND NOT EXISTS (
-                          SELECT 1 FROM automation_fire_attempts AS attempt
-                          WHERE attempt.dispatch_request_id = fire.job_id
+                        AND (
+                          dispatch.interactive_authorized_at IS NOT NULL
+                          OR NOT EXISTS (
+                            SELECT 1 FROM automation_fire_attempts AS attempt
+                            WHERE attempt.dispatch_request_id = fire.job_id
+                          )
                         )
                       )
                       AND NOT (
@@ -5578,12 +5603,19 @@ class Store:
                 and db.execute(
                     """SELECT 1 FROM automation_fires AS fire
                     WHERE fire.job_id = ? AND fire.state = 'entitlement_paused'
-                      AND NOT EXISTS (
-                        SELECT 1 FROM automation_fire_attempts AS attempt
-                        WHERE attempt.dispatch_request_id = ?
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM connect_job_dispatch AS dispatch
+                          WHERE dispatch.job_id = ?
+                            AND dispatch.interactive_authorized_at IS NOT NULL
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM automation_fire_attempts AS attempt
+                          WHERE attempt.dispatch_request_id = ?
+                        )
                       )
                     LIMIT 1""",
-                    (job_id, job_id),
+                    (job_id, job_id, job_id),
                 ).fetchone()
                 is not None
             )

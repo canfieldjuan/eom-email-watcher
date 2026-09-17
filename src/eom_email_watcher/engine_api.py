@@ -3900,7 +3900,7 @@ def _prepare_or_create_generic_connect_job(
                 join_effectful=join_effectful,
             )
             if interactive_authorized:
-                runtime.store.authorize_connect_job_interactively(joined.job_id)
+                joined = runtime.store.authorize_connect_job_interactively(joined.job_id)
             return candidate, joined, True, attachment_content
         try:
             created = runtime.store.create_connect_job(
@@ -3947,7 +3947,7 @@ def _prepare_or_create_generic_connect_job(
                 join_effectful=join_effectful,
             )
             if interactive_authorized:
-                runtime.store.authorize_connect_job_interactively(exact.job_id)
+                exact = runtime.store.authorize_connect_job_interactively(exact.job_id)
             return candidate, exact, True, attachment_content
         collision = created.job_id != candidate.job_id
         if collision:
@@ -3966,7 +3966,7 @@ def _prepare_or_create_generic_connect_job(
                 join_effectful=join_effectful,
             )
         if interactive_authorized:
-            runtime.store.authorize_connect_job_interactively(created.job_id)
+            created = runtime.store.authorize_connect_job_interactively(created.job_id)
         return candidate, created, collision, attachment_content
 
 
@@ -4468,7 +4468,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             part_id=part_id,
             parameters=parameters,
         )
-        runtime.store.authorize_connect_job_interactively(existing.job_id)
+        existing = runtime.store.authorize_connect_job_interactively(existing.job_id)
         return _resume_generic_connect_job(
             runtime,
             capability,
