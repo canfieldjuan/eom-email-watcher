@@ -1788,6 +1788,34 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
         )
         is True
     )
+    claimed = runtime.store.claim_connect_lane_head(
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        expected_job_id=attempt.dispatch_request_id,
+    )
+    assert claimed is not None
+    engine_api._defer_inactive_automation_job(
+        runtime,
+        attempt.dispatch_request_id,
+        expected_dispatch_state="dispatching",
+        next_dispatch_state="waiting",
+    )
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch SET automation_paused_at = ?
+            WHERE job_id = ?""",
+            (
+                (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+                attempt.dispatch_request_id,
+            ),
+        )
+    paused_before_click = runtime.store.automation_fire(fire.fire_id)
+    dispatch_before_click = runtime.store.connect_dispatch(attempt.dispatch_request_id)
+    assert paused_before_click is not None
+    assert paused_before_click.state == "entitlement_paused"
+    assert dispatch_before_click is not None
+    assert dispatch_before_click.automation_paused_at is not None
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
     interactive = engine_api._response(
         api_request(
             config_path,
@@ -1804,6 +1832,15 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
         )
         is False
     )
+    authorized_dispatch = runtime.store.connect_dispatch(attempt.dispatch_request_id)
+    still_paused = runtime.store.automation_fire(fire.fire_id)
+    assert authorized_dispatch is not None
+    assert authorized_dispatch.automation_paused_at is None
+    assert datetime.fromisoformat(authorized_dispatch.admission_deadline) > datetime.fromisoformat(
+        dispatch_before_click.admission_deadline
+    )
+    assert still_paused is not None
+    assert still_paused.state == "entitlement_paused"
     with runtime.store.connection() as db:
         db.execute(
             """UPDATE connect_job_dispatch
@@ -2198,6 +2235,45 @@ def test_active_pending_dispatch_ceiling_stops_before_provider_discovery(
     assert halted.state == "manual_review"
     assert halted.reason == "dispatch_stalled"
     assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_entitlement_pause_preserves_only_observed_authorized_pending_time(
+    tmp_path: Path,
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    _selected, fire, _attempt = seed_contract_fire(runtime)
+    observed_at = datetime(2026, 9, 17, 12, tzinfo=UTC)
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE automation_fires
+            SET pending_since = ?, authorized_pending_seconds = 90
+            WHERE fire_id = ?""",
+            ((observed_at - timedelta(hours=3)).isoformat(), fire.fire_id),
+        )
+    current = runtime.store.automation_fire(fire.fire_id)
+    assert current is not None
+
+    paused = runtime.store.transition_automation_fire(
+        fire_id=current.fire_id,
+        expected_state=current.state,
+        expected_version=current.state_version,
+        next_state="entitlement_paused",
+        reason="entitlement_inactive",
+        now=observed_at,
+    )
+
+    assert paused.authorized_pending_seconds == 90
+    resumed = runtime.store.transition_automation_fire(
+        fire_id=paused.fire_id,
+        expected_state=paused.state,
+        expected_version=paused.state_version,
+        next_state="pending_dispatch",
+        now=observed_at + timedelta(minutes=5),
+    )
+    assert runtime.store.automation_pending_seconds(
+        resumed,
+        now=observed_at + timedelta(minutes=5),
+    ) == 90
 
 
 def test_submitted_automation_settles_from_real_completed_connect_result(

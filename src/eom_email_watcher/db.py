@@ -3631,7 +3631,11 @@ class Store:
             current = _automation_fire(row)
             if current.state != expected_state or current.state_version != expected_version:
                 raise RuntimeError("Automation fire transition lost its expected-state race")
-            accumulated = self.automation_pending_seconds(current, now=observed_at)
+            accumulated = (
+                current.authorized_pending_seconds
+                if current.state == "pending_dispatch" and next_state == "entitlement_paused"
+                else self.automation_pending_seconds(current, now=observed_at)
+            )
             next_job_id = job_id if job_id is not None else current.job_id
             next_prepared_json = (
                 prepared_json if prepared_json is not None else current.prepared_identity_json
@@ -3834,7 +3838,8 @@ class Store:
         *,
         now: datetime | None = None,
     ) -> None:
-        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             authorized = db.execute(
@@ -3851,6 +3856,12 @@ class Store:
             )
             if authorized.rowcount != 1:
                 raise RuntimeError("Only active Connect v2 jobs can be authorized interactively")
+            _resume_automation_dispatch(
+                db,
+                job_id=job_id,
+                observed_at=observed_at,
+                stamp=stamp,
+            )
 
     def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
         with self.connection() as db:
