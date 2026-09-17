@@ -65,6 +65,15 @@ class Adapter(Protocol):
 
     def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]: ...
 
+    # An adapter may declare ``idempotent = True`` to opt a stranded ``pending`` row of its
+    # kind into automatic crash recovery (:meth:`ActionRunner.recover_pending`). It means
+    # redelivering the request after an ambiguous crash -- one where the side effect may have
+    # run before the settle committed -- repeats no external effect, so a duplicate dispatch is
+    # harmless. This is a stronger guarantee than the dedupe-by-key idempotency the outbox
+    # already provides. An adapter that does not declare it is treated as non-idempotent (the
+    # safe default), and the sweep leaves its stranded rows pending for the deferred
+    # ambiguous-state reconciliation rather than risk a duplicate external send.
+
 
 class LocalNotifyAdapter:
     """The host-guaranteed, zero-config ``notify.local`` adapter.
@@ -74,6 +83,11 @@ class LocalNotifyAdapter:
     delivered notification (the title and body live on the durable request, and the request
     and result are surfaced together via ``WorkflowStore.list_actions``).
     """
+
+    # A local notification is a durable outbox row, not an external send: redelivering a
+    # stranded pending row after a crash only re-settles the same fixed metadata onto the same
+    # row (under a status CAS), repeating no side effect, so it is safe to auto-recover.
+    idempotent = True
 
     def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
         title = request.get("title")
@@ -236,6 +250,60 @@ class ActionRunner:
             )
             return _outcome(failed, delivered=False)
         return _outcome(settled, delivered=True)
+
+    def recover_pending(self, *, now: datetime) -> list[ActionOutcome]:
+        """Re-drive every safely recoverable ``pending`` action stranded by a crash: the sweep.
+
+        A decision admits its action intents durably in the same transaction as its ledger
+        event and dispatches them only afterwards, so a crash between that commit and the
+        dispatch leaves ``pending`` rows with no in-flight dispatcher. Run this once at host
+        start, before normal operation resumes: it lists the pending rows in admission order
+        (:meth:`WorkflowStore.list_pending_actions`) and, for each whose kind is safe to
+        auto-recover, dispatches it through :meth:`dispatch`, which reloads the durable row and
+        settles it, fails it, or (no adapter configured) leaves it pending for a later sweep.
+        It never raises for a per-action failure -- one bad row must not abort recovery of the
+        rest -- and returns an outcome per row swept.
+
+        Gated by the license first, like :meth:`run` and :meth:`dispatch`, so an unlicensed
+        host refuses even to enumerate recovery work (the empty-feed case included).
+
+        Only an intrinsically idempotent kind is auto-recovered (see :meth:`_auto_recoverable`).
+        A crash after ``adapter.deliver`` ran but before ``settle_action`` committed leaves a
+        row indistinguishable from one whose delivery never started, so redelivering it is safe
+        only when it repeats no external effect (``notify.local``, an adapter declaring
+        ``idempotent = True``). A non-idempotent external adapter's stranded row is left pending
+        here, untouched, for the deferred ambiguous-state reconciliation (a provider-side lookup
+        or claim identity); this sweep is the recovery primitive, not that provider-idempotency
+        guarantee. Safe to repeat: :meth:`dispatch` only delivers a row still ``pending`` and
+        settles under a status CAS, so a row completed by another path is replayed, not
+        re-delivered.
+        """
+        self._host.require_license()
+        outcomes: list[ActionOutcome] = []
+        for view in self._store.list_pending_actions():
+            if not self._auto_recoverable(view.kind):
+                # No adapter configured for the kind yet, or a configured but non-idempotent
+                # one: leave the row pending (never released) rather than risk a duplicate
+                # external send. A later sweep resumes it once an adapter is configured, or the
+                # deferred reconciliation settles it with a provider identity.
+                outcomes.append(_outcome(view, delivered=False))
+                continue
+            outcomes.append(self.dispatch(view, now=now))
+        return outcomes
+
+    def _auto_recoverable(self, kind: str) -> bool:
+        """Whether a stranded ``pending`` row of this kind is safe to auto-redeliver.
+
+        True only for a configured adapter that declares ``idempotent = True``; a kind with no
+        configured adapter, and an adapter that does not declare it, are both treated as not
+        recoverable (the safe default), so the sweep never auto-repeats a non-idempotent
+        external effect.
+        """
+        try:
+            adapter = self._registry.resolve(kind)
+        except AdapterNotConfigured:
+            return False
+        return bool(getattr(adapter, "idempotent", False))
 
 
 def _outcome(view: ActionView, *, delivered: bool) -> ActionOutcome:
