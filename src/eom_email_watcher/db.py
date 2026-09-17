@@ -541,17 +541,26 @@ BEGIN
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
         WHERE message_id = OLD.message_id
-          AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation')
+          AND (
+            state IN ('pending_dispatch', 'awaiting_confirmation')
+            OR (state = 'entitlement_paused' AND job_id IS NULL)
+          )
     );
     DELETE FROM automation_fire_attempts
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
         WHERE message_id = OLD.message_id
-          AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation')
+          AND (
+            state IN ('pending_dispatch', 'awaiting_confirmation')
+            OR (state = 'entitlement_paused' AND job_id IS NULL)
+          )
     );
     DELETE FROM automation_fires
     WHERE message_id = OLD.message_id
-      AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation');
+      AND (
+        state IN ('pending_dispatch', 'awaiting_confirmation')
+        OR (state = 'entitlement_paused' AND job_id IS NULL)
+      );
 END;
 CREATE TRIGGER IF NOT EXISTS connect_jobs_delete_linked_automation_fires
 AFTER DELETE ON connect_attachment_jobs
@@ -1880,6 +1889,8 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
         _migrate_automation_fires_v21(db)
     elif current_version == 21:
         _migrate_automation_fires_v22(db)
+    db.execute("DROP TRIGGER IF EXISTS messages_delete_pending_automation_fires")
+    _execute_transactional_script(db, _AUTOMATION_FIRE_TABLES_SQL)
 
     account_columns = {
         str(row["name"]) for row in db.execute("PRAGMA table_info(mail_accounts)").fetchall()
@@ -3620,6 +3631,21 @@ class Store:
             ).fetchall()
         return tuple(_automation_fire(row) for row in rows)
 
+    def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1
+                FROM automation_fire_attempts AS attempt
+                JOIN automation_fires AS fire ON fire.fire_id = attempt.fire_id
+                WHERE attempt.dispatch_request_id = ?
+                  AND attempt.job_id = ?
+                  AND fire.job_id = ?
+                  AND fire.state IN ('submitted', 'entitlement_paused')
+                LIMIT 1""",
+                (job_id, job_id, job_id),
+            ).fetchone()
+        return row is not None
+
     def resume_automation_fire_job(
         self,
         *,
@@ -5289,6 +5315,19 @@ class Store:
                 and not bool(dispatch_before["source_available"])
             )
             if discard_terminal:
+                fire_state = "completed" if next_state == "completed" else "failed"
+                fire_reason = (
+                    "connect_completed"
+                    if next_state == "completed"
+                    else str((error or {}).get("code") or "connect_failed")[:128]
+                )
+                db.execute(
+                    """UPDATE automation_fires SET
+                        state = ?, state_version = state_version + 1, reason = ?,
+                        pending_since = NULL, updated_at = ?
+                    WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
+                    (fire_state, fire_reason, stamp, job_id),
+                )
                 cursor = db.execute(
                     "DELETE FROM connect_attachment_jobs WHERE job_id = ? AND status = ?",
                     (job_id, expected_state),

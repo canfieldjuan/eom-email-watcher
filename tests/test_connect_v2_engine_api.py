@@ -960,6 +960,10 @@ def test_automation_source_failure_distinguishes_transient_from_definitive(
     assert settled is not None
     assert settled.state == expected_state
     assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+    if expected_state == "pending_dispatch":
+        assert response["data"]["next_wake_unix_ms"] is not None
+    else:
+        assert response["data"]["next_wake_unix_ms"] is None
 
 
 def test_automation_queue_capacity_failure_remains_pending_for_retry(
@@ -991,6 +995,7 @@ def test_automation_queue_capacity_failure_remains_pending_for_retry(
 def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    real_pump = engine_api._pump_generic_connect_lane
     config_path, runtime = seeded_runtime(tmp_path)
     selected, fire, attempt = seed_contract_fire(runtime)
     install_automation_dispatch_fakes(
@@ -1018,6 +1023,97 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     assert joined.job_id == REQUEST_ID
     assert bound_attempt.dispatch_request_id == attempt.dispatch_request_id
     assert bound_attempt.job_id == REQUEST_ID
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'waiting', submission_possible = 0,
+                next_attempt_at = '2000-01-01T00:00:00+00:00'
+            WHERE job_id = ?""",
+            (REQUEST_ID,),
+        )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    connect_authority_checks = 0
+    submissions_allowed: list[bool] = []
+
+    def require_connect() -> None:
+        nonlocal connect_authority_checks
+        connect_authority_checks += 1
+
+    def run_joined_job(*args: object, **kwargs: object) -> None:
+        submissions_allowed.append(bool(kwargs["allow_submission"]))
+
+    monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", require_connect)
+    monkeypatch.setattr(
+        engine_api,
+        "_discover_persisted_generic_capability",
+        lambda job, *, require_entitlement: (selected, None),
+    )
+    monkeypatch.setattr(engine_api, "_run_claimed_generic_connect_job", run_joined_job)
+    active = runtime.store.connect_job(REQUEST_ID)
+    assert active is not None
+
+    outcome = real_pump(runtime, active)
+
+    assert outcome["outcome"] == "completed"
+    assert connect_authority_checks == 1
+    assert submissions_allowed == [True]
+    still_linked = runtime.store.automation_fire(fire.fire_id)
+    assert still_linked is not None
+    assert still_linked.state == "submitted"
+
+
+def test_effectful_automation_collision_fails_closed_before_active_job_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, _attempt = seed_contract_fire(runtime, external_effects=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    interactive = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(
+                selected,
+                parameters={"mode": "contract"},
+                confirmed=True,
+            ),
+        )
+    )
+    assert interactive["data"]["job_id"] == REQUEST_ID
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert awaiting is not None
+    assert awaiting.state == "awaiting_confirmation"
+    assert awaiting.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": awaiting.state_version,
+                "prepared_identity_sha256": awaiting.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    collision = runtime.store.automation_fire(fire.fire_id)
+    assert collision is not None
+    assert collision.state == "manual_review"
+    assert collision.reason == "effectful_job_active"
+    assert collision.job_id is None
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
 
@@ -1062,6 +1158,75 @@ def test_confirmed_pending_automation_is_deleted_with_its_source_and_receipt(
             ).fetchone()[0]
             == 0
         )
+
+
+def test_provider_owned_paused_fire_survives_source_delete_and_records_terminal_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    submitted = runtime.store.automation_fire(fire.fire_id)
+    assert submitted is not None
+    runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=submitted.state,
+        expected_version=submitted.state_version,
+        next_state="entitlement_paused",
+        reason="entitlement_inactive",
+    )
+    with runtime.store.connection() as db:
+        db.executescript(
+            """DROP TRIGGER messages_delete_pending_automation_fires;
+            CREATE TRIGGER messages_delete_pending_automation_fires
+            BEFORE DELETE ON messages
+            BEGIN
+                DELETE FROM automation_fires
+                WHERE message_id = OLD.message_id AND state = 'entitlement_paused';
+            END;"""
+        )
+    runtime.store.initialize()
+
+    assert runtime.store.delete_message("message-1") is True
+
+    retained = runtime.store.automation_fire(fire.fire_id)
+    assert retained is not None
+    assert retained.state == "entitlement_paused"
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+
+    completed = runtime.store.automation_fire(fire.fire_id)
+    assert completed is not None
+    assert completed.state == "completed"
+    assert completed.reason == "connect_completed"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
 
 
 def test_active_pending_dispatch_ceiling_stops_before_provider_discovery(
@@ -1654,6 +1819,7 @@ def seed_contract_fire(
     runtime: Runtime,
     *,
     confirm_each: bool = False,
+    external_effects: bool = False,
 ) -> tuple[connect.DiscoveredCapability, object, object]:
     mode = connect.CapabilityParameter(
         name="mode",
@@ -1667,6 +1833,7 @@ def seed_contract_fire(
         app_version="0.1.0",
         capability_id="document.summarize",
         parameters=(mode,),
+        external_effects=external_effects,
     )
     runtime.store.put_automation_rule(
         contract_rule_definition(selected, confirm_each=confirm_each)

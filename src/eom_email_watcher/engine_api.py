@@ -3400,6 +3400,20 @@ def _next_connect_queue_wakeup(
             retry_seconds = 2 if outcome == "lock_contended" else 30
             wakeup = observed_at + timedelta(seconds=retry_seconds)
         wakeups.append(wakeup)
+    pending_fires = runtime.store.automation_fires_in_states(
+        ("pending_dispatch",), limit=1
+    )
+    if pending_fires:
+        updated_at = datetime.fromisoformat(pending_fires[0].updated_at)
+        if updated_at.tzinfo is None:
+            raise RuntimeError("Automation fire update time is missing its timezone")
+        wakeups.append(
+            max(
+                observed_at,
+                updated_at.astimezone(UTC)
+                + timedelta(seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS),
+            )
+        )
     return min(wakeups) if wakeups else None
 
 
@@ -3418,7 +3432,13 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
     try:
         with connect_operation_lock(lock_path, busy_message):
             linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
-            automation_authorized = not linked_fires or _automation_entitlement_active()
+            automation_authority_required = bool(
+                linked_fires
+                and runtime.store.connect_job_requires_automation_entitlement(head.job_id)
+            )
+            automation_authorized = (
+                not automation_authority_required or _automation_entitlement_active()
+            )
             if linked_fires and not automation_authorized:
                 for fire in linked_fires:
                     if fire.state == "submitted":
@@ -3447,7 +3467,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             proven_new_submission = dispatch.state == "dispatching"
             if proven_new_submission:
                 try:
-                    if linked_fires:
+                    if automation_authority_required:
                         if not automation_authorized:
                             raise connect.ConnectError(
                                 "ENTITLEMENT_REQUIRED",
@@ -3681,6 +3701,7 @@ def _prepare_or_create_generic_connect_job(
     create_job: bool = True,
     artifact_id: str | None = None,
     join_completed: bool = False,
+    join_effectful: bool = True,
     candidate_check: Callable[[connect.PreparedCapabilityJob], None] | None = None,
 ) -> tuple[
     connect.PreparedCapabilityJob,
@@ -3789,6 +3810,13 @@ def _prepare_or_create_generic_connect_job(
                 part_id=part_id,
                 parameters=parameters,
             )
+            if not join_effectful and (
+                capability.external_effects or capability.confirmation_required
+            ):
+                raise ApiError(
+                    "effectful_job_active",
+                    "An effectful invocation is already active for this attachment.",
+                )
             return candidate, joined, True, attachment_content
         try:
             created = runtime.store.create_connect_job(
@@ -3837,6 +3865,13 @@ def _prepare_or_create_generic_connect_job(
                 part_id=part_id,
                 parameters=parameters,
             )
+            if not join_effectful and (
+                capability.external_effects or capability.confirmation_required
+            ):
+                raise ApiError(
+                    "effectful_job_active",
+                    "An effectful invocation is already active for this attachment.",
+                )
         return candidate, created, collision, attachment_content
 
 
@@ -4133,6 +4168,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             confirmed=confirmed,
             artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
             join_completed=True,
+            join_effectful=False,
             candidate_check=candidate_check,
         )
         if created is None:
@@ -4158,6 +4194,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             "capability_unavailable",
             "unsupported_attachment",
             "automation_confirmation_stale",
+            "effectful_job_active",
             "invalid_request",
         }:
             runtime.store.transition_automation_fire(
