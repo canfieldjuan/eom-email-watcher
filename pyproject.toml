@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 eom-mail-watch = "eom_email_watcher.cli:main"
 eom-mail-engine = "eom_email_watcher.engine_api:main"
+eom-automate-host = "eom_email_watcher.automate.host:main"
 eom-model-benchmark = "eom_email_watcher.benchmark:main"
 eom-llama-cpp-proof = "eom_email_watcher.llama_cpp_proof:main"
 
