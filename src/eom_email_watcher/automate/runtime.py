@@ -124,7 +124,10 @@ class PackRuntime:
         workflow.
         """
         return self._engine.create_record(
-            self._pack.workflow, now=now, pack_id=self._pack.pack_id
+            self._pack.workflow,
+            now=now,
+            pack_id=self._pack.pack_id,
+            pack_version=self._pack.pack_version,
         )
 
     def submit_decision(
@@ -159,6 +162,7 @@ class PackRuntime:
             expected_version=expected_version,
             now=now,
             expected_pack_id=self._pack.pack_id,
+            expected_pack_version=self._pack.pack_version,
         )
         actions: list[ActionOutcome] = []
         if outcome.matched and outcome.event_id is not None:

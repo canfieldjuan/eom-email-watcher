@@ -81,10 +81,14 @@ CREATE TABLE IF NOT EXISTS workflow_records (
     record_id TEXT PRIMARY KEY CHECK (length(record_id) = 36),
     workflow TEXT NOT NULL CHECK (workflow <> ''),
     pack_id TEXT CHECK (pack_id IS NULL OR pack_id <> ''),
+    pack_version INTEGER CHECK (pack_version IS NULL OR pack_version >= 1),
     stage TEXT NOT NULL CHECK (stage <> ''),
     state_version INTEGER NOT NULL CHECK (state_version >= 1),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- A pack-bound record carries both its pack identity and version, or neither (a
+    -- bare-workflow record); a version without an identity is meaningless.
+    CHECK ((pack_id IS NULL) = (pack_version IS NULL))
 );
 CREATE TABLE IF NOT EXISTS workflow_events (
     event_id TEXT PRIMARY KEY CHECK (length(event_id) = 36),
@@ -242,6 +246,10 @@ class RecordView:
     # PackRuntime. None for a record created directly against a bare workflow (the pre-pack
     # slices). Write-once at creation, so an ownership check that reads it is race-free.
     pack_id: str | None = None
+    # The version of that pack, frozen at creation alongside pack_id (both-or-neither). A
+    # record stays on the version it began under, so in-flight work is not driven by an
+    # upgraded pack; also write-once, so the freeze check that reads it is race-free.
+    pack_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -400,6 +408,7 @@ def _record_view(row: sqlite3.Row) -> RecordView:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         pack_id=row["pack_id"],
+        pack_version=row["pack_version"],
     )
 
 
@@ -413,6 +422,7 @@ def _replay_view(record: sqlite3.Row, event: sqlite3.Row) -> RecordView:
         created_at=record["created_at"],
         updated_at=event["created_at"],
         pack_id=record["pack_id"],
+        pack_version=record["pack_version"],
     )
 
 
@@ -607,26 +617,34 @@ class WorkflowStore:
         now: datetime,
         allowed_stages: frozenset[str] | None = None,
         pack_id: str | None = None,
+        pack_version: int | None = None,
     ) -> RecordView:
         """Create a workflow record with a bootstrap ledger event at state_version 1.
 
-        ``pack_id`` binds the record to the signed pack that created it (set by a
-        PackRuntime). It is stored once and never changed, so a later ownership check can
-        rely on it. ``None`` leaves the record unbound, for a bare-workflow record.
+        ``pack_id`` and ``pack_version`` bind the record to the signed pack (and its version)
+        that created it, set by a PackRuntime. Both are stored once and never changed, so a
+        later ownership or version-freeze check can rely on them. Pass both or neither: a
+        version without an identity is meaningless, and ``None``/``None`` leaves the record
+        unbound, for a bare-workflow record.
         """
         if allowed_stages is not None and initial_stage not in allowed_stages:
             raise ValueError(f"stage {initial_stage!r} is not in the allowed set")
         if pack_id is not None and (not isinstance(pack_id, str) or not pack_id):
             raise ValueError("pack_id must be a non-empty string or None")
+        if pack_version is not None and (not isinstance(pack_version, int) or pack_version < 1):
+            raise ValueError("pack_version must be an integer >= 1 or None")
+        if (pack_id is None) != (pack_version is None):
+            raise ValueError("pack_id and pack_version must be given together or both omitted")
         record_id = _new_id()
         timestamp = now.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 "INSERT INTO workflow_records "
-                "(record_id, workflow, pack_id, stage, state_version, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?)",
-                (record_id, workflow, pack_id, initial_stage, timestamp, timestamp),
+                "(record_id, workflow, pack_id, pack_version, stage, state_version, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (record_id, workflow, pack_id, pack_version, initial_stage, timestamp, timestamp),
             )
             db.execute(
                 "INSERT INTO workflow_events "

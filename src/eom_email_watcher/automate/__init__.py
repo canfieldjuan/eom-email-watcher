@@ -36,6 +36,7 @@ from .engine import (
     DecisionOutcome,
     EngineError,
     PackOwnershipError,
+    PackVersionError,
     WorkflowEngine,
     WorkflowMismatch,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "PackManifest",
     "PackOwnershipError",
     "PackRuntime",
+    "PackVersionError",
     "RecordView",
     "StaleRecord",
     "TransitionOutcome",

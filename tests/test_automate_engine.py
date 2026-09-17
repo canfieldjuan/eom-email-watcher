@@ -14,6 +14,7 @@ from eom_email_watcher.automate import (
     AutomateHost,
     AutomateLicenseError,
     PackOwnershipError,
+    PackVersionError,
     Workflow,
     WorkflowEngine,
     WorkflowMismatch,
@@ -555,7 +556,7 @@ def test_no_match_retry_after_advance_stays_a_no_match(tmp_path: Path) -> None:
 def test_create_record_binds_the_pack_id(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()
-    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
     assert record.pack_id == "pack-a"
     assert engine._store.get_record(record.record_id).pack_id == "pack-a"
 
@@ -569,7 +570,7 @@ def test_create_record_leaves_pack_id_none_by_default(tmp_path: Path) -> None:
 def test_submit_decision_accepts_the_owning_pack(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()
-    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
     outcome = engine.submit_decision(
         workflow,
         record.record_id,
@@ -587,7 +588,7 @@ def test_submit_decision_accepts_the_owning_pack(tmp_path: Path) -> None:
 def test_submit_decision_refuses_a_foreign_pack(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()
-    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
     with pytest.raises(PackOwnershipError):
         engine.submit_decision(
             workflow,
@@ -607,7 +608,7 @@ def test_submit_decision_refuses_a_foreign_pack(tmp_path: Path) -> None:
 def test_submit_decision_refuses_a_foreign_pack_even_on_replay(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()
-    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
     engine.submit_decision(
         workflow,
         record.record_id,
@@ -658,7 +659,7 @@ def test_submit_decision_without_expected_pack_id_skips_the_check(tmp_path: Path
     workflow = _workflow()
     # A record bound to a pack can still be driven by a bare-workflow caller (expected_pack_id
     # None): the check is opt-in, preserving the pre-pack engine behavior.
-    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
     outcome = engine.submit_decision(
         workflow,
         record.record_id,
@@ -667,5 +668,96 @@ def test_submit_decision_without_expected_pack_id_skips_the_check(tmp_path: Path
         request={},
         expected_version=1,
         now=NOW,
+    )
+    assert outcome.applied is True
+
+
+def test_submit_decision_accepts_the_matching_pack_version(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=2)
+    assert record.pack_version == 2
+    outcome = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        expected_pack_id="pack-a",
+        expected_pack_version=2,
+    )
+    assert outcome.applied is True
+
+
+def test_submit_decision_refuses_a_different_pack_version(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
+    # Same pack, upgraded version: the record is frozen to the version it started under.
+    with pytest.raises(PackVersionError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={"by": "alice"},
+            expected_version=1,
+            now=NOW,
+            expected_pack_id="pack-a",
+            expected_pack_version=2,
+        )
+    # The record did not advance: the newer version was refused before any mutation.
+    assert engine._store.get_record(record.record_id).stage == "captured"
+    assert engine._store.get_record(record.record_id).state_version == 1
+
+
+def test_submit_decision_refuses_a_different_pack_version_even_on_replay(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=1)
+    engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        expected_pack_id="pack-a",
+        expected_pack_version=1,
+    )
+    # An upgraded runtime replaying the same key is refused before the replay lookup.
+    with pytest.raises(PackVersionError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={"by": "alice"},
+            expected_version=1,
+            now=NOW,
+            expected_pack_id="pack-a",
+            expected_pack_version=2,
+        )
+
+
+def test_submit_decision_without_expected_pack_version_skips_the_version_check(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a", pack_version=5)
+    # expected_pack_version None skips the version freeze (opt-in), like the ownership check.
+    outcome = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={},
+        expected_version=1,
+        now=NOW,
+        expected_pack_id="pack-a",
     )
     assert outcome.applied is True

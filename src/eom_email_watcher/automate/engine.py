@@ -42,6 +42,16 @@ class PackOwnershipError(EngineError):
     """
 
 
+class PackVersionError(EngineError):
+    """Raised when a decision is submitted against a record frozen to a different pack version.
+
+    A record is frozen to the pack version it was created under, so in-flight work is always
+    driven by the version that started it. An upgraded pack applies only to new records; a
+    runtime of a different version is refused rather than allowed to finish work mid-flight
+    under changed semantics.
+    """
+
+
 class AmbiguousDecision(EngineError):
     """Raised when more than one definition matches a single decision.
 
@@ -86,13 +96,19 @@ class WorkflowEngine:
         self._host = host
 
     def create_record(
-        self, workflow: Workflow, *, now: datetime, pack_id: str | None = None
+        self,
+        workflow: Workflow,
+        *,
+        now: datetime,
+        pack_id: str | None = None,
+        pack_version: int | None = None,
     ) -> RecordView:
         """Create a record for a workflow at its initial stage, gated by the license.
 
-        ``pack_id`` binds the record to the signed pack that created it, so a later decision
-        can be refused unless it comes from that same pack. ``None`` leaves it unbound (a
-        bare-workflow record, as in the pre-pack slices).
+        ``pack_id`` and ``pack_version`` bind the record to the signed pack and version that
+        created it, so a later decision can be refused unless it comes from that same pack and
+        version. Pass both or neither; ``None``/``None`` leaves it unbound (a bare-workflow
+        record, as in the pre-pack slices).
         """
         self._host.require_license()
         return self._store.create_record(
@@ -101,6 +117,7 @@ class WorkflowEngine:
             now=now,
             allowed_stages=frozenset(workflow.stages),
             pack_id=pack_id,
+            pack_version=pack_version,
         )
 
     def submit_decision(
@@ -114,6 +131,7 @@ class WorkflowEngine:
         expected_version: int,
         now: datetime,
         expected_pack_id: str | None = None,
+        expected_pack_version: int | None = None,
     ) -> DecisionOutcome:
         """Apply the definition matching ``decision`` to ``record_id``.
 
@@ -127,6 +145,11 @@ class WorkflowEngine:
         created merely because the two workflows share a name. ``None`` skips the check (a
         bare-workflow caller). The check precedes the replay lookup, so even a replay is
         refused for a foreign pack.
+
+        ``expected_pack_version`` likewise freezes the record to the pack version it was
+        created under: a mismatch is refused with :class:`PackVersionError`, so an upgraded
+        pack never drives work that started under an earlier version. Both checks are
+        write-once reads, so they are race-free, and both precede the replay lookup.
 
         Operation-key replay takes precedence over condition re-evaluation: an operator
         retrying the same decision after the record has advanced replays the recorded
@@ -162,6 +185,11 @@ class WorkflowEngine:
             raise PackOwnershipError(
                 f"record {record_id!r} is owned by pack {record.pack_id!r}, "
                 f"not {expected_pack_id!r}"
+            )
+        if expected_pack_version is not None and record.pack_version != expected_pack_version:
+            raise PackVersionError(
+                f"record {record_id!r} is frozen to pack version {record.pack_version!r}, "
+                f"not {expected_pack_version!r}"
             )
         # Replay takes precedence over current-stage re-evaluation: a completed operation
         # must replay its recorded outcome even if a later workflow revision has advanced
