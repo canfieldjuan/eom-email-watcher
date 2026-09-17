@@ -3310,6 +3310,7 @@ def _require_persisted_capability_authority(
         dispatch.capability_external_effects == capability.external_effects
         and dispatch.capability_confirmation_required
         == capability.confirmation_required
+        and dispatch.capability_produces == tuple(sorted(set(capability.produces)))
     ):
         return
     _fail_generic_connect_record(
@@ -3563,6 +3564,7 @@ def _discover_persisted_generic_capability(
             instance_id=job.provider_instance_id,
             capability_id=job.capability_id,
             capability_version=job.capability_version,
+            produces=dispatch.capability_produces,
             external_effects=dispatch.capability_external_effects,
             confirmation_required=dispatch.capability_confirmation_required,
         )
@@ -4075,6 +4077,7 @@ def _prepare_or_create_generic_connect_job(
                 input_display_name=candidate.display_name,
                 source_app_id=connect.SOURCE_APP_ID,
                 request_json=candidate.request_json,
+                capability_produces=capability.produces,
                 capability_external_effects=capability.external_effects,
                 capability_confirmation_required=capability.confirmation_required,
             )

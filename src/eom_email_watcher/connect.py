@@ -499,6 +499,7 @@ class RegisteredCapability:
     instance_id: str
     capability_id: str
     capability_version: str
+    produces: tuple[str, ...]
     external_effects: bool
     confirmation_required: bool
 
@@ -1083,6 +1084,7 @@ def registered_capability_for_reconciliation(
     instance_id: str,
     capability_id: str,
     capability_version: str,
+    produces: tuple[str, ...],
     external_effects: bool,
     confirmation_required: bool,
 ) -> tuple[RegisteredCapability | None, str | None]:
@@ -1123,6 +1125,7 @@ def registered_capability_for_reconciliation(
                 instance_id=instance_id,
                 capability_id=capability_id,
                 capability_version=capability_version,
+                produces=produces,
                 external_effects=external_effects,
                 confirmation_required=confirmation_required,
             )
@@ -2024,10 +2027,7 @@ class ConnectV2Client:
                         "RESPONSE_MISMATCH",
                         "Connect output identity cannot alias its input.",
                     )
-                if (
-                    isinstance(self.capability, DiscoveredCapability)
-                    and output.media_type not in self.capability.produces
-                ):
+                if output.media_type not in self.capability.produces:
                     raise ConnectError(
                         "RESPONSE_MISMATCH",
                         "Connect output type was not declared by the capability.",

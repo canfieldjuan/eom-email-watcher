@@ -579,6 +579,7 @@ def test_registered_reconciliation_deduplicates_endpoint_without_manifest(
         instance_id=INSTANCE_A,
         capability_id="document.summarize",
         capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
         external_effects=False,
         confirmation_required=False,
     )
@@ -593,6 +594,7 @@ def test_registered_reconciliation_deduplicates_endpoint_without_manifest(
         instance_id=INSTANCE_A,
         capability_id="document.summarize",
         capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
         external_effects=False,
         confirmation_required=False,
     )
@@ -624,6 +626,7 @@ def test_registered_reconciliation_rejects_conflicting_endpoints(tmp_path: Path)
         instance_id=INSTANCE_A,
         capability_id="document.summarize",
         capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
         external_effects=False,
         confirmation_required=False,
     )
@@ -1245,7 +1248,7 @@ def test_v2_client_submits_and_polls_generic_outputs() -> None:
     assert final.result.store_dict()["outputs"][1]["payload_base64"] == ""  # type: ignore[index]
 
 
-def test_v2_registered_reconciliation_gets_terminal_job_but_cannot_submit() -> None:
+def test_v2_registered_reconciliation_enforces_outputs_and_cannot_submit() -> None:
     content = b"%PDF-1.4\nfixture\n%%EOF"
     discovered = discovered_v2_capability()
     prepared = connect.prepare_capability_job(
@@ -1260,6 +1263,7 @@ def test_v2_registered_reconciliation_gets_terminal_job_but_cannot_submit() -> N
         instance_id=discovered.instance_id,
         capability_id=discovered.capability_id,
         capability_version=discovered.capability_version,
+        produces=discovered.produces,
         external_effects=discovered.external_effects,
         confirmation_required=discovered.confirmation_required,
     )
@@ -1267,29 +1271,35 @@ def test_v2_registered_reconciliation_gets_terminal_job_but_cannot_submit() -> N
         registered, prepared.request_json
     )
     requests: list[str] = []
+    media_types = iter(("text/plain", "application/octet-stream"))
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request.method)
+        output = generic_output(b"Contract obligations")
+        output["media_type"] = next(media_types)
         return httpx.Response(
             200,
             json=generic_job_status(
                 restored,
                 "completed",
-                result={"outputs": [generic_output(b"Contract obligations")]},
+                result={"outputs": [output]},
             ),
         )
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
         client = connect.ConnectV2Client(registered, client=http_client)
         update = client.get(restored)
+        with pytest.raises(connect.ConnectError) as undeclared:
+            client.get(restored)
         with pytest.raises(connect.ConnectError) as rejected:
             client.submit(restored, content)
 
     assert update.status == "completed"
     assert update.result is not None
     assert update.result.outputs[0].payload == b"Contract obligations"
+    assert undeclared.value.code == "RESPONSE_MISMATCH"
     assert rejected.value.code == "JOB_CAPABILITY_MISMATCH"
-    assert requests == ["GET"]
+    assert requests == ["GET", "GET"]
 
 
 def test_v2_client_reuses_prepared_identity_after_lost_acknowledgement() -> None:

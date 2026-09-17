@@ -333,6 +333,9 @@ CREATE TABLE IF NOT EXISTS connect_job_dispatch (
     capability_authority_known INTEGER NOT NULL DEFAULT 0 CHECK (
         capability_authority_known IN (0, 1)
     ),
+    capability_produces_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        length(capability_produces_json) BETWEEN 2 AND 4096
+    ),
     interactive_authorized_at TEXT,
     automation_paused_at TEXT,
     highest_provider_state TEXT NOT NULL DEFAULT 'requested' CHECK (
@@ -1714,6 +1717,7 @@ class ConnectDispatch:
     capability_external_effects: bool
     capability_confirmation_required: bool
     capability_authority_known: bool
+    capability_produces: tuple[str, ...]
     interactive_authorized_at: str | None
     automation_paused_at: str | None
     highest_provider_state: str
@@ -1818,6 +1822,7 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
         str(row["name"])
         for row in db.execute("PRAGMA table_info(connect_job_dispatch)").fetchall()
     }
+    missing_capability_produces = "capability_produces_json" not in dispatch_columns
     for column, definition in {
         "capability_external_effects": (
             "INTEGER NOT NULL DEFAULT 0 CHECK (capability_external_effects IN (0, 1))"
@@ -1828,11 +1833,17 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
         "capability_authority_known": (
             "INTEGER NOT NULL DEFAULT 0 CHECK (capability_authority_known IN (0, 1))"
         ),
+        "capability_produces_json": (
+            "TEXT NOT NULL DEFAULT '[]' "
+            "CHECK (length(capability_produces_json) BETWEEN 2 AND 4096)"
+        ),
         "interactive_authorized_at": "TEXT",
         "automation_paused_at": "TEXT",
     }.items():
         if column not in dispatch_columns:
             db.execute(f"ALTER TABLE connect_job_dispatch ADD COLUMN {column} {definition}")
+    if missing_capability_produces:
+        db.execute("UPDATE connect_job_dispatch SET capability_authority_known = 0")
     rows = db.execute(
         """SELECT job_id, status, created_at, updated_at
         FROM connect_attachment_jobs
@@ -2078,6 +2089,43 @@ def _valid_uuid_v4(value: object) -> bool:
     except ValueError:
         return False
     return parsed.version == 4 and str(parsed) == value
+
+
+def _canonical_connect_capability_produces(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 16:
+        raise ValueError("Connect capability output authority is invalid")
+    if any(
+        not isinstance(media_type, str)
+        or not 0 < len(media_type) <= 127
+        or media_type != media_type.casefold()
+        or media_type.count("/") != 1
+        for media_type in value
+    ):
+        raise ValueError("Connect capability output authority is invalid")
+    return tuple(sorted(set(value)))
+
+
+def _encode_connect_capability_produces(value: object) -> str:
+    return json.dumps(
+        _canonical_connect_capability_produces(value),
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _decode_connect_capability_produces(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        raise RuntimeError("Stored Connect capability output authority is invalid")
+    if value == "[]":
+        return ()
+    try:
+        decoded = json.loads(value)
+        canonical = _canonical_connect_capability_produces(decoded)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("Stored Connect capability output authority is invalid") from exc
+    if _encode_connect_capability_produces(canonical) != value:
+        raise RuntimeError("Stored Connect capability output authority is invalid")
+    return canonical
 
 
 def _decode_v2_request(request_json: bytes) -> dict[str, object]:
@@ -4782,6 +4830,9 @@ class Store:
             values["capability_confirmation_required"]
         )
         values["capability_authority_known"] = bool(values["capability_authority_known"])
+        values["capability_produces"] = _decode_connect_capability_produces(
+            values.pop("capability_produces_json")
+        )
         return ConnectDispatch(**values)
 
     def connect_dispatch(self, job_id: str) -> ConnectDispatch | None:
@@ -5355,6 +5406,7 @@ class Store:
         input_display_name: str | None = None,
         source_app_id: str | None = None,
         request_json: bytes | None = None,
+        capability_produces: tuple[str, ...] = (),
         capability_external_effects: bool = False,
         capability_confirmation_required: bool = False,
         now: datetime | None = None,
@@ -5368,11 +5420,13 @@ class Store:
         if protocol_version == 1:
             if (
                 request_json is not None
+                or capability_produces
                 or capability_external_effects
                 or capability_confirmation_required
             ):
                 raise ValueError("Connect v1 jobs cannot store a v2 request")
             invocation_fingerprint = "v1"
+            capability_produces_json = "[]"
         else:
             if (
                 not provider_app_version
@@ -5381,6 +5435,9 @@ class Store:
                 or request_json is None
             ):
                 raise ValueError("Connect v2 job provenance is incomplete")
+            capability_produces_json = _encode_connect_capability_produces(
+                capability_produces
+            )
             invocation_fingerprint = _validate_v2_request_record(
                 request_json,
                 job_id=job_id,
@@ -5481,14 +5538,16 @@ class Store:
                         job_id, state, admission_deadline, submission_possible,
                         source_available, capability_external_effects,
                         capability_confirmation_required, capability_authority_known,
+                        capability_produces_json,
                         highest_provider_state,
                         created_at, updated_at
-                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 1, 'requested', ?, ?)""",
+                    ) VALUES (?, 'waiting', ?, 0, 1, ?, ?, 1, ?, 'requested', ?, ?)""",
                     (
                         job_id,
                         (created_at + CONNECT_QUEUE_ADMISSION_WINDOW).isoformat(),
                         int(capability_external_effects),
                         int(capability_confirmation_required),
+                        capability_produces_json,
                         stamp,
                         stamp,
                     ),

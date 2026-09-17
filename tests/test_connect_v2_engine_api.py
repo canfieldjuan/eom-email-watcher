@@ -551,6 +551,49 @@ def test_automation_join_rejects_live_effect_escalation_after_manifest_drift(
     assert failed.error_code == "capability_authority_changed"
 
 
+def test_automation_join_rejects_live_output_contract_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    admitted = capability(produces=("text/plain",))
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((admitted,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=REQUEST_ID,
+        message_id="message-1",
+        part_id="2",
+        capability=admitted,
+        parameters={},
+        confirmed=False,
+        artifact_id=INPUT_ARTIFACT_ID,
+    )
+    assert created is not None
+    drifted = capability(produces=("application/json",))
+
+    with pytest.raises(engine_api.ApiError) as rejected:
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=SECOND_REQUEST_ID,
+            message_id="message-1",
+            part_id="2",
+            capability=drifted,
+            parameters={},
+            confirmed=False,
+            artifact_id=OUTPUT_ID,
+            join_effectful=False,
+        )
+
+    assert rejected.value.code == "capability_authority_changed"
+    failed = runtime.store.connect_job(created.job_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "capability_authority_changed"
+
+
 def test_unknown_persisted_capability_authority_fails_before_submission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1110,10 +1153,14 @@ def test_inactive_automation_reconciles_provider_owned_job_without_resubmission(
         "discover_capabilities_for_reconciliation",
         forbidden_manifest_discovery,
     )
+    def reconcile_registered(**kwargs: object):
+        assert kwargs["produces"] == selected.produces
+        return registered_capability(selected), None
+
     monkeypatch.setattr(
         engine_api.connect,
         "registered_capability_for_reconciliation",
-        lambda **kwargs: (registered_capability(selected), None),
+        reconcile_registered,
         raising=False,
     )
     submissions = 0
@@ -3279,6 +3326,7 @@ def test_connect_queue_pump_reports_admission_deadline_expiry(
         input_display_name=job.display_name,
         source_app_id=connect.SOURCE_APP_ID,
         request_json=job.request_json,
+        capability_produces=selected.produces,
         now=datetime(2000, 1, 1, tzinfo=UTC),
     )
     with runtime.store.connection() as db:
@@ -3333,6 +3381,7 @@ def test_active_result_replays_terminal_job_won_during_dispatch_lookup(
         input_display_name=job.display_name,
         source_app_id=connect.SOURCE_APP_ID,
         request_json=job.request_json,
+        capability_produces=selected.produces,
     )
     active = runtime.store.connect_job(REQUEST_ID)
     assert active is not None
@@ -3523,6 +3572,7 @@ def registered_capability(
         instance_id=selected.instance_id,
         capability_id=selected.capability_id,
         capability_version=selected.capability_version,
+        produces=selected.produces,
         external_effects=selected.external_effects,
         confirmation_required=selected.confirmation_required,
     )
@@ -3711,6 +3761,7 @@ def persist_completed_outputs(
         input_display_name=job.display_name,
         source_app_id=connect.SOURCE_APP_ID,
         request_json=job.request_json,
+        capability_produces=("text/plain",),
     )
     runtime.store.transition_connect_job(
         job_id=job.job_id,
@@ -4141,6 +4192,7 @@ def test_late_terminal_after_source_cleanup_is_returned_without_persistence(
         input_display_name=job.display_name,
         source_app_id=connect.SOURCE_APP_ID,
         request_json=job.request_json,
+        capability_produces=selected.produces,
     )
     runtime.store.transition_connect_job(
         job_id=job.job_id,
@@ -4824,6 +4876,7 @@ def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
             input_display_name=job.display_name,
             source_app_id=connect.SOURCE_APP_ID,
             request_json=job.request_json,
+            capability_produces=("text/plain",),
         )
     submissions: list[str] = []
     waits = 0
