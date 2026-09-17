@@ -141,12 +141,14 @@ class WorkflowEngine:
             if _definition_matches(definition, decision, record)
         ]
         if not matches:
-            # Reserve the key so a retried no-match stays a no-match across stage changes.
+            # Reserve the key so a retried no-match stays a no-match across stage changes,
+            # compare-and-set on the same version the decision was matched against.
             self._store.reserve_no_match(
                 record_id,
                 operation_key,
                 operation_name=decision,
                 request=request,
+                expected_version=expected_version,
                 now=now,
             )
             return DecisionOutcome(

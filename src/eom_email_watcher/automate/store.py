@@ -428,6 +428,7 @@ class WorkflowStore:
         *,
         operation_name: str,
         request: Mapping[str, object],
+        expected_version: int,
         now: datetime,
     ) -> None:
         """Bind an operation key to a no-match outcome (no event, no state change).
@@ -436,16 +437,24 @@ class WorkflowStore:
         same key replays the no-match through :meth:`lookup_operation` instead of applying
         effects because the record has since moved into a stage where the decision matches.
 
+        The reservation is compare-and-set on ``expected_version``, the same version the
+        decision was matched against, so a no-match cannot be recorded against a record
+        another writer advanced after matching; a stale caller raises :class:`StaleRecord`
+        and re-evaluates against the new stage rather than pinning the key to a wrong
+        no-match.
+
         The key is rechecked inside the transaction, so two concurrent identical no-match
         reservations resolve to one insert and one idempotent no-op rather than a primary-key
         violation; a reservation whose key already resolved to an applied effect, or to a
-        no-match with a different name or request, is an :class:`OperationConflict`.
+        no-match with a different name or request, is an :class:`OperationConflict`. The
+        idempotent-replay check precedes the compare-and-set so a genuine retry is not
+        rejected merely because the record has since advanced.
         """
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             record = db.execute(
-                "SELECT 1 FROM workflow_records WHERE record_id = ?", (record_id,)
+                "SELECT state_version FROM workflow_records WHERE record_id = ?", (record_id,)
             ).fetchone()
             if record is None:
                 raise UnknownRecord(record_id)
@@ -462,6 +471,8 @@ class WorkflowStore:
                 ):
                     raise OperationConflict(operation_key=operation_key)
                 return  # identical no-match already reserved: idempotent no-op
+            if record["state_version"] != expected_version:
+                raise StaleRecord(expected=expected_version, actual=record["state_version"])
             db.execute(
                 "INSERT INTO workflow_operations "
                 "(record_id, operation_key, operation_name, request_fingerprint, "

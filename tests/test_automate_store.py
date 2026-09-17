@@ -463,11 +463,21 @@ def test_reserve_no_match_twice_is_idempotent(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
     store.reserve_no_match(
-        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+        record.record_id,
+        "op-1",
+        operation_name="convert",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
     )
     # A second identical reservation is a no-op, not a primary-key violation.
     store.reserve_no_match(
-        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+        record.record_id,
+        "op-1",
+        operation_name="convert",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
     )
 
 
@@ -475,11 +485,47 @@ def test_reserve_no_match_changed_request_conflicts(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
     store.reserve_no_match(
-        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+        record.record_id,
+        "op-1",
+        operation_name="convert",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
     )
     with pytest.raises(OperationConflict):
         store.reserve_no_match(
-            record.record_id, "op-1", operation_name="convert", request={"by": "b"}, now=NOW
+            record.record_id,
+            "op-1",
+            operation_name="convert",
+            request={"by": "b"},
+            expected_version=1,
+            now=NOW,
+        )
+
+
+def test_reserve_no_match_with_stale_version_conflicts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.transition(
+        record.record_id,
+        "reviewing",
+        operation_key="advance",
+        operation_name="start_review",
+        request={},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    # The record is now at version 2; a no-match reservation against version 1 must not pin
+    # the key to a stale outcome.
+    with pytest.raises(StaleRecord):
+        store.reserve_no_match(
+            record.record_id,
+            "op-1",
+            operation_name="convert",
+            request={},
+            expected_version=1,
+            now=NOW,
         )
 
 
@@ -487,7 +533,12 @@ def test_apply_effects_on_a_no_match_key_conflicts(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
     store.reserve_no_match(
-        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+        record.record_id,
+        "op-1",
+        operation_name="convert",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
     )
     # Reusing the reserved no-match key to apply effects is changed intent, not a replay.
     with pytest.raises(OperationConflict):
@@ -507,7 +558,12 @@ def test_reserve_no_match_is_replayed_by_lookup(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
     store.reserve_no_match(
-        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+        record.record_id,
+        "op-1",
+        operation_name="convert",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
     )
     replay = store.lookup_operation(record.record_id, "op-1")
     assert replay is not None
