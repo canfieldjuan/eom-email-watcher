@@ -2272,7 +2272,20 @@ def _configured_mailbox_gateway(
     )
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Mailbox identity changed while opening the provider")
-    return mailbox.gateway
+    gateway = mailbox.gateway
+    try:
+        live_identity = gateway.mailbox_identity_key()
+    except MailboxError as exc:
+        raise ApiError(
+            "connect_source_unavailable",
+            "The message's live mailbox identity is unavailable.",
+        ) from exc
+    if source.mailbox_identity_key is None or live_identity != source.mailbox_identity_key:
+        raise ApiError(
+            "connect_source_unavailable",
+            "The message's mailbox identity changed while opening the provider.",
+        )
+    return gateway
 
 
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
@@ -3600,6 +3613,10 @@ def _next_connect_queue_wakeup(
                 + timedelta(seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS),
             )
         )
+    if _automation_entitlement_active() and runtime.store.automation_fires_in_states(
+        ("entitlement_paused",), limit=1
+    ):
+        wakeups.append(observed_at)
     if runtime.store.automation_fire_settlement_due():
         wakeups.append(observed_at)
     return min(wakeups) if wakeups else None

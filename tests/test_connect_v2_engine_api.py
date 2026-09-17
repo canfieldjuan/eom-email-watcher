@@ -17,6 +17,7 @@ from eom_email_watcher.mailbox import (
     MailboxError,
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
+    MailboxSession,
 )
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
@@ -49,6 +50,11 @@ from eom_email_watcher.db import Store
 deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
 print("deleted" if deleted else "missing", flush=True)
 """
+
+
+class SeededMailboxGateway:
+    def mailbox_identity_key(self) -> str:
+        return TEST_MAILBOX_IDENTITY_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -270,7 +276,7 @@ def test_connect_queue_pump_materializes_matching_automation_fire_once(
     fire = runtime.store.automation_fires_for_message("message-1")[0]
     attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def set_operation_timeout(self, timeout_seconds: float) -> None:
             pass
 
@@ -600,7 +606,7 @@ def test_automation_entitlement_is_rechecked_after_source_fetch_before_admission
     )
     entitlement = {"active": True}
 
-    class ExpiringGmail:
+    class ExpiringGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             entitlement["active"] = False
             return PDF
@@ -716,7 +722,7 @@ def test_automation_entitlement_is_rechecked_before_proven_new_provider_post(
     _, runtime = seeded_runtime(tmp_path)
     selected, fire, attempt = seed_contract_fire(runtime)
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 
@@ -760,7 +766,7 @@ def test_automation_entitlement_is_rechecked_after_source_fetch_before_provider_
     automation_authorized = True
     submissions = 0
 
-    class ExpiringGmail:
+    class ExpiringGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             nonlocal automation_authorized
             automation_authorized = False
@@ -877,7 +883,7 @@ def test_connect_entitlement_is_rechecked_after_source_fetch_before_provider_pos
     connect_authorized = True
     submissions = 0
 
-    class ExpiringGmail:
+    class ExpiringGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             nonlocal connect_authorized
             connect_authorized = False
@@ -1528,6 +1534,84 @@ def test_unchanged_fire_prefix_rotates_so_later_work_is_selected(
     assert (all_fire_ids - first_prefix).issubset(set(attempted))
 
 
+def test_active_entitlement_wakes_paused_fire_beyond_pump_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected = capability()
+    for index in range(26):
+        runtime.store.put_automation_rule(
+            contract_rule_definition(selected, name=f"Paused watch {index}")
+        )
+    runtime.store.mark_analyzed(
+        "message-1",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "A contract arrived.",
+            "action_required": True,
+            "suggested_action": "Review the contract.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    fires = runtime.store.automation_fires_for_message("message-1")
+    for fire in fires:
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="entitlement_paused",
+            reason="entitlement_inactive",
+        )
+
+    def move_to_manual_review(
+        active_runtime: Runtime, fire_id: str, **kwargs: object
+    ) -> None:
+        fire = active_runtime.store.automation_fire(fire_id)
+        assert fire is not None
+        active_runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="manual_review",
+            reason="fixture_terminal",
+        )
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api, "_dispatch_automation_fire", move_to_manual_review)
+
+    outcome = engine_api.pump_connect_runtime(runtime, 25)
+    paused = runtime.store.automation_fires_in_states(("entitlement_paused",), limit=25)
+
+    assert len(fires) == 26
+    assert len(paused) == 1
+    assert outcome["next_wake_unix_ms"] is not None
+
+
+def test_inactive_entitlement_does_not_spin_on_paused_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _selected, fire, _attempt = seed_contract_fire(runtime)
+    runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=fire.state,
+        expected_version=fire.state_version,
+        next_state="entitlement_paused",
+        reason="entitlement_inactive",
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+
+    next_wakeup = engine_api._next_connect_queue_wakeup(
+        runtime, [], datetime(2026, 9, 9, 12, tzinfo=UTC)
+    )
+
+    assert next_wakeup is None
+
+
 def test_maximum_valid_rule_parameters_fit_prepared_confirmation_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1842,7 +1926,7 @@ def test_automation_source_failure_distinguishes_transient_from_definitive(
     config_path, runtime = seeded_runtime(tmp_path)
     selected, fire, attempt = seed_contract_fire(runtime)
 
-    class FailingGmail:
+    class FailingGmail(SeededMailboxGateway):
         def set_operation_timeout(self, timeout_seconds: float) -> None:
             pass
 
@@ -1904,6 +1988,32 @@ def test_automation_source_rejects_unbound_or_replaced_mailbox_identity(
     assert settled is not None
     assert settled.state == "source_unavailable"
     assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_mailbox_gateway_rejects_live_identity_changed_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    source = runtime.store.message_source("message-1")
+
+    class ReplacementGateway:
+        def mailbox_identity_key(self) -> str:
+            return "b" * 64
+
+    monkeypatch.setattr(
+        engine_api,
+        "load_mailbox_account",
+        lambda *args, **kwargs: MailboxSession(
+            source.provider,
+            source.account_id,
+            ReplacementGateway(),  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(engine_api.ApiError) as rejected:
+        engine_api._configured_mailbox_gateway(runtime, source)
+
+    assert rejected.value.code == "connect_source_unavailable"
 
 
 def test_automation_queue_capacity_failure_remains_pending_for_retry(
@@ -2127,7 +2237,7 @@ def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
         discovery_budgets.append(budget)
         return connect.CapabilityCatalog((selected,))
 
-    class BudgetedGmail:
+    class BudgetedGmail(SeededMailboxGateway):
         def set_operation_timeout(self, timeout_seconds: float) -> None:
             operation_budgets.append(timeout_seconds)
 
@@ -3046,7 +3156,7 @@ def test_queue_pump_continues_terminal_fire_settlement_past_batch(
 ) -> None:
     _, runtime = seeded_runtime(tmp_path)
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 
@@ -3498,7 +3608,7 @@ def install_automation_dispatch_fakes(
     *,
     stub_lane: bool = True,
 ) -> None:
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def set_operation_timeout(self, _timeout_seconds: float) -> None:
             return
 
@@ -3684,7 +3794,7 @@ def test_imap_generic_invoke_uses_actual_download_size_for_job(
     payload = invocation_payload(selected)
     payload["part_id"] = "mime-0"
 
-    class FakeImap:
+    class FakeImap(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             assert args == ("provider-message", "mime-0", None)
             return PDF
@@ -3830,7 +3940,7 @@ def test_imap_generic_invoke_rejects_actual_bytes_over_capability_limit(
     payload = invocation_payload(selected)
     payload["part_id"] = "mime-0"
 
-    class OversizedImap:
+    class OversizedImap(SeededMailboxGateway):
         def attachment_bytes(self, *args: object) -> bytes:
             return b"X" * 1025
 
@@ -4281,7 +4391,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
 
     submitted: list[connect.PreparedCapabilityJob] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             nonlocal gmail_reads
             gmail_reads += 1
@@ -4396,7 +4506,7 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
     queries: list[str] = []
     gmail_reads = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             nonlocal gmail_reads
             gmail_reads += 1
@@ -4469,7 +4579,7 @@ def test_queue_pump_retries_provider_busy_with_same_job_after_durable_due_time(
     selected = capability()
     submissions: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4539,7 +4649,7 @@ def test_post_submit_poll_timeout_schedules_durable_reconciliation_backoff(
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4590,7 +4700,7 @@ def test_queue_pump_respects_cross_process_lane_owner_then_recovers(
     selected = capability()
     submissions: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4697,7 +4807,7 @@ def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
     submissions: list[str] = []
     waits = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4761,14 +4871,14 @@ def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
     submissions: list[str] = []
     queries: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, provider_message_id, *args) -> bytes:
             assert provider_message_id in {"message-1", "message-2"}
             return PDF
 
     class SerializedClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in {selected, registered_capability(selected)}
 
         def submit(self, job, content):
             assert content == PDF
@@ -4798,8 +4908,8 @@ def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
     )
     monkeypatch.setattr(
         engine_api.connect,
-        "discover_capabilities_for_reconciliation",
-        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
     )
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", SerializedClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -4852,7 +4962,7 @@ def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting
     submissions = 0
     queries = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4923,7 +5033,7 @@ def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance
     submissions = 0
     queries = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -4988,7 +5098,7 @@ def test_queue_pump_blocks_a_new_post_after_entitlement_revocation(
     selected = capability()
     submissions = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5040,7 +5150,7 @@ def test_nonretryable_provider_refusal_remains_immediately_terminal(
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5084,7 +5194,7 @@ def test_queue_pump_rejects_changed_source_before_a_retry_post(
     source_bytes = [PDF]
     submissions = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return source_bytes[0]
 
@@ -5132,7 +5242,7 @@ def test_queue_pump_rejects_retention_expired_source_before_a_retry_post(
     selected = capability()
     submissions = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5187,7 +5297,7 @@ def test_queue_pump_retries_transient_source_fetch_under_original_deadline(
     reads = 0
     submissions = 0
 
-    class FlakyGmail:
+    class FlakyGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             nonlocal reads
             reads += 1
@@ -5262,7 +5372,7 @@ def test_queue_pump_treats_invalid_or_missing_mailbox_source_as_definitive(
     reads = 0
     submissions = 0
 
-    class DisappearingGmail:
+    class DisappearingGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             nonlocal reads
             reads += 1
@@ -5317,7 +5427,7 @@ def test_source_cleanup_wins_before_retry_and_prevents_another_post(
     selected = capability()
     submissions = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5362,7 +5472,7 @@ def test_handoff_releases_source_lock_after_durable_acceptance(
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5423,7 +5533,7 @@ def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5544,7 +5654,7 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
     submissions = 0
     queries = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5607,7 +5717,7 @@ def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
     submissions: list[str] = []
     queries: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5676,7 +5786,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
     raced = False
     real_transition = runtime.store.transition_connect_job
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             nonlocal gmail_reads
             gmail_reads += 1
@@ -5747,7 +5857,7 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
     submitted: list[connect.PreparedCapabilityJob] = []
     wait_calls = 0
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
@@ -5825,7 +5935,7 @@ def test_concurrent_same_request_id_reuses_the_persisted_winner(
     real_create = runtime.store.create_connect_job
     queried: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return PDF
 
