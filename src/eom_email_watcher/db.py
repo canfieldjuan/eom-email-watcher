@@ -2473,6 +2473,50 @@ def _ensure_mailbox_scope_schema(db: sqlite3.Connection) -> None:
         )
 
 
+def _resume_automation_dispatch(
+    db: sqlite3.Connection,
+    *,
+    job_id: str,
+    observed_at: datetime,
+    stamp: str,
+) -> None:
+    dispatch = db.execute(
+        """SELECT admission_deadline, automation_paused_at
+        FROM connect_job_dispatch WHERE job_id = ?""",
+        (job_id,),
+    ).fetchone()
+    if dispatch is None:
+        raise RuntimeError("Automation entitlement resume lost its Connect job")
+    paused_at_value = dispatch["automation_paused_at"]
+    if paused_at_value is None:
+        return
+    admission_deadline = datetime.fromisoformat(str(dispatch["admission_deadline"]))
+    paused_at = datetime.fromisoformat(str(paused_at_value))
+    if admission_deadline.tzinfo is None:
+        raise RuntimeError("Connect admission deadline is missing its timezone")
+    if paused_at.tzinfo is None:
+        raise RuntimeError("Automation entitlement pause is missing its timezone")
+    paused_seconds = max(
+        0,
+        int((observed_at - paused_at.astimezone(UTC)).total_seconds()),
+    )
+    extended = db.execute(
+        """UPDATE connect_job_dispatch
+        SET admission_deadline = ?, automation_paused_at = NULL, updated_at = ?
+        WHERE job_id = ? AND automation_paused_at = ?""",
+        (
+            (
+                admission_deadline.astimezone(UTC) + timedelta(seconds=paused_seconds)
+            ).isoformat(),
+            stamp,
+            job_id,
+            paused_at_value,
+        ),
+    )
+    if extended.rowcount != 1:
+        raise RuntimeError("Automation entitlement resume lost its pause interval")
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -3568,6 +3612,13 @@ class Store:
                 if paused.rowcount != 1:
                     raise RuntimeError("Automation entitlement pause lost its Connect job")
             if next_state == "submitted":
+                assert next_job_id is not None
+                _resume_automation_dispatch(
+                    db,
+                    job_id=next_job_id,
+                    observed_at=observed_at,
+                    stamp=stamp,
+                )
                 attempt = db.execute(
                     """UPDATE automation_fire_attempts SET job_id = ?
                     WHERE fire_id = ? AND attempt_no = ? AND job_id IS NULL""",
@@ -3749,41 +3800,12 @@ class Store:
                 or current.job_id is None
             ):
                 raise RuntimeError("Automation entitlement resume lost its expected-state race")
-            dispatch = db.execute(
-                """SELECT admission_deadline, automation_paused_at
-                FROM connect_job_dispatch WHERE job_id = ?""",
-                (current.job_id,),
-            ).fetchone()
-            if dispatch is None:
-                raise RuntimeError("Automation entitlement resume lost its Connect job")
-            admission_deadline = datetime.fromisoformat(str(dispatch["admission_deadline"]))
-            if admission_deadline.tzinfo is None:
-                raise RuntimeError("Connect admission deadline is missing its timezone")
-            paused_at_value = dispatch["automation_paused_at"]
-            if paused_at_value is not None:
-                paused_at = datetime.fromisoformat(str(paused_at_value))
-                if paused_at.tzinfo is None:
-                    raise RuntimeError("Automation entitlement pause is missing its timezone")
-                paused_seconds = max(
-                    0,
-                    int((observed_at - paused_at.astimezone(UTC)).total_seconds()),
-                )
-                extended = db.execute(
-                    """UPDATE connect_job_dispatch
-                    SET admission_deadline = ?, automation_paused_at = NULL, updated_at = ?
-                    WHERE job_id = ? AND automation_paused_at = ?""",
-                    (
-                        (
-                            admission_deadline.astimezone(UTC)
-                            + timedelta(seconds=paused_seconds)
-                        ).isoformat(),
-                        stamp,
-                        current.job_id,
-                        paused_at_value,
-                    ),
-                )
-                if extended.rowcount != 1:
-                    raise RuntimeError("Automation entitlement resume lost its pause interval")
+            _resume_automation_dispatch(
+                db,
+                job_id=current.job_id,
+                observed_at=observed_at,
+                stamp=stamp,
+            )
             cursor = db.execute(
                 """UPDATE automation_fires SET state = 'submitted',
                     state_version = state_version + 1, reason = NULL, updated_at = ?

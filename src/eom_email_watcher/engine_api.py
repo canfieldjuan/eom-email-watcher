@@ -99,6 +99,7 @@ from .mailbox import (
     MailboxAccountUnavailable,
     MailboxError,
     MailboxGateway,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     mailbox_polling_session,
 )
@@ -4286,7 +4287,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
                 next_state="manual_review",
                 reason=exc.code.lower()[:128],
             )
-    except MailboxMessageUnavailable:
+    except (MailboxMessageInvalid, MailboxMessageUnavailable):
         runtime.store.transition_automation_fire(
             fire_id=fire.fire_id,
             expected_state=fire.state,

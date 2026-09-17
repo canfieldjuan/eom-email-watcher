@@ -14,6 +14,7 @@ from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
     MailboxError,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
 )
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -730,6 +731,53 @@ def test_unbound_automation_job_keeps_automation_authority_before_fire_selection
     assert runtime.store.automation_fire(fire.fire_id).state == "pending_dispatch"  # type: ignore[union-attr]
 
 
+def test_authorized_unbound_automation_recovery_clears_dispatch_pause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        stub_lane=False,
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=attempt.dispatch_request_id,
+        message_id=fire.message_id,
+        part_id=fire.part_id,
+        capability=selected,
+        parameters={"mode": "contract"},
+        confirmed=False,
+        artifact_id=engine_api._automation_artifact_id(attempt.dispatch_request_id),
+    )
+    assert created is not None
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    assert (
+        engine_api._pump_generic_connect_lane(runtime, created)["outcome"]
+        == "entitlement_paused"
+    )
+    paused = runtime.store.connect_dispatch(created.job_id)
+    assert paused is not None
+    assert paused.automation_paused_at is not None
+    paused_deadline = paused.admission_deadline
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+
+    recovered = runtime.store.automation_fire(fire.fire_id)
+    resumed = runtime.store.connect_dispatch(created.job_id)
+    assert recovered is not None
+    assert recovered.state == "submitted"
+    assert recovered.job_id == created.job_id
+    assert resumed is not None
+    assert resumed.automation_paused_at is None
+    assert datetime.fromisoformat(resumed.admission_deadline) >= datetime.fromisoformat(
+        paused_deadline
+    )
+
+
 def test_automation_entitlement_is_rechecked_after_missing_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1280,6 +1328,10 @@ def test_automation_confirmation_decline_is_exact_and_cannot_be_replayed(
     [
         (MailboxError("temporary"), "pending_dispatch"),
         (MailboxMessageUnavailable("gone"), "source_unavailable"),
+        (
+            MailboxMessageInvalid("imap_bodystructure_invalid", "malformed MIME"),
+            "source_unavailable",
+        ),
     ],
 )
 def test_automation_source_failure_distinguishes_transient_from_definitive(
