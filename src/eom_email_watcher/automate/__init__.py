@@ -28,6 +28,10 @@ from .actions import (
 )
 from .definition import (
     ActionEmit,
+    ConnectInvokeCapability,
+    ConnectInvokeInput,
+    ConnectInvokeProvider,
+    ConnectInvokeRequest,
     DefinitionError,
     Workflow,
     WorkflowDefinition,
@@ -91,6 +95,10 @@ __all__ = [
     "AutomateLicenseError",
     "CapabilityInvoker",
     "ConnectInvokeAdapter",
+    "ConnectInvokeCapability",
+    "ConnectInvokeInput",
+    "ConnectInvokeProvider",
+    "ConnectInvokeRequest",
     "DecisionOutcome",
     "DecisionRun",
     "DefinitionError",
