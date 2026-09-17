@@ -1194,3 +1194,50 @@ def test_create_record_rejects_an_empty_pack_id(tmp_path: Path) -> None:
         store.create_record(
             "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id=""
         )
+
+
+def test_fail_action_persists_surrogate_error_text_without_raising(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    # str(exc) can carry lone surrogates (e.g. a message built from bytes decoded with
+    # errors="surrogateescape"). fail_action must still terminalize the row, not raise and
+    # strand it pending.
+    failed = store.fail_action(
+        admission.view.action_id, error="boom \udce9 tail", now=NOW
+    )
+    assert failed.status == "failed"
+    assert store.get_action(admission.view.action_id).status == "failed"
+    # The stored text is UTF-8-safe (the surrogate became U+FFFD) and still readable.
+    assert failed.last_error is not None
+    assert "\udce9" not in failed.last_error
+    assert failed.last_error.startswith("boom ")
+
+
+def test_fail_action_truncates_long_error_text(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    failed = store.fail_action(admission.view.action_id, error="x" * 900, now=NOW)
+    assert failed.last_error is not None
+    assert len(failed.last_error) == 500
+
+
+def test_fail_action_bounds_a_long_surrogate_laden_error(tmp_path: Path) -> None:
+    # A large error carrying surrogates: truncation happens before the UTF-8 round trip (so a
+    # pathologically large message is bounded before transcoding), and the surrogates in the
+    # kept prefix are still replaced. The result stays within the 500 cap and does not raise.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    failed = store.fail_action(admission.view.action_id, error="\udce9" * 900, now=NOW)
+    assert failed.status == "failed"
+    assert failed.last_error is not None
+    assert len(failed.last_error) == 500
+    assert "\udce9" not in failed.last_error
