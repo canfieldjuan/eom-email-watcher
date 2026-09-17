@@ -4983,6 +4983,7 @@ def test_rule_put_then_real_watcher_check_dispatches_matching_connect_fire(
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: InvoiceGmail())
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", lambda: None)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
