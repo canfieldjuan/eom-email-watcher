@@ -3,16 +3,18 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from eom_email_watcher.automate.store import (
+    ActionConflict,
     InvalidEffect,
     OperationConflict,
     StaleRecord,
     UnknownRecord,
+    UnresolvedAction,
     WorkflowStore,
     request_fingerprint,
 )
@@ -763,3 +765,253 @@ def test_reserve_no_match_is_replayed_by_lookup(tmp_path: Path) -> None:
     assert replay.operation_name == "convert"
     # The record was not changed by a no-match reservation.
     assert store.get_record(record.record_id).state_version == 1
+
+
+def _make_record(store: WorkflowStore) -> str:
+    return store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES).record_id
+
+
+def test_admit_action_inserts_a_pending_row(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    assert admission.admitted is True
+    assert admission.view.status == "pending"
+    assert admission.view.kind == "notify.local"
+    assert admission.view.request == {"title": "t"}
+
+
+def test_settle_action_records_the_result(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    settled = store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    assert settled.status == "settled"
+    assert settled.result == {"ok": True}
+
+
+def test_admit_replays_a_settled_action(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    replay = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    assert replay.admitted is False
+    assert replay.view.status == "settled"
+    assert replay.view.result == {"ok": True}
+
+
+def test_admit_pending_action_is_unresolved(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    # A second admit while still pending (a prior unsettled dispatch) must not re-dispatch.
+    with pytest.raises(UnresolvedAction):
+        store.admit_action(
+            record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+        )
+
+
+def test_admit_conflict_on_changed_kind_or_request(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    with pytest.raises(ActionConflict):
+        store.admit_action(
+            record_id, kind="notify.local", dedupe_key="d1", request={"title": "other"}, now=NOW
+        )
+
+
+def test_fail_action_is_terminal(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="d1", request={"to": "a"}, now=NOW
+    )
+    failed = store.fail_action(admission.view.action_id, error="boom", now=NOW)
+    assert failed.status == "failed"
+    assert failed.last_error == "boom"
+    # A settled transition off a failed action is refused.
+    with pytest.raises(UnknownRecord):
+        store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+
+
+def test_admit_action_unknown_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(UnknownRecord):
+        store.admit_action(
+            "11111111-1111-4111-8111-111111111111",
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"title": "t"},
+            now=NOW,
+        )
+
+
+def test_admit_action_rejects_a_non_mapping_request(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request=None,
+            now=NOW,  # type: ignore[arg-type]
+        )
+
+
+def test_admit_action_rejects_an_oversized_request(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"body": "x" * 20000},
+            now=NOW,
+        )
+
+
+def test_list_actions_is_empty_for_a_fresh_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    assert store.list_actions(record_id) == []
+
+
+def test_dedupe_key_is_scoped_per_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    a = _make_record(store)
+    b = _make_record(store)
+    first = store.admit_action(
+        a, kind="notify.local", dedupe_key="shared", request={"title": "t"}, now=NOW
+    )
+    second = store.admit_action(
+        b, kind="notify.local", dedupe_key="shared", request={"title": "t"}, now=NOW
+    )
+    # The same dedupe key on two records is two independent actions, not a replay.
+    assert first.admitted is True
+    assert second.admitted is True
+    assert first.view.action_id != second.view.action_id
+    assert second.view.record_id == b
+
+
+def test_admit_action_rejects_a_non_finite_value(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"value": float("nan")},
+            now=NOW,
+        )
+
+
+def test_admit_action_rejects_a_non_string_object_key(tmp_path: Path) -> None:
+    # A non-string key would be silently coerced by json.dumps ({1: "a"} -> {"1": "a"}),
+    # colliding the canonical dedupe identity with a genuine {"1": "a"} request. Reject it.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"meta": {1: "a"}},  # nested non-string key
+            now=NOW,
+        )
+
+
+def test_admit_action_rejects_a_circular_reference(tmp_path: Path) -> None:
+    # A self-referential payload would recurse forever in the key walk; it must fail closed
+    # as InvalidEffect (as json.dumps's own circular-reference check would), not RecursionError.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    request: dict[str, object] = {"title": "t"}
+    request["self"] = request
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id, kind="notify.local", dedupe_key="d1", request=request, now=NOW
+        )
+
+
+def test_list_actions_preserves_admission_order_on_timestamp_tie(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    for index in range(5):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key=f"d{index}",
+            request={"n": index},
+            now=NOW,  # identical timestamp for every action
+        )
+    actions = store.list_actions(record_id)
+    assert [action.dedupe_key for action in actions] == ["d0", "d1", "d2", "d3", "d4"]
+
+
+def test_list_actions_orders_by_admission_not_timestamp_text(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    # A later admission whose created_at text sorts *earlier* than the first: a different
+    # UTC offset (12:00+02:00 is the instant 10:00Z, admitted before 11:00Z), the same class
+    # of misordering a backward clock jump would cause. Lexicographic created_at ordering
+    # would reverse these two; admission order (rowid) must not.
+    first = store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="first",
+        request={"n": 0},
+        now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone(timedelta(hours=2))),  # 10:00Z
+    )
+    second = store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="second",
+        request={"n": 1},
+        now=datetime(2026, 6, 1, 11, 0, tzinfo=UTC),  # later instant, earlier-sorting text
+    )
+    assert first.view.created_at > second.view.created_at  # the stored text misorders them
+    actions = store.list_actions(record_id)
+    assert [action.dedupe_key for action in actions] == ["first", "second"]
+
+
+def test_release_action_frees_a_pending_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="d1", request={"to": "a"}, now=NOW
+    )
+    store.release_action(admission.view.action_id)
+    # The dedupe key is free again after release.
+    readmitted = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="d1", request={"to": "a"}, now=NOW
+    )
+    assert readmitted.admitted is True
+
+
+def test_release_action_refuses_a_settled_action(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    with pytest.raises(UnknownRecord):
+        store.release_action(admission.view.action_id)

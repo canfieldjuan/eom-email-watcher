@@ -54,6 +54,17 @@ MAX_EFFECTS_PER_BATCH = 8
 # event and the overlay projection.
 MAX_EFFECT_BATCH_BYTES = 16 * 1024
 
+# The maximum size of a canonical action request or result persisted in the action outbox.
+MAX_ACTION_BYTES = 16 * 1024
+
+# Action outbox statuses. An action is admitted 'pending' before its side effect runs, then
+# settled to a terminal state. 'pending' surviving a crash is the accept-then-crash ambiguity
+# whose reconciliation is deferred hardening; the store detects it and refuses to silently
+# re-dispatch.
+ACTION_PENDING = "pending"
+ACTION_SETTLED = "settled"
+ACTION_FAILED = "failed"
+
 _SCHEMA = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS workflow_records (
@@ -109,6 +120,29 @@ CREATE TABLE IF NOT EXISTS workflow_overlays (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (record_id, key)
 );
+CREATE TABLE IF NOT EXISTS workflow_actions (
+    action_id TEXT PRIMARY KEY CHECK (length(action_id) = 36),
+    record_id TEXT NOT NULL CHECK (record_id <> ''),
+    -- A caller-minted idempotency key for the action's intent, unique per record (not
+    -- globally) so the same key on two records is two independent actions. Modeled on the
+    -- outbound outbox's dedupe_key but scoped to the owning record.
+    dedupe_key TEXT NOT NULL CHECK (dedupe_key <> ''),
+    kind TEXT NOT NULL CHECK (kind <> ''),
+    request TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'failed')),
+    result TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (record_id, dedupe_key),
+    CHECK (
+        (status = 'pending' AND result IS NULL)
+        OR (status = 'settled' AND result IS NOT NULL)
+        OR (status = 'failed')
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_actions_record
+    ON workflow_actions(record_id, created_at);
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -163,6 +197,28 @@ class OperationConflict(WorkflowStoreError):
         self.operation_key = operation_key
 
 
+class ActionConflict(WorkflowStoreError):
+    """Raised when an action dedupe key is reused with a different kind or request."""
+
+    def __init__(self, *, dedupe_key: str):
+        super().__init__(
+            f"action dedupe key {dedupe_key!r} was already used with a different intent"
+        )
+        self.dedupe_key = dedupe_key
+
+
+class UnresolvedAction(WorkflowStoreError):
+    """Raised when an action dedupe key is still pending from an earlier, unsettled dispatch.
+
+    Its side effect may or may not have run (accept-then-crash), so the store refuses to
+    silently re-dispatch. Reconciling a pending action is deferred hardening.
+    """
+
+    def __init__(self, *, dedupe_key: str):
+        super().__init__(f"action {dedupe_key!r} is pending from an unsettled dispatch")
+        self.dedupe_key = dedupe_key
+
+
 @dataclass(frozen=True)
 class RecordView:
     record_id: str
@@ -196,6 +252,33 @@ class OperationReplay:
     operation_name: str
     request_fingerprint: str
     matched: bool
+
+
+@dataclass(frozen=True)
+class ActionView:
+    action_id: str
+    record_id: str
+    dedupe_key: str
+    kind: str
+    request: dict[str, object]
+    status: str
+    result: dict[str, object] | None
+    last_error: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ActionAdmission:
+    """The outcome of admitting an action to the outbox.
+
+    ``admitted`` is True only when this call inserted a fresh pending row and the caller
+    should now run the side effect. When it is False the dedupe key already reached a
+    terminal state and ``view`` carries that recorded outcome to replay.
+    """
+
+    view: ActionView
+    admitted: bool
 
 
 def request_fingerprint(request: Mapping[str, object]) -> str:
@@ -314,6 +397,89 @@ def _replay_view(record: sqlite3.Row, event: sqlite3.Row) -> RecordView:
         created_at=record["created_at"],
         updated_at=event["created_at"],
     )
+
+
+def _action_view(row: sqlite3.Row) -> ActionView:
+    return ActionView(
+        action_id=row["action_id"],
+        record_id=row["record_id"],
+        dedupe_key=row["dedupe_key"],
+        kind=row["kind"],
+        request=json.loads(row["request"]),
+        status=row["status"],
+        result=json.loads(row["result"]) if row["result"] is not None else None,
+        last_error=row["last_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _reject_non_string_keys(
+    value: object, *, label: str, _path: frozenset[int] = frozenset()
+) -> None:
+    """Recursively reject mappings whose keys are not strings, and circular references.
+
+    ``json.dumps`` silently coerces a non-string object key to its string form, so
+    ``{1: "a"}`` and ``{"1": "a"}`` would serialize identically (colliding the dedupe
+    identity) and ``{1: "a", "1": "b"}`` would persist duplicate ``"1"`` members and read
+    back with one value dropped. Reject non-string keys before serialization so a payload's
+    canonical bytes are a faithful, injective encoding of its logical content.
+
+    ``json.dumps`` detects a circular reference itself (a clean ``ValueError``), but this
+    walk runs first, so it must detect the cycle too, via the set of container ids on the
+    current recursion path; otherwise a self-referential payload recurses until it exhausts
+    the stack (see the ``RecursionError`` catch in :func:`_canonical_payload`).
+    """
+    if isinstance(value, Mapping):
+        if id(value) in _path:
+            raise InvalidEffect(f"action {label} contains a circular reference")
+        deeper = _path | {id(value)}
+        for key, sub in value.items():
+            if not isinstance(key, str):
+                raise InvalidEffect(f"action {label} contains a non-string object key {key!r}")
+            _reject_non_string_keys(sub, label=label, _path=deeper)
+    elif isinstance(value, (list, tuple)):
+        if id(value) in _path:
+            raise InvalidEffect(f"action {label} contains a circular reference")
+        deeper = _path | {id(value)}
+        for item in value:
+            _reject_non_string_keys(item, label=label, _path=deeper)
+
+
+def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
+    """Canonical JSON for an action request or result, size-bounded and fail-closed.
+
+    Rejects a non-mapping payload and a value that cannot be serialized within the size
+    bound, so the action outbox never persists an unbounded or unencodable payload.
+    """
+    if not isinstance(payload, Mapping):
+        raise InvalidEffect(f"action {label} must be a mapping")
+    try:
+        _reject_non_string_keys(payload, label=label)
+        canonical = json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        size = len(canonical.encode("utf-8"))
+    except InvalidEffect:
+        # Deliberate rejections from the walk (non-string key, circular reference) carry their
+        # own message; let them through unchanged.
+        raise
+    except Exception as exc:
+        # This is a trust boundary: canonicalizing a caller- or adapter-supplied payload must
+        # yield canonical bytes or InvalidEffect, never leak. Any other failure of the walk or
+        # of json.dumps over that data is such a leak -- a non-JSON value (TypeError), a
+        # non-portable number or unencodable string (ValueError), a payload too deeply nested
+        # (RecursionError), a mapping that misbehaves while being traversed (RuntimeError), and
+        # so on. Terminalize the whole class as InvalidEffect so the runner records a terminal
+        # failure rather than leaving the action stuck pending.
+        raise InvalidEffect(f"action {label} could not be canonicalized: {exc}") from exc
+    if size > MAX_ACTION_BYTES:
+        raise InvalidEffect(f"action {label} exceeds {MAX_ACTION_BYTES} bytes")
+    return canonical
 
 
 class WorkflowStore:
@@ -745,3 +911,146 @@ class WorkflowStore:
                 "SELECT * FROM workflow_records WHERE record_id = ?", (record_id,)
             ).fetchone()
         return TransitionOutcome(record=_record_view(refreshed), event_id=event_id, applied=True)
+
+    def admit_action(
+        self,
+        record_id: str,
+        *,
+        kind: str,
+        dedupe_key: str,
+        request: Mapping[str, object],
+        now: datetime,
+    ) -> ActionAdmission:
+        """Admit an action to the outbox, deduplicated by ``dedupe_key``.
+
+        The dedupe key persists the intent before the side effect runs, so a completed
+        action is never dispatched twice. Behavior by prior state of the key:
+
+        - unused: insert a fresh ``pending`` row and return ``admitted=True``; the caller
+          runs the side effect and then calls :meth:`settle_action` or :meth:`fail_action`.
+        - ``settled`` or ``failed``: return ``admitted=False`` with the recorded outcome to
+          replay. A reuse with a different kind or request is an :class:`ActionConflict`.
+        - ``pending``: raise :class:`UnresolvedAction`; a prior dispatch did not settle and
+          its side effect may have run (reconciliation is deferred hardening).
+        """
+        if not dedupe_key or not isinstance(dedupe_key, str):
+            raise ValueError("dedupe_key must be a non-empty string")
+        if not kind or not isinstance(kind, str):
+            raise ValueError("kind must be a non-empty string")
+        canonical_request = _canonical_payload(request, label="request")
+        timestamp = now.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if (
+                db.execute(
+                    "SELECT 1 FROM workflow_records WHERE record_id = ?", (record_id,)
+                ).fetchone()
+                is None
+            ):
+                raise UnknownRecord(record_id)
+            prior = db.execute(
+                "SELECT * FROM workflow_actions WHERE record_id = ? AND dedupe_key = ?",
+                (record_id, dedupe_key),
+            ).fetchone()
+            if prior is not None:
+                if prior["kind"] != kind or prior["request"] != canonical_request:
+                    raise ActionConflict(dedupe_key=dedupe_key)
+                if prior["status"] == ACTION_PENDING:
+                    raise UnresolvedAction(dedupe_key=dedupe_key)
+                return ActionAdmission(view=_action_view(prior), admitted=False)
+            action_id = _new_id()
+            db.execute(
+                "INSERT INTO workflow_actions "
+                "(action_id, record_id, dedupe_key, kind, request, status, result, "
+                "last_error, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+                (action_id, record_id, dedupe_key, kind, canonical_request, timestamp, timestamp),
+            )
+            row = db.execute(
+                "SELECT * FROM workflow_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+        return ActionAdmission(view=_action_view(row), admitted=True)
+
+    def settle_action(
+        self, action_id: str, *, result: Mapping[str, object], now: datetime
+    ) -> ActionView:
+        """Record a pending action's successful result, moving it to ``settled``."""
+        canonical_result = _canonical_payload(result, label="result")
+        timestamp = now.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute(
+                "UPDATE workflow_actions SET status = 'settled', result = ?, updated_at = ? "
+                "WHERE action_id = ? AND status = 'pending'",
+                (canonical_result, timestamp, action_id),
+            )
+            if updated.rowcount != 1:
+                raise UnknownRecord(action_id)
+            row = db.execute(
+                "SELECT * FROM workflow_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+        return _action_view(row)
+
+    def fail_action(self, action_id: str, *, error: str, now: datetime) -> ActionView:
+        """Record a pending action's failure, moving it to the terminal ``failed`` state."""
+        timestamp = now.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            updated = db.execute(
+                "UPDATE workflow_actions SET status = 'failed', last_error = ?, updated_at = ? "
+                "WHERE action_id = ? AND status = 'pending'",
+                (error[:500], timestamp, action_id),
+            )
+            if updated.rowcount != 1:
+                raise UnknownRecord(action_id)
+            row = db.execute(
+                "SELECT * FROM workflow_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+        return _action_view(row)
+
+    def release_action(self, action_id: str) -> None:
+        """Delete a pending action so its dedupe key is free to admit again.
+
+        Used when a newly admitted action cannot be dispatched (for example no adapter is
+        configured for its kind): releasing the row avoids poisoning the dedupe key with a
+        terminal failure that a later, correctly configured retry could not recover from.
+        Only a pending row may be released; a terminal row raises.
+        """
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            deleted = db.execute(
+                "DELETE FROM workflow_actions WHERE action_id = ? AND status = 'pending'",
+                (action_id,),
+            )
+            if deleted.rowcount != 1:
+                raise UnknownRecord(action_id)
+
+    def get_action(self, action_id: str) -> ActionView:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM workflow_actions WHERE action_id = ?", (action_id,)
+            ).fetchone()
+        if row is None:
+            raise UnknownRecord(action_id)
+        return _action_view(row)
+
+    def list_actions(self, record_id: str) -> list[ActionView]:
+        """Return a record's actions in creation order (the local-notification feed too)."""
+        with self.connection() as db:
+            if (
+                db.execute(
+                    "SELECT 1 FROM workflow_records WHERE record_id = ?", (record_id,)
+                ).fetchone()
+                is None
+            ):
+                raise UnknownRecord(record_id)
+            # Order by rowid, the durable admission sequence. rowid is monotonic with
+            # insertion under the single-threaded admission model (ADR-0006), so it is the
+            # creation order. created_at is display text (an ISO string carrying the caller's
+            # UTC offset) and cannot be the ordering key: differing offsets or a backward
+            # clock jump make its lexicographic order disagree with admission order.
+            rows = db.execute(
+                "SELECT * FROM workflow_actions WHERE record_id = ? ORDER BY rowid",
+                (record_id,),
+            ).fetchall()
+        return [_action_view(row) for row in rows]
