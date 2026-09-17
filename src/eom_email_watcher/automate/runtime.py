@@ -21,11 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .actions import ActionOutcome, ActionRunner, AdapterRegistry
-from .definition import Workflow, WorkflowDefinition
+from .definition import Workflow
 from .engine import DecisionOutcome, WorkflowEngine
 from .host import AutomateHost
 from .pack import LoadedPack, load_pack, verify_grant
-from .store import RecordView, WorkflowStore
+from .store import ACTION_DEDUPE_PREFIX, RecordView, WorkflowStore
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,7 @@ class PackRuntime:
             )
         self._pack = pack
         self._host = host
+        self._store = store
         self._engine = WorkflowEngine(store=store, host=host)
         self._runner = ActionRunner(store=store, registry=registry, host=host)
 
@@ -131,13 +132,16 @@ class PackRuntime:
     ) -> DecisionRun:
         """Apply a decision and dispatch the matched definition's declared actions.
 
-        The record-ledger effects (the transition) commit through the engine first. Then,
-        only on the call that actually applied them (``matched and applied``), the matched
-        definition's actions are emitted through the outbox. A replay of the same
-        ``operation_key`` returns ``applied=False`` and dispatches nothing, so the side
-        effect runs exactly once. Each action's dedupe key is runtime-owned: a reserved
-        ``pack.action:`` namespace over the committed event id, so it cannot collide with a
-        caller-minted outbox key and is unique to this committed decision.
+        The engine commits the record-ledger effects (the transition) and admits the matched
+        definition's action intents to the outbox in the *same* transaction, so the moment a
+        decision applies its declared side effects are durable pending rows. This method then
+        dispatches (delivers and settles) those pending rows.
+
+        This is idempotent and crash-recoverable: a replay of the same ``operation_key``
+        returns ``applied=False`` and re-admits nothing, and the dispatch here re-drives only
+        rows still ``pending`` from an earlier crash mid-dispatch, so each declared action
+        runs at most once and is never lost. An action whose kind has no configured adapter
+        stays pending and resumable rather than being lost or blocking the others.
         """
         outcome = self._engine.submit_decision(
             self._pack.workflow,
@@ -149,26 +153,13 @@ class PackRuntime:
             now=now,
         )
         actions: list[ActionOutcome] = []
-        if outcome.matched and outcome.applied and outcome.definition_name is not None:
-            definition = self._definition(outcome.definition_name)
-            # The committed decision's ledger event id keys the actions: it is set for any
-            # applied batch, unique to this decision, and not caller-minted, so a reserved
-            # namespace over it cannot collide with a key a direct ActionRunner caller used.
-            for index, emit in enumerate(definition.actions):
-                actions.append(
-                    self._runner.run(
-                        record_id,
-                        kind=emit.action,
-                        dedupe_key=f"pack.action:{outcome.event_id}:{index}",
-                        request=emit.request,
-                        now=now,
-                    )
-                )
+        if outcome.matched and outcome.event_id is not None:
+            # The decision's action rows were admitted (pending) in the same transaction as
+            # its ledger event, keyed by that event id. Dispatch them in admission order;
+            # dispatch() delivers a pending row, replays a terminal one, and leaves an
+            # unconfigured-adapter row pending for a later resume.
+            prefix = f"{ACTION_DEDUPE_PREFIX}{outcome.event_id}:"
+            for view in self._store.list_actions(record_id):
+                if view.dedupe_key.startswith(prefix):
+                    actions.append(self._runner.dispatch(view, now=now))
         return DecisionRun(outcome=outcome, actions=actions)
-
-    def _definition(self, name: str) -> WorkflowDefinition:
-        for definition in self._pack.workflow.definitions:
-            if definition.name == name:
-                return definition
-        # Unreachable: the engine only returns a definition_name from this workflow.
-        raise KeyError(name)

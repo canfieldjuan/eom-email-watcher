@@ -938,6 +938,135 @@ def test_admit_action_rejects_a_non_string_object_key(tmp_path: Path) -> None:
         )
 
 
+def test_apply_effects_admits_action_intents_atomically(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    outcome = store.apply_effects(
+        record_id,
+        [{"kind": "record.transition", "to_stage": "reviewing"}],
+        operation_key="op-1",
+        operation_name="review",
+        request={},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+        actions=[{"kind": "notify.local", "request": {"title": "t", "body": "b"}}],
+    )
+    feed = store.list_actions(record_id)
+    assert len(feed) == 1
+    assert feed[0].status == "pending"
+    assert feed[0].kind == "notify.local"
+    assert feed[0].dedupe_key == f"pack.action:{outcome.event_id}:0"
+    assert feed[0].request == {"title": "t", "body": "b"}
+
+
+def test_apply_effects_replay_does_not_readmit_actions(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    args = {
+        "operation_key": "op-1",
+        "operation_name": "review",
+        "request": {},
+        "expected_version": 1,
+        "now": NOW,
+        "allowed_stages": STAGES,
+        "actions": [{"kind": "notify.local", "request": {"title": "t", "body": "b"}}],
+    }
+    effects = [{"kind": "record.transition", "to_stage": "reviewing"}]
+    store.apply_effects(record_id, effects, **args)
+    # An idempotent replay (same key, effects, request) admits no second action row.
+    replay = store.apply_effects(record_id, effects, **args)
+    assert replay.applied is False
+    assert len(store.list_actions(record_id)) == 1
+
+
+def test_apply_effects_rejects_an_unsupported_action_kind(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record_id,
+            [{"kind": "record.transition", "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="review",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+            actions=[{"kind": "mail.blast", "request": {}}],
+            allowed_action_kinds=frozenset({"notify.local"}),
+        )
+    # The record did not advance: the unsupported kind was rejected before the transaction.
+    assert store.get_record(record_id).stage == "captured"
+
+
+def test_apply_effects_rejects_a_non_sequence_actions_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    for bad in ({}, "", b""):
+        with pytest.raises(InvalidEffect):
+            store.apply_effects(
+                record_id,
+                [{"kind": "record.transition", "to_stage": "reviewing"}],
+                operation_key="op-1",
+                operation_name="review",
+                request={},
+                expected_version=1,
+                now=NOW,
+                allowed_stages=STAGES,
+                actions=bad,  # malformed: falsy but not None -- must not be silently dropped
+            )
+    assert store.get_record(record_id).stage == "captured"
+
+
+def test_apply_effects_rejects_an_unknown_action_intent_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record_id,
+            [{"kind": "record.transition", "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="review",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+            actions=[{"kind": "notify.local", "requests": {"title": "t"}}],  # typo'd field
+        )
+    assert store.get_record(record_id).stage == "captured"
+
+
+def test_admit_action_rejects_the_reserved_dedupe_prefix(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(ValueError):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="pack.action:some-event:0",  # reserved for decision-emitted actions
+            request={"title": "t", "body": "b"},
+            now=NOW,
+        )
+
+
+def test_apply_effects_rejects_too_many_actions(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record_id,
+            [{"kind": "record.transition", "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="review",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+            actions=[{"kind": "notify.local", "request": {}} for _ in range(9)],
+        )
+
+
 def test_admit_action_rejects_a_circular_reference(tmp_path: Path) -> None:
     # A self-referential payload would recurse forever in the key walk; it must fail closed
     # as InvalidEffect (as json.dumps's own circular-reference check would), not RecursionError.

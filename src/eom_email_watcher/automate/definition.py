@@ -22,16 +22,16 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .actions import ACTION_KINDS
-from .store import MAX_EFFECTS_PER_BATCH, OVERLAY_SET, RECORD_TRANSITION
+from .store import MAX_ACTIONS_PER_DECISION, MAX_EFFECTS_PER_BATCH, OVERLAY_SET, RECORD_TRANSITION
 
 MAX_DEFINITION_BYTES = 16 * 1024
 MAX_CONDITIONS = 8
 # The per-definition effect cap is the store's per-batch cap: a definition's effects are
 # applied as one batch, so the two must not drift.
 MAX_EFFECTS = MAX_EFFECTS_PER_BATCH
-# The per-definition cap on emitted actions. Actions are side effects on the outbox, not
-# record-ledger effects, so they have their own bound.
-MAX_ACTIONS = 8
+# The per-definition cap on emitted actions is the store's per-decision cap, imported so the
+# definition model and the store admission bound cannot drift.
+MAX_ACTIONS = MAX_ACTIONS_PER_DECISION
 MAX_DEFINITIONS = 64
 MAX_STAGES = 64
 # The maximum length of a name-like identifier (workflow name, definition name, trigger
