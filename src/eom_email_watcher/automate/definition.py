@@ -178,7 +178,9 @@ def parse_workflow(raw: bytes | str) -> Workflow:
     """
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # bytes input can be malformed UTF-8, not just malformed JSON; both are the same
+        # rejection path for an untrusted document.
         raise DefinitionError(f"invalid workflow JSON: {exc}") from exc
     try:
         workflow = Workflow.model_validate(data)

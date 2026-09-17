@@ -459,6 +459,50 @@ def test_apply_effects_rejects_extra_member_on_an_effect(tmp_path: Path) -> None
         )
 
 
+def test_reserve_no_match_twice_is_idempotent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.reserve_no_match(
+        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+    )
+    # A second identical reservation is a no-op, not a primary-key violation.
+    store.reserve_no_match(
+        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+    )
+
+
+def test_reserve_no_match_changed_request_conflicts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.reserve_no_match(
+        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+    )
+    with pytest.raises(OperationConflict):
+        store.reserve_no_match(
+            record.record_id, "op-1", operation_name="convert", request={"by": "b"}, now=NOW
+        )
+
+
+def test_apply_effects_on_a_no_match_key_conflicts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.reserve_no_match(
+        record.record_id, "op-1", operation_name="convert", request={"by": "a"}, now=NOW
+    )
+    # Reusing the reserved no-match key to apply effects is changed intent, not a replay.
+    with pytest.raises(OperationConflict):
+        store.transition(
+            record.record_id,
+            "reviewing",
+            operation_key="op-1",
+            operation_name="convert",
+            request={"by": "a"},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
 def test_reserve_no_match_is_replayed_by_lookup(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)

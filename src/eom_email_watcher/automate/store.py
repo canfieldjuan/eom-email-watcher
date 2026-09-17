@@ -435,6 +435,11 @@ class WorkflowStore:
         This keeps a decision that matched no definition idempotent: a later retry of the
         same key replays the no-match through :meth:`lookup_operation` instead of applying
         effects because the record has since moved into a stage where the decision matches.
+
+        The key is rechecked inside the transaction, so two concurrent identical no-match
+        reservations resolve to one insert and one idempotent no-op rather than a primary-key
+        violation; a reservation whose key already resolved to an applied effect, or to a
+        no-match with a different name or request, is an :class:`OperationConflict`.
         """
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
@@ -444,6 +449,19 @@ class WorkflowStore:
             ).fetchone()
             if record is None:
                 raise UnknownRecord(record_id)
+            prior = db.execute(
+                "SELECT operation_name, request_fingerprint, event_id "
+                "FROM workflow_operations WHERE record_id = ? AND operation_key = ?",
+                (record_id, operation_key),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    prior["event_id"] is not None
+                    or prior["operation_name"] != operation_name
+                    or prior["request_fingerprint"] != fingerprint
+                ):
+                    raise OperationConflict(operation_key=operation_key)
+                return  # identical no-match already reserved: idempotent no-op
             db.execute(
                 "INSERT INTO workflow_operations "
                 "(record_id, operation_key, operation_name, request_fingerprint, "
@@ -525,6 +543,10 @@ class WorkflowStore:
                 (record_id, operation_key),
             ).fetchone()
             if prior is not None:
+                if prior["event_id"] is None:
+                    # The key was reserved as a no-match (no event). Reusing it to apply an
+                    # effect batch is changed intent, so it conflicts rather than replaying.
+                    raise OperationConflict(operation_key=operation_key)
                 prior_event = db.execute(
                     "SELECT next_stage, state_version, created_at, effects "
                     "FROM workflow_events WHERE event_id = ?",

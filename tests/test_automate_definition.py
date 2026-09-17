@@ -158,6 +158,11 @@ def test_oversized_workflow_is_rejected_at_parse() -> None:
         parse_workflow(_json(data))
 
 
+def test_invalid_utf8_bytes_are_a_definition_error() -> None:
+    with pytest.raises(DefinitionError):
+        parse_workflow(b"\xff")
+
+
 def _json(data: dict) -> str:
     import json
 
