@@ -15,6 +15,11 @@ fixtures, plans, and older contracts are supporting context only.
 
 - 2026-09-17: Proposed in commit `48a91e2`; accepted by the operator before
   implementation began.
+- 2026-09-17: Implementation evidence showed that Document Summarizer pins and
+  byte-compares the canonical Connect v2 provider manifest. The accepted change
+  surface therefore includes synchronizing that canonical fixture and the
+  provider's pinned fixture revision. This is a fixture update, not a shared
+  schema or Invoice Processor runtime change.
 
 ## Contract
 
@@ -29,6 +34,10 @@ What is wrong:
 - Document Summarizer implements a Contract summary profile, but its Connect v2
   manifest declares no parameters, v2 validation rejects every supplied
   parameter, and Connect ingestion always persists `SummaryProfile::General`.
+- Document Summarizer's conformance test generates its live manifest and
+  requires exact equality with the pinned Connect contracts v2
+  `valid/manifest.json` fixture, so changing the manifest in only the provider
+  repository would make its canonical conformance proof fail.
 - The canonical `document.translate` examples are protocol fixtures. No
   production provider implements that capability at the inspected revisions.
 
@@ -101,6 +110,11 @@ insurer, lawyer, domain, mailbox, or provider instance.
   queue capacity unchanged.
 - Preserve request parameters in the existing canonical request hash so replay
   with another mode is a conflicting identity rather than an accidental reuse.
+- Update the canonical Connect contracts v2 Document Summarizer manifest fixture
+  to declare the same optional `mode` parameter, then pin Document Summarizer's
+  conformance test to that fixture commit. Keep the existing parameter-free
+  canonical request valid so omission continues to prove General behavior. Do
+  not change a shared JSON schema or another provider's reference fixture.
 
 Expected provider boundary probes:
 
@@ -248,6 +262,9 @@ Cross-repository acceptance must exercise:
 - No Connect v1 schema change, Connect v2 shared-schema change, capability
   version bump, output artifact change, broad refactor, dependency bump, rename,
   formatting sweep, or generated-file churn.
+- No Invoice Processor runtime or copied-fixture update is required by this
+  provider-specific canonical manifest change; its existing pinned contract
+  revision remains independent.
 - No claim that a merged implementation is installed, release-ready, or
   publicly released without separate runtime and platform evidence.
 
@@ -299,10 +316,12 @@ After implementation:
 ## Landing order
 
 1. Commit and accept this behavioral contract by itself.
-2. Implement and verify Email Watcher's bounded fire-to-queue dispatcher against
+2. Synchronize the provider-specific canonical Connect v2 manifest fixture and
+   Document Summarizer's pinned conformance revision without changing schemas.
+3. Implement and verify Email Watcher's bounded fire-to-queue dispatcher against
    an existing parameterized reference provider.
-3. Implement and verify Document Summarizer's `mode` parameter and profile
+4. Implement and verify Document Summarizer's `mode` parameter and profile
    propagation without changing Connect v1.
-4. Run the deterministic and real-model Contract Watch acceptance paths.
-5. Add rule-management UI only under a separately accepted product/copy
+5. Run the deterministic and real-model Contract Watch acceptance paths.
+6. Add rule-management UI only under a separately accepted product/copy
    contract.
