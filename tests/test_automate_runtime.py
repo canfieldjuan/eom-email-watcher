@@ -15,6 +15,7 @@ from eom_email_watcher.automate import (
     AutomateHost,
     AutomateLicenseError,
     PackError,
+    PackOwnershipError,
     PackRuntime,
     load_pack,
 )
@@ -602,3 +603,86 @@ def test_grant_for_a_different_subject_is_rejected(tmp_path: Path) -> None:
             subject=SUBJECT,
             now=NOW,
         )
+
+
+def test_a_pack_cannot_drive_another_packs_record_with_the_same_workflow_name(
+    tmp_path: Path,
+) -> None:
+    # Two independently signed packs whose workflows share the name "lead-funnel" but carry
+    # different pack ids, over one shared store. Pack ownership, not the workflow name, is the
+    # boundary: pack B must not drive a record pack A created.
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    host = _licensed_host(tmp_path)
+    registry = AdapterRegistry.with_defaults()
+    pack_b_id = "22222222-2222-4222-8222-222222222222"
+
+    def pack_bytes(pack_id: str) -> bytes:
+        payload = json.dumps(
+            {
+                "format_version": 1,
+                "pack_id": pack_id,
+                "pack_version": 1,
+                "workflow": _workflow([NOTIFY_ACTION]),
+            },
+            separators=(",", ":"),
+        ).encode()
+        return _envelope(key, payload)
+
+    def grant_bytes(pack_id: str) -> bytes:
+        payload = json.dumps(
+            {
+                "format_version": 1,
+                "grant_id": "33333333-3333-4333-8333-333333333333",
+                "pack_id": pack_id,
+                "subject": SUBJECT,
+                "issued_at": "2026-01-01T00:00:00Z",
+                "not_before": "2026-01-01T00:00:00Z",
+                "expires_at": "2027-01-01T00:00:00Z",
+            },
+            separators=(",", ":"),
+        ).encode()
+        return _envelope(key, payload)
+
+    def make_runtime(pack_id: str) -> PackRuntime:
+        return PackRuntime.load(
+            pack_bytes(pack_id),
+            grant_bytes(pack_id),
+            store=store,
+            host=host,
+            registry=registry,
+            publisher_keys=_pack_keys(key),
+            grant_keys=_pack_keys(key),
+            subject=SUBJECT,
+            now=NOW,
+        )
+
+    runtime_a = make_runtime(PACK_ID)
+    runtime_b = make_runtime(pack_b_id)
+
+    record = runtime_a.create_record(now=NOW)
+    assert record.pack_id == PACK_ID
+
+    with pytest.raises(PackOwnershipError):
+        runtime_b.submit_decision(
+            record.record_id,
+            decision="review",
+            operation_key="op-1",
+            request={},
+            expected_version=record.state_version,
+            now=NOW,
+        )
+    # The record is untouched: pack B was refused before any mutation.
+    assert store.get_record(record.record_id).stage == "captured"
+
+    # Pack A drives its own record normally.
+    run = runtime_a.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.outcome.applied is True
+    assert run.outcome.record.stage == "reviewing"

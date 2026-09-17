@@ -117,8 +117,15 @@ class PackRuntime:
         return cls(pack=pack, store=store, host=host, registry=registry, _token=_VERIFIED)
 
     def create_record(self, *, now: datetime) -> RecordView:
-        """Create a record for the pack's workflow at its initial stage."""
-        return self._engine.create_record(self._pack.workflow, now=now)
+        """Create a record for the pack's workflow at its initial stage.
+
+        The record is bound to this pack's identity, so only this pack's runtime can later
+        submit decisions against it, even if another signed pack declares a same-named
+        workflow.
+        """
+        return self._engine.create_record(
+            self._pack.workflow, now=now, pack_id=self._pack.pack_id
+        )
 
     def submit_decision(
         self,
@@ -151,6 +158,7 @@ class PackRuntime:
             request=request,
             expected_version=expected_version,
             now=now,
+            expected_pack_id=self._pack.pack_id,
         )
         actions: list[ActionOutcome] = []
         if outcome.matched and outcome.event_id is not None:

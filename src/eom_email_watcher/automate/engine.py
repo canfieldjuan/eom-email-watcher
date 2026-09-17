@@ -33,6 +33,15 @@ class WorkflowMismatch(EngineError):
     """Raised when a record does not belong to the named workflow."""
 
 
+class PackOwnershipError(EngineError):
+    """Raised when a decision is submitted against a record owned by a different pack.
+
+    The record's ``pack_id`` is the signed-pack boundary: a workflow name can collide across
+    two independently signed packs, so name equality alone would let one pack's runtime drive
+    another pack's records. This refuses that.
+    """
+
+
 class AmbiguousDecision(EngineError):
     """Raised when more than one definition matches a single decision.
 
@@ -76,14 +85,22 @@ class WorkflowEngine:
         self._store = store
         self._host = host
 
-    def create_record(self, workflow: Workflow, *, now: datetime) -> RecordView:
-        """Create a record for a workflow at its initial stage, gated by the license."""
+    def create_record(
+        self, workflow: Workflow, *, now: datetime, pack_id: str | None = None
+    ) -> RecordView:
+        """Create a record for a workflow at its initial stage, gated by the license.
+
+        ``pack_id`` binds the record to the signed pack that created it, so a later decision
+        can be refused unless it comes from that same pack. ``None`` leaves it unbound (a
+        bare-workflow record, as in the pre-pack slices).
+        """
         self._host.require_license()
         return self._store.create_record(
             workflow.name,
             workflow.initial_stage,
             now=now,
             allowed_stages=frozenset(workflow.stages),
+            pack_id=pack_id,
         )
 
     def submit_decision(
@@ -96,12 +113,20 @@ class WorkflowEngine:
         request: Mapping[str, object],
         expected_version: int,
         now: datetime,
+        expected_pack_id: str | None = None,
     ) -> DecisionOutcome:
         """Apply the definition matching ``decision`` to ``record_id``.
 
         Returns ``matched=False`` with no mutation when no definition handles the decision
         at the record's current stage. Raises :class:`AmbiguousDecision` when more than one
         matches.
+
+        ``expected_pack_id``, when given, is the signed pack the caller is running: the
+        record's own ``pack_id`` must equal it or the decision is refused with
+        :class:`PackOwnershipError`, so a pack cannot drive a record another signed pack
+        created merely because the two workflows share a name. ``None`` skips the check (a
+        bare-workflow caller). The check precedes the replay lookup, so even a replay is
+        refused for a foreign pack.
 
         Operation-key replay takes precedence over condition re-evaluation: an operator
         retrying the same decision after the record has advanced replays the recorded
@@ -129,6 +154,14 @@ class WorkflowEngine:
             raise WorkflowMismatch(
                 f"record {record_id!r} belongs to workflow {record.workflow!r}, "
                 f"not {workflow.name!r}"
+            )
+        # Enforce the signed-pack boundary before anything else touches the operation log:
+        # pack_id is write-once, so this read-then-check is race-free, and placing it before
+        # the replay lookup means a foreign pack cannot even replay a recorded outcome.
+        if expected_pack_id is not None and record.pack_id != expected_pack_id:
+            raise PackOwnershipError(
+                f"record {record_id!r} is owned by pack {record.pack_id!r}, "
+                f"not {expected_pack_id!r}"
             )
         # Replay takes precedence over current-stage re-evaluation: a completed operation
         # must replay its recorded outcome even if a later workflow revision has advanced

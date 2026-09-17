@@ -13,6 +13,7 @@ from eom_email_watcher.automate import (
     AmbiguousDecision,
     AutomateHost,
     AutomateLicenseError,
+    PackOwnershipError,
     Workflow,
     WorkflowEngine,
     WorkflowMismatch,
@@ -549,3 +550,122 @@ def test_no_match_retry_after_advance_stays_a_no_match(tmp_path: Path) -> None:
     assert replay.matched is False
     assert replay.applied is False
     assert engine._store.get_record(record.record_id).stage == "reviewing"
+
+
+def test_create_record_binds_the_pack_id(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    assert record.pack_id == "pack-a"
+    assert engine._store.get_record(record.record_id).pack_id == "pack-a"
+
+
+def test_create_record_leaves_pack_id_none_by_default(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    record = engine.create_record(_workflow(), now=NOW)
+    assert record.pack_id is None
+
+
+def test_submit_decision_accepts_the_owning_pack(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    outcome = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        expected_pack_id="pack-a",
+    )
+    assert outcome.matched is True
+    assert outcome.applied is True
+
+
+def test_submit_decision_refuses_a_foreign_pack(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    with pytest.raises(PackOwnershipError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={"by": "mallory"},
+            expected_version=1,
+            now=NOW,
+            expected_pack_id="pack-b",
+        )
+    # The record did not advance: the foreign pack was refused before any mutation.
+    assert engine._store.get_record(record.record_id).stage == "captured"
+    assert engine._store.get_record(record.record_id).state_version == 1
+
+
+def test_submit_decision_refuses_a_foreign_pack_even_on_replay(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        expected_pack_id="pack-a",
+    )
+    # A foreign pack replaying the same operation key must be refused before the replay lookup,
+    # so it cannot read another pack's recorded outcome.
+    with pytest.raises(PackOwnershipError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={"by": "alice"},
+            expected_version=1,
+            now=NOW,
+            expected_pack_id="pack-b",
+        )
+
+
+def test_submit_decision_refuses_when_the_record_is_unbound_but_a_pack_is_expected(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    # A bare-workflow record (pack_id None) cannot be driven by a pack-scoped caller.
+    record = engine.create_record(workflow, now=NOW)
+    with pytest.raises(PackOwnershipError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request={},
+            expected_version=1,
+            now=NOW,
+            expected_pack_id="pack-a",
+        )
+
+
+def test_submit_decision_without_expected_pack_id_skips_the_check(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    # A record bound to a pack can still be driven by a bare-workflow caller (expected_pack_id
+    # None): the check is opt-in, preserving the pre-pack engine behavior.
+    record = engine.create_record(workflow, now=NOW, pack_id="pack-a")
+    outcome = engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-1",
+        request={},
+        expected_version=1,
+        now=NOW,
+    )
+    assert outcome.applied is True
