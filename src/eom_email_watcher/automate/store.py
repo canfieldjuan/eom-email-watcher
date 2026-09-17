@@ -194,13 +194,13 @@ class WorkflowStore:
             connection.close()
 
     def initialize(self) -> None:
-        parent = self.path.parent
-        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # mkdir does not tighten an already-existing directory, and SQLite creates the
-        # database file under the process umask (often 0644). This ledger holds private
-        # record names and stages, so restrict both the directory and the file to the
-        # owner, mirroring the entitlement store's 0700/0600 handling.
-        _restrict(parent, 0o700)
+        # mode=0o700 applies only when mkdir creates the directory, so a dedicated parent
+        # is created private and an existing, possibly shared, parent is left untouched.
+        # SQLite otherwise creates the database under the process umask (often 0644), so
+        # restrict the database and its WAL sidecars to the owner: this ledger holds
+        # private record names and stages, and 0600 files protect it even under a shared
+        # parent without changing that parent's permissions.
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(_SCHEMA)
