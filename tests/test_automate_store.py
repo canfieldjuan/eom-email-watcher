@@ -891,3 +891,73 @@ def test_list_actions_is_empty_for_a_fresh_record(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record_id = _make_record(store)
     assert store.list_actions(record_id) == []
+
+
+def test_dedupe_key_is_scoped_per_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    a = _make_record(store)
+    b = _make_record(store)
+    first = store.admit_action(
+        a, kind="notify.local", dedupe_key="shared", request={"title": "t"}, now=NOW
+    )
+    second = store.admit_action(
+        b, kind="notify.local", dedupe_key="shared", request={"title": "t"}, now=NOW
+    )
+    # The same dedupe key on two records is two independent actions, not a replay.
+    assert first.admitted is True
+    assert second.admitted is True
+    assert first.view.action_id != second.view.action_id
+    assert second.view.record_id == b
+
+
+def test_admit_action_rejects_a_non_finite_value(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"value": float("nan")},
+            now=NOW,
+        )
+
+
+def test_list_actions_preserves_admission_order_on_timestamp_tie(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    for index in range(5):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key=f"d{index}",
+            request={"n": index},
+            now=NOW,  # identical timestamp for every action
+        )
+    actions = store.list_actions(record_id)
+    assert [action.dedupe_key for action in actions] == ["d0", "d1", "d2", "d3", "d4"]
+
+
+def test_release_action_frees_a_pending_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="d1", request={"to": "a"}, now=NOW
+    )
+    store.release_action(admission.view.action_id)
+    # The dedupe key is free again after release.
+    readmitted = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="d1", request={"to": "a"}, now=NOW
+    )
+    assert readmitted.admitted is True
+
+
+def test_release_action_refuses_a_settled_action(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="d1", request={"title": "t"}, now=NOW
+    )
+    store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    with pytest.raises(UnknownRecord):
+        store.release_action(admission.view.action_id)

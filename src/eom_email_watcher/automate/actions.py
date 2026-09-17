@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .host import AutomateHost
-from .store import ActionView, WorkflowStore
+from .store import ActionView, InvalidEffect, WorkflowStore
 
 NOTIFY_LOCAL = "notify.local"
 NOTIFY = "notify"
@@ -140,19 +140,26 @@ class ActionRunner:
         """Admit, dispatch, and settle an action, gated by the license.
 
         Idempotent by ``dedupe_key``: an already-settled or already-failed action replays its
-        recorded outcome without re-dispatching. The adapter is resolved before admission so a
-        missing integration does not create an outbox row.
+        recorded outcome without re-dispatching, and without needing the adapter still
+        configured. The adapter is resolved only for a newly admitted action; if none is
+        configured the pending row is released so its dedupe key is not poisoned.
         """
         self._host.require_license()
         if kind not in ACTION_KINDS:
             raise ValueError(f"unknown action kind {kind!r}")
-        adapter = self._registry.resolve(kind)
         admission = self._store.admit_action(
             record_id, kind=kind, dedupe_key=dedupe_key, request=request, now=now
         )
         if not admission.admitted:
+            # A terminal (settled or failed) action replays its recorded outcome; a replay
+            # must not depend on the current adapter configuration.
             return _outcome(admission.view, delivered=False)
         action_id = admission.view.action_id
+        try:
+            adapter = self._registry.resolve(kind)
+        except AdapterNotConfigured:
+            self._store.release_action(action_id)
+            raise
         try:
             result = adapter.deliver(request)
         except Exception as exc:
@@ -163,7 +170,17 @@ class ActionRunner:
                 action_id, error="adapter returned a non-mapping result", now=now
             )
             raise ActionDeliveryError(f"adapter for {kind!r} returned a non-mapping result")
-        settled = self._store.settle_action(action_id, result=result, now=now)
+        try:
+            settled = self._store.settle_action(action_id, result=result, now=now)
+        except InvalidEffect as exc:
+            # The side effect ran but its result cannot be persisted (oversized or not
+            # canonical JSON); terminalize as failed rather than leave the action pending.
+            self._store.fail_action(
+                action_id, error=f"adapter result could not be persisted: {exc}", now=now
+            )
+            raise ActionDeliveryError(
+                f"adapter for {kind!r} returned an unpersistable result: {exc}"
+            ) from exc
         return _outcome(settled, delivered=True)
 
 

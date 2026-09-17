@@ -208,3 +208,63 @@ def test_unlicensed_host_refuses_to_run_an_action(tmp_path: Path) -> None:
             now=NOW,
         )
     assert store.list_actions(record_id) == []
+
+
+def test_settled_action_replays_after_its_adapter_is_removed(tmp_path: Path) -> None:
+    class OkAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            return {"ok": True}
+
+    host = _licensed_host(tmp_path)
+    store = WorkflowStore(tmp_path / "automate" / "workflow.db")
+    store.initialize()
+    record_id = _record(store)
+
+    with_adapter = AdapterRegistry.with_defaults()
+    with_adapter.register("mail.send", OkAdapter())
+    first = ActionRunner(store=store, registry=with_adapter, host=host).run(
+        record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW
+    )
+    assert first.delivered is True
+
+    # A later run whose registry no longer configures mail.send must still replay the
+    # recorded outcome instead of raising AdapterNotConfigured.
+    without_adapter = AdapterRegistry.with_defaults()
+    replay = ActionRunner(store=store, registry=without_adapter, host=host).run(
+        record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW
+    )
+    assert replay.delivered is False
+    assert replay.status == "settled"
+    assert replay.result == {"ok": True}
+
+
+def test_unpersistable_result_marks_the_action_failed(tmp_path: Path) -> None:
+    class NanAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            return {"value": float("nan")}  # not canonical JSON
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", NanAdapter())
+    record_id = _record(store)
+    with pytest.raises(ActionDeliveryError):
+        runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    actions = store.list_actions(record_id)
+    assert len(actions) == 1
+    # Terminalized as failed, not left stuck pending.
+    assert actions[0].status == "failed"
+
+
+def test_unconfigured_kind_releases_and_leaves_the_key_reusable(tmp_path: Path) -> None:
+    class OkAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    record_id = _record(store)
+    with pytest.raises(AdapterNotConfigured):
+        runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    assert store.list_actions(record_id) == []
+    # The released dedupe key is reusable once the adapter is configured.
+    runner._registry.register("mail.send", OkAdapter())
+    outcome = runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    assert outcome.delivered is True

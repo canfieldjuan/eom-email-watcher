@@ -123,9 +123,10 @@ CREATE TABLE IF NOT EXISTS workflow_overlays (
 CREATE TABLE IF NOT EXISTS workflow_actions (
     action_id TEXT PRIMARY KEY CHECK (length(action_id) = 36),
     record_id TEXT NOT NULL CHECK (record_id <> ''),
-    -- A caller-minted idempotency key for the action's intent, globally unique so the same
-    -- action is admitted at most once. Modeled on the outbound outbox's dedupe_key.
-    dedupe_key TEXT NOT NULL UNIQUE CHECK (dedupe_key <> ''),
+    -- A caller-minted idempotency key for the action's intent, unique per record (not
+    -- globally) so the same key on two records is two independent actions. Modeled on the
+    -- outbound outbox's dedupe_key but scoped to the owning record.
+    dedupe_key TEXT NOT NULL CHECK (dedupe_key <> ''),
     kind TEXT NOT NULL CHECK (kind <> ''),
     request TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'failed')),
@@ -133,6 +134,7 @@ CREATE TABLE IF NOT EXISTS workflow_actions (
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    UNIQUE (record_id, dedupe_key),
     CHECK (
         (status = 'pending' AND result IS NULL)
         OR (status = 'settled' AND result IS NOT NULL)
@@ -422,10 +424,16 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
         raise InvalidEffect(f"action {label} must be a mapping")
     try:
         canonical = json.dumps(
-            dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
         )
         size = len(canonical.encode("utf-8"))
     except ValueError as exc:
+        # allow_nan=False rejects NaN/Infinity (not portable canonical JSON); unencodable
+        # strings and oversized integers also land here as ValueError.
         raise InvalidEffect(f"action {label} contains an unserializable value: {exc}") from exc
     if size > MAX_ACTION_BYTES:
         raise InvalidEffect(f"action {label} exceeds {MAX_ACTION_BYTES} bytes")
@@ -899,7 +907,8 @@ class WorkflowStore:
             ):
                 raise UnknownRecord(record_id)
             prior = db.execute(
-                "SELECT * FROM workflow_actions WHERE dedupe_key = ?", (dedupe_key,)
+                "SELECT * FROM workflow_actions WHERE record_id = ? AND dedupe_key = ?",
+                (record_id, dedupe_key),
             ).fetchone()
             if prior is not None:
                 if prior["kind"] != kind or prior["request"] != canonical_request:
@@ -957,6 +966,23 @@ class WorkflowStore:
             ).fetchone()
         return _action_view(row)
 
+    def release_action(self, action_id: str) -> None:
+        """Delete a pending action so its dedupe key is free to admit again.
+
+        Used when a newly admitted action cannot be dispatched (for example no adapter is
+        configured for its kind): releasing the row avoids poisoning the dedupe key with a
+        terminal failure that a later, correctly configured retry could not recover from.
+        Only a pending row may be released; a terminal row raises.
+        """
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            deleted = db.execute(
+                "DELETE FROM workflow_actions WHERE action_id = ? AND status = 'pending'",
+                (action_id,),
+            )
+            if deleted.rowcount != 1:
+                raise UnknownRecord(action_id)
+
     def get_action(self, action_id: str) -> ActionView:
         with self.connection() as db:
             row = db.execute(
@@ -976,8 +1002,10 @@ class WorkflowStore:
                 is None
             ):
                 raise UnknownRecord(record_id)
+            # rowid is monotonic with insertion, so it preserves admission order when two
+            # actions share a created_at timestamp (a random action_id would not).
             rows = db.execute(
-                "SELECT * FROM workflow_actions WHERE record_id = ? ORDER BY created_at, action_id",
+                "SELECT * FROM workflow_actions WHERE record_id = ? ORDER BY created_at, rowid",
                 (record_id,),
             ).fetchall()
         return [_action_view(row) for row in rows]
