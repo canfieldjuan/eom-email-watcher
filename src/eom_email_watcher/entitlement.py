@@ -8,7 +8,7 @@ import json
 import os
 import stat
 import sys
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -394,6 +394,25 @@ def _decode_base64url(value: str, max_bytes: int) -> bytes:
     return decoded
 
 
+def verify_signature(
+    keys: Mapping[str, bytes], key_id: str, payload: bytes, signature: bytes
+) -> None:
+    """Verify an Ed25519 signature over ``payload`` by the keyring's key for ``key_id``.
+
+    The single place the Ed25519 verification lives, shared by the Connect entitlement
+    license and the Automate signed-pack / pack-grant formats so no crypto is duplicated.
+    Raises :class:`ValueError` for a wrong-length signature or an unknown ``key_id`` and
+    cryptography's ``InvalidSignature`` for a signature that does not verify; callers catch
+    these and map them to their own domain outcome.
+    """
+    if len(signature) != SIGNATURE_BYTES:
+        raise ValueError("signature length is invalid")
+    public_key = keys.get(key_id)
+    if public_key is None:
+        raise ValueError("signed payload names an unknown key")
+    Ed25519PublicKey.from_public_bytes(public_key).verify(signature, payload)
+
+
 def _parse_utc(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
     if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
@@ -424,12 +443,7 @@ def _evaluate_entitlement(
             MAX_PAYLOAD_BASE64URL_CHARS * 3 // 4,
         )
         signature = _decode_base64url(envelope.signature_base64url, SIGNATURE_BYTES)
-        if len(signature) != SIGNATURE_BYTES:
-            return EntitlementDecision.INVALID
-        public_key = keys.get(envelope.key_id)
-        if public_key is None:
-            return EntitlementDecision.INVALID
-        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, payload)
+        verify_signature(keys, envelope.key_id, payload, signature)
         claims = _Claims.model_validate(_strict_json_object(payload))
         if len(set(claims.features)) != len(claims.features):
             return EntitlementDecision.INVALID
