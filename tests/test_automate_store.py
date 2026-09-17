@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from eom_email_watcher.automate.store import (
+    InvalidEffect,
     OperationConflict,
     StaleRecord,
     UnknownRecord,
@@ -254,3 +255,188 @@ def test_events_cannot_be_deleted_even_after_record_removed(tmp_path: Path) -> N
 def test_database_file_is_owner_only(tmp_path: Path) -> None:
     store = _store(tmp_path)
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+
+def test_apply_effects_sets_overlay_and_advances_stage_atomically(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    outcome = store.apply_effects(
+        record.record_id,
+        [
+            {"kind": "record.transition", "to_stage": "reviewing"},
+            {"kind": "overlay.set", "key": "assignee", "value": "alice"},
+            {"kind": "overlay.set", "key": "priority", "value": 3},
+        ],
+        operation_key="op-1",
+        operation_name="start_review",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    assert outcome.applied is True
+    assert outcome.record.stage == "reviewing"
+    # One event for the whole batch, so exactly one version bump.
+    assert outcome.record.state_version == 2
+    assert store.get_overlays(record.record_id) == {"assignee": "alice", "priority": 3}
+
+
+def test_overlay_only_batch_bumps_version_without_changing_stage(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    outcome = store.apply_effects(
+        record.record_id,
+        [{"kind": "overlay.set", "key": "note", "value": "called back"}],
+        operation_key="op-1",
+        operation_name="annotate",
+        request={},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    assert outcome.record.stage == "captured"
+    assert outcome.record.state_version == 2
+    assert store.get_overlays(record.record_id) == {"note": "called back"}
+
+
+def test_overlay_set_is_last_writer_wins_per_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.apply_effects(
+        record.record_id,
+        [{"kind": "overlay.set", "key": "assignee", "value": "alice"}],
+        operation_key="op-1",
+        operation_name="assign",
+        request={"to": "alice"},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    store.apply_effects(
+        record.record_id,
+        [{"kind": "overlay.set", "key": "assignee", "value": "bob"}],
+        operation_key="op-2",
+        operation_name="assign",
+        request={"to": "bob"},
+        expected_version=2,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    assert store.get_overlays(record.record_id) == {"assignee": "bob"}
+
+
+def test_apply_effects_replay_same_key_changed_effects_conflicts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    store.apply_effects(
+        record.record_id,
+        [{"kind": "overlay.set", "key": "assignee", "value": "alice"}],
+        operation_key="op-1",
+        operation_name="assign",
+        request={"to": "alice"},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    # Same key, name, and request but a changed effect batch is a different intent.
+    with pytest.raises(OperationConflict):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "assignee", "value": "bob"}],
+            operation_key="op-1",
+            operation_name="assign",
+            request={"to": "alice"},
+            expected_version=2,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+    assert store.get_overlays(record.record_id) == {"assignee": "alice"}
+
+
+def test_apply_effects_replay_same_batch_is_noop(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    batch = [
+        {"kind": "record.transition", "to_stage": "reviewing"},
+        {"kind": "overlay.set", "key": "assignee", "value": "alice"},
+    ]
+    first = store.apply_effects(
+        record.record_id,
+        batch,
+        operation_key="op-1",
+        operation_name="start_review",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    replay = store.apply_effects(
+        record.record_id,
+        batch,
+        operation_key="op-1",
+        operation_name="start_review",
+        request={"by": "alice"},
+        expected_version=1,
+        now=NOW + timedelta(hours=1),
+        allowed_stages=STAGES,
+    )
+    assert replay.applied is False
+    assert replay.event_id == first.event_id
+    assert store.get_record(record.record_id).state_version == 2
+
+
+def test_apply_effects_rejects_empty_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [],
+            operation_key="op-1",
+            operation_name="noop",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_two_transitions_in_one_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [
+                {"kind": "record.transition", "to_stage": "reviewing"},
+                {"kind": "record.transition", "to_stage": "converted"},
+            ],
+            operation_key="op-1",
+            operation_name="double",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_unknown_effect_kind(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "record.delete"}],
+            operation_key="op-1",
+            operation_name="bad",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_get_overlays_unknown_record(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(UnknownRecord):
+        store.get_overlays("11111111-1111-4111-8111-111111111111")

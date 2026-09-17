@@ -8,12 +8,19 @@ the Connect interoperability contract). It reuses the proven patterns from
 ``state_version``.
 
 A workflow record is free-standing: it is not anchored to a single source message, unlike
-``automation_runs``. Slice 1 provides create and a single transition primitive with
-operation-key idempotency. Each operation key is bound to a canonical operation name and a
-request fingerprint: an identical replay is a no-op that returns the prior outcome, and the
-same key with a changed request is a conflict. Triggers, effects, and the rule control
-plane arrive in later slices; the host gates admission of any transition behind
-``AutomateHost.require_license``.
+``automation_runs``. Slice 1 provided create plus a single transition primitive with
+operation-key idempotency. Slice 2 generalizes that single write path into
+:meth:`WorkflowStore.apply_effects`, which applies a batch of effects
+(``record.transition`` and ``overlay.set``) atomically under one transaction, one ledger
+event, and one compare-and-set. :meth:`WorkflowStore.transition` is now the single-effect
+case of that primitive, so the ledger stays the single source of truth and every mutation
+still advances ``state_version`` exactly once.
+
+Each operation key is bound to a canonical operation name, a request fingerprint, and the
+canonical effect batch: an identical replay is a no-op that returns the prior outcome, and
+the same key with a changed request or changed effects is a conflict. The store is
+unreleased, so the schema is extended in place rather than migrated. The host gates
+admission of any mutation behind ``AutomateHost.require_license``.
 """
 
 from __future__ import annotations
@@ -23,13 +30,18 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 CREATE_OPERATION_NAME = "create"
+
+# The effect kinds the executor can apply. Kept as module constants so the store, the
+# definition model, and the engine name the same closed vocabulary.
+RECORD_TRANSITION = "record.transition"
+OVERLAY_SET = "overlay.set"
 
 _SCHEMA = """
 BEGIN IMMEDIATE;
@@ -53,14 +65,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     request_fingerprint TEXT CHECK (
         request_fingerprint IS NULL OR length(request_fingerprint) = 64
     ),
+    effects TEXT CHECK (effects IS NULL OR effects <> ''),
     created_at TEXT NOT NULL,
     UNIQUE (record_id, sequence_no),
     UNIQUE (record_id, state_version),
     CHECK (
         (previous_stage IS NULL AND sequence_no = 0 AND state_version = 1
-            AND operation_name = 'create' AND operation_key IS NULL)
+            AND operation_name = 'create' AND operation_key IS NULL AND effects IS NULL)
         OR (previous_stage IS NOT NULL AND sequence_no >= 1
-            AND state_version = sequence_no + 1)
+            AND state_version = sequence_no + 1 AND effects IS NOT NULL)
     )
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_events_record
@@ -73,6 +86,14 @@ CREATE TABLE IF NOT EXISTS workflow_operations (
     event_id TEXT NOT NULL CHECK (length(event_id) = 36),
     created_at TEXT NOT NULL,
     PRIMARY KEY (record_id, operation_key)
+);
+CREATE TABLE IF NOT EXISTS workflow_overlays (
+    record_id TEXT NOT NULL CHECK (record_id <> ''),
+    key TEXT NOT NULL CHECK (key <> ''),
+    value_json TEXT NOT NULL,
+    state_version INTEGER NOT NULL CHECK (state_version >= 1),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (record_id, key)
 );
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
@@ -93,7 +114,11 @@ class WorkflowStoreError(RuntimeError):
 
 
 class UnknownRecord(WorkflowStoreError):
-    """Raised when a transition names a record that does not exist."""
+    """Raised when a mutation names a record that does not exist."""
+
+
+class InvalidEffect(WorkflowStoreError):
+    """Raised when an effect batch is structurally invalid."""
 
 
 class StaleRecord(WorkflowStoreError):
@@ -109,16 +134,17 @@ class StaleRecord(WorkflowStoreError):
 
 
 class OperationConflict(WorkflowStoreError):
-    """Raised when an operation key is reused with a different name or request.
+    """Raised when an operation key is reused with a different name, request, or effects.
 
     The portal's equivalent is a 409: a key is rotated for changed intent, so a mismatched
-    fingerprint must be refused rather than silently replaying the earlier outcome.
+    fingerprint or effect batch must be refused rather than silently replaying the earlier
+    outcome.
     """
 
     def __init__(self, *, operation_key: str):
         super().__init__(
             f"operation key {operation_key!r} was already used with a different "
-            "operation or request"
+            "operation, request, or effect batch"
         )
         self.operation_key = operation_key
 
@@ -141,6 +167,21 @@ class TransitionOutcome:
     applied: bool
 
 
+@dataclass(frozen=True)
+class OperationReplay:
+    """The recorded outcome of a prior operation, for replay-before-matching lookups.
+
+    ``record`` reconstructs the state this operation produced (not the current
+    projection), so a replay after the record has advanced still reports the stage and
+    version this operation yielded.
+    """
+
+    record: RecordView
+    event_id: str
+    operation_name: str
+    request_fingerprint: str
+
+
 def request_fingerprint(request: Mapping[str, object]) -> str:
     """A stable SHA-256 over the canonical JSON of a request payload.
 
@@ -149,6 +190,52 @@ def request_fingerprint(request: Mapping[str, object]) -> str:
     """
     canonical = json.dumps(dict(request), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalize_effects(effects: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    """Validate an effect batch and return it in a canonical, minimal form.
+
+    Structural validation lives here so the store is a self-contained primitive: the
+    definition model validates the same rules semantically, but the store never trusts its
+    caller. A batch must be non-empty, carry at most one ``record.transition``, and use
+    distinct ``overlay.set`` keys.
+    """
+    normalized: list[dict[str, object]] = []
+    seen_overlay_keys: set[str] = set()
+    transition_count = 0
+    for raw in effects:
+        kind = raw.get("kind")
+        if kind == RECORD_TRANSITION:
+            transition_count += 1
+            to_stage = raw.get("to_stage")
+            if not isinstance(to_stage, str) or not to_stage:
+                raise InvalidEffect("record.transition requires a non-empty to_stage")
+            normalized.append({"kind": RECORD_TRANSITION, "to_stage": to_stage})
+        elif kind == OVERLAY_SET:
+            key = raw.get("key")
+            if not isinstance(key, str) or not key:
+                raise InvalidEffect("overlay.set requires a non-empty key")
+            if key in seen_overlay_keys:
+                raise InvalidEffect(f"overlay.set key {key!r} is repeated in one batch")
+            seen_overlay_keys.add(key)
+            value = raw.get("value")
+            # bool is a subclass of int, so this admits str, int, and bool while rejecting
+            # floats and any other type; overlay values are simple scalars.
+            if not isinstance(value, (str, int)):
+                raise InvalidEffect("overlay.set value must be a string, integer, or boolean")
+            normalized.append({"kind": OVERLAY_SET, "key": key, "value": value})
+        else:
+            raise InvalidEffect(f"unknown effect kind {kind!r}")
+    if not normalized:
+        raise InvalidEffect("an effect batch must contain at least one effect")
+    if transition_count > 1:
+        raise InvalidEffect("an effect batch may contain at most one record.transition")
+    return normalized
+
+
+def _canonical_effects(normalized: Sequence[Mapping[str, object]]) -> str:
+    """Canonical JSON for the effect batch, stored on the event and compared on replay."""
+    return json.dumps(list(normalized), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _new_id() -> str:
@@ -169,6 +256,18 @@ def _record_view(row: sqlite3.Row) -> RecordView:
         state_version=row["state_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _replay_view(record: sqlite3.Row, event: sqlite3.Row) -> RecordView:
+    """Reconstruct the record state a prior operation produced from its event row."""
+    return RecordView(
+        record_id=record["record_id"],
+        workflow=record["workflow"],
+        stage=event["next_stage"],
+        state_version=event["state_version"],
+        created_at=record["created_at"],
+        updated_at=event["created_at"],
     )
 
 
@@ -235,8 +334,8 @@ class WorkflowStore:
                 "INSERT INTO workflow_events "
                 "(event_id, record_id, sequence_no, previous_stage, next_stage, "
                 "state_version, operation_name, operation_key, request_fingerprint, "
-                "created_at) "
-                "VALUES (?, ?, 0, NULL, ?, 1, ?, NULL, NULL, ?)",
+                "effects, created_at) "
+                "VALUES (?, ?, 0, NULL, ?, 1, ?, NULL, NULL, NULL, ?)",
                 (_new_id(), record_id, initial_stage, CREATE_OPERATION_NAME, timestamp),
             )
             row = db.execute(
@@ -253,6 +352,53 @@ class WorkflowStore:
             raise UnknownRecord(record_id)
         return _record_view(row)
 
+    def get_overlays(self, record_id: str) -> dict[str, object]:
+        """Return the record's current overlay projection (last-writer-wins per key)."""
+        with self.connection() as db:
+            exists = db.execute(
+                "SELECT 1 FROM workflow_records WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            if exists is None:
+                raise UnknownRecord(record_id)
+            rows = db.execute(
+                "SELECT key, value_json FROM workflow_overlays WHERE record_id = ?",
+                (record_id,),
+            ).fetchall()
+        return {row["key"]: json.loads(row["value_json"]) for row in rows}
+
+    def lookup_operation(self, record_id: str, operation_key: str) -> OperationReplay | None:
+        """Return the recorded outcome for an operation key, or None if it is unused.
+
+        The engine consults this before evaluating a decision's conditions, so an operator
+        retrying the same decision after the record has advanced replays the recorded
+        outcome instead of re-matching against the new stage. The returned name and
+        fingerprint let the caller detect a rotated key (same key, changed intent).
+        """
+        with self.connection() as db:
+            record = db.execute(
+                "SELECT * FROM workflow_records WHERE record_id = ?", (record_id,)
+            ).fetchone()
+            if record is None:
+                raise UnknownRecord(record_id)
+            operation = db.execute(
+                "SELECT operation_name, request_fingerprint, event_id "
+                "FROM workflow_operations WHERE record_id = ? AND operation_key = ?",
+                (record_id, operation_key),
+            ).fetchone()
+            if operation is None:
+                return None
+            event = db.execute(
+                "SELECT next_stage, state_version, created_at "
+                "FROM workflow_events WHERE event_id = ?",
+                (operation["event_id"],),
+            ).fetchone()
+        return OperationReplay(
+            record=_replay_view(record, event),
+            event_id=operation["event_id"],
+            operation_name=operation["operation_name"],
+            request_fingerprint=operation["request_fingerprint"],
+        )
+
     def transition(
         self,
         record_id: str,
@@ -267,18 +413,51 @@ class WorkflowStore:
     ) -> TransitionOutcome:
         """Advance a record to ``to_stage`` under compare-and-set and operation-key rules.
 
+        This is the single-effect case of :meth:`apply_effects`: a batch of exactly one
+        ``record.transition``. See that method for the full ordering and guarantees.
+        """
+        return self.apply_effects(
+            record_id,
+            ({"kind": RECORD_TRANSITION, "to_stage": to_stage},),
+            operation_key=operation_key,
+            operation_name=operation_name,
+            request=request,
+            expected_version=expected_version,
+            now=now,
+            allowed_stages=allowed_stages,
+        )
+
+    def apply_effects(
+        self,
+        record_id: str,
+        effects: Sequence[Mapping[str, object]],
+        *,
+        operation_key: str,
+        operation_name: str,
+        request: Mapping[str, object],
+        expected_version: int,
+        now: datetime,
+        allowed_stages: frozenset[str] | None = None,
+    ) -> TransitionOutcome:
+        """Apply an effect batch atomically under compare-and-set and operation-key rules.
+
         Ordering inside one ``BEGIN IMMEDIATE`` transaction:
 
-        1. The operation key is looked up first. An exact match (same operation name and
-           request fingerprint) is an idempotent replay and returns the prior outcome with
-           ``applied=False`` and no new event, regardless of ``expected_version``. A
-           mismatch raises :class:`OperationConflict`.
+        1. The operation key is looked up first. An exact match (same operation name,
+           request fingerprint, and canonical effect batch) is an idempotent replay and
+           returns the prior outcome with ``applied=False`` and no new event, regardless of
+           ``expected_version``. A mismatch on any of the three raises
+           :class:`OperationConflict`.
         2. Only a genuinely new operation enforces compare-and-set: ``expected_version``
            must equal the record's current ``state_version`` or :class:`StaleRecord` is
            raised.
-        3. The transition then appends one immutable event, advances the record, and binds
-           the operation key to its name, fingerprint, and event.
+        3. The batch then appends exactly one immutable event, advances the record by one
+           ``state_version`` (its stage changes only if the batch carries a
+           ``record.transition``), upserts each ``overlay.set``, and binds the operation
+           key to its name, fingerprint, and event.
         """
+        normalized = _normalize_effects(effects)
+        canonical_effects = _canonical_effects(normalized)
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -295,40 +474,49 @@ class WorkflowStore:
             ).fetchone()
             if prior is not None:
                 prior_event = db.execute(
-                    "SELECT next_stage, state_version, created_at "
+                    "SELECT next_stage, state_version, created_at, effects "
                     "FROM workflow_events WHERE event_id = ?",
                     (prior["event_id"],),
                 ).fetchone()
-                # The destination stage is part of the operation's identity: the same key
-                # with a changed name, request, or target stage is a different intent and
-                # must conflict rather than replay.
+                # The effect batch is part of the operation's identity: the same key with a
+                # changed name, request, or effect batch is a different intent and must
+                # conflict rather than replay.
                 if (
                     prior["operation_name"] != operation_name
                     or prior["request_fingerprint"] != fingerprint
-                    or prior_event["next_stage"] != to_stage
+                    or prior_event["effects"] != canonical_effects
                 ):
                     raise OperationConflict(operation_key=operation_key)
                 # Return the prior outcome reconstructed from the event, not the current
                 # projection, so a replay after the record has advanced still reports the
                 # stage and version this operation produced.
-                replayed = RecordView(
-                    record_id=record_id,
-                    workflow=record["workflow"],
-                    stage=prior_event["next_stage"],
-                    state_version=prior_event["state_version"],
-                    created_at=record["created_at"],
-                    updated_at=prior_event["created_at"],
-                )
                 return TransitionOutcome(
-                    record=replayed,
+                    record=_replay_view(record, prior_event),
                     event_id=prior["event_id"],
                     applied=False,
                 )
 
             if record["state_version"] != expected_version:
                 raise StaleRecord(expected=expected_version, actual=record["state_version"])
-            if allowed_stages is not None and to_stage not in allowed_stages:
+
+            to_stage = next(
+                (
+                    effect["to_stage"]
+                    for effect in normalized
+                    if effect["kind"] == RECORD_TRANSITION
+                ),
+                None,
+            )
+            if (
+                to_stage is not None
+                and allowed_stages is not None
+                and to_stage not in allowed_stages
+            ):
                 raise ValueError(f"stage {to_stage!r} is not in the allowed set")
+            # An overlay-only batch does not change the stage but still advances the record
+            # by one version so the ledger stays a total order and compare-and-set is
+            # meaningful for concurrent writers.
+            next_stage = to_stage if to_stage is not None else record["stage"]
 
             next_version = record["state_version"] + 1
             sequence_no = next_version - 1
@@ -338,18 +526,19 @@ class WorkflowStore:
                 "INSERT INTO workflow_events "
                 "(event_id, record_id, sequence_no, previous_stage, next_stage, "
                 "state_version, operation_name, operation_key, request_fingerprint, "
-                "created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "effects, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_id,
                     record_id,
                     sequence_no,
                     record["stage"],
-                    to_stage,
+                    next_stage,
                     next_version,
                     operation_name,
                     operation_key,
                     fingerprint,
+                    canonical_effects,
                     timestamp,
                 ),
             )
@@ -359,10 +548,28 @@ class WorkflowStore:
             updated = db.execute(
                 "UPDATE workflow_records SET stage = ?, state_version = ?, updated_at = ? "
                 "WHERE record_id = ? AND state_version = ?",
-                (to_stage, next_version, timestamp, record_id, expected_version),
+                (next_stage, next_version, timestamp, record_id, expected_version),
             )
             if updated.rowcount != 1:
                 raise StaleRecord(expected=expected_version, actual=record["state_version"])
+            for effect in normalized:
+                if effect["kind"] == OVERLAY_SET:
+                    db.execute(
+                        "INSERT INTO workflow_overlays "
+                        "(record_id, key, value_json, state_version, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(record_id, key) DO UPDATE SET "
+                        "value_json = excluded.value_json, "
+                        "state_version = excluded.state_version, "
+                        "updated_at = excluded.updated_at",
+                        (
+                            record_id,
+                            effect["key"],
+                            json.dumps(effect["value"]),
+                            next_version,
+                            timestamp,
+                        ),
+                    )
             db.execute(
                 "INSERT INTO workflow_operations "
                 "(record_id, operation_key, operation_name, request_fingerprint, "
