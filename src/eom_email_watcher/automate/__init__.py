@@ -15,12 +15,15 @@ from __future__ import annotations
 
 from .actions import (
     ACTION_KINDS,
+    ActionContext,
     ActionDeliveryError,
     ActionOutcome,
     ActionRunner,
     Adapter,
     AdapterNotConfigured,
     AdapterRegistry,
+    CapabilityInvoker,
+    ConnectInvokeAdapter,
     LocalNotifyAdapter,
 )
 from .definition import (
@@ -77,6 +80,7 @@ __all__ = [
     "AdapterRegistry",
     "ActionAdmission",
     "ActionConflict",
+    "ActionContext",
     "ActionDeliveryError",
     "ActionEmit",
     "ActionOutcome",
@@ -85,6 +89,8 @@ __all__ = [
     "AmbiguousDecision",
     "AutomateHost",
     "AutomateLicenseError",
+    "CapabilityInvoker",
+    "ConnectInvokeAdapter",
     "DecisionOutcome",
     "DecisionRun",
     "DefinitionError",

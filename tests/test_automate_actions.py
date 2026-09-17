@@ -11,12 +11,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from eom_email_watcher import entitlement
 from eom_email_watcher.automate import (
+    ActionContext,
     ActionDeliveryError,
     ActionRunner,
     AdapterNotConfigured,
     AdapterRegistry,
     AutomateHost,
     AutomateLicenseError,
+    ConnectInvokeAdapter,
     LocalNotifyAdapter,
 )
 from eom_email_watcher.automate.store import WorkflowStore
@@ -553,3 +555,119 @@ def test_dispatch_terminalizes_an_adapter_error_with_surrogate_text(tmp_path: Pa
     outcome = runner.dispatch(admission.view, now=NOW)
     assert outcome.delivered is False
     assert store.list_actions(record_id)[0].status == "failed"
+
+
+class _RecordingInvoker:
+    """A fake CapabilityInvoker: records (request, job_id) and returns a fixed result."""
+
+    def __init__(self, *, result: object = None, error: Exception | None = None) -> None:
+        self.calls: list[tuple[dict, str]] = []
+        self._result = result if result is not None else {"job": "done"}
+        self._error = error
+
+    def invoke(self, request: Mapping[str, object], *, job_id: str) -> object:
+        self.calls.append((dict(request), job_id))
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+def test_connect_invoke_kind_is_registrable() -> None:
+    registry = AdapterRegistry.with_defaults()
+    registry.register("connect.invoke", ConnectInvokeAdapter(_RecordingInvoker()))
+    assert isinstance(registry.resolve("connect.invoke"), ConnectInvokeAdapter)
+
+
+def test_connect_invoke_adapter_declares_idempotent() -> None:
+    assert ConnectInvokeAdapter(_RecordingInvoker()).idempotent is True
+
+
+def test_connect_invoke_dispatch_uses_action_id_as_stable_job_id(tmp_path: Path) -> None:
+    invoker = _RecordingInvoker(result={"receipt": "ok"})
+    runner, store = _runner(tmp_path)
+    runner._registry.register("connect.invoke", ConnectInvokeAdapter(invoker))
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id,
+        kind="connect.invoke",
+        dedupe_key="k1",
+        request={"capability_id": "onboarding.public-link.list"},
+        now=NOW,
+    )
+    outcome = runner.dispatch(admission.view, now=NOW)
+    assert outcome.status == "settled"
+    assert outcome.result == {"receipt": "ok"}
+    # Exactly one invocation, and the job id is the durable action id -- stable across a retry
+    # or crash-recovery re-dispatch, so the provider replays the same job (ADR-0002).
+    assert len(invoker.calls) == 1
+    request, job_id = invoker.calls[0]
+    assert job_id == admission.view.action_id
+    assert request == {"capability_id": "onboarding.public-link.list"}
+
+
+def test_connect_invoke_is_recovered_by_the_sweep(tmp_path: Path) -> None:
+    invoker = _RecordingInvoker(result={"ok": True})
+    runner, store = _runner(tmp_path)
+    runner._registry.register("connect.invoke", ConnectInvokeAdapter(invoker))
+    record_id = _record(store)
+    store.admit_action(
+        record_id, kind="connect.invoke", dedupe_key="k1", request={"capability_id": "x"}, now=NOW
+    )
+    # A stranded pending connect.invoke row is auto-recovered: its stable job id makes a
+    # re-POST idempotent, so the sweep may re-drive it (unlike a raw external send).
+    outcomes = runner.recover_pending(now=NOW)
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "settled"
+    assert store.list_actions(record_id)[0].status == "settled"
+    assert invoker.calls[0][1] == store.list_actions(record_id)[0].action_id
+
+
+def test_connect_invoke_failure_marks_the_action_failed(tmp_path: Path) -> None:
+    invoker = _RecordingInvoker(error=RuntimeError("provider down"))
+    runner, store = _runner(tmp_path)
+    runner._registry.register("connect.invoke", ConnectInvokeAdapter(invoker))
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id, kind="connect.invoke", dedupe_key="k1", request={"capability_id": "x"}, now=NOW
+    )
+    outcome = runner.dispatch(admission.view, now=NOW)
+    assert outcome.delivered is False
+    assert store.list_actions(record_id)[0].status == "failed"
+
+
+def test_connect_invoke_non_mapping_result_marks_the_action_failed(tmp_path: Path) -> None:
+    invoker = _RecordingInvoker(result="not-a-mapping")
+    runner, store = _runner(tmp_path)
+    runner._registry.register("connect.invoke", ConnectInvokeAdapter(invoker))
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id, kind="connect.invoke", dedupe_key="k1", request={"capability_id": "x"}, now=NOW
+    )
+    outcome = runner.dispatch(admission.view, now=NOW)
+    assert outcome.delivered is False
+    assert store.list_actions(record_id)[0].status == "failed"
+
+
+def test_context_aware_adapter_receives_the_durable_action_identity(tmp_path: Path) -> None:
+    seen: list[ActionContext] = []
+
+    class ContextAdapter:
+        def deliver_with_context(
+            self, request: Mapping[str, object], context: ActionContext
+        ) -> Mapping[str, object]:
+            seen.append(context)
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", ContextAdapter())
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW
+    )
+    runner.dispatch(admission.view, now=NOW)
+    assert len(seen) == 1
+    context = seen[0]
+    assert context.action_id == admission.view.action_id
+    assert context.dedupe_key == "k1"
+    assert context.record_id == record_id
+    assert context.kind == "mail.send"
