@@ -533,3 +533,23 @@ def test_recover_pending_leaves_a_non_idempotent_action_pending(tmp_path: Path) 
     # ambiguous-state reconciliation, not auto-redelivered.
     assert delivered == []
     assert store.list_actions(record_id)[0].status == "pending"
+
+
+def test_dispatch_terminalizes_an_adapter_error_with_surrogate_text(tmp_path: Path) -> None:
+    class SurrogateAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            # An exception whose message carries a lone surrogate, as a real transport error
+            # decoded with errors="surrogateescape" could.
+            raise RuntimeError("provider said \udce9")
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", SurrogateAdapter())
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW
+    )
+    # dispatch calls fail_action with str(exc); the surrogate must not make fail_action raise
+    # and leave the row pending.
+    outcome = runner.dispatch(admission.view, now=NOW)
+    assert outcome.delivered is False
+    assert store.list_actions(record_id)[0].status == "failed"

@@ -431,6 +431,21 @@ def _action_view(row: sqlite3.Row) -> ActionView:
     )
 
 
+def _safe_error_text(error: str, *, limit: int = 500) -> str:
+    """Make adapter error text safe to persist, then truncate.
+
+    ``fail_action`` is a fail-closed terminalizer: it must always be able to record a failure.
+    But its ``error`` comes from ``str(exc)``, which can carry lone surrogates (for example an
+    exception message built from bytes decoded with ``errors="surrogateescape"``). SQLite
+    binds text as UTF-8, and a lone surrogate raises ``UnicodeEncodeError`` mid-statement,
+    which would abort ``fail_action`` and leave the action stuck ``pending`` -- the opposite of
+    terminalizing it. Round-tripping through UTF-8 with ``errors="replace"`` maps every
+    unencodable code point to U+FFFD, so the text always persists; truncate afterwards so the
+    replacement can never leave a partial escape at the boundary.
+    """
+    return error.encode("utf-8", "replace").decode("utf-8")[:limit]
+
+
 def _reject_non_string_keys(
     value: object, *, label: str, _path: frozenset[int] = frozenset()
 ) -> None:
@@ -1103,7 +1118,7 @@ class WorkflowStore:
             updated = db.execute(
                 "UPDATE workflow_actions SET status = 'failed', last_error = ?, updated_at = ? "
                 "WHERE action_id = ? AND status = 'pending'",
-                (error[:500], timestamp, action_id),
+                (_safe_error_text(error), timestamp, action_id),
             )
             if updated.rowcount != 1:
                 raise UnknownRecord(action_id)
