@@ -442,6 +442,53 @@ def test_get_overlays_unknown_record(tmp_path: Path) -> None:
         store.get_overlays("11111111-1111-4111-8111-111111111111")
 
 
+def test_apply_effects_rejects_a_surrogate_string_value(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    # A lone surrogate is not UTF-8 encodable; the store must reject it, not leak
+    # UnicodeEncodeError.
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "k", "value": "\ud800"}],
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_reserve_no_match_replays_a_matching_applied_operation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    # Model the race: the key was already applied by an identical submission. A subsequent
+    # reserve_no_match with the same name and request must replay that outcome, not conflict.
+    outcome = store.apply_effects(
+        record.record_id,
+        [{"kind": "record.transition", "to_stage": "reviewing"}],
+        operation_key="k",
+        operation_name="advance",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
+        allowed_stages=STAGES,
+    )
+    replay = store.reserve_no_match(
+        record.record_id,
+        "k",
+        operation_name="advance",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
+    )
+    assert replay is not None
+    assert replay.matched is True
+    assert replay.event_id == outcome.event_id
+    assert replay.record.stage == "reviewing"
+
+
 def test_lookup_operation_rejects_a_non_string_key(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)

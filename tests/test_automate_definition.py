@@ -163,6 +163,26 @@ def test_invalid_utf8_bytes_are_a_definition_error() -> None:
         parse_workflow(b"\xff")
 
 
+def test_lone_surrogate_string_is_a_definition_error() -> None:
+    data = _workflow_data()
+    # A lone surrogate parses and validates as a str but is not UTF-8 encodable.
+    data["definitions"][0]["effects"] = [{"kind": "overlay.set", "key": "k", "value": "\ud800"}]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_mutually_exclusive_stage_conditions_are_rejected() -> None:
+    data = _workflow_data()
+    # Two record.stage equals conditions with different declared operands can never both
+    # hold, so the definition is dead and must be rejected at parse.
+    data["definitions"][0]["conditions"] = [
+        {"field": "record.stage", "op": "equals", "value": "captured"},
+        {"field": "record.stage", "op": "equals", "value": "reviewing"},
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
 def test_duplicate_json_member_is_rejected() -> None:
     with pytest.raises(DefinitionError):
         parse_workflow('{"name": "a", "name": "b"}')

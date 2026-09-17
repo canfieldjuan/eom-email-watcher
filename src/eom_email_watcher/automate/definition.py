@@ -137,11 +137,19 @@ class Workflow(_Strict):
             # A record.stage condition can only ever be true for a declared stage, so an
             # operand outside the stage set is a typo that makes the definition dead: it
             # would silently never fire rather than being rejected here.
+            # record.stage conditions are AND-combined at match time, so a definition's
+            # reachable stages are the intersection of its conditions' operand sets. An
+            # operand outside the declared stages, or an empty intersection (mutually
+            # exclusive conditions such as equals "captured" and equals "reviewing"), makes
+            # the definition dead: it can never fire, so reject it here rather than admit it.
+            reachable = set(stage_set)
+            has_stage_condition = False
             for condition in definition.conditions:
                 if condition.field != "record.stage":
                     continue
+                has_stage_condition = True
                 operands = (
-                    [condition.value] if isinstance(condition.value, str) else condition.value
+                    {condition.value} if isinstance(condition.value, str) else set(condition.value)
                 )
                 for operand in operands:
                     if operand not in stage_set:
@@ -149,6 +157,12 @@ class Workflow(_Strict):
                             f"definition {definition.name!r} condition references unknown "
                             f"stage {operand!r}"
                         )
+                reachable &= operands
+            if has_stage_condition and not reachable:
+                raise ValueError(
+                    f"definition {definition.name!r} has mutually exclusive record.stage "
+                    "conditions that can never match"
+                )
         return self
 
 
@@ -159,13 +173,18 @@ def canonical_workflow(workflow: Workflow) -> bytes:
     logically identical workflow always yields the same bytes. Slice 4's signed pack format
     signs over exactly these bytes.
     """
-    raw = json.dumps(
-        workflow.model_dump(mode="json", exclude_defaults=False),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    try:
+        raw = json.dumps(
+            workflow.model_dump(mode="json", exclude_defaults=False),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # A string containing a lone surrogate (e.g. an overlay value decoded from
+        # "\ud800") is not UTF-8 encodable; reject it on the same DefinitionError path.
+        raise DefinitionError(f"workflow contains an unencodable string: {exc}") from exc
     if len(raw) > MAX_DEFINITION_BYTES:
         raise DefinitionError("canonical workflow exceeds 16384 bytes")
     return raw

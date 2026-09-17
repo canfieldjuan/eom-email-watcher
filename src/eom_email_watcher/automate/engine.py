@@ -158,8 +158,10 @@ class WorkflowEngine:
         ]
         if not matches:
             # Reserve the key so a retried no-match stays a no-match across stage changes,
-            # compare-and-set on the same version the decision was matched against.
-            self._store.reserve_no_match(
+            # compare-and-set on the same version the decision was matched against. If an
+            # identical submission raced ahead and matched (or already reserved the same
+            # no-match), reserve_no_match returns that recorded outcome to replay instead.
+            replayed = self._store.reserve_no_match(
                 record_id,
                 operation_key,
                 operation_name=decision,
@@ -167,6 +169,14 @@ class WorkflowEngine:
                 expected_version=expected_version,
                 now=now,
             )
+            if replayed is not None:
+                return DecisionOutcome(
+                    record=replayed.record,
+                    matched=replayed.matched,
+                    applied=False,
+                    definition_name=None,
+                    event_id=replayed.event_id,
+                )
             return DecisionOutcome(
                 record=record,
                 matched=False,

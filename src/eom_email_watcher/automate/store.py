@@ -468,24 +468,25 @@ class WorkflowStore:
         request: Mapping[str, object],
         expected_version: int,
         now: datetime,
-    ) -> None:
-        """Bind an operation key to a no-match outcome (no event, no state change).
+    ) -> OperationReplay | None:
+        """Bind an operation key to a no-match outcome, or replay a same-identity winner.
 
         This keeps a decision that matched no definition idempotent: a later retry of the
         same key replays the no-match through :meth:`lookup_operation` instead of applying
         effects because the record has since moved into a stage where the decision matches.
 
+        Returns None when a fresh no-match is recorded. When the key is already bound with
+        the same operation name and request fingerprint, returns its recorded outcome as an
+        :class:`OperationReplay`: this covers both an identical no-match already reserved and
+        the race where an identical concurrent submission matched and committed an event
+        between this caller's no-match decision and this reservation. Only a key bound with a
+        different name or request is an :class:`OperationConflict`.
+
         The reservation is compare-and-set on ``expected_version``, the same version the
         decision was matched against, so a no-match cannot be recorded against a record
         another writer advanced after matching; a stale caller raises :class:`StaleRecord`
         and re-evaluates against the new stage rather than pinning the key to a wrong
-        no-match.
-
-        The key is rechecked inside the transaction, so two concurrent identical no-match
-        reservations resolve to one insert and one idempotent no-op rather than a primary-key
-        violation; a reservation whose key already resolved to an applied effect, or to a
-        no-match with a different name or request, is an :class:`OperationConflict`. The
-        idempotent-replay check precedes the compare-and-set so a genuine retry is not
+        no-match. The replay check precedes the compare-and-set so a genuine retry is not
         rejected merely because the record has since advanced.
         """
         _require_operation_identity(operation_key, operation_name)
@@ -493,7 +494,7 @@ class WorkflowStore:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             record = db.execute(
-                "SELECT state_version FROM workflow_records WHERE record_id = ?", (record_id,)
+                "SELECT * FROM workflow_records WHERE record_id = ?", (record_id,)
             ).fetchone()
             if record is None:
                 raise UnknownRecord(record_id)
@@ -504,12 +505,33 @@ class WorkflowStore:
             ).fetchone()
             if prior is not None:
                 if (
-                    prior["event_id"] is not None
-                    or prior["operation_name"] != operation_name
+                    prior["operation_name"] != operation_name
                     or prior["request_fingerprint"] != fingerprint
                 ):
                     raise OperationConflict(operation_key=operation_key)
-                return  # identical no-match already reserved: idempotent no-op
+                # Same identity: replay whatever it resolved to. An event_id means an
+                # identical concurrent submission matched and committed while this caller was
+                # mid-flight; None means an identical no-match is already reserved.
+                if prior["event_id"] is None:
+                    return OperationReplay(
+                        record=_record_view(record),
+                        event_id=None,
+                        operation_name=prior["operation_name"],
+                        request_fingerprint=prior["request_fingerprint"],
+                        matched=False,
+                    )
+                event = db.execute(
+                    "SELECT next_stage, state_version, created_at "
+                    "FROM workflow_events WHERE event_id = ?",
+                    (prior["event_id"],),
+                ).fetchone()
+                return OperationReplay(
+                    record=_replay_view(record, event),
+                    event_id=prior["event_id"],
+                    operation_name=prior["operation_name"],
+                    request_fingerprint=prior["request_fingerprint"],
+                    matched=True,
+                )
             if record["state_version"] != expected_version:
                 raise StaleRecord(expected=expected_version, actual=record["state_version"])
             db.execute(
@@ -518,6 +540,7 @@ class WorkflowStore:
                 "event_id, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
                 (record_id, operation_key, operation_name, fingerprint, now.isoformat()),
             )
+        return None
 
     def transition(
         self,
@@ -579,7 +602,13 @@ class WorkflowStore:
         _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
         canonical_effects = _canonical_effects(normalized)
-        if len(canonical_effects.encode("utf-8")) > MAX_EFFECT_BATCH_BYTES:
+        try:
+            batch_bytes = len(canonical_effects.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            # A lone-surrogate string (e.g. "\ud800") is not UTF-8 encodable; reject it on
+            # the store's domain path rather than leaking UnicodeEncodeError.
+            raise InvalidEffect(f"effect batch contains an unencodable string: {exc}") from exc
+        if batch_bytes > MAX_EFFECT_BATCH_BYTES:
             raise InvalidEffect(f"the effect batch exceeds {MAX_EFFECT_BATCH_BYTES} bytes")
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
