@@ -1220,10 +1220,13 @@ class ImapGateway:
         self,
         credentials: ImapCredentials,
         client_factory: Callable[[ImapCredentials, ssl.SSLContext], imaplib.IMAP4] | None = None,
+        *,
+        remaining_timeout: Callable[[], float] | None = None,
     ):
         self.credentials = credentials
         self._mailbox_id = imap_mailbox_identity(credentials)
         self._operation_timeout_seconds = IMAP_TIMEOUT_SECONDS
+        self._remaining_timeout = remaining_timeout
         self._client_factory = client_factory or self._default_client
         self._active_client: imaplib.IMAP4 | None = None
 
@@ -1233,13 +1236,25 @@ class ImapGateway:
         path: Path,
         remaining_timeout: Callable[[], float] | None = None,
     ) -> ImapGateway:
-        gateway = cls(load_credentials(path))
+        gateway = cls(load_credentials(path), remaining_timeout=remaining_timeout)
         if remaining_timeout is not None:
             gateway.set_operation_timeout(remaining_timeout())
         return gateway
 
     def set_operation_timeout(self, timeout_seconds: float) -> None:
         self._operation_timeout_seconds = validate_operation_timeout(timeout_seconds)
+
+    def _current_operation_timeout(self) -> float:
+        if self._remaining_timeout is not None:
+            self._operation_timeout_seconds = validate_operation_timeout(self._remaining_timeout())
+        return self._operation_timeout_seconds
+
+    def _refresh_operation_timeout(self, client: imaplib.IMAP4) -> None:
+        timeout = self._current_operation_timeout()
+        socket = getattr(client, "sock", None)
+        set_timeout = getattr(socket, "settimeout", None)
+        if callable(set_timeout):
+            set_timeout(timeout)
 
     def _default_client(
         self,
@@ -1251,14 +1266,15 @@ class ImapGateway:
                 credentials.host,
                 credentials.port,
                 ssl_context=context,
-                timeout=self._operation_timeout_seconds,
+                timeout=self._current_operation_timeout(),
             )
         client = imaplib.IMAP4(
             credentials.host,
             credentials.port,
-            timeout=self._operation_timeout_seconds,
+            timeout=self._current_operation_timeout(),
         )
         try:
+            self._refresh_operation_timeout(client)
             status, _response = client.starttls(ssl_context=context)
         except ssl.SSLError as exc:
             with contextlib.suppress(Exception):
@@ -1309,6 +1325,7 @@ class ImapGateway:
             ) from exc
 
         try:
+            self._refresh_operation_timeout(client)
             status, _response = client.login(
                 _quoted_imap_astring(self.credentials.username),
                 self.credentials.password,
@@ -1341,6 +1358,7 @@ class ImapGateway:
             ) from exc
 
         try:
+            self._refresh_operation_timeout(client)
             status, response = client.select("INBOX", readonly=True)
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server INBOX is unavailable")
@@ -1605,7 +1623,13 @@ class ImapGateway:
         )
 
     @staticmethod
-    def _catalog(client: imaplib.IMAP4, uid: str) -> _ImapCatalog:
+    def _catalog(
+        client: imaplib.IMAP4,
+        uid: str,
+        refresh_timeout: Callable[[imaplib.IMAP4], None] | None = None,
+    ) -> _ImapCatalog:
+        if refresh_timeout is not None:
+            refresh_timeout(client)
         status, response = client.uid("FETCH", uid, "(UID BODYSTRUCTURE)")
         if status != "OK":
             raise ImapError("imap_protocol_error", "Mail server MIME metadata fetch failed; retry")
@@ -1617,6 +1641,7 @@ class ImapGateway:
         uid: str,
         section: str,
         byte_limit: int,
+        refresh_timeout: Callable[[imaplib.IMAP4], None] | None = None,
     ) -> bytes:
         numbered_section = _IMAP_SECTION.fullmatch(section)
         mime_section = section.endswith(".MIME") and _IMAP_SECTION.fullmatch(section[:-5])
@@ -1628,6 +1653,8 @@ class ImapGateway:
             raise MailboxMessageInvalid(
                 "imap_message_too_large", "Message content exceeds the safe size limit"
             )
+        if refresh_timeout is not None:
+            refresh_timeout(client)
         status, response = client.uid(
             "FETCH",
             uid,
@@ -1645,6 +1672,7 @@ class ImapGateway:
         part: _ImapBodyPart | _ImapAttachment,
         *,
         byte_limit: int = MAX_MESSAGE_BYTES,
+        refresh_timeout: Callable[[imaplib.IMAP4], None] | None = None,
     ) -> bytes:
         root_attachment = isinstance(part, _ImapAttachment) and not part.section
         if not root_attachment and _IMAP_SECTION.fullmatch(part.section) is None:
@@ -1660,18 +1688,34 @@ class ImapGateway:
             )
         if isinstance(part, _ImapAttachment) and part.is_multipart and part.section:
             headers = cls._fetch_section_bytes(
-                client, uid, f"{part.section}.MIME", MAX_HEADER_BYTES
+                client,
+                uid,
+                f"{part.section}.MIME",
+                MAX_HEADER_BYTES,
+                refresh_timeout,
             )
             prefix = _multipart_attachment_prefix(headers, part.descriptor.media_type)
             remaining = MAX_MESSAGE_BYTES - len(prefix)
-            body = cls._fetch_section_bytes(client, uid, part.section, remaining)
+            body = cls._fetch_section_bytes(
+                client,
+                uid,
+                part.section,
+                remaining,
+                refresh_timeout,
+            )
             return prefix + body
-        return cls._fetch_section_bytes(client, uid, part.section, byte_limit)
+        return cls._fetch_section_bytes(
+            client,
+            uid,
+            part.section,
+            byte_limit,
+            refresh_timeout,
+        )
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
-            catalog = self._catalog(client, uid)
+            catalog = self._catalog(client, uid, self._refresh_operation_timeout)
             selected_parts = catalog.plain if catalog.plain else catalog.html
             if sum(part.byte_size for part in selected_parts) > MAX_MESSAGE_BYTES:
                 raise MailboxMessageInvalid(
@@ -1685,6 +1729,7 @@ class ImapGateway:
                     uid,
                     part,
                     byte_limit=remaining_bytes,
+                    refresh_timeout=self._refresh_operation_timeout,
                 )
                 remaining_bytes -= len(section)
                 decoded = _decoded_section(section, part.transfer_encoding)
@@ -1710,11 +1755,16 @@ class ImapGateway:
             ) from exc
         with self._mailbox() as client:
             uid = self._checked_uid(client, message_id)
-            catalog = self._catalog(client, uid)
+            catalog = self._catalog(client, uid, self._refresh_operation_timeout)
             if selected < 0 or selected >= len(catalog.attachments):
                 raise MailboxMessageUnavailable("The mail server attachment is no longer available")
             attachment = catalog.attachments[selected]
-            payload = self._section_bytes(client, uid, attachment)
+            payload = self._section_bytes(
+                client,
+                uid,
+                attachment,
+                refresh_timeout=self._refresh_operation_timeout,
+            )
         if attachment.is_multipart:
             return payload
         return _decoded_section(payload, attachment.transfer_encoding)
