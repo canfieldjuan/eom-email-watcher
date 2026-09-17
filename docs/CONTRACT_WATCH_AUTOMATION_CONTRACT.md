@@ -20,6 +20,11 @@ fixtures, plans, and older contracts are supporting context only.
   surface therefore includes synchronizing that canonical fixture and the
   provider's pinned fixture revision. This is a fixture update, not a shared
   schema or Invoice Processor runtime change.
+- 2026-09-17: The first deterministic Contract job reached persisted profile
+  selection and then failed at an existing Connect delivery guard that admits
+  only General synthesis. The required provider surface therefore also includes
+  running the existing Story and Contract synthesis paths under the existing
+  bounded Connect output policy. The profile must not be downgraded to General.
 
 ## Contract
 
@@ -34,6 +39,9 @@ What is wrong:
 - Document Summarizer implements a Contract summary profile, but its Connect v2
   manifest declares no parameters, v2 validation rejects every supplied
   parameter, and Connect ingestion always persists `SummaryProfile::General`.
+- Document Summarizer's synthesis dispatcher explicitly returns
+  `SUMMARY_PROFILE_DELIVERY_UNSUPPORTED` when a Connect delivery policy reaches
+  Story or Contract, even after the requested profile has been persisted.
 - Document Summarizer's conformance test generates its live manifest and
   requires exact equality with the pinned Connect contracts v2
   `valid/manifest.json` fixture, so changing the manifest in only the provider
@@ -105,6 +113,11 @@ insurer, lawyer, domain, mailbox, or provider instance.
 - Derive one `SummaryProfile` from the validated request and pass that value to
   the single ingestion persistence owner. Do not validate one value and use the
   raw parameter later.
+- Under Connect delivery, route General through its existing direct synthesis
+  path and route Story and Contract through their existing coherent synthesis
+  paths. Preserve the selected profile through verification and artifact
+  generation; never fall back to General. The existing Connect output byte cap,
+  integrity checks, citation requirements, and failure behavior still apply.
 - Keep the capability identifier, capability version, accepted media, effects,
   output media type, output shape, citation behavior, model selection, and
   queue capacity unchanged.
