@@ -517,6 +517,11 @@ def _normalize_action_intents(
     for action in actions:
         if not isinstance(action, Mapping):
             raise InvalidEffect("each action intent must be a mapping")
+        if not set(action.keys()) <= {"kind", "request"}:
+            # Exact key set, like the effect normalizer: an unknown member (a typo such as
+            # "requests") must fail rather than be ignored while a missing request silently
+            # defaults to {}.
+            raise InvalidEffect("an action intent may contain only 'kind' and 'request'")
         kind = action.get("kind")
         request = action.get("request", {})
         if not isinstance(kind, str) or not kind:

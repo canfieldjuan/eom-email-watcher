@@ -151,6 +151,29 @@ def test_notify_local_settles_a_request_near_the_size_bound(tmp_path: Path) -> N
     assert store.list_actions(record_id)[0].request["body"] == big_body
 
 
+def test_dispatch_uses_the_persisted_action_not_a_mutated_view(tmp_path: Path) -> None:
+    received: list[Mapping[str, object]] = []
+
+    class RecordingAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            received.append(dict(request))
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", RecordingAdapter())
+    record_id = _record(store)
+    admission = store.admit_action(
+        record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW
+    )
+    view = admission.view
+    view.request["to"] = "attacker"  # mutate the in-memory view after admission
+    outcome = runner.dispatch(view, now=NOW)
+    assert outcome.status == "settled"
+    # dispatch reloaded the persisted row, so the adapter saw the committed request, not the
+    # mutated view.
+    assert received == [{"to": "a"}]
+
+
 def test_adapter_result_with_a_non_json_value_marks_the_action_failed(tmp_path: Path) -> None:
     from datetime import datetime as _dt
 

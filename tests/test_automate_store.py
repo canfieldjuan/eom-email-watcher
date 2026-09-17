@@ -1019,6 +1019,24 @@ def test_apply_effects_rejects_a_non_sequence_actions_batch(tmp_path: Path) -> N
     assert store.get_record(record_id).stage == "captured"
 
 
+def test_apply_effects_rejects_an_unknown_action_intent_field(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record_id,
+            [{"kind": "record.transition", "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="review",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+            actions=[{"kind": "notify.local", "requests": {"title": "t"}}],  # typo'd field
+        )
+    assert store.get_record(record_id).stage == "captured"
+
+
 def test_admit_action_rejects_the_reserved_dedupe_prefix(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record_id = _make_record(store)

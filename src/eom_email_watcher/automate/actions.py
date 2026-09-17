@@ -208,6 +208,10 @@ class ActionRunner:
           row as ``failed``.
         """
         self._host.require_license()
+        # Reload the persisted row and act only on the durable kind/request/status. A caller
+        # cannot dispatch a mutated in-memory ActionView and have the adapter run a different
+        # side effect than the one the outbox records as settled.
+        view = self._store.get_action(view.action_id)
         if view.status != ACTION_PENDING:
             return _outcome(view, delivered=False)
         try:
