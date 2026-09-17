@@ -21,7 +21,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .actions import ACTION_KINDS
+from .actions import ACTION_KINDS, CONNECT_INVOKE
 from .store import MAX_ACTIONS_PER_DECISION, MAX_EFFECTS_PER_BATCH, OVERLAY_SET, RECORD_TRANSITION
 
 MAX_DEFINITION_BYTES = 16 * 1024
@@ -102,25 +102,109 @@ Effect = Annotated[
 ]
 
 
+# The connect.invoke request shape a signed definition may declare. The invoker
+# (:mod:`eom_email_watcher.automate_connect`) is the exact Connect protocol enforcer at
+# dispatch; these bounds fail a malformed pack fast at parse/sign time and keep the canonical
+# bytes deterministic. The patterns intentionally mirror the Connect contract (hyphenated
+# capability ids and parameter names, uuid4 identities) but are defined locally so this
+# definition model stays decoupled from the transport module, which it must not import.
+_CAPABILITY_ID_PATTERN = r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+_CAPABILITY_VERSION_PATTERN = r"^[0-9]+\.[0-9]+$"
+_UUID4_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+MAX_CONNECT_PARAMETERS = 16
+# content_base64 is capped well under the 16 KiB canonical-definition bound, which is the
+# real ceiling on the whole request; a larger input artifact is a later, streamed concern.
+_MAX_CONTENT_BASE64 = 12_000
+
+_CapabilityId = Annotated[str, Field(strict=True, pattern=_CAPABILITY_ID_PATTERN, max_length=100)]
+_CapabilityVersion = Annotated[str, Field(strict=True, pattern=_CAPABILITY_VERSION_PATTERN)]
+_Uuid4 = Annotated[str, Field(strict=True, pattern=_UUID4_PATTERN)]
+_MediaType = Annotated[str, Field(strict=True, min_length=1, max_length=127)]
+_Filename = Annotated[str, Field(strict=True, min_length=1, max_length=255)]
+_ContentBase64 = Annotated[str, Field(strict=True, max_length=_MAX_CONTENT_BASE64)]
+_ParameterKey = Annotated[str, Field(strict=True, pattern=_CAPABILITY_ID_PATTERN, max_length=100)]
+
+# A request value for a simple (non-connect.invoke) action is a flat scalar; the union also
+# admits one level of nested object so the connect.invoke shape can be carried in the same
+# field and validated structurally below. Deeper nesting is not expressible, bounding the shape.
+_ActionRequestValue = str | int | bool | dict[str, str | int | bool]
+
+
+class ConnectInvokeCapability(_Strict):
+    id: _CapabilityId
+    version: _CapabilityVersion
+
+
+class ConnectInvokeProvider(_Strict):
+    instance_id: _Uuid4
+
+
+class ConnectInvokeInput(_Strict):
+    artifact_id: _Uuid4
+    media_type: _MediaType
+    filename: _Filename
+    content_base64: _ContentBase64 = ""
+
+
+class ConnectInvokeRequest(_Strict):
+    """The signed connect.invoke request template a definition declares.
+
+    ``provider`` is optional: omit it to let the host match any local provider offering the
+    capability, or pin ``instance_id`` to bind one. ``parameters`` and ``confirmed`` carry the
+    capability's bounded inputs and its confirmation flag. This is a *static* template for the
+    first connect.invoke pack; binding parameter values or the input artifact from record state
+    is a later increment, so a capability whose inputs vary per record is not yet expressible.
+    """
+
+    capability: ConnectInvokeCapability
+    input: ConnectInvokeInput
+    provider: ConnectInvokeProvider | None = None
+    parameters: dict[_ParameterKey, str | int | bool] = Field(
+        default_factory=dict, max_length=MAX_CONNECT_PARAMETERS
+    )
+    confirmed: bool = False
+
+
 class ActionEmit(_Strict):
     """A side-effect action a definition emits when its decision applies.
 
     ``action`` is an abstract action kind from the shared :data:`ACTION_KINDS` vocabulary
-    (``notify.local``, ``mail.send``, ...), never a vendor; the host resolves it to a
-    configured adapter. ``request`` is the action's payload. Actions are distinct from
-    record-ledger ``effects``: an effect mutates the record under the ledger transaction,
-    while an action is dispatched through the durable outbox (at most once per dedupe key).
-    A static ``request`` is enough for the first pack; rendering the request from record
-    state or operator parameters is a later slice.
+    (``notify.local``, ``mail.send``, ``connect.invoke``, ...), never a vendor; the host
+    resolves it to a configured adapter. ``request`` is the action's payload. Actions are
+    distinct from record-ledger ``effects``: an effect mutates the record under the ledger
+    transaction, while an action is dispatched through the durable outbox (at most once per
+    dedupe key).
+
+    A simple kind (``notify.local``) carries a flat scalar request. ``connect.invoke`` carries
+    the structured :class:`ConnectInvokeRequest` template, validated here so a malformed pack
+    is rejected at parse/sign time rather than at dispatch, and normalized so its canonical
+    bytes are deterministic. Rendering a request's values from record state is a later slice;
+    the request declared here is static and frozen as-is when the action is admitted.
     """
 
     action: Annotated[str, Field(strict=True, min_length=1, max_length=MAX_NAME_LENGTH)]
-    request: dict[str, str | int | bool] = Field(default_factory=dict)
+    request: dict[str, _ActionRequestValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate(self) -> ActionEmit:
         if self.action not in ACTION_KINDS:
             raise ValueError(f"unknown action kind {self.action!r}")
+        if self.action == CONNECT_INVOKE:
+            try:
+                validated = ConnectInvokeRequest.model_validate(self.request)
+            except ValidationError as exc:
+                raise ValueError(f"invalid connect.invoke request: {exc}") from exc
+            # Normalize to the materialized shape (defaults filled, an absent provider dropped
+            # rather than left null so the request round-trips through the flat-value field),
+            # so the signed canonical bytes are deterministic and the invoker parses the exact
+            # frozen request the pack signed.
+            self.request = validated.model_dump(mode="json", exclude_none=True)
+        else:
+            for value in self.request.values():
+                if isinstance(value, dict):
+                    raise ValueError(
+                        f"action kind {self.action!r} requires a flat scalar request"
+                    )
         return self
 
 

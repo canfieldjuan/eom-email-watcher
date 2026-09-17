@@ -388,3 +388,48 @@ def test_a_zero_byte_input_is_permitted() -> None:
         outcome = invoker.invoke(invoke_request(content=b""), job_id=ACTION_ID)
     assert outcome["status"] == "completed"
     assert captured[0]["inputs"][0]["byte_size"] == 0
+
+
+def test_a_definition_normalized_request_is_driven_end_to_end() -> None:
+    # Cross-layer: the signed definition's normalized connect.invoke request is exactly the
+    # frozen request the composition-layer invoker parses and drives. A shape drift between the
+    # two layers would fail this rather than only at runtime.
+    from eom_email_watcher.automate import ConnectInvokeRequest
+
+    request = ConnectInvokeRequest.model_validate(
+        {
+            "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+            "input": {
+                "artifact_id": ARTIFACT_ID,
+                "media_type": MEDIA_TYPE,
+                "filename": "request.json",
+                "content_base64": base64.b64encode(CONTENT).decode("ascii"),
+            },
+            "provider": {"instance_id": INSTANCE_A},
+            "parameters": {"page-size": 25},
+            "confirmed": True,
+        }
+    ).model_dump(mode="json", exclude_none=True)
+
+    captured: list[dict[str, object]] = []
+    transport = accepted_then_completed(result=completed_result(), captured=captured)
+    capability = make_capability(
+        confirmation_required=True,
+        parameters=(
+            connect.CapabilityParameter(
+                name="page-size",
+                value_type="integer",
+                required=False,
+                label="Page size",
+                description="How many links to list.",
+            ),
+        ),
+    )
+    invoker, http_client = make_invoker(transport, capability)
+    with http_client:
+        outcome = invoker.invoke(request, job_id=ACTION_ID)
+
+    assert outcome["status"] == "completed"
+    assert captured[0]["job_id"] == ACTION_ID
+    assert captured[0]["inputs"][0]["artifact_id"] == ARTIFACT_ID
+    assert captured[0]["parameters"] == {"page-size": 25}

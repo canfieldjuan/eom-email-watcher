@@ -218,22 +218,131 @@ def _json(data: dict) -> str:
     return json.dumps(data)
 
 
+ARTIFACT_ID = "5aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+INSTANCE_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _connect_invoke_request(**overrides: object) -> dict:
+    request = {
+        "capability": {"id": "onboarding.public-link.list", "version": "1.0"},
+        "input": {
+            "artifact_id": ARTIFACT_ID,
+            "media_type": "application/json",
+            "filename": "request.json",
+        },
+    }
+    request.update(overrides)
+    return request
+
+
 def test_workflow_definition_accepts_a_connect_invoke_action() -> None:
     # connect.invoke is in the abstract action vocabulary, so a pack may declare it (the host
-    # resolves it to a configured ConnectInvokeAdapter over a CapabilityInvoker).
+    # resolves it to a configured ConnectInvokeAdapter over a CapabilityInvoker). The request
+    # is normalized to its materialized shape, so an absent provider is dropped and the
+    # defaults for parameters and confirmed are filled.
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {"action": "connect.invoke", "request": _connect_invoke_request()}
+    ]
+    workflow = parse_workflow(_json(data))
+    action = workflow.definitions[0].actions[0]
+    assert action.action == "connect.invoke"
+    assert action.request == {
+        "capability": {"id": "onboarding.public-link.list", "version": "1.0"},
+        "input": {
+            "artifact_id": ARTIFACT_ID,
+            "media_type": "application/json",
+            "filename": "request.json",
+            "content_base64": "",
+        },
+        "parameters": {},
+        "confirmed": False,
+    }
+
+
+def test_connect_invoke_normalized_request_round_trips_through_canonical_bytes() -> None:
     data = _workflow_data()
     data["definitions"][0]["actions"] = [
         {
             "action": "connect.invoke",
-            "request": {"capability_id": "onboarding.public-link.list", "limit": 50},
+            "request": _connect_invoke_request(
+                provider={"instance_id": INSTANCE_ID},
+                parameters={"page-size": 50},
+                confirmed=True,
+            ),
         }
     ]
     workflow = parse_workflow(_json(data))
-    assert workflow.definitions[0].actions[0].action == "connect.invoke"
-    assert workflow.definitions[0].actions[0].request == {
-        "capability_id": "onboarding.public-link.list",
-        "limit": 50,
-    }
+    # The normalized request is stable: re-parsing the canonical bytes yields identical bytes.
+    assert canonical_workflow(parse_workflow(canonical_workflow(workflow))) == canonical_workflow(
+        workflow
+    )
+    action = workflow.definitions[0].actions[0]
+    assert action.request["provider"] == {"instance_id": INSTANCE_ID}
+    assert action.request["parameters"] == {"page-size": 50}
+    assert action.request["confirmed"] is True
+
+
+def test_connect_invoke_rejects_a_malformed_request_at_parse_time() -> None:
+    data = _workflow_data()
+    # A flat request lacking the structured capability/input shape is rejected at parse/sign
+    # time, not deferred to dispatch.
+    data["definitions"][0]["actions"] = [
+        {"action": "connect.invoke", "request": {"capability_id": "onboarding.public-link.list"}}
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_connect_invoke_rejects_an_underscore_capability_id() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {
+            "action": "connect.invoke",
+            "request": _connect_invoke_request(
+                capability={"id": "onboarding.public_link.list", "version": "1.0"}
+            ),
+        }
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_connect_invoke_rejects_a_non_uuid4_artifact_id() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {
+            "action": "connect.invoke",
+            "request": _connect_invoke_request(
+                input={
+                    "artifact_id": "not-a-uuid",
+                    "media_type": "application/json",
+                    "filename": "request.json",
+                }
+            ),
+        }
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_simple_action_rejects_a_nested_request() -> None:
+    data = _workflow_data()
+    # A flat-scalar kind cannot carry a nested object: only connect.invoke may.
+    data["definitions"][0]["actions"] = [
+        {"action": "notify.local", "request": {"title": "Hi", "meta": {"nested": "no"}}}
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_simple_action_accepts_a_flat_scalar_request() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {"action": "notify.local", "request": {"title": "Hi", "body": "There"}}
+    ]
+    workflow = parse_workflow(_json(data))
+    assert workflow.definitions[0].actions[0].request == {"title": "Hi", "body": "There"}
 
 
 def test_workflow_definition_rejects_an_unknown_action_kind() -> None:
