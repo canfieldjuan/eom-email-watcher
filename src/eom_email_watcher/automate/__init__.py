@@ -24,6 +24,7 @@ from .actions import (
     LocalNotifyAdapter,
 )
 from .definition import (
+    ActionEmit,
     DefinitionError,
     Workflow,
     WorkflowDefinition,
@@ -49,6 +50,7 @@ from .pack import (
     load_pack,
     verify_grant,
 )
+from .runtime import DecisionRun, PackRuntime
 from .store import (
     ActionAdmission,
     ActionConflict,
@@ -74,6 +76,7 @@ __all__ = [
     "ActionAdmission",
     "ActionConflict",
     "ActionDeliveryError",
+    "ActionEmit",
     "ActionOutcome",
     "ActionRunner",
     "ActionView",
@@ -81,6 +84,7 @@ __all__ = [
     "AutomateHost",
     "AutomateLicenseError",
     "DecisionOutcome",
+    "DecisionRun",
     "DefinitionError",
     "EngineError",
     "GrantView",
@@ -94,6 +98,7 @@ __all__ = [
     "PackError",
     "PackGrant",
     "PackManifest",
+    "PackRuntime",
     "RecordView",
     "StaleRecord",
     "TransitionOutcome",
