@@ -46,6 +46,15 @@ def test_connect_client_caps_every_http_phase_to_operation_budget() -> None:
         client.close()
 
 
+def test_generic_discovery_rejects_competing_timeout_sources(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="one timeout source"):
+        connect.discover_capabilities(
+            tmp_path,
+            timeout_seconds=0.5,
+            remaining_timeout=lambda: 0.4,
+        )
+
+
 def registration(
     *,
     instance_id: str,
@@ -515,6 +524,36 @@ def test_generic_discovery_preserves_multiple_provider_choices(tmp_path: Path) -
     assert catalog.diagnostic_code is None
     assert [item.app_id for item in catalog.items] == ["provider-a", "provider-b"]
     assert [item.instance_id for item in selected.items] == [INSTANCE_B]
+
+
+def test_generic_discovery_recomputes_remaining_timeout_per_manifest_request(
+    tmp_path: Path,
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    duplicate = registration_v2(
+        instance_id=INSTANCE_A,
+        app_id="provider-a",
+        base_url="http://127.0.0.1:32123/",
+    )
+    write_registration(directory / "a.json", duplicate)
+    write_registration(directory / "b.json", duplicate)
+    request_timeouts: list[float] = []
+    remaining_timeouts = iter((0.8, 0.5))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_timeouts.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, json=manifest_v2(INSTANCE_A, "provider-a"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        catalog = connect.discover_capabilities(
+            tmp_path,
+            client=client,
+            provider_instance_id=INSTANCE_A,
+            remaining_timeout=lambda: next(remaining_timeouts),
+        )
+
+    assert len(catalog.items) == 1
+    assert request_timeouts == [0.8, 0.5]
 
 
 @pytest.mark.parametrize(

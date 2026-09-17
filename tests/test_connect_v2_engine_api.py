@@ -2057,7 +2057,9 @@ def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
     operation_budgets: list[float] = []
 
     def discover(**kwargs: object) -> connect.CapabilityCatalog:
-        budget = kwargs.get("timeout_seconds")
+        remaining_timeout = kwargs.get("remaining_timeout")
+        assert callable(remaining_timeout)
+        budget = remaining_timeout()
         assert isinstance(budget, float)
         discovery_budgets.append(budget)
         return connect.CapabilityCatalog((selected,))

@@ -2401,16 +2401,16 @@ def _discover_selected_generic_capability(
     capability_ref: dict[str, str],
     parameters: dict[str, object],
     *,
-    timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> tuple[connect.DiscoveredCapability, dict[str, str | int | bool]]:
 
     instance_id = str(provider["instance_id"])
-    if timeout_seconds is None:
+    if remaining_timeout is None:
         catalog = connect.discover_capabilities(provider_instance_id=instance_id)
     else:
         catalog = connect.discover_capabilities(
             provider_instance_id=instance_id,
-            timeout_seconds=timeout_seconds,
+            remaining_timeout=remaining_timeout,
         )
     provider_items = tuple(
         item
@@ -4327,11 +4327,19 @@ def _dispatch_automation_fire(
                 reason="entitlement_inactive",
             )
             return
+        discovery_remaining_timeout = None
+        if operation_deadline is not None:
+            def current_discovery_timeout() -> float:
+                remaining = _remaining_automation_dispatch_seconds(operation_deadline)
+                assert remaining is not None
+                return remaining
+
+            discovery_remaining_timeout = current_discovery_timeout
         capability, parameters = _discover_selected_generic_capability(
             provider_ref,
             capability_ref,
             requested_parameters,
-            timeout_seconds=_remaining_automation_dispatch_seconds(operation_deadline),
+            remaining_timeout=discovery_remaining_timeout,
         )
         confirmation_needed = (
             definition.confirm_each

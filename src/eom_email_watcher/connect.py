@@ -878,7 +878,7 @@ def _http_error_v2(response: httpx.Response) -> ConnectError:
     )
 
 
-def _client(timeout_seconds: float | None = None) -> httpx.Client:
+def _http_timeout(timeout_seconds: float | None = None) -> httpx.Timeout:
     if timeout_seconds is not None and (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
@@ -887,18 +887,20 @@ def _client(timeout_seconds: float | None = None) -> httpx.Client:
     ):
         raise ValueError("Connect timeout must be a positive finite number")
     if timeout_seconds is None:
-        timeout = httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0)
-    else:
-        bounded = float(timeout_seconds)
-        timeout = httpx.Timeout(
-            connect=min(1.0, bounded),
-            read=min(10.0, bounded),
-            write=min(60.0, bounded),
-            pool=min(1.0, bounded),
-        )
+        return httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0)
+    bounded = float(timeout_seconds)
+    return httpx.Timeout(
+        connect=min(1.0, bounded),
+        read=min(10.0, bounded),
+        write=min(60.0, bounded),
+        pool=min(1.0, bounded),
+    )
+
+
+def _client(timeout_seconds: float | None = None) -> httpx.Client:
     return httpx.Client(
         follow_redirects=False,
-        timeout=timeout,
+        timeout=_http_timeout(timeout_seconds),
         trust_env=False,
     )
 
@@ -1064,7 +1066,10 @@ def _discover_capabilities(
     provider_instance_id: str | None = None,
     require_entitlement: bool = True,
     timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> CapabilityCatalog:
+    if timeout_seconds is not None and remaining_timeout is not None:
+        raise ValueError("Connect discovery accepts one timeout source")
     if require_entitlement and not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
     locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
@@ -1100,14 +1105,24 @@ def _discover_capabilities(
             if base_url is None:
                 continue
             try:
-                with active_client.stream(
-                    "GET",
-                    f"{base_url}v2/manifest",
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {registration.auth.token}",
-                    },
-                ) as response:
+                headers = {
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {registration.auth.token}",
+                }
+                if remaining_timeout is None:
+                    response_stream = active_client.stream(
+                        "GET",
+                        f"{base_url}v2/manifest",
+                        headers=headers,
+                    )
+                else:
+                    response_stream = active_client.stream(
+                        "GET",
+                        f"{base_url}v2/manifest",
+                        headers=headers,
+                        timeout=_http_timeout(remaining_timeout()),
+                    )
+                with response_stream as response:
                     if response.status_code != 200:
                         continue
                     manifest = _AppManifestV2.model_validate(
@@ -1159,6 +1174,7 @@ def discover_capabilities(
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
     timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> CapabilityCatalog:
     return _discover_capabilities(
         runtime_dir,
@@ -1166,6 +1182,7 @@ def discover_capabilities(
         provider_instance_id=provider_instance_id,
         require_entitlement=True,
         timeout_seconds=timeout_seconds,
+        remaining_timeout=remaining_timeout,
     )
 
 
