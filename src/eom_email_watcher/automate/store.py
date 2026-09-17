@@ -1002,10 +1002,13 @@ class WorkflowStore:
                 is None
             ):
                 raise UnknownRecord(record_id)
-            # rowid is monotonic with insertion, so it preserves admission order when two
-            # actions share a created_at timestamp (a random action_id would not).
+            # Order by rowid, the durable admission sequence. rowid is monotonic with
+            # insertion under the single-threaded admission model (ADR-0006), so it is the
+            # creation order. created_at is display text (an ISO string carrying the caller's
+            # UTC offset) and cannot be the ordering key: differing offsets or a backward
+            # clock jump make its lexicographic order disagree with admission order.
             rows = db.execute(
-                "SELECT * FROM workflow_actions WHERE record_id = ? ORDER BY created_at, rowid",
+                "SELECT * FROM workflow_actions WHERE record_id = ? ORDER BY rowid",
                 (record_id,),
             ).fetchall()
         return [_action_view(row) for row in rows]

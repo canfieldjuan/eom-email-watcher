@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -936,6 +936,32 @@ def test_list_actions_preserves_admission_order_on_timestamp_tie(tmp_path: Path)
         )
     actions = store.list_actions(record_id)
     assert [action.dedupe_key for action in actions] == ["d0", "d1", "d2", "d3", "d4"]
+
+
+def test_list_actions_orders_by_admission_not_timestamp_text(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    # A later admission whose created_at text sorts *earlier* than the first: a different
+    # UTC offset (12:00+02:00 is the instant 10:00Z, admitted before 11:00Z), the same class
+    # of misordering a backward clock jump would cause. Lexicographic created_at ordering
+    # would reverse these two; admission order (rowid) must not.
+    first = store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="first",
+        request={"n": 0},
+        now=datetime(2026, 6, 1, 12, 0, tzinfo=timezone(timedelta(hours=2))),  # 10:00Z
+    )
+    second = store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="second",
+        request={"n": 1},
+        now=datetime(2026, 6, 1, 11, 0, tzinfo=UTC),  # later instant, earlier-sorting text
+    )
+    assert first.view.created_at > second.view.created_at  # the stored text misorders them
+    actions = store.list_actions(record_id)
+    assert [action.dedupe_key for action in actions] == ["first", "second"]
 
 
 def test_release_action_frees_a_pending_key(tmp_path: Path) -> None:
