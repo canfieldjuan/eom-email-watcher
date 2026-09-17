@@ -464,16 +464,19 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
             allow_nan=False,
         )
         size = len(canonical.encode("utf-8"))
-    except (ValueError, TypeError) as exc:
-        # ValueError: allow_nan=False rejects NaN/Infinity; unencodable strings and oversized
-        # integers also land here. TypeError: a value of a non-JSON type (a set, a datetime,
-        # an arbitrary object). Both must fail closed as InvalidEffect so the runner can
-        # terminalize the action rather than leaving the row stuck pending.
-        raise InvalidEffect(f"action {label} contains an unserializable value: {exc}") from exc
-    except RecursionError as exc:
-        # A payload too deeply nested for the key walk or json.dumps to recurse (a cycle is
-        # already caught above). Fail closed rather than let the action stick pending.
-        raise InvalidEffect(f"action {label} is nested too deeply") from exc
+    except InvalidEffect:
+        # Deliberate rejections from the walk (non-string key, circular reference) carry their
+        # own message; let them through unchanged.
+        raise
+    except Exception as exc:
+        # This is a trust boundary: canonicalizing a caller- or adapter-supplied payload must
+        # yield canonical bytes or InvalidEffect, never leak. Any other failure of the walk or
+        # of json.dumps over that data is such a leak -- a non-JSON value (TypeError), a
+        # non-portable number or unencodable string (ValueError), a payload too deeply nested
+        # (RecursionError), a mapping that misbehaves while being traversed (RuntimeError), and
+        # so on. Terminalize the whole class as InvalidEffect so the runner records a terminal
+        # failure rather than leaving the action stuck pending.
+        raise InvalidEffect(f"action {label} could not be canonicalized: {exc}") from exc
     if size > MAX_ACTION_BYTES:
         raise InvalidEffect(f"action {label} exceeds {MAX_ACTION_BYTES} bytes")
     return canonical
