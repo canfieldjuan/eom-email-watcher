@@ -71,11 +71,19 @@ class PackRuntime:
 
     @property
     def pack(self) -> LoadedPack:
-        return self._pack
+        # A defensive deep copy: the verified workflow the engine executes is private, so a
+        # caller cannot mutate an effect or append an action after load() and have
+        # submit_decision run unsigned semantics.
+        return LoadedPack(
+            pack_id=self._pack.pack_id,
+            pack_version=self._pack.pack_version,
+            workflow=self._pack.workflow.model_copy(deep=True),
+        )
 
     @property
     def workflow(self) -> Workflow:
-        return self._pack.workflow
+        # A defensive deep copy, for the same reason as :attr:`pack`.
+        return self._pack.workflow.model_copy(deep=True)
 
     @classmethod
     def load(

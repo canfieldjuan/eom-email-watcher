@@ -390,6 +390,35 @@ def test_separate_publisher_and_grant_keyrings_accept_correct_signatures(tmp_pat
     assert run.actions[0].status == "settled"
 
 
+def test_exposed_workflow_is_a_defensive_copy(tmp_path: Path) -> None:
+    # Mutating the exposed workflow graph must not change the verified semantics the engine
+    # executes, or the publisher signature would be defeatable after load().
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    runtime = _runtime(
+        tmp_path,
+        key,
+        actions=[NOTIFY_ACTION],
+        registry=AdapterRegistry.with_defaults(),
+        store=store,
+    )
+    exposed = runtime.workflow
+    assert exposed is not runtime.workflow  # a fresh copy each access
+    assert runtime.pack.workflow is not runtime.workflow
+    # Neuter the transition on the exposed copy; the executed semantics must be unaffected.
+    exposed.definitions[0].effects[0].to_stage = "captured"
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.outcome.record.stage == "reviewing"  # the original, signed transition ran
+
+
 def test_direct_construction_is_rejected(tmp_path: Path) -> None:
     # A caller cannot build a runtime around an unverified pack: construction must go through
     # load(), which performs signature and grant verification.
