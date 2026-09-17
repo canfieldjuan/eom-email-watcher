@@ -1,6 +1,6 @@
 # Contract Watch automation contract
 
-Status: **PROPOSED — behavioral contract only; no implementation is authorized by this commit.**
+Status: **ACCEPTED — implementation authorized on 2026-09-17.**
 
 Baseline inspected on 2026-09-17:
 
@@ -10,6 +10,11 @@ Baseline inspected on 2026-09-17:
 
 The code at those revisions is the authority for this contract. Product briefs,
 fixtures, plans, and older contracts are supporting context only.
+
+## Revision log
+
+- 2026-09-17: Proposed in commit `48a91e2`; accepted by the operator before
+  implementation began.
 
 ## Contract
 
