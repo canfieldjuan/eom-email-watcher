@@ -1143,3 +1143,20 @@ class WorkflowStore:
                 (record_id,),
             ).fetchall()
         return [_action_view(row) for row in rows]
+
+    def list_pending_actions(self) -> list[ActionView]:
+        """Return every ``pending`` action across all records, in global admission order.
+
+        This is the cross-restart reconciliation feed: an action intent is admitted durably
+        in the decision's transaction and dispatched afterwards, so a crash between the commit
+        and the dispatch leaves a ``pending`` row with no in-flight dispatcher. On the next
+        start the host sweeps this feed and re-drives each row (see
+        :meth:`ActionRunner.recover_pending`); a settled or failed row is terminal and never
+        appears here, so a completed action is not re-dispatched. Ordered by rowid, the durable
+        admission sequence (as in :meth:`list_actions`), so recovery replays in admission order.
+        """
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT * FROM workflow_actions WHERE status = 'pending' ORDER BY rowid"
+            ).fetchall()
+        return [_action_view(row) for row in rows]

@@ -237,6 +237,29 @@ class ActionRunner:
             return _outcome(failed, delivered=False)
         return _outcome(settled, delivered=True)
 
+    def recover_pending(self, *, now: datetime) -> list[ActionOutcome]:
+        """Re-drive every ``pending`` action left stranded by an earlier crash: the sweep.
+
+        A decision admits its action intents durably in the same transaction as its ledger
+        event and dispatches them only afterwards, so a crash between that commit and the
+        dispatch leaves ``pending`` rows with no in-flight dispatcher. Run this once at host
+        start, before normal operation resumes: it lists the pending rows in admission order
+        (:meth:`WorkflowStore.list_pending_actions`) and dispatches each through
+        :meth:`dispatch`, which reloads the durable row and settles it, fails it, or (no
+        adapter configured) leaves it pending for a later sweep. It never raises for a
+        per-action failure -- one bad row must not abort recovery of the rest -- and returns an
+        outcome per row swept.
+
+        Safe to repeat: :meth:`dispatch` only delivers a row still ``pending`` and settles it
+        under a status CAS, so a row completed by a concurrent path is replayed, not
+        re-delivered. Re-delivering a stranded row is correct for an idempotent adapter such as
+        ``notify.local``; a non-idempotent external adapter whose provider may have accepted
+        the request before the crash needs the deferred ambiguous-state reconciliation (a
+        provider-side lookup or claim) before it is swept, so this sweep is the recovery
+        primitive, not that provider-idempotency guarantee.
+        """
+        return [self.dispatch(view, now=now) for view in self._store.list_pending_actions()]
+
 
 def _outcome(view: ActionView, *, delivered: bool) -> ActionOutcome:
     return ActionOutcome(

@@ -1144,3 +1144,29 @@ def test_release_action_refuses_a_settled_action(tmp_path: Path) -> None:
     store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
     with pytest.raises(UnknownRecord):
         store.release_action(admission.view.action_id)
+
+
+def test_list_pending_actions_returns_only_pending_in_admission_order(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    r1 = _make_record(store)
+    r2 = _make_record(store)
+    first = store.admit_action(
+        r1, kind="notify.local", dedupe_key="a", request={"title": "1"}, now=NOW
+    )
+    store.admit_action(r2, kind="notify.local", dedupe_key="b", request={"title": "2"}, now=NOW)
+    store.admit_action(r1, kind="notify.local", dedupe_key="c", request={"title": "3"}, now=NOW)
+    # Terminalize the first (settled): it must not appear; the other two stay pending and are
+    # returned in rowid admission order, interleaved across records rather than grouped by one.
+    store.settle_action(first.view.action_id, result={"ok": True}, now=NOW)
+    pending = store.list_pending_actions()
+    assert [view.request for view in pending] == [{"title": "2"}, {"title": "3"}]
+
+
+def test_list_pending_actions_is_empty_when_nothing_is_pending(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    admission = store.admit_action(
+        record_id, kind="notify.local", dedupe_key="a", request={"title": "1"}, now=NOW
+    )
+    store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
+    assert store.list_pending_actions() == []

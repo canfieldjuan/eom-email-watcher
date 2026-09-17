@@ -388,3 +388,111 @@ def test_unconfigured_kind_releases_and_leaves_the_key_reusable(tmp_path: Path) 
     runner._registry.register("mail.send", OkAdapter())
     outcome = runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
     assert outcome.delivered is True
+
+
+def test_recover_pending_dispatches_a_stranded_pending_action(tmp_path: Path) -> None:
+    runner, store = _runner(tmp_path)
+    record_id = _record(store)
+    # A crash between admission and dispatch leaves a pending row with no dispatcher.
+    store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="k1",
+        request={"title": "New lead", "body": "Call back"},
+        now=NOW,
+    )
+    assert store.list_actions(record_id)[0].status == "pending"
+    outcomes = runner.recover_pending(now=NOW)
+    assert len(outcomes) == 1
+    assert outcomes[0].delivered is True
+    assert outcomes[0].status == "settled"
+    assert store.list_actions(record_id)[0].status == "settled"
+
+
+def test_recover_pending_sweeps_multiple_records_in_admission_order(tmp_path: Path) -> None:
+    delivered: list[str] = []
+
+    class RecordingAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            delivered.append(str(request["tag"]))
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", RecordingAdapter())
+    r1 = _record(store)
+    r2 = _record(store)
+    store.admit_action(r1, kind="mail.send", dedupe_key="a", request={"tag": "first"}, now=NOW)
+    store.admit_action(r2, kind="mail.send", dedupe_key="b", request={"tag": "second"}, now=NOW)
+    store.admit_action(r1, kind="mail.send", dedupe_key="c", request={"tag": "third"}, now=NOW)
+    outcomes = runner.recover_pending(now=NOW)
+    assert [outcome.status for outcome in outcomes] == ["settled", "settled", "settled"]
+    # rowid admission order across all records, not grouped by record.
+    assert delivered == ["first", "second", "third"]
+
+
+def test_recover_pending_leaves_an_unconfigured_action_pending(tmp_path: Path) -> None:
+    runner, store = _runner(tmp_path)
+    record_id = _record(store)
+    # No adapter is registered for mail.send.
+    store.admit_action(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    outcomes = runner.recover_pending(now=NOW)
+    assert len(outcomes) == 1
+    assert outcomes[0].delivered is False
+    # Left pending (durable intent), resumable once the adapter is configured.
+    assert store.list_actions(record_id)[0].status == "pending"
+
+
+def test_recover_pending_does_not_abort_on_one_failing_action(tmp_path: Path) -> None:
+    class FlakyAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            if request.get("boom"):
+                raise RuntimeError("provider down")
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", FlakyAdapter())
+    bad = _record(store)
+    good = _record(store)
+    store.admit_action(bad, kind="mail.send", dedupe_key="x", request={"boom": True}, now=NOW)
+    store.admit_action(good, kind="mail.send", dedupe_key="y", request={"to": "a"}, now=NOW)
+    outcomes = runner.recover_pending(now=NOW)
+    assert len(outcomes) == 2
+    # The failing row terminalizes as failed; the sweep still reaches and settles the good one.
+    assert store.list_actions(bad)[0].status == "failed"
+    assert store.list_actions(good)[0].status == "settled"
+
+
+def test_recover_pending_is_safe_to_repeat_without_re_delivery(tmp_path: Path) -> None:
+    delivered: list[str] = []
+
+    class RecordingAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            delivered.append(str(request["to"]))
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", RecordingAdapter())
+    record_id = _record(store)
+    store.admit_action(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    runner.recover_pending(now=NOW)
+    second = runner.recover_pending(now=NOW)
+    # The settled row is no longer in the pending feed, so the second sweep does nothing and
+    # the side effect never runs twice.
+    assert second == []
+    assert delivered == ["a"]
+
+
+def test_recover_pending_requires_the_license(tmp_path: Path) -> None:
+    runner, store = _runner(tmp_path, host=_host(tmp_path, [entitlement.CONNECT_FEATURE_ID]))
+    record_id = _record(store)
+    store.admit_action(
+        record_id,
+        kind="notify.local",
+        dedupe_key="k1",
+        request={"title": "a", "body": "b"},
+        now=NOW,
+    )
+    with pytest.raises(AutomateLicenseError):
+        runner.recover_pending(now=NOW)
+    # Nothing was dispatched: the row is still pending.
+    assert store.list_actions(record_id)[0].status == "pending"
