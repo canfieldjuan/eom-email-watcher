@@ -163,6 +163,19 @@ def test_invalid_utf8_bytes_are_a_definition_error() -> None:
         parse_workflow(b"\xff")
 
 
+def test_duplicate_json_member_is_rejected() -> None:
+    with pytest.raises(DefinitionError):
+        parse_workflow('{"name": "a", "name": "b"}')
+
+
+def test_integer_over_the_digit_limit_is_a_definition_error() -> None:
+    # A syntactically valid but enormous integer trips CPython's int-string digit limit in
+    # json.loads (a plain ValueError), which must still surface as DefinitionError.
+    raw = '{"value": ' + "1" * 5000 + "}"
+    with pytest.raises(DefinitionError):
+        parse_workflow(raw)
+
+
 def _json(data: dict) -> str:
     import json
 

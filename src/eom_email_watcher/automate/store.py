@@ -43,6 +43,11 @@ CREATE_OPERATION_NAME = "create"
 RECORD_TRANSITION = "record.transition"
 OVERLAY_SET = "overlay.set"
 
+# The maximum number of effects the store applies in one batch. The definition model
+# imports this so its per-definition cap and the store primitive's cap stay in lockstep,
+# and a direct apply_effects caller cannot exceed it.
+MAX_EFFECTS_PER_BATCH = 8
+
 _SCHEMA = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS workflow_records (
@@ -242,12 +247,27 @@ def _normalize_effects(effects: Sequence[Mapping[str, object]]) -> list[dict[str
         raise InvalidEffect("an effect batch must contain at least one effect")
     if transition_count > 1:
         raise InvalidEffect("an effect batch may contain at most one record.transition")
+    if len(normalized) > MAX_EFFECTS_PER_BATCH:
+        raise InvalidEffect(f"an effect batch may contain at most {MAX_EFFECTS_PER_BATCH} effects")
     return normalized
 
 
 def _canonical_effects(normalized: Sequence[Mapping[str, object]]) -> str:
     """Canonical JSON for the effect batch, stored on the event and compared on replay."""
     return json.dumps(list(normalized), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _require_operation_identity(operation_key: str, operation_name: str) -> None:
+    """Reject an empty operation key or name before it reaches a NOT-NULL/CHECK column.
+
+    Both are persisted under constraints that forbid the empty string; validating here
+    turns malformed input (for example an empty decision name) into a domain ValueError at
+    the primitive boundary rather than a raw sqlite3.IntegrityError.
+    """
+    if not operation_key:
+        raise ValueError("operation_key must be a non-empty string")
+    if not operation_name:
+        raise ValueError("operation_name must be a non-empty string")
 
 
 def _new_id() -> str:
@@ -450,6 +470,7 @@ class WorkflowStore:
         idempotent-replay check precedes the compare-and-set so a genuine retry is not
         rejected merely because the record has since advanced.
         """
+        _require_operation_identity(operation_key, operation_name)
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -537,6 +558,7 @@ class WorkflowStore:
            ``record.transition``), upserts each ``overlay.set``, and binds the operation
            key to its name, fingerprint, and event.
         """
+        _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
         canonical_effects = _canonical_effects(normalized)
         fingerprint = request_fingerprint(request)

@@ -325,6 +325,24 @@ def test_decision_refused_when_license_absent_even_for_existing_record(tmp_path:
         )
 
 
+def test_empty_decision_is_rejected_cleanly(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)
+    # An empty decision matches no trigger and must surface a domain ValueError rather than
+    # a raw sqlite3.IntegrityError from the operation_name constraint.
+    with pytest.raises(ValueError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="",
+            operation_key="op-1",
+            request={},
+            expected_version=1,
+            now=NOW,
+        )
+
+
 def test_stale_expected_version_is_rejected_before_matching(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()

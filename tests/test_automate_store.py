@@ -442,6 +442,55 @@ def test_get_overlays_unknown_record(tmp_path: Path) -> None:
         store.get_overlays("11111111-1111-4111-8111-111111111111")
 
 
+def test_apply_effects_rejects_a_batch_over_the_cap(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    effects = [{"kind": "overlay.set", "key": f"k{i}", "value": i} for i in range(9)]
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            effects,
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_empty_operation_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(ValueError):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "k", "value": 1}],
+            operation_key="",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_empty_operation_name(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(ValueError):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "k", "value": 1}],
+            operation_key="op-1",
+            operation_name="",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
 def test_apply_effects_rejects_extra_member_on_an_effect(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)

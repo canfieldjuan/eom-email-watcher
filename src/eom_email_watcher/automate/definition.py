@@ -21,11 +21,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .store import OVERLAY_SET, RECORD_TRANSITION
+from .store import MAX_EFFECTS_PER_BATCH, OVERLAY_SET, RECORD_TRANSITION
 
 MAX_DEFINITION_BYTES = 16 * 1024
 MAX_CONDITIONS = 8
-MAX_EFFECTS = 8
+# The per-definition effect cap is the store's per-batch cap: a definition's effects are
+# applied as one batch, so the two must not drift.
+MAX_EFFECTS = MAX_EFFECTS_PER_BATCH
 MAX_DEFINITIONS = 64
 MAX_STAGES = 64
 
@@ -169,18 +171,33 @@ def canonical_workflow(workflow: Workflow) -> bytes:
     return raw
 
 
+def _reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """object_pairs_hook that rejects a repeated member at any nesting level.
+
+    The default decoder keeps the last occurrence, so a document with two ``kind`` or
+    ``value`` members would pass strict parsing after silently discarding one, potentially
+    executing a different effect than it visibly requests.
+    """
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member {key!r}")
+        result[key] = value
+    return result
+
+
 def parse_workflow(raw: bytes | str) -> Workflow:
     """Parse and strictly validate a workflow definition from JSON.
 
-    The canonical-byte size bound is enforced here, the trust boundary for an untrusted
-    definition, so an oversized workflow is rejected before it can reach the engine or the
-    event ledger.
+    This is the trust boundary for an untrusted definition. Every malformed document has a
+    single rejection path (:class:`DefinitionError`): a JSON syntax error, invalid UTF-8
+    bytes, an integer past the interpreter digit limit, a duplicate member, or input nested
+    too deeply to parse. The canonical-byte size bound is enforced here too, so an oversized
+    workflow is rejected before it can reach the engine or the event ledger.
     """
     try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        # bytes input can be malformed UTF-8, not just malformed JSON; both are the same
-        # rejection path for an untrusted document.
+        data = json.loads(raw, object_pairs_hook=_reject_duplicate_members)
+    except (ValueError, RecursionError) as exc:
         raise DefinitionError(f"invalid workflow JSON: {exc}") from exc
     try:
         workflow = Workflow.model_validate(data)
