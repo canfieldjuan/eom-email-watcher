@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from eom_email_watcher import cli
+from eom_email_watcher import cli, engine_api
 from eom_email_watcher.db import Store
 from eom_email_watcher.engine_api import ApiError
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
@@ -231,8 +231,16 @@ def test_production_check_loads_runtime_after_acquiring_lock(
         return {"retention_days": fresh_config.retention_days}
 
     monkeypatch.setattr(cli, "run_watcher_check", run_watcher_check)
+    pumped = []
+    monkeypatch.setattr(
+        engine_api,
+        "pump_connect_runtime",
+        lambda runtime, limit: pumped.append((runtime, limit)),
+    )
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
+    assert len(pumped) == 1
+    assert pumped[0][1] == 25
 
 
 def test_dry_run_loads_runtime_after_acquiring_production_lock(
@@ -327,8 +335,16 @@ def test_zero_sender_production_check_locks_reloads_and_skips_gmail(
         }
 
     monkeypatch.setattr(cli, "run_watcher_check", run_watcher_check)
+    pumped = []
+    monkeypatch.setattr(
+        engine_api,
+        "pump_connect_runtime",
+        lambda runtime, limit: pumped.append((runtime, limit)),
+    )
 
     assert cli._check(tmp_path / "config.toml", dry_run=False) == 0
+    assert len(pumped) == 1
+    assert pumped[0][1] == 25
     assert json.loads(capsys.readouterr().out) == {
         "active": False,
         "automation_processed": 0,

@@ -1021,15 +1021,18 @@ def test_v2_job_preparation_accepts_empty_artifacts_and_integral_numbers() -> No
 
 def test_v2_job_preparation_accepts_only_canonical_uuid4_request_identity() -> None:
     capability = discovered_v2_capability()
+    artifact_id = "5bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     job = connect.prepare_capability_job(
         capability,
         b"content",
         "application/pdf",
         "document.pdf",
         job_id=JOB_ID,
+        artifact_id=artifact_id,
     )
 
     assert job.job_id == JOB_ID
+    assert job.artifact.artifact_id == artifact_id
     for invalid in (
         "not-a-uuid",
         "55555555-5555-1555-8555-555555555555",
@@ -1039,6 +1042,15 @@ def test_v2_job_preparation_accepts_only_canonical_uuid4_request_identity() -> N
         with pytest.raises(connect.ConnectError) as raised:
             connect.validate_job_id(invalid)
         assert raised.value.code == "JOB_REQUEST_INVALID"
+        with pytest.raises(connect.ConnectError) as artifact:
+            connect.prepare_capability_job(
+                capability,
+                b"content",
+                "application/pdf",
+                "document.pdf",
+                artifact_id=invalid,
+            )
+        assert artifact.value.code == "JOB_REQUEST_INVALID"
 
 
 def test_v2_client_submits_and_polls_generic_outputs() -> None:

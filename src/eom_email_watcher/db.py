@@ -30,7 +30,7 @@ from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -48,6 +48,45 @@ CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS = 30
 MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES = 128
 MAX_CONNECT_DISPATCH_ERROR_MESSAGE_BYTES = 1024
 SOURCE_CLEANUP_LOCK_BATCH_SIZE = 32
+AUTOMATION_FIRE_STATES = (
+    "pending_dispatch",
+    "entitlement_paused",
+    "awaiting_confirmation",
+    "submitted",
+    "completed",
+    "failed",
+    "declined",
+    "manual_review",
+    "source_unavailable",
+)
+AUTOMATION_FIRE_TERMINAL_STATES = frozenset(
+    {"completed", "failed", "declined", "manual_review", "source_unavailable"}
+)
+AUTOMATION_FIRE_TRANSITIONS = frozenset(
+    {
+        ("pending_dispatch", "entitlement_paused"),
+        ("pending_dispatch", "awaiting_confirmation"),
+        ("pending_dispatch", "submitted"),
+        ("pending_dispatch", "manual_review"),
+        ("pending_dispatch", "source_unavailable"),
+        ("entitlement_paused", "pending_dispatch"),
+        ("entitlement_paused", "submitted"),
+        ("entitlement_paused", "source_unavailable"),
+        ("awaiting_confirmation", "pending_dispatch"),
+        ("awaiting_confirmation", "declined"),
+        ("awaiting_confirmation", "manual_review"),
+        ("awaiting_confirmation", "source_unavailable"),
+        ("submitted", "completed"),
+        ("submitted", "failed"),
+        ("submitted", "entitlement_paused"),
+        ("submitted", "pending_dispatch"),
+        ("submitted", "manual_review"),
+        ("submitted", "source_unavailable"),
+    }
+)
+AUTOMATION_FIRE_MAX_ATTEMPTS = 2
+AUTOMATION_FIRE_PENDING_WINDOW = timedelta(hours=2)
+MAX_AUTOMATION_PREPARED_IDENTITY_BYTES = 8 * 1024
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -392,6 +431,9 @@ BEFORE DELETE ON automation_rule_versions
 BEGIN
     SELECT RAISE(ABORT, 'automation rule versions are immutable');
 END;
+"""
+
+_AUTOMATION_FIRE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS automation_fires (
     fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
     event_id TEXT NOT NULL CHECK (length(event_id) = 64),
@@ -400,10 +442,36 @@ CREATE TABLE IF NOT EXISTS automation_fires (
     message_id TEXT NOT NULL CHECK (message_id <> ''),
     part_id TEXT NOT NULL,
     action_kind TEXT NOT NULL CHECK (action_kind = 'connect.invoke'),
-    state TEXT NOT NULL CHECK (state = 'pending_dispatch'),
-    state_version INTEGER NOT NULL CHECK (state_version = 1),
+    state TEXT NOT NULL CHECK (state IN (
+        'pending_dispatch', 'entitlement_paused', 'awaiting_confirmation',
+        'submitted', 'completed', 'failed', 'declined', 'manual_review',
+        'source_unavailable'
+    )),
+    state_version INTEGER NOT NULL CHECK (state_version >= 1),
+    reason TEXT CHECK (reason IS NULL OR (reason <> '' AND length(reason) <= 128)),
+    current_attempt_no INTEGER NOT NULL DEFAULT 1 CHECK (current_attempt_no IN (1, 2)),
+    job_id TEXT CHECK (job_id IS NULL OR length(job_id) = 36),
+    prepared_identity_sha256 TEXT CHECK (
+        prepared_identity_sha256 IS NULL OR length(prepared_identity_sha256) = 64
+    ),
+    prepared_identity_json BLOB CHECK (
+        prepared_identity_json IS NULL OR (
+            typeof(prepared_identity_json) = 'blob'
+            AND length(prepared_identity_json) BETWEEN 2 AND 8192
+        )
+    ),
+    confirmed INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0, 1)),
+    pending_since TEXT,
+    authorized_pending_seconds INTEGER NOT NULL DEFAULT 0 CHECK (
+        authorized_pending_seconds >= 0
+    ),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    CHECK (
+        (prepared_identity_sha256 IS NULL AND prepared_identity_json IS NULL)
+        OR (prepared_identity_sha256 IS NOT NULL AND prepared_identity_json IS NOT NULL)
+    ),
+    CHECK (state <> 'submitted' OR job_id IS NOT NULL),
     UNIQUE (message_id, part_id, rule_id, rule_version)
 );
 CREATE INDEX IF NOT EXISTS idx_automation_fires_state
@@ -425,13 +493,18 @@ BEGIN
 END;
 CREATE TABLE IF NOT EXISTS automation_fire_attempts (
     fire_id TEXT NOT NULL CHECK (length(fire_id) = 36),
-    attempt_no INTEGER NOT NULL CHECK (attempt_no = 1),
+    attempt_no INTEGER NOT NULL CHECK (attempt_no IN (1, 2)),
     dispatch_request_id TEXT NOT NULL UNIQUE CHECK (length(dispatch_request_id) = 36),
+    job_id TEXT CHECK (job_id IS NULL OR length(job_id) = 36),
     created_at TEXT NOT NULL,
     PRIMARY KEY (fire_id, attempt_no)
 );
 CREATE TRIGGER IF NOT EXISTS automation_fire_attempts_immutable_update
 BEFORE UPDATE ON automation_fire_attempts
+WHEN NEW.fire_id <> OLD.fire_id OR NEW.attempt_no <> OLD.attempt_no
+  OR NEW.dispatch_request_id <> OLD.dispatch_request_id
+  OR NEW.created_at <> OLD.created_at
+  OR (OLD.job_id IS NOT NULL AND NEW.job_id IS NOT OLD.job_id)
 BEGIN
     SELECT RAISE(ABORT, 'automation fire attempts are immutable');
 END;
@@ -441,6 +514,11 @@ WHEN NOT EXISTS (SELECT 1 FROM automation_fires WHERE fire_id = NEW.fire_id)
 BEGIN
     SELECT RAISE(ABORT, 'automation fire attempt source is invalid');
 END;
+CREATE TABLE IF NOT EXISTS automation_fire_confirmations (
+    fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
+    prepared_identity_sha256 TEXT NOT NULL CHECK (length(prepared_identity_sha256) = 64),
+    confirmed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS automation_run_source_identities (
     run_id TEXT PRIMARY KEY CHECK (run_id <> ''),
     mailbox_identity_key TEXT NOT NULL CHECK (length(mailbox_identity_key) = 64)
@@ -448,13 +526,34 @@ CREATE TABLE IF NOT EXISTS automation_run_source_identities (
 CREATE TRIGGER IF NOT EXISTS messages_delete_pending_automation_fires
 BEFORE DELETE ON messages
 BEGIN
+    DELETE FROM automation_fire_confirmations
+    WHERE fire_id IN (
+        SELECT fire_id FROM automation_fires
+        WHERE message_id = OLD.message_id
+          AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation')
+    );
     DELETE FROM automation_fire_attempts
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
-        WHERE message_id = OLD.message_id AND state = 'pending_dispatch'
+        WHERE message_id = OLD.message_id
+          AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation')
     );
     DELETE FROM automation_fires
-    WHERE message_id = OLD.message_id AND state = 'pending_dispatch';
+    WHERE message_id = OLD.message_id
+      AND state IN ('pending_dispatch', 'entitlement_paused', 'awaiting_confirmation');
+END;
+CREATE TRIGGER IF NOT EXISTS connect_jobs_delete_linked_automation_fires
+AFTER DELETE ON connect_attachment_jobs
+BEGIN
+    UPDATE automation_fires SET
+        state = 'source_unavailable',
+        state_version = state_version + 1,
+        reason = 'job_removed',
+        job_id = NULL,
+        pending_since = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE job_id = OLD.job_id
+      AND state IN ('submitted', 'entitlement_paused');
 END;
 """
 
@@ -1017,6 +1116,14 @@ class AutomationFire:
     action_kind: str
     state: str
     state_version: int
+    reason: str | None
+    current_attempt_no: int
+    job_id: str | None
+    prepared_identity_sha256: str | None
+    prepared_identity_json: bytes | None
+    confirmed: bool
+    pending_since: str | None
+    authorized_pending_seconds: int
     created_at: str
     updated_at: str
 
@@ -1026,6 +1133,7 @@ class AutomationFireAttempt:
     fire_id: str
     attempt_no: int
     dispatch_request_id: str
+    job_id: str | None
     created_at: str
 
 
@@ -1055,6 +1163,31 @@ class AutomationSourceChanged(RuntimeError):
 
 def _automation_run(row: sqlite3.Row) -> AutomationRun:
     return AutomationRun(**dict(row))
+
+
+def _automation_fire(row: sqlite3.Row) -> AutomationFire:
+    prepared = row["prepared_identity_json"]
+    return AutomationFire(
+        fire_id=str(row["fire_id"]),
+        event_id=str(row["event_id"]),
+        rule_id=str(row["rule_id"]),
+        rule_version=int(row["rule_version"]),
+        message_id=str(row["message_id"]),
+        part_id=str(row["part_id"]),
+        action_kind=str(row["action_kind"]),
+        state=str(row["state"]),
+        state_version=int(row["state_version"]),
+        reason=row["reason"],
+        current_attempt_no=int(row["current_attempt_no"]),
+        job_id=row["job_id"],
+        prepared_identity_sha256=row["prepared_identity_sha256"],
+        prepared_identity_json=bytes(prepared) if prepared is not None else None,
+        confirmed=bool(row["confirmed"]),
+        pending_since=row["pending_since"],
+        authorized_pending_seconds=int(row["authorized_pending_seconds"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
 
 
 def _automation_event(row: sqlite3.Row) -> AutomationEvent:
@@ -1634,9 +1767,48 @@ def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
         raise RuntimeError("automation schema script ended with an incomplete statement")
 
 
+def _migrate_automation_fires_v21(db: sqlite3.Connection) -> None:
+    for trigger in (
+        "connect_jobs_delete_linked_automation_fires",
+        "messages_delete_pending_automation_fires",
+        "automation_fire_attempts_immutable_update",
+        "automation_fire_attempts_require_fire",
+        "automation_fires_require_sources",
+    ):
+        db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    db.execute("ALTER TABLE automation_fire_attempts RENAME TO automation_fire_attempts_v20")
+    db.execute("ALTER TABLE automation_fires RENAME TO automation_fires_v20")
+    _execute_transactional_script(db, _AUTOMATION_FIRE_TABLES_SQL)
+    db.execute(
+        """INSERT INTO automation_fires(
+            fire_id, event_id, rule_id, rule_version, message_id, part_id,
+            action_kind, state, state_version, reason, current_attempt_no, job_id,
+            prepared_identity_sha256, prepared_identity_json, confirmed,
+            pending_since, authorized_pending_seconds, created_at, updated_at
+        ) SELECT fire_id, event_id, rule_id, rule_version, message_id, part_id,
+            action_kind, state, state_version, NULL, 1, NULL, NULL, NULL, 0,
+            updated_at, 0, created_at, updated_at
+        FROM automation_fires_v20"""
+    )
+    db.execute(
+        """INSERT INTO automation_fire_attempts(
+            fire_id, attempt_no, dispatch_request_id, job_id, created_at
+        ) SELECT fire_id, attempt_no, dispatch_request_id, NULL, created_at
+        FROM automation_fire_attempts_v20"""
+    )
+    db.execute("DROP TABLE automation_fire_attempts_v20")
+    db.execute("DROP TABLE automation_fires_v20")
+
+
 def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -> None:
-    """Install schema-20 authority and cross-version completion fences."""
+    """Install schema-21 authority and cross-version completion fences."""
     _execute_transactional_script(db, _AUTOMATE_CORE_TABLES_SQL)
+    _execute_transactional_script(db, _AUTOMATION_FIRE_TABLES_SQL)
+    fire_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(automation_fires)").fetchall()
+    }
+    if "job_id" not in fire_columns:
+        _migrate_automation_fires_v21(db)
 
     account_columns = {
         str(row["name"]) for row in db.execute("PRAGMA table_info(mail_accounts)").fetchall()
@@ -3088,7 +3260,7 @@ class Store:
                 WHERE message_id = ? ORDER BY created_at, fire_id""",
                 (message_id,),
             ).fetchall()
-        return [AutomationFire(**dict(row)) for row in rows]
+        return [_automation_fire(row) for row in rows]
 
     def automation_fire_attempts(self, fire_id: str) -> list[AutomationFireAttempt]:
         with self.connection() as db:
@@ -3098,6 +3270,377 @@ class Store:
                 (fire_id,),
             ).fetchall()
         return [AutomationFireAttempt(**dict(row)) for row in rows]
+
+    def automation_fire(self, fire_id: str) -> AutomationFire | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+        return _automation_fire(row) if row is not None else None
+
+    def automation_fires_in_states(
+        self,
+        states: Sequence[str],
+        *,
+        limit: int = CONNECT_QUEUE_MAX_JOBS,
+    ) -> tuple[AutomationFire, ...]:
+        normalized = tuple(states)
+        if (
+            not normalized
+            or any(state not in AUTOMATION_FIRE_STATES for state in normalized)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= CONNECT_QUEUE_MAX_JOBS
+        ):
+            raise ValueError("Automation fire query boundary is invalid")
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connection() as db:
+            rows = db.execute(
+                f"""SELECT * FROM automation_fires
+                WHERE state IN ({placeholders})
+                ORDER BY updated_at, fire_id LIMIT ?""",
+                (*normalized, limit),
+            ).fetchall()
+        return tuple(_automation_fire(row) for row in rows)
+
+    def automation_fire_definition(self, fire: AutomationFire) -> RuleDefinition:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT definition_json, definition_sha256
+                FROM automation_rule_versions
+                WHERE rule_id = ? AND version = ? AND kind = 'definition'""",
+                (fire.rule_id, fire.rule_version),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Automation fire rule definition is unavailable")
+        encoded = bytes(row["definition_json"])
+        if hashlib.sha256(encoded).hexdigest() != str(row["definition_sha256"]):
+            raise RuntimeError("Automation fire rule definition failed integrity validation")
+        try:
+            definition = parse_rule_definition(json.loads(encoded))
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError, RuleValidationError) as exc:
+            raise RuntimeError("Automation fire rule definition is invalid") from exc
+        if canonical_rule_definition(definition) != encoded:
+            raise RuntimeError("Automation fire rule definition is noncanonical")
+        return definition
+
+    @staticmethod
+    def automation_pending_seconds(fire: AutomationFire, *, now: datetime | None = None) -> int:
+        seconds = fire.authorized_pending_seconds
+        if fire.state != "pending_dispatch" or fire.pending_since is None:
+            return seconds
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        started_at = datetime.fromisoformat(fire.pending_since)
+        if started_at.tzinfo is None:
+            raise RuntimeError("Automation pending time is missing its timezone")
+        return seconds + max(0, int((observed_at - started_at.astimezone(UTC)).total_seconds()))
+
+    def transition_automation_fire(
+        self,
+        *,
+        fire_id: str,
+        expected_state: str,
+        expected_version: int,
+        next_state: str,
+        reason: str | None = None,
+        job_id: str | None = None,
+        prepared_identity: dict[str, object] | None = None,
+        confirmed: bool | None = None,
+        now: datetime | None = None,
+    ) -> AutomationFire:
+        if (expected_state, next_state) not in AUTOMATION_FIRE_TRANSITIONS:
+            raise ValueError(
+                f"Invalid automation fire transition: {expected_state} -> {next_state}"
+            )
+        if isinstance(expected_version, bool) or expected_version < 1:
+            raise ValueError("Automation fire version is invalid")
+        if reason is not None and (not reason or len(reason.encode("utf-8")) > 128):
+            raise ValueError("Automation fire reason is invalid")
+        if job_id is not None and not _valid_uuid_v4(job_id):
+            raise ValueError("Automation fire job identity is invalid")
+        prepared_json: bytes | None = None
+        prepared_sha256: str | None = None
+        if prepared_identity is not None:
+            prepared_json = json.dumps(
+                prepared_identity,
+                separators=(",", ":"),
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+            if not 2 <= len(prepared_json) <= MAX_AUTOMATION_PREPARED_IDENTITY_BYTES:
+                raise ValueError("Automation prepared identity is invalid")
+            prepared_sha256 = hashlib.sha256(prepared_json).hexdigest()
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(fire_id)
+            current = _automation_fire(row)
+            if current.state != expected_state or current.state_version != expected_version:
+                raise RuntimeError("Automation fire transition lost its expected-state race")
+            accumulated = self.automation_pending_seconds(current, now=observed_at)
+            next_job_id = job_id if job_id is not None else current.job_id
+            next_prepared_json = (
+                prepared_json if prepared_json is not None else current.prepared_identity_json
+            )
+            next_prepared_sha256 = (
+                prepared_sha256 if prepared_sha256 is not None else current.prepared_identity_sha256
+            )
+            next_confirmed = current.confirmed if confirmed is None else confirmed
+            if next_state == "submitted" and next_job_id is None:
+                raise ValueError("Submitted automation fire requires a Connect job")
+            if next_state == "awaiting_confirmation" and next_prepared_json is None:
+                raise ValueError("Confirmation requires a prepared invocation identity")
+            if next_state == "submitted":
+                attempt = db.execute(
+                    """UPDATE automation_fire_attempts SET job_id = ?
+                    WHERE fire_id = ? AND attempt_no = ? AND job_id IS NULL""",
+                    (next_job_id, fire_id, current.current_attempt_no),
+                )
+                if attempt.rowcount != 1:
+                    bound = db.execute(
+                        """SELECT job_id FROM automation_fire_attempts
+                        WHERE fire_id = ? AND attempt_no = ?""",
+                        (fire_id, current.current_attempt_no),
+                    ).fetchone()
+                    if bound is None or bound["job_id"] != next_job_id:
+                        raise RuntimeError("Automation fire attempt job binding conflicted")
+            cursor = db.execute(
+                """UPDATE automation_fires SET
+                    state = ?, state_version = state_version + 1, reason = ?, job_id = ?,
+                    prepared_identity_sha256 = ?, prepared_identity_json = ?, confirmed = ?,
+                    pending_since = ?, authorized_pending_seconds = ?, updated_at = ?
+                WHERE fire_id = ? AND state = ? AND state_version = ?""",
+                (
+                    next_state,
+                    reason,
+                    next_job_id,
+                    next_prepared_sha256,
+                    next_prepared_json,
+                    int(next_confirmed),
+                    stamp if next_state == "pending_dispatch" else None,
+                    accumulated,
+                    stamp,
+                    fire_id,
+                    expected_state,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Automation fire transition lost its expected-state race")
+            updated = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation fire disappeared after transition")
+        return _automation_fire(updated)
+
+    def decide_automation_fire(
+        self,
+        *,
+        fire_id: str,
+        expected_version: int,
+        prepared_identity_sha256: str,
+        confirmed: bool,
+        now: datetime | None = None,
+    ) -> AutomationFire:
+        if len(prepared_identity_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in prepared_identity_sha256
+        ):
+            raise ValueError("Automation confirmation identity is invalid")
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(fire_id)
+            current = _automation_fire(row)
+            if (
+                current.state != "awaiting_confirmation"
+                or current.state_version != expected_version
+                or current.prepared_identity_sha256 != prepared_identity_sha256
+            ):
+                raise RuntimeError("Automation confirmation lost its expected-state race")
+            next_state = "pending_dispatch" if confirmed else "declined"
+            if confirmed:
+                db.execute(
+                    """INSERT INTO automation_fire_confirmations(
+                        fire_id, prepared_identity_sha256, confirmed_at
+                    ) VALUES (?, ?, ?)""",
+                    (fire_id, prepared_identity_sha256, stamp),
+                )
+            cursor = db.execute(
+                """UPDATE automation_fires SET state = ?, state_version = state_version + 1,
+                    reason = ?, confirmed = ?, pending_since = ?, updated_at = ?
+                WHERE fire_id = ? AND state = 'awaiting_confirmation' AND state_version = ?""",
+                (
+                    next_state,
+                    None if confirmed else "declined_by_user",
+                    int(confirmed),
+                    stamp if confirmed else None,
+                    stamp,
+                    fire_id,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Automation confirmation lost its expected-state race")
+            updated = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation fire disappeared after confirmation")
+        return _automation_fire(updated)
+
+    def automation_confirmation_matches(self, fire: AutomationFire) -> bool:
+        if fire.prepared_identity_sha256 is None or not fire.confirmed:
+            return False
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1 FROM automation_fire_confirmations
+                WHERE fire_id = ? AND prepared_identity_sha256 = ?""",
+                (fire.fire_id, fire.prepared_identity_sha256),
+            ).fetchone()
+        return row is not None
+
+    def automation_fires_linked_to_job(self, job_id: str) -> tuple[AutomationFire, ...]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT * FROM automation_fires
+                WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')
+                ORDER BY created_at, fire_id""",
+                (job_id,),
+            ).fetchall()
+        return tuple(_automation_fire(row) for row in rows)
+
+    def resume_automation_fire_job(
+        self,
+        *,
+        fire_id: str,
+        expected_version: int,
+        now: datetime | None = None,
+    ) -> AutomationFire:
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(fire_id)
+            current = _automation_fire(row)
+            if (
+                current.state != "entitlement_paused"
+                or current.state_version != expected_version
+                or current.job_id is None
+            ):
+                raise RuntimeError("Automation entitlement resume lost its expected-state race")
+            paused_at = datetime.fromisoformat(current.updated_at)
+            if paused_at.tzinfo is None:
+                raise RuntimeError("Automation entitlement pause is missing its timezone")
+            paused_seconds = max(0, int((observed_at - paused_at.astimezone(UTC)).total_seconds()))
+            dispatch = db.execute(
+                "SELECT admission_deadline FROM connect_job_dispatch WHERE job_id = ?",
+                (current.job_id,),
+            ).fetchone()
+            if dispatch is None:
+                raise RuntimeError("Automation entitlement resume lost its Connect job")
+            admission_deadline = datetime.fromisoformat(str(dispatch["admission_deadline"]))
+            if admission_deadline.tzinfo is None:
+                raise RuntimeError("Connect admission deadline is missing its timezone")
+            db.execute(
+                """UPDATE connect_job_dispatch SET admission_deadline = ?, updated_at = ?
+                WHERE job_id = ?""",
+                (
+                    (
+                        admission_deadline.astimezone(UTC) + timedelta(seconds=paused_seconds)
+                    ).isoformat(),
+                    stamp,
+                    current.job_id,
+                ),
+            )
+            cursor = db.execute(
+                """UPDATE automation_fires SET state = 'submitted',
+                    state_version = state_version + 1, reason = NULL, updated_at = ?
+                WHERE fire_id = ? AND state = 'entitlement_paused' AND state_version = ?""",
+                (stamp, fire_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Automation entitlement resume lost its expected-state race")
+            updated = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation fire disappeared after entitlement resume")
+        return _automation_fire(updated)
+
+    def retry_automation_fire_after_deadline(
+        self,
+        *,
+        fire_id: str,
+        expected_version: int,
+        now: datetime | None = None,
+    ) -> AutomationFire:
+        observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        stamp = observed_at.isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT f.*, j.status AS linked_status, j.error_code AS linked_error_code,
+                    d.highest_provider_state AS linked_highest_provider_state
+                FROM automation_fires AS f
+                JOIN connect_attachment_jobs AS j ON j.job_id = f.job_id
+                JOIN connect_job_dispatch AS d ON d.job_id = j.job_id
+                WHERE f.fire_id = ?""",
+                (fire_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(fire_id)
+            current = _automation_fire(row)
+            if (
+                current.state != "submitted"
+                or current.state_version != expected_version
+                or current.current_attempt_no != 1
+                or row["linked_status"] != "failed"
+                or row["linked_error_code"] != "connect_queue_deadline_exceeded"
+                or row["linked_highest_provider_state"] != "requested"
+            ):
+                raise RuntimeError("Automation retry lacks proof of unaccepted provider work")
+            dispatch_request_id = str(uuid.uuid4())
+            db.execute(
+                """INSERT INTO automation_fire_attempts(
+                    fire_id, attempt_no, dispatch_request_id, job_id, created_at
+                ) VALUES (?, 2, ?, NULL, ?)""",
+                (fire_id, dispatch_request_id, stamp),
+            )
+            cursor = db.execute(
+                """UPDATE automation_fires SET state = 'pending_dispatch',
+                    state_version = state_version + 1, reason = 'first_admission_deadline',
+                    current_attempt_no = 2, job_id = NULL, confirmed = 0,
+                    prepared_identity_sha256 = NULL, prepared_identity_json = NULL,
+                    pending_since = ?, authorized_pending_seconds = 0, updated_at = ?
+                WHERE fire_id = ? AND state = 'submitted' AND state_version = ?""",
+                (stamp, stamp, fire_id, expected_version),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Automation retry lost its expected-state race")
+            db.execute(
+                "DELETE FROM automation_fire_confirmations WHERE fire_id = ?",
+                (fire_id,),
+            )
+            updated = db.execute(
+                "SELECT * FROM automation_fires WHERE fire_id = ?", (fire_id,)
+            ).fetchone()
+        if updated is None:
+            raise RuntimeError("Automation fire disappeared after retry")
+        return _automation_fire(updated)
 
     def activate_mail_account(self, provider: str, account_id: str) -> MailAccount:
         stamp = datetime.now(UTC).isoformat()
@@ -6481,9 +7024,9 @@ class Store:
                     db.execute(
                         """INSERT INTO automation_fires(
                             fire_id, event_id, rule_id, rule_version, message_id, part_id,
-                            action_kind, state, state_version, created_at, updated_at
+                            action_kind, state, state_version, pending_since, created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, 'connect.invoke',
-                            'pending_dispatch', 1, ?, ?)""",
+                            'pending_dispatch', 1, ?, ?, ?)""",
                         (
                             fire_id,
                             event_id,
@@ -6491,6 +7034,7 @@ class Store:
                             fire.rule_version,
                             message_id,
                             fire.part_id,
+                            stamp,
                             stamp,
                             stamp,
                         ),

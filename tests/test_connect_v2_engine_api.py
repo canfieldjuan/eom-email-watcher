@@ -95,6 +95,21 @@ def make_connect_job_due(runtime: Runtime, job_id: str) -> None:
         )
 
 
+def force_unaccepted_admission_deadline(runtime: Runtime, job_id: str) -> None:
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'waiting', submission_possible = 0,
+                admission_deadline = ?, next_attempt_at = ?
+            WHERE job_id = ?""",
+            (
+                "2000-01-01T00:00:00+00:00",
+                "2000-01-01T00:00:00+00:00",
+                job_id,
+            ),
+        )
+
+
 def assert_active_response(
     response: dict[str, object],
     *,
@@ -192,6 +207,732 @@ def test_connect_queue_pump_accepts_boundary_limits(
     )
 
     assert response["data"] == {"items": [], "next_wake_unix_ms": None}
+
+
+def test_connect_queue_pump_materializes_matching_automation_fire_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    mode = connect.CapabilityParameter(
+        name="mode",
+        value_type="string",
+        required=False,
+        label="Summary mode",
+        description="Choose general, story, or contract. Defaults to general.",
+    )
+    selected = capability(
+        app_id="document-summarizer",
+        app_version="0.1.0",
+        capability_id="document.summarize",
+        parameters=(mode,),
+    )
+    runtime.store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": selected.app_id,
+                    "version": selected.app_version,
+                    "instance_id": selected.instance_id,
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": False,
+        }
+    )
+    runtime.store.mark_analyzed(
+        "message-1",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "A contract arrived.",
+            "action_required": True,
+            "suggested_action": "Review the contract.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    fire = runtime.store.automation_fires_for_message("message-1")[0]
+    attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+
+    class FakeGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            return PDF
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(
+        engine_api,
+        "_pump_generic_connect_lane",
+        lambda active_runtime, head: engine_api._connect_queue_item(
+            active_runtime, head.job_id, "queued"
+        ),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert job is not None
+    assert job.message_id == "message-1"
+    assert job.part_id == "2"
+    assert job.capability_id == "document.summarize"
+    assert job.provider_instance_id == selected.instance_id
+    assert runtime.store.connect_job_parameters(job) == {"mode": "contract"}
+    settled = runtime.store.automation_fires_for_message("message-1")[0]
+    assert settled.state == "submitted"
+    assert settled.job_id == job.job_id
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    repeated_attempts = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert len(repeated_attempts) == 1
+    assert repeated_attempts[0].dispatch_request_id == attempt.dispatch_request_id
+    assert repeated_attempts[0].job_id == job.job_id
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_automation_entitlement_pause_prevents_discovery_then_resumes_same_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    discovered = 0
+
+    def discover(**kwargs: object) -> connect.CapabilityCatalog:
+        nonlocal discovered
+        discovered += 1
+        return connect.CapabilityCatalog((selected,))
+
+    install_automation_dispatch_fakes(monkeypatch, runtime, discover)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+
+    paused_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert paused_response["ok"] is True
+    paused = runtime.store.automation_fire(fire.fire_id)
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert paused.pending_since is None
+    assert discovered == 0
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    resumed_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert resumed_response["ok"] is True
+    resumed = runtime.store.automation_fire(fire.fire_id)
+    assert resumed is not None
+    assert resumed.state == "submitted"
+    assert resumed.current_attempt_no == 1
+    assert resumed.job_id == attempt.dispatch_request_id
+    assert discovered == 1
+
+
+def test_automation_entitlement_is_rechecked_before_proven_new_provider_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+
+    class FakeGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            return PDF
+
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert job is not None
+    make_connect_job_due(runtime, job.job_id)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("inactive automation must not discover or submit")
+        ),
+    )
+
+    outcome = engine_api._pump_generic_connect_lane(runtime, job)
+
+    assert outcome["outcome"] == "entitlement_paused"
+    paused = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.state == "waiting"
+    assert dispatch.attempt_count == 0
+
+
+def test_automation_confirmation_binds_stable_preparation_and_admits_after_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime, confirm_each=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    prepared_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert prepared_response["ok"] is True
+    prepared = runtime.store.automation_fire(fire.fire_id)
+    assert prepared is not None
+    assert prepared.state == "awaiting_confirmation"
+    assert prepared.job_id is None
+    assert prepared.prepared_identity_sha256 is not None
+    assert prepared.prepared_identity_json is not None
+    identity = json.loads(prepared.prepared_identity_json)
+    expected_artifact_id = engine_api._automation_artifact_id(attempt.dispatch_request_id)
+    assert identity["input"]["artifact_id"] == expected_artifact_id
+
+    decision_response = engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": prepared.state_version,
+                "prepared_identity_sha256": prepared.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+    assert decision_response["data"] == {
+        "fire_id": fire.fire_id,
+        "state": "pending_dispatch",
+        "state_version": prepared.state_version + 1,
+    }
+
+    admitted_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert admitted_response["ok"] is True
+    admitted = runtime.store.automation_fire(fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert admitted is not None
+    assert admitted.state == "submitted"
+    assert job is not None
+    assert job.input_artifact_id == expected_artifact_id
+    assert runtime.store.automation_confirmation_matches(admitted)
+
+
+def test_automation_confirmation_rejects_live_effect_drift_without_creating_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime, confirm_each=True)
+    current = selected
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((current,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    prepared = runtime.store.automation_fire(fire.fire_id)
+    assert prepared is not None
+    assert prepared.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": prepared.state_version,
+                "prepared_identity_sha256": prepared.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+    current = capability(
+        app_id=selected.app_id,
+        app_version=selected.app_version,
+        capability_id=selected.capability_id,
+        parameters=selected.parameters,
+        external_effects=True,
+    )
+
+    drift_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert drift_response["ok"] is True
+    halted = runtime.store.automation_fire(fire.fire_id)
+    assert halted is not None
+    assert halted.state == "manual_review"
+    assert halted.reason == "automation_confirmation_stale"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"expected_version": False},
+        {"expected_version": 0},
+        {"prepared_identity_sha256": "A" * 64},
+        {"decision": "approve"},
+    ],
+)
+def test_automation_confirmation_decision_rejects_invalid_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, _attempt = seed_contract_fire(runtime, confirm_each=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert awaiting is not None
+    assert awaiting.prepared_identity_sha256 is not None
+    payload = {
+        "fire_id": fire.fire_id,
+        "expected_version": awaiting.state_version,
+        "prepared_identity_sha256": awaiting.prepared_identity_sha256,
+        "decision": "confirmed",
+        **override,
+    }
+
+    rejected = engine_api._response(api_request(config_path, "automation.fire.decide", payload))
+
+    assert rejected["error"]["code"] == "invalid_request"
+    unchanged = runtime.store.automation_fire(fire.fire_id)
+    assert unchanged is not None
+    assert unchanged.state == "awaiting_confirmation"
+    assert unchanged.state_version == awaiting.state_version
+
+
+def test_automation_confirmation_decline_is_exact_and_cannot_be_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, _attempt = seed_contract_fire(runtime, confirm_each=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert awaiting is not None
+    assert awaiting.prepared_identity_sha256 is not None
+    decision = {
+        "fire_id": fire.fire_id,
+        "expected_version": awaiting.state_version,
+        "prepared_identity_sha256": awaiting.prepared_identity_sha256,
+        "decision": "declined",
+    }
+    wrong_hash = engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {**decision, "prepared_identity_sha256": "0" * 64},
+        )
+    )
+    assert wrong_hash["error"]["code"] == "stale_automation_fire"
+
+    declined = engine_api._response(api_request(config_path, "automation.fire.decide", decision))
+    replayed = engine_api._response(api_request(config_path, "automation.fire.decide", decision))
+
+    assert declined["data"]["state"] == "declined"
+    assert replayed["error"]["code"] == "stale_automation_fire"
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == "declined"
+    assert settled.reason == "declined_by_user"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_state"),
+    [
+        (MailboxError("temporary"), "pending_dispatch"),
+        (MailboxMessageUnavailable("gone"), "source_unavailable"),
+    ],
+)
+def test_automation_source_failure_distinguishes_transient_from_definitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    expected_state: str,
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+
+    class FailingGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            raise failure
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FailingGmail())
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == expected_state
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_automation_queue_capacity_failure_remains_pending_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        runtime.store,
+        "create_connect_job",
+        lambda **kwargs: (_ for _ in ()).throw(ConnectQueueFull("full")),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    pending = runtime.store.automation_fire(fire.fire_id)
+    assert pending is not None
+    assert pending.state == "pending_dispatch"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_concurrent_interactive_and_automation_admission_join_one_active_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    interactive = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, parameters={"mode": "contract"}),
+        )
+    )
+    automated = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert interactive["data"]["job_id"] == REQUEST_ID
+    assert automated["ok"] is True
+    joined = runtime.store.automation_fire(fire.fire_id)
+    bound_attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+    assert joined is not None
+    assert joined.state == "submitted"
+    assert joined.job_id == REQUEST_ID
+    assert bound_attempt.dispatch_request_id == attempt.dispatch_request_id
+    assert bound_attempt.job_id == REQUEST_ID
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
+
+
+def test_confirmed_pending_automation_is_deleted_with_its_source_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, _attempt = seed_contract_fire(runtime, confirm_each=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert awaiting is not None
+    assert awaiting.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": awaiting.state_version,
+                "prepared_identity_sha256": awaiting.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+
+    assert runtime.store.delete_message("message-1") is True
+
+    assert runtime.store.automation_fire(fire.fire_id) is None
+    assert runtime.store.automation_fire_attempts(fire.fire_id) == []
+    with runtime.store.connection() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM automation_fire_confirmations WHERE fire_id = ?",
+                (fire.fire_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_active_pending_dispatch_ceiling_stops_before_provider_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    _selected, fire, attempt = seed_contract_fire(runtime)
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE automation_fires
+            SET pending_since = ?, authorized_pending_seconds = 7200
+            WHERE fire_id = ?""",
+            (datetime.now(UTC).isoformat(), fire.fire_id),
+        )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("stalled automation must not discover a provider")
+        ),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    halted = runtime.store.automation_fire(fire.fire_id)
+    assert halted is not None
+    assert halted.state == "manual_review"
+    assert halted.reason == "dispatch_stalled"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_submitted_automation_settles_from_real_completed_connect_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    completed = runtime.store.automation_fire(fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert completed is not None
+    assert completed.state == "completed"
+    assert completed.reason == "connect_completed"
+    assert job is not None
+    assert job.status == "completed"
+    assert runtime.store.completed_connect_outputs(job)[0].sha256 == output.sha256
+
+
+def test_non_deadline_provider_failure_settles_without_another_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="failed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        error={
+            "code": "MODEL_UNAVAILABLE",
+            "message": "The local model is unavailable.",
+            "retryable": True,
+        },
+    )
+
+    response = engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    assert response["ok"] is True
+    failed = runtime.store.automation_fire(fire.fire_id)
+    assert failed is not None
+    assert failed.state == "failed"
+    assert failed.reason == "MODEL_UNAVAILABLE"
+    assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 1
+
+
+def test_deleting_linked_connect_job_settles_automation_source_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+
+    with runtime.store.connection() as db:
+        db.execute(
+            "DELETE FROM connect_attachment_jobs WHERE job_id = ?",
+            (attempt.dispatch_request_id,),
+        )
+
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == "source_unavailable"
+    assert settled.reason == "job_removed"
+    assert settled.job_id is None
+
+
+def test_automation_allows_one_proven_unaccepted_retry_then_requires_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, first_attempt = seed_contract_fire(runtime, confirm_each=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert awaiting is not None
+    assert awaiting.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": awaiting.state_version,
+                "prepared_identity_sha256": awaiting.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    assert runtime.store.connect_job(first_attempt.dispatch_request_id) is not None
+
+    force_unaccepted_admission_deadline(runtime, first_attempt.dispatch_request_id)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    retrying = runtime.store.automation_fire(fire.fire_id)
+    attempts = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert retrying is not None
+    assert retrying.state == "pending_dispatch"
+    assert retrying.current_attempt_no == 2
+    assert retrying.prepared_identity_sha256 is None
+    assert retrying.prepared_identity_json is None
+    assert retrying.confirmed is False
+    assert len(attempts) == 2
+    assert attempts[0].dispatch_request_id == first_attempt.dispatch_request_id
+    assert attempts[1].job_id is None
+    with runtime.store.connection() as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM automation_fire_confirmations WHERE fire_id = ?",
+                (fire.fire_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    second_awaiting = runtime.store.automation_fire(fire.fire_id)
+    assert second_awaiting is not None
+    assert second_awaiting.state == "awaiting_confirmation"
+    assert second_awaiting.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": second_awaiting.state_version,
+                "prepared_identity_sha256": second_awaiting.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    second_attempt = runtime.store.automation_fire_attempts(fire.fire_id)[1]
+    assert second_attempt.job_id == second_attempt.dispatch_request_id
+    force_unaccepted_admission_deadline(runtime, second_attempt.dispatch_request_id)
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    halted = runtime.store.automation_fire(fire.fire_id)
+    assert halted is not None
+    assert halted.state == "manual_review"
+    assert halted.reason == "second_admission_deadline"
+    assert len(runtime.store.automation_fire_attempts(fire.fire_id)) == 2
 
 
 @pytest.mark.parametrize(
@@ -522,6 +1263,89 @@ def capability(
         parameters=parameters,
         external_effects=external_effects,
         confirmation_required=confirmation_required,
+    )
+
+
+def seed_contract_fire(
+    runtime: Runtime,
+    *,
+    confirm_each: bool = False,
+) -> tuple[connect.DiscoveredCapability, object, object]:
+    mode = connect.CapabilityParameter(
+        name="mode",
+        value_type="string",
+        required=False,
+        label="Summary mode",
+        description="Choose general, story, or contract. Defaults to general.",
+    )
+    selected = capability(
+        app_id="document-summarizer",
+        app_version="0.1.0",
+        capability_id="document.summarize",
+        parameters=(mode,),
+    )
+    runtime.store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": selected.app_id,
+                    "version": selected.app_version,
+                    "instance_id": selected.instance_id,
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": confirm_each,
+        }
+    )
+    runtime.store.mark_analyzed(
+        "message-1",
+        {
+            "category": "informational",
+            "priority": "normal",
+            "summary": "A contract arrived.",
+            "action_required": True,
+            "suggested_action": "Review the contract.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    fire = runtime.store.automation_fires_for_message("message-1")[0]
+    attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+    return selected, fire, attempt
+
+
+def install_automation_dispatch_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Runtime,
+    discover: object,
+) -> None:
+    class FakeGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            return PDF
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
+    monkeypatch.setattr(
+        engine_api,
+        "_pump_generic_connect_lane",
+        lambda active_runtime, head: engine_api._connect_queue_item(
+            active_runtime, head.job_id, "queued"
+        ),
     )
 
 

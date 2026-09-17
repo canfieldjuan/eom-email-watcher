@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from eom_email_watcher import engine_api
+from eom_email_watcher import connect, engine_api
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
 from eom_email_watcher.db import Store
@@ -4888,7 +4888,7 @@ def test_check_maps_mailbox_identity_change_to_domain_error(
         ("not-allowed@example.com", 0, 0),
     ],
 )
-def test_rule_put_then_real_watcher_check_creates_only_durable_connect_fire(
+def test_rule_put_then_real_watcher_check_dispatches_matching_connect_fire(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     sender: str,
@@ -4927,18 +4927,80 @@ def test_rule_put_then_real_watcher_check_creates_only_durable_connect_fire(
                 ],
             }
 
-    def unexpected_connect_job(*args: object, **kwargs: object) -> None:
-        pytest.fail("analysis-time rule evaluation must not create or submit a Connect job")
+        def attachment_bytes(self, *args: object) -> bytes:
+            return b"x" * 42
+
+    selected = connect.DiscoveredCapability(
+        protocol_version=2,
+        base_url="http://127.0.0.1:32123/",
+        token="A" * 43,
+        app_id="document-summarizer",
+        app_name="Document Summarizer",
+        app_version="0.1.0",
+        instance_id="11111111-1111-4111-8111-111111111111",
+        capability_id="document.summarize",
+        capability_version="1.0",
+        action_label="Summarize",
+        action_description="Summarize this document locally.",
+        accepts=(connect.AcceptedArtifactType("application/pdf", 1024),),
+        produces=("application/vnd.local-connect.cited-summary+json",),
+        parameters=(
+            connect.CapabilityParameter(
+                name="mode",
+                value_type="string",
+                required=False,
+                label="Summary mode",
+                description="Choose general, story, or contract. Defaults to general.",
+            ),
+        ),
+        external_effects=False,
+        confirmation_required=False,
+    )
+    definition = {
+        "name": "Contract watch",
+        "scope": {},
+        "trigger": {"source_kind": "mail.message"},
+        "conditions": [
+            {
+                "field": "attachment.media_type",
+                "op": "equals",
+                "value": "application/pdf",
+            }
+        ],
+        "action": {
+            "kind": "connect.invoke",
+            "capability": {"id": "document.summarize", "version": "1.0"},
+            "provider": {
+                "app_id": selected.app_id,
+                "version": selected.app_version,
+                "instance_id": selected.instance_id,
+            },
+            "parameters": {"mode": "contract"},
+        },
+        "confirm_each": False,
+    }
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: InvoiceGmail())
-    monkeypatch.setattr(runtime.store, "create_connect_job", unexpected_connect_job)
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(
+        engine_api.connect,
+        "discover_capabilities",
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "_pump_generic_connect_lane",
+        lambda active_runtime, head: engine_api._connect_queue_item(
+            active_runtime, head.job_id, "queued"
+        ),
+    )
 
     created = engine_api._response(
         request(
             config_path,
             "automation.rules.put",
-            {"definition": _automation_definition()},
+            {"definition": definition},
         )
     )
     checked = engine_api._response(request(config_path, "watcher.check"))
@@ -4953,7 +5015,10 @@ def test_rule_put_then_real_watcher_check_creates_only_durable_connect_fire(
             db.execute("SELECT COUNT(*) FROM automation_fire_attempts").fetchone()[0]
             == expected_fires
         )
-        assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 0
+        assert (
+            db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0]
+            == expected_fires
+        )
 
 
 def test_host_notification_contract_delivers_and_state_checks_automation_review(

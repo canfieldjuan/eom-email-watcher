@@ -3570,6 +3570,115 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
             db.execute("UPDATE messages SET status = 'analyzed' WHERE message_id = 'still-pending'")
 
 
+def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111",
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": False,
+        }
+    )
+    store.mark_analyzed("m1", scheduling_analysis())
+    original = store.automation_fires_for_message("m1")[0]
+    original_attempt = store.automation_fire_attempts(original.fire_id)[0]
+
+    with store.connection() as connection:
+        connection.executescript(
+            """
+            DROP TRIGGER connect_jobs_delete_linked_automation_fires;
+            DROP TRIGGER messages_delete_pending_automation_fires;
+            DROP TRIGGER automation_fire_attempts_immutable_update;
+            DROP TRIGGER automation_fire_attempts_require_fire;
+            DROP TRIGGER automation_fires_require_sources;
+            DROP INDEX idx_automation_fires_state;
+            DROP INDEX idx_automation_fires_message;
+            ALTER TABLE automation_fire_attempts RENAME TO automation_fire_attempts_v21;
+            ALTER TABLE automation_fires RENAME TO automation_fires_v21;
+            CREATE TABLE automation_fires (
+                fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
+                event_id TEXT NOT NULL CHECK (length(event_id) = 64),
+                rule_id TEXT NOT NULL CHECK (length(rule_id) = 36),
+                rule_version INTEGER NOT NULL CHECK (rule_version >= 1),
+                message_id TEXT NOT NULL CHECK (message_id <> ''),
+                part_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL CHECK (action_kind = 'connect.invoke'),
+                state TEXT NOT NULL CHECK (state = 'pending_dispatch'),
+                state_version INTEGER NOT NULL CHECK (state_version = 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (message_id, part_id, rule_id, rule_version)
+            );
+            CREATE TABLE automation_fire_attempts (
+                fire_id TEXT NOT NULL CHECK (length(fire_id) = 36),
+                attempt_no INTEGER NOT NULL CHECK (attempt_no = 1),
+                dispatch_request_id TEXT NOT NULL UNIQUE CHECK (length(dispatch_request_id) = 36),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fire_id, attempt_no)
+            );
+            INSERT INTO automation_fires(
+                fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                action_kind, state, state_version, created_at, updated_at
+            ) SELECT fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                action_kind, state, state_version, created_at, updated_at
+              FROM automation_fires_v21;
+            INSERT INTO automation_fire_attempts(
+                fire_id, attempt_no, dispatch_request_id, created_at
+            ) SELECT fire_id, attempt_no, dispatch_request_id, created_at
+              FROM automation_fire_attempts_v21;
+            DROP TABLE automation_fire_attempts_v21;
+            DROP TABLE automation_fires_v21;
+            DROP TABLE automation_fire_confirmations;
+            PRAGMA user_version = 20;
+            """
+        )
+
+    store.initialize()
+
+    migrated = store.automation_fire(original.fire_id)
+    assert migrated is not None
+    assert migrated.state == "pending_dispatch"
+    assert migrated.state_version == 1
+    assert migrated.pending_since == original.updated_at
+    assert migrated.current_attempt_no == 1
+    assert migrated.job_id is None
+    migrated_attempts = store.automation_fire_attempts(original.fire_id)
+    assert len(migrated_attempts) == 1
+    assert migrated_attempts[0].dispatch_request_id == original_attempt.dispatch_request_id
+    assert migrated_attempts[0].job_id is None
+    with store.connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        trigger = connection.execute(
+            "SELECT 1 AS installed FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'connect_jobs_delete_linked_automation_fires'"
+        ).fetchone()
+        assert trigger is not None
+        assert trigger["installed"] == 1
+
+
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
     store = Store(database)

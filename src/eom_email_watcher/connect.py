@@ -1422,6 +1422,7 @@ def prepare_capability_job(
     parameters: dict[str, object] | None = None,
     confirmed: bool = False,
     job_id: str | None = None,
+    artifact_id: str | None = None,
 ) -> PreparedCapabilityJob:
     if capability.confirmation_required and not confirmed:
         raise ConnectError(
@@ -1436,7 +1437,7 @@ def prepare_capability_job(
     return _build_capability_job(
         capability,
         job_id=validate_job_id(job_id) if job_id is not None else str(uuid4()),
-        artifact_id=str(uuid4()),
+        artifact_id=(validate_job_id(artifact_id) if artifact_id is not None else str(uuid4())),
         media_type=media_type,
         byte_size=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
