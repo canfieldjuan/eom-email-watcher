@@ -33,10 +33,13 @@ from .definition import (
     ConnectInvokeProvider,
     ConnectInvokeRequest,
     DefinitionError,
+    OverlayBinding,
+    RequestBindingError,
     Workflow,
     WorkflowDefinition,
     canonical_workflow,
     parse_workflow,
+    render_connect_invoke_request,
 )
 from .engine import (
     AmbiguousDecision,
@@ -111,6 +114,9 @@ __all__ = [
     "MAX_PACK_BYTES",
     "OperationConflict",
     "OperationReplay",
+    "OverlayBinding",
+    "RequestBindingError",
+    "render_connect_invoke_request",
     "PackError",
     "PackGrant",
     "PackManifest",

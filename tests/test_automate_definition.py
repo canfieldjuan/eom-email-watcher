@@ -4,9 +4,11 @@ import pytest
 
 from eom_email_watcher.automate.definition import (
     DefinitionError,
+    RequestBindingError,
     Workflow,
     canonical_workflow,
     parse_workflow,
+    render_connect_invoke_request,
 )
 
 
@@ -343,6 +345,78 @@ def test_simple_action_accepts_a_flat_scalar_request() -> None:
     ]
     workflow = parse_workflow(_json(data))
     assert workflow.definitions[0].actions[0].request == {"title": "Hi", "body": "There"}
+
+
+def test_connect_invoke_accepts_an_overlay_bound_parameter() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {
+            "action": "connect.invoke",
+            "request": _connect_invoke_request(
+                parameters={"lead-id": {"overlay": "lead_id"}, "dry-run": True}
+            ),
+        }
+    ]
+    workflow = parse_workflow(_json(data))
+    action = workflow.definitions[0].actions[0]
+    # The binding is preserved verbatim in the signed template; resolution happens at admission.
+    assert action.request["parameters"] == {
+        "lead-id": {"overlay": "lead_id"},
+        "dry-run": True,
+    }
+    # And it round-trips stably through the canonical bytes.
+    assert canonical_workflow(parse_workflow(canonical_workflow(workflow))) == canonical_workflow(
+        workflow
+    )
+
+
+def test_connect_invoke_rejects_a_binding_with_an_unknown_member() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {
+            "action": "connect.invoke",
+            "request": _connect_invoke_request(
+                parameters={"lead-id": {"overlay": "lead_id", "extra": "no"}}
+            ),
+        }
+    ]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
+
+
+def test_render_resolves_an_overlay_bound_parameter() -> None:
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {"artifact_id": ARTIFACT_ID, "media_type": "application/json", "filename": "r"},
+        "parameters": {"lead-id": {"overlay": "lead_id"}, "dry-run": True},
+        "confirmed": False,
+    }
+    rendered = render_connect_invoke_request(request, {"lead_id": "L-42", "other": "x"})
+    assert rendered["parameters"] == {"lead-id": "L-42", "dry-run": True}
+    # The original request is not mutated.
+    assert request["parameters"]["lead-id"] == {"overlay": "lead_id"}
+
+
+def test_render_leaves_a_binding_free_request_unchanged() -> None:
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {"artifact_id": ARTIFACT_ID, "media_type": "application/json", "filename": "r"},
+        "parameters": {"dry-run": True},
+        "confirmed": False,
+    }
+    rendered = render_connect_invoke_request(request, {"lead_id": "L-42"})
+    assert rendered["parameters"] == {"dry-run": True}
+
+
+def test_render_raises_on_an_unset_bound_overlay() -> None:
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {"artifact_id": ARTIFACT_ID, "media_type": "application/json", "filename": "r"},
+        "parameters": {"lead-id": {"overlay": "lead_id"}},
+        "confirmed": False,
+    }
+    with pytest.raises(RequestBindingError):
+        render_connect_invoke_request(request, {"other": "x"})
 
 
 def test_workflow_definition_rejects_an_unknown_action_kind() -> None:
