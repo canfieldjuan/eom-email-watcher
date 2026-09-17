@@ -3843,10 +3843,18 @@ class Store:
                   AND fire.job_id IS NOT NULL
                   AND (
                     job.job_id IS NULL
-                    OR job.status = 'completed'
                     OR (
-                      job.status = 'failed'
+                      job.status IN ('completed', 'failed')
                       AND NOT (
+                        fire.state = 'entitlement_paused'
+                        AND NOT EXISTS (
+                          SELECT 1 FROM automation_fire_attempts AS attempt
+                          WHERE attempt.dispatch_request_id = fire.job_id
+                        )
+                      )
+                      AND NOT (
+                        job.status = 'failed'
+                        AND
                         fire.state = 'entitlement_paused'
                         AND job.error_code = 'connect_queue_deadline_exceeded'
                       )

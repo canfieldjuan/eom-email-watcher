@@ -3100,7 +3100,7 @@ def _submit_generic_connect_job(
                     "connect_source_unavailable",
                     "The source attachment is no longer available for handoff.",
                 ) from exc
-            except MailboxMessageUnavailable as exc:
+            except (MailboxMessageInvalid, MailboxMessageUnavailable) as exc:
                 _fail_generic_connect_source(runtime, tracked.job_id, capability)
                 raise ApiError(
                     "connect_source_unavailable",
@@ -4343,7 +4343,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
                 reason=exc.code[:128],
             )
     except connect.ConnectError as exc:
-        if exc.code == "ENTITLEMENT_REQUIRED":
+        if exc.code in {"CONNECT_ENTITLEMENT_REQUIRED", "ENTITLEMENT_REQUIRED"}:
             runtime.store.transition_automation_fire(
                 fire_id=fire.fire_id,
                 expected_state=fire.state,

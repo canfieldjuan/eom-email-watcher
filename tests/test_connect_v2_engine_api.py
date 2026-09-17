@@ -761,6 +761,41 @@ def test_automation_entitlement_is_rechecked_after_source_fetch_before_provider_
     assert dispatch.automation_paused_at is not None
 
 
+def test_connect_entitlement_expiry_during_automation_admission_pauses_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    authority_checks = 0
+
+    def require_connect() -> None:
+        nonlocal authority_checks
+        authority_checks += 1
+        if authority_checks == 2:
+            raise connect.ConnectError(
+                "CONNECT_ENTITLEMENT_REQUIRED",
+                "Connect requires an active license.",
+                retryable=False,
+            )
+
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", require_connect)
+
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+
+    paused = runtime.store.automation_fire(fire.fire_id)
+    assert authority_checks == 2
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert paused.reason == "entitlement_inactive"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
 def test_automation_entitlement_pause_rolls_back_dispatch_when_fire_pause_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1715,6 +1750,7 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     still_paused = runtime.store.automation_fire(fire.fire_id)
     assert still_paused is not None
     assert still_paused.state == "entitlement_paused"
+    assert runtime.store.automation_fire_settlement_due() is False
 
     assert runtime.store.delete_message(fire.message_id) is True
     retained = runtime.store.automation_fire(fire.fire_id)
@@ -2049,6 +2085,7 @@ def test_submitted_automation_settles_from_real_completed_connect_result(
         provider_instance_id=selected.instance_id,
         result=connect.CapabilityResult((output,)).store_dict(),
     )
+    assert runtime.store.automation_fire_settlement_due() is True
 
     response = engine_api._response(api_request(config_path, "connect.queue.pump"))
 
@@ -4461,8 +4498,17 @@ def test_queue_pump_retries_transient_source_fetch_under_original_deadline(
     assert submissions == 2
 
 
-def test_queue_pump_treats_missing_mailbox_source_as_definitive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "source_error",
+    [
+        MailboxMessageUnavailable("The message was removed"),
+        MailboxMessageInvalid("imap_bodystructure_invalid", "malformed MIME"),
+    ],
+)
+def test_queue_pump_treats_invalid_or_missing_mailbox_source_as_definitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_error: MailboxError,
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
@@ -4474,7 +4520,7 @@ def test_queue_pump_treats_missing_mailbox_source_as_definitive(
             nonlocal reads
             reads += 1
             if reads > 2:
-                raise MailboxMessageUnavailable("The message was removed")
+                raise source_error
             return PDF
 
     class BusyClient:
