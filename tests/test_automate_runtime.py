@@ -16,6 +16,7 @@ from eom_email_watcher.automate import (
     AutomateLicenseError,
     PackError,
     PackRuntime,
+    load_pack,
 )
 from eom_email_watcher.automate.store import WorkflowStore
 
@@ -181,7 +182,8 @@ def _runtime(
         store=store,
         host=host or _licensed_host(tmp_path),
         registry=registry,
-        keys=_pack_keys(key),
+        publisher_keys=_pack_keys(key),
+        grant_keys=_pack_keys(key),
         subject=SUBJECT,
         now=NOW,
     )
@@ -315,7 +317,8 @@ def test_tampered_pack_is_rejected_before_any_record(tmp_path: Path) -> None:
             store=store,
             host=_licensed_host(tmp_path),
             registry=AdapterRegistry.with_defaults(),
-            keys=_pack_keys(key),
+            publisher_keys=_pack_keys(key),
+            grant_keys=_pack_keys(key),
             subject=SUBJECT,
             now=NOW,
         )
@@ -332,9 +335,72 @@ def test_unlicensed_host_refuses_to_load_a_pack(tmp_path: Path) -> None:
             store=store,
             host=host,
             registry=AdapterRegistry.with_defaults(),
-            keys=_pack_keys(key),
+            publisher_keys=_pack_keys(key),
+            grant_keys=_pack_keys(key),
             subject=SUBJECT,
             now=NOW,
+        )
+
+
+def test_publisher_cannot_self_sign_a_grant_with_separate_keyrings(tmp_path: Path) -> None:
+    # When publishers and the grant issuer use distinct keys, a grant signed by the publisher
+    # must not authorize a pack: the grant keyring does not trust the publisher key.
+    publisher = Ed25519PrivateKey.generate()
+    grant_authority = Ed25519PrivateKey.generate()
+    with pytest.raises(PackError):
+        PackRuntime.load(
+            _pack_bytes(publisher, _workflow([NOTIFY_ACTION])),
+            _grant_bytes(publisher),  # signed by the publisher, not the grant authority
+            store=_store(tmp_path),
+            host=_licensed_host(tmp_path),
+            registry=AdapterRegistry.with_defaults(),
+            publisher_keys=_pack_keys(publisher),
+            grant_keys=_pack_keys(grant_authority),
+            subject=SUBJECT,
+            now=NOW,
+        )
+
+
+def test_separate_publisher_and_grant_keyrings_accept_correct_signatures(tmp_path: Path) -> None:
+    # The pack signed by the publisher and the grant signed by the distinct grant authority
+    # is the correctly split case, and it runs.
+    publisher = Ed25519PrivateKey.generate()
+    grant_authority = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    runtime = PackRuntime.load(
+        _pack_bytes(publisher, _workflow([NOTIFY_ACTION])),
+        _grant_bytes(grant_authority),
+        store=store,
+        host=_licensed_host(tmp_path),
+        registry=AdapterRegistry.with_defaults(),
+        publisher_keys=_pack_keys(publisher),
+        grant_keys=_pack_keys(grant_authority),
+        subject=SUBJECT,
+        now=NOW,
+    )
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.actions[0].status == "settled"
+
+
+def test_direct_construction_is_rejected(tmp_path: Path) -> None:
+    # A caller cannot build a runtime around an unverified pack: construction must go through
+    # load(), which performs signature and grant verification.
+    key = Ed25519PrivateKey.generate()
+    loaded = load_pack(_pack_bytes(key, _workflow([NOTIFY_ACTION])), keys=_pack_keys(key))
+    with pytest.raises(TypeError):
+        PackRuntime(
+            pack=loaded,
+            store=_store(tmp_path),
+            host=_licensed_host(tmp_path),
+            registry=AdapterRegistry.with_defaults(),
         )
 
 
@@ -348,7 +414,8 @@ def test_grant_for_a_different_subject_is_rejected(tmp_path: Path) -> None:
             store=store,
             host=_licensed_host(tmp_path),
             registry=AdapterRegistry.with_defaults(),
-            keys=_pack_keys(key),
+            publisher_keys=_pack_keys(key),
+            grant_keys=_pack_keys(key),
             subject=SUBJECT,
             now=NOW,
         )

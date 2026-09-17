@@ -36,8 +36,19 @@ class DecisionRun:
     actions: list[ActionOutcome]
 
 
+# A private construction token. PackRuntime can only be built through load(), which performs
+# signature and grant verification; a direct construction that skipped it would defeat the
+# whole point of the signed-pack boundary.
+_VERIFIED = object()
+
+
 class PackRuntime:
-    """Runs a verified workflow pack against the durable store and the action outbox."""
+    """Runs a verified workflow pack against the durable store and the action outbox.
+
+    Construct only through :meth:`load`, which verifies the publisher signature and the per-PC
+    grant. The constructor rejects any other caller so a runtime cannot exist for a pack that
+    was not verified.
+    """
 
     def __init__(
         self,
@@ -46,7 +57,13 @@ class PackRuntime:
         store: WorkflowStore,
         host: AutomateHost,
         registry: AdapterRegistry,
+        _token: object = None,
     ):
+        if _token is not _VERIFIED:
+            raise TypeError(
+                "PackRuntime must be created through PackRuntime.load(); direct construction "
+                "would bypass pack-signature and grant verification"
+            )
         self._pack = pack
         self._host = host
         self._engine = WorkflowEngine(store=store, host=host)
@@ -69,22 +86,26 @@ class PackRuntime:
         store: WorkflowStore,
         host: AutomateHost,
         registry: AdapterRegistry,
-        keys: Mapping[str, bytes],
+        publisher_keys: Mapping[str, bytes],
+        grant_keys: Mapping[str, bytes],
         subject: str,
         now: datetime,
     ) -> PackRuntime:
         """Verify a pack and its per-PC grant, then return a runtime for its workflow.
 
         Gated by the license first: an unlicensed host cannot load a pack at all.
-        :func:`load_pack` verifies the publisher signature over the pack bytes;
-        :func:`verify_grant` authorizes this ``subject`` (the licensed PC/customer) to run
-        this pack. A tampered pack, an untrusted key, or a missing/mismatched grant raises
+        :func:`load_pack` verifies the publisher signature over the pack bytes against
+        ``publisher_keys``; :func:`verify_grant` authorizes this ``subject`` (the licensed
+        PC/customer) against the *separate* ``grant_keys``. The two trust stores are kept
+        distinct so a pack publisher cannot self-issue a grant and a grant issuer cannot
+        sign an executable pack; pass the same mapping for both only when one authority holds
+        both roles. A tampered pack, an untrusted key, or a missing/mismatched grant raises
         :class:`PackError` here, before any record is created.
         """
         host.require_license()
-        pack = load_pack(pack_bytes, keys=keys)
-        verify_grant(grant_bytes, keys=keys, pack_id=pack.pack_id, subject=subject, now=now)
-        return cls(pack=pack, store=store, host=host, registry=registry)
+        pack = load_pack(pack_bytes, keys=publisher_keys)
+        verify_grant(grant_bytes, keys=grant_keys, pack_id=pack.pack_id, subject=subject, now=now)
+        return cls(pack=pack, store=store, host=host, registry=registry, _token=_VERIFIED)
 
     def create_record(self, *, now: datetime) -> RecordView:
         """Create a record for the pack's workflow at its initial stage."""
