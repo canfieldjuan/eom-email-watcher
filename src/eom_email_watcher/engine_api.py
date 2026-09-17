@@ -3623,6 +3623,7 @@ def _prepare_or_create_generic_connect_job(
     confirmed: bool,
     create_job: bool = True,
     artifact_id: str | None = None,
+    join_completed: bool = False,
     candidate_check: Callable[[connect.PreparedCapabilityJob], None] | None = None,
 ) -> tuple[
     connect.PreparedCapabilityJob,
@@ -3717,7 +3718,11 @@ def _prepare_or_create_generic_connect_job(
             "request_json": candidate.request_json,
         }
         joined = runtime.store.active_connect_job(**lookup)
-        if joined is None and not (capability.external_effects or capability.confirmation_required):
+        if (
+            joined is None
+            and join_completed
+            and not (capability.external_effects or capability.confirmation_required)
+        ):
             joined = runtime.store.completed_connect_job(**lookup)
         if joined is not None:
             _tracked_invocation_job(
@@ -4039,6 +4044,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             parameters=parameters,
             confirmed=confirmed,
             artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
+            join_completed=True,
             candidate_check=candidate_check,
         )
         if created is None:
