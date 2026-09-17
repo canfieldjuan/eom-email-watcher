@@ -17,7 +17,8 @@ Slice 4's signed pack format signs over.
 from __future__ import annotations
 
 import json
-from typing import Annotated, Literal
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -124,11 +125,6 @@ _Filename = Annotated[str, Field(strict=True, min_length=1, max_length=255)]
 _ContentBase64 = Annotated[str, Field(strict=True, max_length=_MAX_CONTENT_BASE64)]
 _ParameterKey = Annotated[str, Field(strict=True, pattern=_CAPABILITY_ID_PATTERN, max_length=100)]
 
-# A request value for a simple (non-connect.invoke) action is a flat scalar; the union also
-# admits one level of nested object so the connect.invoke shape can be carried in the same
-# field and validated structurally below. Deeper nesting is not expressible, bounding the shape.
-_ActionRequestValue = str | int | bool | dict[str, str | int | bool]
-
 
 class ConnectInvokeCapability(_Strict):
     id: _CapabilityId
@@ -146,23 +142,80 @@ class ConnectInvokeInput(_Strict):
     content_base64: _ContentBase64 = ""
 
 
+# The member of a parameter-value binding: ``{"overlay": "<overlay-key>"}`` takes the
+# parameter's value from the record's overlay projection at admission. A literal parameter
+# value is a bounded primitive (ADR-0002), never an object, so an object-valued parameter is
+# unambiguously a binding. The key mirrors the overlay-key bound in the store's effect model.
+OVERLAY_BINDING_KEY = "overlay"
+
+
+class OverlayBinding(_Strict):
+    overlay: Annotated[str, Field(strict=True, min_length=1, max_length=80)]
+
+
 class ConnectInvokeRequest(_Strict):
     """The signed connect.invoke request template a definition declares.
 
     ``provider`` is optional: omit it to let the host match any local provider offering the
     capability, or pin ``instance_id`` to bind one. ``parameters`` and ``confirmed`` carry the
-    capability's bounded inputs and its confirmation flag. This is a *static* template for the
-    first connect.invoke pack; binding parameter values or the input artifact from record state
-    is a later increment, so a capability whose inputs vary per record is not yet expressible.
+    capability's bounded inputs and its confirmation flag.
+
+    A parameter value is either a literal bounded primitive or an :class:`OverlayBinding`
+    (``{"overlay": key}``) resolved from the record's overlay projection at admission, so a
+    capability whose parameter values vary per record (a specific lead id, a booking key) is
+    expressible while the signed template stays fixed. Binding the input artifact's content
+    from record state is a later increment; the input artifact here is still static.
     """
 
     capability: ConnectInvokeCapability
     input: ConnectInvokeInput
     provider: ConnectInvokeProvider | None = None
-    parameters: dict[_ParameterKey, str | int | bool] = Field(
+    parameters: dict[_ParameterKey, str | int | bool | OverlayBinding] = Field(
         default_factory=dict, max_length=MAX_CONNECT_PARAMETERS
     )
     confirmed: bool = False
+
+
+class RequestBindingError(ValueError):
+    """Raised when a connect.invoke request binds record state that is not available.
+
+    This is a runtime resolution failure at admission (an overlay key a parameter binds is
+    unset for the record), distinct from :class:`DefinitionError`, which is a parse/validate
+    failure of the signed definition itself.
+    """
+
+
+def render_connect_invoke_request(
+    request: Mapping[str, object], overlays: Mapping[str, object]
+) -> dict[str, object]:
+    """Resolve a connect.invoke request's overlay-bound parameters against record state.
+
+    Returns a new request in which each ``{"overlay": key}`` parameter value is replaced by
+    the record's current overlay value for ``key``. A request with no bindings is returned
+    unchanged. Raises :class:`RequestBindingError` when a bound key is unset for the record,
+    so a decision that binds missing state fails cleanly rather than dispatching a request
+    with a hole in it. The resolved request is what the outbox freezes, so a retry replays the
+    resolved values, never re-resolves against later state (the queue-row-binding discipline).
+    """
+    parameters = request.get("parameters")
+    if not isinstance(parameters, Mapping) or not parameters:
+        return dict(request)
+    rendered: dict[str, object] = {}
+    bound = False
+    for name, value in parameters.items():
+        if isinstance(value, Mapping) and OVERLAY_BINDING_KEY in value:
+            key = value[OVERLAY_BINDING_KEY]
+            if key not in overlays:
+                raise RequestBindingError(
+                    f"connect.invoke parameter {name!r} binds unset overlay {key!r}"
+                )
+            rendered[name] = overlays[key]
+            bound = True
+        else:
+            rendered[name] = value
+    if not bound:
+        return dict(request)
+    return {**request, "parameters": rendered}
 
 
 class ActionEmit(_Strict):
@@ -178,12 +231,17 @@ class ActionEmit(_Strict):
     A simple kind (``notify.local``) carries a flat scalar request. ``connect.invoke`` carries
     the structured :class:`ConnectInvokeRequest` template, validated here so a malformed pack
     is rejected at parse/sign time rather than at dispatch, and normalized so its canonical
-    bytes are deterministic. Rendering a request's values from record state is a later slice;
-    the request declared here is static and frozen as-is when the action is admitted.
+    bytes are deterministic. A connect.invoke parameter value may be an :class:`OverlayBinding`
+    resolved from record state when the action is admitted (see
+    :func:`render_connect_invoke_request`); every other request is frozen as declared.
+
+    ``request`` is typed loosely (``dict[str, Any]``) because a simple kind's flat scalars and
+    connect.invoke's nested, possibly-bound shape do not share one field type; the per-kind
+    validation below is the real contract, not the field annotation.
     """
 
     action: Annotated[str, Field(strict=True, min_length=1, max_length=MAX_NAME_LENGTH)]
-    request: dict[str, _ActionRequestValue] = Field(default_factory=dict)
+    request: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate(self) -> ActionEmit:
@@ -195,13 +253,13 @@ class ActionEmit(_Strict):
             except ValidationError as exc:
                 raise ValueError(f"invalid connect.invoke request: {exc}") from exc
             # Normalize to the materialized shape (defaults filled, an absent provider dropped
-            # rather than left null so the request round-trips through the flat-value field),
-            # so the signed canonical bytes are deterministic and the invoker parses the exact
-            # frozen request the pack signed.
+            # rather than left null so the request stays a clean JSON object), so the signed
+            # canonical bytes are deterministic and the invoker parses the exact frozen request
+            # the pack signed (with any overlay bindings resolved at admission).
             self.request = validated.model_dump(mode="json", exclude_none=True)
         else:
             for value in self.request.values():
-                if isinstance(value, dict):
+                if not isinstance(value, str | int | bool):
                     raise ValueError(
                         f"action kind {self.action!r} requires a flat scalar request"
                     )

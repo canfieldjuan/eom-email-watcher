@@ -15,6 +15,7 @@ from eom_email_watcher.automate import (
     AutomateLicenseError,
     PackOwnershipError,
     PackVersionError,
+    RequestBindingError,
     Workflow,
     WorkflowEngine,
     WorkflowMismatch,
@@ -761,3 +762,138 @@ def test_submit_decision_without_expected_pack_version_skips_the_version_check(
         expected_pack_id="pack-a",
     )
     assert outcome.applied is True
+
+
+ARTIFACT_ID = "5aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def _connect_invoke_action(parameters: dict) -> dict:
+    return {
+        "action": "connect.invoke",
+        "request": {
+            "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+            "input": {
+                "artifact_id": ARTIFACT_ID,
+                "media_type": "application/json",
+                "filename": "request.json",
+            },
+            "parameters": parameters,
+        },
+    }
+
+
+def _binding_workflow(convert_parameters: dict, *, set_lead_id_on: str) -> Workflow:
+    """A two-stage workflow whose convert decision emits an overlay-bound connect.invoke.
+
+    ``set_lead_id_on`` chooses which decision sets the ``lead_id`` overlay: "start_review"
+    (a prior decision) or "convert" (the same decision that binds it).
+    """
+    start_effects: list[dict] = [{"kind": "record.transition", "to_stage": "reviewing"}]
+    convert_effects: list[dict] = [{"kind": "record.transition", "to_stage": "converted"}]
+    if set_lead_id_on == "start_review":
+        start_effects.append({"kind": "overlay.set", "key": "lead_id", "value": "L-42"})
+    elif set_lead_id_on == "convert":
+        convert_effects.append({"kind": "overlay.set", "key": "lead_id", "value": "L-42"})
+    return Workflow.model_validate(
+        {
+            "name": "lead-funnel",
+            "stages": ["captured", "reviewing", "converted"],
+            "initial_stage": "captured",
+            "definitions": [
+                {
+                    "name": "start-review",
+                    "trigger": {"source_kind": "operator.decision", "decision": "start_review"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "captured"}],
+                    "effects": start_effects,
+                },
+                {
+                    "name": "convert",
+                    "trigger": {"source_kind": "operator.decision", "decision": "convert"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "reviewing"}],
+                    "effects": convert_effects,
+                    "actions": [_connect_invoke_action(convert_parameters)],
+                },
+            ],
+        }
+    )
+
+
+def _advance_to_reviewing(engine: WorkflowEngine, workflow: Workflow) -> str:
+    record = engine.create_record(workflow, now=NOW)
+    engine.submit_decision(
+        workflow,
+        record.record_id,
+        decision="start_review",
+        operation_key="op-start",
+        request={},
+        expected_version=1,
+        now=NOW,
+    )
+    return record.record_id
+
+
+def _frozen_connect_invoke_request(engine: WorkflowEngine, record_id: str) -> dict:
+    actions = [a for a in engine._store.list_actions(record_id) if a.kind == "connect.invoke"]
+    assert len(actions) == 1
+    return actions[0].request
+
+
+def test_connect_invoke_binding_resolves_against_a_prior_decisions_overlay(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    workflow = _binding_workflow(
+        {"lead-id": {"overlay": "lead_id"}}, set_lead_id_on="start_review"
+    )
+    record_id = _advance_to_reviewing(engine, workflow)
+    engine.submit_decision(
+        workflow,
+        record_id,
+        decision="convert",
+        operation_key="op-convert",
+        request={},
+        expected_version=2,
+        now=NOW,
+    )
+    # The frozen action request carries the resolved value, not the binding.
+    assert _frozen_connect_invoke_request(engine, record_id)["parameters"] == {"lead-id": "L-42"}
+
+
+def test_connect_invoke_binding_resolves_against_the_same_decisions_overlay(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    workflow = _binding_workflow(
+        {"lead-id": {"overlay": "lead_id"}}, set_lead_id_on="convert"
+    )
+    record_id = _advance_to_reviewing(engine, workflow)
+    engine.submit_decision(
+        workflow,
+        record_id,
+        decision="convert",
+        operation_key="op-convert",
+        request={},
+        expected_version=2,
+        now=NOW,
+    )
+    # A value set by this same decision's overlay.set is visible to its connect.invoke binding.
+    assert _frozen_connect_invoke_request(engine, record_id)["parameters"] == {"lead-id": "L-42"}
+
+
+def test_connect_invoke_binding_to_an_unset_overlay_fails_the_decision(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _binding_workflow({"lead-id": {"overlay": "lead_id"}}, set_lead_id_on="none")
+    record_id = _advance_to_reviewing(engine, workflow)
+    with pytest.raises(RequestBindingError):
+        engine.submit_decision(
+            workflow,
+            record_id,
+            decision="convert",
+            operation_key="op-convert",
+            request={},
+            expected_version=2,
+            now=NOW,
+        )
+    # The decision did not apply: the record is still at reviewing and nothing was admitted.
+    assert engine._store.get_record(record_id).stage == "reviewing"
+    assert engine._store.list_actions(record_id) == []

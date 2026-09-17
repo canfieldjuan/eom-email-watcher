@@ -19,10 +19,23 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from .actions import ACTION_KINDS
-from .definition import MAX_NAME_LENGTH, Condition, Workflow, WorkflowDefinition
+from .actions import ACTION_KINDS, CONNECT_INVOKE
+from .definition import (
+    MAX_NAME_LENGTH,
+    Condition,
+    Workflow,
+    WorkflowDefinition,
+    render_connect_invoke_request,
+)
 from .host import AutomateHost
-from .store import OperationConflict, RecordView, StaleRecord, WorkflowStore, request_fingerprint
+from .store import (
+    OVERLAY_SET,
+    OperationConflict,
+    RecordView,
+    StaleRecord,
+    WorkflowStore,
+    request_fingerprint,
+)
 
 
 class EngineError(RuntimeError):
@@ -265,7 +278,7 @@ class WorkflowEngine:
         # The matched definition's declared actions are admitted to the outbox in the same
         # transaction as the ledger commit, so a decision's side-effect intents are durable
         # the moment the decision applies (the runtime then dispatches the pending rows).
-        actions = [{"kind": emit.action, "request": emit.request} for emit in definition.actions]
+        actions = self._render_actions(record_id, definition)
         outcome = self._store.apply_effects(
             record_id,
             effects,
@@ -285,3 +298,32 @@ class WorkflowEngine:
             definition_name=definition.name,
             event_id=outcome.event_id,
         )
+
+    def _render_actions(
+        self, record_id: str, definition: WorkflowDefinition
+    ) -> list[dict[str, object]]:
+        """Build the decision's action intents, resolving connect.invoke overlay bindings.
+
+        A connect.invoke request may bind a parameter value to an overlay key; resolve those
+        against the record's overlay projection merged with this decision's own overlay.set
+        effects, so a value set and used in the same decision binds. The resolved request is
+        what apply_effects freezes into the outbox row, so a retry replays the resolved values
+        rather than re-resolving against later state (the queue-row-binding discipline). The
+        merge is a read outside the ledger transaction, but apply_effects compare-and-sets on
+        the same version this decision matched, so a concurrent overlay write is rejected there
+        rather than admitting a request rendered against a stale projection.
+        """
+        needs_overlays = any(emit.action == CONNECT_INVOKE for emit in definition.actions)
+        overlays: dict[str, object] = {}
+        if needs_overlays:
+            overlays = self._store.get_overlays(record_id)
+            for effect in definition.effects:
+                if effect.kind == OVERLAY_SET:
+                    overlays[effect.key] = effect.value
+        actions: list[dict[str, object]] = []
+        for emit in definition.actions:
+            request: object = emit.request
+            if emit.action == CONNECT_INVOKE:
+                request = render_connect_invoke_request(emit.request, overlays)
+            actions.append({"kind": emit.action, "request": request})
+        return actions
