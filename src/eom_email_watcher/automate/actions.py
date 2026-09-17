@@ -70,8 +70,9 @@ class LocalNotifyAdapter:
     """The host-guaranteed, zero-config ``notify.local`` adapter.
 
     A local notification is a durable record the operator reads, so this adapter has no
-    external dependency: it validates the notification and echoes it, and the outbox row it
-    settles is the delivered notification (surfaced via ``WorkflowStore.list_actions``).
+    external dependency: it validates the notification, and the outbox row it settles is the
+    delivered notification (the title and body live on the durable request, and the request
+    and result are surfaced together via ``WorkflowStore.list_actions``).
     """
 
     def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
@@ -81,7 +82,11 @@ class LocalNotifyAdapter:
             raise ActionDeliveryError("notify.local requires a non-empty 'title'")
         if not isinstance(body, str):
             raise ActionDeliveryError("notify.local requires a string 'body'")
-        return {"channel": "local", "title": title, "body": body, "delivered": True}
+        # Return delivery metadata only, never echoing title/body: the durable request row
+        # already carries them, and echoing them would make the result grow with the request,
+        # so a valid notification admitted just under the size bound could not settle its
+        # (larger) result and would be wrongly marked failed.
+        return {"channel": "local", "delivered": True}
 
 
 class AdapterRegistry:
@@ -161,7 +166,11 @@ class ActionRunner:
             self._store.release_action(action_id)
             raise
         try:
-            result = adapter.deliver(request)
+            # Dispatch the committed canonical snapshot, not the caller's mapping: the durable
+            # row and the dedupe identity are this snapshot, so the adapter must act on exactly
+            # what was recorded. Feeding it the still-mutable caller object could let the side
+            # effect diverge from the recorded intent, and a retry would then conflict.
+            result = adapter.deliver(admission.view.request)
         except Exception as exc:
             self._store.fail_action(action_id, error=str(exc), now=now)
             raise ActionDeliveryError(f"adapter for {kind!r} failed: {exc}") from exc

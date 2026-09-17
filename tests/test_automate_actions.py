@@ -125,16 +125,65 @@ def test_notify_local_delivers_and_records_durably(tmp_path: Path) -> None:
     )
     assert outcome.delivered is True
     assert outcome.status == "settled"
-    assert outcome.result == {
-        "channel": "local",
-        "title": "New lead",
-        "body": "Call back",
-        "delivered": True,
-    }
-    # The settled outbox row is the durable local notification.
+    # The result is delivery metadata only; the title/body live on the durable request.
+    assert outcome.result == {"channel": "local", "delivered": True}
+    # The settled outbox row is the durable local notification: request carries the content.
     actions = store.list_actions(record_id)
     assert [action.kind for action in actions] == ["notify.local"]
     assert actions[0].status == "settled"
+    assert actions[0].request == {"title": "New lead", "body": "Call back"}
+
+
+def test_notify_local_settles_a_request_near_the_size_bound(tmp_path: Path) -> None:
+    # A large-but-valid notification must settle: the result is fixed-size metadata, so it
+    # never grows with the request and cannot push a just-admitted action over the bound.
+    runner, store = _runner(tmp_path)
+    record_id = _record(store)
+    big_body = "x" * 16_000
+    outcome = runner.run(
+        record_id,
+        kind="notify.local",
+        dedupe_key="k1",
+        request={"title": "New lead", "body": big_body},
+        now=NOW,
+    )
+    assert outcome.status == "settled"
+    assert store.list_actions(record_id)[0].request["body"] == big_body
+
+
+def test_adapter_result_with_a_non_json_value_marks_the_action_failed(tmp_path: Path) -> None:
+    from datetime import datetime as _dt
+
+    class DatetimeAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            return {"sent_at": _dt(2026, 6, 1)}  # a TypeError for json.dumps, not a ValueError
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", DatetimeAdapter())
+    record_id = _record(store)
+    with pytest.raises(ActionDeliveryError):
+        runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    actions = store.list_actions(record_id)
+    # Terminalized as failed, not left stuck pending (which would raise UnresolvedAction).
+    assert len(actions) == 1
+    assert actions[0].status == "failed"
+
+
+def test_adapter_receives_the_committed_snapshot_not_the_caller_object(tmp_path: Path) -> None:
+    received: list[Mapping[str, object]] = []
+
+    class RecordingAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            received.append(request)
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", RecordingAdapter())
+    record_id = _record(store)
+    # A tuple value is stored as a JSON array and read back as a list; the adapter must see
+    # the committed snapshot (list), proving it was not handed the caller's original object.
+    runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"tags": ("a", "b")}, now=NOW)
+    assert received == [{"tags": ["a", "b"]}]
 
 
 def test_replaying_a_settled_action_does_not_redeliver(tmp_path: Path) -> None:

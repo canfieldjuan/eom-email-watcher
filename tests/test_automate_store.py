@@ -923,6 +923,21 @@ def test_admit_action_rejects_a_non_finite_value(tmp_path: Path) -> None:
         )
 
 
+def test_admit_action_rejects_a_non_string_object_key(tmp_path: Path) -> None:
+    # A non-string key would be silently coerced by json.dumps ({1: "a"} -> {"1": "a"}),
+    # colliding the canonical dedupe identity with a genuine {"1": "a"} request. Reject it.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="d1",
+            request={"meta": {1: "a"}},  # nested non-string key
+            now=NOW,
+        )
+
+
 def test_list_actions_preserves_admission_order_on_timestamp_tie(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record_id = _make_record(store)

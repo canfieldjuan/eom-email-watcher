@@ -414,6 +414,25 @@ def _action_view(row: sqlite3.Row) -> ActionView:
     )
 
 
+def _reject_non_string_keys(value: object, *, label: str) -> None:
+    """Recursively reject mappings whose keys are not strings.
+
+    ``json.dumps`` silently coerces a non-string object key to its string form, so
+    ``{1: "a"}`` and ``{"1": "a"}`` would serialize identically (colliding the dedupe
+    identity) and ``{1: "a", "1": "b"}`` would persist duplicate ``"1"`` members and read
+    back with one value dropped. Reject non-string keys before serialization so a payload's
+    canonical bytes are a faithful, injective encoding of its logical content.
+    """
+    if isinstance(value, Mapping):
+        for key, sub in value.items():
+            if not isinstance(key, str):
+                raise InvalidEffect(f"action {label} contains a non-string object key {key!r}")
+            _reject_non_string_keys(sub, label=label)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_non_string_keys(item, label=label)
+
+
 def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
     """Canonical JSON for an action request or result, size-bounded and fail-closed.
 
@@ -422,6 +441,7 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
     """
     if not isinstance(payload, Mapping):
         raise InvalidEffect(f"action {label} must be a mapping")
+    _reject_non_string_keys(payload, label=label)
     try:
         canonical = json.dumps(
             dict(payload),
@@ -431,9 +451,11 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
             allow_nan=False,
         )
         size = len(canonical.encode("utf-8"))
-    except ValueError as exc:
-        # allow_nan=False rejects NaN/Infinity (not portable canonical JSON); unencodable
-        # strings and oversized integers also land here as ValueError.
+    except (ValueError, TypeError) as exc:
+        # ValueError: allow_nan=False rejects NaN/Infinity; unencodable strings and oversized
+        # integers also land here. TypeError: a value of a non-JSON type (a set, a datetime,
+        # an arbitrary object). Both must fail closed as InvalidEffect so the runner can
+        # terminalize the action rather than leaving the row stuck pending.
         raise InvalidEffect(f"action {label} contains an unserializable value: {exc}") from exc
     if size > MAX_ACTION_BYTES:
         raise InvalidEffect(f"action {label} exceeds {MAX_ACTION_BYTES} bytes")
