@@ -390,6 +390,32 @@ def test_separate_publisher_and_grant_keyrings_accept_correct_signatures(tmp_pat
     assert run.actions[0].status == "settled"
 
 
+def test_action_dedupe_key_is_namespaced_by_committed_event(tmp_path: Path) -> None:
+    # The runtime owns its outbox keys: a reserved namespace over the committed event id, so
+    # they cannot collide with a caller-minted key such as "op-1:0".
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    runtime = _runtime(
+        tmp_path,
+        key,
+        actions=[NOTIFY_ACTION],
+        registry=AdapterRegistry.with_defaults(),
+        store=store,
+    )
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    dedupe_key = store.list_actions(record.record_id)[0].dedupe_key
+    assert dedupe_key == f"pack.action:{run.outcome.event_id}:0"
+    assert not dedupe_key.startswith("op-1:")  # not the raw caller key
+
+
 def test_exposed_workflow_is_a_defensive_copy(tmp_path: Path) -> None:
     # Mutating the exposed workflow graph must not change the verified semantics the engine
     # executes, or the publisher signature would be defeatable after load().

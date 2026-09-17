@@ -135,8 +135,9 @@ class PackRuntime:
         only on the call that actually applied them (``matched and applied``), the matched
         definition's actions are emitted through the outbox. A replay of the same
         ``operation_key`` returns ``applied=False`` and dispatches nothing, so the side
-        effect runs exactly once. Each action's dedupe key is derived from the operation key,
-        so the outbox deduplicates as a backstop even if an applied decision is re-run.
+        effect runs exactly once. Each action's dedupe key is runtime-owned: a reserved
+        ``pack.action:`` namespace over the committed event id, so it cannot collide with a
+        caller-minted outbox key and is unique to this committed decision.
         """
         outcome = self._engine.submit_decision(
             self._pack.workflow,
@@ -150,12 +151,15 @@ class PackRuntime:
         actions: list[ActionOutcome] = []
         if outcome.matched and outcome.applied and outcome.definition_name is not None:
             definition = self._definition(outcome.definition_name)
+            # The committed decision's ledger event id keys the actions: it is set for any
+            # applied batch, unique to this decision, and not caller-minted, so a reserved
+            # namespace over it cannot collide with a key a direct ActionRunner caller used.
             for index, emit in enumerate(definition.actions):
                 actions.append(
                     self._runner.run(
                         record_id,
                         kind=emit.action,
-                        dedupe_key=f"{operation_key}:{index}",
+                        dedupe_key=f"pack.action:{outcome.event_id}:{index}",
                         request=emit.request,
                         now=now,
                     )
