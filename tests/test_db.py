@@ -3429,6 +3429,29 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
             "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'messages_delete_connect_attachment_jobs'"
         ).fetchone() == (1,)
+        restored_connect_triggers = {
+            str(name): str(sql)
+            for name, sql in db.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name IN (?, ?, ?, ?)",
+                (
+                    "messages_delete_connect_attachment_jobs",
+                    "connect_jobs_delete_dispatch",
+                    "messages_delete_pending_automation_fires",
+                    "connect_jobs_delete_linked_automation_fires",
+                ),
+            ).fetchall()
+        }
+        assert set(restored_connect_triggers) == {
+            "messages_delete_connect_attachment_jobs",
+            "connect_jobs_delete_dispatch",
+            "messages_delete_pending_automation_fires",
+            "connect_jobs_delete_linked_automation_fires",
+        }
+        assert all(
+            "connect_attachment_jobs_v5" not in sql and "connect_attachment_jobs_v6" not in sql
+            for sql in restored_connect_triggers.values()
+        )
 
 
 def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(

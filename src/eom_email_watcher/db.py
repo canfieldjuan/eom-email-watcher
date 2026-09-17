@@ -363,6 +363,13 @@ BEGIN
 END
 """
 
+_CONNECT_TABLE_TRIGGER_NAMES = (
+    "messages_delete_connect_attachment_jobs",
+    "connect_jobs_delete_dispatch",
+    "messages_delete_pending_automation_fires",
+    "connect_jobs_delete_linked_automation_fires",
+)
+
 _CONNECT_JOBS_DELETE_TRIGGER_V19_SQL = """
 CREATE TRIGGER messages_delete_connect_attachment_jobs
 AFTER DELETE ON messages
@@ -607,10 +614,21 @@ CREATE TRIGGER IF NOT EXISTS connect_jobs_delete_linked_automation_fires
 AFTER DELETE ON connect_attachment_jobs
 BEGIN
     UPDATE automation_fires SET
-        state = 'source_unavailable',
+        state = CASE OLD.status
+            WHEN 'completed' THEN 'completed'
+            WHEN 'failed' THEN 'failed'
+            ELSE 'source_unavailable'
+        END,
         state_version = state_version + 1,
-        reason = 'job_removed',
-        job_id = NULL,
+        reason = CASE OLD.status
+            WHEN 'completed' THEN 'connect_completed'
+            WHEN 'failed' THEN substr(COALESCE(OLD.error_code, 'connect_failed'), 1, 128)
+            ELSE 'job_removed'
+        END,
+        job_id = CASE
+            WHEN OLD.status IN ('completed', 'failed') THEN OLD.job_id
+            ELSE NULL
+        END,
         pending_since = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     WHERE job_id = OLD.job_id
@@ -1718,7 +1736,8 @@ def _ensure_connect_jobs_schema(db: sqlite3.Connection, current_version: int) ->
         }
         legacy_table = "protocol_version" not in columns
     if legacy_table:
-        db.execute("DROP TRIGGER IF EXISTS messages_delete_connect_attachment_jobs")
+        for trigger in _CONNECT_TABLE_TRIGGER_NAMES:
+            db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_lookup")
         db.execute("DROP INDEX IF EXISTS idx_connect_attachment_jobs_active")
         db.execute("ALTER TABLE connect_attachment_jobs RENAME TO connect_attachment_jobs_v5")
@@ -1931,6 +1950,7 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
     elif current_version == 21:
         _migrate_automation_fires_v22(db)
     db.execute("DROP TRIGGER IF EXISTS messages_delete_pending_automation_fires")
+    db.execute("DROP TRIGGER IF EXISTS connect_jobs_delete_linked_automation_fires")
     _execute_transactional_script(db, _AUTOMATION_FIRE_TABLES_SQL)
 
     account_columns = {

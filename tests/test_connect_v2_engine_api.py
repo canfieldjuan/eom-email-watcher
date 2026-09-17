@@ -1146,6 +1146,50 @@ def test_automation_confirmation_rejects_live_effect_drift_without_creating_job(
     assert runtime.store.connect_job(attempt.dispatch_request_id) is None
 
 
+def test_automation_confirmation_rejects_effect_requirement_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime, external_effects=True)
+    current = selected
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((current,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    prepared = runtime.store.automation_fire(fire.fire_id)
+    assert prepared is not None
+    assert prepared.prepared_identity_sha256 is not None
+    engine_api._response(
+        api_request(
+            config_path,
+            "automation.fire.decide",
+            {
+                "fire_id": fire.fire_id,
+                "expected_version": prepared.state_version,
+                "prepared_identity_sha256": prepared.prepared_identity_sha256,
+                "decision": "confirmed",
+            },
+        )
+    )
+    current = capability(
+        app_id=selected.app_id,
+        app_version=selected.app_version,
+        capability_id=selected.capability_id,
+        parameters=selected.parameters,
+    )
+
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+
+    halted = runtime.store.automation_fire(fire.fire_id)
+    assert halted is not None
+    assert halted.state == "manual_review"
+    assert halted.reason == "automation_confirmation_stale"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -1534,6 +1578,61 @@ def test_provider_owned_paused_fire_survives_source_delete_and_records_terminal_
     assert completed is not None
     assert completed.state == "completed"
     assert completed.reason == "connect_completed"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_reason"),
+    (("completed", "connect_completed"), ("failed", "PDF_MALFORMED")),
+)
+def test_source_delete_preserves_unsettled_terminal_automation_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+    expected_reason: str,
+) -> None:
+    _config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    if terminal_status == "completed":
+        output = connect.CapabilityOutput(
+            artifact_id=OUTPUT_ID,
+            media_type="application/vnd.local-connect.cited-summary+json",
+            display_name="contract-summary.json",
+            byte_size=2,
+            sha256=hashlib.sha256(b"{}").hexdigest(),
+            payload=b"{}",
+        )
+        runtime.store.transition_connect_job(
+            job_id=attempt.dispatch_request_id,
+            expected_state="requested",
+            next_state="completed",
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+            result=connect.CapabilityResult((output,)).store_dict(),
+        )
+    else:
+        runtime.store.transition_connect_job(
+            job_id=attempt.dispatch_request_id,
+            expected_state="requested",
+            next_state="failed",
+            provider_app_id=selected.app_id,
+            provider_instance_id=selected.instance_id,
+            error={"code": "PDF_MALFORMED", "message": "Invalid PDF", "retryable": False},
+        )
+
+    assert runtime.store.delete_message("message-1") is True
+
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == terminal_status
+    assert settled.reason == expected_reason
     assert runtime.store.connect_job(attempt.dispatch_request_id) is None
 
 

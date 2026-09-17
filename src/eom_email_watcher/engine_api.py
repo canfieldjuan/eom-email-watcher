@@ -4187,7 +4187,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
                 prepared_identity=prepared_identity,
             )
             return
-        if confirmation_needed:
+        if fire.confirmed:
             if not runtime.store.automation_confirmation_matches(fire):
                 runtime.store.transition_automation_fire(
                     fire_id=fire.fire_id,
