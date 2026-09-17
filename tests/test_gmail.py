@@ -27,6 +27,71 @@ def test_gmail_operation_timeout_reaches_authorized_transport() -> None:
         gateway.set_operation_timeout(0)
 
 
+def test_from_token_bounds_refresh_and_authorized_transport(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials_file = tmp_path / "credentials.json"
+    token_file = tmp_path / "token.json"
+    credentials_file.write_text("{}", encoding="utf-8")
+    token_file.write_text("existing token", encoding="utf-8")
+    refresh_timeouts: list[float] = []
+    lock_timeouts: list[float] = []
+    transport = SimpleNamespace(timeout=30.0)
+
+    class CapturingLock:
+        def __init__(self, path: str, *, timeout: float) -> None:
+            lock_timeouts.append(timeout)
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def authorized_request(*args, **kwargs):
+        refresh_timeouts.append(kwargs["timeout"])
+        return object()
+
+    class FakeCredentials:
+        valid = False
+        expired = True
+        refresh_token = "refresh-token"
+
+        def refresh(self, request) -> None:
+            request(
+                method="POST",
+                url="https://oauth2.googleapis.com/token",
+                headers={},
+                body=None,
+                timeout=120,
+            )
+            self.valid = True
+            self.expired = False
+
+        def to_json(self) -> str:
+            return "refreshed token"
+
+    monkeypatch.setattr(
+        gmail_module.Credentials,
+        "from_authorized_user_file",
+        lambda path, scopes: FakeCredentials(),
+    )
+    monkeypatch.setattr(gmail_module, "Request", lambda: authorized_request)
+    monkeypatch.setattr(gmail_module, "FileLock", CapturingLock)
+    monkeypatch.setattr(
+        gmail_module,
+        "build",
+        lambda *args, **kwargs: SimpleNamespace(_http=SimpleNamespace(http=transport)),
+    )
+
+    gateway = GmailGateway.from_token(credentials_file, token_file, 0.25)
+
+    assert gateway.service is not None
+    assert lock_timeouts == [0.25]
+    assert refresh_timeouts == [0.25]
+    assert transport.timeout == 0.25
+
+
 def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
     parsed = parse_metadata(
         {

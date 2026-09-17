@@ -4722,6 +4722,9 @@ def test_zero_sender_check_still_rejects_incompatible_host_delivery(
 
 
 class FakeGmail:
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        pass
+
     def mailbox_identity_key(self) -> str:
         return _test_mailbox_identity("gmail", "gmail-default")
 

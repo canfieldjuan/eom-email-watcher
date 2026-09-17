@@ -194,7 +194,20 @@ class GmailGateway:
         return self.profile().email_address
 
     @classmethod
-    def from_token(cls, credentials_file: Path, token_file: Path) -> GmailGateway:
+    def from_token(
+        cls,
+        credentials_file: Path,
+        token_file: Path,
+        timeout_seconds: float | None = None,
+    ) -> GmailGateway:
+        operation_timeout = (
+            validate_operation_timeout(timeout_seconds) if timeout_seconds is not None else None
+        )
+        token_lock_timeout = (
+            min(float(TOKEN_LOCK_TIMEOUT_SECONDS), operation_timeout)
+            if operation_timeout is not None
+            else TOKEN_LOCK_TIMEOUT_SECONDS
+        )
         resolved_credentials_file = resolve_gmail_credentials_file(credentials_file)
         if not resolved_credentials_file.is_file():
             raise GmailError(
@@ -203,7 +216,7 @@ class GmailGateway:
             )
         token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            with FileLock(f"{token_file}.lock", timeout=token_lock_timeout):
                 credentials: Credentials | None = None
                 if token_file.exists():
                     try:
@@ -214,7 +227,24 @@ class GmailGateway:
                         ) from exc
                 if credentials and credentials.expired and credentials.refresh_token:
                     try:
-                        credentials.refresh(Request())
+                        refresh_request = Request()
+                        if operation_timeout is not None:
+                            unbounded_request = refresh_request
+
+                            def refresh_request(*args: Any, **kwargs: Any) -> Any:
+                                try:
+                                    requested_timeout = validate_operation_timeout(
+                                        kwargs.get("timeout")
+                                    )
+                                except ValueError:
+                                    requested_timeout = operation_timeout
+                                kwargs["timeout"] = min(
+                                    requested_timeout,
+                                    operation_timeout,
+                                )
+                                return unbounded_request(*args, **kwargs)
+
+                        credentials.refresh(refresh_request)
                     except RefreshError as exc:
                         if exc.retryable:
                             raise GmailError("Gmail authorization refresh failed; retry") from exc
@@ -231,10 +261,13 @@ class GmailGateway:
             raise GmailError("Gmail token is busy; retry the operation") from exc
         assert credentials is not None
         identity_key = cls._credential_identity(credentials)
-        return cls(
+        gateway = cls(
             build("gmail", "v1", credentials=credentials, cache_discovery=False),
             identity_key,
         )
+        if operation_timeout is not None:
+            gateway.set_operation_timeout(operation_timeout)
+        return gateway
 
     @classmethod
     def authorize(cls, credentials_file: Path, token_file: Path) -> GmailGateway:

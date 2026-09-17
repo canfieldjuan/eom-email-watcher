@@ -146,11 +146,17 @@ def microsoft_credentials_configured(configured_file: Path) -> bool:
 def _new_public_client(
     configuration: MicrosoftPublicClient,
     cache: msal.SerializableTokenCache,
+    timeout_seconds: float | None = None,
 ) -> Any:
+    options: dict[str, object] = {
+        "authority": configuration.authority,
+        "token_cache": cache,
+    }
+    if timeout_seconds is not None:
+        options["timeout"] = validate_operation_timeout(timeout_seconds)
     return msal.PublicClientApplication(
         configuration.client_id,
-        authority=configuration.authority,
-        token_cache=cache,
+        **options,
     )
 
 
@@ -388,17 +394,30 @@ class Microsoft365Gateway:
         cls,
         credentials_file: Path,
         token_file: Path,
+        timeout_seconds: float | None = None,
         *,
         client: httpx.Client | None = None,
     ) -> Microsoft365Gateway:
+        operation_timeout = (
+            validate_operation_timeout(timeout_seconds) if timeout_seconds is not None else None
+        )
+        token_lock_timeout = (
+            min(float(TOKEN_LOCK_TIMEOUT_SECONDS), operation_timeout)
+            if operation_timeout is not None
+            else TOKEN_LOCK_TIMEOUT_SECONDS
+        )
         configuration = load_microsoft_public_client(credentials_file)
         if not token_file.is_file():
             raise MicrosoftAuthorizationRejected("Microsoft 365 is not authorized")
         try:
-            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            with FileLock(f"{token_file}.lock", timeout=token_lock_timeout):
                 cache = _load_cache(token_file)
                 try:
-                    application = _new_public_client(configuration, cache)
+                    application = _new_public_client(
+                        configuration,
+                        cache,
+                        operation_timeout,
+                    )
                 except Exception as exc:
                     raise Microsoft365Error(
                         "Microsoft authorization service is unavailable; retry"
@@ -423,12 +442,15 @@ class Microsoft365Gateway:
                     _write_private_cache(token_file, cache)
         except FileLockTimeout as exc:
             raise Microsoft365Error("Microsoft authorization cache is busy; retry") from exc
-        return cls(
+        gateway = cls(
             str(result["access_token"]),
             email_address,
             client,
             cls._principal_identity(accounts[0]),
         )
+        if operation_timeout is not None:
+            gateway.set_operation_timeout(operation_timeout)
+        return gateway
 
     @classmethod
     def authorize_with_status(

@@ -114,6 +114,7 @@ def load_mailbox_account(
     store: Store,
     provider: str,
     account_id: str,
+    timeout_seconds: float | None = None,
 ) -> MailboxSession:
     """Load one persisted mailbox account without changing the polling selection."""
     account = store.mail_account(provider, account_id)
@@ -123,11 +124,31 @@ def load_mailbox_account(
     if not token_file.is_file():
         raise MailboxAccountUnavailable("The selected email account is disconnected")
     if account.provider == DEFAULT_MAIL_PROVIDER:
-        gateway = GmailGateway.from_token(config.gmail_credentials_file, token_file)
+        if timeout_seconds is None:
+            gateway = GmailGateway.from_token(config.gmail_credentials_file, token_file)
+        else:
+            gateway = GmailGateway.from_token(
+                config.gmail_credentials_file,
+                token_file,
+                timeout_seconds,
+            )
     elif account.provider == MICROSOFT365_PROVIDER:
-        gateway = Microsoft365Gateway.from_token(config.microsoft_credentials_file, token_file)
+        if timeout_seconds is None:
+            gateway = Microsoft365Gateway.from_token(
+                config.microsoft_credentials_file,
+                token_file,
+            )
+        else:
+            gateway = Microsoft365Gateway.from_token(
+                config.microsoft_credentials_file,
+                token_file,
+                timeout_seconds,
+            )
     elif account.provider == IMAP_PROVIDER:
-        gateway = ImapGateway.from_credentials_file(token_file)
+        if timeout_seconds is None:
+            gateway = ImapGateway.from_credentials_file(token_file)
+        else:
+            gateway = ImapGateway.from_credentials_file(token_file, timeout_seconds)
     else:
         raise MailboxAccountUnavailable(
             "The selected email provider is not available in this build"

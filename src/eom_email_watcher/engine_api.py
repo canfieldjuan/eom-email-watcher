@@ -2258,12 +2258,17 @@ def _retained_connect_message_source(runtime: Runtime, message_id: str) -> Messa
     return source
 
 
-def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
+def _configured_mailbox_gateway(
+    runtime: Runtime,
+    source: MessageSource,
+    timeout_seconds: float | None = None,
+) -> MailboxGateway:
     mailbox = load_mailbox_account(
         runtime.config,
         runtime.store,
         source.provider,
         source.account_id,
+        timeout_seconds,
     )
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Mailbox identity changed while opening the provider")
@@ -2962,6 +2967,24 @@ def _require_submission_authority_for_job(
     expected_dispatch_state: str,
     inactive_dispatch_state: str,
 ) -> bool:
+    if not _automation_submission_authority_active(
+        runtime,
+        job_id,
+        expected_dispatch_state=expected_dispatch_state,
+        inactive_dispatch_state=inactive_dispatch_state,
+    ):
+        return False
+    _require_connect_entitlement_for_job(runtime, job_id, capability)
+    return True
+
+
+def _automation_submission_authority_active(
+    runtime: Runtime,
+    job_id: str,
+    *,
+    expected_dispatch_state: str,
+    inactive_dispatch_state: str,
+) -> bool:
     automation_origin = runtime.store.connect_job_requires_automation_entitlement(job_id)
     automation_active = _automation_entitlement_active()
     if automation_active:
@@ -2981,9 +3004,6 @@ def _require_submission_authority_for_job(
         return False
     else:
         runtime.store.pause_interactive_job_automation_fires(job_id)
-    if automation_origin:
-        return True
-    _require_connect_entitlement_for_job(runtime, job_id, capability)
     return True
 
 
@@ -3549,24 +3569,16 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             claimed_job, dispatch = claimed
             proven_new_submission = dispatch.state == "dispatching"
             if proven_new_submission:
+                if not _automation_submission_authority_active(
+                    runtime,
+                    claimed_job.job_id,
+                    expected_dispatch_state=dispatch.state,
+                    inactive_dispatch_state="waiting",
+                ):
+                    return _connect_queue_item(runtime, head.job_id, "entitlement_paused")
                 try:
-                    if automation_authority_required:
-                        if not _automation_entitlement_active():
-                            raise connect.ConnectError(
-                                "ENTITLEMENT_REQUIRED",
-                                "Automation provider submission requires active entitlements.",
-                            )
-                    else:
-                        connect.require_connect_entitlement()
+                    connect.require_connect_entitlement()
                 except connect.ConnectError as exc:
-                    if automation_authority_required:
-                        _defer_inactive_automation_job(
-                            runtime,
-                            claimed_job.job_id,
-                            expected_dispatch_state=dispatch.state,
-                            next_dispatch_state="waiting",
-                        )
-                        return _connect_queue_item(runtime, head.job_id, "entitlement_paused")
                     _fail_generic_connect_record(
                         runtime,
                         claimed_job,
@@ -3786,9 +3798,7 @@ def _generic_attachment_content(
             "connect_source_unavailable",
             "The source attachment exceeds the local mailbox fetch limit.",
         )
-    gateway = _configured_mailbox_gateway(runtime, current_source)
-    if timeout_seconds is not None:
-        gateway.set_operation_timeout(timeout_seconds)
+    gateway = _configured_mailbox_gateway(runtime, current_source, timeout_seconds)
     return gateway.attachment_bytes(
         current_source.provider_message_id,
         part_id,

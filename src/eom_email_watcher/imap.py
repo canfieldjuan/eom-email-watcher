@@ -1228,8 +1228,15 @@ class ImapGateway:
         self._active_client: imaplib.IMAP4 | None = None
 
     @classmethod
-    def from_credentials_file(cls, path: Path) -> ImapGateway:
-        return cls(load_credentials(path))
+    def from_credentials_file(
+        cls,
+        path: Path,
+        timeout_seconds: float | None = None,
+    ) -> ImapGateway:
+        gateway = cls(load_credentials(path))
+        if timeout_seconds is not None:
+            gateway.set_operation_timeout(timeout_seconds)
+        return gateway
 
     def set_operation_timeout(self, timeout_seconds: float) -> None:
         self._operation_timeout_seconds = validate_operation_timeout(timeout_seconds)
