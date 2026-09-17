@@ -200,6 +200,10 @@ class WorkflowEngine:
             )
         definition = matches[0]
         effects = [effect.model_dump(mode="json") for effect in definition.effects]
+        # The matched definition's declared actions are admitted to the outbox in the same
+        # transaction as the ledger commit, so a decision's side-effect intents are durable
+        # the moment the decision applies (the runtime then dispatches the pending rows).
+        actions = [{"kind": emit.action, "request": emit.request} for emit in definition.actions]
         outcome = self._store.apply_effects(
             record_id,
             effects,
@@ -209,6 +213,7 @@ class WorkflowEngine:
             expected_version=expected_version,
             now=now,
             allowed_stages=frozenset(workflow.stages),
+            actions=actions,
         )
         return DecisionOutcome(
             record=outcome.record,

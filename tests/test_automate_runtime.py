@@ -278,8 +278,9 @@ def test_replaying_a_decision_dispatches_the_action_once(tmp_path: Path) -> None
         expected_version=record.state_version,
         now=NOW,
     )
-    # Replay the same operation key: the engine short-circuits (applied=False) so the runtime
-    # dispatches nothing, and the side effect stays at exactly one.
+    # Replay the same operation key: the engine short-circuits (applied=False) and re-admits
+    # nothing, and the runtime re-dispatches the decision's action rows -- but the row is
+    # already settled, so it is replayed without a new delivery.
     replay = runtime.submit_decision(
         record.record_id,
         decision="review",
@@ -290,10 +291,111 @@ def test_replaying_a_decision_dispatches_the_action_once(tmp_path: Path) -> None
     )
     assert first.outcome.applied is True
     assert len(first.actions) == 1
+    assert first.actions[0].delivered is True
     assert replay.outcome.applied is False
-    assert replay.actions == []
-    assert len(deliveries) == 1
+    # The replay reports the decision's action, replayed from its settled row (no re-delivery).
+    assert len(replay.actions) == 1
+    assert replay.actions[0].delivered is False
+    assert replay.actions[0].status == "settled"
+    assert len(deliveries) == 1  # the side effect ran exactly once
     assert len(store.list_actions(record.record_id)) == 1
+
+
+def test_unconfigured_action_stays_pending_and_resumes_later(tmp_path: Path) -> None:
+    # Durable admission: a decision's action intent is admitted in the ledger transaction, so
+    # even with no adapter configured the record advances and the intent survives as a pending
+    # row (not lost). A later dispatch, once the adapter is configured, resumes it.
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    registry = AdapterRegistry.with_defaults()  # no mail.send adapter
+    runtime = _runtime(tmp_path, key, actions=[MAIL_ACTION], registry=registry, store=store)
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.outcome.applied is True
+    assert run.outcome.record.stage == "reviewing"
+    assert [action.status for action in run.actions] == ["pending"]
+    assert run.actions[0].delivered is False
+    assert [action.status for action in store.list_actions(record.record_id)] == ["pending"]
+
+    delivered: list[Mapping[str, object]] = []
+
+    class StubMail:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            delivered.append(request)
+            return {"ok": True}
+
+    registry.register("mail.send", StubMail())
+    replay = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert replay.outcome.applied is False  # the decision itself replays
+    assert [action.status for action in replay.actions] == ["settled"]
+    assert replay.actions[0].delivered is True  # the resumed action delivered now
+    assert delivered == [{"to": "ops", "subject": "lead"}]
+    assert [action.status for action in store.list_actions(record.record_id)] == ["settled"]
+
+
+def test_partial_dispatch_leaves_only_the_unconfigured_action_pending(tmp_path: Path) -> None:
+    # Mid-list failure: with one adapter configured and one not, the record advances, the
+    # deliverable action settles, and the undeliverable one stays pending and resumable -- no
+    # action is lost and the settled one is never re-delivered on resume.
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    registry = AdapterRegistry.with_defaults()  # notify.local yes, mail.send no
+    runtime = _runtime(
+        tmp_path, key, actions=[NOTIFY_ACTION, MAIL_ACTION], registry=registry, store=store
+    )
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.outcome.applied is True
+    assert [action.status for action in run.actions] == ["settled", "pending"]
+    feed = store.list_actions(record.record_id)
+    assert [action.kind for action in feed] == ["notify.local", "mail.send"]
+    assert [action.status for action in feed] == ["settled", "pending"]
+
+    deliveries: list[Mapping[str, object]] = []
+
+    class StubMail:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            deliveries.append(request)
+            return {"ok": True}
+
+    registry.register("mail.send", StubMail())
+    replay = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert [action.status for action in replay.actions] == ["settled", "settled"]
+    # notify.local replayed (no re-delivery); mail.send delivered now.
+    assert [action.delivered for action in replay.actions] == [False, True]
+    assert len(deliveries) == 1
+    assert [action.status for action in store.list_actions(record.record_id)] == [
+        "settled",
+        "settled",
+    ]
 
 
 def test_tampered_pack_is_rejected_before_any_record(tmp_path: Path) -> None:

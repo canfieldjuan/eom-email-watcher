@@ -57,10 +57,20 @@ MAX_EFFECT_BATCH_BYTES = 16 * 1024
 # The maximum size of a canonical action request or result persisted in the action outbox.
 MAX_ACTION_BYTES = 16 * 1024
 
+# The maximum number of actions one decision may emit. A definition's action list and this
+# store bound are kept in lockstep (the definition model imports this), so a direct
+# apply_effects caller cannot exceed it either.
+MAX_ACTIONS_PER_DECISION = 8
+
+# The reserved namespace for a decision-emitted action's dedupe key: the committed ledger
+# event id and the action's index within the decision. Owned by the store so a decision's
+# actions are admitted with a key no external caller of the outbox can collide with.
+ACTION_DEDUPE_PREFIX = "pack.action:"
+
 # Action outbox statuses. An action is admitted 'pending' before its side effect runs, then
-# settled to a terminal state. 'pending' surviving a crash is the accept-then-crash ambiguity
-# whose reconciliation is deferred hardening; the store detects it and refuses to silently
-# re-dispatch.
+# settled to a terminal state. A 'pending' row surviving a crash is durable intent to be
+# re-dispatched (the runtime resumes it after the decision and a startup sweep reconciles it),
+# not a silent re-dispatch.
 ACTION_PENDING = "pending"
 ACTION_SETTLED = "settled"
 ACTION_FAILED = "failed"
@@ -482,6 +492,35 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
     return canonical
 
 
+def _normalize_action_intents(
+    actions: Sequence[Mapping[str, object]] | None,
+) -> list[tuple[str, str]]:
+    """Validate a decision's action intents and canonicalize each request.
+
+    Returns ``(kind, canonical_request)`` pairs to admit alongside the decision. Fails closed
+    (``InvalidEffect``) on a malformed batch so an unserializable or oversized intent is
+    rejected before any write, exactly like the effect batch.
+    """
+    if not actions:
+        return []
+    if isinstance(actions, str | bytes) or not isinstance(actions, Sequence):
+        raise InvalidEffect("actions must be a sequence")
+    if len(actions) > MAX_ACTIONS_PER_DECISION:
+        raise InvalidEffect(f"a decision may emit at most {MAX_ACTIONS_PER_DECISION} actions")
+    intents: list[tuple[str, str]] = []
+    for action in actions:
+        if not isinstance(action, Mapping):
+            raise InvalidEffect("each action intent must be a mapping")
+        kind = action.get("kind")
+        request = action.get("request", {})
+        if not isinstance(kind, str) or not kind:
+            raise InvalidEffect("action kind must be a non-empty string")
+        if not isinstance(request, Mapping):
+            raise InvalidEffect("action request must be a mapping")
+        intents.append((kind, _canonical_payload(request, label="action request")))
+    return intents
+
+
 class WorkflowStore:
     """SQLite-backed durable store for workflow records and their lifecycle ledger."""
 
@@ -747,6 +786,7 @@ class WorkflowStore:
         expected_version: int,
         now: datetime,
         allowed_stages: frozenset[str] | None = None,
+        actions: Sequence[Mapping[str, object]] | None = None,
     ) -> TransitionOutcome:
         """Apply an effect batch atomically under compare-and-set and operation-key rules.
 
@@ -762,11 +802,19 @@ class WorkflowStore:
            raised.
         3. The batch then appends exactly one immutable event, advances the record by one
            ``state_version`` (its stage changes only if the batch carries a
-           ``record.transition``), upserts each ``overlay.set``, and binds the operation
-           key to its name, fingerprint, and event.
+           ``record.transition``), upserts each ``overlay.set``, binds the operation key to
+           its name, fingerprint, and event, and admits each of ``actions`` as a ``pending``
+           outbox row keyed by the committed event id. Admitting the action intents in this
+           same transaction is what makes a decision's declared side effects durable: a crash
+           after the commit leaves recoverable pending rows rather than losing the intent.
+
+        Because the action intents are admitted only on a genuinely new operation, an
+        idempotent replay does not re-admit them (the original apply's rows persist); the
+        caller resumes any still-pending rows rather than re-inserting.
         """
         _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
+        action_intents = _normalize_action_intents(actions)
         try:
             canonical_effects = _canonical_effects(normalized)
             batch_bytes = len(canonical_effects.encode("utf-8"))
@@ -907,6 +955,25 @@ class WorkflowStore:
                     timestamp,
                 ),
             )
+            # Admit the decision's action intents in the same transaction as the ledger commit,
+            # keyed by the committed event id and their index. They cannot collide with a
+            # caller-minted outbox key (reserved namespace) and are unique to this decision.
+            for index, (kind, canonical_request) in enumerate(action_intents):
+                db.execute(
+                    "INSERT INTO workflow_actions "
+                    "(action_id, record_id, dedupe_key, kind, request, status, result, "
+                    "last_error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?)",
+                    (
+                        _new_id(),
+                        record_id,
+                        f"{ACTION_DEDUPE_PREFIX}{event_id}:{index}",
+                        kind,
+                        canonical_request,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
             refreshed = db.execute(
                 "SELECT * FROM workflow_records WHERE record_id = ?", (record_id,)
             ).fetchone()

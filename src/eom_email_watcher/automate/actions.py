@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from .host import AutomateHost
-from .store import ActionView, InvalidEffect, WorkflowStore
+from .store import ACTION_PENDING, ActionView, InvalidEffect, WorkflowStore
 
 NOTIFY_LOCAL = "notify.local"
 NOTIFY = "notify"
@@ -190,6 +190,47 @@ class ActionRunner:
             raise ActionDeliveryError(
                 f"adapter for {kind!r} returned an unpersistable result: {exc}"
             ) from exc
+        return _outcome(settled, delivered=True)
+
+    def dispatch(self, view: ActionView, *, now: datetime) -> ActionOutcome:
+        """Deliver and settle an already-admitted pending action: the resume path.
+
+        Unlike :meth:`run`, this does not admit -- the intent was durably admitted with the
+        decision -- so it only resolves the adapter, delivers the committed request, and
+        settles or fails. It never raises for a per-action failure (a batch of a decision's
+        actions must not be aborted by one), reporting the outcome instead:
+
+        - a terminal row replays its recorded outcome with no delivery;
+        - a pending row whose kind has no configured adapter is left pending (durable intent)
+          and reported as pending, so a later dispatch once the adapter is configured resumes
+          it -- it is never released;
+        - a delivery error, a non-mapping result, or an unpersistable result terminalizes the
+          row as ``failed``.
+        """
+        self._host.require_license()
+        if view.status != ACTION_PENDING:
+            return _outcome(view, delivered=False)
+        try:
+            adapter = self._registry.resolve(view.kind)
+        except AdapterNotConfigured:
+            return _outcome(view, delivered=False)
+        try:
+            result = adapter.deliver(view.request)
+        except Exception as exc:
+            failed = self._store.fail_action(view.action_id, error=str(exc), now=now)
+            return _outcome(failed, delivered=True)
+        if not isinstance(result, Mapping):
+            failed = self._store.fail_action(
+                view.action_id, error="adapter returned a non-mapping result", now=now
+            )
+            return _outcome(failed, delivered=True)
+        try:
+            settled = self._store.settle_action(view.action_id, result=result, now=now)
+        except InvalidEffect as exc:
+            failed = self._store.fail_action(
+                view.action_id, error=f"adapter result could not be persisted: {exc}", now=now
+            )
+            return _outcome(failed, delivered=True)
         return _outcome(settled, delivered=True)
 
 
