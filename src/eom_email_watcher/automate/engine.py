@@ -110,11 +110,27 @@ class WorkflowEngine:
         its recorded event, not a re-match against the current definition set.
         """
         self._host.require_license()
+        # Validate untrusted inputs before any lookup: a non-string operation_key would
+        # otherwise reach lookup_operation and be matched by SQLite's TEXT affinity (int 7
+        # against a stored "7"), bypassing the store's identity guard on the replay path.
+        if not isinstance(operation_key, str) or not operation_key:
+            raise ValueError("operation_key must be a non-empty string")
+        if not isinstance(decision, str) or not decision:
+            raise ValueError("decision must be a non-empty string")
+        if not isinstance(request, Mapping):
+            raise ValueError("request must be a mapping")
         record = self._store.get_record(record_id)
         if record.workflow != workflow.name:
             raise WorkflowMismatch(
                 f"record {record_id!r} belongs to workflow {record.workflow!r}, "
                 f"not {workflow.name!r}"
+            )
+        if record.stage not in set(workflow.stages):
+            # The supplied workflow (a revision reusing the name) does not declare the
+            # record's current stage, so it cannot legitimately describe or transition it.
+            raise WorkflowMismatch(
+                f"record {record_id!r} is at stage {record.stage!r}, which workflow "
+                f"{workflow.name!r} does not declare"
             )
         prior = self._store.lookup_operation(record_id, operation_key)
         if prior is not None:

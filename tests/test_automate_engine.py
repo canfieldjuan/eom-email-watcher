@@ -325,6 +325,71 @@ def test_decision_refused_when_license_absent_even_for_existing_record(tmp_path:
         )
 
 
+def test_non_string_operation_key_is_rejected_before_lookup(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)
+    with pytest.raises(ValueError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key=7,  # type: ignore[arg-type]
+            request={},
+            expected_version=1,
+            now=NOW,
+        )
+
+
+def test_non_mapping_request_is_rejected(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)
+    with pytest.raises(ValueError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="start_review",
+            operation_key="op-1",
+            request=None,  # type: ignore[arg-type]
+            expected_version=1,
+            now=NOW,
+        )
+
+
+def test_record_stage_outside_supplied_workflow_is_rejected(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()  # stages: captured, reviewing, converted
+    record = engine.create_record(workflow, now=NOW)  # created at "captured"
+    # A same-named workflow revision whose stage set omits the record's current stage must
+    # not be able to describe or transition it.
+    replacement = Workflow.model_validate(
+        {
+            "name": "lead-funnel",
+            "stages": ["intake", "done"],
+            "initial_stage": "intake",
+            "definitions": [
+                {
+                    "name": "advance",
+                    "trigger": {"source_kind": "operator.decision", "decision": "advance"},
+                    "conditions": [],
+                    "effects": [{"kind": "record.transition", "to_stage": "done"}],
+                }
+            ],
+        }
+    )
+    with pytest.raises(WorkflowMismatch):
+        engine.submit_decision(
+            replacement,
+            record.record_id,
+            decision="advance",
+            operation_key="op-1",
+            request={},
+            expected_version=1,
+            now=NOW,
+        )
+
+
 def test_empty_decision_is_rejected_cleanly(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()

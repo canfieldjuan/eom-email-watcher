@@ -442,6 +442,18 @@ def test_get_overlays_unknown_record(tmp_path: Path) -> None:
         store.get_overlays("11111111-1111-4111-8111-111111111111")
 
 
+def test_lookup_operation_rejects_a_non_string_key(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(ValueError):
+        store.lookup_operation(record.record_id, 7)  # type: ignore[arg-type]
+
+
+def test_request_fingerprint_rejects_a_non_mapping() -> None:
+    with pytest.raises(ValueError):
+        request_fingerprint(None)  # type: ignore[arg-type]
+
+
 def test_apply_effects_rejects_a_batch_over_the_cap(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)

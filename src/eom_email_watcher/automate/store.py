@@ -204,6 +204,8 @@ def request_fingerprint(request: Mapping[str, object]) -> str:
     Keys are sorted and separators are fixed so the same logical request always yields the
     same fingerprint, and any change to the request yields a different one.
     """
+    if not isinstance(request, Mapping):
+        raise ValueError("request must be a mapping")
     canonical = json.dumps(dict(request), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -416,7 +418,12 @@ class WorkflowStore:
         retrying the same decision after the record has advanced replays the recorded
         outcome instead of re-matching against the new stage. The returned name and
         fingerprint let the caller detect a rotated key (same key, changed intent).
+
+        The key must be a non-empty string: SQLite's TEXT affinity would otherwise match a
+        non-string key (int 7 against a stored "7") and misreport a replay.
         """
+        if not isinstance(operation_key, str) or not operation_key:
+            raise ValueError("operation_key must be a non-empty string")
         with self.connection() as db:
             record = db.execute(
                 "SELECT * FROM workflow_records WHERE record_id = ?", (record_id,)
