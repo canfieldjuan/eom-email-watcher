@@ -809,12 +809,80 @@ def test_automation_submission_requires_connect_entitlement_before_provider_post
 
     outcome = engine_api._pump_generic_connect_lane(runtime, job)
 
-    failed = runtime.store.connect_job(job.job_id)
-    assert outcome["outcome"] == "failed"
+    paused_job = runtime.store.connect_job(job.job_id)
+    paused_fire = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    assert outcome["outcome"] == "entitlement_paused"
     assert submissions == 0
-    assert failed is not None
-    assert failed.status == "failed"
-    assert failed.error_code == "CONNECT_ENTITLEMENT_REQUIRED"
+    assert paused_job is not None
+    assert paused_job.status == "requested"
+    assert paused_fire is not None
+    assert paused_fire.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.state == "waiting"
+
+
+def test_connect_entitlement_is_rechecked_after_source_fetch_before_provider_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    connect_authorized = True
+    submissions = 0
+
+    class ExpiringGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            nonlocal connect_authorized
+            connect_authorized = False
+            return PDF
+
+    class CompletingClient:
+        def __init__(self, capability_value: connect.DiscoveredCapability) -> None:
+            assert capability_value == selected
+
+        def submit(
+            self, job_value: connect.PreparedCapabilityJob, content: bytes
+        ) -> connect.CapabilityJobUpdate:
+            nonlocal submissions
+            submissions += 1
+            return update(job_value, "completed", payload=b"must not submit")
+
+    def require_connect() -> None:
+        if not connect_authorized:
+            raise connect.ConnectError(
+                "CONNECT_ENTITLEMENT_REQUIRED",
+                "Connect requires an active license.",
+                retryable=False,
+            )
+
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        stub_lane=False,
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert job is not None
+    make_connect_job_due(runtime, job.job_id)
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiringGmail())
+    monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", require_connect)
+
+    outcome = engine_api._pump_generic_connect_lane(runtime, job)
+
+    paused_job = runtime.store.connect_job(job.job_id)
+    paused_fire = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    assert outcome["outcome"] == "entitlement_paused"
+    assert submissions == 0
+    assert paused_job is not None
+    assert paused_job.status == "requested"
+    assert paused_fire is not None
+    assert paused_fire.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.state == "waiting"
 
 
 def test_submission_authority_is_rechecked_after_lane_claim(
@@ -1985,7 +2053,8 @@ def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
     _, runtime = seeded_runtime(tmp_path)
     selected, fire, _attempt = seed_contract_fire(runtime)
     discovery_budgets: list[float] = []
-    source_budgets: list[float] = []
+    construction_budgets: list[float] = []
+    operation_budgets: list[float] = []
 
     def discover(**kwargs: object) -> connect.CapabilityCatalog:
         budget = kwargs.get("timeout_seconds")
@@ -1994,14 +2063,19 @@ def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
         return connect.CapabilityCatalog((selected,))
 
     class BudgetedGmail:
+        def set_operation_timeout(self, timeout_seconds: float) -> None:
+            operation_budgets.append(timeout_seconds)
+
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 
     def load_budgeted_gmail(*args: object) -> BudgetedGmail:
         assert len(args) == 3
-        budget = args[2]
+        remaining_timeout = args[2]
+        assert callable(remaining_timeout)
+        budget = remaining_timeout()
         assert isinstance(budget, float)
-        source_budgets.append(budget)
+        construction_budgets.append(budget)
         return BudgetedGmail()
 
     install_automation_dispatch_fakes(monkeypatch, runtime, discover)
@@ -2018,8 +2092,9 @@ def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
     assert submitted is not None
     assert submitted.state == "submitted"
     assert len(discovery_budgets) == 1
-    assert len(source_budgets) == 1
-    assert 0 < source_budgets[0] <= discovery_budgets[0] <= 5
+    assert len(construction_budgets) == 1
+    assert len(operation_budgets) == 1
+    assert 0 < operation_budgets[0] <= construction_budgets[0] <= discovery_budgets[0] <= 5
 
 
 def test_interactive_join_authorizes_automation_origin_job_submission(

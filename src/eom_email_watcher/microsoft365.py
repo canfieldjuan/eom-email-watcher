@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -394,12 +395,14 @@ class Microsoft365Gateway:
         cls,
         credentials_file: Path,
         token_file: Path,
-        timeout_seconds: float | None = None,
+        remaining_timeout: Callable[[], float] | None = None,
         *,
         client: httpx.Client | None = None,
     ) -> Microsoft365Gateway:
         operation_timeout = (
-            validate_operation_timeout(timeout_seconds) if timeout_seconds is not None else None
+            validate_operation_timeout(remaining_timeout())
+            if remaining_timeout is not None
+            else None
         )
         token_lock_timeout = (
             min(float(TOKEN_LOCK_TIMEOUT_SECONDS), operation_timeout)
@@ -413,10 +416,15 @@ class Microsoft365Gateway:
             with FileLock(f"{token_file}.lock", timeout=token_lock_timeout):
                 cache = _load_cache(token_file)
                 try:
+                    refresh_timeout = (
+                        validate_operation_timeout(remaining_timeout())
+                        if remaining_timeout is not None
+                        else None
+                    )
                     application = _new_public_client(
                         configuration,
                         cache,
-                        operation_timeout,
+                        refresh_timeout,
                     )
                 except Exception as exc:
                     raise Microsoft365Error(
@@ -448,8 +456,10 @@ class Microsoft365Gateway:
             client,
             cls._principal_identity(accounts[0]),
         )
-        if operation_timeout is not None:
-            gateway.set_operation_timeout(operation_timeout)
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(
+                validate_operation_timeout(remaining_timeout())
+            )
         return gateway
 
     @classmethod

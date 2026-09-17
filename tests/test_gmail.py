@@ -36,6 +36,7 @@ def test_from_token_bounds_refresh_and_authorized_transport(
     token_file.write_text("existing token", encoding="utf-8")
     refresh_timeouts: list[float] = []
     lock_timeouts: list[float] = []
+    remaining_timeouts = iter((0.25, 0.2, 0.15))
     transport = SimpleNamespace(timeout=30.0)
 
     class CapturingLock:
@@ -84,12 +85,16 @@ def test_from_token_bounds_refresh_and_authorized_transport(
         lambda *args, **kwargs: SimpleNamespace(_http=SimpleNamespace(http=transport)),
     )
 
-    gateway = GmailGateway.from_token(credentials_file, token_file, 0.25)
+    gateway = GmailGateway.from_token(
+        credentials_file,
+        token_file,
+        lambda: next(remaining_timeouts),
+    )
 
     assert gateway.service is not None
     assert lock_timeouts == [0.25]
-    assert refresh_timeouts == [0.25]
-    assert transport.timeout == 0.25
+    assert refresh_timeouts == [0.2]
+    assert transport.timeout == 0.15
 
 
 def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:

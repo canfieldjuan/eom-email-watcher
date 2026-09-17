@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -198,10 +199,12 @@ class GmailGateway:
         cls,
         credentials_file: Path,
         token_file: Path,
-        timeout_seconds: float | None = None,
+        remaining_timeout: Callable[[], float] | None = None,
     ) -> GmailGateway:
         operation_timeout = (
-            validate_operation_timeout(timeout_seconds) if timeout_seconds is not None else None
+            validate_operation_timeout(remaining_timeout())
+            if remaining_timeout is not None
+            else None
         )
         token_lock_timeout = (
             min(float(TOKEN_LOCK_TIMEOUT_SECONDS), operation_timeout)
@@ -228,7 +231,8 @@ class GmailGateway:
                 if credentials and credentials.expired and credentials.refresh_token:
                     try:
                         refresh_request = Request()
-                        if operation_timeout is not None:
+                        if remaining_timeout is not None:
+                            refresh_timeout = validate_operation_timeout(remaining_timeout())
                             unbounded_request = refresh_request
 
                             def refresh_request(*args: Any, **kwargs: Any) -> Any:
@@ -237,10 +241,10 @@ class GmailGateway:
                                         kwargs.get("timeout")
                                     )
                                 except ValueError:
-                                    requested_timeout = operation_timeout
+                                    requested_timeout = refresh_timeout
                                 kwargs["timeout"] = min(
                                     requested_timeout,
-                                    operation_timeout,
+                                    refresh_timeout,
                                 )
                                 return unbounded_request(*args, **kwargs)
 
@@ -265,8 +269,10 @@ class GmailGateway:
             build("gmail", "v1", credentials=credentials, cache_discovery=False),
             identity_key,
         )
-        if operation_timeout is not None:
-            gateway.set_operation_timeout(operation_timeout)
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(
+                validate_operation_timeout(remaining_timeout())
+            )
         return gateway
 
     @classmethod

@@ -1231,11 +1231,11 @@ class ImapGateway:
     def from_credentials_file(
         cls,
         path: Path,
-        timeout_seconds: float | None = None,
+        remaining_timeout: Callable[[], float] | None = None,
     ) -> ImapGateway:
         gateway = cls(load_credentials(path))
-        if timeout_seconds is not None:
-            gateway.set_operation_timeout(timeout_seconds)
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(remaining_timeout())
         return gateway
 
     def set_operation_timeout(self, timeout_seconds: float) -> None:

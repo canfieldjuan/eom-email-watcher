@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,7 +115,7 @@ def load_mailbox_account(
     store: Store,
     provider: str,
     account_id: str,
-    timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> MailboxSession:
     """Load one persisted mailbox account without changing the polling selection."""
     account = store.mail_account(provider, account_id)
@@ -124,16 +125,16 @@ def load_mailbox_account(
     if not token_file.is_file():
         raise MailboxAccountUnavailable("The selected email account is disconnected")
     if account.provider == DEFAULT_MAIL_PROVIDER:
-        if timeout_seconds is None:
+        if remaining_timeout is None:
             gateway = GmailGateway.from_token(config.gmail_credentials_file, token_file)
         else:
             gateway = GmailGateway.from_token(
                 config.gmail_credentials_file,
                 token_file,
-                timeout_seconds,
+                remaining_timeout,
             )
     elif account.provider == MICROSOFT365_PROVIDER:
-        if timeout_seconds is None:
+        if remaining_timeout is None:
             gateway = Microsoft365Gateway.from_token(
                 config.microsoft_credentials_file,
                 token_file,
@@ -142,13 +143,13 @@ def load_mailbox_account(
             gateway = Microsoft365Gateway.from_token(
                 config.microsoft_credentials_file,
                 token_file,
-                timeout_seconds,
+                remaining_timeout,
             )
     elif account.provider == IMAP_PROVIDER:
-        if timeout_seconds is None:
+        if remaining_timeout is None:
             gateway = ImapGateway.from_credentials_file(token_file)
         else:
-            gateway = ImapGateway.from_credentials_file(token_file, timeout_seconds)
+            gateway = ImapGateway.from_credentials_file(token_file, remaining_timeout)
     else:
         raise MailboxAccountUnavailable(
             "The selected email provider is not available in this build"

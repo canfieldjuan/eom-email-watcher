@@ -259,6 +259,7 @@ def test_silent_refresh_persists_updated_cache(
     calls: list[list[str]] = []
     client_timeouts: list[float] = []
     lock_timeouts: list[float] = []
+    remaining_timeouts = iter((0.25, 0.2, 0.15))
 
     class CapturingLock:
         def __init__(self, path: str, *, timeout: float) -> None:
@@ -301,16 +302,20 @@ def test_silent_refresh_persists_updated_cache(
         ),
     )
 
-    gateway = Microsoft365Gateway.from_token(credentials, token_file, 0.25)
+    gateway = Microsoft365Gateway.from_token(
+        credentials,
+        token_file,
+        lambda: next(remaining_timeouts),
+    )
 
     assert gateway.profile().email_address == "owner@example.com"
     assert calls == [["Mail.Read"]]
     assert lock_timeouts == [0.25]
-    assert client_timeouts == [0.25]
-    assert gateway._client.timeout.connect == 0.25
-    assert gateway._client.timeout.read == 0.25
-    assert gateway._client.timeout.write == 0.25
-    assert gateway._client.timeout.pool == 0.25
+    assert client_timeouts == [0.2]
+    assert gateway._client.timeout.connect == 0.15
+    assert gateway._client.timeout.read == 0.15
+    assert gateway._client.timeout.write == 0.15
+    assert gateway._client.timeout.pool == 0.15
     assert token_file.read_text(encoding="utf-8") == "refreshed-cache"
 
 

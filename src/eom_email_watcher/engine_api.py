@@ -2261,14 +2261,14 @@ def _retained_connect_message_source(runtime: Runtime, message_id: str) -> Messa
 def _configured_mailbox_gateway(
     runtime: Runtime,
     source: MessageSource,
-    timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> MailboxGateway:
     mailbox = load_mailbox_account(
         runtime.config,
         runtime.store,
         source.provider,
         source.account_id,
-        timeout_seconds,
+        remaining_timeout,
     )
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Mailbox identity changed while opening the provider")
@@ -2924,20 +2924,17 @@ def _defer_generic_connect_error(
     )
 
 
-def _require_connect_entitlement_for_job(
+def _persist_connect_entitlement_failure(
     runtime: Runtime,
     job_id: str,
     capability: connect.DiscoveredCapability,
+    failure: connect.ConnectError,
 ) -> None:
     try:
-        connect.require_connect_entitlement()
-    except connect.ConnectError as exc:
-        try:
-            _mark_connect_failed(runtime.store, job_id, capability, exc)
-        except Exception:
-            logger.exception("Connect entitlement failure could not be persisted")
-            raise RuntimeError("Connect entitlement failure could not be persisted safely") from exc
-        raise
+        _mark_connect_failed(runtime.store, job_id, capability, failure)
+    except Exception:
+        logger.exception("Connect entitlement failure could not be persisted")
+        raise RuntimeError("Connect entitlement failure could not be persisted safely") from failure
 
 
 def _defer_inactive_automation_job(
@@ -2974,7 +2971,22 @@ def _require_submission_authority_for_job(
         inactive_dispatch_state=inactive_dispatch_state,
     ):
         return False
-    _require_connect_entitlement_for_job(runtime, job_id, capability)
+    try:
+        connect.require_connect_entitlement()
+    except connect.ConnectError as exc:
+        if runtime.store.connect_job_requires_automation_entitlement(job_id):
+            current = runtime.store.connect_dispatch(job_id)
+            if current is None:
+                raise RuntimeError("Connect submission lost its dispatch state") from exc
+            _defer_inactive_automation_job(
+                runtime,
+                job_id,
+                expected_dispatch_state=current.state,
+                next_dispatch_state=inactive_dispatch_state,
+            )
+            return False
+        _persist_connect_entitlement_failure(runtime, job_id, capability, exc)
+        raise
     return True
 
 
@@ -3579,6 +3591,18 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                 try:
                     connect.require_connect_entitlement()
                 except connect.ConnectError as exc:
+                    if runtime.store.connect_job_requires_automation_entitlement(
+                        claimed_job.job_id
+                    ):
+                        _defer_inactive_automation_job(
+                            runtime,
+                            claimed_job.job_id,
+                            expected_dispatch_state=dispatch.state,
+                            next_dispatch_state="waiting",
+                        )
+                        return _connect_queue_item(
+                            runtime, head.job_id, "entitlement_paused"
+                        )
                     _fail_generic_connect_record(
                         runtime,
                         claimed_job,
@@ -3786,7 +3810,7 @@ def _generic_attachment_content(
     message_id: str,
     part_id: str,
     *,
-    timeout_seconds: float | None = None,
+    operation_deadline: float | None = None,
 ) -> bytes:
     try:
         current_attachment = runtime.store.attachment(message_id, part_id)
@@ -3798,7 +3822,14 @@ def _generic_attachment_content(
             "connect_source_unavailable",
             "The source attachment exceeds the local mailbox fetch limit.",
         )
-    gateway = _configured_mailbox_gateway(runtime, current_source, timeout_seconds)
+    remaining_timeout = (
+        (lambda: _remaining_automation_dispatch_seconds(operation_deadline))
+        if operation_deadline is not None
+        else None
+    )
+    gateway = _configured_mailbox_gateway(runtime, current_source, remaining_timeout)
+    if remaining_timeout is not None:
+        gateway.set_operation_timeout(remaining_timeout())
     return gateway.attachment_bytes(
         current_source.provider_message_id,
         part_id,
@@ -3855,12 +3886,11 @@ def _prepare_or_create_generic_connect_job(
     source_lock = _require_generic_connect_source_lock(runtime, message_id)
 
     def attachment_content() -> bytes:
-        timeout_seconds = _remaining_automation_dispatch_seconds(operation_deadline)
         return _generic_attachment_content(
             runtime,
             message_id,
             part_id,
-            timeout_seconds=timeout_seconds,
+            operation_deadline=operation_deadline,
         )
 
     with connect_operation_lock(
