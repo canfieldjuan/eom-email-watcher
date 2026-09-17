@@ -17,6 +17,7 @@ from eom_email_watcher.automate import (
     PackError,
     PackOwnershipError,
     PackRuntime,
+    PackVersionError,
     load_pack,
 )
 from eom_email_watcher.automate.store import WorkflowStore
@@ -677,6 +678,71 @@ def test_a_pack_cannot_drive_another_packs_record_with_the_same_workflow_name(
 
     # Pack A drives its own record normally.
     run = runtime_a.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.outcome.applied is True
+    assert run.outcome.record.stage == "reviewing"
+
+
+def test_an_upgraded_pack_cannot_drive_a_record_started_under_an_earlier_version(
+    tmp_path: Path,
+) -> None:
+    # Same signed pack id, two versions (an upgrade), over one shared store. A record is frozen
+    # to the version it started under: the upgraded runtime must not finish in-flight work.
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    host = _licensed_host(tmp_path)
+    registry = AdapterRegistry.with_defaults()
+
+    def pack_bytes(pack_version: int) -> bytes:
+        payload = json.dumps(
+            {
+                "format_version": 1,
+                "pack_id": PACK_ID,
+                "pack_version": pack_version,
+                "workflow": _workflow([NOTIFY_ACTION]),
+            },
+            separators=(",", ":"),
+        ).encode()
+        return _envelope(key, payload)
+
+    def make_runtime(pack_version: int) -> PackRuntime:
+        return PackRuntime.load(
+            pack_bytes(pack_version),
+            _grant_bytes(key),  # the grant is bound to pack_id, not version, so it serves both
+            store=store,
+            host=host,
+            registry=registry,
+            publisher_keys=_pack_keys(key),
+            grant_keys=_pack_keys(key),
+            subject=SUBJECT,
+            now=NOW,
+        )
+
+    runtime_v1 = make_runtime(1)
+    runtime_v2 = make_runtime(2)
+
+    record = runtime_v1.create_record(now=NOW)
+    assert record.pack_version == 1
+
+    with pytest.raises(PackVersionError):
+        runtime_v2.submit_decision(
+            record.record_id,
+            decision="review",
+            operation_key="op-1",
+            request={},
+            expected_version=record.state_version,
+            now=NOW,
+        )
+    assert store.get_record(record.record_id).stage == "captured"
+
+    # The originating version drives its own record normally.
+    run = runtime_v1.submit_decision(
         record.record_id,
         decision="review",
         operation_key="op-1",

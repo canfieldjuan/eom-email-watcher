@@ -1175,17 +1175,45 @@ def test_list_pending_actions_is_empty_when_nothing_is_pending(tmp_path: Path) -
 def test_create_record_persists_and_returns_the_pack_id(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record(
-        "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id="pack-a"
+        "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id="pack-a", pack_version=7
     )
     assert record.pack_id == "pack-a"
-    assert store.get_record(record.record_id).pack_id == "pack-a"
+    assert record.pack_version == 7
+    persisted = store.get_record(record.record_id)
+    assert persisted.pack_id == "pack-a"
+    assert persisted.pack_version == 7
 
 
 def test_create_record_pack_id_defaults_to_none(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
     assert record.pack_id is None
-    assert store.get_record(record.record_id).pack_id is None
+    assert record.pack_version is None
+    persisted = store.get_record(record.record_id)
+    assert persisted.pack_id is None
+    assert persisted.pack_version is None
+
+
+def test_create_record_rejects_pack_id_and_version_given_apart(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # A version without an identity, or an identity without a version, is meaningless.
+    with pytest.raises(ValueError):
+        store.create_record(
+            "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id="pack-a"
+        )
+    with pytest.raises(ValueError):
+        store.create_record(
+            "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_version=1
+        )
+
+
+def test_create_record_rejects_a_non_positive_pack_version(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(ValueError):
+        store.create_record(
+            "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id="pack-a",
+            pack_version=0,
+        )
 
 
 def test_create_record_rejects_an_empty_pack_id(tmp_path: Path) -> None:
