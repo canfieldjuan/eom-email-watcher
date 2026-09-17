@@ -18,6 +18,7 @@ plane arrive in later slices; the host gates admission of any transition behind
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -80,7 +81,6 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_delete
 BEFORE DELETE ON workflow_events
-WHEN EXISTS (SELECT 1 FROM workflow_records WHERE record_id = OLD.record_id)
 BEGIN
     SELECT RAISE(ABORT, 'workflow_events are immutable');
 END;
@@ -155,6 +155,12 @@ def _new_id() -> str:
     return str(uuid.uuid4())
 
 
+def _restrict(path: Path, mode: int) -> None:
+    """Best-effort chmod; tolerated where the platform cannot honor POSIX modes."""
+    with contextlib.suppress(OSError, NotImplementedError):
+        path.chmod(mode)
+
+
 def _record_view(row: sqlite3.Row) -> RecordView:
     return RecordView(
         record_id=row["record_id"],
@@ -188,10 +194,21 @@ class WorkflowStore:
             connection.close()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir does not tighten an already-existing directory, and SQLite creates the
+        # database file under the process umask (often 0644). This ledger holds private
+        # record names and stages, so restrict both the directory and the file to the
+        # owner, mirroring the entitlement store's 0700/0600 handling.
+        _restrict(parent, 0o700)
         with self.connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(_SCHEMA)
+        _restrict(self.path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = self.path.with_name(self.path.name + suffix)
+            if sidecar.exists():
+                _restrict(sidecar, 0o600)
 
     def create_record(
         self,
@@ -277,13 +294,33 @@ class WorkflowStore:
                 (record_id, operation_key),
             ).fetchone()
             if prior is not None:
+                prior_event = db.execute(
+                    "SELECT next_stage, state_version, created_at "
+                    "FROM workflow_events WHERE event_id = ?",
+                    (prior["event_id"],),
+                ).fetchone()
+                # The destination stage is part of the operation's identity: the same key
+                # with a changed name, request, or target stage is a different intent and
+                # must conflict rather than replay.
                 if (
                     prior["operation_name"] != operation_name
                     or prior["request_fingerprint"] != fingerprint
+                    or prior_event["next_stage"] != to_stage
                 ):
                     raise OperationConflict(operation_key=operation_key)
+                # Return the prior outcome reconstructed from the event, not the current
+                # projection, so a replay after the record has advanced still reports the
+                # stage and version this operation produced.
+                replayed = RecordView(
+                    record_id=record_id,
+                    workflow=record["workflow"],
+                    stage=prior_event["next_stage"],
+                    state_version=prior_event["state_version"],
+                    created_at=record["created_at"],
+                    updated_at=prior_event["created_at"],
+                )
                 return TransitionOutcome(
-                    record=_record_view(record),
+                    record=replayed,
                     event_id=prior["event_id"],
                     applied=False,
                 )
