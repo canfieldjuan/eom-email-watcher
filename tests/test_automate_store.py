@@ -1170,3 +1170,27 @@ def test_list_pending_actions_is_empty_when_nothing_is_pending(tmp_path: Path) -
     )
     store.settle_action(admission.view.action_id, result={"ok": True}, now=NOW)
     assert store.list_pending_actions() == []
+
+
+def test_create_record_persists_and_returns_the_pack_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record(
+        "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id="pack-a"
+    )
+    assert record.pack_id == "pack-a"
+    assert store.get_record(record.record_id).pack_id == "pack-a"
+
+
+def test_create_record_pack_id_defaults_to_none(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    assert record.pack_id is None
+    assert store.get_record(record.record_id).pack_id is None
+
+
+def test_create_record_rejects_an_empty_pack_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(ValueError):
+        store.create_record(
+            "lead-funnel", "captured", now=NOW, allowed_stages=STAGES, pack_id=""
+        )

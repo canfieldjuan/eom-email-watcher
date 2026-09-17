@@ -35,6 +35,7 @@ from .engine import (
     AmbiguousDecision,
     DecisionOutcome,
     EngineError,
+    PackOwnershipError,
     WorkflowEngine,
     WorkflowMismatch,
 )
@@ -98,6 +99,7 @@ __all__ = [
     "PackError",
     "PackGrant",
     "PackManifest",
+    "PackOwnershipError",
     "PackRuntime",
     "RecordView",
     "StaleRecord",

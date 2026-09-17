@@ -80,6 +80,7 @@ BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS workflow_records (
     record_id TEXT PRIMARY KEY CHECK (length(record_id) = 36),
     workflow TEXT NOT NULL CHECK (workflow <> ''),
+    pack_id TEXT CHECK (pack_id IS NULL OR pack_id <> ''),
     stage TEXT NOT NULL CHECK (stage <> ''),
     state_version INTEGER NOT NULL CHECK (state_version >= 1),
     created_at TEXT NOT NULL,
@@ -237,6 +238,10 @@ class RecordView:
     state_version: int
     created_at: str
     updated_at: str
+    # The identity of the signed pack that created this record, when it was created through a
+    # PackRuntime. None for a record created directly against a bare workflow (the pre-pack
+    # slices). Write-once at creation, so an ownership check that reads it is race-free.
+    pack_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -394,6 +399,7 @@ def _record_view(row: sqlite3.Row) -> RecordView:
         state_version=row["state_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        pack_id=row["pack_id"],
     )
 
 
@@ -406,6 +412,7 @@ def _replay_view(record: sqlite3.Row, event: sqlite3.Row) -> RecordView:
         state_version=event["state_version"],
         created_at=record["created_at"],
         updated_at=event["created_at"],
+        pack_id=record["pack_id"],
     )
 
 
@@ -579,19 +586,27 @@ class WorkflowStore:
         *,
         now: datetime,
         allowed_stages: frozenset[str] | None = None,
+        pack_id: str | None = None,
     ) -> RecordView:
-        """Create a workflow record with a bootstrap ledger event at state_version 1."""
+        """Create a workflow record with a bootstrap ledger event at state_version 1.
+
+        ``pack_id`` binds the record to the signed pack that created it (set by a
+        PackRuntime). It is stored once and never changed, so a later ownership check can
+        rely on it. ``None`` leaves the record unbound, for a bare-workflow record.
+        """
         if allowed_stages is not None and initial_stage not in allowed_stages:
             raise ValueError(f"stage {initial_stage!r} is not in the allowed set")
+        if pack_id is not None and (not isinstance(pack_id, str) or not pack_id):
+            raise ValueError("pack_id must be a non-empty string or None")
         record_id = _new_id()
         timestamp = now.isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 "INSERT INTO workflow_records "
-                "(record_id, workflow, stage, state_version, created_at, updated_at) "
-                "VALUES (?, ?, ?, 1, ?, ?)",
-                (record_id, workflow, initial_stage, timestamp, timestamp),
+                "(record_id, workflow, pack_id, stage, state_version, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (record_id, workflow, pack_id, initial_stage, timestamp, timestamp),
             )
             db.execute(
                 "INSERT INTO workflow_events "
