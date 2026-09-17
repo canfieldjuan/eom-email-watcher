@@ -1860,9 +1860,51 @@ def test_submitted_interactive_join_pauses_before_terminal_settlement(
     engine_api._settle_submitted_automation_fires(runtime, limit=25)
 
     paused = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(submitted.job_id)
     assert paused is not None
     assert paused.state == "entitlement_paused"
     assert paused.reason == "entitlement_inactive"
+    assert dispatch is not None
+    assert dispatch.automation_paused_at is None
+
+
+def test_automation_dispatch_bounds_discovery_and_source_fetch_to_phase_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, _attempt = seed_contract_fire(runtime)
+    discovery_budgets: list[float] = []
+    source_budgets: list[float] = []
+
+    def discover(**kwargs: object) -> connect.CapabilityCatalog:
+        budget = kwargs.get("timeout_seconds")
+        assert isinstance(budget, float)
+        discovery_budgets.append(budget)
+        return connect.CapabilityCatalog((selected,))
+
+    class BudgetedGmail:
+        def set_operation_timeout(self, timeout_seconds: float) -> None:
+            source_budgets.append(timeout_seconds)
+
+        def attachment_bytes(self, *args: object) -> bytes:
+            return PDF
+
+    install_automation_dispatch_fakes(monkeypatch, runtime, discover)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: BudgetedGmail(),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    engine_api._dispatch_automation_fires(runtime, limit=25)
+
+    submitted = runtime.store.automation_fire(fire.fire_id)
+    assert submitted is not None
+    assert submitted.state == "submitted"
+    assert len(discovery_budgets) == 1
+    assert len(source_budgets) == 1
+    assert 0 < source_budgets[0] <= discovery_budgets[0] <= 5
 
 
 def test_interactive_join_authorizes_automation_origin_job_submission(
@@ -3185,6 +3227,9 @@ def install_automation_dispatch_fakes(
     stub_lane: bool = True,
 ) -> None:
     class FakeGmail:
+        def set_operation_timeout(self, _timeout_seconds: float) -> None:
+            return
+
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 

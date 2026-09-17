@@ -878,10 +878,27 @@ def _http_error_v2(response: httpx.Response) -> ConnectError:
     )
 
 
-def _client() -> httpx.Client:
+def _client(timeout_seconds: float | None = None) -> httpx.Client:
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("Connect timeout must be a positive finite number")
+    if timeout_seconds is None:
+        timeout = httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0)
+    else:
+        bounded = float(timeout_seconds)
+        timeout = httpx.Timeout(
+            connect=min(1.0, bounded),
+            read=min(10.0, bounded),
+            write=min(60.0, bounded),
+            pool=min(1.0, bounded),
+        )
     return httpx.Client(
         follow_redirects=False,
-        timeout=httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0),
+        timeout=timeout,
         trust_env=False,
     )
 
@@ -1046,6 +1063,7 @@ def _discover_capabilities(
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
     require_entitlement: bool = True,
+    timeout_seconds: float | None = None,
 ) -> CapabilityCatalog:
     if require_entitlement and not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
@@ -1062,7 +1080,7 @@ def _discover_capabilities(
         return CapabilityCatalog((), "provider_unavailable")
 
     owned_client = client is None
-    active_client = client or _client()
+    active_client = client or _client(timeout_seconds)
     providers: dict[str, tuple[DiscoveredCapability, ...]] = {}
     conflicting_instances: set[str] = set()
     try:
@@ -1140,12 +1158,14 @@ def discover_capabilities(
     *,
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> CapabilityCatalog:
     return _discover_capabilities(
         runtime_dir,
         client=client,
         provider_instance_id=provider_instance_id,
         require_entitlement=True,
+        timeout_seconds=timeout_seconds,
     )
 
 

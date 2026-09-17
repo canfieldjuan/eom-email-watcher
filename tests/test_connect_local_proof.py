@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 PROOF_SCRIPT = runpy.run_path(str(SCRIPTS_DIR / "connect-local-proof.py"))
 FIXTURE_PART_ID = PROOF_SCRIPT["FIXTURE_PART_ID"]
 FIXTURE_MODEL_DIGEST = PROOF_SCRIPT["FIXTURE_MODEL_DIGEST"]
+FIXTURE_MAILBOX_IDENTITY_KEY = PROOF_SCRIPT["FIXTURE_MAILBOX_IDENTITY_KEY"]
 FixtureModelHandler = PROOF_SCRIPT["FixtureModelHandler"]
 install_fixture_mailbox = PROOF_SCRIPT["install_fixture_mailbox"]
 require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
@@ -27,7 +28,6 @@ privacy_projection = PROOF_SCRIPT["privacy_projection"]
 request = PROOF_SCRIPT["request"]
 write_config = PROOF_SCRIPT["write_config"]
 write_private_contract_summary = PROOF_SCRIPT["write_private_contract_summary"]
-TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
 def test_fixture_model_serves_native_identity_and_stream() -> None:
@@ -112,7 +112,7 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
     runtime.store.reconcile_mailbox_identity(
         DEFAULT_MAIL_PROVIDER,
         DEFAULT_MAIL_ACCOUNT_ID,
-        TEST_MAILBOX_IDENTITY_KEY,
+        FIXTURE_MAILBOX_IDENTITY_KEY,
         legacy_status="replacement",
     )
     runtime.store.add_message(
@@ -124,7 +124,7 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         received_at="2026-08-29T12:00:00+00:00",
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
-        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
     )
     runtime.store.replace_attachments(
         "fixture-message",

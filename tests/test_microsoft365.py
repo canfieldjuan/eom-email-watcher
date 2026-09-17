@@ -28,6 +28,21 @@ CLIENT_ID = "11111111-2222-4333-8444-555555555555"
 TENANT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
+def test_microsoft_operation_timeout_reaches_graph_transport() -> None:
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+    try:
+        gateway = Microsoft365Gateway("token", "owner@example.com", client)
+
+        gateway.set_operation_timeout(0.25)
+
+        assert client.timeout.connect == 0.25
+        assert client.timeout.read == 0.25
+        assert client.timeout.write == 0.25
+        assert client.timeout.pool == 0.25
+    finally:
+        client.close()
+
+
 def write_public_client(path: Path, *, tenant: str = "organizations") -> None:
     path.write_text(
         json.dumps({"client_id": CLIENT_ID, "tenant": tenant}),

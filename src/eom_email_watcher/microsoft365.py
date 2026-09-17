@@ -27,6 +27,7 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, html_to_text
 
@@ -375,6 +376,9 @@ class Microsoft365Gateway:
         if self._mailbox_identity_key is None:
             raise MicrosoftAuthorizationRejected("Microsoft mailbox identity is unavailable")
         return self._mailbox_identity_key
+
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        self._client.timeout = httpx.Timeout(validate_operation_timeout(timeout_seconds))
 
     def mailbox_address(self) -> str:
         return self._email_address

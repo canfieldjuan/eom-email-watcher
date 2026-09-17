@@ -2566,6 +2566,23 @@ def _pause_linked_automation_fires(
     return paused.rowcount
 
 
+def _connect_job_requires_automation_entitlement(
+    db: sqlite3.Connection,
+    job_id: str,
+) -> bool:
+    row = db.execute(
+        """SELECT 1
+        FROM automation_fire_attempts AS attempt
+        JOIN connect_job_dispatch AS dispatch
+          ON dispatch.job_id = attempt.dispatch_request_id
+        WHERE attempt.dispatch_request_id = ?
+          AND dispatch.interactive_authorized_at IS NULL
+        LIMIT 1""",
+        (job_id,),
+    ).fetchone()
+    return row is not None
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -3656,14 +3673,19 @@ class Store:
             if next_state == "awaiting_confirmation" and next_prepared_json is None:
                 raise ValueError("Confirmation requires a prepared invocation identity")
             if next_state == "entitlement_paused" and next_job_id is not None:
-                paused = db.execute(
-                    """UPDATE connect_job_dispatch
-                    SET automation_paused_at = COALESCE(automation_paused_at, ?)
-                    WHERE job_id = ?""",
-                    (stamp, next_job_id),
-                )
-                if paused.rowcount != 1:
+                dispatch = db.execute(
+                    "SELECT 1 FROM connect_job_dispatch WHERE job_id = ?",
+                    (next_job_id,),
+                ).fetchone()
+                if dispatch is None:
                     raise RuntimeError("Automation entitlement pause lost its Connect job")
+                if _connect_job_requires_automation_entitlement(db, next_job_id):
+                    db.execute(
+                        """UPDATE connect_job_dispatch
+                        SET automation_paused_at = COALESCE(automation_paused_at, ?)
+                        WHERE job_id = ?""",
+                        (stamp, next_job_id),
+                    )
             if next_state == "submitted":
                 assert next_job_id is not None
                 _resume_automation_dispatch(
@@ -3886,17 +3908,7 @@ class Store:
 
     def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
         with self.connection() as db:
-            row = db.execute(
-                """SELECT 1
-                FROM automation_fire_attempts AS attempt
-                JOIN connect_job_dispatch AS dispatch
-                  ON dispatch.job_id = attempt.dispatch_request_id
-                WHERE attempt.dispatch_request_id = ?
-                  AND dispatch.interactive_authorized_at IS NULL
-                LIMIT 1""",
-                (job_id,),
-            ).fetchone()
-        return row is not None
+            return _connect_job_requires_automation_entitlement(db, job_id)
 
     def automation_fire_settlement_due(self) -> bool:
         with self.connection() as db:
@@ -5412,10 +5424,19 @@ class Store:
                         raise sqlite3.IntegrityError("Connect job identity already exists")
                     return self._connect_job(existing)
                 lane_size = db.execute(
-                    """SELECT COUNT(*) FROM connect_attachment_jobs
-                    WHERE protocol_version = 2
-                      AND provider_app_id = ? AND provider_instance_id = ?
-                      AND status IN ('requested', 'accepted', 'processing')""",
+                    """SELECT COUNT(*)
+                    FROM connect_attachment_jobs AS job
+                    JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+                    WHERE job.protocol_version = 2
+                      AND job.provider_app_id = ? AND job.provider_instance_id = ?
+                      AND job.status IN ('requested', 'accepted', 'processing')
+                      AND dispatch.state IN (
+                        'waiting', 'dispatching', 'reconciling', 'provider_owned'
+                      )
+                      AND (
+                        dispatch.automation_paused_at IS NULL
+                        OR dispatch.state IN ('dispatching', 'reconciling', 'provider_owned')
+                      )""",
                     (provider_app_id, provider_instance_id),
                 ).fetchone()[0]
                 if int(lane_size) >= CONNECT_QUEUE_MAX_JOBS:

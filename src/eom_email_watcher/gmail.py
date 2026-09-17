@@ -28,6 +28,7 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    validate_operation_timeout,
 )
 from .mime import extract_body
 
@@ -180,6 +181,14 @@ class GmailGateway:
         if self._mailbox_identity_key is None:
             raise GmailAuthorizationRejected("Gmail mailbox identity is unavailable")
         return self._mailbox_identity_key
+
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        timeout = validate_operation_timeout(timeout_seconds)
+        authorized_http = getattr(self.service, "_http", None)
+        transport = getattr(authorized_http, "http", authorized_http)
+        if transport is None or not hasattr(transport, "timeout"):
+            raise GmailError("Gmail transport timeout cannot be configured")
+        transport.timeout = timeout
 
     def mailbox_address(self) -> str:
         return self.profile().email_address

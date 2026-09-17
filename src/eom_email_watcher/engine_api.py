@@ -10,6 +10,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -145,6 +146,7 @@ from .service import (
 )
 
 PROTOCOL_VERSION = 1
+AUTOMATION_DISPATCH_PHASE_SECONDS = 5.0
 MAX_REQUEST_BYTES = 1_000_000
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 MAX_INBOX_CURSOR_BYTES = 1024
@@ -2393,10 +2395,18 @@ def _discover_selected_generic_capability(
     provider: dict[str, str],
     capability_ref: dict[str, str],
     parameters: dict[str, object],
+    *,
+    timeout_seconds: float | None = None,
 ) -> tuple[connect.DiscoveredCapability, dict[str, str | int | bool]]:
 
     instance_id = str(provider["instance_id"])
-    catalog = connect.discover_capabilities(provider_instance_id=instance_id)
+    if timeout_seconds is None:
+        catalog = connect.discover_capabilities(provider_instance_id=instance_id)
+    else:
+        catalog = connect.discover_capabilities(
+            provider_instance_id=instance_id,
+            timeout_seconds=timeout_seconds,
+        )
     provider_items = tuple(
         item
         for item in catalog.items
@@ -3759,7 +3769,13 @@ def _validate_existing_invocation_identity(
         )
 
 
-def _generic_attachment_content(runtime: Runtime, message_id: str, part_id: str) -> bytes:
+def _generic_attachment_content(
+    runtime: Runtime,
+    message_id: str,
+    part_id: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> bytes:
     try:
         current_attachment = runtime.store.attachment(message_id, part_id)
     except KeyError as exc:
@@ -3771,6 +3787,8 @@ def _generic_attachment_content(runtime: Runtime, message_id: str, part_id: str)
             "The source attachment exceeds the local mailbox fetch limit.",
         )
     gateway = _configured_mailbox_gateway(runtime, current_source)
+    if timeout_seconds is not None:
+        gateway.set_operation_timeout(timeout_seconds)
     return gateway.attachment_bytes(
         current_source.provider_message_id,
         part_id,
@@ -3793,6 +3811,7 @@ def _prepare_or_create_generic_connect_job(
     join_effectful: bool = True,
     interactive_authorized: bool = False,
     candidate_check: Callable[[connect.PreparedCapabilityJob], None] | None = None,
+    operation_deadline: float | None = None,
 ) -> tuple[
     connect.PreparedCapabilityJob,
     ConnectJob | None,
@@ -3826,7 +3845,13 @@ def _prepare_or_create_generic_connect_job(
     source_lock = _require_generic_connect_source_lock(runtime, message_id)
 
     def attachment_content() -> bytes:
-        return _generic_attachment_content(runtime, message_id, part_id)
+        timeout_seconds = _remaining_automation_dispatch_seconds(operation_deadline)
+        return _generic_attachment_content(
+            runtime,
+            message_id,
+            part_id,
+            timeout_seconds=timeout_seconds,
+        )
 
     with connect_operation_lock(
         source_lock,
@@ -4121,7 +4146,25 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
         )
 
 
-def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
+class _AutomationDispatchBudgetExhausted(RuntimeError):
+    pass
+
+
+def _remaining_automation_dispatch_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _AutomationDispatchBudgetExhausted
+    return remaining
+
+
+def _dispatch_automation_fire(
+    runtime: Runtime,
+    fire_id: str,
+    *,
+    operation_deadline: float | None = None,
+) -> None:
     fire = runtime.store.automation_fire(fire_id)
     if fire is None or fire.state not in {"pending_dispatch", "entitlement_paused"}:
         return
@@ -4248,6 +4291,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             provider_ref,
             capability_ref,
             requested_parameters,
+            timeout_seconds=_remaining_automation_dispatch_seconds(operation_deadline),
         )
         confirmation_needed = (
             definition.confirm_each
@@ -4267,6 +4311,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
                 confirmed=True,
                 create_job=False,
                 artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
+                operation_deadline=operation_deadline,
             )
             prepared_identity = _automation_prepared_identity(
                 fire.fire_id, definition, capability, candidate
@@ -4328,6 +4373,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             join_completed=True,
             join_effectful=False,
             candidate_check=check_admission_authority,
+            operation_deadline=operation_deadline,
         )
         if created is None:
             raise RuntimeError("Automation admission did not create or join a Connect job")
@@ -4394,16 +4440,23 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
 
 
 def _dispatch_automation_fires(runtime: Runtime, *, limit: int) -> None:
-    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    deadline = time.monotonic() + AUTOMATION_DISPATCH_PHASE_SECONDS
     fires = runtime.store.automation_fires_in_states(
         ("pending_dispatch", "entitlement_paused"),
         limit=limit,
     )
     for fire in fires:
-        if datetime.now(UTC) >= deadline:
+        if time.monotonic() >= deadline:
             break
+        budget_exhausted = False
         try:
-            _dispatch_automation_fire(runtime, fire.fire_id)
+            _dispatch_automation_fire(
+                runtime,
+                fire.fire_id,
+                operation_deadline=deadline,
+            )
+        except _AutomationDispatchBudgetExhausted:
+            budget_exhausted = True
         except RuntimeError as exc:
             if "expected-state race" not in str(exc):
                 raise
@@ -4418,6 +4471,8 @@ def _dispatch_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 expected_state=fire.state,
                 expected_version=fire.state_version,
             )
+        if budget_exhausted:
+            break
 
 
 def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:

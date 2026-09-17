@@ -30,6 +30,7 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, html_to_text
 
@@ -1222,6 +1223,7 @@ class ImapGateway:
     ):
         self.credentials = credentials
         self._mailbox_id = imap_mailbox_identity(credentials)
+        self._operation_timeout_seconds = IMAP_TIMEOUT_SECONDS
         self._client_factory = client_factory or self._default_client
         self._active_client: imaplib.IMAP4 | None = None
 
@@ -1229,19 +1231,25 @@ class ImapGateway:
     def from_credentials_file(cls, path: Path) -> ImapGateway:
         return cls(load_credentials(path))
 
-    @staticmethod
-    def _default_client(credentials: ImapCredentials, context: ssl.SSLContext) -> imaplib.IMAP4:
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        self._operation_timeout_seconds = validate_operation_timeout(timeout_seconds)
+
+    def _default_client(
+        self,
+        credentials: ImapCredentials,
+        context: ssl.SSLContext,
+    ) -> imaplib.IMAP4:
         if credentials.security == "tls":
             return imaplib.IMAP4_SSL(
                 credentials.host,
                 credentials.port,
                 ssl_context=context,
-                timeout=IMAP_TIMEOUT_SECONDS,
+                timeout=self._operation_timeout_seconds,
             )
         client = imaplib.IMAP4(
             credentials.host,
             credentials.port,
-            timeout=IMAP_TIMEOUT_SECONDS,
+            timeout=self._operation_timeout_seconds,
         )
         try:
             status, _response = client.starttls(ssl_context=context)

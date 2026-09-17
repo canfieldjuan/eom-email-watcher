@@ -16,6 +16,17 @@ from eom_email_watcher.gmail import (
 )
 
 
+def test_gmail_operation_timeout_reaches_authorized_transport() -> None:
+    transport = SimpleNamespace(timeout=30.0)
+    gateway = GmailGateway(SimpleNamespace(_http=SimpleNamespace(http=transport)))
+
+    gateway.set_operation_timeout(0.25)
+
+    assert transport.timeout == 0.25
+    with pytest.raises(ValueError, match="positive finite"):
+        gateway.set_operation_timeout(0)
+
+
 def test_parse_metadata_uses_internal_date_and_normalized_from() -> None:
     parsed = parse_metadata(
         {

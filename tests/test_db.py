@@ -4048,6 +4048,42 @@ def test_connect_v2_lane_cap_checks_replay_before_boundary(tmp_path: Path) -> No
     assert all(store.connect_job(job_id).status == "failed" for job_id in job_ids)  # type: ignore[union-attr]
 
 
+def test_connect_v2_lane_cap_excludes_paused_waiting_automation_jobs(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    for index in range(CONNECT_QUEUE_MAX_JOBS):
+        create_v2_connect_job(
+            store,
+            f"00000000-0000-4000-8000-{index:012d}",
+            parameters={"sequence": index},
+            now=created_at,
+        )
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET automation_paused_at = ? WHERE state = 'waiting'""",
+            ((created_at + timedelta(minutes=1)).isoformat(),),
+        )
+
+    interactive_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    create_v2_connect_job(
+        store,
+        interactive_id,
+        parameters={"sequence": CONNECT_QUEUE_MAX_JOBS},
+        now=created_at + timedelta(minutes=1),
+    )
+
+    created = store.connect_job(interactive_id)
+    dispatch = store.connect_dispatch(interactive_id)
+    assert created is not None
+    assert dispatch is not None
+    assert dispatch.automation_paused_at is None
+
+
 def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()

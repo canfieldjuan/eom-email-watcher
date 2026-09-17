@@ -29,6 +29,23 @@ def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.parametrize("invalid", [0, float("inf")])
+def test_connect_client_timeout_requires_positive_finite_budget(invalid: float) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        connect._client(invalid)
+
+
+def test_connect_client_caps_every_http_phase_to_operation_budget() -> None:
+    client = connect._client(0.25)
+    try:
+        assert client.timeout.connect == 0.25
+        assert client.timeout.read == 0.25
+        assert client.timeout.write == 0.25
+        assert client.timeout.pool == 0.25
+    finally:
+        client.close()
+
+
 def registration(
     *,
     instance_id: str,

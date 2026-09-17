@@ -164,6 +164,27 @@ def credentials() -> ImapCredentials:
     )
 
 
+def test_imap_operation_timeout_reaches_socket_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def open_imap(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", open_imap)
+    gateway = ImapGateway(credentials())
+    gateway.set_operation_timeout(0.25)
+
+    opened = gateway._default_client(credentials(), ssl.create_default_context())
+
+    assert opened is sentinel
+    assert captured["kwargs"]["timeout"] == 0.25  # type: ignore[index]
+
+
 def cursor(uid: int = 7, *, uid_validity: int = 44, values: ImapCredentials | None = None) -> str:
     mailbox_id = imap_mailbox_identity(values or credentials())
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
