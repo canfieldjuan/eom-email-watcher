@@ -2930,6 +2930,7 @@ def _defer_inactive_automation_job(
         error_code="entitlement_inactive",
         error_message="Automation entitlements are inactive.",
         delay_seconds=30,
+        pause_automation_deadline=True,
     )
     for fire in runtime.store.automation_fires_linked_to_job(job_id):
         if fire.state == "submitted":
@@ -3668,6 +3669,25 @@ def _tracked_invocation_job(
     return tracked
 
 
+def _reject_disallowed_effectful_join(
+    runtime: Runtime,
+    job: ConnectJob,
+    *,
+    join_effectful: bool,
+) -> None:
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    if dispatch is None:
+        raise RuntimeError("Connect v2 job is missing its durable dispatch authority")
+    if not join_effectful and (
+        dispatch.capability_external_effects
+        or dispatch.capability_confirmation_required
+    ):
+        raise ApiError(
+            "effectful_job_active",
+            "An effectful invocation is already active for this attachment.",
+        )
+
+
 def _validate_existing_invocation_identity(
     job: ConnectJob,
     *,
@@ -3842,13 +3862,11 @@ def _prepare_or_create_generic_connect_job(
                 part_id=part_id,
                 parameters=parameters,
             )
-            if not join_effectful and (
-                capability.external_effects or capability.confirmation_required
-            ):
-                raise ApiError(
-                    "effectful_job_active",
-                    "An effectful invocation is already active for this attachment.",
-                )
+            _reject_disallowed_effectful_join(
+                runtime,
+                joined,
+                join_effectful=join_effectful,
+            )
             return candidate, joined, True, attachment_content
         try:
             created = runtime.store.create_connect_job(
@@ -3887,6 +3905,11 @@ def _prepare_or_create_generic_connect_job(
                 part_id=part_id,
                 parameters=parameters,
             )
+            _reject_disallowed_effectful_join(
+                runtime,
+                exact,
+                join_effectful=join_effectful,
+            )
             return candidate, exact, True, attachment_content
         collision = created.job_id != candidate.job_id
         if collision:
@@ -3897,13 +3920,11 @@ def _prepare_or_create_generic_connect_job(
                 part_id=part_id,
                 parameters=parameters,
             )
-            if not join_effectful and (
-                capability.external_effects or capability.confirmation_required
-            ):
-                raise ApiError(
-                    "effectful_job_active",
-                    "An effectful invocation is already active for this attachment.",
-                )
+            _reject_disallowed_effectful_join(
+                runtime,
+                created,
+                join_effectful=join_effectful,
+            )
         return candidate, created, collision, attachment_content
 
 
@@ -4190,6 +4211,18 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
 
             candidate_check = check_candidate
             confirmed = True
+        identity_check = candidate_check
+
+        def check_admission_authority(candidate: connect.PreparedCapabilityJob) -> None:
+            if identity_check is not None:
+                identity_check(candidate)
+            connect.require_connect_entitlement()
+            if not _automation_entitlement_active():
+                raise connect.ConnectError(
+                    "ENTITLEMENT_REQUIRED",
+                    "Automation provider submission requires active entitlements.",
+                )
+
         _candidate, created, _collision, _content = _prepare_or_create_generic_connect_job(
             runtime,
             request_id=attempt.dispatch_request_id,
@@ -4201,7 +4234,7 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
             join_completed=True,
             join_effectful=False,
-            candidate_check=candidate_check,
+            candidate_check=check_admission_authority,
         )
         if created is None:
             raise RuntimeError("Automation admission did not create or join a Connect job")

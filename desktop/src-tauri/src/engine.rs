@@ -299,6 +299,21 @@ pub struct InboxAttachment {
     pub byte_size: u64,
     #[serde(default)]
     pub capability_results: Vec<AttachmentCapabilityResult>,
+    #[serde(default)]
+    pub automation_fires: Vec<AutomationFireProjection>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomationFireProjection {
+    pub fire_id: String,
+    pub rule_id: String,
+    pub rule_version: u64,
+    pub state: String,
+    pub state_version: u64,
+    pub reason: Option<String>,
+    pub job_id: Option<String>,
+    pub prepared_identity_sha256: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1711,6 +1726,38 @@ mod tests {
         assert_eq!(item.category, None);
         assert_eq!(item.provider, "gmail");
         assert_eq!(item.account_id, "gmail-default");
+    }
+
+    #[test]
+    fn inbox_automation_fire_contract_is_typed() {
+        let attachment: InboxAttachment = serde_json::from_value(json!({
+            "part_id": "2",
+            "attachment_id": "attachment-1",
+            "filename": "contract.pdf",
+            "media_type": "application/pdf",
+            "byte_size": 42,
+            "automation_fires": [{
+                "fire_id": "11111111-1111-4111-8111-111111111111",
+                "rule_id": "22222222-2222-4222-8222-222222222222",
+                "rule_version": 3,
+                "state": "awaiting_confirmation",
+                "state_version": 4,
+                "reason": "confirmation_required",
+                "job_id": null,
+                "prepared_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "updated_at": "2026-09-17T09:00:00+00:00"
+            }]
+        }))
+        .expect("automation fire projection must deserialize through the desktop contract");
+
+        assert_eq!(attachment.automation_fires.len(), 1);
+        assert_eq!(attachment.automation_fires[0].state_version, 4);
+        assert_eq!(
+            attachment.automation_fires[0]
+                .prepared_identity_sha256
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]

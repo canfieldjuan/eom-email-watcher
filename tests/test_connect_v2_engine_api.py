@@ -311,6 +311,202 @@ def test_connect_queue_pump_materializes_matching_automation_fire_once(
         assert db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0] == 1
 
 
+def test_source_delete_recovers_provider_owned_unbound_automation_fire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=attempt.dispatch_request_id,
+        message_id=fire.message_id,
+        part_id=fire.part_id,
+        capability=selected,
+        parameters={"mode": "contract"},
+        confirmed=False,
+        artifact_id=engine_api._automation_artifact_id(attempt.dispatch_request_id),
+    )
+    assert created is not None
+    runtime.store.transition_connect_job(
+        job_id=created.job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+    )
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'provider_owned', submission_possible = 1
+            WHERE job_id = ?""",
+            (created.job_id,),
+        )
+    assert runtime.store.automation_fire(fire.fire_id).job_id is None  # type: ignore[union-attr]
+
+    assert runtime.store.delete_message(fire.message_id) is True
+
+    retained = runtime.store.automation_fire(fire.fire_id)
+    retained_attempt = runtime.store.automation_fire_attempts(fire.fire_id)
+    assert retained is not None
+    assert retained.state == "submitted"
+    assert retained.job_id == created.job_id
+    assert len(retained_attempt) == 1
+    assert retained_attempt[0].job_id == created.job_id
+    assert runtime.store.connect_job(created.job_id) is not None
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+
+    runtime.store.transition_connect_job(
+        job_id=created.job_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+
+    completed = runtime.store.automation_fire(fire.fire_id)
+    assert completed is not None
+    assert completed.state == "completed"
+    assert completed.reason == "connect_completed"
+    assert runtime.store.connect_job(created.job_id) is None
+
+
+def test_automation_join_rejects_persisted_effectful_authority_after_manifest_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected = capability(external_effects=True)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=REQUEST_ID,
+        message_id="message-1",
+        part_id="2",
+        capability=selected,
+        parameters={},
+        confirmed=True,
+        artifact_id=INPUT_ARTIFACT_ID,
+    )
+    assert created is not None
+    drifted = capability(external_effects=False)
+
+    with pytest.raises(engine_api.ApiError) as rejected:
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=SECOND_REQUEST_ID,
+            message_id="message-1",
+            part_id="2",
+            capability=drifted,
+            parameters={},
+            confirmed=False,
+            artifact_id=OUTPUT_ID,
+            join_effectful=False,
+        )
+
+    assert rejected.value.code == "effectful_job_active"
+
+
+def test_automation_entitlement_is_rechecked_after_source_fetch_before_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    entitlement = {"active": True}
+
+    class ExpiringGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            entitlement["active"] = False
+            return PDF
+
+    monkeypatch.setattr(
+        engine_api,
+        "_automation_entitlement_active",
+        lambda: entitlement["active"],
+    )
+    monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: ExpiringGmail())
+
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+
+    paused = runtime.store.automation_fire(fire.fire_id)
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert runtime.store.connect_job(attempt.dispatch_request_id) is None
+
+
+def test_due_lane_selection_skips_paused_waiting_automation_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    seed_second_attachment(runtime)
+    selected = capability()
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    _first_candidate, first, _collision, _content = (
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=REQUEST_ID,
+            message_id="message-1",
+            part_id="2",
+            capability=selected,
+            parameters={},
+            confirmed=False,
+            artifact_id=INPUT_ARTIFACT_ID,
+        )
+    )
+    _second_candidate, second, _collision, _content = (
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=SECOND_REQUEST_ID,
+            message_id="message-2",
+            part_id="2",
+            capability=selected,
+            parameters={},
+            confirmed=False,
+            artifact_id=OUTPUT_ID,
+        )
+    )
+    assert first is not None
+    assert second is not None
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET automation_paused_at = ? WHERE job_id = ?""",
+            (datetime.now(UTC).isoformat(), first.job_id),
+        )
+
+    due = runtime.store.due_connect_lane_heads(now=datetime.now(UTC))
+    wakeups = runtime.store.connect_queue_wakeups(now=datetime.now(UTC))
+
+    assert [job.job_id for job in due] == [second.job_id]
+    wakeup_job_ids = [job_id for job_id, _wakeup in wakeups]
+    assert first.job_id not in wakeup_job_ids
+    assert second.job_id in wakeup_job_ids
+
+
 def test_automation_entitlement_pause_prevents_discovery_then_resumes_same_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -530,6 +726,7 @@ def test_unbound_automation_job_keeps_automation_authority_before_fire_selection
     assert runtime.store.connect_job(created.job_id).status == "requested"  # type: ignore[union-attr]
     assert dispatch is not None
     assert dispatch.state == "waiting"
+    assert dispatch.automation_paused_at is not None
     assert runtime.store.automation_fire(fire.fire_id).state == "pending_dispatch"  # type: ignore[union-attr]
 
 

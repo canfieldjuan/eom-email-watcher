@@ -537,6 +537,47 @@ CREATE TABLE IF NOT EXISTS automation_run_source_identities (
 CREATE TRIGGER IF NOT EXISTS messages_delete_pending_automation_fires
 BEFORE DELETE ON messages
 BEGIN
+    UPDATE automation_fire_attempts
+    SET job_id = dispatch_request_id
+    WHERE job_id IS NULL
+      AND fire_id IN (
+        SELECT fire_id FROM automation_fires
+        WHERE message_id = OLD.message_id
+          AND state IN ('pending_dispatch', 'entitlement_paused')
+      )
+      AND EXISTS (
+        SELECT 1
+        FROM connect_attachment_jobs AS job
+        JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+        WHERE job.job_id = automation_fire_attempts.dispatch_request_id
+          AND job.protocol_version = 2
+          AND job.status IN ('requested', 'accepted', 'processing')
+          AND NOT (
+            dispatch.state = 'waiting' AND dispatch.submission_possible = 0
+          )
+      );
+    UPDATE automation_fires
+    SET state = 'submitted',
+        state_version = state_version + 1,
+        reason = 'source_removed_after_provider_admission',
+        job_id = (
+            SELECT attempt.job_id
+            FROM automation_fire_attempts AS attempt
+            WHERE attempt.fire_id = automation_fires.fire_id
+              AND attempt.attempt_no = automation_fires.current_attempt_no
+        ),
+        pending_since = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+    WHERE message_id = OLD.message_id
+      AND state IN ('pending_dispatch', 'entitlement_paused')
+      AND job_id IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM automation_fire_attempts AS attempt
+        WHERE attempt.fire_id = automation_fires.fire_id
+          AND attempt.attempt_no = automation_fires.current_attempt_no
+          AND attempt.job_id IS NOT NULL
+      );
     DELETE FROM automation_fire_confirmations
     WHERE fire_id IN (
         SELECT fire_id FROM automation_fires
@@ -4559,6 +4600,10 @@ class Store:
                       AND d.state IN (
                           'waiting', 'dispatching', 'reconciling', 'provider_owned'
                       )
+                      AND (
+                          d.automation_paused_at IS NULL
+                          OR d.state IN ('dispatching', 'reconciling', 'provider_owned')
+                      )
                 )
                 SELECT lane_rank - 1 AS queue_ahead
                 FROM ranked WHERE job_id = ?""",
@@ -4589,6 +4634,10 @@ class Store:
                       AND j.status IN ('requested', 'accepted', 'processing')
                       AND d.state IN (
                           'waiting', 'dispatching', 'reconciling', 'provider_owned'
+                      )
+                      AND (
+                          d.automation_paused_at IS NULL
+                          OR d.state IN ('dispatching', 'reconciling', 'provider_owned')
                       )
                 )
                 SELECT job_id, state, next_attempt_at FROM ranked
@@ -4661,6 +4710,10 @@ class Store:
                       AND d.state IN (
                           'waiting', 'dispatching', 'reconciling', 'provider_owned'
                       )
+                      AND (
+                          d.automation_paused_at IS NULL
+                          OR d.state IN ('dispatching', 'reconciling', 'provider_owned')
+                      )
                 )
                 SELECT j.*
                 FROM ranked AS r
@@ -4690,6 +4743,7 @@ class Store:
         error_code: str,
         error_message: str,
         delay_seconds: int,
+        pause_automation_deadline: bool = False,
         now: datetime | None = None,
     ) -> ConnectDispatch:
         if expected_dispatch_state not in {
@@ -4702,6 +4756,8 @@ class Store:
             raise ValueError("Connect retry next state is invalid")
         if isinstance(delay_seconds, bool) or not 0 <= delay_seconds <= 30:
             raise ValueError("Connect retry delay must be between 0 and 30 seconds")
+        if type(pause_automation_deadline) is not bool:
+            raise ValueError("Connect automation pause flag is invalid")
         code = error_code.encode("utf-8")[:MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES].decode(
             "utf-8", errors="ignore"
         )
@@ -4745,6 +4801,9 @@ class Store:
                         WHEN ? IN ('reconciling', 'provider_owned') THEN 1 ELSE 0 END,
                     next_attempt_at = ?,
                     submission_possible = CASE WHEN ? = 'waiting' THEN 0 ELSE 1 END,
+                    automation_paused_at = CASE WHEN ?
+                        THEN COALESCE(automation_paused_at, ?)
+                        ELSE automation_paused_at END,
                     last_error_code = ?, last_error_message = ?, updated_at = ?
                 WHERE job_id = ? AND state = ?""",
                 (
@@ -4752,6 +4811,8 @@ class Store:
                     next_dispatch_state,
                     next_attempt_at,
                     next_dispatch_state,
+                    int(pause_automation_deadline),
+                    stamp,
                     code,
                     message,
                     stamp,
