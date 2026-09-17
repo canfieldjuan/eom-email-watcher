@@ -1150,7 +1150,7 @@ class WorkflowStore:
         This is the cross-restart reconciliation feed: an action intent is admitted durably
         in the decision's transaction and dispatched afterwards, so a crash between the commit
         and the dispatch leaves a ``pending`` row with no in-flight dispatcher. On the next
-        start the host sweeps this feed and re-drives each row (see
+        start the host sweeps this feed and re-drives each safely recoverable row (see
         :meth:`ActionRunner.recover_pending`); a settled or failed row is terminal and never
         appears here, so a completed action is not re-dispatched. Ordered by rowid, the durable
         admission sequence (as in :meth:`list_actions`), so recovery replays in admission order.

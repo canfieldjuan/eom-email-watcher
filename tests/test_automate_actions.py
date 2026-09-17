@@ -413,6 +413,8 @@ def test_recover_pending_sweeps_multiple_records_in_admission_order(tmp_path: Pa
     delivered: list[str] = []
 
     class RecordingAdapter:
+        idempotent = True
+
         def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
             delivered.append(str(request["tag"]))
             return {"ok": True}
@@ -444,6 +446,8 @@ def test_recover_pending_leaves_an_unconfigured_action_pending(tmp_path: Path) -
 
 def test_recover_pending_does_not_abort_on_one_failing_action(tmp_path: Path) -> None:
     class FlakyAdapter:
+        idempotent = True
+
         def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
             if request.get("boom"):
                 raise RuntimeError("provider down")
@@ -466,6 +470,8 @@ def test_recover_pending_is_safe_to_repeat_without_re_delivery(tmp_path: Path) -
     delivered: list[str] = []
 
     class RecordingAdapter:
+        idempotent = True
+
         def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
             delivered.append(str(request["to"]))
             return {"ok": True}
@@ -495,4 +501,35 @@ def test_recover_pending_requires_the_license(tmp_path: Path) -> None:
     with pytest.raises(AutomateLicenseError):
         runner.recover_pending(now=NOW)
     # Nothing was dispatched: the row is still pending.
+    assert store.list_actions(record_id)[0].status == "pending"
+
+
+def test_recover_pending_requires_the_license_even_with_an_empty_feed(tmp_path: Path) -> None:
+    # No pending rows at all: recover_pending must still refuse on an unlicensed host rather
+    # than short-circuit to [] before the license check.
+    runner, _ = _runner(tmp_path, host=_host(tmp_path, [entitlement.CONNECT_FEATURE_ID]))
+    with pytest.raises(AutomateLicenseError):
+        runner.recover_pending(now=NOW)
+
+
+def test_recover_pending_leaves_a_non_idempotent_action_pending(tmp_path: Path) -> None:
+    delivered: list[Mapping[str, object]] = []
+
+    class NonIdempotentAdapter:
+        # Declares no idempotent marker: an external send that must not be auto-redelivered
+        # after an ambiguous crash (delivered but not settled).
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            delivered.append(dict(request))
+            return {"ok": True}
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", NonIdempotentAdapter())
+    record_id = _record(store)
+    store.admit_action(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    outcomes = runner.recover_pending(now=NOW)
+    assert len(outcomes) == 1
+    assert outcomes[0].delivered is False
+    # The adapter was never invoked and the row is left pending for the deferred
+    # ambiguous-state reconciliation, not auto-redelivered.
+    assert delivered == []
     assert store.list_actions(record_id)[0].status == "pending"
