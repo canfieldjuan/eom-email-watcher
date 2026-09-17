@@ -158,17 +158,6 @@ class ConnectInvokeInput(_Strict):
     content_base64: _ContentBase64 | OverlayBinding = ""
 
 
-# The member of a parameter-value binding: ``{"overlay": "<overlay-key>"}`` takes the
-# parameter's value from the record's overlay projection at admission. A literal parameter
-# value is a bounded primitive (ADR-0002), never an object, so an object-valued parameter is
-# unambiguously a binding. The key mirrors the overlay-key bound in the store's effect model.
-OVERLAY_BINDING_KEY = "overlay"
-
-
-class OverlayBinding(_Strict):
-    overlay: Annotated[str, Field(strict=True, min_length=1, max_length=80)]
-
-
 class ConnectInvokeRequest(_Strict):
     """The signed connect.invoke request template a definition declares.
 
