@@ -79,6 +79,11 @@ class PackManifest(_StrictModel):
 
     format_version: Literal[1]
     pack_id: UuidV4
+    # A positive integer identifying this pack revision. It is carried for the deferred
+    # version-freeze / anti-downgrade work (persisting the referenced version and refusing an
+    # older one): the ``ge=1`` bound is only well-formedness, not a monotonic guarantee, so
+    # load-time verification here does not by itself prevent pairing an older validly-signed
+    # pack with a current grant.
     pack_version: Annotated[StrictInt, Field(ge=1)]
     workflow: Workflow
 
@@ -126,7 +131,11 @@ def _verify_envelope(content: bytes, keys: Mapping[str, bytes], *, max_bytes: in
         payload = _decode_base64url(envelope.payload_base64url, max_bytes)
         signature = _decode_base64url(envelope.signature_base64url, SIGNATURE_BYTES)
         verify_signature(keys, envelope.key_id, payload, signature)
-    except (InvalidSignature, ValidationError, ValueError) as exc:
+    except (InvalidSignature, ValidationError, ValueError, RecursionError) as exc:
+        # RecursionError: deeply nested JSON within the size bound exhausts the decoder's
+        # recursion before verification. This is a trust boundary, so every failure over
+        # untrusted bytes fails closed as PackError, never escaping to crash a caller that
+        # handles invalid packs by catching PackError.
         raise PackError(f"signed document is malformed or untrusted: {exc}") from exc
     return payload
 
@@ -144,7 +153,7 @@ def load_pack(pack_bytes: bytes, *, keys: Mapping[str, bytes]) -> LoadedPack:
         # Enforce the workflow's canonical-definition size bound (DefinitionError is a
         # ValueError), so a pack cannot smuggle an oversized or unserializable workflow.
         canonical_workflow(manifest.workflow)
-    except (ValidationError, ValueError) as exc:
+    except (ValidationError, ValueError, RecursionError) as exc:
         raise PackError(f"pack manifest is invalid: {exc}") from exc
     return LoadedPack(
         pack_id=manifest.pack_id,
@@ -176,7 +185,7 @@ def verify_grant(
         issued_at = _parse_utc(grant.issued_at)
         not_before = _parse_utc(grant.not_before)
         expires_at = _parse_utc(grant.expires_at)
-    except (ValidationError, ValueError) as exc:
+    except (ValidationError, ValueError, RecursionError) as exc:
         raise PackError(f"pack grant is invalid: {exc}") from exc
     if issued_at > not_before or not_before >= expires_at:
         raise PackError("pack grant has an invalid validity window")

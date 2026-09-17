@@ -138,6 +138,16 @@ def test_load_pack_rejects_an_unknown_key_id() -> None:
         load_pack(pack, keys=_keys(key))
 
 
+def test_load_pack_rejects_deeply_nested_json_as_pack_error() -> None:
+    # Deeply nested JSON within the size bound exhausts the decoder's recursion; the trust
+    # boundary must fail closed as PackError, not let RecursionError escape and crash a caller
+    # that handles invalid packs by catching PackError.
+    key = Ed25519PrivateKey.generate()
+    deep = (b"[" * 12000) + (b"]" * 12000)  # ~24 KB, under MAX_PACK_BYTES
+    with pytest.raises(PackError):
+        load_pack(deep, keys=_keys(key))
+
+
 def test_load_pack_rejects_a_malformed_workflow() -> None:
     key = Ed25519PrivateKey.generate()
     bad = dict(WORKFLOW)
