@@ -38,6 +38,17 @@ from .engine import (
     WorkflowMismatch,
 )
 from .host import REQUIRED_FEATURES, AutomateHost, AutomateLicenseError
+from .pack import (
+    MAX_GRANT_BYTES,
+    MAX_PACK_BYTES,
+    GrantView,
+    LoadedPack,
+    PackError,
+    PackGrant,
+    PackManifest,
+    load_pack,
+    verify_grant,
+)
 from .store import (
     ActionAdmission,
     ActionConflict,
@@ -72,10 +83,17 @@ __all__ = [
     "DecisionOutcome",
     "DefinitionError",
     "EngineError",
+    "GrantView",
     "InvalidEffect",
+    "LoadedPack",
     "LocalNotifyAdapter",
+    "MAX_GRANT_BYTES",
+    "MAX_PACK_BYTES",
     "OperationConflict",
     "OperationReplay",
+    "PackError",
+    "PackGrant",
+    "PackManifest",
     "RecordView",
     "StaleRecord",
     "TransitionOutcome",
@@ -88,5 +106,7 @@ __all__ = [
     "WorkflowStore",
     "WorkflowStoreError",
     "canonical_workflow",
+    "load_pack",
     "parse_workflow",
+    "verify_grant",
 ]
