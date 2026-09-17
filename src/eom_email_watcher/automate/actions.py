@@ -34,12 +34,33 @@ NOTIFY = "notify"
 NOTIFY_NTFY = "notify.ntfy"
 MAIL_SEND = "mail.send"
 CALENDAR_WRITE = "calendar.write"
+CONNECT_INVOKE = "connect.invoke"
 
 # The closed set of abstract action kinds. A workflow references only these; the registry
-# resolves each to a configured adapter.
+# resolves each to a configured adapter. ``connect.invoke`` is the generic Connect v2
+# capability-invocation kind: its adapter hands the frozen request to a configured
+# CapabilityInvoker under a stable job identity, so a pack can drive any local Connect
+# provider without naming one.
 ACTION_KINDS: frozenset[str] = frozenset(
-    {NOTIFY_LOCAL, NOTIFY, NOTIFY_NTFY, MAIL_SEND, CALENDAR_WRITE}
+    {NOTIFY_LOCAL, NOTIFY, NOTIFY_NTFY, MAIL_SEND, CALENDAR_WRITE, CONNECT_INVOKE}
 )
+
+
+@dataclass(frozen=True)
+class ActionContext:
+    """The durable identity of an admitted action, passed to adapters that need it.
+
+    A simple effect adapter (``notify.local``) needs only the request. An adapter that
+    invokes an external, idempotent-by-identity operation -- a Connect v2 capability -- needs a
+    stable identifier that survives retries and crash recovery, so a re-dispatch re-POSTs the
+    *same* job rather than starting a new one (ADR-0002 caller-minted stable job identity,
+    idempotent re-POST). ``action_id`` is that stable, durable, per-record identifier.
+    """
+
+    action_id: str
+    dedupe_key: str
+    record_id: str
+    kind: str
 
 
 class AdapterNotConfigured(RuntimeError):
@@ -73,6 +94,59 @@ class Adapter(Protocol):
     # already provides. An adapter that does not declare it is treated as non-idempotent (the
     # safe default), and the sweep leaves its stranded rows pending for the deferred
     # ambiguous-state reconciliation rather than risk a duplicate external send.
+    #
+    # An adapter may also define ``deliver_with_context(request, context)`` instead of (or as
+    # well as) ``deliver``: the runner calls it when present, passing the :class:`ActionContext`
+    # for the admitted row, so the adapter can bind its side effect to the durable action
+    # identity (for example to mint a stable job id). Simple adapters implement only
+    # ``deliver``; the runner falls back to it when ``deliver_with_context`` is absent.
+
+
+@runtime_checkable
+class CapabilityInvoker(Protocol):
+    """Invokes one Connect v2 capability job under a caller-minted stable job id.
+
+    Provider-agnostic: it takes the frozen action request and a stable ``job_id`` and returns
+    the terminal result as a JSON object, or raises on failure. The concrete implementation
+    (which selects the discovered capability, prepares the input artifact and parameters, and
+    drives submit/poll through the v2 client) lives at the host composition layer, not in this
+    generic package, so no vendor or transport is named here. Repeated invocation with the
+    same ``job_id`` and request must be idempotent (ADR-0002 idempotent re-POST): it re-drives
+    the existing job to its recorded terminal outcome rather than starting a second one.
+    """
+
+    def invoke(self, request: Mapping[str, object], *, job_id: str) -> Mapping[str, object]: ...
+
+
+class ConnectInvokeAdapter:
+    """The ``connect.invoke`` adapter: drive a Connect v2 capability from the action lane.
+
+    It bridges the abstract ``connect.invoke`` kind to a configured
+    :class:`CapabilityInvoker`, binding the invocation to the durable action identity: the
+    stable ``job_id`` is the admitted action's ``action_id``, so a retry or crash-recovery
+    re-dispatch re-POSTs the *same* job (ADR-0002 idempotent re-POST) rather than starting a
+    second invocation. That stable-identity idempotency is exactly what a raw external send
+    lacks, so this adapter declares ``idempotent = True`` and is safe for
+    :meth:`ActionRunner.recover_pending` to re-drive: the provider replays the recorded
+    outcome for a job it already accepted.
+    """
+
+    # Safe to auto-recover: re-dispatch re-POSTs the same job_id, which the provider replays
+    # idempotently rather than performing the side effect twice.
+    idempotent = True
+
+    def __init__(self, invoker: CapabilityInvoker):
+        self._invoker = invoker
+
+    def deliver_with_context(
+        self, request: Mapping[str, object], context: ActionContext
+    ) -> Mapping[str, object]:
+        # The stable job identity is the durable action id, not a fresh value per dispatch, so
+        # a recovery sweep or retry re-drives the same job instead of duplicating it.
+        result = self._invoker.invoke(request, job_id=context.action_id)
+        if not isinstance(result, Mapping):
+            raise ActionDeliveryError("connect.invoke invoker returned a non-mapping result")
+        return result
 
 
 class LocalNotifyAdapter:
@@ -184,7 +258,7 @@ class ActionRunner:
             # row and the dedupe identity are this snapshot, so the adapter must act on exactly
             # what was recorded. Feeding it the still-mutable caller object could let the side
             # effect diverge from the recorded intent, and a retry would then conflict.
-            result = adapter.deliver(admission.view.request)
+            result = _invoke_adapter(adapter, admission.view.request, _context(admission.view))
         except Exception as exc:
             self._store.fail_action(action_id, error=str(exc), now=now)
             raise ActionDeliveryError(f"adapter for {kind!r} failed: {exc}") from exc
@@ -233,7 +307,7 @@ class ActionRunner:
         except AdapterNotConfigured:
             return _outcome(view, delivered=False)
         try:
-            result = adapter.deliver(view.request)
+            result = _invoke_adapter(adapter, view.request, _context(view))
         except Exception as exc:
             failed = self._store.fail_action(view.action_id, error=str(exc), now=now)
             return _outcome(failed, delivered=False)
@@ -314,3 +388,27 @@ def _outcome(view: ActionView, *, delivered: bool) -> ActionOutcome:
         result=view.result,
         delivered=delivered,
     )
+
+
+def _context(view: ActionView) -> ActionContext:
+    return ActionContext(
+        action_id=view.action_id,
+        dedupe_key=view.dedupe_key,
+        record_id=view.record_id,
+        kind=view.kind,
+    )
+
+
+def _invoke_adapter(
+    adapter: Adapter, request: Mapping[str, object], context: ActionContext
+) -> object:
+    """Call the adapter, passing the durable action context when it accepts one.
+
+    An adapter that binds its side effect to the action identity (``connect.invoke``) defines
+    ``deliver_with_context``; a simple effect adapter defines only ``deliver``. Preferring the
+    context form keeps the durable-identity plumbing off the common path.
+    """
+    deliver_with_context = getattr(adapter, "deliver_with_context", None)
+    if deliver_with_context is not None:
+        return deliver_with_context(request, context)
+    return adapter.deliver(request)

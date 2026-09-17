@@ -216,3 +216,28 @@ def _json(data: dict) -> str:
     import json
 
     return json.dumps(data)
+
+
+def test_workflow_definition_accepts_a_connect_invoke_action() -> None:
+    # connect.invoke is in the abstract action vocabulary, so a pack may declare it (the host
+    # resolves it to a configured ConnectInvokeAdapter over a CapabilityInvoker).
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [
+        {
+            "action": "connect.invoke",
+            "request": {"capability_id": "onboarding.public-link.list", "limit": 50},
+        }
+    ]
+    workflow = parse_workflow(_json(data))
+    assert workflow.definitions[0].actions[0].action == "connect.invoke"
+    assert workflow.definitions[0].actions[0].request == {
+        "capability_id": "onboarding.public-link.list",
+        "limit": 50,
+    }
+
+
+def test_workflow_definition_rejects_an_unknown_action_kind() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["actions"] = [{"action": "connect.blast", "request": {}}]
+    with pytest.raises(DefinitionError):
+        parse_workflow(_json(data))
