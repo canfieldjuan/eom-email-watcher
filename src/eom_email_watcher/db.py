@@ -2517,6 +2517,22 @@ def _resume_automation_dispatch(
         raise RuntimeError("Automation entitlement resume lost its pause interval")
 
 
+def _pause_linked_automation_fires(
+    db: sqlite3.Connection,
+    *,
+    job_id: str,
+    stamp: str,
+) -> int:
+    paused = db.execute(
+        """UPDATE automation_fires SET
+            state = 'entitlement_paused', state_version = state_version + 1,
+            reason = 'entitlement_inactive', pending_since = NULL, updated_at = ?
+        WHERE job_id = ? AND state = 'submitted'""",
+        (stamp, job_id),
+    )
+    return paused.rowcount
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
@@ -3743,6 +3759,33 @@ class Store:
             ).fetchall()
         return tuple(_automation_fire(row) for row in rows)
 
+    def pause_interactive_job_automation_fires(
+        self,
+        job_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute(
+                """SELECT 1 FROM connect_attachment_jobs AS job
+                JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
+                WHERE job.job_id = ?
+                  AND job.status IN ('requested', 'accepted', 'processing')""",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise RuntimeError("Only active Connect jobs can pause joined automation fires")
+            automation_origin = db.execute(
+                """SELECT 1 FROM automation_fire_attempts
+                WHERE dispatch_request_id = ? LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if automation_origin is not None:
+                raise RuntimeError("Automation-origin jobs require a dispatch pause")
+            return _pause_linked_automation_fires(db, job_id=job_id, stamp=stamp)
+
     def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
         with self.connection() as db:
             row = db.execute(
@@ -4786,6 +4829,7 @@ class Store:
         error_message: str,
         delay_seconds: int,
         pause_automation_deadline: bool = False,
+        pause_linked_automation_fires: bool = False,
         now: datetime | None = None,
     ) -> ConnectDispatch:
         if expected_dispatch_state not in {
@@ -4800,6 +4844,10 @@ class Store:
             raise ValueError("Connect retry delay must be between 0 and 30 seconds")
         if type(pause_automation_deadline) is not bool:
             raise ValueError("Connect automation pause flag is invalid")
+        if type(pause_linked_automation_fires) is not bool:
+            raise ValueError("Connect linked automation pause flag is invalid")
+        if pause_linked_automation_fires and not pause_automation_deadline:
+            raise ValueError("Linked automation fires require a paused dispatch deadline")
         code = error_code.encode("utf-8")[:MAX_CONNECT_DISPATCH_ERROR_CODE_BYTES].decode(
             "utf-8", errors="ignore"
         )
@@ -4864,6 +4912,8 @@ class Store:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Connect retry lost its expected dispatch-state race")
+            if pause_linked_automation_fires:
+                _pause_linked_automation_fires(db, job_id=job_id, stamp=stamp)
             if next_dispatch_state == "waiting":
                 self._expire_waiting_connect_jobs_transaction(db, stamp)
             updated = db.execute(

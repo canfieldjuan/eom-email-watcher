@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -577,14 +578,124 @@ def test_automation_entitlement_is_rechecked_before_proven_new_provider_post(
 
     outcome = engine_api._pump_generic_connect_lane(runtime, job)
 
-    assert outcome["outcome"] == "not_due"
+    assert outcome["outcome"] == "entitlement_paused"
     paused = runtime.store.automation_fire(fire.fire_id)
     dispatch = runtime.store.connect_dispatch(job.job_id)
     assert paused is not None
     assert paused.state == "entitlement_paused"
     assert dispatch is not None
     assert dispatch.state == "waiting"
-    assert dispatch.attempt_count == 0
+    assert dispatch.attempt_count == 1
+
+
+def test_automation_entitlement_is_rechecked_after_source_fetch_before_provider_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    automation_authorized = True
+    submissions = 0
+
+    class ExpiringGmail:
+        def attachment_bytes(self, *args: object) -> bytes:
+            nonlocal automation_authorized
+            automation_authorized = False
+            return PDF
+
+    class CompletingClient:
+        def __init__(self, capability_value: connect.DiscoveredCapability) -> None:
+            assert capability_value == selected
+
+        def submit(
+            self, job_value: connect.PreparedCapabilityJob, content: bytes
+        ) -> connect.CapabilityJobUpdate:
+            nonlocal submissions
+            submissions += 1
+            return update(job_value, "completed", payload=b"must not submit")
+
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        stub_lane=False,
+    )
+    monkeypatch.setattr(
+        engine_api,
+        "_automation_entitlement_active",
+        lambda: automation_authorized,
+    )
+    monkeypatch.setattr(engine_api.connect, "ConnectV2Client", CompletingClient)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert job is not None
+    make_connect_job_due(runtime, job.job_id)
+    monkeypatch.setattr(
+        engine_api.GmailGateway,
+        "from_token",
+        lambda *args: ExpiringGmail(),
+    )
+
+    outcome = engine_api._pump_generic_connect_lane(runtime, job)
+
+    paused = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    assert outcome["outcome"] == "entitlement_paused"
+    assert submissions == 0
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.state == "waiting"
+    assert dispatch.automation_paused_at is not None
+
+
+def test_automation_entitlement_pause_rolls_back_dispatch_when_fire_pause_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        stub_lane=False,
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    job = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert job is not None
+    make_connect_job_due(runtime, job.job_id)
+    claimed = runtime.store.claim_connect_lane_head(
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        expected_job_id=job.job_id,
+    )
+    assert claimed is not None
+    assert claimed[1].state == "dispatching"
+    with runtime.store.connection() as db:
+        db.execute(
+            """CREATE TRIGGER reject_automation_entitlement_pause
+            BEFORE UPDATE OF state ON automation_fires
+            WHEN NEW.state = 'entitlement_paused'
+            BEGIN
+                SELECT RAISE(ABORT, 'injected automation pause failure');
+            END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected automation pause failure"):
+        engine_api._defer_inactive_automation_job(
+            runtime,
+            job.job_id,
+            expected_dispatch_state="dispatching",
+            next_dispatch_state="waiting",
+        )
+
+    unchanged_fire = runtime.store.automation_fire(fire.fire_id)
+    unchanged_dispatch = runtime.store.connect_dispatch(job.job_id)
+    assert unchanged_fire is not None
+    assert unchanged_fire.state == "submitted"
+    assert unchanged_dispatch is not None
+    assert unchanged_dispatch.state == "dispatching"
+    assert unchanged_dispatch.automation_paused_at is None
 
 
 def test_inactive_automation_reconciles_provider_owned_job_without_resubmission(
@@ -1461,12 +1572,43 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
 
     outcome = real_pump(runtime, active)
 
-    assert outcome["outcome"] == "completed"
+    assert outcome["outcome"] == "entitlement_paused"
     assert connect_authority_checks == 1
     assert run_calls == 1
-    still_linked = runtime.store.automation_fire(fire.fire_id)
-    assert still_linked is not None
-    assert still_linked.state == "submitted"
+    paused_join = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(REQUEST_ID)
+    assert paused_join is not None
+    assert paused_join.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.automation_paused_at is None
+
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="text/plain",
+        display_name="contract-summary.txt",
+        byte_size=4,
+        sha256=hashlib.sha256(b"done").hexdigest(),
+        payload=b"done",
+    )
+    runtime.store.transition_connect_job(
+        job_id=REQUEST_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    still_paused = runtime.store.automation_fire(fire.fire_id)
+    assert still_paused is not None
+    assert still_paused.state == "entitlement_paused"
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._dispatch_automation_fire(runtime, fire.fire_id)
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    completed = runtime.store.automation_fire(fire.fire_id)
+    assert completed is not None
+    assert completed.state == "completed"
 
 
 def test_effectful_automation_collision_fails_closed_before_active_job_join(

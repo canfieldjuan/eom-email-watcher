@@ -2932,16 +2932,8 @@ def _defer_inactive_automation_job(
         error_message="Automation entitlements are inactive.",
         delay_seconds=30,
         pause_automation_deadline=True,
+        pause_linked_automation_fires=True,
     )
-    for fire in runtime.store.automation_fires_linked_to_job(job_id):
-        if fire.state == "submitted":
-            runtime.store.transition_automation_fire(
-                fire_id=fire.fire_id,
-                expected_state=fire.state,
-                expected_version=fire.state_version,
-                next_state="entitlement_paused",
-                reason="entitlement_inactive",
-            )
 
 
 def _require_submission_authority_for_job(
@@ -2952,9 +2944,16 @@ def _require_submission_authority_for_job(
     expected_dispatch_state: str,
     inactive_dispatch_state: str,
 ) -> bool:
-    if runtime.store.connect_job_requires_automation_entitlement(job_id):
-        if _automation_entitlement_active():
-            return True
+    automation_origin = runtime.store.connect_job_requires_automation_entitlement(job_id)
+    automation_active = _automation_entitlement_active()
+    if automation_active:
+        for fire in runtime.store.automation_fires_linked_to_job(job_id):
+            if fire.state == "entitlement_paused":
+                runtime.store.resume_automation_fire_job(
+                    fire_id=fire.fire_id,
+                    expected_version=fire.state_version,
+                )
+    elif automation_origin:
         _defer_inactive_automation_job(
             runtime,
             job_id,
@@ -2962,6 +2961,10 @@ def _require_submission_authority_for_job(
             next_dispatch_state=inactive_dispatch_state,
         )
         return False
+    else:
+        runtime.store.pause_interactive_job_automation_fires(job_id)
+    if automation_origin:
+        return True
     _require_connect_entitlement_for_job(runtime, job_id, capability)
     return True
 
@@ -3071,6 +3074,7 @@ def _submit_generic_connect_job(
     message_id: str,
     content: Callable[[], bytes],
     *,
+    inactive_dispatch_state: str,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     source_lock = _require_generic_connect_source_lock(runtime, message_id)
@@ -3127,6 +3131,17 @@ def _submit_generic_connect_job(
                     "connect_source_unavailable",
                     "The source attachment changed before handoff.",
                 )
+            if not _require_submission_authority_for_job(
+                runtime,
+                tracked.job_id,
+                capability,
+                expected_dispatch_state="dispatching",
+                inactive_dispatch_state=inactive_dispatch_state,
+            ):
+                current = runtime.store.connect_job(tracked.job_id)
+                if current is None:
+                    raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+                return _generic_connect_active_result(runtime, current)
             client = connect.ConnectV2Client(capability)
             try:
                 initial = client.submit(tracked, payload)
@@ -3239,6 +3254,7 @@ def _run_claimed_generic_connect_job(
             tracked,
             claimed_job.message_id,
             content,
+            inactive_dispatch_state="waiting",
             wait_for_terminal=wait_for_terminal,
         )
 
@@ -3323,6 +3339,7 @@ def _run_claimed_generic_connect_job(
         tracked,
         refreshed.message_id,
         content,
+        inactive_dispatch_state="reconciling",
         wait_for_terminal=wait_for_terminal,
     )
 
@@ -3483,20 +3500,10 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             automation_authority_required = (
                 runtime.store.connect_job_requires_automation_entitlement(head.job_id)
             )
-            automation_authorized = (
-                not automation_authority_required or _automation_entitlement_active()
-            )
-            if linked_fires and not automation_authorized:
-                for fire in linked_fires:
-                    if fire.state == "submitted":
-                        runtime.store.transition_automation_fire(
-                            fire_id=fire.fire_id,
-                            expected_state=fire.state,
-                            expected_version=fire.state_version,
-                            next_state="entitlement_paused",
-                            reason="entitlement_inactive",
-                        )
-            else:
+            automation_authorized = _automation_entitlement_active()
+            if linked_fires and not automation_authorized and not automation_authority_required:
+                runtime.store.pause_interactive_job_automation_fires(head.job_id)
+            elif automation_authorized:
                 for fire in linked_fires:
                     if fire.state == "entitlement_paused":
                         runtime.store.resume_automation_fire_job(
@@ -3515,7 +3522,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             if proven_new_submission:
                 try:
                     if automation_authority_required:
-                        if not automation_authorized:
+                        if not _automation_entitlement_active():
                             raise connect.ConnectError(
                                 "ENTITLEMENT_REQUIRED",
                                 "Automation provider submission requires active entitlements.",
@@ -4005,6 +4012,17 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 expected_version=fire.state_version,
                 next_state="source_unavailable",
                 reason="job_removed",
+            )
+            continue
+        if (
+            fire.state == "entitlement_paused"
+            and not runtime.store.connect_job_requires_automation_entitlement(fire.job_id)
+            and not _automation_entitlement_active()
+        ):
+            runtime.store.touch_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
             )
             continue
         if job.status == "completed":
