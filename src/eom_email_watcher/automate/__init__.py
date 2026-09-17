@@ -13,6 +13,54 @@ only after :meth:`AutomateHost.require_license` passes.
 
 from __future__ import annotations
 
+from .definition import (
+    DefinitionError,
+    Workflow,
+    WorkflowDefinition,
+    canonical_workflow,
+    parse_workflow,
+)
+from .engine import (
+    AmbiguousDecision,
+    DecisionOutcome,
+    EngineError,
+    WorkflowEngine,
+    WorkflowMismatch,
+)
 from .host import REQUIRED_FEATURES, AutomateHost, AutomateLicenseError
+from .store import (
+    InvalidEffect,
+    OperationConflict,
+    OperationReplay,
+    RecordView,
+    StaleRecord,
+    TransitionOutcome,
+    UnknownRecord,
+    WorkflowStore,
+    WorkflowStoreError,
+)
 
-__all__ = ["REQUIRED_FEATURES", "AutomateHost", "AutomateLicenseError"]
+__all__ = [
+    "REQUIRED_FEATURES",
+    "AmbiguousDecision",
+    "AutomateHost",
+    "AutomateLicenseError",
+    "DecisionOutcome",
+    "DefinitionError",
+    "EngineError",
+    "InvalidEffect",
+    "OperationConflict",
+    "OperationReplay",
+    "RecordView",
+    "StaleRecord",
+    "TransitionOutcome",
+    "UnknownRecord",
+    "Workflow",
+    "WorkflowDefinition",
+    "WorkflowEngine",
+    "WorkflowMismatch",
+    "WorkflowStore",
+    "WorkflowStoreError",
+    "canonical_workflow",
+    "parse_workflow",
+]
