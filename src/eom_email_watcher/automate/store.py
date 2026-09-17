@@ -601,13 +601,15 @@ class WorkflowStore:
         """
         _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
-        canonical_effects = _canonical_effects(normalized)
         try:
+            canonical_effects = _canonical_effects(normalized)
             batch_bytes = len(canonical_effects.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            # A lone-surrogate string (e.g. "\ud800") is not UTF-8 encodable; reject it on
-            # the store's domain path rather than leaking UnicodeEncodeError.
-            raise InvalidEffect(f"effect batch contains an unencodable string: {exc}") from exc
+        except ValueError as exc:
+            # A value that cannot be serialized or UTF-8 encoded (a lone surrogate such as
+            # "\ud800", or an integer past the interpreter digit limit such as 10**5000) is
+            # rejected on the store's domain path rather than leaking a raw ValueError or
+            # UnicodeEncodeError (the latter is a ValueError subclass).
+            raise InvalidEffect(f"effect batch contains an unserializable value: {exc}") from exc
         if batch_bytes > MAX_EFFECT_BATCH_BYTES:
             raise InvalidEffect(f"the effect batch exceeds {MAX_EFFECT_BATCH_BYTES} bytes")
         fingerprint = request_fingerprint(request)

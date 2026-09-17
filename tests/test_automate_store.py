@@ -460,6 +460,24 @@ def test_apply_effects_rejects_a_surrogate_string_value(tmp_path: Path) -> None:
         )
 
 
+def test_apply_effects_rejects_an_oversized_integer_value(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    # An integer past the interpreter digit limit cannot be serialized; reject it as an
+    # InvalidEffect rather than leaking ValueError from json.dumps.
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "k", "value": 10**5000}],
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
 def test_reserve_no_match_replays_a_matching_applied_operation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)

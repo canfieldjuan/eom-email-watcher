@@ -163,6 +163,12 @@ def test_invalid_utf8_bytes_are_a_definition_error() -> None:
         parse_workflow(b"\xff")
 
 
+def test_definition_error_is_importable_from_the_package() -> None:
+    from eom_email_watcher.automate import DefinitionError as PackageDefinitionError
+
+    assert PackageDefinitionError is DefinitionError
+
+
 def test_lone_surrogate_string_is_a_definition_error() -> None:
     data = _workflow_data()
     # A lone surrogate parses and validates as a str but is not UTF-8 encodable.

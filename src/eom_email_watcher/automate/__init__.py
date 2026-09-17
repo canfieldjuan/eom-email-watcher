@@ -14,6 +14,7 @@ only after :meth:`AutomateHost.require_license` passes.
 from __future__ import annotations
 
 from .definition import (
+    DefinitionError,
     Workflow,
     WorkflowDefinition,
     canonical_workflow,
@@ -45,6 +46,7 @@ __all__ = [
     "AutomateHost",
     "AutomateLicenseError",
     "DecisionOutcome",
+    "DefinitionError",
     "EngineError",
     "InvalidEffect",
     "OperationConflict",
