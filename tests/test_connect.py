@@ -556,6 +556,82 @@ def test_generic_discovery_recomputes_remaining_timeout_per_manifest_request(
     assert request_timeouts == [0.8, 0.5]
 
 
+def test_registered_reconciliation_deduplicates_endpoint_without_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    duplicate = registration_v2(
+        instance_id=INSTANCE_A,
+        app_id="provider-a",
+        base_url="http://127.0.0.1:32123/",
+    )
+    write_registration(directory / "a.json", duplicate)
+    write_registration(directory / "b.json", duplicate)
+
+    def forbidden_client(*args: object, **kwargs: object) -> httpx.Client:
+        raise AssertionError("registration-only reconciliation must not create an HTTP client")
+
+    monkeypatch.setattr(connect, "_client", forbidden_client)
+    registered, diagnostic = connect.registered_capability_for_reconciliation(
+        tmp_path,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+    assert diagnostic is None
+    assert registered == connect.RegisteredCapability(
+        protocol_version=2,
+        base_url="http://127.0.0.1:32123/",
+        token=TOKEN,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+
+def test_registered_reconciliation_rejects_conflicting_endpoints(tmp_path: Path) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "a.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider-a",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    write_registration(
+        directory / "b.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider-a",
+            base_url="http://127.0.0.1:32124/",
+        ),
+    )
+
+    registered, diagnostic = connect.registered_capability_for_reconciliation(
+        tmp_path,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+    assert registered is None
+    assert diagnostic == "provider_unavailable"
+
+
 @pytest.mark.parametrize(
     "registration_value",
     [
@@ -1167,6 +1243,53 @@ def test_v2_client_submits_and_polls_generic_outputs() -> None:
         b"",
     ]
     assert final.result.store_dict()["outputs"][1]["payload_base64"] == ""  # type: ignore[index]
+
+
+def test_v2_registered_reconciliation_gets_terminal_job_but_cannot_submit() -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    discovered = discovered_v2_capability()
+    prepared = connect.prepare_capability_job(
+        discovered, content, "application/pdf", "contract.pdf"
+    )
+    registered = connect.RegisteredCapability(
+        protocol_version=discovered.protocol_version,
+        base_url=discovered.base_url,
+        token=discovered.token,
+        app_id=discovered.app_id,
+        app_version=discovered.app_version,
+        instance_id=discovered.instance_id,
+        capability_id=discovered.capability_id,
+        capability_version=discovered.capability_version,
+        external_effects=discovered.external_effects,
+        confirmation_required=discovered.confirmation_required,
+    )
+    restored = connect.restore_registered_capability_job(
+        registered, prepared.request_json
+    )
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(
+            200,
+            json=generic_job_status(
+                restored,
+                "completed",
+                result={"outputs": [generic_output(b"Contract obligations")]},
+            ),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(registered, client=http_client)
+        update = client.get(restored)
+        with pytest.raises(connect.ConnectError) as rejected:
+            client.submit(restored, content)
+
+    assert update.status == "completed"
+    assert update.result is not None
+    assert update.result.outputs[0].payload == b"Contract obligations"
+    assert rejected.value.code == "JOB_CAPABILITY_MISMATCH"
+    assert requests == ["GET"]
 
 
 def test_v2_client_reuses_prepared_identity_after_lost_acknowledgement() -> None:

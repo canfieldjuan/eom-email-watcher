@@ -2648,7 +2648,8 @@ def _connect_output_export(request: dict[str, object]) -> dict[str, object]:
 
 
 def _tracked_generic_job(
-    job: ConnectJob, capability: connect.DiscoveredCapability
+    job: ConnectJob,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
 ) -> connect.PreparedCapabilityJob:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
@@ -2657,10 +2658,24 @@ def _tracked_generic_job(
         or job.provider_app_id != capability.app_id
         or job.provider_app_version != capability.app_version
         or job.provider_instance_id != capability.instance_id
+        or job.source_app_id != connect.SOURCE_APP_ID
         or job.request_json is None
     ):
         raise RuntimeError("Connect v2 job is missing its durable provider request")
-    return connect.restore_persisted_capability_job(capability, job.request_json)
+    if isinstance(capability, connect.RegisteredCapability):
+        tracked = connect.restore_registered_capability_job(capability, job.request_json)
+    else:
+        tracked = connect.restore_persisted_capability_job(capability, job.request_json)
+    if (
+        tracked.job_id != job.job_id
+        or tracked.artifact.artifact_id != job.input_artifact_id
+        or tracked.artifact.media_type != job.input_media_type
+        or tracked.artifact.byte_size != job.input_byte_size
+        or tracked.artifact.sha256 != job.input_sha256
+        or tracked.display_name != job.input_display_name
+    ):
+        raise RuntimeError("Connect v2 job request does not match its durable record")
+    return tracked
 
 
 def _apply_connect_update(
@@ -2714,7 +2729,11 @@ def _apply_connect_update(
 def _mark_connect_failed(
     store: Store,
     job_id: str,
-    provider: connect.ProviderCapability | connect.DiscoveredCapability,
+    provider: (
+        connect.ProviderCapability
+        | connect.DiscoveredCapability
+        | connect.RegisteredCapability
+    ),
     error: connect.ConnectError,
 ) -> None:
     for _attempt in range(4):
@@ -2802,7 +2821,7 @@ def _query_connect_job(
 
 def _run_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     job: connect.PreparedCapabilityJob,
     content: bytes | None,
     *,
@@ -2927,7 +2946,7 @@ def _defer_generic_connect_error(
 def _persist_connect_entitlement_failure(
     runtime: Runtime,
     job_id: str,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     failure: connect.ConnectError,
 ) -> None:
     try:
@@ -2959,7 +2978,7 @@ def _defer_inactive_automation_job(
 def _require_submission_authority_for_job(
     runtime: Runtime,
     job_id: str,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     *,
     expected_dispatch_state: str,
     inactive_dispatch_state: str,
@@ -3021,7 +3040,7 @@ def _automation_submission_authority_active(
 
 def _query_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     job: connect.PreparedCapabilityJob,
     *,
     wait_for_terminal: bool = True,
@@ -3056,7 +3075,8 @@ def _stored_connect_failure(job: ConnectJob) -> ApiError:
 
 
 def _require_generic_connect_lane_lock(
-    runtime: Runtime, capability: connect.DiscoveredCapability
+    runtime: Runtime,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
 ) -> Path:
     lock_path = connect_lane_lock_path(
         runtime.store.path,
@@ -3252,7 +3272,7 @@ def _require_persisted_capability_authority(
     runtime: Runtime,
     job: ConnectJob,
     dispatch: ConnectDispatch,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
 ) -> None:
     if not dispatch.capability_authority_known:
         _fail_generic_connect_record(
@@ -3285,7 +3305,7 @@ def _require_persisted_capability_authority(
 
 def _run_claimed_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     claimed_job: ConnectJob,
     dispatch: ConnectDispatch,
     content: Callable[[], bytes],
@@ -3294,13 +3314,15 @@ def _run_claimed_generic_connect_job(
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     tracked = _tracked_generic_job(claimed_job, capability)
+    _require_persisted_capability_authority(
+        runtime,
+        claimed_job,
+        dispatch,
+        capability,
+    )
     if dispatch.state == "dispatching" and not reconcile_first:
-        _require_persisted_capability_authority(
-            runtime,
-            claimed_job,
-            dispatch,
-            capability,
-        )
+        if not isinstance(capability, connect.DiscoveredCapability):
+            raise RuntimeError("Connect v2 submission is missing its admitted manifest")
         if not _require_submission_authority_for_job(
             runtime,
             tracked.job_id,
@@ -3346,6 +3368,37 @@ def _run_claimed_generic_connect_job(
     current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
     if current_dispatch is None:
         raise RuntimeError("Connect reconciliation lost its dispatch state")
+    if isinstance(capability, connect.RegisteredCapability):
+        if not _require_submission_authority_for_job(
+            runtime,
+            tracked.job_id,
+            capability,
+            expected_dispatch_state=current_dispatch.state,
+            inactive_dispatch_state="reconciling",
+        ):
+            current = runtime.store.connect_job(tracked.job_id)
+            if current is None:
+                raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+            return _generic_connect_active_result(runtime, current)
+        discovered, diagnostic = _discover_persisted_generic_capability(
+            refreshed,
+            current_dispatch,
+            require_entitlement=True,
+        )
+        if discovered is None:
+            runtime.store.defer_connect_job(
+                job_id=refreshed.job_id,
+                expected_dispatch_state=current_dispatch.state,
+                next_dispatch_state="reconciling",
+                error_code=diagnostic or "provider_unavailable",
+                error_message="The durable Connect provider is unavailable for resubmission.",
+                delay_seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
+            )
+            current = runtime.store.connect_job(refreshed.job_id)
+            if current is None:
+                raise RuntimeError("Connect v2 job disappeared after provider deferral")
+            return _generic_connect_active_result(runtime, current)
+        capability = discovered
     _require_persisted_capability_authority(
         runtime,
         refreshed,
@@ -3468,9 +3521,13 @@ def _resume_generic_connect_job(
 
 def _discover_persisted_generic_capability(
     job: ConnectJob,
+    dispatch: ConnectDispatch,
     *,
     require_entitlement: bool,
-) -> tuple[connect.DiscoveredCapability | None, str | None]:
+) -> tuple[
+    connect.DiscoveredCapability | connect.RegisteredCapability | None,
+    str | None,
+]:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
         or job.provider_app_id is None
@@ -3478,14 +3535,19 @@ def _discover_persisted_generic_capability(
         or job.provider_instance_id is None
     ):
         raise RuntimeError("Connect v2 job is missing provider provenance")
-    if require_entitlement:
-        catalog = connect.discover_capabilities(
-            provider_instance_id=job.provider_instance_id,
+    if not require_entitlement:
+        return connect.registered_capability_for_reconciliation(
+            app_id=job.provider_app_id,
+            app_version=job.provider_app_version,
+            instance_id=job.provider_instance_id,
+            capability_id=job.capability_id,
+            capability_version=job.capability_version,
+            external_effects=dispatch.capability_external_effects,
+            confirmation_required=dispatch.capability_confirmation_required,
         )
-    else:
-        catalog = connect.discover_capabilities_for_reconciliation(
-            provider_instance_id=job.provider_instance_id,
-        )
+    catalog = connect.discover_capabilities(
+        provider_instance_id=job.provider_instance_id,
+    )
     matches = tuple(
         item
         for item in catalog.items
@@ -3612,6 +3674,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     return _connect_queue_item(runtime, head.job_id, "failed")
             capability, diagnostic = _discover_persisted_generic_capability(
                 claimed_job,
+                dispatch,
                 require_entitlement=proven_new_submission,
             )
             if capability is None:
@@ -3753,14 +3816,9 @@ def _reject_disallowed_effectful_join(
     dispatch = runtime.store.connect_dispatch(job.job_id)
     if dispatch is None:
         raise RuntimeError("Connect v2 job is missing its durable dispatch authority")
+    _require_persisted_capability_authority(runtime, job, dispatch, capability)
     if job.job_id == request_id:
-        _require_persisted_capability_authority(runtime, job, dispatch, capability)
         return
-    if not dispatch.capability_authority_known:
-        raise ApiError(
-            "capability_authority_unknown",
-            "An invocation with unknown capability authority is already active.",
-        )
     if not join_effectful and (
         dispatch.capability_external_effects
         or dispatch.capability_confirmation_required

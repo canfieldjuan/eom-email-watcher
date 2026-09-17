@@ -494,7 +494,54 @@ def test_automation_join_rejects_persisted_effectful_authority_after_manifest_dr
             join_effectful=False,
         )
 
-    assert rejected.value.code == "effectful_job_active"
+    assert rejected.value.code == "capability_authority_changed"
+    failed = runtime.store.connect_job(created.job_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "capability_authority_changed"
+
+
+def test_automation_join_rejects_live_effect_escalation_after_manifest_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    admitted = capability(external_effects=False)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((admitted,)),
+    )
+    _candidate, created, _collision, _content = engine_api._prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=REQUEST_ID,
+        message_id="message-1",
+        part_id="2",
+        capability=admitted,
+        parameters={},
+        confirmed=False,
+        artifact_id=INPUT_ARTIFACT_ID,
+    )
+    assert created is not None
+    escalated = capability(external_effects=True)
+
+    with pytest.raises(engine_api.ApiError) as rejected:
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=SECOND_REQUEST_ID,
+            message_id="message-1",
+            part_id="2",
+            capability=escalated,
+            parameters={},
+            confirmed=True,
+            artifact_id=OUTPUT_ID,
+            join_effectful=False,
+        )
+
+    assert rejected.value.code == "capability_authority_changed"
+    failed = runtime.store.connect_job(created.job_id)
+    assert failed is not None
+    assert failed.status == "failed"
+    assert failed.error_code == "capability_authority_changed"
 
 
 def test_unknown_persisted_capability_authority_fails_before_submission(
@@ -1047,17 +1094,30 @@ def test_inactive_automation_reconciles_provider_owned_job_without_resubmission(
     )
     make_connect_job_due(runtime, job.job_id)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+
+    def forbidden_manifest_discovery(**kwargs: object) -> connect.CapabilityCatalog:
+        raise AssertionError("provider-owned reconciliation must not fetch the manifest")
+
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities_for_reconciliation",
-        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        forbidden_manifest_discovery,
+    )
+    monkeypatch.setattr(
+        engine_api.connect,
+        "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
+        raising=False,
     )
     submissions = 0
     queries = 0
 
     class CompletedClient:
-        def __init__(self, capability_value: connect.DiscoveredCapability) -> None:
-            assert capability_value == selected
+        def __init__(
+            self,
+            capability_value: connect.DiscoveredCapability | connect.RegisteredCapability,
+        ) -> None:
+            assert capability_value == registered_capability(selected)
 
         def submit(self, job_value: object, content: bytes) -> object:
             nonlocal submissions
@@ -1227,8 +1287,8 @@ def test_automation_entitlement_is_rechecked_after_missing_reconciliation(
     )
     monkeypatch.setattr(
         engine_api.connect,
-        "discover_capabilities_for_reconciliation",
-        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
     )
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     engine_api._dispatch_automation_fire(runtime, fire.fire_id)
@@ -1237,8 +1297,11 @@ def test_automation_entitlement_is_rechecked_after_missing_reconciliation(
     submissions = 0
 
     class MissingAfterLostAckClient:
-        def __init__(self, capability_value: connect.DiscoveredCapability) -> None:
-            assert capability_value == selected
+        def __init__(
+            self,
+            capability_value: connect.DiscoveredCapability | connect.RegisteredCapability,
+        ) -> None:
+            assert capability_value in {selected, registered_capability(selected)}
 
         def submit(self, job_value: connect.PreparedCapabilityJob, content: bytes) -> object:
             nonlocal submissions
@@ -1927,7 +1990,7 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     monkeypatch.setattr(
         engine_api,
         "_discover_persisted_generic_capability",
-        lambda job, *, require_entitlement: (selected, None),
+        lambda job, dispatch, *, require_entitlement: (selected, None),
     )
     monkeypatch.setattr(engine_api, "_run_claimed_generic_connect_job", run_joined_job)
     active = runtime.store.connect_job(REQUEST_ID)
@@ -2196,7 +2259,7 @@ def test_interactive_join_authorizes_automation_origin_job_submission(
     monkeypatch.setattr(
         engine_api,
         "_discover_persisted_generic_capability",
-        lambda job, *, require_entitlement: (selected, None),
+        lambda job, dispatch, *, require_entitlement: (selected, None),
     )
     monkeypatch.setattr(engine_api, "_run_claimed_generic_connect_job", run_joined_job)
     active = runtime.store.connect_job(attempt.dispatch_request_id)
@@ -3331,6 +3394,23 @@ def capability(
         parameters=parameters,
         external_effects=external_effects,
         confirmation_required=confirmation_required,
+    )
+
+
+def registered_capability(
+    selected: connect.DiscoveredCapability,
+) -> connect.RegisteredCapability:
+    return connect.RegisteredCapability(
+        protocol_version=selected.protocol_version,
+        base_url=selected.base_url,
+        token=selected.token,
+        app_id=selected.app_id,
+        app_version=selected.app_version,
+        instance_id=selected.instance_id,
+        capability_id=selected.capability_id,
+        capability_version=selected.capability_version,
+        external_effects=selected.external_effects,
+        confirmation_required=selected.confirmation_required,
     )
 
 
@@ -4778,7 +4858,7 @@ def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting
 
     class LostAckThenCompleteClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in {selected, registered_capability(selected)}
 
         def submit(self, job, content):
             nonlocal submissions
@@ -4803,16 +4883,16 @@ def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting
         discovery_modes.append("entitlement-gated")
         return connect.CapabilityCatalog((selected,))
 
-    def reconcile_discovery(**kwargs):
+    def reconcile_registration(**kwargs):
         discovery_modes.append("reconciliation")
-        return connect.CapabilityCatalog((selected,))
+        return registered_capability(selected), None
 
     monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
     monkeypatch.setattr(
         engine_api.connect,
-        "discover_capabilities_for_reconciliation",
-        reconcile_discovery,
+        "registered_capability_for_reconciliation",
+        reconcile_registration,
     )
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", LostAckThenCompleteClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
@@ -4849,7 +4929,7 @@ def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance
 
     class AcceptedThenMissingClient:
         def __init__(self, capability_value):
-            assert capability_value == selected
+            assert capability_value in {selected, registered_capability(selected)}
 
         def submit(self, job, content):
             nonlocal submissions
@@ -4879,8 +4959,8 @@ def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance
     )
     monkeypatch.setattr(
         engine_api.connect,
-        "discover_capabilities_for_reconciliation",
-        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+        "registered_capability_for_reconciliation",
+        lambda **kwargs: (registered_capability(selected), None),
     )
     monkeypatch.setattr(engine_api.connect, "ConnectV2Client", AcceptedThenMissingClient)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())

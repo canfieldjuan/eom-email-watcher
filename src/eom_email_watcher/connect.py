@@ -488,6 +488,22 @@ class DiscoveredCapability:
 
 
 @dataclass(frozen=True)
+class RegisteredCapability:
+    """Durable provider endpoint and admitted authority for GET-only reconciliation."""
+
+    protocol_version: int
+    base_url: str
+    token: str
+    app_id: str
+    app_version: str
+    instance_id: str
+    capability_id: str
+    capability_version: str
+    external_effects: bool
+    confirmation_required: bool
+
+
+@dataclass(frozen=True)
 class CapabilityCatalog:
     items: tuple[DiscoveredCapability, ...]
     diagnostic_code: str | None = None
@@ -1059,6 +1075,63 @@ def _generic_capabilities(
     )
 
 
+def registered_capability_for_reconciliation(
+    runtime_dir: Path | None = None,
+    *,
+    app_id: str,
+    app_version: str,
+    instance_id: str,
+    capability_id: str,
+    capability_version: str,
+    external_effects: bool,
+    confirmation_required: bool,
+) -> tuple[RegisteredCapability | None, str | None]:
+    """Resolve a GET-only endpoint without consulting an entitlement-gated manifest."""
+    locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
+    if locations is None:
+        return None, "connect_unavailable"
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return None, "connect_unavailable"
+    if not _secure_directory(providers_dir, windows_root=root_value):
+        return None, "provider_unavailable"
+    registrations = _registration_candidates(providers_dir)
+    if registrations is None:
+        return None, "provider_unavailable"
+    matches: set[RegisteredCapability] = set()
+    for path in registrations:
+        registration = _read_registration_v2(path, windows_root=root_value)
+        if (
+            registration is None
+            or registration.app_id != app_id
+            or registration.instance_id != instance_id
+        ):
+            continue
+        base_url = _validated_base_url(registration.transport.base_url)
+        if base_url is None:
+            continue
+        matches.add(
+            RegisteredCapability(
+                protocol_version=GENERIC_PROTOCOL_VERSION,
+                base_url=base_url,
+                token=registration.auth.token,
+                app_id=app_id,
+                app_version=app_version,
+                instance_id=instance_id,
+                capability_id=capability_id,
+                capability_version=capability_version,
+                external_effects=external_effects,
+                confirmation_required=confirmation_required,
+            )
+        )
+    if len(matches) != 1:
+        return None, "provider_unavailable"
+    return next(iter(matches)), None
+
+
 def _discover_capabilities(
     runtime_dir: Path | None = None,
     *,
@@ -1450,6 +1523,56 @@ def restore_persisted_capability_job(
     )
 
 
+def restore_registered_capability_job(
+    capability: RegisteredCapability,
+    request_json: bytes,
+) -> PreparedCapabilityJob:
+    """Restore a durable request for GET-only reconciliation without a manifest schema."""
+    if capability.protocol_version != GENERIC_PROTOCOL_VERSION:
+        raise ConnectError(
+            "PROTOCOL_VERSION_UNSUPPORTED",
+            "The registered capability does not use the generic Connect protocol.",
+        )
+    try:
+        request = _JobRequestV2.model_validate_json(request_json)
+    except (ValueError, TypeError) as exc:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job request is invalid.",
+        ) from exc
+    if (
+        request.capability.id != capability.capability_id
+        or request.capability.version != capability.capability_version
+    ):
+        raise ConnectError(
+            "JOB_CAPABILITY_MISMATCH",
+            "The durable job does not match the registered capability.",
+        )
+    artifact = request.inputs[0]
+    if artifact.source_app_id != SOURCE_APP_ID:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job source is invalid.",
+        )
+    return PreparedCapabilityJob(
+        job_id=request.job_id,
+        provider_app_id=capability.app_id,
+        provider_app_version=capability.app_version,
+        provider_instance_id=capability.instance_id,
+        capability_id=request.capability.id,
+        capability_version=request.capability.version,
+        artifact=ArtifactIdentity(
+            artifact_id=artifact.artifact_id,
+            media_type=artifact.media_type,
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+        ),
+        display_name=artifact.display_name,
+        parameters=tuple(sorted(request.parameters.items())),
+        request_json=request_json,
+    )
+
+
 def prepare_capability_job(
     capability: DiscoveredCapability,
     content: bytes,
@@ -1722,7 +1845,7 @@ class ConnectClient:
 class ConnectV2Client:
     def __init__(
         self,
-        capability: DiscoveredCapability,
+        capability: DiscoveredCapability | RegisteredCapability,
         *,
         client: httpx.Client | None = None,
         poll_interval_seconds: float = 0.25,
@@ -1759,13 +1882,19 @@ class ConnectV2Client:
                 "JOB_CAPABILITY_MISMATCH",
                 "The prepared job does not match the selected capability.",
             )
-        if require_compatible_input and not self.capability.accepts_artifact(
-            job.artifact.media_type, job.artifact.byte_size
-        ):
-            raise ConnectError(
-                "JOB_CAPABILITY_MISMATCH",
-                "The prepared job input is not accepted by the selected capability.",
-            )
+        if require_compatible_input:
+            if not isinstance(self.capability, DiscoveredCapability):
+                raise ConnectError(
+                    "JOB_CAPABILITY_MISMATCH",
+                    "A registered reconciliation endpoint cannot submit jobs.",
+                )
+            if not self.capability.accepts_artifact(
+                job.artifact.media_type, job.artifact.byte_size
+            ):
+                raise ConnectError(
+                    "JOB_CAPABILITY_MISMATCH",
+                    "The prepared job input is not accepted by the selected capability.",
+                )
 
     def submit(self, job: PreparedCapabilityJob, content: bytes) -> CapabilityJobUpdate:
         self._validate_job(job, require_compatible_input=True)
@@ -1895,7 +2024,10 @@ class ConnectV2Client:
                         "RESPONSE_MISMATCH",
                         "Connect output identity cannot alias its input.",
                     )
-                if output.media_type not in self.capability.produces:
+                if (
+                    isinstance(self.capability, DiscoveredCapability)
+                    and output.media_type not in self.capability.produces
+                ):
                     raise ConnectError(
                         "RESPONSE_MISMATCH",
                         "Connect output type was not declared by the capability.",
