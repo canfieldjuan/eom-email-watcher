@@ -2192,6 +2192,14 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
             "account_unavailable",
             "The message's mailbox account is not available in this application version.",
         )
+    if (
+        source.mailbox_identity_key is None
+        or account.mailbox_identity_key != source.mailbox_identity_key
+    ):
+        raise ApiError(
+            "connect_source_unavailable",
+            "The message's mailbox identity no longer matches the connected account.",
+        )
     return source
 
 
@@ -4048,16 +4056,23 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 reason="job_removed",
             )
             continue
-        if (
-            fire.state == "entitlement_paused"
-            and not runtime.store.connect_job_requires_automation_entitlement(fire.job_id)
-            and not _automation_entitlement_active()
-        ):
-            runtime.store.touch_automation_fire(
-                fire_id=fire.fire_id,
-                expected_state=fire.state,
-                expected_version=fire.state_version,
-            )
+        if not runtime.store.connect_job_requires_automation_entitlement(
+            fire.job_id
+        ) and not _automation_entitlement_active():
+            if fire.state == "submitted":
+                runtime.store.transition_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                    next_state="entitlement_paused",
+                    reason="entitlement_inactive",
+                )
+            else:
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
             continue
         if job.status == "completed":
             runtime.store.transition_automation_fire(
