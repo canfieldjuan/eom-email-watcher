@@ -30,7 +30,7 @@ from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS connect_job_dispatch (
     capability_authority_known INTEGER NOT NULL DEFAULT 0 CHECK (
         capability_authority_known IN (0, 1)
     ),
+    interactive_authorized_at TEXT,
     automation_paused_at TEXT,
     highest_provider_state TEXT NOT NULL DEFAULT 'requested' CHECK (
         highest_provider_state IN ('requested', 'accepted', 'processing')
@@ -1706,6 +1707,7 @@ class ConnectDispatch:
     capability_external_effects: bool
     capability_confirmation_required: bool
     capability_authority_known: bool
+    interactive_authorized_at: str | None
     automation_paused_at: str | None
     highest_provider_state: str
     last_error_code: str | None
@@ -1819,6 +1821,7 @@ def _ensure_connect_dispatch_schema(db: sqlite3.Connection) -> None:
         "capability_authority_known": (
             "INTEGER NOT NULL DEFAULT 0 CHECK (capability_authority_known IN (0, 1))"
         ),
+        "interactive_authorized_at": "TEXT",
         "automation_paused_at": "TEXT",
     }.items():
         if column not in dispatch_columns:
@@ -3805,7 +3808,8 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             job = db.execute(
-                """SELECT 1 FROM connect_attachment_jobs AS job
+                """SELECT dispatch.interactive_authorized_at
+                FROM connect_attachment_jobs AS job
                 JOIN connect_job_dispatch AS dispatch ON dispatch.job_id = job.job_id
                 WHERE job.job_id = ?
                   AND job.status IN ('requested', 'accepted', 'processing')""",
@@ -3818,16 +3822,45 @@ class Store:
                 WHERE dispatch_request_id = ? LIMIT 1""",
                 (job_id,),
             ).fetchone()
-            if automation_origin is not None:
-                raise RuntimeError("Automation-origin jobs require a dispatch pause")
+            if automation_origin is not None and job["interactive_authorized_at"] is None:
+                raise RuntimeError(
+                    "Automation-origin jobs require durable interactive authority"
+                )
             return _pause_linked_automation_fires(db, job_id=job_id, stamp=stamp)
+
+    def authorize_connect_job_interactively(
+        self,
+        job_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            authorized = db.execute(
+                """UPDATE connect_job_dispatch
+                SET interactive_authorized_at = COALESCE(interactive_authorized_at, ?)
+                WHERE job_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM connect_attachment_jobs AS job
+                    WHERE job.job_id = connect_job_dispatch.job_id
+                      AND job.protocol_version = 2
+                      AND job.status IN ('requested', 'accepted', 'processing')
+                  )""",
+                (stamp, job_id),
+            )
+            if authorized.rowcount != 1:
+                raise RuntimeError("Only active Connect v2 jobs can be authorized interactively")
 
     def connect_job_requires_automation_entitlement(self, job_id: str) -> bool:
         with self.connection() as db:
             row = db.execute(
                 """SELECT 1
                 FROM automation_fire_attempts AS attempt
+                JOIN connect_job_dispatch AS dispatch
+                  ON dispatch.job_id = attempt.dispatch_request_id
                 WHERE attempt.dispatch_request_id = ?
+                  AND dispatch.interactive_authorized_at IS NULL
                 LIMIT 1""",
                 (job_id,),
             ).fetchone()
@@ -7809,8 +7842,12 @@ class Store:
                     ) AS recency
                     FROM connect_attachment_jobs
                     WHERE message_id IN ({placeholders})
-                )
+                ) AS ranked
                 WHERE recency = 1
+                   OR EXISTS (
+                        SELECT 1 FROM automation_fires AS fire
+                        WHERE fire.job_id = ranked.job_id
+                   )
             ) AS latest
             LEFT JOIN connect_job_dispatch AS d ON d.job_id = latest.job_id
             ORDER BY latest.created_at DESC""",

@@ -381,6 +381,7 @@ def test_source_delete_recovers_provider_owned_unbound_automation_fire(
     completed = runtime.store.automation_fire(fire.fire_id)
     assert completed is not None
     assert completed.state == "completed"
+    assert runtime.store.connect_job(REQUEST_ID) is None
     assert completed.reason == "connect_completed"
     assert runtime.store.connect_job(created.job_id) is None
 
@@ -1765,7 +1766,149 @@ def test_concurrent_interactive_and_automation_admission_join_one_active_job(
     completed = runtime.store.automation_fire(fire.fire_id)
     assert completed is not None
     assert completed.state == "completed"
-    assert runtime.store.connect_job(REQUEST_ID) is None
+
+
+def test_interactive_join_authorizes_automation_origin_job_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_pump = engine_api._pump_generic_connect_lane
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    automated = engine_api._response(api_request(config_path, "connect.queue.pump"))
+    assert (
+        runtime.store.connect_job_requires_automation_entitlement(
+            attempt.dispatch_request_id
+        )
+        is True
+    )
+    interactive = engine_api._response(
+        api_request(
+            config_path,
+            "connect.attachment.invoke",
+            invocation_payload(selected, parameters={"mode": "contract"}),
+        )
+    )
+
+    assert automated["ok"] is True
+    assert interactive["data"]["job_id"] == attempt.dispatch_request_id
+    assert (
+        runtime.store.connect_job_requires_automation_entitlement(
+            attempt.dispatch_request_id
+        )
+        is False
+    )
+    with runtime.store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET state = 'waiting', submission_possible = 0,
+                next_attempt_at = '2000-01-01T00:00:00+00:00'
+            WHERE job_id = ?""",
+            (attempt.dispatch_request_id,),
+        )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
+    connect_authority_checks = 0
+    run_calls = 0
+
+    def require_connect() -> None:
+        nonlocal connect_authority_checks
+        connect_authority_checks += 1
+
+    def run_joined_job(*args: object, **kwargs: object) -> None:
+        nonlocal run_calls
+        run_calls += 1
+
+    monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", require_connect)
+    monkeypatch.setattr(
+        engine_api,
+        "_discover_persisted_generic_capability",
+        lambda job, *, require_entitlement: (selected, None),
+    )
+    monkeypatch.setattr(engine_api, "_run_claimed_generic_connect_job", run_joined_job)
+    active = runtime.store.connect_job(attempt.dispatch_request_id)
+    assert active is not None
+
+    outcome = real_pump(runtime, active)
+
+    assert outcome["outcome"] == "entitlement_paused"
+    assert connect_authority_checks == 1
+    assert run_calls == 1
+    paused = runtime.store.automation_fire(fire.fire_id)
+    dispatch = runtime.store.connect_dispatch(attempt.dispatch_request_id)
+    assert paused is not None
+    assert paused.state == "entitlement_paused"
+    assert dispatch is not None
+    assert dispatch.automation_paused_at is None
+
+
+def test_inbox_keeps_completed_automation_result_when_newer_retry_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, runtime = seeded_runtime(tmp_path)
+    selected, fire, attempt = seed_contract_fire(runtime)
+    install_automation_dispatch_fakes(
+        monkeypatch,
+        runtime,
+        lambda **kwargs: connect.CapabilityCatalog((selected,)),
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._response(api_request(config_path, "connect.queue.pump"))
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    runtime.store.transition_connect_job(
+        job_id=attempt.dispatch_request_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    completed_fire = runtime.store.automation_fire(fire.fire_id)
+    assert completed_fire is not None
+    assert completed_fire.state == "completed"
+
+    _candidate, retry, collision, _content = (
+        engine_api._prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=SECOND_REQUEST_ID,
+            message_id=fire.message_id,
+            part_id=fire.part_id,
+            capability=selected,
+            parameters={"mode": "contract"},
+            confirmed=False,
+        )
+    )
+    assert retry is not None
+    assert retry.job_id == SECOND_REQUEST_ID
+    assert collision is False
+    runtime.store.transition_connect_job(
+        job_id=retry.job_id,
+        expected_state="requested",
+        next_state="failed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        error={"code": "MODEL_UNAVAILABLE", "message": "Try again", "retryable": True},
+    )
+
+    results = runtime.store.recent(1)[0]["attachments"][0]["capability_results"]
+    by_job_id = {result["job_id"]: result for result in results}
+    assert set(by_job_id) == {attempt.dispatch_request_id, SECOND_REQUEST_ID}
+    assert by_job_id[attempt.dispatch_request_id]["status"] == "completed"
+    assert by_job_id[attempt.dispatch_request_id]["outputs"][0]["sha256"] == output.sha256
+    assert by_job_id[SECOND_REQUEST_ID]["status"] == "failed"
 
 
 def test_effectful_automation_collision_fails_closed_before_active_job_join(

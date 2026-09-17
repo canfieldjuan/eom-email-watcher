@@ -3783,6 +3783,7 @@ def _prepare_or_create_generic_connect_job(
     artifact_id: str | None = None,
     join_completed: bool = False,
     join_effectful: bool = True,
+    interactive_authorized: bool = False,
     candidate_check: Callable[[connect.PreparedCapabilityJob], None] | None = None,
 ) -> tuple[
     connect.PreparedCapabilityJob,
@@ -3898,6 +3899,8 @@ def _prepare_or_create_generic_connect_job(
                 capability=capability,
                 join_effectful=join_effectful,
             )
+            if interactive_authorized:
+                runtime.store.authorize_connect_job_interactively(joined.job_id)
             return candidate, joined, True, attachment_content
         try:
             created = runtime.store.create_connect_job(
@@ -3943,6 +3946,8 @@ def _prepare_or_create_generic_connect_job(
                 capability=capability,
                 join_effectful=join_effectful,
             )
+            if interactive_authorized:
+                runtime.store.authorize_connect_job_interactively(exact.job_id)
             return candidate, exact, True, attachment_content
         collision = created.job_id != candidate.job_id
         if collision:
@@ -3960,6 +3965,8 @@ def _prepare_or_create_generic_connect_job(
                 capability=capability,
                 join_effectful=join_effectful,
             )
+        if interactive_authorized:
+            runtime.store.authorize_connect_job_interactively(created.job_id)
         return candidate, created, collision, attachment_content
 
 
@@ -4461,6 +4468,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             part_id=part_id,
             parameters=parameters,
         )
+        runtime.store.authorize_connect_job_interactively(existing.job_id)
         return _resume_generic_connect_job(
             runtime,
             capability,
@@ -4477,6 +4485,7 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         capability=capability,
         parameters=parameters,
         confirmed=confirmed,
+        interactive_authorized=True,
     )
     assert created is not None
     if created.status == "completed":

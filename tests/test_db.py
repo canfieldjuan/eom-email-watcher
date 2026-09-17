@@ -3797,11 +3797,13 @@ def test_schema_22_marks_legacy_dispatch_capability_authority_unknown(tmp_path: 
     legacy = store.connect_dispatch(legacy_job_id)
     assert legacy is not None
     assert legacy.capability_authority_known is False
+    assert legacy.interactive_authorized_at is None
     new_job_id = "44444444-4444-4444-8444-444444444444"
     create_v2_connect_job(store, new_job_id, parameters={"target-language": "French"})
     current = store.connect_dispatch(new_job_id)
     assert current is not None
     assert current.capability_authority_known is True
+    assert current.interactive_authorized_at is None
 
 
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
