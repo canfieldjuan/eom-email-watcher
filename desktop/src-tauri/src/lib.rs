@@ -485,17 +485,29 @@ async fn connect_entitlement_status(
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+fn wake_connect_queue_after_entitlement_install<T, E>(
+    result: Result<T, E>,
+    wake: impl FnOnce(),
+) -> Result<T, E> {
+    if result.is_ok() {
+        wake();
+    }
+    result
+}
+
 #[tauri::command]
 async fn connect_entitlement_install(
     engine: State<'_, Engine>,
+    connect_queue: State<'_, ConnectQueueScheduler>,
     source_path: String,
 ) -> Result<ConnectEntitlementStatus, EngineError> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         engine.install_connect_entitlement(PathBuf::from(source_path))
     })
     .await
-    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?;
+    wake_connect_queue_after_entitlement_install(result, || connect_queue.wake())
 }
 
 #[tauri::command]
@@ -888,6 +900,23 @@ mod tests {
             "email-watcher",
             "prefix--background"
         ]));
+    }
+
+    #[test]
+    fn entitlement_install_wakes_queue_only_after_success() {
+        let mut success_wakes = 0;
+        let success = wake_connect_queue_after_entitlement_install(Ok::<_, ()>("active"), || {
+            success_wakes += 1
+        });
+        let mut failure_wakes = 0;
+        let failure = wake_connect_queue_after_entitlement_install(Err::<(), _>("invalid"), || {
+            failure_wakes += 1
+        });
+
+        assert_eq!(success, Ok("active"));
+        assert_eq!(success_wakes, 1);
+        assert_eq!(failure, Err("invalid"));
+        assert_eq!(failure_wakes, 0);
     }
 
     #[test]

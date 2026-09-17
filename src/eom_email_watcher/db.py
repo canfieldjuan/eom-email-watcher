@@ -3636,13 +3636,32 @@ class Store:
             row = db.execute(
                 """SELECT 1
                 FROM automation_fire_attempts AS attempt
-                JOIN automation_fires AS fire ON fire.fire_id = attempt.fire_id
                 WHERE attempt.dispatch_request_id = ?
-                  AND attempt.job_id = ?
-                  AND fire.job_id = ?
-                  AND fire.state IN ('submitted', 'entitlement_paused')
                 LIMIT 1""",
-                (job_id, job_id, job_id),
+                (job_id,),
+            ).fetchone()
+        return row is not None
+
+    def automation_fire_settlement_due(self) -> bool:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1
+                FROM automation_fires AS fire
+                LEFT JOIN connect_attachment_jobs AS job ON job.job_id = fire.job_id
+                WHERE fire.state IN ('submitted', 'entitlement_paused')
+                  AND fire.job_id IS NOT NULL
+                  AND (
+                    job.job_id IS NULL
+                    OR job.status = 'completed'
+                    OR (
+                      job.status = 'failed'
+                      AND NOT (
+                        fire.state = 'entitlement_paused'
+                        AND job.error_code = 'connect_queue_deadline_exceeded'
+                      )
+                    )
+                  )
+                LIMIT 1"""
             ).fetchone()
         return row is not None
 

@@ -2916,6 +2916,54 @@ def _require_connect_entitlement_for_job(
         raise
 
 
+def _defer_inactive_automation_job(
+    runtime: Runtime,
+    job_id: str,
+    *,
+    expected_dispatch_state: str,
+    next_dispatch_state: str,
+) -> None:
+    runtime.store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state=expected_dispatch_state,
+        next_dispatch_state=next_dispatch_state,
+        error_code="entitlement_inactive",
+        error_message="Automation entitlements are inactive.",
+        delay_seconds=30,
+    )
+    for fire in runtime.store.automation_fires_linked_to_job(job_id):
+        if fire.state == "submitted":
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="entitlement_paused",
+                reason="entitlement_inactive",
+            )
+
+
+def _require_submission_authority_for_job(
+    runtime: Runtime,
+    job_id: str,
+    capability: connect.DiscoveredCapability,
+    *,
+    expected_dispatch_state: str,
+    inactive_dispatch_state: str,
+) -> bool:
+    if runtime.store.connect_job_requires_automation_entitlement(job_id):
+        if _automation_entitlement_active():
+            return True
+        _defer_inactive_automation_job(
+            runtime,
+            job_id,
+            expected_dispatch_state=expected_dispatch_state,
+            next_dispatch_state=inactive_dispatch_state,
+        )
+        return False
+    _require_connect_entitlement_for_job(runtime, job_id, capability)
+    return True
+
+
 def _query_generic_connect_job(
     runtime: Runtime,
     capability: connect.DiscoveredCapability,
@@ -3164,7 +3212,6 @@ def _run_claimed_generic_connect_job(
     dispatch: ConnectDispatch,
     content: Callable[[], bytes],
     *,
-    allow_submission: bool = True,
     reconcile_first: bool = False,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
@@ -3176,11 +3223,14 @@ def _run_claimed_generic_connect_job(
             dispatch,
             capability,
         )
-        _require_connect_entitlement_for_job(
+        if not _require_submission_authority_for_job(
             runtime,
             tracked.job_id,
             capability,
-        )
+            expected_dispatch_state=dispatch.state,
+            inactive_dispatch_state="waiting",
+        ):
+            return _generic_connect_active_result(runtime, claimed_job)
         return _submit_generic_connect_job(
             runtime,
             capability,
@@ -3214,19 +3264,6 @@ def _run_claimed_generic_connect_job(
         return _generic_connect_result(refreshed)
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
-    if not allow_submission:
-        current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
-        if current_dispatch is None:
-            raise RuntimeError("Connect reconciliation lost its dispatch state")
-        runtime.store.defer_connect_job(
-            job_id=refreshed.job_id,
-            expected_dispatch_state=current_dispatch.state,
-            next_dispatch_state="reconciling",
-            error_code="entitlement_inactive",
-            error_message="Automation entitlements are inactive.",
-            delay_seconds=30,
-        )
-        return _generic_connect_active_result(runtime, refreshed)
     current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
     if current_dispatch is None:
         raise RuntimeError("Connect reconciliation lost its dispatch state")
@@ -3266,11 +3303,18 @@ def _run_claimed_generic_connect_job(
             "connect_job_in_progress",
             "The local capability job changed while it was being reconciled.",
         ) from exc
-    _require_connect_entitlement_for_job(
+    reclaimed_dispatch = reclaimed[1]
+    if not _require_submission_authority_for_job(
         runtime,
         tracked.job_id,
         capability,
-    )
+        expected_dispatch_state=reclaimed_dispatch.state,
+        inactive_dispatch_state="reconciling",
+    ):
+        current = runtime.store.connect_job(tracked.job_id)
+        if current is None:
+            raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+        return _generic_connect_active_result(runtime, current)
     return _submit_generic_connect_job(
         runtime,
         capability,
@@ -3414,6 +3458,8 @@ def _next_connect_queue_wakeup(
                 + timedelta(seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS),
             )
         )
+    if runtime.store.automation_fire_settlement_due():
+        wakeups.append(observed_at)
     return min(wakeups) if wakeups else None
 
 
@@ -3432,9 +3478,8 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
     try:
         with connect_operation_lock(lock_path, busy_message):
             linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
-            automation_authority_required = bool(
-                linked_fires
-                and runtime.store.connect_job_requires_automation_entitlement(head.job_id)
+            automation_authority_required = (
+                runtime.store.connect_job_requires_automation_entitlement(head.job_id)
             )
             automation_authorized = (
                 not automation_authority_required or _automation_entitlement_active()
@@ -3476,26 +3521,13 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     else:
                         connect.require_connect_entitlement()
                 except connect.ConnectError as exc:
-                    if linked_fires:
-                        runtime.store.defer_connect_job(
-                            job_id=claimed_job.job_id,
+                    if automation_authority_required:
+                        _defer_inactive_automation_job(
+                            runtime,
+                            claimed_job.job_id,
                             expected_dispatch_state=dispatch.state,
                             next_dispatch_state="waiting",
-                            error_code="entitlement_inactive",
-                            error_message="Automation entitlements are inactive.",
-                            delay_seconds=30,
                         )
-                        for linked in runtime.store.automation_fires_linked_to_job(
-                            claimed_job.job_id
-                        ):
-                            if linked.state == "submitted":
-                                runtime.store.transition_automation_fire(
-                                    fire_id=linked.fire_id,
-                                    expected_state=linked.state,
-                                    expected_version=linked.state_version,
-                                    next_state="entitlement_paused",
-                                    reason="entitlement_inactive",
-                                )
                         return _connect_queue_item(runtime, head.job_id, "entitlement_paused")
                     _fail_generic_connect_record(
                         runtime,
@@ -3554,12 +3586,12 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     claimed_job,
                     dispatch,
                     content,
-                    allow_submission=automation_authorized,
                     wait_for_terminal=False,
                 )
             except (ApiError, connect.ConnectError):
                 return _connect_queue_item(runtime, head.job_id, "deferred_or_failed")
-            if linked_fires and not automation_authorized:
+            current_linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
+            if any(fire.state == "entitlement_paused" for fire in current_linked_fires):
                 current = runtime.store.connect_job(head.job_id)
                 outcome = (
                     "completed"

@@ -311,6 +311,33 @@ notifications_enabled = false
     path.chmod(0o600)
 
 
+def write_private_contract_summary(path: Path, content: str) -> None:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    parent = candidate.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise RuntimeError("Contract summary output directory does not exist")
+    destination = parent / candidate.name
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".contract-summary-",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, destination, follow_symlinks=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
     account = runtime.store.mail_account(DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
     if account is None:
@@ -788,11 +815,10 @@ def main() -> None:
             if not isinstance(automation_text, str):
                 raise RuntimeError("Contract Watch output text is not a string")
             if args.contract_summary_output is not None:
-                contract_summary_output = args.contract_summary_output.resolve()
-                if not contract_summary_output.parent.is_dir():
-                    raise RuntimeError("Contract summary output directory does not exist")
-                contract_summary_output.write_text(automation_text, encoding="utf-8")
-                contract_summary_output.chmod(0o600)
+                write_private_contract_summary(
+                    args.contract_summary_output,
+                    automation_text,
+                )
             missing_expected_contract_terms = [
                 term
                 for term in args.expected_contract_term

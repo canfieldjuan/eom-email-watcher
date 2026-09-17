@@ -26,6 +26,7 @@ require_proof_checks = PROOF_SCRIPT["require_proof_checks"]
 privacy_projection = PROOF_SCRIPT["privacy_projection"]
 request = PROOF_SCRIPT["request"]
 write_config = PROOF_SCRIPT["write_config"]
+write_private_contract_summary = PROOF_SCRIPT["write_private_contract_summary"]
 TEST_MAILBOX_IDENTITY_KEY = "a" * 64
 
 
@@ -209,3 +210,29 @@ def test_privacy_projection_allows_only_artifact_display_names() -> None:
             }
         ],
     }
+
+
+def test_contract_summary_output_appears_complete_and_private(tmp_path: Path) -> None:
+    output = tmp_path / "contract-summary.txt"
+
+    write_private_contract_summary(output, "complete summary")
+
+    assert output.read_text(encoding="utf-8") == "complete summary"
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_contract_summary_output_refuses_existing_file_and_symlink(tmp_path: Path) -> None:
+    existing = tmp_path / "existing.txt"
+    existing.write_text("keep existing", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("keep target", encoding="utf-8")
+    linked = tmp_path / "linked.txt"
+    linked.symlink_to(target)
+
+    with pytest.raises(FileExistsError):
+        write_private_contract_summary(existing, "replace existing")
+    with pytest.raises(FileExistsError):
+        write_private_contract_summary(linked, "follow link")
+
+    assert existing.read_text(encoding="utf-8") == "keep existing"
+    assert target.read_text(encoding="utf-8") == "keep target"
