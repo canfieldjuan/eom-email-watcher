@@ -3656,13 +3656,16 @@ def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
             """
         )
 
+    migration_started = datetime.now(UTC)
     store.initialize()
 
     migrated = store.automation_fire(original.fire_id)
     assert migrated is not None
     assert migrated.state == "pending_dispatch"
     assert migrated.state_version == 1
-    assert migrated.pending_since == original.updated_at
+    assert migrated.pending_since is not None
+    assert datetime.fromisoformat(migrated.pending_since) >= migration_started
+    assert migrated.pending_since != original.updated_at
     assert migrated.current_attempt_no == 1
     assert migrated.job_id is None
     migrated_attempts = store.automation_fire_attempts(original.fire_id)
@@ -3677,6 +3680,73 @@ def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
         ).fetchone()
         assert trigger is not None
         assert trigger["installed"] == 1
+        indexes = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA index_list(automation_fires)").fetchall()
+        }
+        assert "idx_automation_fires_state" in indexes
+        assert "idx_automation_fires_message" in indexes
+
+
+def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111",
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": False,
+        }
+    )
+    store.mark_analyzed("m1", scheduling_analysis())
+    original = store.automation_fires_for_message("m1")[0]
+    original_attempt = store.automation_fire_attempts(original.fire_id)[0]
+
+    with store.connection() as connection:
+        connection.execute("PRAGMA writable_schema = ON")
+        changed = connection.execute(
+            """UPDATE sqlite_schema
+            SET sql = replace(sql, 'AND 32768', 'AND 8192')
+            WHERE type = 'table' AND name = 'automation_fires'"""
+        )
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute("PRAGMA user_version = 21")
+        assert changed.rowcount == 1
+
+    store.initialize()
+
+    migrated = store.automation_fire(original.fire_id)
+    assert migrated == original
+    assert store.automation_fire_attempts(original.fire_id) == [original_attempt]
+    prepared_identity = b'{"parameters":{"memo":"' + (b"x" * 9000) + b'"}}'
+    with store.connection() as connection:
+        connection.execute(
+            """UPDATE automation_fires
+            SET prepared_identity_sha256 = ?, prepared_identity_json = ?
+            WHERE fire_id = ?""",
+            (hashlib.sha256(prepared_identity).hexdigest(), prepared_identity, original.fire_id),
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:

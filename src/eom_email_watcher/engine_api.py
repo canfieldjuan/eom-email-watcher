@@ -1694,13 +1694,7 @@ def _automation_fire_decide(request: dict[str, object]) -> dict[str, object]:
         fire_id = connect.validate_job_id(payload.get("fire_id"))
     except connect.ConnectError as exc:
         raise ApiError("invalid_request", "fire_id must be a UUIDv4 string") from exc
-    expected_version = payload.get("expected_version")
-    if (
-        isinstance(expected_version, bool)
-        or not isinstance(expected_version, int)
-        or expected_version < 1
-    ):
-        raise ApiError("invalid_request", "expected_version must be a positive integer")
+    expected_version = _automation_expected_version(payload.get("expected_version"))
     prepared_identity_sha256 = payload.get("prepared_identity_sha256")
     if (
         not isinstance(prepared_identity_sha256, str)
@@ -3139,6 +3133,30 @@ def _submit_generic_connect_job(
         raise
 
 
+def _require_persisted_capability_authority(
+    runtime: Runtime,
+    job: ConnectJob,
+    dispatch: ConnectDispatch,
+    capability: connect.DiscoveredCapability,
+) -> None:
+    if (
+        dispatch.capability_external_effects == capability.external_effects
+        and dispatch.capability_confirmation_required
+        == capability.confirmation_required
+    ):
+        return
+    _fail_generic_connect_record(
+        runtime,
+        job,
+        code="capability_authority_changed",
+        message="The provider capability authority changed after admission.",
+    )
+    raise ApiError(
+        "capability_authority_changed",
+        "The provider capability authority changed after admission.",
+    )
+
+
 def _run_claimed_generic_connect_job(
     runtime: Runtime,
     capability: connect.DiscoveredCapability,
@@ -3146,11 +3164,18 @@ def _run_claimed_generic_connect_job(
     dispatch: ConnectDispatch,
     content: Callable[[], bytes],
     *,
+    allow_submission: bool = True,
     reconcile_first: bool = False,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     tracked = _tracked_generic_job(claimed_job, capability)
     if dispatch.state == "dispatching" and not reconcile_first:
+        _require_persisted_capability_authority(
+            runtime,
+            claimed_job,
+            dispatch,
+            capability,
+        )
         _require_connect_entitlement_for_job(
             runtime,
             tracked.job_id,
@@ -3189,6 +3214,28 @@ def _run_claimed_generic_connect_job(
         return _generic_connect_result(refreshed)
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
+    if not allow_submission:
+        current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
+        if current_dispatch is None:
+            raise RuntimeError("Connect reconciliation lost its dispatch state")
+        runtime.store.defer_connect_job(
+            job_id=refreshed.job_id,
+            expected_dispatch_state=current_dispatch.state,
+            next_dispatch_state="reconciling",
+            error_code="entitlement_inactive",
+            error_message="Automation entitlements are inactive.",
+            delay_seconds=30,
+        )
+        return _generic_connect_active_result(runtime, refreshed)
+    current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
+    if current_dispatch is None:
+        raise RuntimeError("Connect reconciliation lost its dispatch state")
+    _require_persisted_capability_authority(
+        runtime,
+        refreshed,
+        current_dispatch,
+        capability,
+    )
     tracked = _tracked_generic_job(refreshed, capability)
     if not capability.accepts_artifact(tracked.artifact.media_type, tracked.artifact.byte_size):
         raise ApiError(
@@ -3371,7 +3418,8 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
     try:
         with connect_operation_lock(lock_path, busy_message):
             linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
-            if linked_fires and not _automation_entitlement_active():
+            automation_authorized = not linked_fires or _automation_entitlement_active()
+            if linked_fires and not automation_authorized:
                 for fire in linked_fires:
                     if fire.state == "submitted":
                         runtime.store.transition_automation_fire(
@@ -3381,13 +3429,13 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                             next_state="entitlement_paused",
                             reason="entitlement_inactive",
                         )
-                return _connect_queue_item(runtime, head.job_id, "entitlement_paused")
-            for fire in linked_fires:
-                if fire.state == "entitlement_paused":
-                    runtime.store.resume_automation_fire_job(
-                        fire_id=fire.fire_id,
-                        expected_version=fire.state_version,
-                    )
+            else:
+                for fire in linked_fires:
+                    if fire.state == "entitlement_paused":
+                        runtime.store.resume_automation_fire_job(
+                            fire_id=fire.fire_id,
+                            expected_version=fire.state_version,
+                        )
             claimed = runtime.store.claim_connect_lane_head(
                 provider_app_id=head.provider_app_id,
                 provider_instance_id=head.provider_instance_id,
@@ -3400,7 +3448,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             if proven_new_submission:
                 try:
                     if linked_fires:
-                        if not _automation_entitlement_active():
+                        if not automation_authorized:
                             raise connect.ConnectError(
                                 "ENTITLEMENT_REQUIRED",
                                 "Automation provider submission requires active entitlements.",
@@ -3486,10 +3534,19 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     claimed_job,
                     dispatch,
                     content,
+                    allow_submission=automation_authorized,
                     wait_for_terminal=False,
                 )
             except (ApiError, connect.ConnectError):
                 return _connect_queue_item(runtime, head.job_id, "deferred_or_failed")
+            if linked_fires and not automation_authorized:
+                current = runtime.store.connect_job(head.job_id)
+                outcome = (
+                    "completed"
+                    if current is not None and current.status in {"completed", "failed"}
+                    else "entitlement_paused"
+                )
+                return _connect_queue_item(runtime, head.job_id, outcome)
             return _connect_queue_item(runtime, head.job_id, "completed")
     except RuntimeError as exc:
         if str(exc) == busy_message:
@@ -3751,6 +3808,8 @@ def _prepare_or_create_generic_connect_job(
                 input_display_name=candidate.display_name,
                 source_app_id=connect.SOURCE_APP_ID,
                 request_json=candidate.request_json,
+                capability_external_effects=capability.external_effects,
+                capability_confirmation_required=capability.confirmation_required,
             )
         except ConnectQueueFull as exc:
             raise ApiError(
@@ -3837,8 +3896,17 @@ def _automation_artifact_id(dispatch_request_id: str) -> str:
 
 
 def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
-    for fire in runtime.store.automation_fires_in_states(("submitted",), limit=limit):
+    for fire in runtime.store.automation_fires_in_states(
+        ("submitted", "entitlement_paused"), limit=limit
+    ):
         if fire.job_id is None:
+            if fire.state == "entitlement_paused":
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
+                continue
             raise RuntimeError("Submitted automation fire is missing its Connect job")
         job = runtime.store.connect_job(fire.job_id)
         if job is None:
@@ -3860,8 +3928,20 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
             )
             continue
         if job.status != "failed":
+            runtime.store.touch_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+            )
             continue
         if job.error_code == "connect_queue_deadline_exceeded":
+            if fire.state == "entitlement_paused":
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
+                continue
             if fire.current_attempt_no < 2:
                 runtime.store.retry_automation_fire_after_deadline(
                     fire_id=fire.fire_id,
@@ -3890,6 +3970,52 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
     if fire is None or fire.state not in {"pending_dispatch", "entitlement_paused"}:
         return
     authorized = _automation_entitlement_active()
+    definition = runtime.store.automation_fire_definition(fire)
+    action = definition.action
+    provider_ref = {
+        "app_id": action.provider.app_id,
+        "version": action.provider.version,
+        "instance_id": action.provider.instance_id,
+    }
+    capability_ref = {
+        "id": action.capability.id,
+        "version": action.capability.version,
+    }
+    requested_parameters: dict[str, object] = dict(action.parameters)
+    attempt_rows = runtime.store.automation_fire_attempts(fire.fire_id)
+    attempts = [
+        attempt for attempt in attempt_rows if attempt.attempt_no == fire.current_attempt_no
+    ]
+    if len(attempts) != 1:
+        raise RuntimeError("Automation fire has no unique current attempt")
+    attempt = attempts[0]
+    exact = runtime.store.connect_job(attempt.dispatch_request_id)
+    if exact is not None and fire.job_id is None:
+        _validate_existing_invocation_identity(
+            exact,
+            message_id=fire.message_id,
+            part_id=fire.part_id,
+            provider=provider_ref,
+            capability=capability_ref,
+            parameters=requested_parameters,
+        )
+        recovered = runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="job_recovered",
+            job_id=exact.job_id,
+        )
+        if not authorized:
+            runtime.store.transition_automation_fire(
+                fire_id=recovered.fire_id,
+                expected_state=recovered.state,
+                expected_version=recovered.state_version,
+                next_state="entitlement_paused",
+                reason="entitlement_inactive",
+            )
+        return
     if fire.state == "entitlement_paused":
         if not authorized:
             return
@@ -3924,44 +4050,6 @@ def _dispatch_automation_fire(runtime: Runtime, fire_id: str) -> None:
             expected_version=fire.state_version,
             next_state="manual_review",
             reason="dispatch_stalled",
-        )
-        return
-    definition = runtime.store.automation_fire_definition(fire)
-    action = definition.action
-    provider_ref = {
-        "app_id": action.provider.app_id,
-        "version": action.provider.version,
-        "instance_id": action.provider.instance_id,
-    }
-    capability_ref = {
-        "id": action.capability.id,
-        "version": action.capability.version,
-    }
-    requested_parameters: dict[str, object] = dict(action.parameters)
-    attempt_rows = runtime.store.automation_fire_attempts(fire.fire_id)
-    attempts = [
-        attempt for attempt in attempt_rows if attempt.attempt_no == fire.current_attempt_no
-    ]
-    if len(attempts) != 1:
-        raise RuntimeError("Automation fire has no unique current attempt")
-    attempt = attempts[0]
-    exact = runtime.store.connect_job(attempt.dispatch_request_id)
-    if exact is not None:
-        _validate_existing_invocation_identity(
-            exact,
-            message_id=fire.message_id,
-            part_id=fire.part_id,
-            provider=provider_ref,
-            capability=capability_ref,
-            parameters=requested_parameters,
-        )
-        runtime.store.transition_automation_fire(
-            fire_id=fire.fire_id,
-            expected_state=fire.state,
-            expected_version=fire.state_version,
-            next_state="submitted",
-            reason="job_recovered",
-            job_id=exact.job_id,
         )
         return
     try:
@@ -4122,6 +4210,17 @@ def _dispatch_automation_fires(runtime: Runtime, *, limit: int) -> None:
         except RuntimeError as exc:
             if "expected-state race" not in str(exc):
                 raise
+        current = runtime.store.automation_fire(fire.fire_id)
+        if (
+            current is not None
+            and current.state == fire.state
+            and current.state_version == fire.state_version
+        ):
+            runtime.store.touch_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+            )
 
 
 def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
