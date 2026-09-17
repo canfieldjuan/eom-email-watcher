@@ -48,6 +48,12 @@ OVERLAY_SET = "overlay.set"
 # and a direct apply_effects caller cannot exceed it.
 MAX_EFFECTS_PER_BATCH = 8
 
+# The maximum size of a canonical effect batch. Workflow-originated batches are already
+# bounded by the 16 KiB canonical-definition limit; this bounds a direct apply_effects
+# caller so a single overlay value cannot persist an unbounded payload in the immutable
+# event and the overlay projection.
+MAX_EFFECT_BATCH_BYTES = 16 * 1024
+
 _SCHEMA = """
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS workflow_records (
@@ -210,10 +216,14 @@ def _normalize_effects(effects: Sequence[Mapping[str, object]]) -> list[dict[str
     caller. A batch must be non-empty, carry at most one ``record.transition``, and use
     distinct ``overlay.set`` keys.
     """
+    if isinstance(effects, (str, bytes, Mapping)) or not isinstance(effects, Sequence):
+        raise InvalidEffect("effects must be a sequence of effect objects")
     normalized: list[dict[str, object]] = []
     seen_overlay_keys: set[str] = set()
     transition_count = 0
     for raw in effects:
+        if not isinstance(raw, Mapping):
+            raise InvalidEffect("each effect must be an object")
         kind = raw.get("kind")
         if kind == RECORD_TRANSITION:
             # An exact key set: an unrecognized member (e.g. an "overlay.set" key smuggled
@@ -258,15 +268,16 @@ def _canonical_effects(normalized: Sequence[Mapping[str, object]]) -> str:
 
 
 def _require_operation_identity(operation_key: str, operation_name: str) -> None:
-    """Reject an empty operation key or name before it reaches a NOT-NULL/CHECK column.
+    """Reject a non-string or empty operation key or name before it is persisted.
 
-    Both are persisted under constraints that forbid the empty string; validating here
-    turns malformed input (for example an empty decision name) into a domain ValueError at
-    the primitive boundary rather than a raw sqlite3.IntegrityError.
+    Both are stored as TEXT under constraints that forbid the empty string, and SQLite would
+    silently coerce a non-string (so a retry with int ``7`` would not match stored ``"7"``);
+    validating here turns malformed input (for example an empty decision name) into a domain
+    ValueError at the primitive boundary rather than a raw sqlite3.IntegrityError.
     """
-    if not operation_key:
+    if not isinstance(operation_key, str) or not operation_key:
         raise ValueError("operation_key must be a non-empty string")
-    if not operation_name:
+    if not isinstance(operation_name, str) or not operation_name:
         raise ValueError("operation_name must be a non-empty string")
 
 
@@ -561,6 +572,8 @@ class WorkflowStore:
         _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
         canonical_effects = _canonical_effects(normalized)
+        if len(canonical_effects.encode("utf-8")) > MAX_EFFECT_BATCH_BYTES:
+            raise InvalidEffect(f"the effect batch exceeds {MAX_EFFECT_BATCH_BYTES} bytes")
         fingerprint = request_fingerprint(request)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")

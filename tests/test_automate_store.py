@@ -475,6 +475,71 @@ def test_apply_effects_rejects_empty_operation_key(tmp_path: Path) -> None:
         )
 
 
+def test_apply_effects_rejects_a_non_object_effect_element(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    # A scalar/None element must fail closed with InvalidEffect, not a raw AttributeError.
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [None],
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_a_non_sequence_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            {"kind": "overlay.set", "key": "k", "value": 1},  # a mapping, not a batch
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_an_oversized_overlay_payload(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "blob", "value": "x" * 20000}],
+            operation_key="op-1",
+            operation_name="x",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
+def test_apply_effects_rejects_a_non_string_operation_name(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
+    with pytest.raises(ValueError):
+        store.apply_effects(
+            record.record_id,
+            [{"kind": "overlay.set", "key": "k", "value": 1}],
+            operation_key="op-1",
+            operation_name=7,  # type: ignore[arg-type]
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+        )
+
+
 def test_apply_effects_rejects_empty_operation_name(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record = store.create_record("lead-funnel", "captured", now=NOW, allowed_stages=STAGES)
