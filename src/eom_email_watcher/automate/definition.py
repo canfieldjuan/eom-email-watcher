@@ -30,8 +30,12 @@ MAX_CONDITIONS = 8
 MAX_EFFECTS = MAX_EFFECTS_PER_BATCH
 MAX_DEFINITIONS = 64
 MAX_STAGES = 64
+# The maximum length of a name-like identifier (workflow name, definition name, trigger
+# decision). Exported so the engine can reject an over-long decision (which can never match
+# a trigger) before it is persisted as an unbounded operation name.
+MAX_NAME_LENGTH = 80
 
-_Name = Annotated[str, Field(strict=True, min_length=1, max_length=80)]
+_Name = Annotated[str, Field(strict=True, min_length=1, max_length=MAX_NAME_LENGTH)]
 _Stage = Annotated[str, Field(strict=True, min_length=1, max_length=80)]
 _OverlayKey = Annotated[str, Field(strict=True, min_length=1, max_length=80)]
 
@@ -181,10 +185,13 @@ def canonical_workflow(workflow: Workflow) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
-    except UnicodeEncodeError as exc:
-        # A string containing a lone surrogate (e.g. an overlay value decoded from
-        # "\ud800") is not UTF-8 encodable; reject it on the same DefinitionError path.
-        raise DefinitionError(f"workflow contains an unencodable string: {exc}") from exc
+    except ValueError as exc:
+        # A value that cannot be serialized or UTF-8 encoded (a lone surrogate such as an
+        # overlay value decoded from "\ud800", or an integer past the interpreter digit
+        # limit such as 10**5000) is rejected on the same DefinitionError path. This covers
+        # a Workflow built directly via model_validate, not only one from parse_workflow.
+        # UnicodeEncodeError is a ValueError subclass, so this catch handles both.
+        raise DefinitionError(f"workflow contains an unserializable value: {exc}") from exc
     if len(raw) > MAX_DEFINITION_BYTES:
         raise DefinitionError("canonical workflow exceeds 16384 bytes")
     return raw

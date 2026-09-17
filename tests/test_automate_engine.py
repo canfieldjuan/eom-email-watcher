@@ -325,6 +325,92 @@ def test_decision_refused_when_license_absent_even_for_existing_record(tmp_path:
         )
 
 
+def test_over_long_decision_is_rejected(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    workflow = _workflow()
+    record = engine.create_record(workflow, now=NOW)
+    with pytest.raises(ValueError):
+        engine.submit_decision(
+            workflow,
+            record.record_id,
+            decision="x" * 81,  # longer than the 80-char trigger-name limit
+            operation_key="op-1",
+            request={},
+            expected_version=1,
+            now=NOW,
+        )
+
+
+def test_completed_operation_replays_after_a_revision_advanced_the_record(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    v1 = Workflow.model_validate(
+        {
+            "name": "flow",
+            "stages": ["captured", "reviewing"],
+            "initial_stage": "captured",
+            "definitions": [
+                {
+                    "name": "start",
+                    "trigger": {"source_kind": "operator.decision", "decision": "start"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "captured"}],
+                    "effects": [{"kind": "record.transition", "to_stage": "reviewing"}],
+                }
+            ],
+        }
+    )
+    record = engine.create_record(v1, now=NOW)
+    first = engine.submit_decision(
+        v1,
+        record.record_id,
+        decision="start",
+        operation_key="k1",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
+    )
+    assert first.record.stage == "reviewing"
+    # A same-named revision drops "captured" and adds "archived", then advances the record.
+    v2 = Workflow.model_validate(
+        {
+            "name": "flow",
+            "stages": ["reviewing", "archived"],
+            "initial_stage": "reviewing",
+            "definitions": [
+                {
+                    "name": "archive",
+                    "trigger": {"source_kind": "operator.decision", "decision": "archive"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "reviewing"}],
+                    "effects": [{"kind": "record.transition", "to_stage": "archived"}],
+                }
+            ],
+        }
+    )
+    engine.submit_decision(
+        v2,
+        record.record_id,
+        decision="archive",
+        operation_key="k2",
+        request={},
+        expected_version=2,
+        now=NOW,
+    )
+    assert engine._store.get_record(record.record_id).stage == "archived"
+    # Retrying the v1 operation must replay its recorded outcome, even though the record's
+    # current stage ("archived") is not declared by v1.
+    replay = engine.submit_decision(
+        v1,
+        record.record_id,
+        decision="start",
+        operation_key="k1",
+        request={"by": "a"},
+        expected_version=1,
+        now=NOW,
+    )
+    assert replay.applied is False
+    assert replay.event_id == first.event_id
+    assert replay.record.stage == "reviewing"
+
+
 def test_non_string_operation_key_is_rejected_before_lookup(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     workflow = _workflow()

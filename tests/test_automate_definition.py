@@ -163,6 +163,16 @@ def test_invalid_utf8_bytes_are_a_definition_error() -> None:
         parse_workflow(b"\xff")
 
 
+def test_canonical_workflow_rejects_an_oversized_integer_via_direct_model() -> None:
+    data = _workflow_data()
+    data["definitions"][0]["effects"] = [{"kind": "overlay.set", "key": "k", "value": 10**5000}]
+    workflow = Workflow.model_validate(data)
+    # Building the model directly bypasses parse_workflow's json.loads guard, so
+    # canonical_workflow itself must translate the json.dumps ValueError.
+    with pytest.raises(DefinitionError):
+        canonical_workflow(workflow)
+
+
 def test_definition_error_is_importable_from_the_package() -> None:
     from eom_email_watcher.automate import DefinitionError as PackageDefinitionError
 

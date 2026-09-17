@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from .definition import Condition, Workflow, WorkflowDefinition
+from .definition import MAX_NAME_LENGTH, Condition, Workflow, WorkflowDefinition
 from .host import AutomateHost
 from .store import OperationConflict, RecordView, StaleRecord, WorkflowStore, request_fingerprint
 
@@ -117,6 +117,10 @@ class WorkflowEngine:
             raise ValueError("operation_key must be a non-empty string")
         if not isinstance(decision, str) or not decision:
             raise ValueError("decision must be a non-empty string")
+        if len(decision) > MAX_NAME_LENGTH:
+            # A decision longer than the trigger-name limit can never match a trigger, and
+            # would otherwise be persisted verbatim as an unbounded operation name.
+            raise ValueError(f"decision must be at most {MAX_NAME_LENGTH} characters")
         if not isinstance(request, Mapping):
             raise ValueError("request must be a mapping")
         record = self._store.get_record(record_id)
@@ -125,13 +129,9 @@ class WorkflowEngine:
                 f"record {record_id!r} belongs to workflow {record.workflow!r}, "
                 f"not {workflow.name!r}"
             )
-        if record.stage not in set(workflow.stages):
-            # The supplied workflow (a revision reusing the name) does not declare the
-            # record's current stage, so it cannot legitimately describe or transition it.
-            raise WorkflowMismatch(
-                f"record {record_id!r} is at stage {record.stage!r}, which workflow "
-                f"{workflow.name!r} does not declare"
-            )
+        # Replay takes precedence over current-stage re-evaluation: a completed operation
+        # must replay its recorded outcome even if a later workflow revision has advanced
+        # the record into a stage this supplied workflow does not declare.
         prior = self._store.lookup_operation(record_id, operation_key)
         if prior is not None:
             if prior.operation_name != decision or prior.request_fingerprint != request_fingerprint(
@@ -144,6 +144,15 @@ class WorkflowEngine:
                 applied=False,
                 definition_name=None,
                 event_id=prior.event_id,
+            )
+        # For a new operation, the supplied workflow must actually describe the record: a
+        # revision reusing the name whose stage set omits the record's current stage cannot
+        # legitimately transition it. Checked after the replay lookup so a completed
+        # operation still replays regardless of the current stage.
+        if record.stage not in set(workflow.stages):
+            raise WorkflowMismatch(
+                f"record {record_id!r} is at stage {record.stage!r}, which workflow "
+                f"{workflow.name!r} does not declare"
             )
         # Bind matching and the compare-and-set to one version: reject a stale caller here,
         # before matching, so a definition selected against this snapshot cannot be applied
