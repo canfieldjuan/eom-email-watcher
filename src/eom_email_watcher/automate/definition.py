@@ -16,6 +16,7 @@ Slice 4's signed pack format signs over.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal
@@ -126,6 +127,18 @@ _ContentBase64 = Annotated[str, Field(strict=True, max_length=_MAX_CONTENT_BASE6
 _ParameterKey = Annotated[str, Field(strict=True, pattern=_CAPABILITY_ID_PATTERN, max_length=100)]
 
 
+# The member of a value binding: ``{"overlay": "<overlay-key>"}`` takes a value from the
+# record's overlay projection at admission. A literal parameter value is a bounded primitive
+# (ADR-0002) and a literal input content is a base64 string, so an object-valued parameter or
+# content field is unambiguously a binding. The key mirrors the overlay-key bound in the
+# store's effect model.
+OVERLAY_BINDING_KEY = "overlay"
+
+
+class OverlayBinding(_Strict):
+    overlay: Annotated[str, Field(strict=True, min_length=1, max_length=80)]
+
+
 class ConnectInvokeCapability(_Strict):
     id: _CapabilityId
     version: _CapabilityVersion
@@ -139,18 +152,10 @@ class ConnectInvokeInput(_Strict):
     artifact_id: _Uuid4
     media_type: _MediaType
     filename: _Filename
-    content_base64: _ContentBase64 = ""
-
-
-# The member of a parameter-value binding: ``{"overlay": "<overlay-key>"}`` takes the
-# parameter's value from the record's overlay projection at admission. A literal parameter
-# value is a bounded primitive (ADR-0002), never an object, so an object-valued parameter is
-# unambiguously a binding. The key mirrors the overlay-key bound in the store's effect model.
-OVERLAY_BINDING_KEY = "overlay"
-
-
-class OverlayBinding(_Strict):
-    overlay: Annotated[str, Field(strict=True, min_length=1, max_length=80)]
+    # A literal base64 string, or an OverlayBinding whose (string) overlay value is the raw
+    # input content that the host UTF-8- then base64-encodes at admission, so a workflow can
+    # assemble a payload in an overlay and send it as the input artifact.
+    content_base64: _ContentBase64 | OverlayBinding = ""
 
 
 class ConnectInvokeRequest(_Strict):
@@ -160,11 +165,11 @@ class ConnectInvokeRequest(_Strict):
     capability, or pin ``instance_id`` to bind one. ``parameters`` and ``confirmed`` carry the
     capability's bounded inputs and its confirmation flag.
 
-    A parameter value is either a literal bounded primitive or an :class:`OverlayBinding`
-    (``{"overlay": key}``) resolved from the record's overlay projection at admission, so a
-    capability whose parameter values vary per record (a specific lead id, a booking key) is
-    expressible while the signed template stays fixed. Binding the input artifact's content
-    from record state is a later increment; the input artifact here is still static.
+    A parameter value, and the input artifact's content, are each either a literal or an
+    :class:`OverlayBinding` (``{"overlay": key}``) resolved from the record's overlay projection
+    at admission (see :func:`render_connect_invoke_request`), so a capability whose inputs vary
+    per record (a specific lead id, a booking key, an assembled payload) is expressible while
+    the signed template stays fixed.
     """
 
     capability: ConnectInvokeCapability
@@ -185,37 +190,64 @@ class RequestBindingError(ValueError):
     """
 
 
+def _resolve_overlay(binding: Mapping[str, object], overlays: Mapping[str, object], what: str):
+    key = binding[OVERLAY_BINDING_KEY]
+    if key not in overlays:
+        raise RequestBindingError(f"connect.invoke {what} binds unset overlay {key!r}")
+    return overlays[key]
+
+
+def _is_binding(value: object) -> bool:
+    return isinstance(value, Mapping) and OVERLAY_BINDING_KEY in value
+
+
 def render_connect_invoke_request(
     request: Mapping[str, object], overlays: Mapping[str, object]
 ) -> dict[str, object]:
-    """Resolve a connect.invoke request's overlay-bound parameters against record state.
+    """Resolve a connect.invoke request's overlay bindings against record state.
 
-    Returns a new request in which each ``{"overlay": key}`` parameter value is replaced by
-    the record's current overlay value for ``key``. A request with no bindings is returned
-    unchanged. Raises :class:`RequestBindingError` when a bound key is unset for the record,
-    so a decision that binds missing state fails cleanly rather than dispatching a request
-    with a hole in it. The resolved request is what the outbox freezes, so a retry replays the
-    resolved values, never re-resolves against later state (the queue-row-binding discipline).
+    Returns a new request in which each ``{"overlay": key}`` binding is replaced by the
+    record's current overlay value for ``key``:
+
+    - a bound *parameter* takes the overlay's scalar value directly;
+    - a bound *input content* takes the overlay's string value as the raw input, which the host
+      UTF-8- then base64-encodes into ``content_base64`` (so an overlay holds a plain payload,
+      not base64).
+
+    A request with no bindings is returned unchanged. Raises :class:`RequestBindingError` when
+    a bound key is unset, or when a bound input content resolves to a non-string, so a decision
+    that binds missing or unusable state fails cleanly rather than dispatching a request with a
+    hole in it. The resolved request is what the outbox freezes, so a retry replays the resolved
+    values, never re-resolves against later state (the queue-row-binding discipline).
     """
+    result = dict(request)
+
     parameters = request.get("parameters")
-    if not isinstance(parameters, Mapping) or not parameters:
-        return dict(request)
-    rendered: dict[str, object] = {}
-    bound = False
-    for name, value in parameters.items():
-        if isinstance(value, Mapping) and OVERLAY_BINDING_KEY in value:
-            key = value[OVERLAY_BINDING_KEY]
-            if key not in overlays:
+    if isinstance(parameters, Mapping) and parameters:
+        rendered: dict[str, object] = {}
+        bound = False
+        for name, value in parameters.items():
+            if _is_binding(value):
+                rendered[name] = _resolve_overlay(value, overlays, f"parameter {name!r}")
+                bound = True
+            else:
+                rendered[name] = value
+        if bound:
+            result["parameters"] = rendered
+
+    input_artifact = request.get("input")
+    if isinstance(input_artifact, Mapping):
+        content = input_artifact.get("content_base64")
+        if _is_binding(content):
+            raw = _resolve_overlay(content, overlays, "input content")
+            if not isinstance(raw, str):
                 raise RequestBindingError(
-                    f"connect.invoke parameter {name!r} binds unset overlay {key!r}"
+                    "connect.invoke input content binding must resolve to a string"
                 )
-            rendered[name] = overlays[key]
-            bound = True
-        else:
-            rendered[name] = value
-    if not bound:
-        return dict(request)
-    return {**request, "parameters": rendered}
+            encoded = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+            result["input"] = {**input_artifact, "content_base64": encoded}
+
+    return result
 
 
 class ActionEmit(_Strict):

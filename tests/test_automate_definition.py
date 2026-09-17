@@ -419,6 +419,75 @@ def test_render_raises_on_an_unset_bound_overlay() -> None:
         render_connect_invoke_request(request, {"other": "x"})
 
 
+def test_connect_invoke_accepts_an_overlay_bound_input_content() -> None:
+    data = _workflow_data()
+    request = _connect_invoke_request()
+    request["input"]["content_base64"] = {"overlay": "payload"}
+    data["definitions"][0]["actions"] = [{"action": "connect.invoke", "request": request}]
+    workflow = parse_workflow(_json(data))
+    action = workflow.definitions[0].actions[0]
+    # The binding is preserved verbatim in the signed template and round-trips.
+    assert action.request["input"]["content_base64"] == {"overlay": "payload"}
+    assert canonical_workflow(parse_workflow(canonical_workflow(workflow))) == canonical_workflow(
+        workflow
+    )
+
+
+def test_render_resolves_and_encodes_bound_input_content() -> None:
+    import base64
+
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {
+            "artifact_id": ARTIFACT_ID,
+            "media_type": "application/json",
+            "filename": "r",
+            "content_base64": {"overlay": "payload"},
+        },
+        "parameters": {},
+        "confirmed": False,
+    }
+    rendered = render_connect_invoke_request(request, {"payload": '{"lead":"L-42"}'})
+    # The overlay holds the raw payload; the host base64-encodes it into the input artifact.
+    assert rendered["input"]["content_base64"] == base64.b64encode(
+        b'{"lead":"L-42"}'
+    ).decode("ascii")
+    # The original request is not mutated.
+    assert request["input"]["content_base64"] == {"overlay": "payload"}
+
+
+def test_render_raises_on_an_unset_bound_input_content() -> None:
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {
+            "artifact_id": ARTIFACT_ID,
+            "media_type": "application/json",
+            "filename": "r",
+            "content_base64": {"overlay": "payload"},
+        },
+        "parameters": {},
+        "confirmed": False,
+    }
+    with pytest.raises(RequestBindingError):
+        render_connect_invoke_request(request, {"other": "x"})
+
+
+def test_render_raises_when_bound_input_content_is_not_a_string() -> None:
+    request = {
+        "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+        "input": {
+            "artifact_id": ARTIFACT_ID,
+            "media_type": "application/json",
+            "filename": "r",
+            "content_base64": {"overlay": "count"},
+        },
+        "parameters": {},
+        "confirmed": False,
+    }
+    with pytest.raises(RequestBindingError):
+        render_connect_invoke_request(request, {"count": 7})
+
+
 def test_workflow_definition_rejects_an_unknown_action_kind() -> None:
     data = _workflow_data()
     data["definitions"][0]["actions"] = [{"action": "connect.blast", "request": {}}]

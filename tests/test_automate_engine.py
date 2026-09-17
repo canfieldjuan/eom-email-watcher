@@ -897,3 +897,59 @@ def test_connect_invoke_binding_to_an_unset_overlay_fails_the_decision(tmp_path:
     # The decision did not apply: the record is still at reviewing and nothing was admitted.
     assert engine._store.get_record(record_id).stage == "reviewing"
     assert engine._store.list_actions(record_id) == []
+
+
+def test_connect_invoke_input_content_binding_resolves_and_encodes(tmp_path: Path) -> None:
+    import base64
+
+    engine = _engine(tmp_path)
+    action = {
+        "action": "connect.invoke",
+        "request": {
+            "capability": {"id": "lead.customer-handoff", "version": "1.0"},
+            "input": {
+                "artifact_id": ARTIFACT_ID,
+                "media_type": "application/json",
+                "filename": "request.json",
+                "content_base64": {"overlay": "payload"},
+            },
+        },
+    }
+    workflow = Workflow.model_validate(
+        {
+            "name": "lead-funnel",
+            "stages": ["captured", "reviewing", "converted"],
+            "initial_stage": "captured",
+            "definitions": [
+                {
+                    "name": "start-review",
+                    "trigger": {"source_kind": "operator.decision", "decision": "start_review"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "captured"}],
+                    "effects": [{"kind": "record.transition", "to_stage": "reviewing"}],
+                },
+                {
+                    "name": "convert",
+                    "trigger": {"source_kind": "operator.decision", "decision": "convert"},
+                    "conditions": [{"field": "record.stage", "op": "equals", "value": "reviewing"}],
+                    "effects": [
+                        {"kind": "record.transition", "to_stage": "converted"},
+                        {"kind": "overlay.set", "key": "payload", "value": '{"lead":"L-42"}'},
+                    ],
+                    "actions": [action],
+                },
+            ],
+        }
+    )
+    record_id = _advance_to_reviewing(engine, workflow)
+    engine.submit_decision(
+        workflow,
+        record_id,
+        decision="convert",
+        operation_key="op-convert",
+        request={},
+        expected_version=2,
+        now=NOW,
+    )
+    frozen = _frozen_connect_invoke_request(engine, record_id)
+    # The overlay's raw payload is base64-encoded into the frozen input artifact.
+    assert frozen["input"]["content_base64"] == base64.b64encode(b'{"lead":"L-42"}').decode("ascii")
