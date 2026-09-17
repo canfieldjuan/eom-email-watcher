@@ -13,6 +13,16 @@ only after :meth:`AutomateHost.require_license` passes.
 
 from __future__ import annotations
 
+from .actions import (
+    ACTION_KINDS,
+    ActionDeliveryError,
+    ActionOutcome,
+    ActionRunner,
+    Adapter,
+    AdapterNotConfigured,
+    AdapterRegistry,
+    LocalNotifyAdapter,
+)
 from .definition import (
     DefinitionError,
     Workflow,
@@ -29,6 +39,9 @@ from .engine import (
 )
 from .host import REQUIRED_FEATURES, AutomateHost, AutomateLicenseError
 from .store import (
+    ActionAdmission,
+    ActionConflict,
+    ActionView,
     InvalidEffect,
     OperationConflict,
     OperationReplay,
@@ -36,12 +49,23 @@ from .store import (
     StaleRecord,
     TransitionOutcome,
     UnknownRecord,
+    UnresolvedAction,
     WorkflowStore,
     WorkflowStoreError,
 )
 
 __all__ = [
+    "ACTION_KINDS",
     "REQUIRED_FEATURES",
+    "Adapter",
+    "AdapterNotConfigured",
+    "AdapterRegistry",
+    "ActionAdmission",
+    "ActionConflict",
+    "ActionDeliveryError",
+    "ActionOutcome",
+    "ActionRunner",
+    "ActionView",
     "AmbiguousDecision",
     "AutomateHost",
     "AutomateLicenseError",
@@ -49,12 +73,14 @@ __all__ = [
     "DefinitionError",
     "EngineError",
     "InvalidEffect",
+    "LocalNotifyAdapter",
     "OperationConflict",
     "OperationReplay",
     "RecordView",
     "StaleRecord",
     "TransitionOutcome",
     "UnknownRecord",
+    "UnresolvedAction",
     "Workflow",
     "WorkflowDefinition",
     "WorkflowEngine",
