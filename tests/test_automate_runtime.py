@@ -398,6 +398,32 @@ def test_partial_dispatch_leaves_only_the_unconfigured_action_pending(tmp_path: 
     ]
 
 
+def test_a_failed_action_is_not_reported_as_delivered(tmp_path: Path) -> None:
+    # delivered means this call performed the side effect. A failed adapter attempt must not
+    # be reported delivered=True, or a consumer would treat an undelivered action as sent.
+    class BrokenMail:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            raise RuntimeError("smtp down")
+
+    key = Ed25519PrivateKey.generate()
+    store = _store(tmp_path)
+    registry = AdapterRegistry.with_defaults()
+    registry.register("mail.send", BrokenMail())
+    runtime = _runtime(tmp_path, key, actions=[MAIL_ACTION], registry=registry, store=store)
+    record = runtime.create_record(now=NOW)
+    run = runtime.submit_decision(
+        record.record_id,
+        decision="review",
+        operation_key="op-1",
+        request={},
+        expected_version=record.state_version,
+        now=NOW,
+    )
+    assert run.actions[0].status == "failed"
+    assert run.actions[0].delivered is False
+    assert store.list_actions(record.record_id)[0].status == "failed"
+
+
 def test_tampered_pack_is_rejected_before_any_record(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
     store = _store(tmp_path)

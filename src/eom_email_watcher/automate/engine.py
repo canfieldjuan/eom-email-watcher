@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from .actions import ACTION_KINDS
 from .definition import MAX_NAME_LENGTH, Condition, Workflow, WorkflowDefinition
 from .host import AutomateHost
 from .store import OperationConflict, RecordView, StaleRecord, WorkflowStore, request_fingerprint
@@ -214,6 +215,7 @@ class WorkflowEngine:
             now=now,
             allowed_stages=frozenset(workflow.stages),
             actions=actions,
+            allowed_action_kinds=ACTION_KINDS,
         )
         return DecisionOutcome(
             record=outcome.record,

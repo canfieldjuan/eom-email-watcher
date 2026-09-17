@@ -980,6 +980,58 @@ def test_apply_effects_replay_does_not_readmit_actions(tmp_path: Path) -> None:
     assert len(store.list_actions(record_id)) == 1
 
 
+def test_apply_effects_rejects_an_unsupported_action_kind(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(InvalidEffect):
+        store.apply_effects(
+            record_id,
+            [{"kind": "record.transition", "to_stage": "reviewing"}],
+            operation_key="op-1",
+            operation_name="review",
+            request={},
+            expected_version=1,
+            now=NOW,
+            allowed_stages=STAGES,
+            actions=[{"kind": "mail.blast", "request": {}}],
+            allowed_action_kinds=frozenset({"notify.local"}),
+        )
+    # The record did not advance: the unsupported kind was rejected before the transaction.
+    assert store.get_record(record_id).stage == "captured"
+
+
+def test_apply_effects_rejects_a_non_sequence_actions_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    for bad in ({}, "", b""):
+        with pytest.raises(InvalidEffect):
+            store.apply_effects(
+                record_id,
+                [{"kind": "record.transition", "to_stage": "reviewing"}],
+                operation_key="op-1",
+                operation_name="review",
+                request={},
+                expected_version=1,
+                now=NOW,
+                allowed_stages=STAGES,
+                actions=bad,  # malformed: falsy but not None -- must not be silently dropped
+            )
+    assert store.get_record(record_id).stage == "captured"
+
+
+def test_admit_action_rejects_the_reserved_dedupe_prefix(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    with pytest.raises(ValueError):
+        store.admit_action(
+            record_id,
+            kind="notify.local",
+            dedupe_key="pack.action:some-event:0",  # reserved for decision-emitted actions
+            request={"title": "t", "body": "b"},
+            now=NOW,
+        )
+
+
 def test_apply_effects_rejects_too_many_actions(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record_id = _make_record(store)

@@ -218,19 +218,19 @@ class ActionRunner:
             result = adapter.deliver(view.request)
         except Exception as exc:
             failed = self._store.fail_action(view.action_id, error=str(exc), now=now)
-            return _outcome(failed, delivered=True)
+            return _outcome(failed, delivered=False)
         if not isinstance(result, Mapping):
             failed = self._store.fail_action(
                 view.action_id, error="adapter returned a non-mapping result", now=now
             )
-            return _outcome(failed, delivered=True)
+            return _outcome(failed, delivered=False)
         try:
             settled = self._store.settle_action(view.action_id, result=result, now=now)
         except InvalidEffect as exc:
             failed = self._store.fail_action(
                 view.action_id, error=f"adapter result could not be persisted: {exc}", now=now
             )
-            return _outcome(failed, delivered=True)
+            return _outcome(failed, delivered=False)
         return _outcome(settled, delivered=True)
 
 

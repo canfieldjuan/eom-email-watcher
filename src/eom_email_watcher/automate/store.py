@@ -494,14 +494,20 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
 
 def _normalize_action_intents(
     actions: Sequence[Mapping[str, object]] | None,
+    *,
+    allowed_kinds: frozenset[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Validate a decision's action intents and canonicalize each request.
 
     Returns ``(kind, canonical_request)`` pairs to admit alongside the decision. Fails closed
-    (``InvalidEffect``) on a malformed batch so an unserializable or oversized intent is
-    rejected before any write, exactly like the effect batch.
+    (``InvalidEffect``) on a malformed batch so an unserializable, oversized, over-count, or
+    unsupported-kind intent is rejected before any write, exactly like the effect batch. Only
+    ``None`` means "no actions": a non-``None`` non-sequence (a mapping, ``str``, ``bytes``)
+    is a malformed batch and is rejected rather than silently dropped. When ``allowed_kinds``
+    is given, each kind must be in it, so a typo or unsupported kind cannot commit a row that
+    could never be delivered.
     """
-    if not actions:
+    if actions is None:
         return []
     if isinstance(actions, str | bytes) or not isinstance(actions, Sequence):
         raise InvalidEffect("actions must be a sequence")
@@ -515,6 +521,8 @@ def _normalize_action_intents(
         request = action.get("request", {})
         if not isinstance(kind, str) or not kind:
             raise InvalidEffect("action kind must be a non-empty string")
+        if allowed_kinds is not None and kind not in allowed_kinds:
+            raise InvalidEffect(f"unsupported action kind {kind!r}")
         if not isinstance(request, Mapping):
             raise InvalidEffect("action request must be a mapping")
         intents.append((kind, _canonical_payload(request, label="action request")))
@@ -787,6 +795,7 @@ class WorkflowStore:
         now: datetime,
         allowed_stages: frozenset[str] | None = None,
         actions: Sequence[Mapping[str, object]] | None = None,
+        allowed_action_kinds: frozenset[str] | None = None,
     ) -> TransitionOutcome:
         """Apply an effect batch atomically under compare-and-set and operation-key rules.
 
@@ -814,7 +823,7 @@ class WorkflowStore:
         """
         _require_operation_identity(operation_key, operation_name)
         normalized = _normalize_effects(effects)
-        action_intents = _normalize_action_intents(actions)
+        action_intents = _normalize_action_intents(actions, allowed_kinds=allowed_action_kinds)
         try:
             canonical_effects = _canonical_effects(normalized)
             batch_bytes = len(canonical_effects.encode("utf-8"))
@@ -1002,6 +1011,14 @@ class WorkflowStore:
         """
         if not dedupe_key or not isinstance(dedupe_key, str):
             raise ValueError("dedupe_key must be a non-empty string")
+        if dedupe_key.startswith(ACTION_DEDUPE_PREFIX):
+            # The decision-emitted namespace is reserved for apply_effects (which admits a
+            # decision's actions keyed by its committed event id). An external admission must
+            # not squat it, or a later runtime dispatch by that prefix could run a row the
+            # signed pack never declared.
+            raise ValueError(
+                f"dedupe_key must not use the reserved {ACTION_DEDUPE_PREFIX!r} namespace"
+            )
         if not kind or not isinstance(kind, str):
             raise ValueError("kind must be a non-empty string")
         canonical_request = _canonical_payload(request, label="request")
