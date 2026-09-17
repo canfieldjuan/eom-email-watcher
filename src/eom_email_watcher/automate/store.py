@@ -414,23 +414,36 @@ def _action_view(row: sqlite3.Row) -> ActionView:
     )
 
 
-def _reject_non_string_keys(value: object, *, label: str) -> None:
-    """Recursively reject mappings whose keys are not strings.
+def _reject_non_string_keys(
+    value: object, *, label: str, _path: frozenset[int] = frozenset()
+) -> None:
+    """Recursively reject mappings whose keys are not strings, and circular references.
 
     ``json.dumps`` silently coerces a non-string object key to its string form, so
     ``{1: "a"}`` and ``{"1": "a"}`` would serialize identically (colliding the dedupe
     identity) and ``{1: "a", "1": "b"}`` would persist duplicate ``"1"`` members and read
     back with one value dropped. Reject non-string keys before serialization so a payload's
     canonical bytes are a faithful, injective encoding of its logical content.
+
+    ``json.dumps`` detects a circular reference itself (a clean ``ValueError``), but this
+    walk runs first, so it must detect the cycle too, via the set of container ids on the
+    current recursion path; otherwise a self-referential payload recurses until it exhausts
+    the stack (see the ``RecursionError`` catch in :func:`_canonical_payload`).
     """
     if isinstance(value, Mapping):
+        if id(value) in _path:
+            raise InvalidEffect(f"action {label} contains a circular reference")
+        deeper = _path | {id(value)}
         for key, sub in value.items():
             if not isinstance(key, str):
                 raise InvalidEffect(f"action {label} contains a non-string object key {key!r}")
-            _reject_non_string_keys(sub, label=label)
+            _reject_non_string_keys(sub, label=label, _path=deeper)
     elif isinstance(value, (list, tuple)):
+        if id(value) in _path:
+            raise InvalidEffect(f"action {label} contains a circular reference")
+        deeper = _path | {id(value)}
         for item in value:
-            _reject_non_string_keys(item, label=label)
+            _reject_non_string_keys(item, label=label, _path=deeper)
 
 
 def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
@@ -441,8 +454,8 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
     """
     if not isinstance(payload, Mapping):
         raise InvalidEffect(f"action {label} must be a mapping")
-    _reject_non_string_keys(payload, label=label)
     try:
+        _reject_non_string_keys(payload, label=label)
         canonical = json.dumps(
             dict(payload),
             sort_keys=True,
@@ -457,6 +470,10 @@ def _canonical_payload(payload: Mapping[str, object], *, label: str) -> str:
         # an arbitrary object). Both must fail closed as InvalidEffect so the runner can
         # terminalize the action rather than leaving the row stuck pending.
         raise InvalidEffect(f"action {label} contains an unserializable value: {exc}") from exc
+    except RecursionError as exc:
+        # A payload too deeply nested for the key walk or json.dumps to recurse (a cycle is
+        # already caught above). Fail closed rather than let the action stick pending.
+        raise InvalidEffect(f"action {label} is nested too deeply") from exc
     if size > MAX_ACTION_BYTES:
         raise InvalidEffect(f"action {label} exceeds {MAX_ACTION_BYTES} bytes")
     return canonical

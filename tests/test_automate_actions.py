@@ -169,6 +169,24 @@ def test_adapter_result_with_a_non_json_value_marks_the_action_failed(tmp_path: 
     assert actions[0].status == "failed"
 
 
+def test_adapter_result_with_a_circular_reference_marks_the_action_failed(tmp_path: Path) -> None:
+    class CyclicAdapter:
+        def deliver(self, request: Mapping[str, object]) -> Mapping[str, object]:
+            result: dict[str, object] = {"ok": True}
+            result["self"] = result  # a circular reference json.dumps cannot persist
+            return result
+
+    runner, store = _runner(tmp_path)
+    runner._registry.register("mail.send", CyclicAdapter())
+    record_id = _record(store)
+    with pytest.raises(ActionDeliveryError):
+        runner.run(record_id, kind="mail.send", dedupe_key="k1", request={"to": "a"}, now=NOW)
+    actions = store.list_actions(record_id)
+    # Terminalized as failed, not left stuck pending (which would raise UnresolvedAction).
+    assert len(actions) == 1
+    assert actions[0].status == "failed"
+
+
 def test_adapter_receives_the_committed_snapshot_not_the_caller_object(tmp_path: Path) -> None:
     received: list[Mapping[str, object]] = []
 

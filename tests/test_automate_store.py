@@ -938,6 +938,19 @@ def test_admit_action_rejects_a_non_string_object_key(tmp_path: Path) -> None:
         )
 
 
+def test_admit_action_rejects_a_circular_reference(tmp_path: Path) -> None:
+    # A self-referential payload would recurse forever in the key walk; it must fail closed
+    # as InvalidEffect (as json.dumps's own circular-reference check would), not RecursionError.
+    store = _store(tmp_path)
+    record_id = _make_record(store)
+    request: dict[str, object] = {"title": "t"}
+    request["self"] = request
+    with pytest.raises(InvalidEffect):
+        store.admit_action(
+            record_id, kind="notify.local", dedupe_key="d1", request=request, now=NOW
+        )
+
+
 def test_list_actions_preserves_admission_order_on_timestamp_tie(tmp_path: Path) -> None:
     store = _store(tmp_path)
     record_id = _make_record(store)
