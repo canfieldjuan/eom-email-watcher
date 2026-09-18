@@ -29,6 +29,32 @@ def active_connect_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.parametrize("invalid", [0, float("inf")])
+def test_connect_client_timeout_requires_positive_finite_budget(invalid: float) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        connect._client(invalid)
+
+
+def test_connect_client_caps_every_http_phase_to_operation_budget() -> None:
+    client = connect._client(0.25)
+    try:
+        assert client.timeout.connect == 0.25
+        assert client.timeout.read == 0.25
+        assert client.timeout.write == 0.25
+        assert client.timeout.pool == 0.25
+    finally:
+        client.close()
+
+
+def test_generic_discovery_rejects_competing_timeout_sources(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="one timeout source"):
+        connect.discover_capabilities(
+            tmp_path,
+            timeout_seconds=0.5,
+            remaining_timeout=lambda: 0.4,
+        )
+
+
 def registration(
     *,
     instance_id: str,
@@ -498,6 +524,115 @@ def test_generic_discovery_preserves_multiple_provider_choices(tmp_path: Path) -
     assert catalog.diagnostic_code is None
     assert [item.app_id for item in catalog.items] == ["provider-a", "provider-b"]
     assert [item.instance_id for item in selected.items] == [INSTANCE_B]
+
+
+def test_generic_discovery_recomputes_remaining_timeout_per_manifest_request(
+    tmp_path: Path,
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    duplicate = registration_v2(
+        instance_id=INSTANCE_A,
+        app_id="provider-a",
+        base_url="http://127.0.0.1:32123/",
+    )
+    write_registration(directory / "a.json", duplicate)
+    write_registration(directory / "b.json", duplicate)
+    request_timeouts: list[float] = []
+    remaining_timeouts = iter((0.8, 0.5))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_timeouts.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, json=manifest_v2(INSTANCE_A, "provider-a"))
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        catalog = connect.discover_capabilities(
+            tmp_path,
+            client=client,
+            provider_instance_id=INSTANCE_A,
+            remaining_timeout=lambda: next(remaining_timeouts),
+        )
+
+    assert len(catalog.items) == 1
+    assert request_timeouts == [0.8, 0.5]
+
+
+def test_registered_reconciliation_deduplicates_endpoint_without_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = providers_dir_v2(tmp_path)
+    duplicate = registration_v2(
+        instance_id=INSTANCE_A,
+        app_id="provider-a",
+        base_url="http://127.0.0.1:32123/",
+    )
+    write_registration(directory / "a.json", duplicate)
+    write_registration(directory / "b.json", duplicate)
+
+    def forbidden_client(*args: object, **kwargs: object) -> httpx.Client:
+        raise AssertionError("registration-only reconciliation must not create an HTTP client")
+
+    monkeypatch.setattr(connect, "_client", forbidden_client)
+    registered, diagnostic = connect.registered_capability_for_reconciliation(
+        tmp_path,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+    assert diagnostic is None
+    assert registered == connect.RegisteredCapability(
+        protocol_version=2,
+        base_url="http://127.0.0.1:32123/",
+        token=TOKEN,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+
+def test_registered_reconciliation_rejects_conflicting_endpoints(tmp_path: Path) -> None:
+    directory = providers_dir_v2(tmp_path)
+    write_registration(
+        directory / "a.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider-a",
+            base_url="http://127.0.0.1:32123/",
+        ),
+    )
+    write_registration(
+        directory / "b.json",
+        registration_v2(
+            instance_id=INSTANCE_A,
+            app_id="provider-a",
+            base_url="http://127.0.0.1:32124/",
+        ),
+    )
+
+    registered, diagnostic = connect.registered_capability_for_reconciliation(
+        tmp_path,
+        app_id="provider-a",
+        app_version="1.2.3",
+        instance_id=INSTANCE_A,
+        capability_id="document.summarize",
+        capability_version="1.0",
+        produces=("application/vnd.local-connect.document-summary+json",),
+        external_effects=False,
+        confirmation_required=False,
+    )
+
+    assert registered is None
+    assert diagnostic == "provider_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -1021,15 +1156,18 @@ def test_v2_job_preparation_accepts_empty_artifacts_and_integral_numbers() -> No
 
 def test_v2_job_preparation_accepts_only_canonical_uuid4_request_identity() -> None:
     capability = discovered_v2_capability()
+    artifact_id = "5bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     job = connect.prepare_capability_job(
         capability,
         b"content",
         "application/pdf",
         "document.pdf",
         job_id=JOB_ID,
+        artifact_id=artifact_id,
     )
 
     assert job.job_id == JOB_ID
+    assert job.artifact.artifact_id == artifact_id
     for invalid in (
         "not-a-uuid",
         "55555555-5555-1555-8555-555555555555",
@@ -1039,6 +1177,15 @@ def test_v2_job_preparation_accepts_only_canonical_uuid4_request_identity() -> N
         with pytest.raises(connect.ConnectError) as raised:
             connect.validate_job_id(invalid)
         assert raised.value.code == "JOB_REQUEST_INVALID"
+        with pytest.raises(connect.ConnectError) as artifact:
+            connect.prepare_capability_job(
+                capability,
+                b"content",
+                "application/pdf",
+                "document.pdf",
+                artifact_id=invalid,
+            )
+        assert artifact.value.code == "JOB_REQUEST_INVALID"
 
 
 def test_v2_client_submits_and_polls_generic_outputs() -> None:
@@ -1099,6 +1246,60 @@ def test_v2_client_submits_and_polls_generic_outputs() -> None:
         b"",
     ]
     assert final.result.store_dict()["outputs"][1]["payload_base64"] == ""  # type: ignore[index]
+
+
+def test_v2_registered_reconciliation_enforces_outputs_and_cannot_submit() -> None:
+    content = b"%PDF-1.4\nfixture\n%%EOF"
+    discovered = discovered_v2_capability()
+    prepared = connect.prepare_capability_job(
+        discovered, content, "application/pdf", "contract.pdf"
+    )
+    registered = connect.RegisteredCapability(
+        protocol_version=discovered.protocol_version,
+        base_url=discovered.base_url,
+        token=discovered.token,
+        app_id=discovered.app_id,
+        app_version=discovered.app_version,
+        instance_id=discovered.instance_id,
+        capability_id=discovered.capability_id,
+        capability_version=discovered.capability_version,
+        produces=discovered.produces,
+        external_effects=discovered.external_effects,
+        confirmation_required=discovered.confirmation_required,
+    )
+    restored = connect.restore_registered_capability_job(
+        registered, prepared.request_json
+    )
+    requests: list[str] = []
+    media_types = iter(("text/plain", "application/octet-stream"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        output = generic_output(b"Contract obligations")
+        output["media_type"] = next(media_types)
+        return httpx.Response(
+            200,
+            json=generic_job_status(
+                restored,
+                "completed",
+                result={"outputs": [output]},
+            ),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = connect.ConnectV2Client(registered, client=http_client)
+        update = client.get(restored)
+        with pytest.raises(connect.ConnectError) as undeclared:
+            client.get(restored)
+        with pytest.raises(connect.ConnectError) as rejected:
+            client.submit(restored, content)
+
+    assert update.status == "completed"
+    assert update.result is not None
+    assert update.result.outputs[0].payload == b"Contract obligations"
+    assert undeclared.value.code == "RESPONSE_MISMATCH"
+    assert rejected.value.code == "JOB_CAPABILITY_MISMATCH"
+    assert requests == ["GET", "GET"]
 
 
 def test_v2_client_reuses_prepared_identity_after_lost_acknowledgement() -> None:

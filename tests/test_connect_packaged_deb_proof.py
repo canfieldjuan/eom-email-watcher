@@ -63,6 +63,8 @@ def test_isolated_config_pins_every_private_state_path(tmp_path: Path) -> None:
     assert config.gmail_send_token_file == tmp_path / "state" / "send-token.json"
     assert config.database_file == database_path
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+    assert config.gmail_token_file.read_bytes() == b"packaged-proof-fixture-only"
+    assert stat.S_IMODE(config.gmail_token_file.stat().st_mode) == 0o600
     assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
     assert (
         Store(database_path)

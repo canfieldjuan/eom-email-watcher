@@ -10,6 +10,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -43,6 +44,7 @@ from .config import (
     update_settings,
 )
 from .db import (
+    AUTOMATION_FIRE_PENDING_WINDOW,
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
     CONNECT_RETRY_DELAYS_SECONDS,
     AutomationRuleDetail,
@@ -97,7 +99,7 @@ from .mailbox import (
     DEFAULT_MAIL_PROVIDER,
     MailboxAccountUnavailable,
     MailboxError,
-    MailboxGateway,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     mailbox_polling_session,
 )
@@ -143,6 +145,7 @@ from .service import (
 )
 
 PROTOCOL_VERSION = 1
+AUTOMATION_DISPATCH_PHASE_SECONDS = 5.0
 MAX_REQUEST_BYTES = 1_000_000
 MAX_NATIVE_TEXT_OUTPUT_BYTES = 256 * 1024
 MAX_INBOX_CURSOR_BYTES = 1024
@@ -1651,6 +1654,8 @@ def _check(request: dict[str, object]) -> dict[str, object]:
                 str(exc),
                 retryable=True,
             ) from exc
+        if not dry_run:
+            pump_connect_runtime(active_runtime, 25)
         return {
             **result,
             "pending_notifications": _host_notification_intent_count(active_runtime),
@@ -1680,6 +1685,48 @@ def _automation_rule_id(value: object) -> str:
     if parsed.version != 4 or str(parsed) != value:
         raise ApiError("invalid_request", "rule_id must be a lower-case UUIDv4")
     return value
+
+
+def _automation_fire_decide(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {"fire_id", "expected_version", "prepared_identity_sha256", "decision"},
+    )
+    try:
+        fire_id = connect.validate_job_id(payload.get("fire_id"))
+    except connect.ConnectError as exc:
+        raise ApiError("invalid_request", "fire_id must be a UUIDv4 string") from exc
+    expected_version = _automation_expected_version(payload.get("expected_version"))
+    prepared_identity_sha256 = payload.get("prepared_identity_sha256")
+    if (
+        not isinstance(prepared_identity_sha256, str)
+        or len(prepared_identity_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in prepared_identity_sha256)
+    ):
+        raise ApiError(
+            "invalid_request",
+            "prepared_identity_sha256 must be a lowercase SHA-256 value",
+        )
+    decision = payload.get("decision")
+    if decision not in {"confirmed", "declined"}:
+        raise ApiError("invalid_request", "decision must be confirmed or declined")
+    runtime = _runtime(request)
+    try:
+        fire = runtime.store.decide_automation_fire(
+            fire_id=fire_id,
+            expected_version=expected_version,
+            prepared_identity_sha256=prepared_identity_sha256,
+            confirmed=decision == "confirmed",
+        )
+    except KeyError as exc:
+        raise ApiError("not_found", "Automation fire was not found") from exc
+    except RuntimeError as exc:
+        raise ApiError("stale_automation_fire", str(exc)) from exc
+    return {
+        "fire_id": fire.fire_id,
+        "state": fire.state,
+        "state_version": fire.state_version,
+    }
 
 
 def _automation_expected_version(value: object) -> int:
@@ -2146,6 +2193,14 @@ def _configured_message_source(runtime: Runtime, message_id: str) -> MessageSour
             "account_unavailable",
             "The message's mailbox account is not available in this application version.",
         )
+    if (
+        source.mailbox_identity_key is None
+        or account.mailbox_identity_key != source.mailbox_identity_key
+    ):
+        raise ApiError(
+            "connect_source_unavailable",
+            "The message's mailbox identity no longer matches the connected account.",
+        )
     return source
 
 
@@ -2202,16 +2257,43 @@ def _retained_connect_message_source(runtime: Runtime, message_id: str) -> Messa
     return source
 
 
-def _configured_mailbox_gateway(runtime: Runtime, source: MessageSource) -> MailboxGateway:
+def _verified_mailbox_attachment_bytes(
+    runtime: Runtime,
+    source: MessageSource,
+    part_id: str,
+    attachment_id: str | None,
+    remaining_timeout: Callable[[], float] | None = None,
+) -> bytes:
     mailbox = load_mailbox_account(
         runtime.config,
         runtime.store,
         source.provider,
         source.account_id,
+        remaining_timeout,
     )
     if (mailbox.provider, mailbox.account_id) != (source.provider, source.account_id):
         raise RuntimeError("Mailbox identity changed while opening the provider")
-    return mailbox.gateway
+    gateway = mailbox.gateway
+    with mailbox_polling_session(gateway):
+        try:
+            live_identity = gateway.mailbox_identity_key()
+        except MailboxError as exc:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The message's live mailbox identity is unavailable.",
+            ) from exc
+        if source.mailbox_identity_key is None or live_identity != source.mailbox_identity_key:
+            raise ApiError(
+                "connect_source_unavailable",
+                "The message's mailbox identity changed while opening the provider.",
+            )
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(remaining_timeout())
+        return gateway.attachment_bytes(
+            source.provider_message_id,
+            part_id,
+            attachment_id,
+        )
 
 
 def _attachment_export(request: dict[str, object]) -> dict[str, object]:
@@ -2229,9 +2311,9 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
     except KeyError as exc:
         raise ApiError("not_found", "Attachment was not found") from exc
     source = _configured_message_source(runtime, message_id)
-    gateway = _configured_mailbox_gateway(runtime, source)
-    content = gateway.attachment_bytes(
-        source.provider_message_id,
+    content = _verified_mailbox_attachment_bytes(
+        runtime,
+        source,
         part_id,
         attachment.attachment_id,
     )
@@ -2339,10 +2421,18 @@ def _discover_selected_generic_capability(
     provider: dict[str, str],
     capability_ref: dict[str, str],
     parameters: dict[str, object],
+    *,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> tuple[connect.DiscoveredCapability, dict[str, str | int | bool]]:
 
     instance_id = str(provider["instance_id"])
-    catalog = connect.discover_capabilities(provider_instance_id=instance_id)
+    if remaining_timeout is None:
+        catalog = connect.discover_capabilities(provider_instance_id=instance_id)
+    else:
+        catalog = connect.discover_capabilities(
+            provider_instance_id=instance_id,
+            remaining_timeout=remaining_timeout,
+        )
     provider_items = tuple(
         item
         for item in catalog.items
@@ -2579,7 +2669,8 @@ def _connect_output_export(request: dict[str, object]) -> dict[str, object]:
 
 
 def _tracked_generic_job(
-    job: ConnectJob, capability: connect.DiscoveredCapability
+    job: ConnectJob,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
 ) -> connect.PreparedCapabilityJob:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
@@ -2588,10 +2679,24 @@ def _tracked_generic_job(
         or job.provider_app_id != capability.app_id
         or job.provider_app_version != capability.app_version
         or job.provider_instance_id != capability.instance_id
+        or job.source_app_id != connect.SOURCE_APP_ID
         or job.request_json is None
     ):
         raise RuntimeError("Connect v2 job is missing its durable provider request")
-    return connect.restore_persisted_capability_job(capability, job.request_json)
+    if isinstance(capability, connect.RegisteredCapability):
+        tracked = connect.restore_registered_capability_job(capability, job.request_json)
+    else:
+        tracked = connect.restore_persisted_capability_job(capability, job.request_json)
+    if (
+        tracked.job_id != job.job_id
+        or tracked.artifact.artifact_id != job.input_artifact_id
+        or tracked.artifact.media_type != job.input_media_type
+        or tracked.artifact.byte_size != job.input_byte_size
+        or tracked.artifact.sha256 != job.input_sha256
+        or tracked.display_name != job.input_display_name
+    ):
+        raise RuntimeError("Connect v2 job request does not match its durable record")
+    return tracked
 
 
 def _apply_connect_update(
@@ -2645,7 +2750,11 @@ def _apply_connect_update(
 def _mark_connect_failed(
     store: Store,
     job_id: str,
-    provider: connect.ProviderCapability | connect.DiscoveredCapability,
+    provider: (
+        connect.ProviderCapability
+        | connect.DiscoveredCapability
+        | connect.RegisteredCapability
+    ),
     error: connect.ConnectError,
 ) -> None:
     for _attempt in range(4):
@@ -2733,7 +2842,7 @@ def _query_connect_job(
 
 def _run_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     job: connect.PreparedCapabilityJob,
     content: bytes | None,
     *,
@@ -2855,25 +2964,104 @@ def _defer_generic_connect_error(
     )
 
 
-def _require_connect_entitlement_for_job(
+def _persist_connect_entitlement_failure(
     runtime: Runtime,
     job_id: str,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
+    failure: connect.ConnectError,
 ) -> None:
+    try:
+        _mark_connect_failed(runtime.store, job_id, capability, failure)
+    except Exception:
+        logger.exception("Connect entitlement failure could not be persisted")
+        raise RuntimeError("Connect entitlement failure could not be persisted safely") from failure
+
+
+def _defer_inactive_automation_job(
+    runtime: Runtime,
+    job_id: str,
+    *,
+    expected_dispatch_state: str,
+    next_dispatch_state: str,
+) -> None:
+    runtime.store.defer_connect_job(
+        job_id=job_id,
+        expected_dispatch_state=expected_dispatch_state,
+        next_dispatch_state=next_dispatch_state,
+        error_code="entitlement_inactive",
+        error_message="Automation entitlements are inactive.",
+        delay_seconds=30,
+        pause_automation_deadline=True,
+        pause_linked_automation_fires=True,
+    )
+
+
+def _require_submission_authority_for_job(
+    runtime: Runtime,
+    job_id: str,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
+    *,
+    expected_dispatch_state: str,
+    inactive_dispatch_state: str,
+) -> bool:
+    if not _automation_submission_authority_active(
+        runtime,
+        job_id,
+        expected_dispatch_state=expected_dispatch_state,
+        inactive_dispatch_state=inactive_dispatch_state,
+    ):
+        return False
     try:
         connect.require_connect_entitlement()
     except connect.ConnectError as exc:
-        try:
-            _mark_connect_failed(runtime.store, job_id, capability, exc)
-        except Exception:
-            logger.exception("Connect entitlement failure could not be persisted")
-            raise RuntimeError("Connect entitlement failure could not be persisted safely") from exc
+        if runtime.store.connect_job_requires_automation_entitlement(job_id):
+            current = runtime.store.connect_dispatch(job_id)
+            if current is None:
+                raise RuntimeError("Connect submission lost its dispatch state") from exc
+            _defer_inactive_automation_job(
+                runtime,
+                job_id,
+                expected_dispatch_state=current.state,
+                next_dispatch_state=inactive_dispatch_state,
+            )
+            return False
+        _persist_connect_entitlement_failure(runtime, job_id, capability, exc)
         raise
+    return True
+
+
+def _automation_submission_authority_active(
+    runtime: Runtime,
+    job_id: str,
+    *,
+    expected_dispatch_state: str,
+    inactive_dispatch_state: str,
+) -> bool:
+    automation_origin = runtime.store.connect_job_requires_automation_entitlement(job_id)
+    automation_active = _automation_entitlement_active()
+    if automation_active:
+        for fire in runtime.store.automation_fires_linked_to_job(job_id):
+            if fire.state == "entitlement_paused":
+                runtime.store.resume_automation_fire_job(
+                    fire_id=fire.fire_id,
+                    expected_version=fire.state_version,
+                )
+    elif automation_origin:
+        _defer_inactive_automation_job(
+            runtime,
+            job_id,
+            expected_dispatch_state=expected_dispatch_state,
+            next_dispatch_state=inactive_dispatch_state,
+        )
+        return False
+    else:
+        runtime.store.pause_interactive_job_automation_fires(job_id)
+    return True
 
 
 def _query_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     job: connect.PreparedCapabilityJob,
     *,
     wait_for_terminal: bool = True,
@@ -2908,7 +3096,8 @@ def _stored_connect_failure(job: ConnectJob) -> ApiError:
 
 
 def _require_generic_connect_lane_lock(
-    runtime: Runtime, capability: connect.DiscoveredCapability
+    runtime: Runtime,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
 ) -> Path:
     lock_path = connect_lane_lock_path(
         runtime.store.path,
@@ -2976,6 +3165,7 @@ def _submit_generic_connect_job(
     message_id: str,
     content: Callable[[], bytes],
     *,
+    inactive_dispatch_state: str,
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     source_lock = _require_generic_connect_source_lock(runtime, message_id)
@@ -3001,7 +3191,7 @@ def _submit_generic_connect_job(
                     "connect_source_unavailable",
                     "The source attachment is no longer available for handoff.",
                 ) from exc
-            except MailboxMessageUnavailable as exc:
+            except (MailboxMessageInvalid, MailboxMessageUnavailable) as exc:
                 _fail_generic_connect_source(runtime, tracked.job_id, capability)
                 raise ApiError(
                     "connect_source_unavailable",
@@ -3032,6 +3222,17 @@ def _submit_generic_connect_job(
                     "connect_source_unavailable",
                     "The source attachment changed before handoff.",
                 )
+            if not _require_submission_authority_for_job(
+                runtime,
+                tracked.job_id,
+                capability,
+                expected_dispatch_state="dispatching",
+                inactive_dispatch_state=inactive_dispatch_state,
+            ):
+                current = runtime.store.connect_job(tracked.job_id)
+                if current is None:
+                    raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+                return _generic_connect_active_result(runtime, current)
             client = connect.ConnectV2Client(capability)
             try:
                 initial = client.submit(tracked, payload)
@@ -3088,9 +3289,45 @@ def _submit_generic_connect_job(
         raise
 
 
+def _require_persisted_capability_authority(
+    runtime: Runtime,
+    job: ConnectJob,
+    dispatch: ConnectDispatch,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
+) -> None:
+    if not dispatch.capability_authority_known:
+        _fail_generic_connect_record(
+            runtime,
+            job,
+            code="capability_authority_unknown",
+            message="The admitted provider capability authority is unknown.",
+        )
+        raise ApiError(
+            "capability_authority_unknown",
+            "The admitted provider capability authority is unknown.",
+        )
+    if (
+        dispatch.capability_external_effects == capability.external_effects
+        and dispatch.capability_confirmation_required
+        == capability.confirmation_required
+        and dispatch.capability_produces == tuple(sorted(set(capability.produces)))
+    ):
+        return
+    _fail_generic_connect_record(
+        runtime,
+        job,
+        code="capability_authority_changed",
+        message="The provider capability authority changed after admission.",
+    )
+    raise ApiError(
+        "capability_authority_changed",
+        "The provider capability authority changed after admission.",
+    )
+
+
 def _run_claimed_generic_connect_job(
     runtime: Runtime,
-    capability: connect.DiscoveredCapability,
+    capability: connect.DiscoveredCapability | connect.RegisteredCapability,
     claimed_job: ConnectJob,
     dispatch: ConnectDispatch,
     content: Callable[[], bytes],
@@ -3099,18 +3336,30 @@ def _run_claimed_generic_connect_job(
     wait_for_terminal: bool = True,
 ) -> dict[str, object]:
     tracked = _tracked_generic_job(claimed_job, capability)
+    _require_persisted_capability_authority(
+        runtime,
+        claimed_job,
+        dispatch,
+        capability,
+    )
     if dispatch.state == "dispatching" and not reconcile_first:
-        _require_connect_entitlement_for_job(
+        if not isinstance(capability, connect.DiscoveredCapability):
+            raise RuntimeError("Connect v2 submission is missing its admitted manifest")
+        if not _require_submission_authority_for_job(
             runtime,
             tracked.job_id,
             capability,
-        )
+            expected_dispatch_state=dispatch.state,
+            inactive_dispatch_state="waiting",
+        ):
+            return _generic_connect_active_result(runtime, claimed_job)
         return _submit_generic_connect_job(
             runtime,
             capability,
             tracked,
             claimed_job.message_id,
             content,
+            inactive_dispatch_state="waiting",
             wait_for_terminal=wait_for_terminal,
         )
 
@@ -3138,6 +3387,46 @@ def _run_claimed_generic_connect_job(
         return _generic_connect_result(refreshed)
     if refreshed.status == "failed":
         raise _stored_connect_failure(refreshed)
+    current_dispatch = runtime.store.connect_dispatch(refreshed.job_id)
+    if current_dispatch is None:
+        raise RuntimeError("Connect reconciliation lost its dispatch state")
+    if isinstance(capability, connect.RegisteredCapability):
+        if not _require_submission_authority_for_job(
+            runtime,
+            tracked.job_id,
+            capability,
+            expected_dispatch_state=current_dispatch.state,
+            inactive_dispatch_state="reconciling",
+        ):
+            current = runtime.store.connect_job(tracked.job_id)
+            if current is None:
+                raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+            return _generic_connect_active_result(runtime, current)
+        discovered, diagnostic = _discover_persisted_generic_capability(
+            refreshed,
+            current_dispatch,
+            require_entitlement=True,
+        )
+        if discovered is None:
+            runtime.store.defer_connect_job(
+                job_id=refreshed.job_id,
+                expected_dispatch_state=current_dispatch.state,
+                next_dispatch_state="reconciling",
+                error_code=diagnostic or "provider_unavailable",
+                error_message="The durable Connect provider is unavailable for resubmission.",
+                delay_seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
+            )
+            current = runtime.store.connect_job(refreshed.job_id)
+            if current is None:
+                raise RuntimeError("Connect v2 job disappeared after provider deferral")
+            return _generic_connect_active_result(runtime, current)
+        capability = discovered
+    _require_persisted_capability_authority(
+        runtime,
+        refreshed,
+        current_dispatch,
+        capability,
+    )
     tracked = _tracked_generic_job(refreshed, capability)
     if not capability.accepts_artifact(tracked.artifact.media_type, tracked.artifact.byte_size):
         raise ApiError(
@@ -3168,17 +3457,25 @@ def _run_claimed_generic_connect_job(
             "connect_job_in_progress",
             "The local capability job changed while it was being reconciled.",
         ) from exc
-    _require_connect_entitlement_for_job(
+    reclaimed_dispatch = reclaimed[1]
+    if not _require_submission_authority_for_job(
         runtime,
         tracked.job_id,
         capability,
-    )
+        expected_dispatch_state=reclaimed_dispatch.state,
+        inactive_dispatch_state="reconciling",
+    ):
+        current = runtime.store.connect_job(tracked.job_id)
+        if current is None:
+            raise RuntimeError("Connect v2 job disappeared after entitlement deferral")
+        return _generic_connect_active_result(runtime, current)
     return _submit_generic_connect_job(
         runtime,
         capability,
         tracked,
         refreshed.message_id,
         content,
+        inactive_dispatch_state="reconciling",
         wait_for_terminal=wait_for_terminal,
     )
 
@@ -3246,9 +3543,13 @@ def _resume_generic_connect_job(
 
 def _discover_persisted_generic_capability(
     job: ConnectJob,
+    dispatch: ConnectDispatch,
     *,
     require_entitlement: bool,
-) -> tuple[connect.DiscoveredCapability | None, str | None]:
+) -> tuple[
+    connect.DiscoveredCapability | connect.RegisteredCapability | None,
+    str | None,
+]:
     if (
         job.protocol_version != connect.GENERIC_PROTOCOL_VERSION
         or job.provider_app_id is None
@@ -3256,14 +3557,20 @@ def _discover_persisted_generic_capability(
         or job.provider_instance_id is None
     ):
         raise RuntimeError("Connect v2 job is missing provider provenance")
-    if require_entitlement:
-        catalog = connect.discover_capabilities(
-            provider_instance_id=job.provider_instance_id,
+    if not require_entitlement:
+        return connect.registered_capability_for_reconciliation(
+            app_id=job.provider_app_id,
+            app_version=job.provider_app_version,
+            instance_id=job.provider_instance_id,
+            capability_id=job.capability_id,
+            capability_version=job.capability_version,
+            produces=dispatch.capability_produces,
+            external_effects=dispatch.capability_external_effects,
+            confirmation_required=dispatch.capability_confirmation_required,
         )
-    else:
-        catalog = connect.discover_capabilities_for_reconciliation(
-            provider_instance_id=job.provider_instance_id,
-        )
+    catalog = connect.discover_capabilities(
+        provider_instance_id=job.provider_instance_id,
+    )
     matches = tuple(
         item
         for item in catalog.items
@@ -3302,6 +3609,26 @@ def _next_connect_queue_wakeup(
             retry_seconds = 2 if outcome == "lock_contended" else 30
             wakeup = observed_at + timedelta(seconds=retry_seconds)
         wakeups.append(wakeup)
+    pending_fires = runtime.store.automation_fires_in_states(
+        ("pending_dispatch",), limit=1
+    )
+    if pending_fires:
+        updated_at = datetime.fromisoformat(pending_fires[0].updated_at)
+        if updated_at.tzinfo is None:
+            raise RuntimeError("Automation fire update time is missing its timezone")
+        wakeups.append(
+            max(
+                observed_at,
+                updated_at.astimezone(UTC)
+                + timedelta(seconds=CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS),
+            )
+        )
+    if _automation_entitlement_active() and runtime.store.automation_fires_in_states(
+        ("entitlement_paused",), limit=1
+    ):
+        wakeups.append(observed_at)
+    if runtime.store.automation_fire_settlement_due():
+        wakeups.append(observed_at)
     return min(wakeups) if wakeups else None
 
 
@@ -3319,6 +3646,20 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
     busy_message = "Another Connect provider operation is already running"
     try:
         with connect_operation_lock(lock_path, busy_message):
+            linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
+            automation_authority_required = (
+                runtime.store.connect_job_requires_automation_entitlement(head.job_id)
+            )
+            automation_authorized = _automation_entitlement_active()
+            if linked_fires and not automation_authorized and not automation_authority_required:
+                runtime.store.pause_interactive_job_automation_fires(head.job_id)
+            elif automation_authorized:
+                for fire in linked_fires:
+                    if fire.state == "entitlement_paused":
+                        runtime.store.resume_automation_fire_job(
+                            fire_id=fire.fire_id,
+                            expected_version=fire.state_version,
+                        )
             claimed = runtime.store.claim_connect_lane_head(
                 provider_app_id=head.provider_app_id,
                 provider_instance_id=head.provider_instance_id,
@@ -3329,9 +3670,28 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
             claimed_job, dispatch = claimed
             proven_new_submission = dispatch.state == "dispatching"
             if proven_new_submission:
+                if not _automation_submission_authority_active(
+                    runtime,
+                    claimed_job.job_id,
+                    expected_dispatch_state=dispatch.state,
+                    inactive_dispatch_state="waiting",
+                ):
+                    return _connect_queue_item(runtime, head.job_id, "entitlement_paused")
                 try:
                     connect.require_connect_entitlement()
                 except connect.ConnectError as exc:
+                    if runtime.store.connect_job_requires_automation_entitlement(
+                        claimed_job.job_id
+                    ):
+                        _defer_inactive_automation_job(
+                            runtime,
+                            claimed_job.job_id,
+                            expected_dispatch_state=dispatch.state,
+                            next_dispatch_state="waiting",
+                        )
+                        return _connect_queue_item(
+                            runtime, head.job_id, "entitlement_paused"
+                        )
                     _fail_generic_connect_record(
                         runtime,
                         claimed_job,
@@ -3341,6 +3701,7 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     return _connect_queue_item(runtime, head.job_id, "failed")
             capability, diagnostic = _discover_persisted_generic_capability(
                 claimed_job,
+                dispatch,
                 require_entitlement=proven_new_submission,
             )
             if capability is None:
@@ -3375,9 +3736,9 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                     runtime,
                     claimed_job.message_id,
                 )
-                gateway = _configured_mailbox_gateway(runtime, source)
-                return gateway.attachment_bytes(
-                    source.provider_message_id,
+                return _verified_mailbox_attachment_bytes(
+                    runtime,
+                    source,
                     claimed_job.part_id,
                     attachment.attachment_id,
                 )
@@ -3393,6 +3754,15 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
                 )
             except (ApiError, connect.ConnectError):
                 return _connect_queue_item(runtime, head.job_id, "deferred_or_failed")
+            current_linked_fires = runtime.store.automation_fires_linked_to_job(head.job_id)
+            if any(fire.state == "entitlement_paused" for fire in current_linked_fires):
+                current = runtime.store.connect_job(head.job_id)
+                outcome = (
+                    "completed"
+                    if current is not None and current.status in {"completed", "failed"}
+                    else "entitlement_paused"
+                )
+                return _connect_queue_item(runtime, head.job_id, outcome)
             return _connect_queue_item(runtime, head.job_id, "completed")
     except RuntimeError as exc:
         if str(exc) == busy_message:
@@ -3400,12 +3770,8 @@ def _pump_generic_connect_lane(runtime: Runtime, head: ConnectJob) -> dict[str, 
         raise
 
 
-def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"limit"})
-    raw_limit = payload.get("limit", 25)
-    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 25:
-        raise ApiError("invalid_request", "limit must be an integer between 1 and 25")
-    runtime = _runtime(request)
+def pump_connect_runtime(runtime: Runtime, raw_limit: int) -> dict[str, object]:
+    _dispatch_automation_fires(runtime, limit=raw_limit)
     expired = runtime.store.expire_waiting_connect_jobs()
     items = [_connect_queue_item(runtime, job_id, "expired") for job_id in expired[:raw_limit]]
     attempted: set[str] = set()
@@ -3419,6 +3785,7 @@ def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
             items.append(_pump_generic_connect_lane(runtime, head))
             if len(items) == raw_limit:
                 break
+    _settle_submitted_automation_fires(runtime, limit=raw_limit)
     observed_at = datetime.now(UTC)
     next_wakeup = _next_connect_queue_wakeup(runtime, items, observed_at)
     return {
@@ -3427,6 +3794,14 @@ def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
             int(next_wakeup.timestamp() * 1000) if next_wakeup is not None else None
         ),
     }
+
+
+def _connect_queue_pump(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"limit"})
+    raw_limit = payload.get("limit", 25)
+    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 25:
+        raise ApiError("invalid_request", "limit must be an integer between 1 and 25")
+    return pump_connect_runtime(_runtime(request), raw_limit)
 
 
 def _tracked_invocation_job(
@@ -3455,6 +3830,30 @@ def _tracked_invocation_job(
             "The capability request identity belongs to different parameters.",
         )
     return tracked
+
+
+def _reject_disallowed_effectful_join(
+    runtime: Runtime,
+    job: ConnectJob,
+    *,
+    request_id: str,
+    capability: connect.DiscoveredCapability,
+    join_effectful: bool,
+) -> None:
+    dispatch = runtime.store.connect_dispatch(job.job_id)
+    if dispatch is None:
+        raise RuntimeError("Connect v2 job is missing its durable dispatch authority")
+    _require_persisted_capability_authority(runtime, job, dispatch, capability)
+    if job.job_id == request_id:
+        return
+    if not join_effectful and (
+        dispatch.capability_external_effects
+        or dispatch.capability_confirmation_required
+    ):
+        raise ApiError(
+            "effectful_job_active",
+            "An effectful invocation is already active for this attachment.",
+        )
 
 
 def _validate_existing_invocation_identity(
@@ -3489,6 +3888,724 @@ def _validate_existing_invocation_identity(
             "request_id_conflict",
             "The capability request identity belongs to different parameters.",
         )
+
+
+def _generic_attachment_content(
+    runtime: Runtime,
+    message_id: str,
+    part_id: str,
+    *,
+    operation_deadline: float | None = None,
+) -> bytes:
+    try:
+        current_attachment = runtime.store.attachment(message_id, part_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Attachment was not found") from exc
+    current_source = _retained_connect_message_source(runtime, message_id)
+    if not _attachment_is_locally_fetchable(current_source.provider, current_attachment.byte_size):
+        raise ApiError(
+            "connect_source_unavailable",
+            "The source attachment exceeds the local mailbox fetch limit.",
+        )
+    remaining_timeout = (
+        (lambda: _remaining_automation_dispatch_seconds(operation_deadline))
+        if operation_deadline is not None
+        else None
+    )
+    return _verified_mailbox_attachment_bytes(
+        runtime,
+        current_source,
+        part_id,
+        current_attachment.attachment_id,
+        remaining_timeout,
+    )
+
+
+def _prepare_or_create_generic_connect_job(
+    runtime: Runtime,
+    *,
+    request_id: str,
+    message_id: str,
+    part_id: str,
+    capability: connect.DiscoveredCapability,
+    parameters: dict[str, str | int | bool],
+    confirmed: bool,
+    create_job: bool = True,
+    artifact_id: str | None = None,
+    join_completed: bool = False,
+    join_effectful: bool = True,
+    interactive_authorized: bool = False,
+    candidate_check: Callable[[connect.PreparedCapabilityJob], None] | None = None,
+    operation_deadline: float | None = None,
+) -> tuple[
+    connect.PreparedCapabilityJob,
+    ConnectJob | None,
+    bool,
+    Callable[[], bytes],
+]:
+    try:
+        attachment = runtime.store.attachment(message_id, part_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Attachment was not found") from exc
+    source = _retained_connect_message_source(runtime, message_id)
+    if not _attachment_is_locally_fetchable(source.provider, attachment.byte_size):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment exceeds the local mailbox fetch limit.",
+        )
+    if not capability.accepts_artifact(
+        attachment.media_type,
+        _attachment_contract_size(source.provider, attachment.byte_size),
+    ):
+        raise ApiError(
+            "unsupported_attachment",
+            "The attachment is not accepted by the selected capability.",
+        )
+    if (capability.external_effects or capability.confirmation_required) and not confirmed:
+        raise ApiError(
+            "confirmation_required",
+            "The selected capability requires explicit confirmation.",
+        )
+    _require_generic_connect_lane_lock(runtime, capability)
+    source_lock = _require_generic_connect_source_lock(runtime, message_id)
+
+    def attachment_content() -> bytes:
+        return _generic_attachment_content(
+            runtime,
+            message_id,
+            part_id,
+            operation_deadline=operation_deadline,
+        )
+
+    with connect_operation_lock(
+        source_lock,
+        "The Connect source attachment is being changed",
+    ):
+        locked_source = _retained_connect_message_source(runtime, message_id)
+        try:
+            locked_attachment = runtime.store.attachment(message_id, part_id)
+        except KeyError as exc:
+            raise ApiError("connect_source_unavailable", "Attachment was not found") from exc
+        if not _attachment_is_locally_fetchable(
+            locked_source.provider, locked_attachment.byte_size
+        ) or not capability.accepts_artifact(
+            locked_attachment.media_type,
+            _attachment_contract_size(
+                locked_source.provider,
+                locked_attachment.byte_size,
+            ),
+        ):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment changed before it could be queued.",
+            )
+        content = attachment_content()
+        if not _attachment_download_matches(
+            locked_source.provider,
+            locked_attachment.byte_size,
+            content,
+        ) or not capability.accepts_artifact(locked_attachment.media_type, len(content)):
+            raise ApiError(
+                "connect_source_unavailable",
+                "The source attachment changed before it could be queued.",
+            )
+        candidate = connect.prepare_capability_job(
+            capability,
+            content,
+            locked_attachment.media_type,
+            locked_attachment.filename,
+            parameters=parameters,
+            confirmed=confirmed,
+            job_id=request_id,
+            artifact_id=artifact_id,
+        )
+        if candidate_check is not None:
+            candidate_check(candidate)
+        if not create_job:
+            return candidate, None, False, attachment_content
+        lookup = {
+            "message_id": message_id,
+            "part_id": part_id,
+            "capability_id": capability.capability_id,
+            "capability_version": capability.capability_version,
+            "protocol_version": connect.GENERIC_PROTOCOL_VERSION,
+            "provider_app_id": capability.app_id,
+            "provider_app_version": capability.app_version,
+            "provider_instance_id": capability.instance_id,
+            "request_json": candidate.request_json,
+        }
+        joined = runtime.store.active_connect_job(**lookup)
+        if (
+            joined is None
+            and join_completed
+            and not (capability.external_effects or capability.confirmation_required)
+        ):
+            joined = runtime.store.completed_connect_job(**lookup)
+        if joined is not None:
+            _tracked_invocation_job(
+                joined,
+                capability,
+                message_id=message_id,
+                part_id=part_id,
+                parameters=parameters,
+            )
+            _reject_disallowed_effectful_join(
+                runtime,
+                joined,
+                request_id=request_id,
+                capability=capability,
+                join_effectful=join_effectful,
+            )
+            if interactive_authorized:
+                joined = runtime.store.authorize_connect_job_interactively(joined.job_id)
+            return candidate, joined, True, attachment_content
+        try:
+            created = runtime.store.create_connect_job(
+                job_id=candidate.job_id,
+                message_id=message_id,
+                part_id=part_id,
+                protocol_version=connect.GENERIC_PROTOCOL_VERSION,
+                capability_id=capability.capability_id,
+                capability_version=capability.capability_version,
+                provider_app_id=capability.app_id,
+                provider_app_version=capability.app_version,
+                provider_instance_id=capability.instance_id,
+                input_artifact_id=candidate.artifact.artifact_id,
+                input_media_type=candidate.artifact.media_type,
+                input_byte_size=candidate.artifact.byte_size,
+                input_sha256=candidate.artifact.sha256,
+                input_display_name=candidate.display_name,
+                source_app_id=connect.SOURCE_APP_ID,
+                request_json=candidate.request_json,
+                capability_produces=capability.produces,
+                capability_external_effects=capability.external_effects,
+                capability_confirmation_required=capability.confirmation_required,
+            )
+        except ConnectQueueFull as exc:
+            raise ApiError(
+                "connect_queue_full",
+                "The selected provider already has the maximum number of queued jobs.",
+            ) from exc
+        except sqlite3.IntegrityError:
+            exact = runtime.store.connect_job(request_id)
+            if exact is None:
+                raise
+            _tracked_invocation_job(
+                exact,
+                capability,
+                message_id=message_id,
+                part_id=part_id,
+                parameters=parameters,
+            )
+            _reject_disallowed_effectful_join(
+                runtime,
+                exact,
+                request_id=request_id,
+                capability=capability,
+                join_effectful=join_effectful,
+            )
+            if interactive_authorized:
+                exact = runtime.store.authorize_connect_job_interactively(exact.job_id)
+            return candidate, exact, True, attachment_content
+        collision = created.job_id != candidate.job_id
+        if collision:
+            _tracked_invocation_job(
+                created,
+                capability,
+                message_id=message_id,
+                part_id=part_id,
+                parameters=parameters,
+            )
+            _reject_disallowed_effectful_join(
+                runtime,
+                created,
+                request_id=request_id,
+                capability=capability,
+                join_effectful=join_effectful,
+            )
+        if interactive_authorized:
+            created = runtime.store.authorize_connect_job_interactively(created.job_id)
+        return candidate, created, collision, attachment_content
+
+
+def _automation_prepared_identity(
+    fire_id: str,
+    definition: RuleDefinition,
+    capability: connect.DiscoveredCapability,
+    candidate: connect.PreparedCapabilityJob,
+) -> dict[str, object]:
+    return {
+        "fire_id": fire_id,
+        "provider": {
+            "app_id": capability.app_id,
+            "version": capability.app_version,
+            "instance_id": capability.instance_id,
+        },
+        "capability": {
+            "id": capability.capability_id,
+            "version": capability.capability_version,
+        },
+        "parameters": dict(candidate.parameters),
+        "input": {
+            "artifact_id": candidate.artifact.artifact_id,
+            "media_type": candidate.artifact.media_type,
+            "byte_size": candidate.artifact.byte_size,
+            "sha256": candidate.artifact.sha256,
+            "display_name": candidate.display_name,
+        },
+        "effects": {
+            "external": capability.external_effects,
+            "confirmation_required": capability.confirmation_required,
+            "confirm_each": definition.confirm_each,
+        },
+        "request_sha256": hashlib.sha256(candidate.request_json).hexdigest(),
+    }
+
+
+def _automation_identity_sha256(identity: dict[str, object]) -> str:
+    encoded = json.dumps(
+        identity,
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _automation_artifact_id(dispatch_request_id: str) -> str:
+    digest = bytearray(
+        hashlib.sha256(b"automation-artifact-v1\0" + dispatch_request_id.encode("ascii")).digest()[
+            :16
+        ]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x40
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
+    for fire in runtime.store.automation_fires_in_states(
+        ("submitted", "entitlement_paused"), limit=limit
+    ):
+        if fire.job_id is None:
+            if fire.state == "entitlement_paused":
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
+                continue
+            raise RuntimeError("Submitted automation fire is missing its Connect job")
+        job = runtime.store.connect_job(fire.job_id)
+        if job is None:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="source_unavailable",
+                reason="job_removed",
+            )
+            continue
+        if not runtime.store.connect_job_requires_automation_entitlement(
+            fire.job_id
+        ) and not _automation_entitlement_active():
+            if fire.state == "submitted":
+                runtime.store.transition_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                    next_state="entitlement_paused",
+                    reason="entitlement_inactive",
+                )
+            else:
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
+            continue
+        if job.status == "completed":
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="completed",
+                reason="connect_completed",
+            )
+            continue
+        if job.status != "failed":
+            runtime.store.touch_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+            )
+            continue
+        if job.error_code == "connect_queue_deadline_exceeded":
+            if fire.state == "entitlement_paused":
+                runtime.store.touch_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                )
+                continue
+            if fire.current_attempt_no < 2:
+                runtime.store.retry_automation_fire_after_deadline(
+                    fire_id=fire.fire_id,
+                    expected_version=fire.state_version,
+                )
+            else:
+                runtime.store.transition_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                    next_state="manual_review",
+                    reason="second_admission_deadline",
+                )
+            continue
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="failed",
+            reason=(job.error_code or "connect_failed")[:128],
+        )
+
+
+class _AutomationDispatchBudgetExhausted(RuntimeError):
+    pass
+
+
+def _remaining_automation_dispatch_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _AutomationDispatchBudgetExhausted
+    return remaining
+
+
+def _dispatch_automation_fire(
+    runtime: Runtime,
+    fire_id: str,
+    *,
+    operation_deadline: float | None = None,
+) -> None:
+    fire = runtime.store.automation_fire(fire_id)
+    if fire is None or fire.state not in {"pending_dispatch", "entitlement_paused"}:
+        return
+    authorized = _automation_entitlement_active()
+    definition = runtime.store.automation_fire_definition(fire)
+    action = definition.action
+    provider_ref = {
+        "app_id": action.provider.app_id,
+        "version": action.provider.version,
+        "instance_id": action.provider.instance_id,
+    }
+    capability_ref = {
+        "id": action.capability.id,
+        "version": action.capability.version,
+    }
+    requested_parameters: dict[str, object] = dict(action.parameters)
+    attempt_rows = runtime.store.automation_fire_attempts(fire.fire_id)
+    attempts = [
+        attempt for attempt in attempt_rows if attempt.attempt_no == fire.current_attempt_no
+    ]
+    if len(attempts) != 1:
+        raise RuntimeError("Automation fire has no unique current attempt")
+    attempt = attempts[0]
+    exact = runtime.store.connect_job(attempt.dispatch_request_id)
+    if exact is not None and fire.job_id is None:
+        _validate_existing_invocation_identity(
+            exact,
+            message_id=fire.message_id,
+            part_id=fire.part_id,
+            provider=provider_ref,
+            capability=capability_ref,
+            parameters=requested_parameters,
+        )
+        exact_dispatch = runtime.store.connect_dispatch(exact.job_id)
+        if exact_dispatch is None:
+            raise RuntimeError("Recovered automation attempt is missing dispatch authority")
+        if not exact_dispatch.capability_authority_known:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="capability_authority_unknown",
+            )
+            return
+        if (
+            definition.confirm_each
+            or exact_dispatch.capability_external_effects
+            or exact_dispatch.capability_confirmation_required
+        ) and not runtime.store.automation_confirmation_matches(fire):
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason="confirmation_receipt_missing",
+            )
+            return
+        recovered = runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="job_recovered",
+            job_id=exact.job_id,
+        )
+        if not authorized:
+            runtime.store.transition_automation_fire(
+                fire_id=recovered.fire_id,
+                expected_state=recovered.state,
+                expected_version=recovered.state_version,
+                next_state="entitlement_paused",
+                reason="entitlement_inactive",
+            )
+        return
+    if fire.state == "entitlement_paused":
+        if not authorized:
+            return
+        if fire.job_id is not None:
+            runtime.store.resume_automation_fire_job(
+                fire_id=fire.fire_id,
+                expected_version=fire.state_version,
+            )
+            return
+        fire = runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="pending_dispatch",
+            reason=None,
+        )
+    elif not authorized:
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="entitlement_paused",
+            reason="entitlement_inactive",
+        )
+        return
+    if runtime.store.automation_pending_seconds(fire) >= int(
+        AUTOMATION_FIRE_PENDING_WINDOW.total_seconds()
+    ):
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="manual_review",
+            reason="dispatch_stalled",
+        )
+        return
+    try:
+        connect.require_connect_entitlement()
+        if not _automation_entitlement_active():
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="entitlement_paused",
+                reason="entitlement_inactive",
+            )
+            return
+        discovery_remaining_timeout = None
+        if operation_deadline is not None:
+            def current_discovery_timeout() -> float:
+                remaining = _remaining_automation_dispatch_seconds(operation_deadline)
+                assert remaining is not None
+                return remaining
+
+            discovery_remaining_timeout = current_discovery_timeout
+        capability, parameters = _discover_selected_generic_capability(
+            provider_ref,
+            capability_ref,
+            requested_parameters,
+            remaining_timeout=discovery_remaining_timeout,
+        )
+        confirmation_needed = (
+            definition.confirm_each
+            or capability.external_effects
+            or capability.confirmation_required
+        )
+        candidate_check = None
+        confirmed = False
+        if confirmation_needed and not fire.confirmed:
+            candidate, _job, _collision, _content = _prepare_or_create_generic_connect_job(
+                runtime,
+                request_id=attempt.dispatch_request_id,
+                message_id=fire.message_id,
+                part_id=fire.part_id,
+                capability=capability,
+                parameters=parameters,
+                confirmed=True,
+                create_job=False,
+                artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
+                operation_deadline=operation_deadline,
+            )
+            prepared_identity = _automation_prepared_identity(
+                fire.fire_id, definition, capability, candidate
+            )
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="awaiting_confirmation",
+                reason="confirmation_required",
+                prepared_identity=prepared_identity,
+            )
+            return
+        if fire.confirmed:
+            if not runtime.store.automation_confirmation_matches(fire):
+                runtime.store.transition_automation_fire(
+                    fire_id=fire.fire_id,
+                    expected_state=fire.state,
+                    expected_version=fire.state_version,
+                    next_state="manual_review",
+                    reason="confirmation_receipt_missing",
+                )
+                return
+            expected_identity = fire.prepared_identity_sha256
+
+            def check_candidate(candidate: connect.PreparedCapabilityJob) -> None:
+                identity = _automation_prepared_identity(
+                    fire.fire_id, definition, capability, candidate
+                )
+                if _automation_identity_sha256(identity) != expected_identity:
+                    raise ApiError(
+                        "automation_confirmation_stale",
+                        "The prepared automation invocation changed after confirmation.",
+                    )
+
+            candidate_check = check_candidate
+            confirmed = True
+        identity_check = candidate_check
+
+        def check_admission_authority(candidate: connect.PreparedCapabilityJob) -> None:
+            if identity_check is not None:
+                identity_check(candidate)
+            connect.require_connect_entitlement()
+            if not _automation_entitlement_active():
+                raise connect.ConnectError(
+                    "ENTITLEMENT_REQUIRED",
+                    "Automation provider submission requires active entitlements.",
+                )
+
+        _candidate, created, _collision, _content = _prepare_or_create_generic_connect_job(
+            runtime,
+            request_id=attempt.dispatch_request_id,
+            message_id=fire.message_id,
+            part_id=fire.part_id,
+            capability=capability,
+            parameters=parameters,
+            confirmed=confirmed,
+            artifact_id=_automation_artifact_id(attempt.dispatch_request_id),
+            join_completed=True,
+            join_effectful=False,
+            candidate_check=check_admission_authority,
+            operation_deadline=operation_deadline,
+        )
+        if created is None:
+            raise RuntimeError("Automation admission did not create or join a Connect job")
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="connect_admitted",
+            job_id=created.job_id,
+        )
+    except ApiError as exc:
+        if exc.code in {"not_found", "connect_source_unavailable"}:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="source_unavailable",
+                reason="source_unavailable",
+            )
+        elif exc.code in {
+            "capability_unavailable",
+            "unsupported_attachment",
+            "automation_confirmation_stale",
+            "effectful_job_active",
+            "capability_authority_changed",
+            "capability_authority_unknown",
+            "invalid_request",
+        }:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason=exc.code[:128],
+            )
+    except connect.ConnectError as exc:
+        if exc.code in {"CONNECT_ENTITLEMENT_REQUIRED", "ENTITLEMENT_REQUIRED"}:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="entitlement_paused",
+                reason="entitlement_inactive",
+            )
+        elif not exc.retryable:
+            runtime.store.transition_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+                next_state="manual_review",
+                reason=exc.code.lower()[:128],
+            )
+    except (MailboxMessageInvalid, MailboxMessageUnavailable):
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="source_unavailable",
+            reason="source_unavailable",
+        )
+    except (MailboxAccountUnavailable, MailboxError, OperationLockBusy):
+        return
+
+
+def _dispatch_automation_fires(runtime: Runtime, *, limit: int) -> None:
+    deadline = time.monotonic() + AUTOMATION_DISPATCH_PHASE_SECONDS
+    fires = runtime.store.automation_fires_in_states(
+        ("pending_dispatch", "entitlement_paused"),
+        limit=limit,
+    )
+    for fire in fires:
+        if time.monotonic() >= deadline:
+            break
+        budget_exhausted = False
+        try:
+            _dispatch_automation_fire(
+                runtime,
+                fire.fire_id,
+                operation_deadline=deadline,
+            )
+        except _AutomationDispatchBudgetExhausted:
+            budget_exhausted = True
+        except RuntimeError as exc:
+            if "expected-state race" not in str(exc):
+                raise
+        current = runtime.store.automation_fire(fire.fire_id)
+        if (
+            current is not None
+            and current.state == fire.state
+            and current.state_version == fire.state_version
+        ):
+            runtime.store.touch_automation_fire(
+                fire_id=fire.fire_id,
+                expected_state=fire.state,
+                expected_version=fire.state_version,
+            )
+        if budget_exhausted:
+            break
 
 
 def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
@@ -3546,27 +4663,6 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
         requested_parameters,
     )
 
-    def attachment_content() -> bytes:
-        try:
-            current_attachment = runtime.store.attachment(message_id, part_id)
-        except KeyError as exc:
-            raise ApiError("not_found", "Attachment was not found") from exc
-        current_source = _retained_connect_message_source(runtime, message_id)
-        if not _attachment_is_locally_fetchable(
-            current_source.provider, current_attachment.byte_size
-        ):
-            raise ApiError(
-                "connect_source_unavailable",
-                "The source attachment exceeds the local mailbox fetch limit.",
-            )
-        gateway = _configured_mailbox_gateway(runtime, current_source)
-        content = gateway.attachment_bytes(
-            current_source.provider_message_id,
-            part_id,
-            current_attachment.attachment_id,
-        )
-        return content
-
     if existing is not None:
         _tracked_invocation_job(
             existing,
@@ -3575,112 +4671,26 @@ def _connect_attachment_invoke(request: dict[str, object]) -> dict[str, object]:
             part_id=part_id,
             parameters=parameters,
         )
+        existing = runtime.store.authorize_connect_job_interactively(existing.job_id)
         return _resume_generic_connect_job(
             runtime,
             capability,
             existing,
-            attachment_content,
+            lambda: _generic_attachment_content(runtime, message_id, part_id),
             reconcile_first=True,
         )
 
-    if not capability.accepts_artifact(
-        attachment.media_type,
-        _attachment_contract_size(source.provider, attachment.byte_size),
-    ):
-        raise ApiError(
-            "unsupported_attachment",
-            "The attachment is not accepted by the selected capability.",
-        )
-    if (capability.external_effects or capability.confirmation_required) and not confirmed:
-        raise ApiError(
-            "confirmation_required",
-            "The selected capability requires explicit confirmation.",
-        )
-    _require_generic_connect_lane_lock(runtime, capability)
-    source_lock = _require_generic_connect_source_lock(runtime, message_id)
-    with connect_operation_lock(
-        source_lock,
-        "The Connect source attachment is being changed",
-    ):
-        locked_source = _retained_connect_message_source(runtime, message_id)
-        try:
-            locked_attachment = runtime.store.attachment(message_id, part_id)
-        except KeyError as exc:
-            raise ApiError("connect_source_unavailable", "Attachment was not found") from exc
-        if not _attachment_is_locally_fetchable(
-            locked_source.provider, locked_attachment.byte_size
-        ) or not capability.accepts_artifact(
-            locked_attachment.media_type,
-            _attachment_contract_size(
-                locked_source.provider,
-                locked_attachment.byte_size,
-            ),
-        ):
-            raise ApiError(
-                "connect_source_unavailable",
-                "The source attachment changed before it could be queued.",
-            )
-        content = attachment_content()
-        if not _attachment_download_matches(
-            locked_source.provider,
-            locked_attachment.byte_size,
-            content,
-        ) or not capability.accepts_artifact(
-            locked_attachment.media_type,
-            len(content),
-        ):
-            raise ApiError(
-                "connect_source_unavailable",
-                "The source attachment changed before it could be queued.",
-            )
-        candidate = connect.prepare_capability_job(
-            capability,
-            content,
-            locked_attachment.media_type,
-            locked_attachment.filename,
-            parameters=parameters,
-            confirmed=confirmed,
-            job_id=request_id,
-        )
-        collision = False
-        try:
-            created = runtime.store.create_connect_job(
-                job_id=candidate.job_id,
-                message_id=message_id,
-                part_id=part_id,
-                protocol_version=connect.GENERIC_PROTOCOL_VERSION,
-                capability_id=capability.capability_id,
-                capability_version=capability.capability_version,
-                provider_app_id=capability.app_id,
-                provider_app_version=capability.app_version,
-                provider_instance_id=capability.instance_id,
-                input_artifact_id=candidate.artifact.artifact_id,
-                input_media_type=candidate.artifact.media_type,
-                input_byte_size=candidate.artifact.byte_size,
-                input_sha256=candidate.artifact.sha256,
-                input_display_name=candidate.display_name,
-                source_app_id=connect.SOURCE_APP_ID,
-                request_json=candidate.request_json,
-            )
-        except ConnectQueueFull as exc:
-            raise ApiError(
-                "connect_queue_full",
-                "The selected provider already has the maximum number of queued jobs.",
-            ) from exc
-        except sqlite3.IntegrityError:
-            exact = runtime.store.connect_job(request_id)
-            if exact is not None:
-                _tracked_invocation_job(
-                    exact,
-                    capability,
-                    message_id=message_id,
-                    part_id=part_id,
-                    parameters=parameters,
-                )
-                created = exact
-                collision = True
-            else:
-                raise
+    candidate, created, collision, attachment_content = _prepare_or_create_generic_connect_job(
+        runtime,
+        request_id=request_id,
+        message_id=message_id,
+        part_id=part_id,
+        capability=capability,
+        parameters=parameters,
+        confirmed=confirmed,
+        interactive_authorized=True,
+    )
+    assert created is not None
     if created.status == "completed":
         return _generic_connect_result(created)
     if created.status == "failed":
@@ -3807,9 +4817,9 @@ def _connect_attachment_summarize(request: dict[str, object]) -> dict[str, objec
 
     if source.provider != IMAP_PROVIDER and attachment.byte_size > provider.max_input_bytes:
         raise ApiError("input_too_large", "The PDF exceeds the provider's input limit")
-    gateway = _configured_mailbox_gateway(runtime, source)
-    content = gateway.attachment_bytes(
-        source.provider_message_id,
+    content = _verified_mailbox_attachment_bytes(
+        runtime,
+        source,
         part_id,
         attachment.attachment_id,
     )
@@ -4113,6 +5123,7 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
 
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "analysis.requeue": _analysis_requeue,
+    "automation.fire.decide": _automation_fire_decide,
     "automation.rules.delete": _automation_rules_delete,
     "automation.rules.get": _automation_rules_get,
     "automation.rules.list": _automation_rules_list,

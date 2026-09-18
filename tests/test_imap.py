@@ -164,6 +164,48 @@ def credentials() -> ImapCredentials:
     )
 
 
+def test_imap_operation_timeout_reaches_socket_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def open_imap(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", open_imap)
+    gateway = ImapGateway(credentials())
+    gateway.set_operation_timeout(0.25)
+
+    opened = gateway._default_client(credentials(), ssl.create_default_context())
+
+    assert opened is sentinel
+    assert captured["kwargs"]["timeout"] == 0.25  # type: ignore[index]
+
+
+def test_attachment_bytes_recomputes_remaining_timeout_before_each_imap_network_step(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "credentials.json"
+    write_credentials(path, credentials())
+    remaining_timeouts = iter((0.9, 0.8, 0.7, 0.6, 0.5))
+    socket_timeouts: list[float] = []
+
+    class TimeoutSocket:
+        def settimeout(self, timeout_seconds: float) -> None:
+            socket_timeouts.append(timeout_seconds)
+
+    client = FakeImap()
+    client.sock = TimeoutSocket()  # type: ignore[attr-defined]
+    gateway = ImapGateway.from_credentials_file(path, lambda: next(remaining_timeouts))
+    gateway._client_factory = lambda _credentials, _context: client
+
+    assert gateway.attachment_bytes(message_id(), "mime-0", None) == b"PDFDATA"
+    assert socket_timeouts == [0.8, 0.7, 0.6, 0.5]
+
+
 def cursor(uid: int = 7, *, uid_validity: int = 44, values: ImapCredentials | None = None) -> str:
     mailbox_id = imap_mailbox_identity(values or credentials())
     return f"{CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{uid}"

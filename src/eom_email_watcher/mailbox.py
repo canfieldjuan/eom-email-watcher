@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ class MessageContent:
 
 
 class MailboxGateway(Protocol):
+    def set_operation_timeout(self, timeout_seconds: float) -> None: ...
+
     def mailbox_address(self) -> str: ...
 
     def mailbox_identity_key(self) -> str: ...
@@ -87,6 +90,17 @@ class MailboxGateway(Protocol):
     def attachment_bytes(
         self, message_id: str, part_id: str, attachment_id: str | None
     ) -> bytes: ...
+
+
+def validate_operation_timeout(timeout_seconds: float) -> float:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("Mailbox operation timeout must be a positive finite number")
+    return float(timeout_seconds)
 
 
 @contextmanager

@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, html_to_text
 
@@ -145,11 +147,17 @@ def microsoft_credentials_configured(configured_file: Path) -> bool:
 def _new_public_client(
     configuration: MicrosoftPublicClient,
     cache: msal.SerializableTokenCache,
+    timeout_seconds: float | None = None,
 ) -> Any:
+    options: dict[str, object] = {
+        "authority": configuration.authority,
+        "token_cache": cache,
+    }
+    if timeout_seconds is not None:
+        options["timeout"] = validate_operation_timeout(timeout_seconds)
     return msal.PublicClientApplication(
         configuration.client_id,
-        authority=configuration.authority,
-        token_cache=cache,
+        **options,
     )
 
 
@@ -376,6 +384,9 @@ class Microsoft365Gateway:
             raise MicrosoftAuthorizationRejected("Microsoft mailbox identity is unavailable")
         return self._mailbox_identity_key
 
+    def set_operation_timeout(self, timeout_seconds: float) -> None:
+        self._client.timeout = httpx.Timeout(validate_operation_timeout(timeout_seconds))
+
     def mailbox_address(self) -> str:
         return self._email_address
 
@@ -384,17 +395,37 @@ class Microsoft365Gateway:
         cls,
         credentials_file: Path,
         token_file: Path,
+        remaining_timeout: Callable[[], float] | None = None,
         *,
         client: httpx.Client | None = None,
     ) -> Microsoft365Gateway:
+        operation_timeout = (
+            validate_operation_timeout(remaining_timeout())
+            if remaining_timeout is not None
+            else None
+        )
+        token_lock_timeout = (
+            min(float(TOKEN_LOCK_TIMEOUT_SECONDS), operation_timeout)
+            if operation_timeout is not None
+            else TOKEN_LOCK_TIMEOUT_SECONDS
+        )
         configuration = load_microsoft_public_client(credentials_file)
         if not token_file.is_file():
             raise MicrosoftAuthorizationRejected("Microsoft 365 is not authorized")
         try:
-            with FileLock(f"{token_file}.lock", timeout=TOKEN_LOCK_TIMEOUT_SECONDS):
+            with FileLock(f"{token_file}.lock", timeout=token_lock_timeout):
                 cache = _load_cache(token_file)
                 try:
-                    application = _new_public_client(configuration, cache)
+                    refresh_timeout = (
+                        validate_operation_timeout(remaining_timeout())
+                        if remaining_timeout is not None
+                        else None
+                    )
+                    application = _new_public_client(
+                        configuration,
+                        cache,
+                        refresh_timeout,
+                    )
                 except Exception as exc:
                     raise Microsoft365Error(
                         "Microsoft authorization service is unavailable; retry"
@@ -419,12 +450,17 @@ class Microsoft365Gateway:
                     _write_private_cache(token_file, cache)
         except FileLockTimeout as exc:
             raise Microsoft365Error("Microsoft authorization cache is busy; retry") from exc
-        return cls(
+        gateway = cls(
             str(result["access_token"]),
             email_address,
             client,
             cls._principal_identity(accounts[0]),
         )
+        if remaining_timeout is not None:
+            gateway.set_operation_timeout(
+                validate_operation_timeout(remaining_timeout())
+            )
+        return gateway
 
     @classmethod
     def authorize_with_status(

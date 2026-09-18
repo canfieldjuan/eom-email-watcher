@@ -488,6 +488,23 @@ class DiscoveredCapability:
 
 
 @dataclass(frozen=True)
+class RegisteredCapability:
+    """Durable provider endpoint and admitted authority for GET-only reconciliation."""
+
+    protocol_version: int
+    base_url: str
+    token: str
+    app_id: str
+    app_version: str
+    instance_id: str
+    capability_id: str
+    capability_version: str
+    produces: tuple[str, ...]
+    external_effects: bool
+    confirmation_required: bool
+
+
+@dataclass(frozen=True)
 class CapabilityCatalog:
     items: tuple[DiscoveredCapability, ...]
     diagnostic_code: str | None = None
@@ -878,10 +895,29 @@ def _http_error_v2(response: httpx.Response) -> ConnectError:
     )
 
 
-def _client() -> httpx.Client:
+def _http_timeout(timeout_seconds: float | None = None) -> httpx.Timeout:
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("Connect timeout must be a positive finite number")
+    if timeout_seconds is None:
+        return httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0)
+    bounded = float(timeout_seconds)
+    return httpx.Timeout(
+        connect=min(1.0, bounded),
+        read=min(10.0, bounded),
+        write=min(60.0, bounded),
+        pool=min(1.0, bounded),
+    )
+
+
+def _client(timeout_seconds: float | None = None) -> httpx.Client:
     return httpx.Client(
         follow_redirects=False,
-        timeout=httpx.Timeout(connect=1.0, read=10.0, write=60.0, pool=1.0),
+        timeout=_http_timeout(timeout_seconds),
         trust_env=False,
     )
 
@@ -1040,13 +1076,76 @@ def _generic_capabilities(
     )
 
 
+def registered_capability_for_reconciliation(
+    runtime_dir: Path | None = None,
+    *,
+    app_id: str,
+    app_version: str,
+    instance_id: str,
+    capability_id: str,
+    capability_version: str,
+    produces: tuple[str, ...],
+    external_effects: bool,
+    confirmation_required: bool,
+) -> tuple[RegisteredCapability | None, str | None]:
+    """Resolve a GET-only endpoint without consulting an entitlement-gated manifest."""
+    locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
+    if locations is None:
+        return None, "connect_unavailable"
+    root_value, providers_dir = locations
+    if not root_value.is_absolute() or not _secure_directory(
+        root_value,
+        windows_root=root_value,
+    ):
+        return None, "connect_unavailable"
+    if not _secure_directory(providers_dir, windows_root=root_value):
+        return None, "provider_unavailable"
+    registrations = _registration_candidates(providers_dir)
+    if registrations is None:
+        return None, "provider_unavailable"
+    matches: set[RegisteredCapability] = set()
+    for path in registrations:
+        registration = _read_registration_v2(path, windows_root=root_value)
+        if (
+            registration is None
+            or registration.app_id != app_id
+            or registration.instance_id != instance_id
+        ):
+            continue
+        base_url = _validated_base_url(registration.transport.base_url)
+        if base_url is None:
+            continue
+        matches.add(
+            RegisteredCapability(
+                protocol_version=GENERIC_PROTOCOL_VERSION,
+                base_url=base_url,
+                token=registration.auth.token,
+                app_id=app_id,
+                app_version=app_version,
+                instance_id=instance_id,
+                capability_id=capability_id,
+                capability_version=capability_version,
+                produces=produces,
+                external_effects=external_effects,
+                confirmation_required=confirmation_required,
+            )
+        )
+    if len(matches) != 1:
+        return None, "provider_unavailable"
+    return next(iter(matches)), None
+
+
 def _discover_capabilities(
     runtime_dir: Path | None = None,
     *,
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
     require_entitlement: bool = True,
+    timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> CapabilityCatalog:
+    if timeout_seconds is not None and remaining_timeout is not None:
+        raise ValueError("Connect discovery accepts one timeout source")
     if require_entitlement and not entitlement.connect_entitlement_decision().is_active:
         return CapabilityCatalog((), "connect_entitlement_required")
     locations = _providers_directory(runtime_dir, GENERIC_PROTOCOL_VERSION)
@@ -1062,7 +1161,7 @@ def _discover_capabilities(
         return CapabilityCatalog((), "provider_unavailable")
 
     owned_client = client is None
-    active_client = client or _client()
+    active_client = client or _client(timeout_seconds)
     providers: dict[str, tuple[DiscoveredCapability, ...]] = {}
     conflicting_instances: set[str] = set()
     try:
@@ -1082,14 +1181,24 @@ def _discover_capabilities(
             if base_url is None:
                 continue
             try:
-                with active_client.stream(
-                    "GET",
-                    f"{base_url}v2/manifest",
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {registration.auth.token}",
-                    },
-                ) as response:
+                headers = {
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {registration.auth.token}",
+                }
+                if remaining_timeout is None:
+                    response_stream = active_client.stream(
+                        "GET",
+                        f"{base_url}v2/manifest",
+                        headers=headers,
+                    )
+                else:
+                    response_stream = active_client.stream(
+                        "GET",
+                        f"{base_url}v2/manifest",
+                        headers=headers,
+                        timeout=_http_timeout(remaining_timeout()),
+                    )
+                with response_stream as response:
                     if response.status_code != 200:
                         continue
                     manifest = _AppManifestV2.model_validate(
@@ -1140,12 +1249,16 @@ def discover_capabilities(
     *,
     client: httpx.Client | None = None,
     provider_instance_id: str | None = None,
+    timeout_seconds: float | None = None,
+    remaining_timeout: Callable[[], float] | None = None,
 ) -> CapabilityCatalog:
     return _discover_capabilities(
         runtime_dir,
         client=client,
         provider_instance_id=provider_instance_id,
         require_entitlement=True,
+        timeout_seconds=timeout_seconds,
+        remaining_timeout=remaining_timeout,
     )
 
 
@@ -1413,6 +1526,56 @@ def restore_persisted_capability_job(
     )
 
 
+def restore_registered_capability_job(
+    capability: RegisteredCapability,
+    request_json: bytes,
+) -> PreparedCapabilityJob:
+    """Restore a durable request for GET-only reconciliation without a manifest schema."""
+    if capability.protocol_version != GENERIC_PROTOCOL_VERSION:
+        raise ConnectError(
+            "PROTOCOL_VERSION_UNSUPPORTED",
+            "The registered capability does not use the generic Connect protocol.",
+        )
+    try:
+        request = _JobRequestV2.model_validate_json(request_json)
+    except (ValueError, TypeError) as exc:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job request is invalid.",
+        ) from exc
+    if (
+        request.capability.id != capability.capability_id
+        or request.capability.version != capability.capability_version
+    ):
+        raise ConnectError(
+            "JOB_CAPABILITY_MISMATCH",
+            "The durable job does not match the registered capability.",
+        )
+    artifact = request.inputs[0]
+    if artifact.source_app_id != SOURCE_APP_ID:
+        raise ConnectError(
+            "JOB_REQUEST_INVALID",
+            "The durable capability job source is invalid.",
+        )
+    return PreparedCapabilityJob(
+        job_id=request.job_id,
+        provider_app_id=capability.app_id,
+        provider_app_version=capability.app_version,
+        provider_instance_id=capability.instance_id,
+        capability_id=request.capability.id,
+        capability_version=request.capability.version,
+        artifact=ArtifactIdentity(
+            artifact_id=artifact.artifact_id,
+            media_type=artifact.media_type,
+            byte_size=artifact.byte_size,
+            sha256=artifact.sha256,
+        ),
+        display_name=artifact.display_name,
+        parameters=tuple(sorted(request.parameters.items())),
+        request_json=request_json,
+    )
+
+
 def prepare_capability_job(
     capability: DiscoveredCapability,
     content: bytes,
@@ -1422,6 +1585,7 @@ def prepare_capability_job(
     parameters: dict[str, object] | None = None,
     confirmed: bool = False,
     job_id: str | None = None,
+    artifact_id: str | None = None,
 ) -> PreparedCapabilityJob:
     if capability.confirmation_required and not confirmed:
         raise ConnectError(
@@ -1436,7 +1600,7 @@ def prepare_capability_job(
     return _build_capability_job(
         capability,
         job_id=validate_job_id(job_id) if job_id is not None else str(uuid4()),
-        artifact_id=str(uuid4()),
+        artifact_id=(validate_job_id(artifact_id) if artifact_id is not None else str(uuid4())),
         media_type=media_type,
         byte_size=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
@@ -1684,7 +1848,7 @@ class ConnectClient:
 class ConnectV2Client:
     def __init__(
         self,
-        capability: DiscoveredCapability,
+        capability: DiscoveredCapability | RegisteredCapability,
         *,
         client: httpx.Client | None = None,
         poll_interval_seconds: float = 0.25,
@@ -1721,13 +1885,19 @@ class ConnectV2Client:
                 "JOB_CAPABILITY_MISMATCH",
                 "The prepared job does not match the selected capability.",
             )
-        if require_compatible_input and not self.capability.accepts_artifact(
-            job.artifact.media_type, job.artifact.byte_size
-        ):
-            raise ConnectError(
-                "JOB_CAPABILITY_MISMATCH",
-                "The prepared job input is not accepted by the selected capability.",
-            )
+        if require_compatible_input:
+            if not isinstance(self.capability, DiscoveredCapability):
+                raise ConnectError(
+                    "JOB_CAPABILITY_MISMATCH",
+                    "A registered reconciliation endpoint cannot submit jobs.",
+                )
+            if not self.capability.accepts_artifact(
+                job.artifact.media_type, job.artifact.byte_size
+            ):
+                raise ConnectError(
+                    "JOB_CAPABILITY_MISMATCH",
+                    "The prepared job input is not accepted by the selected capability.",
+                )
 
     def submit(self, job: PreparedCapabilityJob, content: bytes) -> CapabilityJobUpdate:
         self._validate_job(job, require_compatible_input=True)

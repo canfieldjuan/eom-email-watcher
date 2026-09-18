@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -199,6 +200,44 @@ class FixtureModelHandler(BaseHTTPRequestHandler):
             )
         if schema_name == "document_general_summary_v1":
             sources = prompt["source_segments"]
+            if any(source.get("contract_clause") for source in sources):
+                maximum_units = int(prompt["maximum_units"])
+                group_size = max(1, (len(sources) + maximum_units - 1) // maximum_units)
+                units = []
+                for start in range(0, len(sources), group_size):
+                    source_ids = []
+                    paragraphs = []
+                    for source in sources[start : start + group_size]:
+                        source_ids.append(source["source_id"])
+                        text = " ".join(str(source["exact_quote"]).split())
+                        clause = source.get("contract_clause")
+                        if clause is None:
+                            agreement_start = text.find("This Agreement")
+                            if agreement_start >= 0:
+                                text = text[agreement_start:]
+                            paragraphs.append(text)
+                            continue
+                        number = str(clause["number"])
+                        clause_prefix = f"{number}."
+                        if text.startswith(clause_prefix):
+                            heading_and_body = text[len(clause_prefix) :].strip()
+                            _, separator, body = heading_and_body.partition(".")
+                            text = (
+                                body.strip()
+                                if separator and body.strip()
+                                else heading_and_body
+                            )
+                        signature_start = text.find(" Customer:")
+                        if signature_start >= 0:
+                            text = text[:signature_start].rstrip()
+                        paragraphs.append(f"Section {number}: {text}")
+                    units.append(
+                        {
+                            "text": " ".join(paragraphs),
+                            "source_ids": source_ids,
+                        }
+                    )
+                return json.dumps({"units": units}, separators=(",", ":"))
             return json.dumps(
                 {
                     "units": [
@@ -308,6 +347,33 @@ notifications_enabled = false
         encoding="utf-8",
     )
     path.chmod(0o600)
+
+
+def write_private_contract_summary(path: Path, content: str) -> None:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    parent = candidate.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise RuntimeError("Contract summary output directory does not exist")
+    destination = parent / candidate.name
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".contract-summary-",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, destination, follow_symlinks=False)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def install_fixture_mailbox(runtime: Runtime) -> MailAccount:
@@ -441,6 +507,17 @@ def main() -> None:
     parser.add_argument("--model-name")
     parser.add_argument("--model-api-token-file", type=Path)
     parser.add_argument("--model-timeout-seconds", type=positive_seconds)
+    parser.add_argument(
+        "--expected-contract-term",
+        action="append",
+        default=[],
+        help="Require this case-insensitive term in the Contract Watch summary; repeatable",
+    )
+    parser.add_argument(
+        "--contract-summary-output",
+        type=Path,
+        help="Write the Contract Watch summary to this private local file for review",
+    )
     args = parser.parse_args()
     configured_model = args.model_base_url is not None or args.model_name is not None
     if configured_model and not (args.model_base_url and args.model_name):
@@ -481,6 +558,7 @@ def main() -> None:
     original_config_home = os.environ.get("XDG_CONFIG_HOME")
     original_connect_client_factory = connect._client
     original_entitlement_decision = entitlement.connect_entitlement_decision
+    original_feature_entitlements_active = entitlement.feature_entitlements_active
 
     def stop_active_providers() -> None:
         nonlocal provider, recovered, reference_provider, restarted
@@ -522,9 +600,18 @@ def main() -> None:
             )
             if proof_entitlement.decision() is not entitlement.EntitlementDecision.ACTIVE:
                 raise RuntimeError("The supplied active Connect entitlement is not active")
+            if not proof_entitlement.features_active(
+                (entitlement.CONNECT_FEATURE_ID, entitlement.AUTOMATIONS_FEATURE_ID)
+            ):
+                raise RuntimeError(
+                    "The supplied active Connect entitlement does not include automations"
+                )
             os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
             os.environ["XDG_CONFIG_HOME"] = str(config_dir)
             entitlement.connect_entitlement_decision = proof_entitlement.decision
+            entitlement.feature_entitlements_active = (
+                lambda *feature_ids: proof_entitlement.features_active(feature_ids)
+            )
             environment = os.environ.copy()
             environment.pop("DOC_SUM_MODEL_API_TOKEN_FILE", None)
             environment.pop("DOC_SUM_CONNECT_PROOF_MODE", None)
@@ -663,6 +750,133 @@ def main() -> None:
                 raise RuntimeError("Unexpected Connect output presentation kind")
             summary_text = rendered["summary"]["text"]
 
+            automation_rule = runtime.store.put_automation_rule(
+                {
+                    "name": "Contract watch",
+                    "scope": {},
+                    "trigger": {"source_kind": "mail.message"},
+                    "conditions": [
+                        {
+                            "field": "sender",
+                            "op": "equals",
+                            "value": "fixture@example.invalid",
+                        },
+                        {
+                            "field": "attachment.media_type",
+                            "op": "equals",
+                            "value": "application/pdf",
+                        },
+                    ],
+                    "action": {
+                        "kind": "connect.invoke",
+                        "capability": {
+                            "id": selected["capability"]["id"],
+                            "version": selected["capability"]["version"],
+                        },
+                        "provider": {
+                            "app_id": selected["provider"]["app_id"],
+                            "version": selected["provider"]["version"],
+                            "instance_id": selected["provider"]["instance_id"],
+                        },
+                        "parameters": {"mode": "contract"},
+                    },
+                    "confirm_each": False,
+                }
+            )
+            runtime.store.mark_analyzed(
+                "fixture-message",
+                {
+                    "category": "informational",
+                    "priority": "normal",
+                    "summary": "A contract arrived.",
+                    "action_required": True,
+                    "suggested_action": "Review the contract.",
+                    "deadline_text": None,
+                    "deadline_iso": None,
+                    "confidence": 0.9,
+                },
+                mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+            )
+            automation_fires = runtime.store.automation_fires_for_message("fixture-message")
+            if len(automation_fires) != 1:
+                raise RuntimeError(
+                    f"Contract Watch did not create one fire: {automation_fires}"
+                )
+            automation_fire = automation_fires[0]
+            automation_deadline = time.monotonic() + model_timeout_seconds + 30
+            engine_api.GmailGateway.from_token = staticmethod(
+                lambda *_args: FixtureGmail(pdf)
+            )
+            try:
+                while automation_fire.state not in {
+                    "completed",
+                    "failed",
+                    "declined",
+                    "manual_review",
+                    "source_unavailable",
+                }:
+                    queue_pump = engine_api._response(
+                        request(config_path, "connect.queue.pump")
+                    )
+                    if not queue_pump["ok"]:
+                        raise RuntimeError(
+                            f"Contract Watch queue pump failed: {queue_pump}"
+                        )
+                    automation_fire = runtime.store.automation_fire(
+                        automation_fire.fire_id
+                    )
+                    if automation_fire is None:
+                        raise RuntimeError("Contract Watch fire disappeared")
+                    if time.monotonic() >= automation_deadline:
+                        raise RuntimeError(
+                            f"Contract Watch did not settle: {automation_fire}"
+                        )
+                    if automation_fire.state != "completed":
+                        time.sleep(0.1)
+            finally:
+                engine_api.GmailGateway.from_token = original_from_token
+            if automation_fire.state != "completed" or automation_fire.job_id is None:
+                raise RuntimeError(
+                    f"Contract Watch did not complete: {automation_fire}"
+                )
+            automation_job = runtime.store.connect_job(automation_fire.job_id)
+            if automation_job is None:
+                raise RuntimeError("Contract Watch completed without a durable Connect job")
+            automation_outputs = runtime.store.completed_connect_outputs(automation_job)
+            if len(automation_outputs) != 1:
+                raise RuntimeError(
+                    f"Contract Watch produced an unexpected output set: {automation_outputs}"
+                )
+            automation_output = automation_outputs[0]
+            automation_payload = json.loads(automation_output.payload)
+            automation_text = automation_payload.get("text")
+            if not isinstance(automation_text, str):
+                raise RuntimeError("Contract Watch output text is not a string")
+            if args.contract_summary_output is not None:
+                write_private_contract_summary(
+                    args.contract_summary_output,
+                    automation_text,
+                )
+            missing_expected_contract_terms = [
+                term
+                for term in args.expected_contract_term
+                if term.casefold() not in automation_text.casefold()
+            ]
+            provider_databases = tuple(data_dir.rglob("summarizer.db"))
+            if len(provider_databases) != 1:
+                raise RuntimeError(
+                    f"Expected one Document Summarizer database: {provider_databases}"
+                )
+            with sqlite3.connect(provider_databases[0]) as provider_database:
+                provider_profile_rows = provider_database.execute(
+                    """SELECT p.summary_profile
+                    FROM connect_jobs AS c
+                    JOIN pipeline_run_summary_profiles AS p
+                      ON p.run_id = c.pipeline_run_id
+                    WHERE c.job_id IN (?, ?)""",
+                    (request_id, automation_fire.job_id),
+                ).fetchall()
+            provider_profiles = sorted(json.loads(row[0]) for row in provider_profile_rows)
             entitlement_path.write_bytes(expired_entitlement)
             entitlement_path.chmod(0o600)
             expired_decision = proof_entitlement.decision()
@@ -1101,6 +1315,39 @@ def main() -> None:
             )
             proof_checks = {
                 "before_provider_absent": not before["items"],
+                "contract_watch_rule_persisted": (
+                    automation_rule.summary.name == "Contract watch"
+                    and automation_rule.summary.enabled
+                ),
+                "contract_watch_completed_once": (
+                    automation_fire.state == "completed"
+                    and automation_fire.current_attempt_no == 1
+                    and len(
+                        runtime.store.automation_fire_attempts(automation_fire.fire_id)
+                    )
+                    == 1
+                    and automation_job.status == "completed"
+                ),
+                "contract_watch_mode_reached_provider": (
+                    automation_job.job_id != request_id
+                    and provider_profiles == ["contract", "general"]
+                ),
+                "contract_watch_output_integrity": (
+                    automation_output.sha256
+                    == hashlib.sha256(automation_output.payload).hexdigest()
+                    and automation_output.byte_size == len(automation_output.payload)
+                ),
+                "contract_watch_output_links_source": (
+                    automation_payload.get("input_artifact", {}).get("sha256")
+                    == hashlib.sha256(pdf).hexdigest()
+                    and automation_payload.get("input_artifact", {}).get("artifact_id")
+                    == automation_job.input_artifact_id
+                    and bool(automation_text)
+                ),
+                "contract_watch_citation_present": bool(
+                    re.search(r"\[p(?:p)?\. \d", automation_text)
+                ),
+                "contract_watch_expected_terms_present": not missing_expected_contract_terms,
                 "provider_available": bool(during["items"]),
                 "consumer_denies_expired_entitlement": (
                     expired_decision is entitlement.EntitlementDecision.EXPIRED
@@ -1367,6 +1614,16 @@ def main() -> None:
                 "before_provider_capabilities": len(before["items"]),
                 "capability_id": selected["capability"]["id"],
                 "capability_version": selected["capability"]["version"],
+                "contract_watch_fire_state": automation_fire.state,
+                "contract_watch_job_status": automation_job.status,
+                "contract_watch_profiles": provider_profiles,
+                "contract_watch_summary_sha256": hashlib.sha256(
+                    automation_text.encode()
+                ).hexdigest(),
+                "contract_watch_expected_term_count": len(args.expected_contract_term),
+                "contract_watch_missing_expected_term_count": len(
+                    missing_expected_contract_terms
+                ),
                 "during_provider_capabilities": len(during["items"]),
                 "expired_entitlement_capabilities": len(while_expired["items"]),
                 "restored_entitlement_capabilities": len(after_entitlement_restore["items"]),
@@ -1399,6 +1656,7 @@ def main() -> None:
     finally:
         connect._client = original_connect_client_factory
         entitlement.connect_entitlement_decision = original_entitlement_decision
+        entitlement.feature_entitlements_active = original_feature_entitlements_active
         if provider is not None:
             stop_provider(provider)
         if restarted is not None:

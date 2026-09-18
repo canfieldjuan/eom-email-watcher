@@ -182,12 +182,18 @@ def _check(config_path: Path, dry_run: bool) -> int:
     config = load_config(config_path)
 
     def run(active_config, active_store, active_model):
-        return run_watcher_check(
+        result = run_watcher_check(
             active_config,
             active_store,
             active_model,
             dry_run=dry_run,
         )
+        if not dry_run:
+            from .engine_api import pump_connect_runtime
+            from .runtime import Runtime
+
+            pump_connect_runtime(Runtime(active_config, active_store, active_model), 25)
+        return result
 
     with _production_check_lock(config.database_file):
         result = run(*_runtime(config_path))

@@ -32,6 +32,19 @@ interface InboxAttachment {
   media_type: string;
   byte_size: number;
   capability_results: AttachmentCapabilityResult[];
+  automation_fires: AutomationFireProjection[];
+}
+
+interface AutomationFireProjection {
+  fire_id: string;
+  rule_id: string;
+  rule_version: number;
+  state: string;
+  state_version: number;
+  reason: string | null;
+  job_id: string | null;
+  prepared_identity_sha256: string | null;
+  updated_at: string;
 }
 
 interface ConnectWarning {

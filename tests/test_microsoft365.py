@@ -28,6 +28,21 @@ CLIENT_ID = "11111111-2222-4333-8444-555555555555"
 TENANT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 
+def test_microsoft_operation_timeout_reaches_graph_transport() -> None:
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200)))
+    try:
+        gateway = Microsoft365Gateway("token", "owner@example.com", client)
+
+        gateway.set_operation_timeout(0.25)
+
+        assert client.timeout.connect == 0.25
+        assert client.timeout.read == 0.25
+        assert client.timeout.write == 0.25
+        assert client.timeout.pool == 0.25
+    finally:
+        client.close()
+
+
 def write_public_client(path: Path, *, tenant: str = "organizations") -> None:
     path.write_text(
         json.dumps({"client_id": CLIENT_ID, "tenant": tenant}),
@@ -242,6 +257,19 @@ def test_silent_refresh_persists_updated_cache(
     token_file.write_text("old-cache", encoding="utf-8")
     cache = FakeCache()
     calls: list[list[str]] = []
+    client_timeouts: list[float] = []
+    lock_timeouts: list[float] = []
+    remaining_timeouts = iter((0.25, 0.2, 0.15))
+
+    class CapturingLock:
+        def __init__(self, path: str, *, timeout: float) -> None:
+            lock_timeouts.append(timeout)
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *args: object) -> None:
+            return None
 
     class FakeApplication:
         def get_accounts(self):
@@ -265,17 +293,51 @@ def test_silent_refresh_persists_updated_cache(
             return {"access_token": "refreshed-access"}
 
     monkeypatch.setattr(microsoft365.msal, "SerializableTokenCache", lambda: cache)
+    monkeypatch.setattr(microsoft365, "FileLock", CapturingLock)
     monkeypatch.setattr(
         microsoft365,
         "_new_public_client",
-        lambda configuration, selected_cache: FakeApplication(),
+        lambda configuration, selected_cache, timeout_seconds: (
+            client_timeouts.append(timeout_seconds) or FakeApplication()
+        ),
     )
 
-    gateway = Microsoft365Gateway.from_token(credentials, token_file)
+    gateway = Microsoft365Gateway.from_token(
+        credentials,
+        token_file,
+        lambda: next(remaining_timeouts),
+    )
 
     assert gateway.profile().email_address == "owner@example.com"
     assert calls == [["Mail.Read"]]
+    assert lock_timeouts == [0.25]
+    assert client_timeouts == [0.2]
+    assert gateway._client.timeout.connect == 0.15
+    assert gateway._client.timeout.read == 0.15
+    assert gateway._client.timeout.write == 0.15
+    assert gateway._client.timeout.pool == 0.15
     assert token_file.read_text(encoding="utf-8") == "refreshed-cache"
+
+
+def test_public_client_receives_silent_acquisition_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = microsoft365.MicrosoftPublicClient(
+        client_id=CLIENT_ID,
+        tenant=TENANT_ID,
+    )
+    cache = FakeCache()
+    observed: dict[str, object] = {}
+
+    def application(*args: object, **kwargs: object) -> object:
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(microsoft365.msal, "PublicClientApplication", application)
+
+    microsoft365._new_public_client(configuration, cache, 0.25)
+
+    assert observed["timeout"] == 0.25
 
 
 @pytest.mark.parametrize(
