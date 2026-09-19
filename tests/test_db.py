@@ -8,8 +8,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from connect_automate import locking
+
 from eom_email_watcher import db as db_module
 from eom_email_watcher.config import MAX_RETENTION_DAYS
 from eom_email_watcher.db import (

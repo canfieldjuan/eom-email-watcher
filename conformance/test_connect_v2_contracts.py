@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 
 import httpx
-
 from connect_automate import connect
 
 CONTRACTS_REVISION = "4d46af25ef5112f76daf841c7622987f05d25142"
