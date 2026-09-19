@@ -5,6 +5,7 @@ description = "Private watched-sender email app with local-only summarization"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "connect-automate @ git+https://github.com/canfieldjuan/connect-automate@171f56934f1d1191715da1b4109b944c305c1f1e",
   "cryptography>=45,<50",
   "filelock>=3.18,<4",
   "google-api-python-client>=2.179,<3",
@@ -19,6 +20,7 @@ dependencies = [
 [project.scripts]
 eom-mail-watch = "eom_email_watcher.cli:main"
 eom-mail-engine = "eom_email_watcher.engine_api:main"
+eom-automate-host = "connect_automate.automate.host:main"
 eom-model-benchmark = "eom_email_watcher.benchmark:main"
 eom-llama-cpp-proof = "eom_email_watcher.llama_cpp_proof:main"
 
@@ -33,6 +35,11 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# Required so the pinned git dependency on connect-automate (a direct URL
+# reference in project.dependencies) is accepted by the build backend.
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 addopts = "-q"

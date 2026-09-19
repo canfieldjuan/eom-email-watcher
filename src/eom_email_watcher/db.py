@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from connect_automate.locking import connect_operation_lock, connect_source_lock_path
+
 from .automation.rules import (
     MAX_AUTOMATION_ATTACHMENTS,
     MAX_AUTOMATION_RULES,
@@ -26,7 +28,6 @@ from .automation.rules import (
     parse_rule_definition,
 )
 from .config import MAX_RETENTION_DAYS, normalize_validated_address
-from .locking import connect_operation_lock, connect_source_lock_path
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 

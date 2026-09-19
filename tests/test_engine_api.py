@@ -9,8 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from connect_automate import connect
 
-from eom_email_watcher import connect, engine_api
+from eom_email_watcher import engine_api
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
 from eom_email_watcher.db import Store

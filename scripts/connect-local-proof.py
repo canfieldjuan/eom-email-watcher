@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import httpx
+from connect_automate import connect, entitlement
 from connect_reference_provider import (
     INSPECT_CAPABILITY_ID,
     INSPECT_OUTPUT_MEDIA_TYPE,
@@ -27,7 +28,7 @@ from connect_reference_provider import (
     ReferenceProvider,
 )
 
-from eom_email_watcher import connect, engine_api, entitlement
+from eom_email_watcher import engine_api
 from eom_email_watcher.db import SCHEMA_VERSION, MailAccount
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor

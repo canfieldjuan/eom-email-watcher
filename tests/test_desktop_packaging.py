@@ -655,7 +655,7 @@ def test_entitlement_build_input_rejects_unapproved_production_authority(
 def test_entitlement_build_input_rejects_windows_reparse_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from eom_email_watcher import connect_windows
+    from connect_automate import connect_windows
 
     path = tmp_path / "keyring.json"
     _write_entitlement_keyring(path)
@@ -745,7 +745,7 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     assert len(add_data) == 1
     staged_source, destination = add_data[0].rsplit(";", 1)
     assert Path(staged_source).name == "connect-entitlement-keyring.json"
-    assert destination == "eom_email_watcher_data"
+    assert destination == "connect_automate_data"
     assert staged_keyring == [validated_keyring]
     assert source.read_bytes() == b"substituted after validation"
     assert not Path(staged_source).exists()

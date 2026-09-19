@@ -11,10 +11,11 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 
+from connect_automate.locking import operation_lock
+
 from . import __version__
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .db import Store
-from .locking import operation_lock
 from .mailbox import MailboxError
 from .model import ModelRuntime
 from .notifications import NotificationError, send_fallback

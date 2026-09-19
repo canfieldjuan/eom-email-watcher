@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
-from eom_email_watcher.entitlement import APPROVED_RELEASE_AUTHORITIES
+from connect_automate.entitlement import APPROVED_RELEASE_AUTHORITIES
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_DIRECTORY = SCRIPT_DIRECTORY.parent
@@ -156,8 +156,8 @@ def validate_microsoft_oauth_client(path: Path) -> None:
 
 
 def validate_entitlement_keyring(path: Path) -> bytes:
-    from eom_email_watcher.connect_windows import read_bounded_regular_file
-    from eom_email_watcher.entitlement import (
+    from connect_automate.connect_windows import read_bounded_regular_file
+    from connect_automate.entitlement import (
         MAX_KEYRING_BYTES,
         _parse_keyring,
     )
@@ -333,7 +333,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_keyring}{os.pathsep}eom_email_watcher_data"]
+                ["--add-data", f"{staged_keyring}{os.pathsep}connect_automate_data"]
             )
 
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))

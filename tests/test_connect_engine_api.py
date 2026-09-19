@@ -4,8 +4,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from connect_automate import connect, entitlement
 
-from eom_email_watcher import connect, engine_api, entitlement
+from eom_email_watcher import engine_api
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
