@@ -7,10 +7,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from connect_automate import entitlement
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
-from connect_automate import entitlement
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-user-services.sh"
