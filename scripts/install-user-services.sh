@@ -6,8 +6,11 @@ unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 tool_bin_dir="$HOME/.local/bin"
 tool_dir="${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools"
 release_keyring_source="${LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE:-}"
-release_keyring_dir="$HOME/.local/share/eom-email-watcher"
-release_keyring_target="$release_keyring_dir/connect-entitlement-keyring.json"
+# Where installers before the vendor-neutral connect_automate core placed the
+# authority. That directory also holds other watcher data, so it is only read.
+legacy_release_keyring="$HOME/.local/share/eom-email-watcher/connect-entitlement-keyring.json"
+release_keyring_target=""
+release_keyring_input=""
 release_keyring_stage=""
 constraints_file="$(mktemp)"
 cleanup() {
@@ -30,23 +33,47 @@ UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
   uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"
 test -x "$tool_bin_dir/eom-mail-watch"
 
+validate_release_keyring() {
+  PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$1" \
+    uv run --project "$repo_dir" --no-dev --locked python -c \
+    'import os; from pathlib import Path; from scripts.build_desktop_sidecar import validate_entitlement_keyring; validate_entitlement_keyring(Path(os.environ["RELEASE_KEYRING_SOURCE"]))'
+}
+
+# The runtime reader owns the installed authority location; never restate it here.
+release_keyring_target="$(
+  PYTHONPATH="$repo_dir" uv run --project "$repo_dir" --no-dev --locked python -c \
+    'import os; from connect_automate.entitlement import _installed_release_keyring_path; print(_installed_release_keyring_path(os.environ.get("HOME")) or "")'
+)"
+
 if [[ -n "$release_keyring_source" ]]; then
   if [[ "$release_keyring_source" != /* ]]; then
     echo "LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE must be absolute." >&2
     exit 1
   fi
-  if [[ "$release_keyring_dir" != /* ]]; then
+  if [[ -z "$release_keyring_target" ]]; then
     echo "HOME must be absolute when installing the Connect authority." >&2
     exit 1
   fi
-  PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$release_keyring_source" \
-    uv run --project "$repo_dir" --no-dev --locked python -c \
-    'import os; from pathlib import Path; from scripts.build_desktop_sidecar import validate_entitlement_keyring; validate_entitlement_keyring(Path(os.environ["RELEASE_KEYRING_SOURCE"]))'
+  validate_release_keyring "$release_keyring_source"
+  release_keyring_input="$release_keyring_source"
+elif [[ -n "$release_keyring_target" && ! -e "$release_keyring_target" && -f "$legacy_release_keyring" ]]; then
+  if validate_release_keyring "$legacy_release_keyring"; then
+    release_keyring_input="$legacy_release_keyring"
+  else
+    echo "Did not migrate $legacy_release_keyring: it is not the approved Connect release authority." >&2
+  fi
+fi
+
+if [[ -n "$release_keyring_input" ]]; then
+  release_keyring_dir="$(dirname "$release_keyring_target")"
   install -d -m 0700 "$release_keyring_dir"
   release_keyring_stage="$(mktemp "$release_keyring_dir/.connect-entitlement-keyring.XXXXXX")"
-  install -m 0600 "$release_keyring_source" "$release_keyring_stage"
+  install -m 0600 "$release_keyring_input" "$release_keyring_stage"
   mv -f "$release_keyring_stage" "$release_keyring_target"
   release_keyring_stage=""
+  if [[ "$release_keyring_input" == "$legacy_release_keyring" ]]; then
+    echo "Migrated the Connect release authority from $legacy_release_keyring."
+  fi
 fi
 
 install -m 0644 "$repo_dir/systemd/eom-email-watcher.service" "$unit_dir/"
@@ -61,7 +88,7 @@ systemctl --user enable eom-monthly-hours.timer
 echo "Installed and enabled eom-email-watcher.timer."
 echo "Installed and enabled eom-monthly-hours.timer."
 echo "Installed a stable eom-mail-watch snapshot at $tool_bin_dir/eom-mail-watch."
-if [[ -f "$release_keyring_target" ]]; then
+if [[ -n "$release_keyring_target" && -f "$release_keyring_target" ]]; then
   echo "Installed the approved Connect release authority for the service snapshot."
 else
   echo "Connect remains unavailable to the service snapshot until an approved release authority is installed."
