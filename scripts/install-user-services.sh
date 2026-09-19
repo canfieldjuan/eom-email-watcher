@@ -32,16 +32,20 @@ uv export --project "$repo_dir" --locked --no-dev --no-emit-project --format req
 UV_TOOL_BIN_DIR="$tool_bin_dir" UV_TOOL_DIR="$tool_dir" \
   uv tool install --force --reinstall --constraints "$constraints_file" "$repo_dir"
 test -x "$tool_bin_dir/eom-mail-watch"
+# The service runs this snapshot, so its interpreter decides where the Connect
+# authority is read from and whether it is approved. Using it also keeps the
+# installer from creating or syncing an environment inside the source checkout.
+snapshot_python="$tool_dir/eom-email-watcher/bin/python"
+test -x "$snapshot_python"
 
 validate_release_keyring() {
-  PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$1" \
-    uv run --project "$repo_dir" --no-dev --locked python -c \
+  PYTHONPATH="$repo_dir" RELEASE_KEYRING_SOURCE="$1" "$snapshot_python" -c \
     'import os; from pathlib import Path; from scripts.build_desktop_sidecar import validate_entitlement_keyring; validate_entitlement_keyring(Path(os.environ["RELEASE_KEYRING_SOURCE"]))'
 }
 
 # The runtime reader owns the installed authority location; never restate it here.
 release_keyring_target="$(
-  PYTHONPATH="$repo_dir" uv run --project "$repo_dir" --no-dev --locked python -c \
+  "$snapshot_python" -c \
     'import os; from connect_automate.entitlement import _installed_release_keyring_path; print(_installed_release_keyring_path(os.environ.get("HOME")) or "")'
 )"
 

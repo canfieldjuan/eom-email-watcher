@@ -32,7 +32,6 @@ def test_installer_snapshots_cli_before_installing_units() -> None:
     assert script.index(snapshot) < script.index(unit_install)
     assert 'test -x "$tool_bin_dir/eom-mail-watch"' in script
     assert '[[ "$release_keyring_source" != /* ]]' in script
-    assert 'uv run --project "$repo_dir" --no-dev --locked python -c' in script
     assert "validate_entitlement_keyring" in script
     stage = 'install -m 0600 "$release_keyring_input" "$release_keyring_stage"'
     promote = 'mv -f "$release_keyring_stage" "$release_keyring_target"'
@@ -58,6 +57,7 @@ def test_systemd_services_use_stable_cli_snapshot() -> None:
 LEGACY_RELEASE_KEYRING = Path(".local/share/eom-email-watcher/connect-entitlement-keyring.json")
 FAKE_UV = """#!/usr/bin/env bash
 set -euo pipefail
+printf '%s\\n' "$*" >> "$INSTALLER_TEST_UV_LOG"
 case "$1" in
   export)
     while [[ $# -gt 0 ]]; do
@@ -68,16 +68,11 @@ case "$1" in
     done
     ;;
   tool)
-    mkdir -p "$UV_TOOL_BIN_DIR"
+    mkdir -p "$UV_TOOL_BIN_DIR" "$UV_TOOL_DIR/eom-email-watcher/bin"
     printf '#!/bin/sh\\n' > "$UV_TOOL_BIN_DIR/eom-mail-watch"
-    chmod 0755 "$UV_TOOL_BIN_DIR/eom-mail-watch"
-    ;;
-  run)
-    while [[ "$1" != python ]]; do
-      shift
-    done
-    shift
-    exec "$INSTALLER_TEST_PYTHON" "$@"
+    printf '#!/bin/sh\\nexec "$INSTALLER_TEST_PYTHON" "$@"\\n' \\
+      > "$UV_TOOL_DIR/eom-email-watcher/bin/python"
+    chmod 0755 "$UV_TOOL_BIN_DIR/eom-mail-watch" "$UV_TOOL_DIR/eom-email-watcher/bin/python"
     ;;
   *)
     exit 97
@@ -145,6 +140,7 @@ def _run_installer(
         "TMPDIR": str(tmp_path),
         "INSTALLER_TEST_PYTHON": sys.executable,
         "INSTALLER_TEST_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
+        "INSTALLER_TEST_UV_LOG": str(tmp_path / "uv.log"),
     }
     if keyring_source is not None:
         environment["LOCAL_CONNECT_ENTITLEMENT_KEYRING_FILE"] = str(keyring_source)
@@ -162,6 +158,24 @@ def _runtime_authority(home: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delattr(entitlement.sys, "_MEIPASS", raising=False)
     return entitlement._load_installed_release_keyring()
+
+
+@posix_installer
+def test_installer_without_an_authority_never_syncs_the_project_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+
+    result = _run_installer(tmp_path, home)
+
+    assert result.returncode == 0, result.stderr
+    assert _runtime_authority(home, monkeypatch) is None
+    assert [line.split()[0] for line in (tmp_path / "uv.log").read_text().splitlines()] == [
+        "export",
+        "tool",
+    ]
+    assert "Connect remains unavailable" in result.stdout
+    assert "--user daemon-reload" in (tmp_path / "systemctl.log").read_text()
 
 
 @posix_installer
