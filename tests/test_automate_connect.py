@@ -16,7 +16,7 @@ from email.policy import default
 import httpx
 import pytest
 
-from eom_email_watcher import automate_connect, connect
+from connect_automate import automate_connect, connect
 
 TOKEN = "A" * 43
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"
@@ -394,7 +394,7 @@ def test_a_definition_normalized_request_is_driven_end_to_end() -> None:
     # Cross-layer: the signed definition's normalized connect.invoke request is exactly the
     # frozen request the composition-layer invoker parses and drives. A shape drift between the
     # two layers would fail this rather than only at runtime.
-    from eom_email_watcher.automate import ConnectInvokeRequest
+    from connect_automate.automate import ConnectInvokeRequest
 
     request = ConnectInvokeRequest.model_validate(
         {

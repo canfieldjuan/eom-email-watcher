@@ -1,13 +1,13 @@
 """Composition-layer Connect v2 invoker for the ``connect.invoke`` action kind.
 
-The Automate package (:mod:`eom_email_watcher.automate.actions`) declares the abstract
+The Automate package (:mod:`connect_automate.automate.actions`) declares the abstract
 ``connect.invoke`` kind and the :class:`CapabilityInvoker` seam without naming a transport,
 so that package stays provider- and transport-free. This module is the composition layer
 that fulfils the seam with the real Connect v2 client: it renders a frozen ``connect.invoke``
 request into a prepared v2 job under the caller-minted stable ``job_id``, submits it to the
 same-PC loopback provider, polls to a terminal outcome, and maps the result back to the
 action lane. It lives outside the Automate package precisely because it depends on the
-concrete v2 client and its loopback transport (:mod:`eom_email_watcher.connect`).
+concrete v2 client and its loopback transport (:mod:`connect_automate.connect`).
 
 Idempotent re-POST is the whole point of the stable identity, so the render is *deterministic*
 in the frozen request: the input artifact id is carried on the request, not minted per

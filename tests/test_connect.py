@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from eom_email_watcher import connect
+from connect_automate import connect
 
 TOKEN = "A" * 43
 INSTANCE_A = "11111111-1111-4111-8111-111111111111"

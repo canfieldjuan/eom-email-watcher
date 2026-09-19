@@ -1,8 +1,8 @@
 """Durable workflow record, lifecycle ledger, and stage engine for the Automate host.
 
 This is the host's own application-private store (ADR-0005 keeps app databases outside
-the Connect interoperability contract). It reuses the proven patterns from
-``eom_email_watcher.db``: a ``BEGIN IMMEDIATE`` writer, an append-only event log with
+the Connect interoperability contract). It reuses proven production-store patterns: a
+``BEGIN IMMEDIATE`` writer, an append-only event log with
 ``UNIQUE(record_id, sequence_no)`` and ``UNIQUE(record_id, state_version)``, a
 ``sequence_no = 0`` bootstrap row, immutable-log triggers, and optimistic concurrency on
 ``state_version``.

@@ -13,8 +13,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from eom_email_watcher import connect, entitlement
-from eom_email_watcher.connect_windows import (
+from connect_automate import connect, entitlement
+from connect_automate.connect_windows import (
     WINDOWS_LOCK_LENGTH,
     WINDOWS_LOCK_OFFSET,
     WindowsFileLock,

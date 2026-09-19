@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher.automate.store import (
+from connect_automate.automate.store import (
     ActionConflict,
     InvalidEffect,
     OperationConflict,

@@ -13,7 +13,7 @@ external accounts configured. The bundled Gmail, notifier, and Microsoft calenda
 are wrapped as adapters behind ``mail.send`` / ``notify`` / ``calendar.write`` at the host
 composition layer (a later slice), not inside this generic package.
 
-The action lane is the durable outbox in :mod:`eom_email_watcher.automate.store`: an action
+The action lane is the durable outbox in :mod:`connect_automate.automate.store`: an action
 is admitted (deduplicated) before its side effect runs, then settled with the adapter's
 result. Accept-then-crash reconciliation of a stuck-pending action, per-kind queue-admission
 policy, and retry are deferred hardening; this slice provides admit, dispatch, and settle.

@@ -5,7 +5,7 @@ consumer, so it owns admission, ordering, and retry (ADR-0006), and it runs only
 the local machine holds an active ``connect.automations`` entitlement.
 
 Slice 0 provides the host skeleton and the startup license gate, reusing the existing
-entitlement substrate (:mod:`eom_email_watcher.entitlement`). Later slices attach the
+entitlement substrate (:mod:`connect_automate.entitlement`). Later slices attach the
 durable workflow record, the lifecycle ledger and stage engine, the effect executor and
 outbox, the adapter registry, and the signed pack loader. Every one of those is admitted
 only after :meth:`AutomateHost.require_license` passes.

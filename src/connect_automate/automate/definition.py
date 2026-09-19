@@ -1,10 +1,10 @@
 """The generic workflow definition model for the Automate host.
 
 This is the host's own closed, strict definition vocabulary. It deliberately mirrors the
-discipline of :mod:`eom_email_watcher.automation.rules` (every model forbids extras and is
+discipline of a strict application rule model (every model forbids extras and is
 strict, and canonical bytes are produced with sorted keys and fixed separators) rather than
-importing it: the mail-watcher rule model is coupled to ``mail.message`` triggers, mailbox
-identity, and attachment fan-out, and the two products ship independently. A workflow here
+importing one: an application's own rule model tends to be coupled to its own trigger,
+identity, and payload concerns, and products ship independently. A workflow here
 is provider-agnostic and business-agnostic: it names abstract stages, conditions, and
 effect kinds, never a vendor.
 
@@ -105,7 +105,7 @@ Effect = Annotated[
 
 
 # The connect.invoke request shape a signed definition may declare. The invoker
-# (:mod:`eom_email_watcher.automate_connect`) is the exact Connect protocol enforcer at
+# (:mod:`connect_automate.automate_connect`) is the exact Connect protocol enforcer at
 # dispatch; these bounds fail a malformed pack fast at parse/sign time and keep the canonical
 # bytes deterministic. The patterns intentionally mirror the Connect contract (hyphenated
 # capability ids and parameter names, uuid4 identities) but are defined locally so this

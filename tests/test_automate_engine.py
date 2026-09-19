@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from eom_email_watcher import entitlement
-from eom_email_watcher.automate import (
+from connect_automate import entitlement
+from connect_automate.automate import (
     AmbiguousDecision,
     AutomateHost,
     AutomateLicenseError,
@@ -20,7 +20,7 @@ from eom_email_watcher.automate import (
     WorkflowEngine,
     WorkflowMismatch,
 )
-from eom_email_watcher.automate.store import (
+from connect_automate.automate.store import (
     OperationConflict,
     StaleRecord,
     UnknownRecord,

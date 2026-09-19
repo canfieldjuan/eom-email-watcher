@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from eom_email_watcher.automate import (
+from connect_automate.automate import (
     GrantView,
     LoadedPack,
     PackError,
