@@ -37,6 +37,8 @@ discarded after each local inference request.
 ## Requirements
 
 - Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
+- Git: `uv sync` resolves the pinned `connect-automate` dependency over Git, so a
+  Git executable must be on `PATH` at install time
 - An administrator-managed on-prem inference gateway, or LM Studio `llmster` with its API bound to
   `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
@@ -279,7 +281,10 @@ The check reads fixtures from canonical Git revision
 `4d46af25ef5112f76daf841c7622987f05d25142`; it does not trust or copy the contracts checkout's
 working tree. Updating that pin requires an explicit compatibility change.
 
-Run the signed-entitlement conformance check against its independently pinned canonical revision:
+The signed-entitlement conformance check now lives with the entitlement gate in
+the [`connect-automate`](https://github.com/canfieldjuan/connect-automate)
+package that this app depends on. Run it from a checkout of that repository,
+against its independently pinned canonical revision:
 
 ```bash
 CONNECT_CONTRACTS_DIR=/absolute/path/to/connect-contracts \

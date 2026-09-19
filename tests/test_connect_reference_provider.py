@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from connect_automate import connect
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
