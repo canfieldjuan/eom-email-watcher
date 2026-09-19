@@ -37,6 +37,8 @@ discarded after each local inference request.
 ## Requirements
 
 - Python 3.13 and [`uv`](https://docs.astral.sh/uv/)
+- Git: `uv sync` resolves the pinned `connect-automate` dependency over Git, so a
+  Git executable must be on `PATH` at install time
 - An administrator-managed on-prem inference gateway, or LM Studio `llmster` with its API bound to
   `127.0.0.1`
 - `notify-send` (normally provided by `libnotify-bin`)
