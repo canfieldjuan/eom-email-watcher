@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-
 from connect_automate import connect
+
 from eom_email_watcher import engine_api
 from eom_email_watcher.db import ConnectQueueFull, MessageSource
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES

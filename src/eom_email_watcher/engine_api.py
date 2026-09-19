@@ -15,9 +15,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from filelock import FileLock
-from filelock import Timeout as FileLockTimeout
-
 from connect_automate import connect, entitlement
 from connect_automate.locking import (
     OperationLockBusy,
@@ -28,6 +25,8 @@ from connect_automate.locking import (
     operation_lock_supported,
     operation_lock_uses_soft_fallback,
 )
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from .automation.rules import (
     RuleDefinition,
