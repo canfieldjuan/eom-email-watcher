@@ -176,6 +176,17 @@ wheels = [
 ]
 
 [[package]]
+name = "connect-automate"
+version = "0.1.0"
+source = { git = "https://github.com/canfieldjuan/connect-automate?rev=bf1cd1de1491601c7570ef72d2037b83a72b63c6#bf1cd1de1491601c7570ef72d2037b83a72b63c6" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "filelock" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[[package]]
 name = "coverage"
 version = "7.15.2"
 source = { registry = "https://pypi.org/simple" }
@@ -284,6 +295,7 @@ name = "eom-email-watcher"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "connect-automate" },
     { name = "cryptography" },
     { name = "filelock" },
     { name = "google-api-python-client" },
@@ -305,6 +317,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "connect-automate", git = "https://github.com/canfieldjuan/connect-automate?rev=bf1cd1de1491601c7570ef72d2037b83a72b63c6" },
     { name = "cryptography", specifier = ">=45,<50" },
     { name = "filelock", specifier = ">=3.18,<4" },
     { name = "google-api-python-client", specifier = ">=2.179,<3" },
