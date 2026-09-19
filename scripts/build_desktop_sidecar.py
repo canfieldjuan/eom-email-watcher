@@ -333,7 +333,7 @@ def build_sidecar() -> Path:
                 )
             )
             pyinstaller_arguments.extend(
-                ["--add-data", f"{staged_keyring}{os.pathsep}eom_email_watcher_data"]
+                ["--add-data", f"{staged_keyring}{os.pathsep}connect_automate_data"]
             )
 
         pyinstaller_arguments.append(str(PROJECT_DIRECTORY / "packaging" / "engine_entry.py"))

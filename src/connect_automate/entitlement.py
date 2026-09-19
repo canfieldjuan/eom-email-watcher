@@ -37,9 +37,14 @@ AUTOMATIONS_FEATURE_ID = "connect.automations"
 FEATURE_ID = CONNECT_FEATURE_ID
 ENTITLEMENT_FILE_NAME = "entitlement-v1.json"
 ENTITLEMENT_LOCK_FILE_NAME = ".entitlement-v1.lock"
-BUNDLED_KEYRING = Path("eom_email_watcher_data/connect-entitlement-keyring.json")
+# Vendor-neutral locations for the Connect entitlement key ring. The bundled
+# copy lives under this package's own PyInstaller data namespace; the installed
+# release copy lives under the same ``local-connect`` namespace as the
+# entitlement file itself (see ``_entitlement_path``), so all Connect
+# entitlement material shares one product namespace rather than a host app's.
+BUNDLED_KEYRING = Path("connect_automate_data/connect-entitlement-keyring.json")
 INSTALLED_RELEASE_KEYRING = Path(
-    "eom-email-watcher/connect-entitlement-keyring.json"
+    "local-connect/connect-entitlement-keyring.json"
 )
 APPROVED_RELEASE_AUTHORITIES = frozenset(
     {
