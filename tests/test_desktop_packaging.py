@@ -745,7 +745,7 @@ def test_windows_build_stages_connect_keyring_with_platform_separator(
     assert len(add_data) == 1
     staged_source, destination = add_data[0].rsplit(";", 1)
     assert Path(staged_source).name == "connect-entitlement-keyring.json"
-    assert destination == "eom_email_watcher_data"
+    assert destination == "connect_automate_data"
     assert staged_keyring == [validated_keyring]
     assert source.read_bytes() == b"substituted after validation"
     assert not Path(staged_source).exists()
