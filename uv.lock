@@ -178,7 +178,7 @@ wheels = [
 [[package]]
 name = "connect-automate"
 version = "0.1.0"
-source = { git = "https://github.com/canfieldjuan/connect-automate?rev=171f56934f1d1191715da1b4109b944c305c1f1e#171f56934f1d1191715da1b4109b944c305c1f1e" }
+source = { git = "https://github.com/canfieldjuan/connect-automate?rev=a3e2667741d9b06608e8a0b9689ea5f4fb75fc48#a3e2667741d9b06608e8a0b9689ea5f4fb75fc48" }
 dependencies = [
     { name = "cryptography" },
     { name = "filelock" },
@@ -317,7 +317,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "connect-automate", git = "https://github.com/canfieldjuan/connect-automate?rev=171f56934f1d1191715da1b4109b944c305c1f1e" },
+    { name = "connect-automate", git = "https://github.com/canfieldjuan/connect-automate?rev=a3e2667741d9b06608e8a0b9689ea5f4fb75fc48" },
     { name = "cryptography", specifier = ">=45,<50" },
     { name = "filelock", specifier = ">=3.18,<4" },
     { name = "google-api-python-client", specifier = ">=2.179,<3" },

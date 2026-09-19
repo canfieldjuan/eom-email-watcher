@@ -5,7 +5,7 @@ description = "Private watched-sender email app with local-only summarization"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-  "connect-automate @ git+https://github.com/canfieldjuan/connect-automate@171f56934f1d1191715da1b4109b944c305c1f1e",
+  "connect-automate @ git+https://github.com/canfieldjuan/connect-automate@a3e2667741d9b06608e8a0b9689ea5f4fb75fc48",
   "cryptography>=45,<50",
   "filelock>=3.18,<4",
   "google-api-python-client>=2.179,<3",
