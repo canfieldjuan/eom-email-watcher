@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import connect, engine_api
+from connect_automate import connect
+from eom_email_watcher import engine_api
 from eom_email_watcher.db import ConnectQueueFull, MessageSource
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import (
@@ -32,7 +33,7 @@ LOCK_HOLDER = """
 import sys
 from pathlib import Path
 
-from eom_email_watcher.locking import connect_operation_lock
+from connect_automate.locking import connect_operation_lock
 
 with connect_operation_lock(Path(sys.argv[1]), "busy"):
     print("locked", flush=True)

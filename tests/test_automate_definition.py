@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from eom_email_watcher.automate.definition import (
+from connect_automate.automate.definition import (
     DefinitionError,
     RequestBindingError,
     Workflow,
@@ -176,7 +176,7 @@ def test_canonical_workflow_rejects_an_oversized_integer_via_direct_model() -> N
 
 
 def test_definition_error_is_importable_from_the_package() -> None:
-    from eom_email_watcher.automate import DefinitionError as PackageDefinitionError
+    from connect_automate.automate import DefinitionError as PackageDefinitionError
 
     assert PackageDefinitionError is DefinitionError
 

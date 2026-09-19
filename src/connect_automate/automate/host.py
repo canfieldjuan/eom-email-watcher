@@ -35,7 +35,7 @@ class AutomateLicenseError(RuntimeError):
 class AutomateHost:
     """Skeleton of the licensed Automate host.
 
-    The host holds an :class:`~eom_email_watcher.entitlement.EntitlementGate` rather than
+    The host holds an :class:`~connect_automate.entitlement.EntitlementGate` rather than
     reaching for global entitlement state, so tests can drive it with a fixed clock and a
     test keyring, and so a future host process can hold a single gate for its lifetime.
     """

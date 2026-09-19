@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from connect_automate.entitlement import (
+    AUTOMATIONS_FEATURE_ID,
+    CONNECT_FEATURE_ID,
+    feature_entitlements_active,
+)
+
 from .config import Config, normalize_validated_address
 from .db import (
     AnalyzedMessage,
@@ -21,11 +27,6 @@ from .db import (
     NotificationIntent,
     PendingMessage,
     Store,
-)
-from .entitlement import (
-    AUTOMATIONS_FEATURE_ID,
-    CONNECT_FEATURE_ID,
-    feature_entitlements_active,
 )
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (

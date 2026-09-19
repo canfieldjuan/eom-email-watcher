@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from eom_email_watcher import entitlement
-from eom_email_watcher.automate import (
+from connect_automate import entitlement
+from connect_automate.automate import (
     AdapterRegistry,
     AutomateHost,
     AutomateLicenseError,
@@ -20,7 +20,7 @@ from eom_email_watcher.automate import (
     PackVersionError,
     load_pack,
 )
-from eom_email_watcher.automate.store import WorkflowStore
+from connect_automate.automate.store import WorkflowStore
 
 NOW = datetime(2026, 6, 1, tzinfo=UTC)
 PACK_ID = "11111111-1111-4111-8111-111111111111"

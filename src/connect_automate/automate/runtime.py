@@ -1,7 +1,7 @@
 """The pack runtime: load a signed pack, then run its workflow end to end.
 
 This is the composition that makes a signed workflow pack runnable on a licensed host. It
-verifies the pack's publisher signature and the per-PC grant (:mod:`eom_email_watcher.
+verifies the pack's publisher signature and the per-PC grant (:mod:`connect_automate.
 automate.pack`), then drives the verified workflow through the record/stage engine and the
 action outbox: an operator decision applies the matching definition's record-ledger effects
 (the transition) and emits its declared abstract actions (``notify.local`` and friends)

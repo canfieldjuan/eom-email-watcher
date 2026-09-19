@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import connect
+from connect_automate import connect
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 

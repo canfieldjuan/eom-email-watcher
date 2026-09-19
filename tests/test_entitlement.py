@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from eom_email_watcher import entitlement
+from connect_automate import entitlement
 
 CONTRACTS_REVISION = "c5405935bd1354cf6a4c8539425a53dfd7f52949"
 
@@ -800,7 +800,7 @@ def test_held_lock_blocks_installer_and_child_process(tmp_path: Path) -> None:
                 "-c",
                 (
                     "import sys; from pathlib import Path; "
-                    "from eom_email_watcher import entitlement as e; "
+                    "from connect_automate import entitlement as e; "
                     "\ntry:\n"
                     "    with e._activation_lock(Path(sys.argv[1])):\n"
                     "        raise SystemExit(4)\n"

@@ -18,7 +18,17 @@ from pathlib import Path
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
-from . import connect, entitlement
+from connect_automate import connect, entitlement
+from connect_automate.locking import (
+    OperationLockBusy,
+    connect_lane_lock_path,
+    connect_operation_lock,
+    connect_source_lock_path,
+    operation_lock,
+    operation_lock_supported,
+    operation_lock_uses_soft_fallback,
+)
+
 from .automation.rules import (
     RuleDefinition,
     RuleValidationError,
@@ -82,15 +92,6 @@ from .imap import (
     imap_mailbox_identity,
     load_credentials,
     write_credentials,
-)
-from .locking import (
-    OperationLockBusy,
-    connect_lane_lock_path,
-    connect_operation_lock,
-    connect_source_lock_path,
-    operation_lock,
-    operation_lock_supported,
-    operation_lock_uses_soft_fallback,
 )
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,

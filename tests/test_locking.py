@@ -8,13 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher import locking
+from connect_automate import locking
 
 LOCK_PROBE = """
 import sys
 from pathlib import Path
 
-from eom_email_watcher.locking import operation_lock
+from connect_automate.locking import operation_lock
 
 try:
     with operation_lock(Path(sys.argv[1]), "watcher busy"):
@@ -27,7 +27,7 @@ BLOCKING_LOCK_PROBE = """
 import sys
 from pathlib import Path
 
-from eom_email_watcher.locking import operation_lock
+from connect_automate.locking import operation_lock
 
 print("waiting", flush=True)
 with operation_lock(Path(sys.argv[1]), "watcher busy", timeout_seconds=-1):

@@ -5,7 +5,7 @@ A pack is the unit the Automate host sells and loads. Its bytes are a signed env
 the same shape as the Connect entitlement license (``{format_version, key_id,
 payload_base64url, signature_base64url}``) whose payload is a canonical :class:`PackManifest`
 carrying a stable pack identity, a monotonic pack version, and the signed :class:`Workflow`
-(trigger, stages, conditions, effects) from :mod:`eom_email_watcher.automate.definition`.
+(trigger, stages, conditions, effects) from :mod:`connect_automate.automate.definition`.
 
 Two independent signatures gate a pack:
 
@@ -16,7 +16,7 @@ Two independent signatures gate a pack:
   A publisher signature without a matching grant is an unlicensed copy.
 
 Verification reuses the entitlement substrate: the one Ed25519 verification lives in
-:func:`eom_email_watcher.entitlement.verify_signature`, and the base64url, strict-JSON, and
+:func:`connect_automate.entitlement.verify_signature`, and the base64url, strict-JSON, and
 UTC-timestamp primitives are shared too, so no crypto or parsing is duplicated. The pack
 envelope carries a larger payload than the license envelope (it embeds a whole workflow), so
 its size bounds are its own.
