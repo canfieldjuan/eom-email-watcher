@@ -948,9 +948,8 @@ def test_existing_overlong_sender_selector_fails_before_watcher_polling(
     }
 
 
-def test_existing_overlong_sender_name_fails_before_watcher_polling(
+def test_existing_overlong_sender_name_can_be_listed_removed_and_shortened(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path)
@@ -960,15 +959,28 @@ def test_existing_overlong_sender_name_fails_before_watcher_polling(
     )
     config_path.write_text(text, encoding="utf-8")
 
-    def reject_poll(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("Watcher polling started before configuration validation")
-
-    monkeypatch.setattr(engine_api, "run_watcher_check", reject_poll)
-    response = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
-    assert response["error"] == {
-        "code": "configuration_error",
-        "message": "sender name must be at most 1024 UTF-8 bytes",
+    legacy_name = ("é" * 512) + "a"
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+    legacy_item = next(
+        item for item in listed["data"]["items"] if item["email"] == "z@example.com"
+    )
+    assert legacy_item == {
+        "email": "z@example.com",
+        "name": legacy_name,
     }
+
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "z@example.com"})
+    )
+    assert removed["data"]["item"]["name"] == legacy_name
+    shortened = engine_api._response(
+        request(
+            config_path,
+            "watchlist.add",
+            {"email": "z@example.com", "name": "é" * 512},
+        )
+    )
+    assert shortened["data"]["item"]["name"] == "é" * 512
 
 
 def test_gmail_label_list_marks_superseded_identity_inert_without_provider_access(

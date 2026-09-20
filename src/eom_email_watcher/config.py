@@ -168,7 +168,22 @@ def _valid_network_host(host: str) -> bool:
     return True
 
 
-def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
+def admission_sender_display_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    encoded = value.encode("utf-8")
+    if len(encoded) <= MAX_SENDER_NAME_BYTES:
+        return value
+    return encoded[:MAX_SENDER_NAME_BYTES].decode("utf-8", errors="ignore")
+
+
+def _sender(
+    email_value: str,
+    name_value: str | None,
+    *,
+    invalid_message: str,
+    enforce_name_limit: bool = True,
+) -> Sender:
     try:
         email = normalize_validated_address(email_value)
     except ValueError as exc:
@@ -182,7 +197,11 @@ def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -
     ):
         raise InvalidSenderError("sender name must not contain control characters")
     name = name_value.strip() if name_value and name_value.strip() else None
-    if name is not None and len(name.encode("utf-8")) > MAX_SENDER_NAME_BYTES:
+    if (
+        enforce_name_limit
+        and name is not None
+        and len(name.encode("utf-8")) > MAX_SENDER_NAME_BYTES
+    ):
         raise InvalidSenderError(
             f"sender name must be at most {MAX_SENDER_NAME_BYTES} UTF-8 bytes"
         )
@@ -297,6 +316,7 @@ def load_config(path: Path | None = None) -> Config:
                 raw_email,
                 name,
                 invalid_message=f"senders entry {index} has an invalid email",
+                enforce_name_limit=False,
             )
         except InvalidSenderError as exc:
             raise ConfigError(str(exc)) from exc

@@ -344,7 +344,9 @@ def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
     assert load_config(path).allowlist == frozenset({"trusted@example.com"})
 
 
-def test_sender_name_is_bounded_by_utf8_bytes_on_load_and_add(tmp_path: Path) -> None:
+def test_sender_name_is_bounded_on_new_writes_but_legacy_names_remain_editable(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "config.toml"
     write_config(path, include_sender=False)
 
@@ -364,8 +366,15 @@ def test_sender_name_is_bounded_by_utf8_bytes_on_load_and_add(tmp_path: Path) ->
         + '"\n',
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="at most 1024 UTF-8 bytes"):
-        load_config(path)
+    loaded = load_config(path)
+    legacy = next(sender for sender in loaded.senders if sender.email == "legacy@example.com")
+    assert legacy.name == ("é" * 512) + "a"
+
+    removed = remove_sender(path, "legacy@example.com")
+    assert removed == legacy
+    shortened = add_sender(path, "legacy@example.com", "é" * 512)
+    assert shortened.name == "é" * 512
+    assert len(shortened.name.encode("utf-8")) == 1024
 
 
 @pytest.mark.parametrize(

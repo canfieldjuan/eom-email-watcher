@@ -10146,7 +10146,14 @@ class Store:
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         stamp_epoch = (stamp - epoch).total_seconds()
         cutoff_epoch = (cutoff - epoch).total_seconds()
-        expiry_predicate = """aware_iso_epoch(received_at) IS NULL
+        effective_cutoff = """MIN(?, COALESCE((
+                           SELECT aware_iso_epoch(recovery.retention_cutoff)
+                           FROM gmail_recovery_state AS recovery
+                           WHERE recovery.provider = messages.provider
+                             AND recovery.account_id = messages.account_id
+                             AND recovery.mailbox_identity_key = messages.mailbox_identity_key
+                       ), ?))"""
+        expiry_predicate = f"""aware_iso_epoch(received_at) IS NULL
                    OR (
                        aware_iso_epoch(received_at) > ?
                        AND (
@@ -10157,13 +10164,14 @@ class Store:
                    )
                    OR (
                        aware_iso_epoch(received_at) <= ?
-                       AND aware_iso_epoch(received_at) < ?
+                       AND aware_iso_epoch(received_at) < {effective_cutoff}
                    )"""
         expiry_parameters = (
             stamp_epoch,
             cutoff_epoch,
             stamp_epoch,
             stamp_epoch,
+            cutoff_epoch,
             cutoff_epoch,
         )
         with self.connection() as db:
@@ -10211,8 +10219,14 @@ class Store:
             )
             db.execute(
                 """DELETE FROM suppressed_messages
-                    WHERE julianday(expires_at) IS NULL
-                       OR julianday(expires_at) < julianday(?)""",
+                    WHERE (
+                          julianday(expires_at) IS NULL
+                       OR julianday(expires_at) < julianday(?)
+                    ) AND NOT EXISTS (
+                          SELECT 1 FROM gmail_recovery_state AS recovery
+                          WHERE recovery.provider = suppressed_messages.provider
+                            AND recovery.account_id = suppressed_messages.account_id
+                      )""",
                 (stamp.isoformat(),),
             )
         return PurgeOutcome(deleted, automation_review_required)

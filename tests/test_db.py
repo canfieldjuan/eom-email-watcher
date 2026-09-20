@@ -2810,6 +2810,85 @@ def test_due_recovery_backoff_preserves_retry_count_until_progress(tmp_path: Pat
     assert progressed.consecutive_retry_count == 0
 
 
+def test_open_recovery_purge_uses_frozen_cutoff_and_preserves_account_dedupe(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    now = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    frozen_cutoff = now - timedelta(days=7)
+    admission = db_module.AdmissionProvenance(
+        kind="exact_sender",
+        selector_id="sender:trusted@example.com",
+        display_name="Trusted",
+        mailbox_identity_key=identity,
+        admitted_at=now.isoformat(),
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        0,
+        (("trusted@example.com", "Trusted"),),
+        (),
+        int(frozen_cutoff.timestamp()) - 1,
+        int(now.timestamp()) + 1,
+        "replacement-history",
+        retention_cutoff=frozen_cutoff,
+        now=now,
+    )
+    for message_id, received_at in (
+        ("inside-frozen-window", frozen_cutoff + timedelta(hours=1)),
+        ("before-frozen-window", frozen_cutoff - timedelta(hours=1)),
+    ):
+        assert store.add_message(
+            message_id=message_id,
+            provider="gmail",
+            account_id="gmail-default",
+            provider_message_id=message_id,
+            mailbox_identity_key=identity,
+            thread_id=None,
+            sender="trusted@example.com",
+            sender_name="Trusted",
+            subject=message_id,
+            received_at=received_at.isoformat(),
+            admission=admission,
+        )
+    with store.connection() as db:
+        db.execute(
+            """INSERT INTO suppressed_messages(
+                provider, account_id, message_key, expires_at
+            ) VALUES ('gmail', 'gmail-default', ?, ?)""",
+            ("d" * 64, (now - timedelta(minutes=1)).isoformat()),
+        )
+
+    assert store.purge(1, now=now) == 1
+    assert store.has_seen_message(
+        "inside-frozen-window",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM suppressed_messages WHERE message_key=?", ("d" * 64,)
+        ).fetchone()
+
+    store.store_gmail_recovery_page("gmail-default", identity, (), None, now=now)
+    assert store.finish_gmail_recovery_page("gmail-default", identity, now=now)
+    store.complete_gmail_recovery("gmail-default", identity, now=now)
+
+    assert store.purge(1, now=now) == 1
+    assert not store.has_seen_message(
+        "inside-frozen-window",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM suppressed_messages WHERE message_key=?", ("d" * 64,)
+        ).fetchone() is None
+
+
 def test_message_insert_atomically_persists_deterministic_admission_provenance(
     tmp_path: Path,
 ) -> None:

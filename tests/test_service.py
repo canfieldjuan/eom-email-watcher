@@ -14,6 +14,7 @@ from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
+    GmailRecoveryPageTokenInvalid,
     MessageMetadata,
     MessageUnavailable,
     StaleHistoryCursor,
@@ -951,6 +952,223 @@ def test_common_admission_matcher_enforces_inbox_provider_and_deterministic_winn
         )
         is None
     )
+
+
+def test_legacy_sender_name_is_bounded_only_in_immutable_admission_provenance(
+    tmp_path: Path,
+) -> None:
+    legacy_name = ("é" * 512) + "a"
+    cfg = replace(config(tmp_path), senders=(Sender("trusted@example.com", legacy_name),))
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    result = Watcher(cfg, store, FreshGmail(), FakeModel()).check()
+    provenance = store.recent(1)[0]["admission"]
+
+    assert result["discovered"] == 1
+    assert provenance["display_name"] == "é" * 512
+    assert len(provenance["display_name"].encode("utf-8")) == 1024
+
+
+def test_due_recovery_retry_crash_preserves_degraded_backoff_state(
+    tmp_path: Path,
+) -> None:
+    checked_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        0,
+        (("trusted@example.com", "Trusted"),),
+        (),
+        1,
+        2,
+        "200",
+    )
+    store.record_gmail_recovery_backoff(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        failure_code="gmail_recovery_provider_unavailable",
+        next_retry_at=(checked_at - timedelta(minutes=1)).isoformat(),
+        degraded=True,
+        now=checked_at - timedelta(minutes=2),
+    )
+    before = store.gmail_recovery_state("gmail-default")
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashBeforeProgressGmail(FreshGmail):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recovery_calls = 0
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.recovery_calls += 1
+            raise SimulatedCrash("crash before provider progress")
+
+    gateway = CrashBeforeProgressGmail()
+    with pytest.raises(SimulatedCrash, match="before provider progress"):
+        Watcher(cfg, store, gateway, FakeModel())._run_gmail_recovery(
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            checked_at=checked_at,
+        )
+
+    assert gateway.recovery_calls == 1
+    assert store.gmail_recovery_state("gmail-default") == before
+
+
+def test_open_recovery_retains_dedupe_until_page_token_restart_drains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    received_at = checked_at - timedelta(days=2)
+
+    class FixedDatetime(datetime):
+        current = checked_at
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current if tz is None else cls.current.astimezone(tz)
+
+    cfg = replace(
+        config(tmp_path),
+        retention_days=1,
+        notifications_enabled=True,
+        ntfy_topic="a" * 20,
+        ntfy_content_disclosure_acknowledged=True,
+    )
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        checked_at - timedelta(days=30),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    frozen_cutoff = checked_at - timedelta(days=7)
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        0,
+        (("trusted@example.com", "Trusted"),),
+        (),
+        math.ceil(frozen_cutoff.timestamp()) - 1,
+        math.floor(checked_at.timestamp()) + 1,
+        "200",
+        retention_cutoff=frozen_cutoff,
+        now=checked_at,
+    )
+    store.store_gmail_recovery_page(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        ("replayed",),
+        "expired-token",
+        now=checked_at,
+    )
+
+    class RestartedRecoveryGmail(FreshGmail):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recovery_tokens: list[str | None] = []
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.recovery_tokens.append(page_token)
+            if page_token == "expired-token":
+                raise GmailRecoveryPageTokenInvalid("expired page token")
+            assert page_token is None
+            return ("replayed",), None
+
+        def metadata(
+            self,
+            message_id: str,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> MessageMetadata:
+            return MessageMetadata(
+                message_id,
+                None,
+                "trusted@example.com",
+                "Trusted",
+                "Recovery replay",
+                received_at.isoformat(),
+                frozenset({"INBOX"}),
+            )
+
+    notifications: list[str] = []
+    monkeypatch.setattr(service_module, "datetime", FixedDatetime)
+    monkeypatch.setattr(
+        service_module,
+        "send_analysis",
+        lambda *_args, **_kwargs: notifications.append("analysis"),
+    )
+    gateway = RestartedRecoveryGmail()
+    model = FakeModel()
+
+    first = Watcher(cfg, store, gateway, model).check()
+    assert first["discovered"] == 1
+    assert first["summarized"] == 1
+    assert first["recovery_state"] == "backoff"
+    assert store.has_seen_message(
+        "replayed",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    FixedDatetime.current = checked_at + timedelta(minutes=2)
+    second = Watcher(cfg, store, gateway, model).check()
+
+    assert second["discovered"] == 0
+    assert gateway.recovery_tokens == ["expired-token", None]
+    assert model.calls == 1
+    assert notifications == ["analysis"]
+    assert store.gmail_recovery_state("gmail-default") is None
+    assert store.recent(1) == []
 
 
 def test_stale_label_only_recovery_uses_broad_durable_page(

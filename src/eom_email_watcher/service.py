@@ -16,7 +16,12 @@ from connect_automate.entitlement import (
     feature_entitlements_active,
 )
 
-from .config import Config, exact_sender_selector_id, normalize_validated_address
+from .config import (
+    Config,
+    admission_sender_display_name,
+    exact_sender_selector_id,
+    normalize_validated_address,
+)
 from .db import (
     AdmissionProvenance,
     AnalyzedMessage,
@@ -158,7 +163,7 @@ def match_mailbox_admission(
         return AdmissionDecision(
             kind="exact_sender",
             selector_id=exact_sender_selector_id(sender),
-            display_name=exact_senders[sender],
+            display_name=admission_sender_display_name(exact_senders[sender]),
             mailbox_identity_key=mailbox_identity_key,
             admitted_at=admitted_at_text,
         )
@@ -1246,6 +1251,10 @@ class Watcher:
         self.gateway = self.mailbox.gateway
         self.model = model
         self.sender_names = {sender.email: sender.name for sender in config.senders}
+        self.admission_sender_names = {
+            address: admission_sender_display_name(name)
+            for address, name in self.sender_names.items()
+        }
 
     def _active_gmail_label_selectors(
         self, mailbox_identity_key: str
@@ -1576,13 +1585,6 @@ class Watcher:
         retention_cutoff = self._recovery_retention_cutoff(state)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
-        if state.state in {"backoff", "degraded"}:
-            state = self.store.clear_gmail_recovery_backoff(
-                self.mailbox.account_id,
-                mailbox_identity_key,
-                now=checked_at,
-            )
-
         deadline = time.monotonic() + 30.0
         terminal = 0
         added = 0
@@ -1932,7 +1934,7 @@ class Watcher:
                     self.mailbox.account_id,
                     mailbox_identity_key,
                     selector_set.revision,
-                    tuple(sorted(self.sender_names.items())),
+                    tuple(sorted(self.admission_sender_names.items())),
                     label_selectors,
                     after_epoch,
                     before_epoch,
@@ -2000,7 +2002,7 @@ class Watcher:
                 provider=self.mailbox.provider,
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
-                exact_senders=self.sender_names,
+                exact_senders=self.admission_sender_names,
                 label_selectors=label_selectors,
                 admitted_at=checked_at,
             )
