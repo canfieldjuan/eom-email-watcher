@@ -32,7 +32,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -1769,6 +1769,24 @@ class GmailLabelSelector:
 
 
 @dataclass(frozen=True)
+class GmailLabelSelectorValidation:
+    selector_id: str
+    label_id: str
+    status: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class GmailLabelValidationSnapshot:
+    provider: str
+    account_id: str
+    mailbox_identity_key: str = field(repr=False)
+    selector_revision: int
+    validated_at: str
+    selectors: tuple[GmailLabelSelectorValidation, ...]
+
+
+@dataclass(frozen=True)
 class GmailLabelSelectorSnapshot:
     selector_id: str
     label_id: str
@@ -2375,6 +2393,85 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
         BEFORE UPDATE ON gmail_label_selectors
         BEGIN
           SELECT RAISE(ABORT, 'gmail label selectors are immutable');
+        END;
+        CREATE TABLE IF NOT EXISTS gmail_label_validation_sets (
+          provider TEXT NOT NULL CHECK (provider = 'gmail'),
+          account_id TEXT NOT NULL CHECK (
+            account_id <> '' AND length(CAST(account_id AS BLOB)) <= 128
+          ),
+          mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key = lower(mailbox_identity_key)
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+          ),
+          selector_revision INTEGER NOT NULL CHECK (selector_revision >= 0),
+          validated_at TEXT NOT NULL CHECK (validated_at <> ''),
+          PRIMARY KEY (provider, account_id)
+        );
+        CREATE TABLE IF NOT EXISTS gmail_label_selector_validations (
+          selector_id TEXT PRIMARY KEY CHECK (length(selector_id) = 36),
+          provider TEXT NOT NULL CHECK (provider = 'gmail'),
+          account_id TEXT NOT NULL CHECK (
+            account_id <> '' AND length(CAST(account_id AS BLOB)) <= 128
+          ),
+          mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key = lower(mailbox_identity_key)
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+          ),
+          selector_revision INTEGER NOT NULL CHECK (selector_revision >= 0),
+          label_id TEXT NOT NULL CHECK (
+            label_id <> '' AND length(CAST(label_id AS BLOB)) <= 512
+          ),
+          status TEXT NOT NULL CHECK (status IN ('active', 'deleted', 'not_user')),
+          display_name TEXT NOT NULL CHECK (
+            display_name <> '' AND length(CAST(display_name AS BLOB)) <= 1024
+          ),
+          UNIQUE (provider, account_id, mailbox_identity_key, selector_revision, label_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gmail_label_selector_validations_account
+          ON gmail_label_selector_validations(provider, account_id, selector_id);
+        CREATE TRIGGER IF NOT EXISTS gmail_label_validation_sets_require_current_scope
+        BEFORE INSERT ON gmail_label_validation_sets
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM gmail_label_selector_sets AS s
+          JOIN mail_accounts AS a
+            ON a.provider = s.provider AND a.account_id = s.account_id
+          WHERE s.provider = NEW.provider AND s.account_id = NEW.account_id
+            AND s.current_mailbox_identity_key = NEW.mailbox_identity_key
+            AND s.revision = NEW.selector_revision
+            AND a.mailbox_identity_key = NEW.mailbox_identity_key
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail label validation scope is stale');
+        END;
+        CREATE TRIGGER IF NOT EXISTS gmail_label_validations_require_snapshot_selector
+        BEFORE INSERT ON gmail_label_selector_validations
+        WHEN NOT EXISTS (
+          SELECT 1
+          FROM gmail_label_validation_sets AS v
+          JOIN gmail_label_selectors AS l
+            ON l.provider = v.provider AND l.account_id = v.account_id
+          WHERE v.provider = NEW.provider AND v.account_id = NEW.account_id
+            AND v.mailbox_identity_key = NEW.mailbox_identity_key
+            AND v.selector_revision = NEW.selector_revision
+            AND l.selector_id = NEW.selector_id
+            AND l.mailbox_identity_key = NEW.mailbox_identity_key
+            AND l.label_id = NEW.label_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail label validation selector is stale');
+        END;
+        CREATE TRIGGER IF NOT EXISTS gmail_label_validation_sets_immutable
+        BEFORE UPDATE ON gmail_label_validation_sets
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail label validation sets are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS gmail_label_selector_validations_immutable
+        BEFORE UPDATE ON gmail_label_selector_validations
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail label selector validations are immutable');
         END;
         CREATE TABLE IF NOT EXISTS gmail_recovery_state (
           provider TEXT NOT NULL CHECK (provider = 'gmail'),
@@ -3862,6 +3959,7 @@ class Store:
                         ) VALUES ('gmail', ?, ?, 0, ?, ?)""",
                         (account_id, mailbox_identity_key, stamp, stamp),
                     )
+                    self._delete_gmail_label_validation(db, account_id)
                 elif selector_set["current_mailbox_identity_key"] != mailbox_identity_key:
                     revision = int(selector_set["revision"])
                     if revision == SQLITE_MAX_INTEGER:
@@ -3872,6 +3970,7 @@ class Store:
                         WHERE provider = 'gmail' AND account_id = ?""",
                         (mailbox_identity_key, revision + 1, stamp, account_id),
                     )
+                    self._delete_gmail_label_validation(db, account_id)
                     db.execute(
                         """DELETE FROM gmail_recovery_state
                         WHERE provider = 'gmail' AND account_id = ?""",
@@ -3963,6 +4062,225 @@ class Store:
                 (account_id, mailbox_identity_key),
             ).fetchall()
         return tuple(_gmail_label_selector(row) for row in rows)
+
+    @staticmethod
+    def _delete_gmail_label_validation(
+        db: sqlite3.Connection,
+        account_id: str,
+    ) -> None:
+        db.execute(
+            """DELETE FROM gmail_label_selector_validations
+            WHERE provider = 'gmail' AND account_id = ?""",
+            (account_id,),
+        )
+        db.execute(
+            """DELETE FROM gmail_label_validation_sets
+            WHERE provider = 'gmail' AND account_id = ?""",
+            (account_id,),
+        )
+
+    def persist_gmail_label_validation(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        expected_revision: int,
+        catalog_labels: Sequence[tuple[str, str, str]],
+        *,
+        now: datetime | None = None,
+    ) -> GmailLabelValidationSnapshot:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        expected = _require_revision(expected_revision)
+        labels: dict[str, tuple[str, str]] = {}
+        for raw_label_id, raw_display_name, raw_label_type in catalog_labels:
+            label_id = _require_bounded_text(
+                raw_label_id,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="gmail label id",
+            )
+            display_name = _require_bounded_text(
+                raw_display_name,
+                maximum_bytes=MAX_GMAIL_LABEL_NAME_BYTES,
+                field="gmail label display name",
+            )
+            if raw_label_type not in {"user", "system"}:
+                raise ValueError("gmail label type is invalid")
+            if label_id in labels:
+                raise ValueError("gmail label ids must be unique")
+            labels[label_id] = (display_name, raw_label_type)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selector_set = self._require_current_gmail_selector_set(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if int(selector_set["revision"]) != expected:
+                raise GmailLabelStoreError("stale_revision")
+            previous_names = {
+                str(row["selector_id"]): str(row["display_name"])
+                for row in db.execute(
+                    """SELECT selector_id, display_name
+                    FROM gmail_label_selector_validations
+                    WHERE provider = 'gmail' AND account_id = ?
+                      AND mailbox_identity_key = ?""",
+                    (account_id, mailbox_identity_key),
+                ).fetchall()
+            }
+            selectors = tuple(
+                _gmail_label_selector(row)
+                for row in db.execute(
+                    """SELECT selector_id, provider, account_id, mailbox_identity_key,
+                        label_id, selected_display_name, created_at
+                    FROM gmail_label_selectors
+                    WHERE provider = 'gmail' AND account_id = ?
+                      AND mailbox_identity_key = ?
+                    ORDER BY selector_id""",
+                    (account_id, mailbox_identity_key),
+                ).fetchall()
+            )
+            validations: list[GmailLabelSelectorValidation] = []
+            for selector in selectors:
+                catalog_label = labels.get(selector.label_id)
+                if catalog_label is None:
+                    status = "deleted"
+                    display_name = previous_names.get(
+                        selector.selector_id,
+                        selector.selected_display_name,
+                    )
+                else:
+                    display_name, label_type = catalog_label
+                    status = "active" if label_type == "user" else "not_user"
+                validations.append(
+                    GmailLabelSelectorValidation(
+                        selector_id=selector.selector_id,
+                        label_id=selector.label_id,
+                        status=status,
+                        display_name=display_name,
+                    )
+                )
+            self._delete_gmail_label_validation(db, account_id)
+            db.execute(
+                """INSERT INTO gmail_label_validation_sets(
+                    provider, account_id, mailbox_identity_key,
+                    selector_revision, validated_at
+                ) VALUES ('gmail', ?, ?, ?, ?)""",
+                (account_id, mailbox_identity_key, expected, stamp),
+            )
+            db.executemany(
+                """INSERT INTO gmail_label_selector_validations(
+                    selector_id, provider, account_id, mailbox_identity_key,
+                    selector_revision, label_id, status, display_name
+                ) VALUES (?, 'gmail', ?, ?, ?, ?, ?, ?)""",
+                (
+                    (
+                        validation.selector_id,
+                        account_id,
+                        mailbox_identity_key,
+                        expected,
+                        validation.label_id,
+                        validation.status,
+                        validation.display_name,
+                    )
+                    for validation in validations
+                ),
+            )
+        return GmailLabelValidationSnapshot(
+            provider="gmail",
+            account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            selector_revision=expected,
+            validated_at=stamp,
+            selectors=tuple(validations),
+        )
+
+    def gmail_label_validation_snapshot(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        selector_revision: int,
+    ) -> GmailLabelValidationSnapshot | None:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        revision = _require_revision(selector_revision)
+        with self.connection() as db:
+            snapshot = db.execute(
+                """SELECT v.provider, v.account_id, v.mailbox_identity_key,
+                    v.selector_revision, v.validated_at
+                FROM gmail_label_validation_sets AS v
+                JOIN gmail_label_selector_sets AS s
+                  ON s.provider = v.provider AND s.account_id = v.account_id
+                JOIN mail_accounts AS a
+                  ON a.provider = v.provider AND a.account_id = v.account_id
+                WHERE v.provider = 'gmail' AND v.account_id = ?
+                  AND v.mailbox_identity_key = ? AND v.selector_revision = ?
+                  AND s.current_mailbox_identity_key = v.mailbox_identity_key
+                  AND s.revision = v.selector_revision
+                  AND a.mailbox_identity_key = v.mailbox_identity_key""",
+                (account_id, mailbox_identity_key, revision),
+            ).fetchone()
+            if snapshot is None:
+                return None
+            selectors = db.execute(
+                """SELECT selector_id, label_id
+                FROM gmail_label_selectors
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ?
+                ORDER BY selector_id""",
+                (account_id, mailbox_identity_key),
+            ).fetchall()
+            rows = db.execute(
+                """SELECT selector_id, label_id, status, display_name
+                FROM gmail_label_selector_validations
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ? AND selector_revision = ?
+                ORDER BY selector_id""",
+                (account_id, mailbox_identity_key, revision),
+            ).fetchall()
+        expected_selectors = [
+            (str(row["selector_id"]), str(row["label_id"])) for row in selectors
+        ]
+        validated_selectors = [
+            (str(row["selector_id"]), str(row["label_id"])) for row in rows
+        ]
+        if validated_selectors != expected_selectors:
+            return None
+        return GmailLabelValidationSnapshot(
+            provider=str(snapshot["provider"]),
+            account_id=str(snapshot["account_id"]),
+            mailbox_identity_key=str(snapshot["mailbox_identity_key"]),
+            selector_revision=int(snapshot["selector_revision"]),
+            validated_at=str(snapshot["validated_at"]),
+            selectors=tuple(
+                GmailLabelSelectorValidation(
+                    selector_id=str(row["selector_id"]),
+                    label_id=str(row["label_id"]),
+                    status=str(row["status"]),
+                    display_name=str(row["display_name"]),
+                )
+                for row in rows
+            ),
+        )
+
+    def invalidate_gmail_label_validation(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        selector_revision: int,
+    ) -> bool:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        revision = _require_revision(selector_revision)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            snapshot = db.execute(
+                """SELECT 1 FROM gmail_label_validation_sets
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ? AND selector_revision = ?""",
+                (account_id, mailbox_identity_key, revision),
+            ).fetchone()
+            if snapshot is None:
+                return False
+            self._delete_gmail_label_validation(db, account_id)
+        return True
 
     @staticmethod
     def _require_current_gmail_selector_set(
@@ -4072,6 +4390,7 @@ class Store:
             )
             if changed.rowcount != 1:
                 raise GmailLabelStoreError("stale_revision")
+            self._delete_gmail_label_validation(db, account_id)
         selector = GmailLabelSelector(
             selector_id=selector_id,
             provider="gmail",
@@ -4126,6 +4445,7 @@ class Store:
             )
             if changed.rowcount != 1:
                 raise GmailLabelStoreError("stale_revision")
+            self._delete_gmail_label_validation(db, account_id)
         return new_revision
 
     def gmail_label_selector_is_current(

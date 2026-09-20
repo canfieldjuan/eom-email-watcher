@@ -2184,7 +2184,7 @@ def _gmail_selector_store(tmp_path: Path) -> tuple[Store, str]:
     return store, identity
 
 
-def test_gmail_admission_schema_bump_rejects_previous_binary(
+def test_gmail_validation_schema_bump_rejects_previous_binary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "state" / "watcher.sqlite3"
@@ -2192,11 +2192,114 @@ def test_gmail_admission_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 26
 
-    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 24)
-    with pytest.raises(RuntimeError, match="newer than supported version 24"):
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 25)
+    with pytest.raises(RuntimeError, match="newer than supported version 25"):
         Store(database).initialize()
+
+
+def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selectors(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    with store.connection() as db:
+        db.execute("DROP TABLE gmail_label_selector_validations")
+        db.execute("DROP TABLE gmail_label_validation_sets")
+        db.execute("PRAGMA user_version = 25")
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    with migrated.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 26
+        tables = {
+            str(row["name"])
+            for row in db.execute(
+                """SELECT name FROM sqlite_schema
+                WHERE type = 'table' AND name LIKE 'gmail_label_%validation%'"""
+            ).fetchall()
+        }
+    assert tables == {
+        "gmail_label_selector_validations",
+        "gmail_label_validation_sets",
+    }
+    assert migrated.gmail_label_selectors("gmail-default") == (selector,)
+    assert migrated.gmail_label_validation_snapshot("gmail-default", identity, revision) is None
+
+
+def test_gmail_label_validation_is_revision_bound_durable_and_invalidated_by_mutation(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, first = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    snapshot = store.persist_gmail_label_validation(
+        "gmail-default",
+        identity,
+        revision,
+        (("Label_1", "Renamed invoices", "user"),),
+    )
+    assert snapshot.selector_revision == revision
+    assert snapshot.selectors == (
+        db_module.GmailLabelSelectorValidation(
+            selector_id=first.selector_id,
+            label_id="Label_1",
+            status="active",
+            display_name="Renamed invoices",
+        ),
+    )
+
+    restarted = Store(store.path)
+    restarted.initialize()
+    assert restarted.gmail_label_validation_snapshot(
+        "gmail-default", identity, revision
+    ) == snapshot
+
+    revision, second = restarted.add_gmail_label_selector(
+        "gmail-default", identity, "Label_2", "Second", revision
+    )
+    assert restarted.gmail_label_validation_snapshot(
+        "gmail-default", identity, revision
+    ) is None
+    with pytest.raises(db_module.GmailLabelStoreError, match="stale_revision"):
+        restarted.persist_gmail_label_validation(
+            "gmail-default",
+            identity,
+            revision - 1,
+            (("Label_1", "Invoices", "user"),),
+        )
+
+    refreshed = restarted.persist_gmail_label_validation(
+        "gmail-default",
+        identity,
+        revision,
+        (("Label_2", "System second", "system"),),
+    )
+    assert {item.selector_id: item for item in refreshed.selectors} == {
+        first.selector_id: db_module.GmailLabelSelectorValidation(
+            selector_id=first.selector_id,
+            label_id="Label_1",
+            status="deleted",
+            display_name="Invoices",
+        ),
+        second.selector_id: db_module.GmailLabelSelectorValidation(
+            selector_id=second.selector_id,
+            label_id="Label_2",
+            status="not_user",
+            display_name="System second",
+        ),
+    }
+    revision = restarted.remove_gmail_label_selector(
+        "gmail-default", identity, second.selector_id, revision
+    )
+    assert restarted.gmail_label_validation_snapshot(
+        "gmail-default", identity, revision
+    ) is None
 
 
 def test_gmail_label_selector_cas_bounds_and_immutable_identity(tmp_path: Path) -> None:

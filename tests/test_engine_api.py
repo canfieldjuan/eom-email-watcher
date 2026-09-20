@@ -352,8 +352,14 @@ def test_gmail_label_catalog_add_list_remove_are_account_and_revision_bound(
         )
     )
     assert listed["revision"] == 1
-    assert listed["catalog_state"] == "current"
-    assert listed["items"] == [added["item"]]
+    assert listed["catalog_state"] == "unavailable"
+    assert listed["items"] == [
+        {
+            **added["item"],
+            "status": "validation_unavailable",
+            "admission_active": False,
+        }
+    ]
 
     removed = engine_api.dispatch(
         request(
@@ -452,14 +458,249 @@ def test_gmail_label_list_uses_durable_identity_without_provider_access(
         "provider": "gmail",
         "account_id": "gmail-default",
         "revision": revision,
-        "catalog_state": "current",
+        "catalog_state": "unavailable",
         "items": [
             {
                 "selector_id": selector.selector_id,
                 "label_id": "Label_123",
                 "display_name": "Invoices",
+                "status": "validation_unavailable",
+                "admission_active": False,
+            }
+        ],
+    }
+
+
+def test_gmail_catalog_validation_survives_restart_and_tracks_rename_delete_and_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, selector = runtime.store.add_gmail_label_selector(
+        "gmail-default",
+        identity_key,
+        "Label_123",
+        "Invoices",
+        0,
+    )
+    runtime.store.add_message(
+        message_id="message-before-rename",
+        provider_message_id="provider-before-rename",
+        mailbox_identity_key=identity_key,
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Original admission",
+        received_at="2026-09-19T11:59:00+00:00",
+        admission=AdmissionProvenance(
+            kind="gmail_user_label",
+            selector_id=selector.selector_id,
+            display_name="Invoices",
+            mailbox_identity_key=identity_key,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
+    )
+    gateway = FakeGmailLabelGateway(
+        identity_key,
+        (GmailLabel("Label_123", "Renamed invoices", "user"),),
+    )
+    mailbox = MailboxSession("gmail", "gmail-default", gateway)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+
+    renamed_catalog = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert renamed_catalog["revision"] == revision
+    assert renamed_catalog["items"][0]["display_name"] == "Renamed invoices"
+    assert renamed_catalog["items"][0]["selected"] is True
+
+    restarted = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: restarted)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: False)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Offline selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    renamed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert renamed == {
+        "provider": "gmail",
+        "account_id": "gmail-default",
+        "revision": revision,
+        "catalog_state": "current",
+        "items": [
+            {
+                "selector_id": selector.selector_id,
+                "label_id": "Label_123",
+                "display_name": "Renamed invoices",
                 "status": "active",
                 "admission_active": True,
+            }
+        ],
+    }
+    assert restarted.store.recent(1)[0]["admission"] == {
+        "kind": "gmail_user_label",
+        "selector_id": selector.selector_id,
+        "display_name": "Invoices",
+        "admitted_at": "2026-09-19T12:00:00+00:00",
+    }
+
+    for labels, expected_status, expected_name in (
+        ((), "deleted", "Renamed invoices"),
+        ((GmailLabel("Label_123", "System invoices", "system"),), "not_user", "System invoices"),
+    ):
+        gateway.labels = labels
+        monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+        monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+        engine_api.dispatch(
+            request(
+                config_path,
+                "gmail.labels.catalog",
+                {"provider": "gmail", "account_id": "gmail-default"},
+            )
+        )
+        monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: False)
+        monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+        listed = engine_api.dispatch(
+            request(
+                config_path,
+                "gmail.label_selectors.list",
+                {"provider": "gmail", "account_id": "gmail-default"},
+            )
+        )
+        assert listed["catalog_state"] == "current"
+        assert listed["items"] == [
+            {
+                "selector_id": selector.selector_id,
+                "label_id": "Label_123",
+                "display_name": expected_name,
+                "status": expected_status,
+                "admission_active": False,
+            }
+        ]
+
+
+def test_gmail_catalog_revision_race_does_not_validate_newer_selector_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, _selector = runtime.store.add_gmail_label_selector(
+        "gmail-default", identity_key, "Label_1", "First", 0
+    )
+    gateway = FakeGmailLabelGateway(identity_key, ())
+
+    def race_catalog() -> tuple[GmailLabel, ...]:
+        runtime.store.add_gmail_label_selector(
+            "gmail-default",
+            identity_key,
+            "Label_2",
+            "Second",
+            revision,
+        )
+        return (
+            GmailLabel("Label_1", "First", "user"),
+            GmailLabel("Label_2", "Second", "user"),
+        )
+
+    gateway.label_catalog = race_catalog  # type: ignore[method-assign]
+    mailbox = MailboxSession("gmail", "gmail-default", gateway)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert response["error"]["code"] == "stale_revision"
+
+
+def test_gmail_catalog_failure_invalidates_only_matching_durable_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, selector = runtime.store.add_gmail_label_selector(
+        "gmail-default", identity_key, "Label_1", "Invoices", 0
+    )
+    gateway = FakeGmailLabelGateway(
+        identity_key,
+        (GmailLabel("Label_1", "Invoices", "user"),),
+    )
+    mailbox = MailboxSession("gmail", "gmail-default", gateway)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+    engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+
+    def unavailable() -> tuple[GmailLabel, ...]:
+        raise GmailLabelCatalogUnavailable("offline")
+
+    gateway.label_catalog = unavailable  # type: ignore[method-assign]
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert response["error"]["code"] == "gmail_label_catalog_unavailable"
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Offline selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: False)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    listed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert listed == {
+        "provider": "gmail",
+        "account_id": "gmail-default",
+        "revision": revision,
+        "catalog_state": "unavailable",
+        "items": [
+            {
+                "selector_id": selector.selector_id,
+                "label_id": "Label_1",
+                "display_name": "Invoices",
+                "status": "validation_unavailable",
+                "admission_active": False,
             }
         ],
     }
@@ -505,7 +746,7 @@ def test_gmail_label_list_marks_superseded_identity_inert_without_provider_acces
         "provider": "gmail",
         "account_id": "gmail-default",
         "revision": revision + 1,
-        "catalog_state": "current",
+        "catalog_state": "unavailable",
         "items": [
             {
                 "selector_id": selector.selector_id,
