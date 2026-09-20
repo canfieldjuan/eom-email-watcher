@@ -13,7 +13,10 @@ import {
   classifyCapabilityDiagnostic,
   durableCapabilityStatus,
 } from "./connectAvailability";
-import { configAdmissionView } from "./configAdmissionView";
+import {
+  configAdmissionView,
+  reconcileConfigAdmissionRefresh,
+} from "./configAdmissionView";
 import {
   buildMailServerConnection,
   type MailServerConnection,
@@ -3019,14 +3022,17 @@ function renderConfigAdmission(status: ConfigAdmissionStatus): void {
 }
 
 async function refreshConfigAdmission(): Promise<void> {
-  try {
-    renderConfigAdmission(await invoke<ConfigAdmissionStatus>("config_admission_status"));
-  } catch {
-    renderConfigAdmissionState({ state: "manual_repair_required" });
-    settingsStatus.textContent =
-      "Watcher configuration admission could not be verified. Repair the configuration and restart Email Watcher.";
-    settingsStatus.dataset.kind = "error";
-  }
+  await reconcileConfigAdmissionRefresh({
+    currentGeneration: () => configAdmissionGeneration,
+    request: () => invoke<ConfigAdmissionStatus>("config_admission_status"),
+    renderStatus: renderConfigAdmission,
+    renderFailure: () => {
+      renderConfigAdmissionState({ state: "manual_repair_required" });
+      settingsStatus.textContent =
+        "Watcher configuration admission could not be verified. Repair the configuration and restart Email Watcher.";
+      settingsStatus.dataset.kind = "error";
+    },
+  });
 }
 
 async function initializeDesktop(): Promise<void> {

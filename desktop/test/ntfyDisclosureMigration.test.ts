@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { configAdmissionView } from "../src/configAdmissionView.ts";
+import {
+  configAdmissionView,
+  reconcileConfigAdmissionRefresh,
+} from "../src/configAdmissionView.ts";
 
 const libSource = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 const engineSource = await readFile(
@@ -189,6 +192,52 @@ test("ntfy disclosure UI requires one explicit click and reconciles every outcom
   const acknowledgementCalls = uiSource.match(/"config_ntfy_disclosure_acknowledge"/g) ?? [];
   assert.equal(acknowledgementCalls.length, 1, "render, focus, and reconciliation must not acknowledge");
   assert.doesNotMatch(uiSource, /invoke<ConfigStatus>\("config_status"\)/);
+});
+
+test("newer admission generation suppresses a stale refresh failure", async () => {
+  let generation = 4;
+  let configurationReady = false;
+  let renderedState = "manual_repair_required";
+  let rejectRequest: ((reason?: unknown) => void) | undefined;
+  const request = new Promise<never>((_resolve, reject) => {
+    rejectRequest = reject;
+  });
+  const refresh = reconcileConfigAdmissionRefresh({
+    currentGeneration: () => generation,
+    request: () => request,
+    renderStatus: () => assert.fail("rejected request rendered a status"),
+    renderFailure: () => {
+      configurationReady = false;
+      renderedState = "manual_repair_required";
+    },
+  });
+
+  generation = 5;
+  configurationReady = true;
+  renderedState = "admitted";
+  rejectRequest?.(new Error("older status request failed"));
+  await refresh;
+  assert.equal(configurationReady, true);
+  assert.equal(renderedState, "admitted");
+
+  configurationReady = true;
+  renderedState = "admitted";
+  await reconcileConfigAdmissionRefresh({
+    currentGeneration: () => generation,
+    request: () => Promise.reject(new Error("current status request failed")),
+    renderStatus: () => assert.fail("rejected request rendered a status"),
+    renderFailure: () => {
+      configurationReady = false;
+      renderedState = "manual_repair_required";
+    },
+  });
+  assert.equal(configurationReady, false);
+  assert.equal(renderedState, "manual_repair_required");
+
+  assert.match(
+    uiSource,
+    /reconcileConfigAdmissionRefresh\(\{[\s\S]*currentGeneration: \(\) => configAdmissionGeneration,[\s\S]*request: \(\) => invoke<ConfigAdmissionStatus>\("config_admission_status"\),[\s\S]*renderStatus: renderConfigAdmission,[\s\S]*renderFailure:[\s\S]*renderConfigAdmissionState\(\{ state: "manual_repair_required" \}\)/,
+  );
 });
 
 test("admitted startup opens the populated application while held states alone force settings", () => {
