@@ -65,9 +65,13 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   );
   assert.match(
     boundedDelivery,
-    /delivery\.deliver_bounded\(app, engine, STARTUP_DELIVERY_TIMEOUT\)/,
+    /delivery\.deliver_bounded\(engine, STARTUP_DELIVERY_TIMEOUT\)/,
   );
   assert.match(deliverySource, /deadline\.cancel\(\);[\s\S]*worker\.join\(\)/);
+  assert.match(deliverySource, /Command::new\(&self\.program\)/);
+  assert.match(deliverySource, /child\.kill\(\)/);
+  assert.match(deliverySource, /child\.wait\(\)/);
+  assert.match(deliverySource, /run_notification_helper/);
   assert.match(deliverySource, /self\.lock\.try_lock\(\)/);
   assert.match(deliverySource, /deadline\.bounded_engine\(engine\)/);
   assert.match(schedulerSource, /fn wait_for_activation/);

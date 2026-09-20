@@ -372,7 +372,7 @@ impl PollScheduler {
                     &scheduler.gate,
                     scheduler.next_check_unix_ms.load(Ordering::Relaxed),
                 ) {
-                    let event = match delivery.check_and_deliver(&app, &engine) {
+                    let event = match delivery.check_and_deliver(&engine) {
                         Ok(outcome) => {
                             if outcome.delivery.failed > 0 {
                                 eprintln!(

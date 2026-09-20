@@ -1,4 +1,8 @@
 use crate::engine::{CheckResult, Engine, EngineError, NotificationIntent};
+use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Read, Write};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, Ordering},
@@ -6,12 +10,15 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
 const DELIVERY_BATCH_LIMIT: u16 = 25;
 const DEFAULT_DELIVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DELIVERY_LOCK_RETRY: Duration = Duration::from_millis(5);
+const NOTIFICATION_HELPER_ARG: &str = "--notification-helper";
+const NOTIFICATION_HELPER_PROTOCOL: u8 = 1;
+const MAX_NOTIFICATION_HELPER_BYTES: u64 = 64 * 1024;
+const NOTIFICATION_PROCESS_POLL: Duration = Duration::from_millis(5);
 
 fn delivery_timeout() -> EngineError {
     EngineError::host("engine_timeout", "Desktop notification delivery timed out")
@@ -164,28 +171,231 @@ impl NotificationQueue for DeadlineQueue<'_> {
 }
 
 trait NotificationSink {
-    fn show(&self, intent: &NotificationIntent) -> Result<(), EngineError>;
+    fn show(
+        &self,
+        intent: &NotificationIntent,
+        deadline: &DeliveryDeadline,
+    ) -> Result<(), EngineError>;
 }
 
-struct TauriNotificationSink<'a> {
-    app: &'a AppHandle,
+#[derive(Deserialize, Serialize)]
+struct NotificationHelperRequest {
+    protocol: u8,
+    title: String,
+    body: String,
 }
 
-impl NotificationSink for TauriNotificationSink<'_> {
-    fn show(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
-        self.app
-            .notification()
-            .builder()
-            .title(&intent.title)
-            .body(&intent.body)
-            .show()
+struct NotificationProcess {
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+impl NotificationProcess {
+    fn production() -> Result<Self, EngineError> {
+        let program = std::env::current_exe().map_err(|_| {
+            EngineError::host(
+                "notification_error",
+                "The desktop notification helper is unavailable",
+            )
+        })?;
+        Ok(Self {
+            program: program.into_os_string(),
+            args: vec![OsString::from(NOTIFICATION_HELPER_ARG)],
+        })
+    }
+
+    #[cfg(test)]
+    fn with_command(program: impl Into<OsString>, args: Vec<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            args,
+        }
+    }
+
+    fn stop_and_reap(child: &mut Child) -> io::Result<()> {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Err(kill_error) = child.kill()
+            && child.try_wait()?.is_none()
+        {
+            return Err(kill_error);
+        }
+        child.wait().map(|_| ())
+    }
+
+    fn join_input(
+        input: &mut Option<thread::JoinHandle<io::Result<()>>>,
+    ) -> Result<(), EngineError> {
+        let Some(input) = input.take() else {
+            return Ok(());
+        };
+        input
+            .join()
             .map_err(|_| {
                 EngineError::host(
                     "notification_error",
-                    "The desktop notification could not be delivered",
+                    "The desktop notification helper input worker stopped",
+                )
+            })?
+            .map_err(|_| {
+                EngineError::host(
+                    "notification_error",
+                    "The desktop notification helper stopped before delivery",
                 )
             })
     }
+}
+
+impl NotificationSink for NotificationProcess {
+    fn show(
+        &self,
+        intent: &NotificationIntent,
+        deadline: &DeliveryDeadline,
+    ) -> Result<(), EngineError> {
+        deadline.check()?;
+        let payload = serde_json::to_vec(&NotificationHelperRequest {
+            protocol: NOTIFICATION_HELPER_PROTOCOL,
+            title: intent.title.clone(),
+            body: intent.body.clone(),
+        })
+        .map_err(|_| {
+            EngineError::host(
+                "notification_error",
+                "The desktop notification could not be prepared",
+            )
+        })?;
+        if payload.len() as u64 > MAX_NOTIFICATION_HELPER_BYTES {
+            return Err(EngineError::host(
+                "notification_error",
+                "The desktop notification is too large",
+            ));
+        }
+
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| {
+                EngineError::host(
+                    "notification_error",
+                    "The desktop notification helper could not be started",
+                )
+            })?;
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = Self::stop_and_reap(&mut child);
+            return Err(EngineError::host(
+                "notification_error",
+                "The desktop notification helper input is unavailable",
+            ));
+        };
+        let input = thread::Builder::new()
+            .name("email-watcher-notification-input".into())
+            .spawn(move || stdin.write_all(&payload));
+        let mut input = match input {
+            Ok(input) => Some(input),
+            Err(_) => {
+                let _ = Self::stop_and_reap(&mut child);
+                return Err(EngineError::host(
+                    "notification_error",
+                    "The desktop notification helper input worker could not start",
+                ));
+            }
+        };
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    Self::join_input(&mut input)?;
+                    return Ok(());
+                }
+                Ok(Some(_)) => {
+                    let _ = Self::join_input(&mut input);
+                    return Err(EngineError::host(
+                        "notification_error",
+                        "The desktop notification could not be delivered",
+                    ));
+                }
+                Ok(None) => match deadline.remaining() {
+                    Ok(remaining) => {
+                        thread::sleep(remaining.min(NOTIFICATION_PROCESS_POLL));
+                    }
+                    Err(error) => {
+                        if Self::stop_and_reap(&mut child).is_err() {
+                            let _ = Self::join_input(&mut input);
+                            return Err(EngineError::host(
+                                "notification_error",
+                                "The desktop notification helper could not be stopped",
+                            ));
+                        }
+                        let _ = Self::join_input(&mut input);
+                        return Err(error);
+                    }
+                },
+                Err(_) => {
+                    let _ = Self::stop_and_reap(&mut child);
+                    let _ = Self::join_input(&mut input);
+                    return Err(EngineError::host(
+                        "notification_error",
+                        "The desktop notification helper status is unavailable",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn notification_helper_requested<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+    let _program = args.next();
+    matches!(
+        (args.next(), args.next()),
+        (Some(arg), None) if arg.as_ref() == OsStr::new(NOTIFICATION_HELPER_ARG)
+    )
+}
+
+pub(crate) fn run_notification_helper() -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = Vec::new();
+    std::io::stdin()
+        .take(MAX_NOTIFICATION_HELPER_BYTES + 1)
+        .read_to_end(&mut payload)?;
+    if payload.is_empty() || payload.len() as u64 > MAX_NOTIFICATION_HELPER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "notification helper input is invalid",
+        )
+        .into());
+    }
+    let request: NotificationHelperRequest = serde_json::from_slice(&payload)?;
+    if request.protocol != NOTIFICATION_HELPER_PROTOCOL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "notification helper protocol is invalid",
+        )
+        .into());
+    }
+
+    let mut context = tauri::generate_context!();
+    context.config_mut().app.windows.clear();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .setup(move |app| {
+            app.notification()
+                .builder()
+                .title(request.title)
+                .body(request.body)
+                .show()?;
+            app.handle().exit(0);
+            Ok(())
+        })
+        .run(context)?;
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -213,7 +423,7 @@ fn deliver_batch_until(
     let mut failed = 0;
     for intent in intents {
         deadline.check()?;
-        if sink.show(&intent).is_err() {
+        if sink.show(&intent, deadline).is_err() {
             failed += 1;
             continue;
         }
@@ -350,49 +560,41 @@ impl NotificationDelivery {
 
     fn deliver_until(
         &self,
-        app: &AppHandle,
         engine: &Engine,
         deadline: &DeliveryDeadline,
     ) -> Result<DeliveryOutcome, EngineError> {
         let queue = DeadlineQueue { engine, deadline };
+        let sink = NotificationProcess::production()?;
         self.run_exclusive_until(deadline, |_| {
             deadline
                 .bounded_engine(engine)?
-                .run_with_operation_lock(|| {
-                    deliver_batch_until(&queue, &TauriNotificationSink { app }, deadline)
-                })
+                .run_with_operation_lock(|| deliver_batch_until(&queue, &sink, deadline))
         })
     }
 
     pub(crate) fn deliver_bounded(
         &self,
-        app: AppHandle,
         engine: Engine,
         timeout: Duration,
     ) -> BoundedOperation<Result<DeliveryOutcome, EngineError>> {
         let delivery = self.clone();
         run_bounded_operation(timeout, move |deadline| {
-            delivery.deliver_until(&app, &engine, &deadline)
+            delivery.deliver_until(&engine, &deadline)
         })
     }
 
-    pub fn check_and_deliver(
-        &self,
-        app: &AppHandle,
-        engine: &Engine,
-    ) -> Result<CoordinatedCheck, EngineError> {
+    pub fn check_and_deliver(&self, engine: &Engine) -> Result<CoordinatedCheck, EngineError> {
         let deadline = DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT);
         let queue = DeadlineQueue {
             engine,
             deadline: &deadline,
         };
+        let sink = NotificationProcess::production()?;
         self.run_exclusive_until(&deadline, |_| {
             let check = queue.check();
             let delivery = deadline
                 .bounded_engine(engine)?
-                .run_with_operation_lock(|| {
-                    deliver_batch_until(&queue, &TauriNotificationSink { app }, &deadline)
-                });
+                .run_with_operation_lock(|| deliver_batch_until(&queue, &sink, &deadline));
             coordinated_result(check, delivery)
         })
     }
@@ -492,13 +694,16 @@ mod tests {
 
     struct CancellationSink {
         events: Arc<Mutex<Vec<&'static str>>>,
-        deadline: DeliveryDeadline,
     }
 
     impl NotificationSink for CancellationSink {
-        fn show(&self, _intent: &NotificationIntent) -> Result<(), EngineError> {
+        fn show(
+            &self,
+            _intent: &NotificationIntent,
+            deadline: &DeliveryDeadline,
+        ) -> Result<(), EngineError> {
             self.events.lock().expect("events lock").push("show");
-            while !self.deadline.is_cancelled() {
+            while !deadline.is_cancelled() {
                 thread::yield_now();
             }
             Ok(())
@@ -506,7 +711,11 @@ mod tests {
     }
 
     impl NotificationSink for FakeSink {
-        fn show(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
+        fn show(
+            &self,
+            intent: &NotificationIntent,
+            _deadline: &DeliveryDeadline,
+        ) -> Result<(), EngineError> {
             self.events.lock().expect("events lock").push("show");
             if self.failed_message.as_deref() == Some(&intent.message_id) {
                 return Err(EngineError::host(
@@ -797,7 +1006,6 @@ mod tests {
             };
             let sink = CancellationSink {
                 events: Arc::clone(&worker_events),
-                deadline: deadline.clone(),
             };
             deliver_batch_until(&queue, &sink, &deadline)
         });
@@ -826,5 +1034,60 @@ mod tests {
             *events.lock().expect("events lock"),
             ["show", "show", "acknowledge"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noncooperative_platform_process_is_killed_and_reaped_at_deadline() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let pid_path = directory.path().join("notification-helper.pid");
+        let notifier = NotificationProcess::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from("notification-timeout-probe"),
+                pid_path.as_os_str().to_owned(),
+            ],
+        );
+
+        let delivery = NotificationDelivery::default();
+        let bounded_delivery = delivery.clone();
+        let outcome = run_bounded_operation(Duration::from_millis(200), move |deadline| {
+            bounded_delivery.run_exclusive_until(&deadline, |deadline| {
+                notifier.show(&intent("message-1"), deadline)
+            })
+        });
+
+        assert_eq!(outcome, BoundedOperation::TimedOut);
+        let process_id: i32 = std::fs::read_to_string(pid_path)
+            .expect("read notification helper pid")
+            .trim()
+            .parse()
+            .expect("parse notification helper pid");
+        assert_ne!(unsafe { libc::kill(process_id, 0) }, 0);
+        assert_eq!(
+            delivery
+                .run_exclusive_with_timeout(Duration::from_secs(1), |_| Ok("manual"))
+                .expect("manual delivery remains usable after helper timeout"),
+            "manual"
+        );
+    }
+
+    #[test]
+    fn notification_helper_requires_the_exact_private_invocation() {
+        assert!(notification_helper_requested([
+            OsStr::new("watcher"),
+            OsStr::new(NOTIFICATION_HELPER_ARG),
+        ]));
+        assert!(!notification_helper_requested([
+            OsStr::new("watcher"),
+            OsStr::new("--start-in-background"),
+            OsStr::new(NOTIFICATION_HELPER_ARG),
+        ]));
+        assert!(!notification_helper_requested([
+            OsStr::new("watcher"),
+            OsStr::new("--notification-helper-extra"),
+        ]));
     }
 }

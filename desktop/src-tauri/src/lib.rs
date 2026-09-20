@@ -532,11 +532,11 @@ fn stage_admitted_workers(
     })
 }
 
-fn start_startup_delivery(app: AppHandle, engine: Engine, delivery: NotificationDelivery) {
+fn start_startup_delivery(engine: Engine, delivery: NotificationDelivery) {
     if thread::Builder::new()
         .name("email-watcher-startup-delivery".into())
         .spawn(
-            move || match delivery.deliver_bounded(app, engine, STARTUP_DELIVERY_TIMEOUT) {
+            move || match delivery.deliver_bounded(engine, STARTUP_DELIVERY_TIMEOUT) {
                 BoundedOperation::Completed(Ok(outcome)) if outcome.failed > 0 => eprintln!(
                     "{} watcher startup notification deliveries failed; {} remain queued",
                     outcome.failed, outcome.remaining
@@ -562,12 +562,11 @@ fn start_startup_delivery(app: AppHandle, engine: Engine, delivery: Notification
 
 fn finish_admission_transition(
     transition: AdmissionTransition,
-    app: &AppHandle,
     engine: &Engine,
     delivery: &NotificationDelivery,
 ) -> ConfigAdmissionStatus {
     if transition.start_startup_delivery {
-        start_startup_delivery(app.clone(), engine.clone(), delivery.clone());
+        start_startup_delivery(engine.clone(), delivery.clone());
     }
     transition.status
 }
@@ -583,9 +582,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             || engine.ntfy_disclosure_status(),
             || stage_admitted_workers(app, engine, delivery),
         )?;
-        Ok(finish_admission_transition(
-            transition, app, engine, delivery,
-        ))
+        Ok(finish_admission_transition(transition, engine, delivery))
     }
 
     fn initialize(
@@ -614,7 +611,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             );
             (initialization, Self::install_attempt(&mut inner, attempt))
         };
-        let status = finish_admission_transition(transition, app, engine, delivery);
+        let status = finish_admission_transition(transition, engine, delivery);
         match initialization {
             Ok(_) => Ok(status),
             Err(_) if status == ConfigAdmissionStatus::Admitted => Ok(status),
@@ -657,9 +654,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             };
             Self::install_attempt(&mut inner, attempt)
         };
-        Ok(finish_admission_transition(
-            transition, app, engine, delivery,
-        ))
+        Ok(finish_admission_transition(transition, engine, delivery))
     }
 
     fn wake_connect_queue(&self) -> Result<(), EngineError> {
@@ -1225,7 +1220,6 @@ async fn settings_update(
 
 #[tauri::command]
 async fn watcher_check(
-    app: AppHandle,
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
@@ -1234,7 +1228,7 @@ async fn watcher_check(
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let outcome = delivery.check_and_deliver(&app, &engine)?;
+        let outcome = delivery.check_and_deliver(&engine)?;
         Ok(DesktopCheckResult {
             check: outcome.check,
             delivered_notifications: outcome.delivery.delivered,
@@ -1289,6 +1283,14 @@ async fn watchlist_remove(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(desktop)]
+    if delivery::notification_helper_requested(std::env::args_os()) {
+        if delivery::run_notification_helper().is_err() {
+            eprintln!("watcher notification helper failed");
+            std::process::exit(2);
+        }
+        return;
+    }
     #[cfg(desktop)]
     let launch_in_background = starts_in_background(std::env::args_os());
     let builder = tauri::Builder::default();
