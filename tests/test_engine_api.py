@@ -247,8 +247,10 @@ class FakeGmailLabelGateway:
         self.identity_key = identity_key
         self.labels = labels
         self.catalog_calls = 0
+        self.identity_calls = 0
 
     def mailbox_identity_key(self) -> str:
+        self.identity_calls += 1
         return self.identity_key
 
     def label_catalog(self) -> tuple[GmailLabel, ...]:
@@ -303,6 +305,8 @@ def test_gmail_label_catalog_add_list_remove_are_account_and_revision_bound(
             },
         ],
     }
+    assert gateway.identity_calls == 1
+    assert gateway.catalog_calls == 1
 
     system_label = engine_api._response(
         request(
@@ -413,7 +417,7 @@ def test_gmail_label_add_reopens_identity_and_fails_closed_on_replacement(
     assert runtime.store.gmail_label_selector_set("gmail-default").revision == 0
 
 
-def test_gmail_label_list_keeps_selector_visible_when_catalog_is_unavailable(
+def test_gmail_label_list_uses_durable_identity_without_provider_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -429,16 +433,13 @@ def test_gmail_label_list_keeps_selector_visible_when_catalog_is_unavailable(
         0,
     )
 
-    gateway = FakeGmailLabelGateway(identity_key, ())
-
-    def unavailable() -> tuple[GmailLabel, ...]:
-        raise GmailLabelCatalogUnavailable("offline")
-
-    gateway.label_catalog = unavailable  # type: ignore[method-assign]
-    mailbox = MailboxSession("gmail", "gmail-default", gateway)
     monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
-    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
-    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: False)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
 
     listed = engine_api.dispatch(
         request(
@@ -451,17 +452,116 @@ def test_gmail_label_list_keeps_selector_visible_when_catalog_is_unavailable(
         "provider": "gmail",
         "account_id": "gmail-default",
         "revision": revision,
-        "catalog_state": "unavailable",
+        "catalog_state": "current",
         "items": [
             {
                 "selector_id": selector.selector_id,
                 "label_id": "Label_123",
                 "display_name": "Invoices",
-                "status": "validation_unavailable",
+                "status": "active",
+                "admission_active": True,
+            }
+        ],
+    }
+
+
+def test_gmail_label_list_marks_superseded_identity_inert_without_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    original_identity = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, selector = runtime.store.add_gmail_label_selector(
+        "gmail-default",
+        original_identity,
+        "Label_123",
+        "Invoices",
+        0,
+    )
+    replacement_identity = "f" * 64
+    runtime.store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        replacement_identity,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: False)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+
+    listed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert listed == {
+        "provider": "gmail",
+        "account_id": "gmail-default",
+        "revision": revision + 1,
+        "catalog_state": "current",
+        "items": [
+            {
+                "selector_id": selector.selector_id,
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "status": "identity_mismatch",
                 "admission_active": False,
             }
         ],
     }
+
+
+def test_gmail_label_list_requires_durable_account_identity_without_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert response["error"]["code"] == "account_unavailable"
+
+
+def test_gmail_label_list_rejects_missing_account_without_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Selector listing attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-missing"},
+        )
+    )
+    assert response["error"]["code"] == "not_found"
 
 
 def test_gmail_label_remove_is_provider_network_free(

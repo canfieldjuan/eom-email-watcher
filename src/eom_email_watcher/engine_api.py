@@ -899,6 +899,8 @@ def _gmail_label_revision(payload: dict[str, object]) -> int:
 def _require_active_gmail_label_account(
     runtime: Runtime,
     payload: dict[str, object],
+    *,
+    require_connected: bool = True,
 ) -> MailAccount:
     provider, account_id = _gmail_label_account_key(payload)
     account = runtime.store.mail_account(provider, account_id)
@@ -907,7 +909,7 @@ def _require_active_gmail_label_account(
     active = runtime.store.active_mail_account()
     if active is None or (active.provider, active.account_id) != (provider, account_id):
         raise ApiError("account_not_active", "The Gmail account is not active")
-    if not mail_account_connected(runtime.config, account):
+    if require_connected and not mail_account_connected(runtime.config, account):
         raise ApiError("account_unavailable", "The active Gmail account is disconnected")
     return account
 
@@ -1050,44 +1052,40 @@ def _gmail_label_selectors_list(request: dict[str, object]) -> dict[str, object]
     _gmail_label_account_key(payload)
 
     def list_selectors(runtime: Runtime) -> dict[str, object]:
-        account, mailbox, identity_key = _gmail_label_session(runtime, payload)
+        account = _require_active_gmail_label_account(
+            runtime,
+            payload,
+            require_connected=False,
+        )
+        identity_key = account.mailbox_identity_key
+        if identity_key is None:
+            raise ApiError(
+                "account_unavailable",
+                "The active Gmail account has no stored mailbox identity",
+            )
         selector_set = runtime.store.gmail_label_selector_set(account.account_id)
-        if selector_set is None or selector_set.current_mailbox_identity_key != identity_key:
-            raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed")
+        if selector_set is None:
+            return {
+                "provider": DEFAULT_MAIL_PROVIDER,
+                "account_id": account.account_id,
+                "revision": 0,
+                "catalog_state": "current",
+                "items": [],
+            }
         selectors = runtime.store.gmail_label_selectors(account.account_id)
-        catalog_state = "current"
-        labels_by_id: dict[str, GmailLabel] = {}
-        try:
-            labels_by_id = {label.label_id: label for label in _read_gmail_label_catalog(mailbox)}
-        except ApiError as exc:
-            if exc.code == "gmail_label_catalog_invalid":
-                catalog_state = "invalid_catalog"
-            elif exc.code == "gmail_label_catalog_unavailable":
-                catalog_state = "unavailable"
-            else:
-                raise
+        selector_set_is_current = selector_set.current_mailbox_identity_key == identity_key
+        catalog_state = "current" if selector_set_is_current else "unavailable"
         items: list[dict[str, object]] = []
         for selector in selectors:
-            display_name = selector.selected_display_name
-            if selector.mailbox_identity_key != identity_key:
+            if not selector_set_is_current or selector.mailbox_identity_key != identity_key:
                 status = "identity_mismatch"
-            elif catalog_state != "current":
-                status = "validation_unavailable"
             else:
-                label = labels_by_id.get(selector.label_id)
-                if label is None:
-                    status = "deleted"
-                elif label.label_type != "user":
-                    status = "not_user"
-                    display_name = label.display_name
-                else:
-                    status = "active"
-                    display_name = label.display_name
+                status = "active"
             items.append(
                 _gmail_selector_public(
                     selector,
                     status=status,
-                    display_name=display_name,
+                    display_name=selector.selected_display_name,
                 )
             )
         return {
