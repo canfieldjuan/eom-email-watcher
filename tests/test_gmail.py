@@ -590,7 +590,7 @@ def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
         (
             403,
             b'{"error":{"errors":[{"reason":"quotaExceeded"}]}}',
-            gmail_module.GmailLabelCatalogUnavailable,
+            GmailAuthorizationRejected,
         ),
         (
             403,
@@ -605,11 +605,22 @@ def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
         (
             403,
             b'{"error":{"errors":[{"reason":"quotaExceeded"},{"reason":"rateLimitExceeded"}]}}',
+            GmailAuthorizationRejected,
+        ),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"},{"reason":"userRateLimitExceeded"}]}}',
             gmail_module.GmailLabelCatalogUnavailable,
         ),
         (
             403,
             b'{"error":{"message":"private provider body","errors":[{"reason":"forbidden"}]}}',
+            GmailAuthorizationRejected,
+        ),
+        (403, b'{"error":{"errors":[]}}', GmailAuthorizationRejected),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}',
             GmailAuthorizationRejected,
         ),
         (403, b'{"error":{"errors":[{"reason":"unknownReason"}]}}', GmailAuthorizationRejected),

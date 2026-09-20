@@ -29,6 +29,8 @@ enum ScheduledCheckStatus {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ScheduledCheckEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox_operation_revision: Option<u64>,
     status: ScheduledCheckStatus,
     failed_notifications: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,9 +169,14 @@ impl ConnectQueueScheduler {
 }
 
 impl ScheduledCheckEvent {
-    fn from_check(check: &CheckResult, failed_notifications: u64) -> Self {
+    fn from_check(
+        check: &CheckResult,
+        failed_notifications: u64,
+        mailbox_operation_revision: u64,
+    ) -> Self {
         let recovery_pending = check.recovery_pending == Some(true);
         Self {
+            mailbox_operation_revision: Some(mailbox_operation_revision),
             status: if recovery_pending {
                 ScheduledCheckStatus::RecoveryPending
             } else if !check.active && check.reason.is_some() {
@@ -198,6 +205,7 @@ impl ScheduledCheckEvent {
 
     fn check_failed(error: &EngineError) -> Self {
         Self {
+            mailbox_operation_revision: error.mailbox_operation_revision,
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
             reason: None,
@@ -306,6 +314,7 @@ impl PollScheduler {
                         ScheduledCheckEvent::from_check(
                             &outcome.check,
                             outcome.delivery.failed,
+                            outcome.mailbox_operation_revision,
                         )
                     }
                     Err(error) => {
@@ -392,8 +401,9 @@ mod tests {
     fn scheduled_event_distinguishes_delivery_failure_from_complete_check() {
         let check = check_result_with_recovery(None, None, None);
         assert_eq!(
-            ScheduledCheckEvent::from_check(&check, 2),
+            ScheduledCheckEvent::from_check(&check, 2, 7),
             ScheduledCheckEvent {
+                mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::DeliveryFailed,
                 failed_notifications: 2,
                 reason: None,
@@ -406,8 +416,9 @@ mod tests {
             }
         );
         assert_eq!(
-            ScheduledCheckEvent::from_check(&check, 0),
+            ScheduledCheckEvent::from_check(&check, 0, 7),
             ScheduledCheckEvent {
+                mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::Complete,
                 failed_notifications: 0,
                 reason: None,
@@ -420,9 +431,10 @@ mod tests {
             }
         );
         assert_eq!(
-            serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2))
+            serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2, 7))
                 .expect("serialize event"),
             serde_json::json!({
+                "mailbox_operation_revision": 7,
                 "status": "delivery_failed",
                 "failed_notifications": 2,
             })
@@ -436,11 +448,13 @@ mod tests {
                 code: "gmail_authorization_rejected".to_owned(),
                 message: "provider detail must stay private".to_owned(),
                 retryable,
+                mailbox_operation_revision: Some(11),
             };
             let event = serde_json::to_value(ScheduledCheckEvent::check_failed(&error))
                 .expect("serialize scheduled error");
             assert_eq!(event["status"], "check_failed");
             assert_eq!(event["error_code"], "gmail_authorization_rejected");
+            assert_eq!(event["mailbox_operation_revision"], 11);
             assert_eq!(
                 event["error_retryable"],
                 retryable.map_or(serde_json::Value::Null, serde_json::Value::Bool)
@@ -455,7 +469,7 @@ mod tests {
         check.active = false;
         check.reason = Some("gmail_label_selectors_inactive".to_owned());
 
-        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0))
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0, 0))
             .expect("serialize scheduled inactive event");
 
         assert_eq!(event["status"], "inactive");
@@ -468,7 +482,7 @@ mod tests {
         let mut check = check_result_with_recovery(None, None, None);
         check.reason = Some("recovery_truncated".to_owned());
 
-        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0))
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0, 0))
             .expect("serialize scheduled active result reason");
 
         assert_eq!(event["status"], "complete");
@@ -491,7 +505,7 @@ mod tests {
             ),
         ] {
             let check = check_result_with_recovery(Some(state), failure_code, next_retry_at);
-            let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2))
+            let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2, 0))
                 .expect("serialize scheduled recovery event");
 
             assert_eq!(event["status"], "recovery_pending");

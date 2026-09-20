@@ -349,11 +349,13 @@ interface GmailLabelSenderCountState {
 interface MailAccounts {
   providers: MailProviderStatus[];
   accounts: MailAccountStatus[];
+  mailbox_operation_revision?: number;
 }
 
 interface MailAccountResult {
   account: MailAccountStatus;
   baseline_initialized?: boolean;
+  mailbox_operation_revision: number;
 }
 
 interface CalendarConsentEntry {
@@ -420,6 +422,7 @@ interface CheckResult extends GmailRecoveryStatus {
 }
 
 interface ScheduledCheckEvent extends GmailRecoveryStatus {
+  mailbox_operation_revision?: number;
   status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending" | "inactive";
   failed_notifications: number;
   reason?: string;
@@ -921,6 +924,23 @@ let gmailLabelSenderCount: GmailLabelSenderCountState = {
   count: null,
   observation_version: 0,
 };
+let mailboxOperationRevision = 0;
+let mailboxOperationRevisionReady = false;
+
+function observeMailboxOperationRevision(revision: number): void {
+  if (!Number.isSafeInteger(revision) || revision < 0) return;
+  mailboxOperationRevision = Math.max(mailboxOperationRevision, revision);
+  mailboxOperationRevisionReady = true;
+}
+
+function scheduledCheckEventIsCurrent(event: ScheduledCheckEvent): boolean {
+  if (!mailboxOperationRevisionReady) return false;
+  const revision = event.mailbox_operation_revision;
+  if (revision === undefined || !Number.isSafeInteger(revision) || revision < 0) return false;
+  if (revision < mailboxOperationRevision) return false;
+  mailboxOperationRevision = revision;
+  return true;
+}
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -2957,6 +2977,7 @@ async function connectMailProvider(provider: string): Promise<void> {
   delete healthStatus.dataset.kind;
   try {
     const result = await invoke<MailAccountResult>("mail_account_connect", { provider });
+    observeMailboxOperationRevision(result.mailbox_operation_revision);
     const message = result.baseline_initialized
       ? "Email account connected. Watching begins from its current mailbox state."
       : "Email account connected. Its saved mailbox position was preserved.";
@@ -3000,6 +3021,7 @@ async function submitMailServerConnection(): Promise<void> {
           provider: provider.provider,
           connection,
         });
+    observeMailboxOperationRevision(result.mailbox_operation_revision);
     const message = result.baseline_initialized
       ? "Mail server connected. Watching begins from its current mailbox state."
       : "Mail server connected. Its saved mailbox position was preserved.";
@@ -3021,10 +3043,11 @@ async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
   healthStatus.textContent = "Complete email authorization in your browser…";
   delete healthStatus.dataset.kind;
   try {
-    await invoke<MailAccountResult>("mail_account_reconnect", {
+    const result = await invoke<MailAccountResult>("mail_account_reconnect", {
       provider: account.provider,
       accountId: account.account_id,
     });
+    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account reconnected. Its saved mailbox position was preserved.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
@@ -3045,10 +3068,11 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    await invoke<MailAccountResult>("mail_account_disconnect", {
+    const result = await invoke<MailAccountResult>("mail_account_disconnect", {
       provider: account.provider,
       accountId: account.account_id,
     });
+    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account disconnected. Its local history was retained.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
@@ -3065,10 +3089,11 @@ async function activateMailAccount(account: MailAccountStatus): Promise<void> {
   mailOperationInFlight = true;
   renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    await invoke<MailAccountResult>("mail_account_activate", {
+    const result = await invoke<MailAccountResult>("mail_account_activate", {
       provider: account.provider,
       accountId: account.account_id,
     });
+    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Active email account changed.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
@@ -3089,6 +3114,8 @@ async function loadMailAccounts(): Promise<boolean> {
     ) {
       return false;
     }
+    if (accounts.mailbox_operation_revision === undefined) return false;
+    observeMailboxOperationRevision(accounts.mailbox_operation_revision);
     renderMailAccounts(accounts);
     return true;
   } catch (error) {
@@ -4067,6 +4094,7 @@ inboxClear.addEventListener("click", () => void clearInboxHistory());
 checkNow.addEventListener("click", () => void runCheck());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
 void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
+  if (!configurationReady || !scheduledCheckEventIsCurrent(event.payload)) return;
   void loadInbox();
   if (!healthView.hidden) {
     const recoveryMessage = recoveryStatusMessage({

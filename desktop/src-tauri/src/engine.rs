@@ -280,8 +280,13 @@ pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
-    mailbox_operation_gate: Arc<Mutex<()>>,
+    mailbox_operation_gate: Arc<Mutex<MailboxOperationState>>,
     request_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct MailboxOperationState {
+    revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -722,6 +727,8 @@ pub struct GmailHealth {
 pub struct GmailAuthorization {
     pub baseline_initialized: bool,
     pub connected: bool,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -754,6 +761,8 @@ pub struct MailAccountStatus {
 pub struct MailAccounts {
     pub providers: Vec<MailProviderStatus>,
     pub accounts: Vec<MailAccountStatus>,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -844,6 +853,8 @@ pub struct MailAccountResult {
     pub account: MailAccountStatus,
     #[serde(default)]
     pub baseline_initialized: Option<bool>,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -887,6 +898,12 @@ pub struct CheckResult {
     pub recovery_failure_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_next_retry_at: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MailboxCheckResult {
+    pub check: CheckResult,
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -934,6 +951,8 @@ pub struct EngineError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_operation_revision: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -994,6 +1013,7 @@ impl EngineError {
             code: code.to_owned(),
             message: message.into(),
             retryable: None,
+            mailbox_operation_revision: None,
         }
     }
 
@@ -1020,7 +1040,7 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
-                mailbox_operation_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 request_timeout: None,
             });
         }
@@ -1032,7 +1052,7 @@ impl Engine {
                 program: packaged_program,
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
-                mailbox_operation_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 request_timeout: None,
             });
         }
@@ -1050,7 +1070,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
-            mailbox_operation_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             request_timeout: None,
         })
     }
@@ -1065,7 +1085,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
-            mailbox_operation_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             request_timeout: None,
         }
     }
@@ -1235,16 +1255,46 @@ impl Engine {
         )
     }
 
-    pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
+    fn lock_mailbox_operation(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, MailboxOperationState>, EngineError> {
+        self.mailbox_operation_gate
             .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request("gmail.authorize", json!({}))
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))
+    }
+
+    fn complete_mailbox_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+        stamp_revision: impl FnOnce(&mut T, u64),
+    ) -> Result<T, EngineError> {
+        let mut state = self.lock_mailbox_operation()?;
+        let next_revision = state.revision.checked_add(1).ok_or_else(|| {
+            EngineError::host(
+                "host_error",
+                "Email account operation revision is exhausted",
+            )
+        })?;
+        let mut result = operation()?;
+        state.revision = next_revision;
+        stamp_revision(&mut result, next_revision);
+        Ok(result)
+    }
+
+    pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
+        self.complete_mailbox_mutation(
+            || self.request("gmail.authorize", json!({})),
+            |result: &mut GmailAuthorization, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
     }
 
     pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
-        self.request("mail.accounts.list", json!({}))
+        let state = self.lock_mailbox_operation()?;
+        let mut result: MailAccounts = self.request("mail.accounts.list", json!({}))?;
+        result.mailbox_operation_revision = state.revision;
+        Ok(result)
     }
 
     pub fn gmail_label_catalog(
@@ -1440,15 +1490,16 @@ impl Engine {
         provider: String,
         connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         let payload = match connection {
             Some(connection) => json!({"provider": provider, "connection": connection}),
             None => json!({"provider": provider}),
         };
-        self.request("mail.accounts.connect", payload)
+        self.complete_mailbox_mutation(
+            || self.request("mail.accounts.connect", payload),
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
     }
 
     pub fn reconnect_mail_account(
@@ -1457,10 +1508,6 @@ impl Engine {
         account_id: String,
         connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         let payload = match connection {
             Some(connection) => json!({
                 "provider": provider,
@@ -1469,7 +1516,12 @@ impl Engine {
             }),
             None => json!({"provider": provider, "account_id": account_id}),
         };
-        self.request("mail.accounts.reconnect", payload)
+        self.complete_mailbox_mutation(
+            || self.request("mail.accounts.reconnect", payload),
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
     }
 
     pub fn disconnect_mail_account(
@@ -1477,13 +1529,16 @@ impl Engine {
         provider: String,
         account_id: String,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request(
-            "mail.accounts.disconnect",
-            json!({"provider": provider, "account_id": account_id}),
+        self.complete_mailbox_mutation(
+            || {
+                self.request(
+                    "mail.accounts.disconnect",
+                    json!({"provider": provider, "account_id": account_id}),
+                )
+            },
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
         )
     }
 
@@ -1492,13 +1547,16 @@ impl Engine {
         provider: String,
         account_id: String,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request(
-            "mail.accounts.activate",
-            json!({"provider": provider, "account_id": account_id}),
+        self.complete_mailbox_mutation(
+            || {
+                self.request(
+                    "mail.accounts.activate",
+                    json!({"provider": provider, "account_id": account_id}),
+                )
+            },
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
         )
     }
 
@@ -1565,12 +1623,24 @@ impl Engine {
         engine
     }
 
+    #[cfg(test)]
     pub fn check(&self) -> Result<CheckResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.check_with_mailbox_revision()
+            .map(|result| result.check)
+    }
+
+    pub(crate) fn check_with_mailbox_revision(&self) -> Result<MailboxCheckResult, EngineError> {
+        let state = self.lock_mailbox_operation()?;
+        let mailbox_operation_revision = state.revision;
         self.request("watcher.check", json!({"dry_run": false}))
+            .map(|check| MailboxCheckResult {
+                check,
+                mailbox_operation_revision,
+            })
+            .map_err(|mut error| {
+                error.mailbox_operation_revision = Some(mailbox_operation_revision);
+                error
+            })
     }
 
     pub(crate) fn run_with_operation_lock<T>(
@@ -1891,6 +1961,7 @@ mod tests {
             code: "configuration_error".into(),
             message: "Configuration not found: /home/private/config.toml".into(),
             retryable: Some(false),
+            mailbox_operation_revision: None,
         };
 
         assert_eq!(
@@ -1899,6 +1970,7 @@ mod tests {
                 code: "configuration_error".into(),
                 message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
                 retryable: Some(false),
+                mailbox_operation_revision: None,
             }
         );
     }
@@ -2302,6 +2374,7 @@ mod tests {
             GmailAuthorization {
                 baseline_initialized: true,
                 connected: true,
+                mailbox_operation_revision: 0,
             }
         );
     }
@@ -3012,6 +3085,112 @@ esac"#,
                 .active
         );
         assert!(check_started.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mailbox_account_mutations_advance_stamped_check_revision() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *watcher.check*)
+    printf '%s\n' '{"protocol":1,"ok":false,"operation":"watcher.check","error":{"code":"gmail_authorization_rejected","message":"private provider detail","retryable":false}}'
+    ;;
+  *gmail.authorize*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.authorize","data":{"baseline_initialized":true,"connected":true}}'
+    ;;
+  *mail.accounts.list*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.list","data":{"providers":[],"accounts":[]}}'
+    ;;
+  *mail.accounts.connect*) operation=mail.accounts.connect ;;
+  *mail.accounts.reconnect*account_id*fail*)
+    printf '%s\n' '{"protocol":1,"ok":false,"operation":"mail.accounts.reconnect","error":{"code":"gmail_authorization_rejected","message":"safe reconnect failure","retryable":false}}'
+    ;;
+  *mail.accounts.reconnect*) operation=mail.accounts.reconnect ;;
+  *mail.accounts.disconnect*) operation=mail.accounts.disconnect ;;
+  *mail.accounts.activate*) operation=mail.accounts.activate ;;
+esac
+if [ -n "$operation" ]; then
+  printf '%s\n' "{\"protocol\":1,\"ok\":true,\"operation\":\"$operation\",\"data\":{\"account\":{\"provider\":\"gmail\",\"account_id\":\"gmail-default\",\"display_name\":\"Gmail\",\"address\":\"owner@example.com\",\"connected\":true,\"active\":true,\"last_check\":null},\"baseline_initialized\":false}}"
+fi"#,
+                ),
+                OsString::from("engine-mailbox-revision-probe"),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let initial_failure = engine
+            .check_with_mailbox_revision()
+            .expect_err("initial scheduled failure");
+        assert_eq!(initial_failure.mailbox_operation_revision, Some(0));
+
+        assert_eq!(
+            engine
+                .connect_mail_provider("gmail".into(), None)
+                .expect("connect account")
+                .mailbox_operation_revision,
+            1
+        );
+        assert_eq!(
+            engine
+                .reconnect_mail_account("gmail".into(), "fail".into(), None)
+                .expect_err("failed reconnect")
+                .code,
+            "gmail_authorization_rejected"
+        );
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("failed mutation leaves account revision unchanged")
+                .mailbox_operation_revision,
+            1
+        );
+        assert_eq!(
+            engine
+                .reconnect_mail_account("gmail".into(), "gmail-default".into(), None)
+                .expect("reconnect account")
+                .mailbox_operation_revision,
+            2
+        );
+        assert_eq!(
+            engine
+                .disconnect_mail_account("gmail".into(), "gmail-default".into())
+                .expect("disconnect account")
+                .mailbox_operation_revision,
+            3
+        );
+        assert_eq!(
+            engine
+                .activate_mail_account("gmail".into(), "gmail-default".into())
+                .expect("activate account")
+                .mailbox_operation_revision,
+            4
+        );
+        assert_eq!(
+            engine
+                .authorize_gmail()
+                .expect("authorize Gmail")
+                .mailbox_operation_revision,
+            5
+        );
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("read stamped account catalog")
+                .mailbox_operation_revision,
+            5
+        );
+
+        let current_failure = engine
+            .check_with_mailbox_revision()
+            .expect_err("current scheduled failure");
+        assert_eq!(current_failure.mailbox_operation_revision, Some(5));
+        assert_eq!(current_failure.code, "gmail_authorization_rejected");
+        assert_eq!(current_failure.retryable, Some(false));
     }
 
     fn real_engine(config_path: PathBuf) -> Engine {

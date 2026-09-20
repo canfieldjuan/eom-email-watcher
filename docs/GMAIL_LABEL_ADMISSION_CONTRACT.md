@@ -491,13 +491,20 @@ Result:
 }
 ```
 
-Transient Gmail/catalog failure returns retryable
-`gmail_label_catalog_unavailable`. A transport byte overflow, malformed or
-partial JSON document, decoded item-count overflow, unknown label type,
-malformed item, duplicate ID, or canonical byte overflow rejects the whole
-snapshot with stable `gmail_label_catalog_invalid`; it never becomes a partial
-result.
-Rejected/disconnected credentials return `account_unavailable`;
+For Gmail HTTP 403, only `rateLimitExceeded` and `userRateLimitExceeded` are
+transient. A nonempty reason set containing only those two values returns
+retryable `gmail_label_catalog_unavailable`. A 401 is rejected without reading
+its response body. A 403 with a missing, malformed, permission, unknown,
+`quotaExceeded`, or mixed transient/stable reason set returns stable,
+nonretryable `gmail_authorization_rejected`. The manual catalog refresh and
+scheduled discovery paths expose the same public code and retryability, and
+neither exposes the provider response body.
+
+A transport byte overflow, malformed or partial successful JSON document,
+decoded item-count overflow, unknown label type, malformed item, duplicate ID,
+or canonical byte overflow rejects the whole snapshot with stable
+`gmail_label_catalog_invalid`; it never becomes a partial result. Locally
+disconnected or absent credentials return `account_unavailable`;
 account/provider mismatch returns `account_not_active`, `not_found`, or
 `unsupported_provider`. No selector or mailbox cursor changes, except that an
 identity replacement already detected by established reconciliation performs
@@ -602,6 +609,7 @@ Result:
 Stable errors are `stale_revision`, `conflict`, `limit_exceeded`,
 `invalid_request`, `label_not_found`, `label_not_user`,
 `gmail_label_catalog_invalid`, `gmail_label_catalog_unavailable`,
+`gmail_authorization_rejected`,
 `account_not_active`, `account_unavailable`, and
 `mailbox_identity_changed`. Every failure leaves selector rows and revision
 unchanged, except an independently required identity-reconciliation transaction
@@ -951,7 +959,8 @@ their active Gmail incremental request still uses the same broad stable stream.
 If current-identity selector rows exist but the catalog cannot be completed,
 the discovery round fails closed with retryable
 `gmail_label_catalog_unavailable` or stable
-`gmail_label_catalog_invalid`: no new history/recovery request, body fetch,
+`gmail_label_catalog_invalid`, or stable nonretryable
+`gmail_authorization_rejected`: no new history/recovery request, body fetch,
 model call, cursor advance, or message write occurs. Already admitted pending
 work may continue from persisted provenance. A union sender-plus-label
 configuration delays new exact-sender discovery in that failed round so the

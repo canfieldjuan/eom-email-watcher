@@ -55,7 +55,7 @@ MAX_GMAIL_PAGE_TOKEN_BYTES = 8_192
 GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels"
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
 TRANSIENT_GMAIL_LABEL_403_REASONS = frozenset(
-    {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
+    {"rateLimitExceeded", "userRateLimitExceeded"}
 )
 
 

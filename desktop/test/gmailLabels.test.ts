@@ -5,6 +5,10 @@ import test from "node:test";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+const contract = await readFile(
+  new URL("../../docs/GMAIL_LABEL_ADMISSION_CONTRACT.md", import.meta.url),
+  "utf8",
+);
 
 function gmailLabelLoadHarness(
   invoke: (operation: string) => Promise<Record<string, unknown>>,
@@ -191,6 +195,90 @@ test("Gmail authorization and throttling keep distinct operator guidance", () =>
   assert.match(scheduledMessage({ error_retryable: false }), /manual attention/);
   assert.match(scheduledMessage({}), /Open Health/);
   assert.doesNotMatch(scheduledMessage({}), /retry on schedule/);
+});
+
+test("scheduled check events cannot overwrite a newer mailbox account operation", () => {
+  const helpers = source.match(
+    /let mailboxOperationRevision = 0;([\s\S]*?)\n\nfunction errorMessage/,
+  );
+  assert.ok(helpers);
+  const executableHelpers = helpers[1]
+    .replace(/revision: number/g, "revision")
+    .replace(/event: ScheduledCheckEvent/g, "event")
+    .replace(/\): void/g, ")")
+    .replace(/\): boolean/g, ")");
+  const harness = Function(
+    `let mailboxOperationRevision = 0;${executableHelpers}
+     return {
+       observe: observeMailboxOperationRevision,
+       accepts: scheduledCheckEventIsCurrent,
+       current: () => mailboxOperationRevision,
+     };`,
+  )() as {
+    observe: (revision: number) => void;
+    accepts: (event: { mailbox_operation_revision?: number }) => boolean;
+    current: () => number;
+  };
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+  harness.observe(1);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+  assert.equal(harness.current(), 2);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+  assert.equal(harness.accepts({}), false);
+
+  const listener = source.match(
+    /listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(listener);
+  assert.ok(
+    listener[1].indexOf("scheduledCheckEventIsCurrent(event.payload)") <
+      listener[1].indexOf("loadInbox()"),
+  );
+  assert.match(listener[1], /if \(!configurationReady/);
+  assert.match(
+    source,
+    /observeMailboxOperationRevision\(accounts\.mailbox_operation_revision\);[\s\S]*renderMailAccounts\(accounts\)/,
+  );
+
+  for (const operation of [
+    "connectMailProvider",
+    "submitMailServerConnection",
+    "reconnectMailAccount",
+    "disconnectMailAccount",
+    "activateMailAccount",
+  ]) {
+    const start = source.indexOf(`async function ${operation}`);
+    assert.notEqual(start, -1);
+    const next = source.indexOf("\nasync function ", start + 1);
+    const body = source.slice(start, next === -1 ? source.length : next);
+    assert.match(body, /observeMailboxOperationRevision\(result\.mailbox_operation_revision\)/);
+    assert.ok(
+      body.indexOf("observeMailboxOperationRevision(result.mailbox_operation_revision)") <
+        body.indexOf("refreshAfterMailMutation"),
+      `${operation} must observe the mutation revision before refreshing health`,
+    );
+  }
+});
+
+test("label admission contract publishes exact Gmail authorization retry semantics", () => {
+  assert.match(
+    contract,
+    /only `rateLimitExceeded` and `userRateLimitExceeded`[\s\S]*retryable `gmail_label_catalog_unavailable`/,
+  );
+  assert.match(
+    contract,
+    /missing, malformed, permission, unknown,\s+`quotaExceeded`, or mixed[\s\S]*nonretryable `gmail_authorization_rejected`/,
+  );
+  assert.match(
+    contract,
+    /manual catalog refresh and\s+scheduled discovery[\s\S]*same public code and retryability/,
+  );
 });
 
 test("active account generation invalidates late Gmail label responses", () => {
