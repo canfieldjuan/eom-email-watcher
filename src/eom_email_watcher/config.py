@@ -475,14 +475,7 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
 
 
 def load_config(path: Path | None = None) -> Config:
-    config_path = (path or DEFAULT_CONFIG).expanduser()
-    try:
-        content = config_path.read_bytes()
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
-        ) from exc
-    return _load_config_bytes(content, config_path)
+    return _load_runtime_config(path or DEFAULT_CONFIG)
 
 
 def _absolute_lexical_path(path: Path) -> Path:
@@ -641,39 +634,53 @@ def _non_posix_admission_file_is_safe(file_stat: os.stat_result) -> bool:
     )
 
 
+def _read_recovered_posix_config_at(
+    absolute: Path,
+    parent_fd: int,
+    name: str,
+) -> tuple[Path, os.stat_result, bytes]:
+    file_fd: int | None = None
+    try:
+        recovery = _recover_ntfy_transaction_at(
+            parent_fd,
+            name,
+            parent_path=absolute.parent,
+        )
+        if recovery in {"unsupported", "manual_artifact"}:
+            raise _UnsafeConfigPath
+        parent = _validate_held_parent(
+            parent_fd,
+            parent_path=absolute.parent,
+        )
+        file_fd, identity, content = _read_safe_file_at(parent_fd, name)
+        _validate_held_parent(parent_fd, parent)
+        current = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if _safe_file_version(current) != _safe_file_version(identity):
+            raise _UnsafeConfigPath
+        return absolute, identity, content
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+
 def _read_admission_config(
     path: Path,
 ) -> tuple[Path, os.stat_result, bytes]:
     absolute = _absolute_lexical_path(path)
     if os.name == "posix":
         absolute, parent_fd, name = _open_safe_parent(absolute)
-        file_fd: int | None = None
         try:
             with FileLock(f"{absolute}.lock"):
-                recovery = _recover_ntfy_transaction_at(
+                return _read_recovered_posix_config_at(
+                    absolute,
                     parent_fd,
                     name,
-                    parent_path=absolute.parent,
                 )
-                if recovery in {"unsupported", "manual_artifact"}:
-                    raise _UnsafeConfigPath
-                parent = _validate_held_parent(
-                    parent_fd,
-                    parent_path=absolute.parent,
-                )
-                file_fd, identity, content = _read_safe_file_at(parent_fd, name)
-                _validate_held_parent(parent_fd, parent)
-                current = os.stat(
-                    name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-                if _safe_file_version(current) != _safe_file_version(identity):
-                    raise _UnsafeConfigPath
-                return absolute, identity, content
         finally:
-            if file_fd is not None:
-                os.close(file_fd)
             os.close(parent_fd)
 
     try:
@@ -715,6 +722,86 @@ def _read_admission_config(
         raise _UnsafeConfigPath from exc
     finally:
         os.close(file_fd)
+
+
+def _read_admission_config_under_lock(
+    path: Path,
+) -> tuple[Path, os.stat_result, bytes]:
+    if os.name != "posix":
+        return _read_admission_config(path)
+    absolute, parent_fd, name = _open_safe_parent(path)
+    try:
+        return _read_recovered_posix_config_at(
+            absolute,
+            parent_fd,
+            name,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _load_runtime_config_from_reader(
+    config_path: Path,
+    reader: Callable[[], tuple[Path, os.stat_result, bytes]],
+) -> Config:
+    try:
+        absolute, _file_stat, content = reader()
+    except _MissingConfigPath as exc:
+        raise ConfigError(
+            f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
+        ) from exc
+    except (OSError, _UnsafeConfigPath) as exc:
+        raise ConfigError(
+            "Configuration is unavailable or requires manual repair"
+        ) from exc
+    return _load_config_bytes(content, absolute)
+
+
+def _load_runtime_config(path: Path, *, lock_held: bool = False) -> Config:
+    config_path = path.expanduser()
+    absolute = _absolute_lexical_path(config_path)
+    if lock_held:
+        return _load_runtime_config_from_reader(
+            config_path,
+            lambda: _read_admission_config_under_lock(absolute),
+        )
+    if os.name == "posix":
+        try:
+            absolute, parent_fd, name = _open_safe_parent(absolute)
+        except _MissingConfigPath as exc:
+            raise ConfigError(
+                f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
+            ) from exc
+        except (OSError, _UnsafeConfigPath) as exc:
+            raise ConfigError(
+                "Configuration is unavailable or requires manual repair"
+            ) from exc
+        try:
+            with FileLock(f"{absolute}.lock"):
+                return _load_runtime_config_from_reader(
+                    config_path,
+                    lambda: _read_recovered_posix_config_at(
+                        absolute,
+                        parent_fd,
+                        name,
+                    ),
+                )
+        except OSError as exc:
+            raise ConfigError(
+                "Configuration is unavailable or requires manual repair"
+            ) from exc
+        finally:
+            os.close(parent_fd)
+    try:
+        with FileLock(f"{absolute}.lock"):
+            return _load_runtime_config_from_reader(
+                config_path,
+                lambda: _read_admission_config_under_lock(absolute),
+            )
+    except OSError as exc:
+        raise ConfigError(
+            "Configuration is unavailable or requires manual repair"
+        ) from exc
 
 
 def _config_admission_token(
@@ -2766,7 +2853,7 @@ def acknowledge_ntfy_disclosure(
                         )
                 finally:
                     final_handle.close()
-                load_config(absolute)
+                _load_runtime_config(absolute, lock_held=True)
                 confirmed_handle = _open_safe_config(absolute)
                 try:
                     if confirmed_handle.content != candidate:
@@ -3026,8 +3113,10 @@ def _sender_table(sender: Sender, *, inline: bool):
 def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
     sender = _sender(email, name, invalid_message="email must be a valid email address")
     config_path = path.expanduser().resolve()
+    if not config_path.exists():
+        load_config(config_path)
     with FileLock(f"{config_path}.lock"):
-        config = load_config(config_path)
+        config = _load_runtime_config(config_path, lock_held=True)
         if sender.email in config.allowlist:
             raise DuplicateSenderError(f"Sender is already watched: {sender.email}")
         document = parse(config_path.read_text(encoding="utf-8"))
@@ -3048,8 +3137,10 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
 def remove_sender(path: Path, email: str) -> Sender:
     requested = _sender(email, None, invalid_message="email must be a valid email address")
     config_path = path.expanduser().resolve()
+    if not config_path.exists():
+        load_config(config_path)
     with FileLock(f"{config_path}.lock"):
-        config = load_config(config_path)
+        config = _load_runtime_config(config_path, lock_held=True)
         try:
             index = next(
                 index
@@ -3118,9 +3209,11 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
         normalized_updates["model_name"] = normalized_model_name
 
     config_path = path.expanduser().resolve()
+    if not config_path.exists():
+        load_config(config_path)
     try:
         with FileLock(f"{config_path}.lock"):
-            config = load_config(config_path)
+            config = _load_runtime_config(config_path, lock_held=True)
             if {
                 "model_base_url",
                 "model_name",
@@ -3132,7 +3225,7 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
             for key, value in normalized_updates.items():
                 document[key] = value
             _atomic_write(config_path, dumps(document))
-            return load_config(config_path)
+            return _load_runtime_config(config_path, lock_held=True)
     except FileNotFoundError:
         load_config(config_path)
         raise

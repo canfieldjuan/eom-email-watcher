@@ -268,6 +268,24 @@ replacement path. Disclosure acknowledgement uses the stronger exchange and
 recovery protocol because it must prove compare-and-swap disposition of both
 the new config and displaced secret-bearing original.
 
+Every normal runtime config load is also a transaction recovery boundary. The
+public `load_config` path acquires the same config lock, safely opens the held
+parent, reconciles any marker, disposition, candidate, or unsupported sentinel,
+and only then parses bytes read from the recovered current file descriptor.
+Callers that already hold the config lock use the same recovery and same-fd read
+primitive without recursively acquiring the lock. The disclosure status and
+acknowledgement operations continue to use their internal inspection primitives
+so they can classify and repair transaction states without entering the public
+loader recursively.
+
+Therefore the systemd service path (`eom-mail-watch check`), human CLI, engine
+operations, and runtime construction cannot consume an acknowledgement or topic
+while transaction artifacts remain unresolved. A proven committed exchange is
+cleaned and admitted. A displaced mismatch is rolled back before parsing, so a
+manual concurrent replacement remains live. Ambiguous, tampered, unsafe, or
+unsupported recovery returns one fixed configuration error with no path, topic,
+operating-system detail, or parsed config values, and no runtime effect occurs.
+
 The durability invariant is **exact old bytes or fully prevalidated new bytes**.
 A failure before exchange leaves the exact old config at the path and removes
 only files whose marker provenance and identities prove they belong to that
@@ -493,6 +511,11 @@ behavior and then pass without weakening `load_config`:
    rollback, rollback response loss, repeated recovery, candidate/disposition
    tamper, and topic-removing manual replacement never grant consent or hide or
    delete the manual entry.
+   A process killed immediately after an exchange with a concurrent manual
+   topic removal is followed directly by the exact systemd/CLI check path,
+   without a prior status call; recovery restores the exact manual bytes before
+   config parsing, no old topic reaches notification delivery, and ambiguous or
+   tampered recovery stops with the generic configuration error.
 9. **Indeterminate reconciliation:** success, conflict, `outcome_unknown`,
    timeout, broken pipe, and response loss all refresh status and normal
    admission. A loadable acknowledged result proceeds, a remaining repairable

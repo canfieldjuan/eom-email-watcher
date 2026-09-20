@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 import eom_email_watcher.config as config_module
-from eom_email_watcher import engine_api
+import eom_email_watcher.notifications as notifications_module
+from eom_email_watcher import cli, engine_api
 from eom_email_watcher.config import ConfigError, load_config, ntfy_disclosure_status
 
 TOPIC = "YOUR_NTFY_TOPIC_0123456789"
@@ -259,6 +260,42 @@ def test_non_posix_admission_rejects_atomic_swap_during_same_fd_read(
         "message": "Configuration admission snapshot is unavailable",
     }
     assert str(path) not in json.dumps(response)
+
+
+def test_non_posix_runtime_load_rejects_atomic_swap_generically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "sensitive-config-name.toml"
+    original = _write_bytes(path, _config_bytes(topic=None))
+
+    class NonPosixOsProxy:
+        name = "nt"
+
+        def __getattr__(self, attribute: str):
+            return getattr(os, attribute)
+
+    real_read = config_module._read_fd_bytes
+    swapped = False
+
+    def swap_after_read(file_fd: int) -> bytes:
+        nonlocal swapped
+        content = real_read(file_fd)
+        if not swapped:
+            replacement = tmp_path / "replacement.toml"
+            _write_bytes(replacement, original)
+            os.replace(replacement, path)
+            swapped = True
+        return content
+
+    monkeypatch.setattr(config_module, "os", NonPosixOsProxy())
+    monkeypatch.setattr(config_module, "_read_fd_bytes", swap_after_read)
+
+    with pytest.raises(ConfigError) as raised:
+        load_config(path)
+
+    assert str(raised.value) == "Configuration is unavailable or requires manual repair"
+    assert str(path) not in str(raised.value)
+    assert TOPIC not in str(raised.value)
 
 
 @pytest.mark.parametrize("unsafe", ["file_mode", "parent_mode", "hardlink", "fifo"])
@@ -789,6 +826,81 @@ def test_restart_restores_atomic_replacement_across_mismatch_rollback(
     assert not candidate.exists()
 
 
+def test_systemd_cli_check_recovers_mismatch_before_consuming_topic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    runtime_paths = (
+        f'database_file = "{tmp_path / "watcher.sqlite3"}"\n'
+        f'gmail_credentials_file = "{tmp_path / "credentials.json"}"\n'
+        f'microsoft_credentials_file = "{tmp_path / "microsoft.json"}"\n'
+        f'gmail_token_file = "{tmp_path / "token.json"}"\n'
+        f'gmail_send_token_file = "{tmp_path / "send-token.json"}"'
+    )
+    _write_bytes(path, _config_bytes(extra=runtime_paths))
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(
+        topic=None,
+        extra=f"{runtime_paths}\n# manual topic removal",
+    )
+    child = os.fork()
+    if child == 0:
+        real_exchange = config_module._rename_exchange_at
+        replaced = False
+
+        def replace_before_exchange(stage: str) -> None:
+            nonlocal replaced
+            if stage == "before_exchange" and not replaced:
+                replacement = path.parent / "manual.toml"
+                _write_bytes(replacement, manual)
+                os.replace(replacement, path)
+                replaced = True
+
+        def exchange_then_crash(parent_fd: int, first: str, second: str) -> None:
+            real_exchange(parent_fd, first, second)
+            os._exit(86)
+
+        config_module._transaction_probe = replace_before_exchange
+        config_module._rename_exchange_at = exchange_then_crash
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    observed_topics: list[str | None] = []
+    captured_requests: list[tuple[object, ...]] = []
+    real_check = cli.run_watcher_check
+
+    def observe_check(config, store, model, *, dry_run: bool):
+        observed_topics.append(config.ntfy_topic)
+        return real_check(config, store, model, dry_run=dry_run)
+
+    monkeypatch.setattr(cli, "run_watcher_check", observe_check)
+    monkeypatch.setattr(
+        notifications_module,
+        "_send_ntfy",
+        lambda *args: captured_requests.append(args),
+    )
+
+    assert cli._check(path, dry_run=False) == 0
+
+    assert observed_topics == [None]
+    assert captured_requests == []
+    assert path.read_bytes() == manual
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+    assert not _disposition_path(path).exists()
+
+
 def test_post_exchange_displaced_replacement_is_restored_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1185,7 +1297,11 @@ def test_recovery_fails_closed_on_tampered_transaction_marker(tmp_path: Path) ->
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
     assert marker.read_bytes() == tampered
     assert candidate.read_bytes() == displaced
-    assert load_config(path).ntfy_content_disclosure_acknowledged is True
+    with pytest.raises(ConfigError) as raised:
+        load_config(path)
+    assert str(raised.value) == "Configuration is unavailable or requires manual repair"
+    assert str(path) not in str(raised.value)
+    assert TOPIC not in str(raised.value)
 
 
 def test_recovery_preserves_manual_concurrent_replacement(tmp_path: Path) -> None:
@@ -1912,10 +2028,10 @@ def test_final_validation_failure_reports_unknown_without_rollback(
     revision = ntfy_disclosure_status(path).expected_revision
     assert revision is not None
 
-    def fail_final_load(_path: Path | None = None):
+    def fail_final_load(_path: Path, *, lock_held: bool = False):
         raise ConfigError("injected")
 
-    monkeypatch.setattr(config_module, "load_config", fail_final_load)
+    monkeypatch.setattr(config_module, "_load_runtime_config", fail_final_load)
 
     response = engine_api._response(
         _request(

@@ -51,6 +51,8 @@ gmail_token_file = "{(path.parent / "token.json").as_posix()}"
 ''',
         encoding="utf-8",
     )
+    path.parent.chmod(0o700)
+    path.chmod(0o600)
 
 
 def test_config_normalizes_exact_sender(tmp_path: Path) -> None:
@@ -386,7 +388,10 @@ def test_windows_settings_and_watchlist_mutations_avoid_posix_only_apis(
 
     original = path.read_bytes()
     os.link(path, tmp_path / "second-link.toml")
-    with pytest.raises(ConfigError, match="path is unsafe"):
+    with pytest.raises(
+        ConfigError,
+        match="Configuration is unavailable or requires manual repair",
+    ):
         update_settings(path, {"poll_interval_minutes": 60})
     assert path.read_bytes() == original
 
