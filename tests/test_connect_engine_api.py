@@ -1,5 +1,6 @@
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,11 @@ from eom_email_watcher.runtime import load_runtime, mail_account_token_file
 
 INSTANCE = "11111111-1111-4111-8111-111111111111"
 TEST_MAILBOX_IDENTITY_KEY = "a" * 64
+
+
+class SeededMailboxGateway:
+    def mailbox_identity_key(self) -> str:
+        return TEST_MAILBOX_IDENTITY_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -223,7 +229,7 @@ def test_attachment_summary_persists_terminal_result_and_reuses_it(
     assert len(pdf) == 28
     captured: dict[str, object] = {}
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str) -> bytes:
             assert (message_id, part_id, attachment_id) == (
                 "message-1",
@@ -351,10 +357,27 @@ def test_imap_attachment_summary_uses_actual_download_size(
     )
     pdf = b"%PDF-1.4\nreal attachment\nEOF"
 
-    class FakeImap:
+    class FakeImap(SeededMailboxGateway):
+        def __init__(self) -> None:
+            self.session_active = False
+
+        @contextmanager
+        def polling_session(self):
+            assert self.session_active is False
+            self.session_active = True
+            try:
+                yield
+            finally:
+                self.session_active = False
+
+        def mailbox_identity_key(self) -> str:
+            assert self.session_active, "identity read outside IMAP session"
+            return TEST_MAILBOX_IDENTITY_KEY
+
         def attachment_bytes(
             self, message_id: str, part_id: str, attachment_id: str | None
         ) -> bytes:
+            assert self.session_active, "attachment read outside IMAP session"
             assert (message_id, part_id, attachment_id) == (
                 "provider-message",
                 "mime-0",
@@ -519,7 +542,7 @@ def test_provider_failure_is_durable_and_never_masquerades_as_success(
     config_path, runtime = seeded_runtime(tmp_path)
     pdf = b"%PDF-1.4\nreal attachment\nEOF"
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return pdf
 
@@ -584,7 +607,7 @@ def test_provider_crash_after_acceptance_remains_active_for_reconciliation(
     config_path, runtime = seeded_runtime(tmp_path)
     pdf = b"%PDF-1.4\nreal attachment\nEOF"
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return pdf
 
@@ -642,7 +665,7 @@ def test_lost_submit_ack_reuses_identity_and_resubmits_only_after_not_found(
     submitted: list[connect.PreparedSummaryJob] = []
     queried: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return pdf
 
@@ -790,7 +813,7 @@ def test_poll_not_found_reloads_processing_state_before_same_identity_resubmissi
     discovered_instances: list[str | None] = []
     submitted: list[str] = []
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return b"%PDF-1.4\nreal attachment\nEOF"
 
@@ -974,7 +997,7 @@ def test_simultaneous_submit_returns_structured_in_progress_error(
     pdf = b"%PDF-1.4\nreal attachment\nEOF"
     real_create = runtime.store.create_connect_job
 
-    class FakeGmail:
+    class FakeGmail(SeededMailboxGateway):
         def attachment_bytes(self, *args) -> bytes:
             return pdf
 

@@ -119,10 +119,13 @@ def write_isolated_config(config_path: Path, state_directory: Path) -> Path:
     config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     config_path.parent.chmod(0o700)
     database_path = state_directory / "watcher.sqlite3"
+    gmail_token_file = state_directory / "token.json"
+    gmail_token_file.write_bytes(b"packaged-proof-fixture-only")
+    gmail_token_file.chmod(0o600)
     values = {
         "timezone": "UTC",
         "gmail_credentials_file": state_directory / "credentials.json",
-        "gmail_token_file": state_directory / "token.json",
+        "gmail_token_file": gmail_token_file,
         "gmail_send_token_file": state_directory / "send-token.json",
         "database_file": database_path,
         "model_base_url": "http://127.0.0.1:9/v1",

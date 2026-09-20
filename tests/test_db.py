@@ -3289,6 +3289,7 @@ def create_v2_connect_job(
     input_byte_size: int = 20,
     input_sha256: str = "a" * 64,
     parameters: dict[str, object] | None = None,
+    capability_produces: tuple[str, ...] = ("text/plain",),
     now: datetime | None = None,
 ) -> bytes:
     parameter_values = {"target-language": "Spanish"} if parameters is None else parameters
@@ -3330,6 +3331,7 @@ def create_v2_connect_job(
         input_display_name="invoice.pdf",
         source_app_id="email-watcher",
         request_json=request_json,
+        capability_produces=capability_produces,
         now=now,
     )
     return request_json
@@ -3429,6 +3431,29 @@ def test_initialize_migrates_v5_connect_jobs_without_losing_terminal_state(
             "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'messages_delete_connect_attachment_jobs'"
         ).fetchone() == (1,)
+        restored_connect_triggers = {
+            str(name): str(sql)
+            for name, sql in db.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name IN (?, ?, ?, ?)",
+                (
+                    "messages_delete_connect_attachment_jobs",
+                    "connect_jobs_delete_dispatch",
+                    "messages_delete_pending_automation_fires",
+                    "connect_jobs_delete_linked_automation_fires",
+                ),
+            ).fetchall()
+        }
+        assert set(restored_connect_triggers) == {
+            "messages_delete_connect_attachment_jobs",
+            "connect_jobs_delete_dispatch",
+            "messages_delete_pending_automation_fires",
+            "connect_jobs_delete_linked_automation_fires",
+        }
+        assert all(
+            "connect_attachment_jobs_v5" not in sql and "connect_attachment_jobs_v6" not in sql
+            for sql in restored_connect_triggers.values()
+        )
 
 
 def test_failed_v5_connect_migration_rolls_back_without_losing_legacy_rows(
@@ -3568,6 +3593,227 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
             )
         with pytest.raises(sqlite3.IntegrityError, match="rule revision"):
             db.execute("UPDATE messages SET status = 'analyzed' WHERE message_id = 'still-pending'")
+
+
+def test_schema_20_to_21_preserves_pending_fire_and_attempt_identity(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111",
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": False,
+        }
+    )
+    store.mark_analyzed("m1", scheduling_analysis())
+    original = store.automation_fires_for_message("m1")[0]
+    original_attempt = store.automation_fire_attempts(original.fire_id)[0]
+
+    with store.connection() as connection:
+        connection.executescript(
+            """
+            DROP TRIGGER connect_jobs_delete_linked_automation_fires;
+            DROP TRIGGER messages_delete_pending_automation_fires;
+            DROP TRIGGER automation_fire_attempts_immutable_update;
+            DROP TRIGGER automation_fire_attempts_require_fire;
+            DROP TRIGGER automation_fires_require_sources;
+            DROP INDEX idx_automation_fires_state;
+            DROP INDEX idx_automation_fires_message;
+            ALTER TABLE automation_fire_attempts RENAME TO automation_fire_attempts_v21;
+            ALTER TABLE automation_fires RENAME TO automation_fires_v21;
+            CREATE TABLE automation_fires (
+                fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
+                event_id TEXT NOT NULL CHECK (length(event_id) = 64),
+                rule_id TEXT NOT NULL CHECK (length(rule_id) = 36),
+                rule_version INTEGER NOT NULL CHECK (rule_version >= 1),
+                message_id TEXT NOT NULL CHECK (message_id <> ''),
+                part_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL CHECK (action_kind = 'connect.invoke'),
+                state TEXT NOT NULL CHECK (state = 'pending_dispatch'),
+                state_version INTEGER NOT NULL CHECK (state_version = 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (message_id, part_id, rule_id, rule_version)
+            );
+            CREATE TABLE automation_fire_attempts (
+                fire_id TEXT NOT NULL CHECK (length(fire_id) = 36),
+                attempt_no INTEGER NOT NULL CHECK (attempt_no = 1),
+                dispatch_request_id TEXT NOT NULL UNIQUE CHECK (length(dispatch_request_id) = 36),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (fire_id, attempt_no)
+            );
+            INSERT INTO automation_fires(
+                fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                action_kind, state, state_version, created_at, updated_at
+            ) SELECT fire_id, event_id, rule_id, rule_version, message_id, part_id,
+                action_kind, state, state_version, created_at, updated_at
+              FROM automation_fires_v21;
+            INSERT INTO automation_fire_attempts(
+                fire_id, attempt_no, dispatch_request_id, created_at
+            ) SELECT fire_id, attempt_no, dispatch_request_id, created_at
+              FROM automation_fire_attempts_v21;
+            DROP TABLE automation_fire_attempts_v21;
+            DROP TABLE automation_fires_v21;
+            DROP TABLE automation_fire_confirmations;
+            PRAGMA user_version = 20;
+            """
+        )
+
+    migration_started = datetime.now(UTC)
+    store.initialize()
+
+    migrated = store.automation_fire(original.fire_id)
+    assert migrated is not None
+    assert migrated.state == "pending_dispatch"
+    assert migrated.state_version == 1
+    assert migrated.pending_since is not None
+    assert datetime.fromisoformat(migrated.pending_since) >= migration_started
+    assert migrated.pending_since != original.updated_at
+    assert migrated.current_attempt_no == 1
+    assert migrated.job_id is None
+    migrated_attempts = store.automation_fire_attempts(original.fire_id)
+    assert len(migrated_attempts) == 1
+    assert migrated_attempts[0].dispatch_request_id == original_attempt.dispatch_request_id
+    assert migrated_attempts[0].job_id is None
+    with store.connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        trigger = connection.execute(
+            "SELECT 1 AS installed FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'connect_jobs_delete_linked_automation_fires'"
+        ).fetchone()
+        assert trigger is not None
+        assert trigger["installed"] == 1
+        indexes = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA index_list(automation_fires)").fetchall()
+        }
+        assert "idx_automation_fires_state" in indexes
+        assert "idx_automation_fires_message" in indexes
+
+
+def test_schema_21_to_22_widens_prepared_identity_constraint(tmp_path: Path) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    store.put_automation_rule(
+        {
+            "name": "Contract watch",
+            "scope": {},
+            "trigger": {"source_kind": "mail.message"},
+            "conditions": [
+                {
+                    "field": "attachment.media_type",
+                    "op": "equals",
+                    "value": "application/pdf",
+                }
+            ],
+            "action": {
+                "kind": "connect.invoke",
+                "capability": {"id": "document.summarize", "version": "1.0"},
+                "provider": {
+                    "app_id": "document-summarizer",
+                    "version": "0.1.0",
+                    "instance_id": "11111111-1111-4111-8111-111111111111",
+                },
+                "parameters": {"mode": "contract"},
+            },
+            "confirm_each": False,
+        }
+    )
+    store.mark_analyzed("m1", scheduling_analysis())
+    original = store.automation_fires_for_message("m1")[0]
+    original_attempt = store.automation_fire_attempts(original.fire_id)[0]
+
+    with store.connection() as connection:
+        connection.execute("PRAGMA writable_schema = ON")
+        changed = connection.execute(
+            """UPDATE sqlite_schema
+            SET sql = replace(sql, 'AND 32768', 'AND 8192')
+            WHERE type = 'table' AND name = 'automation_fires'"""
+        )
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute("PRAGMA user_version = 21")
+        assert changed.rowcount == 1
+
+    store.initialize()
+
+    migrated = store.automation_fire(original.fire_id)
+    assert migrated == original
+    assert store.automation_fire_attempts(original.fire_id) == [original_attempt]
+    prepared_identity = b'{"parameters":{"memo":"' + (b"x" * 9000) + b'"}}'
+    with store.connection() as connection:
+        connection.execute(
+            """UPDATE automation_fires
+            SET prepared_identity_sha256 = ?, prepared_identity_json = ?
+            WHERE fire_id = ?""",
+            (hashlib.sha256(prepared_identity).hexdigest(), prepared_identity, original.fire_id),
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_schema_22_marks_incomplete_legacy_dispatch_capability_authority_unknown(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+    seed_pdf_attachment(store)
+    legacy_job_id = "33333333-3333-4333-8333-333333333333"
+    create_v2_connect_job(store, legacy_job_id)
+
+    with store.connection() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(connect_job_dispatch)").fetchall()
+        }
+        connection.execute("DROP TRIGGER messages_delete_pending_automation_fires")
+        if "capability_produces_json" in columns:
+            connection.execute(
+                "ALTER TABLE connect_job_dispatch DROP COLUMN capability_produces_json"
+            )
+        if "capability_authority_known" in columns:
+            connection.execute(
+                "ALTER TABLE connect_job_dispatch DROP COLUMN capability_authority_known"
+            )
+        connection.execute("PRAGMA user_version = 22")
+
+    store.initialize()
+
+    legacy = store.connect_dispatch(legacy_job_id)
+    assert legacy is not None
+    assert legacy.capability_authority_known is False
+    assert legacy.capability_produces == ()
+    assert legacy.interactive_authorized_at is None
+    new_job_id = "44444444-4444-4444-8444-444444444444"
+    create_v2_connect_job(store, new_job_id, parameters={"target-language": "French"})
+    current = store.connect_dispatch(new_job_id)
+    assert current is not None
+    assert current.capability_authority_known is True
+    assert current.capability_produces == ("text/plain",)
+    assert current.interactive_authorized_at is None
 
 
 def test_connect_v2_request_and_generic_outputs_survive_reopen(tmp_path: Path) -> None:
@@ -3812,6 +4058,42 @@ def test_connect_v2_lane_cap_checks_replay_before_boundary(tmp_path: Path) -> No
     assert all(store.connect_job(job_id).status == "failed" for job_id in job_ids)  # type: ignore[union-attr]
 
 
+def test_connect_v2_lane_cap_excludes_paused_waiting_automation_jobs(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+    created_at = datetime(2026, 9, 8, 12, tzinfo=UTC)
+    for index in range(CONNECT_QUEUE_MAX_JOBS):
+        create_v2_connect_job(
+            store,
+            f"00000000-0000-4000-8000-{index:012d}",
+            parameters={"sequence": index},
+            now=created_at,
+        )
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch
+            SET automation_paused_at = ? WHERE state = 'waiting'""",
+            ((created_at + timedelta(minutes=1)).isoformat(),),
+        )
+
+    interactive_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    create_v2_connect_job(
+        store,
+        interactive_id,
+        parameters={"sequence": CONNECT_QUEUE_MAX_JOBS},
+        now=created_at + timedelta(minutes=1),
+    )
+
+    created = store.connect_job(interactive_id)
+    dispatch = store.connect_dispatch(interactive_id)
+    assert created is not None
+    assert dispatch is not None
+    assert dispatch.automation_paused_at is None
+
+
 def test_expired_waiting_tail_is_failed_behind_claimed_head(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
@@ -4021,6 +4303,18 @@ def test_connect_queue_wakeup_and_inbox_projection_use_durable_dispatch_state(
         "message": "Another job is running.",
     }
     assert by_job_id[second_id]["queue_ahead"] == 1
+
+    with store.connection() as db:
+        db.execute(
+            """UPDATE connect_job_dispatch SET automation_paused_at = ?
+            WHERE job_id = ?""",
+            (created_at.isoformat(), first_id),
+        )
+
+    assert store.connect_queue_ahead(second_id) == 0
+    results = store.recent(1)[0]["attachments"][0]["capability_results"]
+    by_job_id = {result["job_id"]: result for result in results}
+    assert by_job_id[second_id]["queue_ahead"] == 0
 
 
 def test_due_connect_lane_heads_returns_only_authoritative_head_per_provider(
@@ -4316,6 +4610,28 @@ def test_connect_v2_persists_maximum_generated_request_and_zero_byte_input(
     assert empty is not None
     assert empty.input_byte_size == 0
     assert empty.request_json == empty_request
+    assert store.connect_dispatch(empty.job_id).capability_produces == ("text/plain",)  # type: ignore[union-attr]
+
+
+def test_connect_v2_output_contract_boundaries(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    seed_pdf_attachment(store)
+
+    with pytest.raises(ValueError, match="output authority"):
+        create_v2_connect_job(store, capability_produces=())
+
+    maximum = tuple(f"application/x{index:02d}-" + "a" * 111 for index in range(16))
+    create_v2_connect_job(store, capability_produces=maximum)
+    assert store.connect_dispatch(
+        "33333333-3333-4333-8333-333333333333"
+    ).capability_produces == maximum  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="output authority"):
+        create_v2_connect_job(
+            store,
+            capability_produces=maximum + ("text/plain",),
+        )
 
 
 def test_connect_v2_rejects_mismatched_request_and_corrupt_result(
@@ -4348,6 +4664,7 @@ def test_connect_v2_rejects_mismatched_request_and_corrupt_result(
             input_display_name="invoice.pdf",
             source_app_id="email-watcher",
             request_json=mismatched,
+            capability_produces=("text/plain",),
         )
 
     result, _ = v2_result()
