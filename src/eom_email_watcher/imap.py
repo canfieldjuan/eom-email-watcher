@@ -1256,6 +1256,19 @@ class ImapGateway:
         if callable(set_timeout):
             set_timeout(timeout)
 
+    def _close_client(self, client: imaplib.IMAP4) -> None:
+        try:
+            self._refresh_operation_timeout(client)
+        except Exception:
+            with contextlib.suppress(Exception):
+                client.shutdown()
+            return
+        try:
+            client.logout()
+        except Exception:
+            with contextlib.suppress(Exception):
+                client.shutdown()
+
     def _default_client(
         self,
         credentials: ImapCredentials,
@@ -1277,28 +1290,23 @@ class ImapGateway:
             self._refresh_operation_timeout(client)
             status, _response = client.starttls(ssl_context=context)
         except ssl.SSLError as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS") from exc
         except imaplib.IMAP4.abort as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError(
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
         except (OSError, TimeoutError) as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError(
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
         except imaplib.IMAP4.error as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS") from exc
         if status != "OK":
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError("imap_tls_failed", "Mail server did not establish STARTTLS")
         return client
 
@@ -1335,24 +1343,20 @@ class ImapGateway:
                     "imap_authentication_failed", "Mail server rejected the credentials"
                 )
         except ImapError:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise
         except imaplib.IMAP4.abort as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError(
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
         except imaplib.IMAP4.error as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError(
                 "imap_authentication_failed", "Mail server rejected the credentials"
             ) from exc
         except (OSError, TimeoutError) as exc:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
             raise ImapError(
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
@@ -1388,8 +1392,7 @@ class ImapGateway:
                 "imap_connection_failed", "Mail server connection failed; retry"
             ) from exc
         finally:
-            with contextlib.suppress(Exception):
-                client.logout()
+            self._close_client(client)
 
     @contextlib.contextmanager
     def polling_session(self) -> Iterator[None]:

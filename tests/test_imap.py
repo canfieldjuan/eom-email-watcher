@@ -190,20 +190,63 @@ def test_attachment_bytes_recomputes_remaining_timeout_before_each_imap_network_
 ) -> None:
     path = tmp_path / "credentials.json"
     write_credentials(path, credentials())
-    remaining_timeouts = iter((0.9, 0.8, 0.7, 0.6, 0.5))
+    remaining_timeouts = iter((0.9, 0.8, 0.7, 0.6, 0.5, 0.4))
     socket_timeouts: list[float] = []
+    logout_timeouts: list[float | None] = []
 
     class TimeoutSocket:
+        current_timeout: float | None = None
+
         def settimeout(self, timeout_seconds: float) -> None:
+            self.current_timeout = timeout_seconds
             socket_timeouts.append(timeout_seconds)
 
-    client = FakeImap()
+    class TimeoutAwareImap(FakeImap):
+        def logout(self) -> tuple[str, list[bytes]]:
+            logout_timeouts.append(self.sock.current_timeout)  # type: ignore[attr-defined]
+            return super().logout()
+
+    client = TimeoutAwareImap()
     client.sock = TimeoutSocket()  # type: ignore[attr-defined]
     gateway = ImapGateway.from_credentials_file(path, lambda: next(remaining_timeouts))
     gateway._client_factory = lambda _credentials, _context: client
 
     assert gateway.attachment_bytes(message_id(), "mime-0", None) == b"PDFDATA"
-    assert socket_timeouts == [0.8, 0.7, 0.6, 0.5]
+    assert socket_timeouts == [0.8, 0.7, 0.6, 0.5, 0.4]
+    assert logout_timeouts == [0.4]
+
+
+def test_attachment_bytes_closes_without_logout_when_deadline_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "credentials.json"
+    write_credentials(path, credentials())
+    remaining_timeouts = iter((0.9, 0.8, 0.7, 0.6, 0.5))
+
+    class DeadlineExhausted(RuntimeError):
+        pass
+
+    def remaining_timeout() -> float:
+        try:
+            return next(remaining_timeouts)
+        except StopIteration as exc:
+            raise DeadlineExhausted from exc
+
+    class CloseAwareImap(FakeImap):
+        shutdown_called = False
+
+        def logout(self) -> tuple[str, list[bytes]]:
+            raise AssertionError("deadline-exhausted cleanup must not send LOGOUT")
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    client = CloseAwareImap()
+    gateway = ImapGateway.from_credentials_file(path, remaining_timeout)
+    gateway._client_factory = lambda _credentials, _context: client
+
+    assert gateway.attachment_bytes(message_id(), "mime-0", None) == b"PDFDATA"
+    assert client.shutdown_called is True
 
 
 def cursor(uid: int = 7, *, uid_validity: int = 44, values: ImapCredentials | None = None) -> str:
