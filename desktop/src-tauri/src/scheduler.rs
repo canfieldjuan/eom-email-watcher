@@ -3,11 +3,11 @@ use crate::engine::Engine;
 use serde::Serialize;
 use std::io;
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
 };
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
@@ -39,6 +39,78 @@ struct ConnectQueueEvent {
 #[derive(Clone)]
 pub struct ConnectQueueScheduler {
     wake_sender: SyncSender<()>,
+    gate: Arc<WorkerGate>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+#[derive(Default)]
+struct WorkerGateState {
+    activated: bool,
+    stopped: bool,
+}
+
+#[derive(Default)]
+struct WorkerGate {
+    state: Mutex<WorkerGateState>,
+    changed: Condvar,
+}
+
+impl WorkerGate {
+    fn activate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.stopped {
+            state.activated = true;
+        }
+        self.changed.notify_all();
+    }
+
+    fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.stopped = true;
+        self.changed.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stopped
+    }
+
+    fn wait_for_activation(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !state.activated && !state.stopped {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.activated && !state.stopped
+    }
+
+    fn wait_for(&self, duration: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            return false;
+        }
+        let (state, _) = self
+            .changed
+            .wait_timeout(state, duration)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.stopped
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -89,16 +161,28 @@ fn queue_refresh_needed(
 }
 
 impl ConnectQueueScheduler {
-    pub fn start(app: AppHandle, engine: Engine) -> io::Result<Self> {
+    pub fn stage(app: AppHandle, engine: Engine) -> io::Result<Self> {
         let (wake_sender, receiver) = mpsc::sync_channel(1);
-        let scheduler = Self { wake_sender };
+        let gate = Arc::new(WorkerGate::default());
+        let handle = Arc::new(Mutex::new(None));
+        let scheduler = Self {
+            wake_sender,
+            gate: Arc::clone(&gate),
+            handle: Arc::clone(&handle),
+        };
         let engine = engine.with_request_timeout(SCHEDULED_ENGINE_TIMEOUT);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("email-watcher-connect-queue".into())
             .spawn(move || {
+                if !gate.wait_for_activation() {
+                    return;
+                }
                 let mut next_wake_unix_ms = Some(unix_ms_now());
                 let mut queue_was_active = false;
                 while wait_for_queue_wakeup(&receiver, next_wake_unix_ms) {
+                    if gate.is_stopped() {
+                        break;
+                    }
                     match engine.pump_connect_queue() {
                         Ok(outcome) => {
                             next_wake_unix_ms = outcome.next_wake_unix_ms;
@@ -135,9 +219,31 @@ impl ConnectQueueScheduler {
                         }
                     }
                 }
-            })
-            .map(|_| ())?;
+            })?;
+        *handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
         Ok(scheduler)
+    }
+
+    pub fn activate(&self) {
+        self.gate.activate();
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.gate.stop();
+        let _ = self.wake_sender.try_send(());
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| io::Error::other("Connect queue worker handle is unavailable"))?
+            .take();
+        match handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| io::Error::other("Connect queue worker stopped unexpectedly")),
+            None => Ok(()),
+        }
     }
 
     pub fn wake(&self) {
@@ -182,6 +288,8 @@ pub struct PollScheduler {
     enabled: bool,
     interval_minutes: u64,
     next_check_unix_ms: Arc<AtomicU64>,
+    gate: Arc<WorkerGate>,
+    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 fn next_check_unix_ms(now: SystemTime, interval_minutes: u64) -> u64 {
@@ -201,7 +309,7 @@ fn sleep_slice(deadline_unix_ms: u64, now_unix_ms: u64) -> Option<Duration> {
     Some(Duration::from_millis(remaining_ms).min(MAX_SLEEP_SLICE))
 }
 
-fn wait_until(deadline_unix_ms: u64) {
+fn wait_until(gate: &WorkerGate, deadline_unix_ms: u64) -> bool {
     loop {
         let now_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -210,9 +318,11 @@ fn wait_until(deadline_unix_ms: u64) {
             .try_into()
             .unwrap_or(u64::MAX);
         let Some(duration) = sleep_slice(deadline_unix_ms, now_unix_ms) else {
-            return;
+            return !gate.is_stopped();
         };
-        thread::sleep(duration);
+        if !gate.wait_for(duration) {
+            return false;
+        }
     }
 }
 
@@ -226,6 +336,8 @@ impl PollScheduler {
             } else {
                 0
             })),
+            gate: Arc::new(WorkerGate::default()),
+            handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -238,7 +350,7 @@ impl PollScheduler {
         }
     }
 
-    pub fn start(
+    pub fn stage(
         &self,
         app: AppHandle,
         engine: Engine,
@@ -250,38 +362,68 @@ impl PollScheduler {
         }
         let scheduler = self.clone();
         let engine = engine.with_request_timeout(SCHEDULED_ENGINE_TIMEOUT);
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("email-watcher-poll".into())
-            .spawn(move || loop {
-                wait_until(scheduler.next_check_unix_ms.load(Ordering::Relaxed));
-                let event = match delivery.check_and_deliver(&app, &engine) {
-                    Ok(outcome) => {
-                        if outcome.delivery.failed > 0 {
-                            eprintln!(
-                                "{} scheduled notifications remain queued after delivery errors",
-                                outcome.delivery.failed
-                            );
-                        }
-                        ScheduledCheckEvent::completed(outcome.delivery.failed)
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "scheduled watcher check failed ({}): {}",
-                            error.code, error.message
-                        );
-                        ScheduledCheckEvent::check_failed()
-                    }
-                };
-                connect_queue.wake();
-                scheduler.next_check_unix_ms.store(
-                    next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
-                    Ordering::Relaxed,
-                );
-                if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
-                    eprintln!("scheduled watcher check could not refresh the desktop window");
+            .spawn(move || {
+                if !scheduler.gate.wait_for_activation() {
+                    return;
                 }
-            })
-            .map(|_| ())
+                while wait_until(
+                    &scheduler.gate,
+                    scheduler.next_check_unix_ms.load(Ordering::Relaxed),
+                ) {
+                    let event = match delivery.check_and_deliver(&app, &engine) {
+                        Ok(outcome) => {
+                            if outcome.delivery.failed > 0 {
+                                eprintln!(
+                                    "{} scheduled notifications remain queued after delivery errors",
+                                    outcome.delivery.failed
+                                );
+                            }
+                            ScheduledCheckEvent::completed(outcome.delivery.failed)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "scheduled watcher check failed ({}): {}",
+                                error.code, error.message
+                            );
+                            ScheduledCheckEvent::check_failed()
+                        }
+                    };
+                    connect_queue.wake();
+                    scheduler.next_check_unix_ms.store(
+                        next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
+                        Ordering::Relaxed,
+                    );
+                    if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
+                        eprintln!("scheduled watcher check could not refresh the desktop window");
+                    }
+                }
+            })?;
+        *self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        Ok(())
+    }
+
+    pub fn activate(&self) {
+        self.gate.activate();
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.gate.stop();
+        let handle = self
+            .handle
+            .lock()
+            .map_err(|_| io::Error::other("Polling worker handle is unavailable"))?
+            .take();
+        match handle {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| io::Error::other("Polling worker stopped unexpectedly")),
+            None => Ok(()),
+        }
     }
 }
 
@@ -289,6 +431,7 @@ impl PollScheduler {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn next_check_uses_configured_interval() {
@@ -362,13 +505,35 @@ mod tests {
     #[test]
     fn repeated_queue_wakes_are_coalesced() {
         let (wake_sender, receiver) = mpsc::sync_channel(1);
-        let scheduler = ConnectQueueScheduler { wake_sender };
+        let scheduler = ConnectQueueScheduler {
+            wake_sender,
+            gate: Arc::new(WorkerGate::default()),
+            handle: Arc::new(Mutex::new(None)),
+        };
 
         scheduler.wake();
         scheduler.wake();
 
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn staged_worker_stopped_before_activation_does_no_work() {
+        let gate = Arc::new(WorkerGate::default());
+        let work = Arc::new(AtomicUsize::new(0));
+        let worker_gate = Arc::clone(&gate);
+        let worker_work = Arc::clone(&work);
+        let worker = thread::spawn(move || {
+            if worker_gate.wait_for_activation() {
+                worker_work.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        gate.stop();
+        worker.join().expect("staged worker joins");
+
+        assert_eq!(work.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -7,6 +7,10 @@ const engineSource = await readFile(
   new URL("../src-tauri/src/engine.rs", import.meta.url),
   "utf8",
 );
+const schedulerSource = await readFile(
+  new URL("../src-tauri/src/scheduler.rs", import.meta.url),
+  "utf8",
+);
 const uiSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 
 const disclosureCopy =
@@ -28,18 +32,37 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   assert.ok(inspect >= 0, "native setup must invoke the admission coordinator");
   assert.ok(inspect < setup.indexOf("app.manage(engine.clone())"));
 
-  const workers = libSource.slice(
-    libSource.indexOf("fn start_admitted_workers"),
-    libSource.indexOf("impl AdmissionCoordinator<AdmissionWorkers>"),
+  const stagedWorkers = libSource.slice(
+    libSource.indexOf("fn stage_admitted_workers"),
+    libSource.indexOf("enum BoundedOperation"),
   );
-  const settings = workers.indexOf("settings_with_timeout");
-  const queue = workers.indexOf("ConnectQueueScheduler::start");
-  const delivery = workers.indexOf("startup_delivery.deliver");
-  const poller = workers.indexOf("scheduler\n        .start");
+  const settings = stagedWorkers.indexOf("settings_with_timeout");
+  const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage");
+  const poller = stagedWorkers.indexOf("scheduler\n                .stage");
   assert.ok(settings >= 0, "worker startup must begin with normal settings admission");
-  assert.ok(settings < queue, "settings admission must precede the Connect queue");
-  assert.ok(queue < delivery, "Connect queue construction must precede startup delivery");
-  assert.ok(delivery < poller, "startup delivery must precede the poll scheduler");
+  assert.ok(settings < queue, "settings admission must precede staged Connect queue startup");
+  assert.ok(queue < poller, "Connect queue staging must precede poll staging");
+  assert.doesNotMatch(
+    stagedWorkers,
+    /startup_delivery\.deliver/,
+    "startup delivery must not run while admission stages workers",
+  );
+
+  const installAttempt = libSource.slice(
+    libSource.indexOf("fn install_attempt"),
+    libSource.indexOf("fn refresh_with"),
+  );
+  assert.match(installAttempt, /workers\.activate\(\)/);
+  assert.match(installAttempt, /startup_delivery_started/);
+
+  const boundedDelivery = libSource.slice(
+    libSource.indexOf("fn start_startup_delivery"),
+    libSource.indexOf("fn finish_admission_transition"),
+  );
+  assert.match(boundedDelivery, /with_request_timeout\(STARTUP_DELIVERY_TIMEOUT\)/);
+  assert.match(boundedDelivery, /run_bounded_operation\(STARTUP_DELIVERY_TIMEOUT/);
+  assert.match(schedulerSource, /fn wait_for_activation/);
+  assert.match(schedulerSource, /pub fn shutdown\(&self\) -> io::Result<\(\)>/);
   assert.match(libSource, /configuration_not_admitted/);
 
   const guardedCommands = [

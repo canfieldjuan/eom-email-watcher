@@ -17,12 +17,14 @@ use std::collections::BTreeMap;
 #[cfg(desktop)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
 const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(desktop)]
 const TRAY_OPEN_ID: &str = "open";
 #[cfg(desktop)]
@@ -332,9 +334,78 @@ struct AdmissionWorkers {
     scheduler: PollScheduler,
 }
 
+trait StagedWorker {
+    fn shutdown(&self);
+}
+
+impl StagedWorker for ConnectQueueScheduler {
+    fn shutdown(&self) {
+        if let Err(error) = ConnectQueueScheduler::shutdown(self) {
+            eprintln!("Connect queue scheduler could not stop cleanly: {error}");
+        }
+    }
+}
+
+impl StagedWorker for PollScheduler {
+    fn shutdown(&self) {
+        if let Err(error) = PollScheduler::shutdown(self) {
+            eprintln!("Polling scheduler could not stop cleanly: {error}");
+        }
+    }
+}
+
+fn stage_worker_pair<Q, P, E>(
+    stage_queue: impl FnOnce() -> Result<Q, E>,
+    stage_poll: impl FnOnce(&Q) -> Result<P, E>,
+) -> Result<(Q, P), E>
+where
+    Q: StagedWorker,
+{
+    let queue = stage_queue()?;
+    match stage_poll(&queue) {
+        Ok(poll) => Ok((queue, poll)),
+        Err(error) => {
+            queue.shutdown();
+            Err(error)
+        }
+    }
+}
+
+trait AdmissionWorkerSet {
+    fn activate(&self);
+}
+
+impl AdmissionWorkerSet for AdmissionWorkers {
+    fn activate(&self) {
+        self.connect_queue.activate();
+        self.scheduler.activate();
+    }
+}
+
+impl AdmissionWorkerSet for () {
+    fn activate(&self) {}
+}
+
+impl Drop for AdmissionWorkers {
+    fn drop(&mut self) {
+        if let Err(error) = self.scheduler.shutdown() {
+            eprintln!("Polling scheduler could not stop cleanly: {error}");
+        }
+        if let Err(error) = self.connect_queue.shutdown() {
+            eprintln!("Connect queue scheduler could not stop cleanly: {error}");
+        }
+    }
+}
+
 struct AdmissionInner<W> {
     state: AdmissionState,
     workers: Option<W>,
+    startup_delivery_started: bool,
+}
+
+struct AdmissionTransition {
+    status: ConfigAdmissionStatus,
+    start_startup_delivery: bool,
 }
 
 struct AdmissionCoordinator<W = AdmissionWorkers> {
@@ -355,6 +426,7 @@ impl<W> AdmissionCoordinator<W> {
             inner: Arc::new(Mutex::new(AdmissionInner {
                 state: AdmissionState::Inspecting,
                 workers: None,
+                startup_delivery_started: false,
             })),
         }
     }
@@ -379,50 +451,156 @@ impl<W> AdmissionCoordinator<W> {
     fn install_attempt(
         inner: &mut AdmissionInner<W>,
         attempt: AdmissionAttempt<W>,
-    ) -> ConfigAdmissionStatus {
+    ) -> AdmissionTransition
+    where
+        W: AdmissionWorkerSet,
+    {
         inner.state = attempt.state;
         inner.workers = attempt.workers;
-        inner.state.public_status()
+        let mut start_startup_delivery = false;
+        if inner.state == AdmissionState::Admitted
+            && let Some(workers) = inner.workers.as_ref()
+        {
+            workers.activate();
+            if !inner.startup_delivery_started {
+                inner.startup_delivery_started = true;
+                start_startup_delivery = true;
+            }
+        }
+        AdmissionTransition {
+            status: inner.state.public_status(),
+            start_startup_delivery,
+        }
+    }
+
+    fn refresh_with(
+        &self,
+        inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+        admit: impl FnOnce() -> Result<W, EngineError>,
+    ) -> Result<AdmissionTransition, EngineError>
+    where
+        W: AdmissionWorkerSet,
+    {
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+            return Ok(AdmissionTransition {
+                status: ConfigAdmissionStatus::Admitted,
+                start_startup_delivery: false,
+            });
+        }
+        inner.state = AdmissionState::Inspecting;
+        let attempt = run_admission_attempt(inspect, admit);
+        Ok(Self::install_attempt(&mut inner, attempt))
     }
 }
 
-fn start_admitted_workers(
+fn stage_admitted_workers(
     app: &AppHandle,
     engine: &Engine,
     startup_delivery: &NotificationDelivery,
 ) -> Result<AdmissionWorkers, EngineError> {
     let settings = engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)?;
-    let connect_queue =
-        ConnectQueueScheduler::start(app.clone(), engine.clone()).map_err(|_| {
-            EngineError::host("host_error", "Connect queue scheduler could not be started")
-        })?;
-    match startup_delivery.deliver(app, engine) {
-        Ok(outcome) if outcome.failed > 0 => eprintln!(
-            "{} watcher startup notification deliveries failed; {} remain queued",
-            outcome.failed, outcome.remaining
-        ),
-        Ok(_) => {}
-        Err(error) => eprintln!(
-            "watcher startup notification delivery failed ({}): {}",
-            error.code, error.message
-        ),
-    }
     let scheduler = PollScheduler::new(settings.poll_interval_minutes, settings.polling_supported);
     if !settings.polling_supported {
         eprintln!("watcher automatic polling is disabled for the current host configuration");
     }
-    scheduler
-        .start(
-            app.clone(),
-            engine.clone(),
-            startup_delivery.clone(),
-            connect_queue.clone(),
-        )
-        .map_err(|_| EngineError::host("host_error", "Polling scheduler could not be started"))?;
+    let (connect_queue, scheduler) = stage_worker_pair(
+        || {
+            ConnectQueueScheduler::stage(app.clone(), engine.clone()).map_err(|_| {
+                EngineError::host("host_error", "Connect queue scheduler could not be started")
+            })
+        },
+        |connect_queue| {
+            scheduler
+                .stage(
+                    app.clone(),
+                    engine.clone(),
+                    startup_delivery.clone(),
+                    connect_queue.clone(),
+                )
+                .map_err(|_| {
+                    EngineError::host("host_error", "Polling scheduler could not be started")
+                })?;
+            Ok(scheduler)
+        },
+    )?;
     Ok(AdmissionWorkers {
         connect_queue,
         scheduler,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedOperation<T> {
+    Completed(T),
+    TimedOut,
+    WorkerStopped,
+}
+
+fn run_bounded_operation<T: Send + 'static>(
+    timeout: Duration,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> BoundedOperation<T> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("email-watcher-startup-delivery-request".into())
+        .spawn(move || {
+            let outcome = operation();
+            let _ = sender.send(outcome);
+        });
+    if worker.is_err() {
+        return BoundedOperation::WorkerStopped;
+    }
+    match receiver.recv_timeout(timeout) {
+        Ok(outcome) => BoundedOperation::Completed(outcome),
+        Err(mpsc::RecvTimeoutError::Timeout) => BoundedOperation::TimedOut,
+        Err(mpsc::RecvTimeoutError::Disconnected) => BoundedOperation::WorkerStopped,
+    }
+}
+
+fn start_startup_delivery(app: AppHandle, engine: Engine, delivery: NotificationDelivery) {
+    let engine = engine.with_request_timeout(STARTUP_DELIVERY_TIMEOUT);
+    if thread::Builder::new()
+        .name("email-watcher-startup-delivery".into())
+        .spawn(move || {
+            match run_bounded_operation(STARTUP_DELIVERY_TIMEOUT, move || {
+                delivery.deliver(&app, &engine)
+            }) {
+                BoundedOperation::Completed(Ok(outcome)) if outcome.failed > 0 => eprintln!(
+                    "{} watcher startup notification deliveries failed; {} remain queued",
+                    outcome.failed, outcome.remaining
+                ),
+                BoundedOperation::Completed(Ok(_)) => {}
+                BoundedOperation::Completed(Err(error)) => eprintln!(
+                    "watcher startup notification delivery failed ({}): {}",
+                    error.code, error.message
+                ),
+                BoundedOperation::TimedOut => {
+                    eprintln!("watcher startup notification delivery timed out")
+                }
+                BoundedOperation::WorkerStopped => {
+                    eprintln!("watcher startup notification delivery worker stopped")
+                }
+            }
+        })
+        .is_err()
+    {
+        eprintln!("watcher startup notification delivery could not be started");
+    }
+}
+
+fn finish_admission_transition(
+    transition: AdmissionTransition,
+    app: &AppHandle,
+    engine: &Engine,
+    delivery: &NotificationDelivery,
+) -> ConfigAdmissionStatus {
+    if transition.start_startup_delivery {
+        start_startup_delivery(app.clone(), engine.clone(), delivery.clone());
+    }
+    transition.status
 }
 
 impl AdmissionCoordinator<AdmissionWorkers> {
@@ -432,18 +610,13 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         engine: &Engine,
         delivery: &NotificationDelivery,
     ) -> Result<ConfigAdmissionStatus, EngineError> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            EngineError::host("host_error", "Configuration admission coordinator stopped")
-        })?;
-        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
-            return Ok(ConfigAdmissionStatus::Admitted);
-        }
-        inner.state = AdmissionState::Inspecting;
-        let attempt = run_admission_attempt(
+        let transition = self.refresh_with(
             || engine.ntfy_disclosure_status(),
-            || start_admitted_workers(app, engine, delivery),
-        );
-        Ok(Self::install_attempt(&mut inner, attempt))
+            || stage_admitted_workers(app, engine, delivery),
+        )?;
+        Ok(finish_admission_transition(
+            transition, app, engine, delivery,
+        ))
     }
 
     fn initialize(
@@ -455,21 +628,24 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         model_base_url: String,
         model_name: String,
     ) -> Result<ConfigAdmissionStatus, EngineError> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            EngineError::host("host_error", "Configuration admission coordinator stopped")
-        })?;
-        if inner.state != AdmissionState::Missing || inner.workers.is_some() {
-            return Err(EngineError::host(
-                "configuration_not_admitted",
-                "Watcher configuration cannot be initialized in its current state",
-            ));
-        }
-        let initialization = engine.initialize_config(timezone, model_base_url, model_name);
-        let attempt = run_admission_attempt(
-            || engine.ntfy_disclosure_status(),
-            || start_admitted_workers(app, engine, delivery),
-        );
-        let status = Self::install_attempt(&mut inner, attempt);
+        let (initialization, transition) = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.state != AdmissionState::Missing || inner.workers.is_some() {
+                return Err(EngineError::host(
+                    "configuration_not_admitted",
+                    "Watcher configuration cannot be initialized in its current state",
+                ));
+            }
+            let initialization = engine.initialize_config(timezone, model_base_url, model_name);
+            let attempt = run_admission_attempt(
+                || engine.ntfy_disclosure_status(),
+                || stage_admitted_workers(app, engine, delivery),
+            );
+            (initialization, Self::install_attempt(&mut inner, attempt))
+        };
+        let status = finish_admission_transition(transition, app, engine, delivery);
         match initialization {
             Ok(_) => Ok(status),
             Err(_) if status == ConfigAdmissionStatus::Admitted => Ok(status),
@@ -484,32 +660,37 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         delivery: &NotificationDelivery,
         expected_revision: String,
     ) -> Result<ConfigAdmissionStatus, EngineError> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            EngineError::host("host_error", "Configuration admission coordinator stopped")
-        })?;
-        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
-            return Ok(ConfigAdmissionStatus::Admitted);
-        }
-        let revision_matches = match &inner.state {
-            AdmissionState::AwaitingAcknowledgement {
-                expected_revision: current,
-            } => current == &expected_revision,
-            _ => false,
+        let transition = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+                return Ok(ConfigAdmissionStatus::Admitted);
+            }
+            let revision_matches = match &inner.state {
+                AdmissionState::AwaitingAcknowledgement {
+                    expected_revision: current,
+                } => current == &expected_revision,
+                _ => false,
+            };
+            inner.state = AdmissionState::Inspecting;
+            let attempt = if revision_matches {
+                run_acknowledgement_attempt(
+                    || engine.acknowledge_ntfy_disclosure(expected_revision),
+                    || engine.ntfy_disclosure_status(),
+                    || stage_admitted_workers(app, engine, delivery),
+                )
+            } else {
+                run_admission_attempt(
+                    || engine.ntfy_disclosure_status(),
+                    || stage_admitted_workers(app, engine, delivery),
+                )
+            };
+            Self::install_attempt(&mut inner, attempt)
         };
-        inner.state = AdmissionState::Inspecting;
-        let attempt = if revision_matches {
-            run_acknowledgement_attempt(
-                || engine.acknowledge_ntfy_disclosure(expected_revision),
-                || engine.ntfy_disclosure_status(),
-                || start_admitted_workers(app, engine, delivery),
-            )
-        } else {
-            run_admission_attempt(
-                || engine.ntfy_disclosure_status(),
-                || start_admitted_workers(app, engine, delivery),
-            )
-        };
-        Ok(Self::install_attempt(&mut inner, attempt))
+        Ok(finish_admission_transition(
+            transition, app, engine, delivery,
+        ))
     }
 
     fn wake_connect_queue(&self) -> Result<(), EngineError> {
@@ -752,6 +933,8 @@ async fn capability_output_present(
 }
 
 #[tauri::command]
+// Tauri deserializes these named fields directly from the frozen frontend command.
+#[allow(clippy::too_many_arguments)]
 async fn capability_output_export(
     app: AppHandle,
     engine: State<'_, Engine>,
@@ -1039,6 +1222,8 @@ async fn settings_get(
 }
 
 #[tauri::command]
+// Tauri deserializes these named fields directly from the frozen frontend command.
+#[allow(clippy::too_many_arguments)]
 async fn settings_update(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
@@ -1239,6 +1424,30 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct ProbeStagedWorker {
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl StagedWorker for ProbeStagedWorker {
+        fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ProbeAdmissionWorkers {
+        queue_activations: Arc<AtomicUsize>,
+        poll_activations: Arc<AtomicUsize>,
+    }
+
+    impl AdmissionWorkerSet for ProbeAdmissionWorkers {
+        fn activate(&self) {
+            self.queue_activations.fetch_add(1, Ordering::SeqCst);
+            self.poll_activations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn tray_menu_routing_is_explicit() {
@@ -1339,6 +1548,119 @@ mod tests {
         );
         assert_eq!(admission_error.state, AdmissionState::ManualRepairRequired);
         assert!(admission_error.workers.is_none());
+    }
+
+    #[test]
+    fn poll_spawn_failure_rolls_back_staged_queue_without_work() {
+        let queue_shutdowns = Arc::new(AtomicUsize::new(0));
+        let poll_stage_attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = stage_worker_pair(
+            || {
+                Ok::<_, &'static str>(ProbeStagedWorker {
+                    shutdowns: Arc::clone(&queue_shutdowns),
+                })
+            },
+            |_| {
+                poll_stage_attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>("poll spawn failed")
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(poll_stage_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(queue_shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn queue_spawn_failure_never_stages_poll() {
+        let poll_stage_attempts = Arc::new(AtomicUsize::new(0));
+        let result = stage_worker_pair::<ProbeStagedWorker, (), _>(
+            || Err("queue spawn failed"),
+            |_| {
+                poll_stage_attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(poll_stage_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repeated_admission_refresh_activates_one_worker_pair_and_one_delivery() {
+        let queue_activations = Arc::new(AtomicUsize::new(0));
+        let poll_activations = Arc::new(AtomicUsize::new(0));
+        let admission = AdmissionCoordinator::<ProbeAdmissionWorkers>::new();
+
+        let first = admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(ProbeAdmissionWorkers {
+                        queue_activations: Arc::clone(&queue_activations),
+                        poll_activations: Arc::clone(&poll_activations),
+                    })
+                },
+            )
+            .expect("first admission succeeds");
+        let second = admission
+            .refresh_with(
+                || panic!("admitted refresh must not inspect again"),
+                || panic!("admitted refresh must not stage workers again"),
+            )
+            .expect("repeated admission succeeds");
+
+        assert_eq!(first.status, ConfigAdmissionStatus::Admitted);
+        assert!(first.start_startup_delivery);
+        assert_eq!(second.status, ConfigAdmissionStatus::Admitted);
+        assert!(!second.start_startup_delivery);
+        assert_eq!(queue_activations.load(Ordering::SeqCst), 1);
+        assert_eq!(poll_activations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timed_out_delivery_does_not_hold_admission_commands() {
+        let admission = AdmissionCoordinator::<ProbeAdmissionWorkers>::new();
+        let transition = admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(ProbeAdmissionWorkers {
+                        queue_activations: Arc::new(AtomicUsize::new(0)),
+                        poll_activations: Arc::new(AtomicUsize::new(0)),
+                    })
+                },
+            )
+            .expect("admission succeeds");
+        assert!(transition.start_startup_delivery);
+
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let delivery = thread::spawn(move || {
+            run_bounded_operation(Duration::from_millis(10), move || {
+                started_sender.send(()).expect("signal delivery start");
+                let _ = release_receiver.recv();
+            })
+        });
+        started_receiver.recv().expect("delivery started");
+
+        admission
+            .require_admitted()
+            .expect("commands remain admitted during delivery");
+        let repeated = admission
+            .refresh_with(
+                || panic!("admitted refresh must not inspect"),
+                || panic!("admitted refresh must not stage"),
+            )
+            .expect("repair UI remains usable during delivery");
+        assert_eq!(repeated.status, ConfigAdmissionStatus::Admitted);
+        assert!(!repeated.start_startup_delivery);
+        assert_eq!(
+            delivery.join().expect("delivery waiter joins"),
+            BoundedOperation::TimedOut
+        );
+        release_sender.send(()).expect("release delivery worker");
     }
 
     #[test]

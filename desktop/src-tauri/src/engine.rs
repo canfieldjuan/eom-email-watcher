@@ -283,6 +283,8 @@ pub struct Engine {
     config_path: PathBuf,
     mailbox_operation_gate: Arc<Mutex<()>>,
     request_timeout: Option<Duration>,
+    #[cfg(test)]
+    test_environment: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -940,6 +942,8 @@ impl Engine {
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
+                #[cfg(test)]
+                test_environment: Vec::new(),
             });
         }
 
@@ -952,6 +956,8 @@ impl Engine {
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
+                #[cfg(test)]
+                test_environment: Vec::new(),
             });
         }
 
@@ -970,6 +976,8 @@ impl Engine {
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
+            #[cfg(test)]
+            test_environment: Vec::new(),
         })
     }
 
@@ -985,7 +993,18 @@ impl Engine {
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
+            test_environment: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_environment(
+        mut self,
+        key: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.test_environment.push((key.into(), value.into()));
+        self
     }
 
     pub fn list(&self) -> Result<Vec<WatchedSender>, EngineError> {
@@ -1527,6 +1546,8 @@ impl Engine {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(test)]
+        command.envs(self.test_environment.iter().cloned());
         #[cfg(unix)]
         command.process_group(0);
         let mut child = EngineChild::spawn(&mut command).map_err(|_| {
@@ -2588,6 +2609,10 @@ esac"#,
             .parent()
             .and_then(Path::parent)
             .expect("repository root");
+        let process_root = config_path
+            .parent()
+            .expect("test configuration has a parent")
+            .join("isolated-process-environment");
         Engine::with_command(
             "uv",
             vec![
@@ -2598,6 +2623,9 @@ esac"#,
             ],
             config_path,
         )
+        .with_test_environment("HOME", process_root.join("home"))
+        .with_test_environment("XDG_CONFIG_HOME", process_root.join("xdg-config"))
+        .with_test_environment("LOCALAPPDATA", process_root.join("local-app-data"))
     }
 
     fn toml_path_literal(path: &Path) -> String {
