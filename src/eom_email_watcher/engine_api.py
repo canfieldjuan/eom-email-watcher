@@ -1214,7 +1214,9 @@ def _gmail_label_selector_add(request: dict[str, object]) -> dict[str, object]:
             )
             with mailbox_polling_session(reopened.gateway):
                 identity_y = mailbox_session_identity_key(reopened)
-        except (GmailAuthorizationRejected, MailboxError) as exc:
+        except GmailAuthorizationRejected as exc:
+            raise _gmail_label_catalog_error(exc) from exc
+        except MailboxError as exc:
             raise ApiError(
                 "account_unavailable",
                 "The active Gmail account could not be reopened",

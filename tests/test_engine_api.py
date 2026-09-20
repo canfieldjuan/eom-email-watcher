@@ -38,6 +38,7 @@ from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
     MailboxChanges,
+    MailboxError,
     MailboxSession,
     MessageContent,
     scoped_message_id,
@@ -422,6 +423,76 @@ def test_gmail_label_add_reopens_identity_and_fails_closed_on_replacement(
         )
     )
     assert response["error"]["code"] == "mailbox_identity_changed"
+    assert runtime.store.gmail_label_selectors("gmail-default") == ()
+    assert runtime.store.gmail_label_selector_set("gmail-default").revision == 0
+
+
+@pytest.mark.parametrize(
+    ("reopen_error", "expected_error"),
+    [
+        (
+            GmailAuthorizationRejected("private authorization response"),
+            {
+                "code": "gmail_authorization_rejected",
+                "message": "Gmail authorization was rejected; reconnect the account",
+                "retryable": False,
+            },
+        ),
+        (
+            MailboxError("private mailbox failure"),
+            {
+                "code": "account_unavailable",
+                "message": "The active Gmail account could not be reopened",
+            },
+        ),
+    ],
+)
+def test_gmail_label_add_preserves_typed_error_from_required_identity_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reopen_error: Exception,
+    expected_error: dict[str, object],
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    gateway = FakeGmailLabelGateway(
+        identity_key,
+        (GmailLabel("Label_123", "Invoices", "user"),),
+    )
+    first = MailboxSession("gmail", "gmail-default", gateway)
+    open_calls = 0
+
+    def open_mailbox(*_args: object, **_kwargs: object) -> MailboxSession:
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls == 1:
+            return first
+        raise reopen_error
+
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", open_mailbox)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.label_selectors.add",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "Label_123",
+                "expected_revision": 0,
+            },
+        )
+    )
+
+    assert response["error"] == expected_error
+    assert "private authorization response" not in json.dumps(response)
+    assert "private mailbox failure" not in json.dumps(response)
+    assert open_calls == 2
+    assert gateway.catalog_calls == 1
     assert runtime.store.gmail_label_selectors("gmail-default") == ()
     assert runtime.store.gmail_label_selector_set("gmail-default").revision == 0
 
