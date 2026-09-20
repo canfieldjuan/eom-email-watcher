@@ -344,7 +344,7 @@ test("sender observation versions reject crossed health and accept later fresh h
   assert.match(source, /watchlistCount\.textContent = String\(exactSenderCount\)/);
   assert.doesNotMatch(source, /watchlistCount\.textContent = String\(health\.watchlist_count\)/);
   const localReducerSource = source.match(
-    /function gmailLabelSenderCountAfterLocalObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelSenderCountAfterHealth/,
+    /function gmailLabelSenderCountAfterLocalObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction activeExactSenderCount/,
   );
   assert.ok(localReducerSource);
   const observeLocal = Function(
@@ -390,6 +390,32 @@ test("sender observation versions reject crossed health and accept later fresh h
     count: 2,
     observation_version: 1,
   });
+});
+
+test("legacy-only sender rows remain manageable without defeating label-only state", () => {
+  assert.match(source, /function activeExactSenderCount\(senders: WatchedSender\[\]\): number/);
+  assert.match(source, /senders\.filter\(\(sender\) => sender\.admission_active\)\.length/);
+  assert.match(source, /const exactSenderCount = activeExactSenderCount\(senders\)/);
+  const renderSenders = source.match(
+    /function renderSenders\(senders: WatchedSender\[\]\): void \{([\s\S]*?)\n\}\n\nasync function loadSenders/,
+  );
+  assert.ok(renderSenders);
+  assert.doesNotMatch(
+    renderSenders[1],
+    /gmailLabelSenderCountAfterLocalObservation\(\s*gmailLabelSenderCount,\s*senders\.length,/s,
+  );
+  const helper = source.match(
+    /function activeExactSenderCount\(senders: WatchedSender\[\]\): number \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const activeCount = Function(
+    `return function activeExactSenderCount(senders) {${helper[1]}\n}`,
+  )() as (senders: Array<{ admission_active: boolean }>) => number;
+  assert.equal(activeCount([{ admission_active: false }]), 0);
+  assert.equal(
+    activeCount([{ admission_active: false }, { admission_active: true }]),
+    1,
+  );
 });
 
 test("health captures sender version and preserves health request generation ordering", () => {

@@ -1353,7 +1353,7 @@ def _health(request: dict[str, object]) -> dict[str, object]:
             "ntfy_configured": config.ntfy_topic is not None,
         },
         "production_check_supported": production_check_supported,
-        "watchlist_count": len(config.senders),
+        "watchlist_count": len(config.allowlist),
     }
 
 
@@ -5329,14 +5329,18 @@ def _watchlist(request: dict[str, object]) -> dict[str, object]:
     config = load_config(_config_path(request))
     return {
         "items": [
-            {"email": sender.email, "name": sender.name}
+            _sender_data(sender, admission_active=sender.email in config.allowlist)
             for sender in sorted(config.senders, key=lambda item: item.email)
         ]
     }
 
 
-def _sender_data(sender: Sender) -> dict[str, str | None]:
-    return {"email": sender.email, "name": sender.name}
+def _sender_data(sender: Sender, *, admission_active: bool) -> dict[str, str | bool | None]:
+    return {
+        "email": sender.email,
+        "name": sender.name,
+        "admission_active": admission_active,
+    }
 
 
 def _with_watchlist_mutation(
@@ -5372,7 +5376,7 @@ def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
             raise ApiError("invalid_request", str(exc)) from exc
         except DuplicateSenderError as exc:
             raise ApiError("conflict", str(exc)) from exc
-        return {"item": _sender_data(sender)}
+        return {"item": _sender_data(sender, admission_active=True)}
 
     return _with_watchlist_mutation(request, add)
 
@@ -5383,13 +5387,19 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     if not isinstance(email, str) or not email.strip():
         raise ApiError("invalid_request", "email must be a non-empty string")
     def remove() -> dict[str, object]:
+        config = load_config(_config_path(request))
         try:
             sender = remove_sender(_config_path(request), email)
         except InvalidSenderError as exc:
             raise ApiError("invalid_request", str(exc)) from exc
         except SenderNotFoundError as exc:
             raise ApiError("not_found", str(exc)) from exc
-        return {"item": _sender_data(sender)}
+        return {
+            "item": _sender_data(
+                sender,
+                admission_active=sender.email in config.allowlist,
+            )
+        }
 
     return _with_watchlist_mutation(request, remove)
 

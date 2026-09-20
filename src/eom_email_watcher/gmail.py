@@ -54,6 +54,9 @@ MAX_GMAIL_RECOVERY_PAGE_IDS = 200
 MAX_GMAIL_PAGE_TOKEN_BYTES = 8_192
 GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels"
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
+TRANSIENT_GMAIL_LABEL_403_REASONS = frozenset(
+    {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded"}
+)
 
 
 class GmailError(MailboxError):
@@ -284,6 +287,54 @@ def decode_gmail_label_catalog(
             "gmail_label_catalog_invalid: normalized response is too large"
         )
     return tuple(labels)
+
+
+def _bounded_gmail_label_response_body(response: object) -> bytes | None:
+    headers = getattr(response, "headers", {})
+    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if (
+        isinstance(content_length, str)
+        and content_length.strip().isdecimal()
+        and int(content_length.strip()) > MAX_GMAIL_LABEL_CATALOG_BYTES
+    ):
+        return None
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=65_536):
+        if not chunk:
+            continue
+        remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
+        body.extend(chunk[:remaining])
+        if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+            return None
+    return bytes(body)
+
+
+def _gmail_error_reasons(body: bytes) -> frozenset[str]:
+    try:
+        payload = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_json_numeric_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return frozenset()
+    if not isinstance(payload, dict):
+        return frozenset()
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return frozenset()
+    errors = error.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return frozenset()
+    reasons: set[str] = set()
+    for item in errors:
+        if not isinstance(item, dict):
+            return frozenset()
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason:
+            return frozenset()
+        reasons.add(reason)
+    return frozenset(reasons)
 
 
 def resolve_gmail_credentials_file(configured_file: Path) -> Path:
@@ -618,7 +669,17 @@ class GmailGateway:
         try:
             with AuthorizedSession(self._credentials) as session:
                 response = session.get(GMAIL_LABELS_URL, stream=True, timeout=120)
-                if response.status_code in (401, 403):
+                if response.status_code == 401:
+                    raise GmailAuthorizationRejected(
+                        "Gmail rejected the configured authorization"
+                    )
+                if response.status_code == 403:
+                    body = _bounded_gmail_label_response_body(response)
+                    reasons = _gmail_error_reasons(body) if body is not None else frozenset()
+                    if reasons and reasons <= TRANSIENT_GMAIL_LABEL_403_REASONS:
+                        raise GmailLabelCatalogUnavailable(
+                            "gmail_label_catalog_unavailable: Gmail labels request was throttled"
+                        )
                     raise GmailAuthorizationRejected(
                         "Gmail rejected the configured authorization"
                     )
@@ -628,26 +689,13 @@ class GmailGateway:
                         f"Gmail labels request failed (HTTP {response.status_code})"
                     )
                 content_length = response.headers.get("Content-Length")
-                if (
-                    isinstance(content_length, str)
-                    and content_length.strip().isdecimal()
-                    and int(content_length.strip()) > MAX_GMAIL_LABEL_CATALOG_BYTES
-                ):
+                body = _bounded_gmail_label_response_body(response)
+                if body is None:
                     raise GmailLabelCatalogInvalid(
                         "gmail_label_catalog_invalid: response is too large"
                     )
-                body = bytearray()
-                for chunk in response.iter_content(chunk_size=65_536):
-                    if not chunk:
-                        continue
-                    remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
-                    body.extend(chunk[:remaining])
-                    if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
-                        raise GmailLabelCatalogInvalid(
-                            "gmail_label_catalog_invalid: response is too large"
-                        )
                 return decode_gmail_label_catalog(
-                    bytes(body),
+                    body,
                     content_length=content_length,
                 )
         except (GmailAuthorizationRejected, GmailLabelCatalogInvalid):

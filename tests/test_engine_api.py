@@ -937,18 +937,28 @@ def test_existing_overlong_sender_selector_can_be_listed_removed_and_replaced(
     )
 
     listed = engine_api._response(request(config_path, "watchlist.list"))
-    assert listed["data"]["items"] == [{"email": rejected_address, "name": None}]
+    assert listed["data"]["items"] == [
+        {"email": rejected_address, "name": None, "admission_active": False}
+    ]
 
     removed = engine_api._response(
         request(config_path, "watchlist.remove", {"email": rejected_address})
     )
-    assert removed["data"]["item"] == {"email": rejected_address, "name": None}
+    assert removed["data"]["item"] == {
+        "email": rejected_address,
+        "name": None,
+        "admission_active": False,
+    }
 
     replacement_address = f"{'é' * 246}a@example.com"
     replaced = engine_api._response(
         request(config_path, "watchlist.add", {"email": replacement_address})
     )
-    assert replaced["data"]["item"] == {"email": replacement_address, "name": None}
+    assert replaced["data"]["item"] == {
+        "email": replacement_address,
+        "name": None,
+        "admission_active": True,
+    }
 
 
 def test_existing_overlong_sender_name_can_be_listed_removed_and_shortened(
@@ -970,6 +980,7 @@ def test_existing_overlong_sender_name_can_be_listed_removed_and_shortened(
     assert legacy_item == {
         "email": "z@example.com",
         "name": legacy_name,
+        "admission_active": True,
     }
 
     removed = engine_api._response(
@@ -1211,8 +1222,16 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
         "operation": "watchlist.list",
         "data": {
             "items": [
-                {"email": "a@example.com", "name": "Trusted A"},
-                {"email": "z@example.com", "name": "Zed"},
+                {
+                    "email": "a@example.com",
+                    "name": "Trusted A",
+                    "admission_active": True,
+                },
+                {
+                    "email": "z@example.com",
+                    "name": "Zed",
+                    "admission_active": True,
+                },
             ]
         },
     }
@@ -1717,6 +1736,32 @@ def test_health_reports_current_identity_gmail_recovery_without_selectors(
     health = engine_api._response(request(config_path, "health.get"))
 
     assert health["data"]["gmail"]["label_watch_configured"] is True
+
+
+def test_health_counts_only_active_exact_sender_admissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    legacy_address = f"{'e' * 494}@example.com"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "\n[[senders]]\nemail = \"active@example.com\"\n"
+        + f"\n[[senders]]\nemail = \"{legacy_address}\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert health["data"]["watchlist_count"] == 1
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+    assert listed["data"]["items"] == [
+        {"email": "active@example.com", "name": None, "admission_active": True},
+        {"email": legacy_address, "name": None, "admission_active": False},
+    ]
 
 
 def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
@@ -5263,6 +5308,7 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
     assert added["data"]["item"] == {
         "email": "new@example.com",
         "name": "New Person",
+        "admission_active": True,
     }
     assert duplicate["error"]["code"] == "conflict"
     assert missing["error"]["code"] == "not_found"

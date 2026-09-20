@@ -288,6 +288,7 @@ pub struct Engine {
 pub struct WatchedSender {
     pub email: String,
     pub name: Option<String>,
+    pub admission_active: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -2134,6 +2135,24 @@ mod tests {
     }
 
     #[test]
+    fn watched_sender_admission_state_is_typed() {
+        let sender: WatchedSender = serde_json::from_value(json!({
+            "email": "legacy@example.com",
+            "name": null,
+            "admission_active": false
+        }))
+        .expect("deserialize watched sender");
+        assert_eq!(
+            sender,
+            WatchedSender {
+                email: "legacy@example.com".into(),
+                name: None,
+                admission_active: false,
+            }
+        );
+    }
+
+    #[test]
     fn protocol_v2_capabilities_and_durable_results_are_typed() {
         let capabilities: ConnectCapabilities = serde_json::from_value(json!({
             "items": [{
@@ -3332,6 +3351,7 @@ notifications_enabled = true
             WatchedSender {
                 email: "watched@example.com".into(),
                 name: Some("Watched".into()),
+                admission_active: true,
             }
         );
         assert_eq!(engine.list().expect("list sender"), vec![added]);

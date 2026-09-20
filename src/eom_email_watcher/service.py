@@ -39,7 +39,12 @@ from .db import (
     PendingMessage,
     Store,
 )
-from .gmail import GmailRecoveryPageInvalid, GmailRecoveryPageTokenInvalid
+from .gmail import (
+    GmailLabelCatalogInvalid,
+    GmailLabelCatalogUnavailable,
+    GmailRecoveryPageInvalid,
+    GmailRecoveryPageTokenInvalid,
+)
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
     MailboxAccountUnavailable,
@@ -1352,11 +1357,24 @@ class Watcher:
                 if self.mailbox.provider == "gmail"
                 else None
             )
-            label_selectors = (
-                ()
-                if recovery_state is not None
-                else self._active_gmail_label_selectors(mailbox_identity_key)
-            )
+            try:
+                label_selectors = (
+                    ()
+                    if recovery_state is not None
+                    else self._active_gmail_label_selectors(mailbox_identity_key)
+                )
+            except (GmailLabelCatalogInvalid, GmailLabelCatalogUnavailable):
+                checked_at = datetime.now(UTC)
+                self._process_pending(
+                    dry_run=dry_run,
+                    deliver_notifications=deliver_notifications,
+                    extra=[],
+                    retention_cutoff=checked_at
+                    - timedelta(days=self.config.retention_days),
+                    retention_observed_at=checked_at,
+                    mailbox_identity_key=mailbox_identity_key,
+                )
+                raise
             if (
                 not self.admission_sender_names
                 and not label_selectors

@@ -14,6 +14,8 @@ from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
+    GmailLabelCatalogInvalid,
+    GmailLabelCatalogUnavailable,
     GmailRecoveryPageTokenInvalid,
     MessageMetadata,
     MessageUnavailable,
@@ -672,6 +674,83 @@ def test_label_only_configuration_runs_check_with_zero_senders(
     assert gateway.full_payload_calls == 1
     assert model.calls == 1
     assert store.recent(1)[0]["admission"]["display_name"] == "Renamed Invoices"
+
+
+@pytest.mark.parametrize(
+    "catalog_error",
+    [
+        GmailLabelCatalogUnavailable("catalog unavailable"),
+        GmailLabelCatalogInvalid("catalog invalid"),
+    ],
+)
+def test_catalog_failure_blocks_discovery_but_processes_one_persisted_retry(
+    tmp_path: Path,
+    catalog_error: Exception,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+
+    class CatalogGateway(FreshGmail):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_error: Exception | None = None
+            self.change_calls = 0
+
+        def label_catalog(self):
+            if self.catalog_error is not None:
+                raise self.catalog_error
+            return (
+                SimpleNamespace(
+                    label_id="Label_123",
+                    display_name="Invoices",
+                    label_type="user",
+                ),
+            )
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            self.change_calls += 1
+            return super().changes_since(cursor)
+
+    gateway = CatalogGateway()
+    model = FailOnceModel()
+    watcher = Watcher(cfg, store, gateway, model)
+    assert watcher.check()["summarized"] == 0
+    assert store.state()[0] == "200"
+    assert len(store.recent(10)) == 1
+    _make_retries_due(store)
+    gateway.catalog_error = catalog_error
+
+    with pytest.raises(type(catalog_error)):
+        watcher.check()
+
+    assert gateway.change_calls == 1
+    assert store.state()[0] == "200"
+    assert len(store.recent(10)) == 1
+    assert model.calls == 2
+    assert gateway.full_payload_calls == 2
+    assert store.recent(1)[0]["status"] == "summarized"
 
 
 def test_open_recovery_keeps_watch_configured_after_last_selector_is_removed(

@@ -23,6 +23,7 @@ import "./styles.css";
 interface WatchedSender {
   email: string;
   name: string | null;
+  admission_active: boolean;
 }
 
 interface InboxAttachment {
@@ -2349,6 +2350,10 @@ function gmailLabelSenderCountAfterLocalObservation(
   };
 }
 
+function activeExactSenderCount(senders: WatchedSender[]): number {
+  return senders.filter((sender) => sender.admission_active).length;
+}
+
 function gmailLabelSenderCountAfterHealth(
   current: GmailLabelSenderCountState,
   incomingCount: number,
@@ -3864,11 +3869,11 @@ function finishOperation(): void {
 
 function renderSenders(senders: WatchedSender[]): void {
   watchedSenders = senders;
+  const exactSenderCount = activeExactSenderCount(senders);
   gmailLabelSenderCount = gmailLabelSenderCountAfterLocalObservation(
     gmailLabelSenderCount,
-    senders.length,
+    exactSenderCount,
   );
-  const exactSenderCount = gmailLabelSenderCount.count ?? senders.length;
   if (gmailLabelHealth !== null) {
     gmailLabelHealth = {
       ...gmailLabelHealth,

@@ -510,8 +510,14 @@ def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_parse() -
 
 
 class FakeCatalogResponse:
-    def __init__(self, body: bytes, content_length: str | None = None):
-        self.status_code = 200
+    def __init__(
+        self,
+        body: bytes,
+        content_length: str | None = None,
+        *,
+        status_code: int = 200,
+    ):
+        self.status_code = status_code
         self.headers = {} if content_length is None else {"Content-Length": content_length}
         self.body = body
         self.read_started = False
@@ -575,6 +581,52 @@ def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
         gateway.label_catalog()
 
     assert response.read_started is True
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "error_type"),
+    [
+        (401, b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}', GmailAuthorizationRejected),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"quotaExceeded"}]}}',
+            gmail_module.GmailLabelCatalogUnavailable,
+        ),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
+            gmail_module.GmailLabelCatalogUnavailable,
+        ),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}',
+            gmail_module.GmailLabelCatalogUnavailable,
+        ),
+        (403, b'{"error":{"errors":[{"reason":"forbidden"}]}}', GmailAuthorizationRejected),
+        (403, b'{"error":{"errors":[{"reason":"unknownReason"}]}}', GmailAuthorizationRejected),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"},{"reason":"forbidden"}]}}',
+            GmailAuthorizationRejected,
+        ),
+        (403, b'not-json', GmailAuthorizationRejected),
+    ],
+)
+def test_gmail_catalog_classifies_http_auth_and_quota_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    body: bytes,
+    error_type: type[Exception],
+) -> None:
+    response = FakeCatalogResponse(body, status_code=status_code)
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    with pytest.raises(error_type):
+        gateway.label_catalog()
+
+    assert response.read_started is (status_code == 403)
 
 
 def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:
