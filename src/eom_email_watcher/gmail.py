@@ -297,7 +297,7 @@ def _bounded_gmail_label_response_body(
     require_content_length_match: bool = False,
 ) -> bytes | None:
     headers = getattr(response, "headers", {})
-    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    content_length = _decoded_content_length(headers)
     expected_length: int | None = None
     if content_length is not None:
         if isinstance(content_length, str) and content_length.strip().isdecimal():
@@ -330,6 +330,18 @@ def _bounded_gmail_label_response_body(
     ):
         return None
     return bytes(body)
+
+
+def _decoded_content_length(headers: object) -> object:
+    if not hasattr(headers, "get"):
+        return None
+    content_encoding = headers.get("Content-Encoding")
+    if content_encoding is not None and (
+        not isinstance(content_encoding, str)
+        or content_encoding.strip().casefold() not in {"", "identity"}
+    ):
+        return None
+    return headers.get("Content-Length")
 
 
 def _gmail_error_reasons(body: bytes) -> frozenset[str]:
@@ -719,7 +731,7 @@ class GmailGateway:
                         "gmail_label_catalog_unavailable: "
                         f"Gmail labels request failed (HTTP {response.status_code})"
                     )
-                content_length = response.headers.get("Content-Length")
+                content_length = _decoded_content_length(response.headers)
                 body = _bounded_gmail_label_response_body(response)
                 if body is None:
                     raise GmailLabelCatalogInvalid(

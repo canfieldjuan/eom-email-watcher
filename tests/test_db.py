@@ -294,6 +294,72 @@ def test_cursor_dedup_and_summary_lifecycle(tmp_path: Path) -> None:
     assert recent["notified_at"] is not None
 
 
+def test_pending_mailbox_work_requires_current_identity_and_ignores_retry_deadline(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    old_identity = "a" * 64
+    current_identity = "b" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    assert store.add_message(
+        message_id="old-pending",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="old-pending",
+        mailbox_identity_key=old_identity,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Old pending",
+        received_at="2026-09-20T12:00:00+00:00",
+    )
+    assert store.has_current_pending_mailbox_work(
+        "gmail", "gmail-default", old_identity
+    )
+
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        current_identity,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    assert not store.has_current_pending_mailbox_work(
+        "gmail", "gmail-default", old_identity
+    )
+    assert store.add_message(
+        message_id="current-pending",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="current-pending",
+        mailbox_identity_key=current_identity,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Current pending",
+        received_at="2026-09-20T12:00:00+00:00",
+    )
+    store.record_analysis_failure(
+        "current-pending",
+        "retry later",
+        0,
+        retryable=True,
+        now=datetime.now(UTC),
+    )
+
+    assert [message.message_id for message in store.pending()] == ["old-pending"]
+    assert store.has_current_pending_mailbox_work(
+        "gmail", "gmail-default", current_identity
+    )
+
+
 def test_scheduling_analysis_atomically_admits_one_durable_run(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()

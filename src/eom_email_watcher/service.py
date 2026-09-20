@@ -1337,15 +1337,55 @@ class Watcher:
             result["reason"] = reason
         return result
 
+    @staticmethod
+    def recovery_backoff_result(
+        state: GmailRecoveryState,
+    ) -> dict[str, int | bool | str]:
+        result: dict[str, int | bool | str] = {
+            "active": True,
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": True,
+            "recovery_pending": True,
+            "recovery_state": state.state,
+        }
+        if state.failure_code is not None:
+            result["recovery_failure_code"] = state.failure_code
+        if state.next_retry_at is not None:
+            result["recovery_next_retry_at"] = state.next_retry_at
+        return result
+
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool | str]:
-        if not self.admission_sender_names and self.mailbox.provider != "gmail":
-            return self.inactive_result(self.config, self.store, dry_run=dry_run)
+        account = self.store.mail_account(self.mailbox.provider, self.mailbox.account_id)
+        recorded_identity = account.mailbox_identity_key if account is not None else None
+        if self.mailbox.provider == "gmail" and dry_run:
+            recovery_state = self.store.gmail_recovery_state(self.mailbox.account_id)
+            checked_at = datetime.now(UTC)
+            if (
+                recovery_state is not None
+                and recorded_identity == recovery_state.mailbox_identity_key
+                and not self._retry_due(recovery_state.next_retry_at, checked_at)
+            ):
+                return self.recovery_backoff_result(recovery_state)
+        pending_current_identity = (
+            recorded_identity is not None
+            and self.store.has_current_pending_mailbox_work(
+                self.mailbox.provider,
+                self.mailbox.account_id,
+                recorded_identity,
+            )
+        )
+        gmail_watch_configured = self.mailbox.provider == "gmail" and (
+            _gmail_label_watch_configured(self.store)
+        )
         if (
             not self.admission_sender_names
-            and self.mailbox.provider == "gmail"
-            and not _gmail_label_watch_configured(self.store)
+            and not gmail_watch_configured
+            and not pending_current_identity
         ):
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
@@ -1387,9 +1427,31 @@ class Watcher:
                 and not label_selectors
                 and recovery_state is None
             ):
-                current_label_rows = self.store.gmail_current_label_selectors(
+                pending_current_identity = self.store.has_current_pending_mailbox_work(
+                    self.mailbox.provider,
                     self.mailbox.account_id,
                     mailbox_identity_key,
+                )
+                if pending_current_identity:
+                    checked_at = datetime.now(UTC)
+                    return self._finish_active_result(
+                        added=0,
+                        purged=0,
+                        recovered=False,
+                        dry_run=dry_run,
+                        deliver_notifications=deliver_notifications,
+                        checked_at=checked_at,
+                        retention_cutoff=checked_at
+                        - timedelta(days=self.config.retention_days),
+                        mailbox_identity_key=mailbox_identity_key,
+                    )
+                current_label_rows = (
+                    self.store.gmail_current_label_selectors(
+                        self.mailbox.account_id,
+                        mailbox_identity_key,
+                    )
+                    if self.mailbox.provider == "gmail"
+                    else ()
                 )
                 return self.inactive_result(
                     self.config,
@@ -1501,10 +1563,10 @@ class Watcher:
     ) -> dict[str, int | bool | str]:
         """Preview the frozen recovery window without changing durable progress."""
         deadline = time.monotonic() + 30.0
+        if not self._retry_due(state.next_retry_at, checked_at):
+            return self.recovery_backoff_result(state)
         if state.page_loaded:
             message_ids = state.current_page_ids[state.next_index :]
-        elif not self._retry_due(state.next_retry_at, checked_at):
-            message_ids = ()
         else:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:

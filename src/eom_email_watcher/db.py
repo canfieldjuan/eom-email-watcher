@@ -7832,6 +7832,26 @@ class Store:
             ).fetchall()
         return [PendingMessage(**dict(row)) for row in rows]
 
+    def has_current_pending_mailbox_work(
+        self,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+    ) -> bool:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT 1 FROM messages AS m
+                JOIN mail_accounts AS a
+                  ON a.provider = m.provider AND a.account_id = m.account_id
+                 AND a.mailbox_identity_key = m.mailbox_identity_key
+                WHERE m.status = 'pending' AND COALESCE(m.analysis_retryable, 1) = 1
+                  AND m.provider = ? AND m.account_id = ? AND m.mailbox_identity_key = ?
+                LIMIT 1""",
+                (provider, account_id, mailbox_identity_key),
+            ).fetchone()
+        return row is not None
+
     def recoverable_automation_runs(
         self,
         limit: int = 25,

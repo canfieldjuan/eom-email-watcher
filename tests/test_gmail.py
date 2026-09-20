@@ -516,9 +516,12 @@ class FakeCatalogResponse:
         content_length: str | None = None,
         *,
         status_code: int = 200,
+        content_encoding: str | None = None,
     ):
         self.status_code = status_code
         self.headers = {} if content_length is None else {"Content-Length": content_length}
+        if content_encoding is not None:
+            self.headers["Content-Encoding"] = content_encoding
         self.body = body
         self.read_started = False
 
@@ -663,10 +666,17 @@ def test_gmail_catalog_classifies_http_auth_and_quota_boundaries(
             b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
             status_code=403,
         ),
+        InterruptedCatalogResponse(
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
+            content_length="17",
+            status_code=403,
+            content_encoding="gzip",
+        ),
         FakeCatalogResponse(
             b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
             content_length="999",
             status_code=403,
+            content_encoding="identity",
         ),
     ],
 )
@@ -682,6 +692,43 @@ def test_gmail_catalog_403_requires_a_complete_error_document(
         gateway.label_catalog()
 
     assert "private provider stream failure" not in str(raised.value)
+
+
+@pytest.mark.parametrize("content_encoding", ["gzip", "deflate"])
+def test_gmail_catalog_compressed_rate_limit_uses_decoded_body_length(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+) -> None:
+    body = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
+    response = FakeCatalogResponse(
+        body,
+        content_length="17",
+        status_code=403,
+        content_encoding=content_encoding,
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    with pytest.raises(gmail_module.GmailLabelCatalogUnavailable, match="throttled"):
+        gateway.label_catalog()
+
+
+def test_gmail_catalog_compressed_success_uses_decoded_size_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = catalog_body([])
+    response = FakeCatalogResponse(
+        body,
+        content_length=str(gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1),
+        content_encoding="gzip",
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    assert gateway.label_catalog() == ()
+    assert response.read_started is True
 
 
 def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:
