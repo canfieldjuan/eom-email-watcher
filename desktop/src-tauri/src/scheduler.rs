@@ -5,9 +5,9 @@ use std::io;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
-    mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
 };
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
@@ -16,6 +16,7 @@ pub const CONNECT_QUEUE_EVENT: &str = "watcher://connect-queue";
 const MAX_SLEEP_SLICE: Duration = Duration::from_secs(30);
 const SCHEDULED_ENGINE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONNECT_QUEUE_ERROR_RETRY: Duration = Duration::from_secs(30);
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +41,7 @@ struct ConnectQueueEvent {
 pub struct ConnectQueueScheduler {
     wake_sender: SyncSender<()>,
     gate: Arc<WorkerGate>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    worker: OwnedWorker,
 }
 
 #[derive(Default)]
@@ -49,7 +50,7 @@ struct WorkerGateState {
     stopped: bool,
 }
 
-struct WorkerGate {
+pub(crate) struct WorkerGate {
     state: Mutex<WorkerGateState>,
     changed: Condvar,
     cancellation: CancellationToken,
@@ -62,7 +63,7 @@ impl Default for WorkerGate {
 }
 
 impl WorkerGate {
-    fn with_cancellation(cancellation: CancellationToken) -> Self {
+    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
             state: Mutex::new(WorkerGateState::default()),
             changed: Condvar::new(),
@@ -70,11 +71,11 @@ impl WorkerGate {
         }
     }
 
-    fn cancellation(&self) -> CancellationToken {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }
 
-    fn activate(&self) {
+    pub(crate) fn activate(&self) {
         let mut state = self
             .state
             .lock()
@@ -85,8 +86,7 @@ impl WorkerGate {
         self.changed.notify_all();
     }
 
-    fn stop(&self) {
-        self.cancellation.cancel();
+    pub(crate) fn signal_stop(&self) {
         let mut state = self
             .state
             .lock()
@@ -104,7 +104,7 @@ impl WorkerGate {
                 .stopped
     }
 
-    fn wait_for_activation(&self) -> bool {
+    pub(crate) fn wait_for_activation(&self) -> bool {
         let mut state = self
             .state
             .lock()
@@ -131,6 +131,81 @@ impl WorkerGate {
             .wait_timeout(state, duration)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.stopped && !self.cancellation.is_cancelled()
+    }
+}
+
+struct CompletionSignal(Option<Sender<()>>);
+
+impl Drop for CompletionSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct WorkerRegistration {
+    handle: thread::JoinHandle<()>,
+    completed: Receiver<()>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct OwnedWorker {
+    registration: Arc<Mutex<Option<WorkerRegistration>>>,
+}
+
+impl OwnedWorker {
+    pub(crate) fn spawn(
+        &self,
+        name: &str,
+        operation: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
+        let mut registration = self
+            .registration
+            .lock()
+            .map_err(|_| io::Error::other("Worker handle is unavailable"))?;
+        if registration.is_some() {
+            return Err(io::Error::other("Worker is already running"));
+        }
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        let handle = thread::Builder::new().name(name.into()).spawn(move || {
+            let _completion = CompletionSignal(Some(completed_sender));
+            operation();
+        })?;
+        *registration = Some(WorkerRegistration {
+            handle,
+            completed: completed_receiver,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn join(&self, label: &str) -> io::Result<()> {
+        let registration = self
+            .registration
+            .lock()
+            .map_err(|_| io::Error::other("Worker handle is unavailable"))?
+            .take();
+        let Some(registration) = registration else {
+            return Ok(());
+        };
+        match registration.completed.recv_timeout(WORKER_SHUTDOWN_GRACE) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => registration
+                .handle
+                .join()
+                .map_err(|_| io::Error::other(format!("{label} stopped unexpectedly"))),
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("fatal: {label} did not stop within the owned worker shutdown deadline");
+                std::process::abort();
+            }
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn is_joined(&self) -> bool {
+        self.registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
     }
 }
 
@@ -189,90 +264,88 @@ impl ConnectQueueScheduler {
     ) -> io::Result<Self> {
         let (wake_sender, receiver) = mpsc::sync_channel(1);
         let gate = Arc::new(WorkerGate::with_cancellation(cancellation));
-        let handle = Arc::new(Mutex::new(None));
+        let worker = OwnedWorker::default();
         let scheduler = Self {
             wake_sender,
             gate: Arc::clone(&gate),
-            handle: Arc::clone(&handle),
+            worker: worker.clone(),
         };
         let engine = engine
             .with_request_timeout(SCHEDULED_ENGINE_TIMEOUT)
             .with_cancellation(gate.cancellation());
-        let worker = thread::Builder::new()
-            .name("email-watcher-connect-queue".into())
-            .spawn(move || {
-                if !gate.wait_for_activation() {
-                    return;
+        worker.spawn("email-watcher-connect-queue", move || {
+            if !gate.wait_for_activation() {
+                return;
+            }
+            let mut next_wake_unix_ms = Some(unix_ms_now());
+            let mut queue_was_active = false;
+            while wait_for_queue_wakeup(&receiver, next_wake_unix_ms) {
+                if gate.is_stopped() {
+                    break;
                 }
-                let mut next_wake_unix_ms = Some(unix_ms_now());
-                let mut queue_was_active = false;
-                while wait_for_queue_wakeup(&receiver, next_wake_unix_ms) {
-                    if gate.is_stopped() {
-                        break;
-                    }
-                    match engine.pump_connect_queue() {
-                        Ok(outcome) => {
-                            next_wake_unix_ms = outcome.next_wake_unix_ms;
-                            let refresh = queue_refresh_needed(
-                                queue_was_active,
-                                outcome.items.len(),
-                                next_wake_unix_ms,
-                            );
-                            queue_was_active = next_wake_unix_ms.is_some();
-                            if refresh
-                                && app
-                                    .emit(
-                                        CONNECT_QUEUE_EVENT,
-                                        ConnectQueueEvent {
-                                            attempted: outcome.items.len(),
-                                        },
-                                    )
-                                    .is_err()
-                            {
-                                eprintln!(
-                                    "Connect queue progress could not refresh the desktop window"
-                                );
-                            }
-                        }
-                        Err(error) => {
+                match engine.pump_connect_queue() {
+                    Ok(outcome) => {
+                        next_wake_unix_ms = outcome.next_wake_unix_ms;
+                        let refresh = queue_refresh_needed(
+                            queue_was_active,
+                            outcome.items.len(),
+                            next_wake_unix_ms,
+                        );
+                        queue_was_active = next_wake_unix_ms.is_some();
+                        if refresh
+                            && app
+                                .emit(
+                                    CONNECT_QUEUE_EVENT,
+                                    ConnectQueueEvent {
+                                        attempted: outcome.items.len(),
+                                    },
+                                )
+                                .is_err()
+                        {
                             eprintln!(
-                                "Connect queue pump failed ({}): {}",
-                                error.code, error.message
-                            );
-                            next_wake_unix_ms = Some(
-                                unix_ms_now()
-                                    .saturating_add(CONNECT_QUEUE_ERROR_RETRY.as_millis() as u64),
+                                "Connect queue progress could not refresh the desktop window"
                             );
                         }
                     }
+                    Err(error) => {
+                        eprintln!(
+                            "Connect queue pump failed ({}): {}",
+                            error.code, error.message
+                        );
+                        next_wake_unix_ms = Some(
+                            unix_ms_now()
+                                .saturating_add(CONNECT_QUEUE_ERROR_RETRY.as_millis() as u64),
+                        );
+                    }
                 }
-            })?;
-        *handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+            }
+        })?;
         Ok(scheduler)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn stage_probe(operation: impl FnOnce(CancellationToken) + Send + 'static) -> io::Result<Self> {
+        Self::stage_probe_with_cancellation(CancellationToken::new(), operation)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn stage_probe_with_cancellation(
+        cancellation: CancellationToken,
+        operation: impl FnOnce(CancellationToken) + Send + 'static,
+    ) -> io::Result<Self> {
         let (wake_sender, _receiver) = mpsc::sync_channel(1);
-        let gate = Arc::new(WorkerGate::default());
-        let handle = Arc::new(Mutex::new(None));
+        let gate = Arc::new(WorkerGate::with_cancellation(cancellation));
+        let worker = OwnedWorker::default();
         let scheduler = Self {
             wake_sender,
             gate: Arc::clone(&gate),
-            handle: Arc::clone(&handle),
+            worker: worker.clone(),
         };
-        let worker = thread::Builder::new()
-            .name("email-watcher-connect-queue-probe".into())
-            .spawn(move || {
-                if gate.wait_for_activation() {
-                    operation(gate.cancellation());
-                }
-            })?;
-        *handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        worker.spawn("email-watcher-connect-queue-probe", move || {
+            if gate.wait_for_activation() {
+                operation(gate.cancellation());
+            }
+        })?;
         Ok(scheduler)
     }
 
@@ -280,20 +353,24 @@ impl ConnectQueueScheduler {
         self.gate.activate();
     }
 
-    pub fn shutdown(&self) -> io::Result<()> {
-        self.gate.stop();
+    pub(crate) fn signal_stop(&self) {
+        self.gate.signal_stop();
         let _ = self.wake_sender.try_send(());
-        let handle = self
-            .handle
-            .lock()
-            .map_err(|_| io::Error::other("Connect queue worker handle is unavailable"))?
-            .take();
-        match handle {
-            Some(handle) => handle
-                .join()
-                .map_err(|_| io::Error::other("Connect queue worker stopped unexpectedly")),
-            None => Ok(()),
-        }
+    }
+
+    pub(crate) fn join(&self) -> io::Result<()> {
+        self.worker.join("Connect queue worker")
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.gate.cancellation().cancel();
+        self.signal_stop();
+        self.join()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn is_joined(&self) -> bool {
+        self.worker.is_joined()
     }
 
     pub fn wake(&self) {
@@ -339,7 +416,7 @@ pub struct PollScheduler {
     interval_minutes: u64,
     next_check_unix_ms: Arc<AtomicU64>,
     gate: Arc<WorkerGate>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    worker: OwnedWorker,
 }
 
 fn next_check_unix_ms(now: SystemTime, interval_minutes: u64) -> u64 {
@@ -396,7 +473,7 @@ impl PollScheduler {
                 0
             })),
             gate: Arc::new(WorkerGate::with_cancellation(cancellation)),
-            handle: Arc::new(Mutex::new(None)),
+            worker: OwnedWorker::default(),
         }
     }
 
@@ -424,57 +501,50 @@ impl PollScheduler {
             .with_request_timeout(SCHEDULED_ENGINE_TIMEOUT)
             .with_cancellation(scheduler.gate.cancellation());
         let cancellation = scheduler.gate.cancellation();
-        let worker = thread::Builder::new()
-            .name("email-watcher-poll".into())
-            .spawn(move || {
-                if !scheduler.gate.wait_for_activation() {
-                    return;
-                }
-                while wait_until(
-                    &scheduler.gate,
-                    scheduler.next_check_unix_ms.load(Ordering::Relaxed),
+        self.worker.spawn("email-watcher-poll", move || {
+            if !scheduler.gate.wait_for_activation() {
+                return;
+            }
+            while wait_until(
+                &scheduler.gate,
+                scheduler.next_check_unix_ms.load(Ordering::Relaxed),
+            ) {
+                let event = match delivery.check_and_deliver_with_cancellation(
+                    &engine,
+                    SCHEDULED_ENGINE_TIMEOUT,
+                    cancellation.clone(),
                 ) {
-                    let event = match delivery.check_and_deliver_with_cancellation(
-                        &engine,
-                        SCHEDULED_ENGINE_TIMEOUT,
-                        cancellation.clone(),
-                    ) {
-                        Ok(outcome) => {
-                            if outcome.delivery.failed > 0 {
-                                eprintln!(
-                                    "{} scheduled notifications remain queued after delivery errors",
-                                    outcome.delivery.failed
-                                );
-                            }
-                            ScheduledCheckEvent::completed(outcome.delivery.failed)
-                        }
-                        Err(error) => {
+                    Ok(outcome) => {
+                        if outcome.delivery.failed > 0 {
                             eprintln!(
-                                "scheduled watcher check failed ({}): {}",
-                                error.code, error.message
+                                "{} scheduled notifications remain queued after delivery errors",
+                                outcome.delivery.failed
                             );
-                            ScheduledCheckEvent::check_failed()
                         }
-                    };
-                    connect_queue.wake();
-                    scheduler.next_check_unix_ms.store(
-                        next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
-                        Ordering::Relaxed,
-                    );
-                    if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
-                        eprintln!("scheduled watcher check could not refresh the desktop window");
+                        ScheduledCheckEvent::completed(outcome.delivery.failed)
                     }
+                    Err(error) => {
+                        eprintln!(
+                            "scheduled watcher check failed ({}): {}",
+                            error.code, error.message
+                        );
+                        ScheduledCheckEvent::check_failed()
+                    }
+                };
+                connect_queue.wake();
+                scheduler.next_check_unix_ms.store(
+                    next_check_unix_ms(SystemTime::now(), scheduler.interval_minutes),
+                    Ordering::Relaxed,
+                );
+                if app.emit(SCHEDULED_CHECK_EVENT, event).is_err() {
+                    eprintln!("scheduled watcher check could not refresh the desktop window");
                 }
-            })?;
-        *self
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
-        Ok(())
+            }
+        })
     }
 
-    #[cfg(test)]
-    fn stage_probe(
+    #[cfg(all(test, unix))]
+    pub(crate) fn stage_probe(
         &self,
         operation: impl FnOnce(CancellationToken) + Send + 'static,
     ) -> io::Result<()> {
@@ -482,37 +552,34 @@ impl PollScheduler {
             return Ok(());
         }
         let scheduler = self.clone();
-        let worker = thread::Builder::new()
-            .name("email-watcher-poll-probe".into())
-            .spawn(move || {
-                if scheduler.gate.wait_for_activation() {
-                    operation(scheduler.gate.cancellation());
-                }
-            })?;
-        *self
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
-        Ok(())
+        self.worker.spawn("email-watcher-poll-probe", move || {
+            if scheduler.gate.wait_for_activation() {
+                operation(scheduler.gate.cancellation());
+            }
+        })
     }
 
     pub fn activate(&self) {
         self.gate.activate();
     }
 
+    pub(crate) fn signal_stop(&self) {
+        self.gate.signal_stop();
+    }
+
+    pub(crate) fn join(&self) -> io::Result<()> {
+        self.worker.join("Polling worker")
+    }
+
     pub fn shutdown(&self) -> io::Result<()> {
-        self.gate.stop();
-        let handle = self
-            .handle
-            .lock()
-            .map_err(|_| io::Error::other("Polling worker handle is unavailable"))?
-            .take();
-        match handle {
-            Some(handle) => handle
-                .join()
-                .map_err(|_| io::Error::other("Polling worker stopped unexpectedly")),
-            None => Ok(()),
-        }
+        self.gate.cancellation().cancel();
+        self.signal_stop();
+        self.join()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn is_joined(&self) -> bool {
+        self.worker.is_joined()
     }
 }
 
@@ -658,7 +725,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
         let scheduler = ConnectQueueScheduler {
             wake_sender,
             gate: Arc::new(WorkerGate::default()),
-            handle: Arc::new(Mutex::new(None)),
+            worker: OwnedWorker::default(),
         };
 
         scheduler.wake();
@@ -680,7 +747,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
             }
         });
 
-        gate.stop();
+        gate.signal_stop();
         worker.join().expect("staged worker joins");
 
         assert_eq!(work.load(Ordering::SeqCst), 0);
@@ -745,13 +812,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
             "engine_cancelled"
         );
         assert_process_stopped(process_id);
-        assert!(
-            scheduler
-                .handle
-                .lock()
-                .expect("queue handle lock")
-                .is_none()
-        );
+        assert!(scheduler.is_joined());
 
         let engine = successful_queue_engine();
         let (restart_sender, restart_receiver) = mpsc::sync_channel(1);
@@ -809,13 +870,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
                 .is_err()
         );
         assert_process_stopped(process_id);
-        assert!(
-            scheduler
-                .handle
-                .lock()
-                .expect("polling handle lock")
-                .is_none()
-        );
+        assert!(scheduler.is_joined());
         delivery
             .run_exclusive_with_timeout(Duration::from_millis(100), |_| Ok(()))
             .expect("delivery lock is released after shutdown");

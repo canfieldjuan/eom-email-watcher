@@ -3,10 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::mpsc;
 use std::sync::{
     Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +47,7 @@ impl DeliveryDeadline {
         deadline
     }
 
+    #[cfg(test)]
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
@@ -81,6 +83,7 @@ impl DeliveryDeadline {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BoundedOperation<T> {
     Completed(T),
@@ -88,6 +91,7 @@ pub(crate) enum BoundedOperation<T> {
     WorkerStopped,
 }
 
+#[cfg(test)]
 pub(crate) fn run_bounded_operation<T: Send + 'static>(
     timeout: Duration,
     operation: impl FnOnce(DeliveryDeadline) -> T + Send + 'static,
@@ -693,15 +697,14 @@ impl NotificationDelivery {
         })
     }
 
-    pub(crate) fn deliver_bounded(
+    pub(crate) fn deliver_with_cancellation(
         &self,
-        engine: Engine,
+        engine: &Engine,
         timeout: Duration,
-    ) -> BoundedOperation<Result<DeliveryOutcome, EngineError>> {
-        let delivery = self.clone();
-        run_bounded_operation(timeout, move |deadline| {
-            delivery.deliver_until(&engine, &deadline)
-        })
+        cancellation: CancellationToken,
+    ) -> Result<DeliveryOutcome, EngineError> {
+        let deadline = DeliveryDeadline::with_cancellation(timeout, cancellation);
+        self.deliver_until(engine, &deadline)
     }
 
     pub fn check_and_deliver(&self, engine: &Engine) -> Result<CoordinatedCheck, EngineError> {

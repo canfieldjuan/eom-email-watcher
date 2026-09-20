@@ -2,7 +2,7 @@ mod delivery;
 mod engine;
 mod scheduler;
 
-use delivery::{BoundedOperation, NotificationDelivery};
+use delivery::NotificationDelivery;
 use engine::{
     CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
     CheckResult, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
@@ -10,7 +10,7 @@ use engine::{
     EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
     MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
-use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
+use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -18,7 +18,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -333,6 +332,93 @@ struct AdmissionWorkers {
     cancellation: CancellationToken,
     connect_queue: ConnectQueueScheduler,
     scheduler: PollScheduler,
+    startup_delivery: StartupDeliveryWorker,
+}
+
+#[derive(Clone)]
+struct StartupDeliveryWorker {
+    gate: Arc<WorkerGate>,
+    worker: OwnedWorker,
+}
+
+impl StartupDeliveryWorker {
+    fn stage(
+        engine: Engine,
+        delivery: NotificationDelivery,
+        cancellation: CancellationToken,
+    ) -> std::io::Result<Self> {
+        let gate = Arc::new(WorkerGate::with_cancellation(cancellation));
+        let worker = OwnedWorker::default();
+        let staged = Self {
+            gate: Arc::clone(&gate),
+            worker: worker.clone(),
+        };
+        worker.spawn("email-watcher-startup-delivery", move || {
+            if !gate.wait_for_activation() {
+                return;
+            }
+            let cancellation = gate.cancellation();
+            match delivery.deliver_with_cancellation(
+                &engine,
+                STARTUP_DELIVERY_TIMEOUT,
+                cancellation.clone(),
+            ) {
+                Ok(outcome) if outcome.failed > 0 => eprintln!(
+                    "{} watcher startup notification deliveries failed; {} remain queued",
+                    outcome.failed, outcome.remaining
+                ),
+                Ok(_) => {}
+                Err(_) if cancellation.is_cancelled() => {}
+                Err(error) => eprintln!(
+                    "watcher startup notification delivery failed ({}): {}",
+                    error.code, error.message
+                ),
+            }
+        })?;
+        Ok(staged)
+    }
+
+    #[cfg(all(test, unix))]
+    fn stage_probe(
+        cancellation: CancellationToken,
+        operation: impl FnOnce(CancellationToken) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let gate = Arc::new(WorkerGate::with_cancellation(cancellation));
+        let worker = OwnedWorker::default();
+        let staged = Self {
+            gate: Arc::clone(&gate),
+            worker: worker.clone(),
+        };
+        worker.spawn("email-watcher-startup-delivery-probe", move || {
+            if gate.wait_for_activation() {
+                operation(gate.cancellation());
+            }
+        })?;
+        Ok(staged)
+    }
+
+    fn activate(&self) {
+        self.gate.activate();
+    }
+
+    fn signal_stop(&self) {
+        self.gate.signal_stop();
+    }
+
+    fn join(&self) -> std::io::Result<()> {
+        self.worker.join("Startup notification delivery worker")
+    }
+
+    fn shutdown(&self) -> std::io::Result<()> {
+        self.gate.cancellation().cancel();
+        self.signal_stop();
+        self.join()
+    }
+
+    #[cfg(all(test, unix))]
+    fn is_joined(&self) -> bool {
+        self.worker.is_joined()
+    }
 }
 
 trait StagedWorker {
@@ -351,6 +437,14 @@ impl StagedWorker for PollScheduler {
     fn shutdown(&self) {
         if let Err(error) = PollScheduler::shutdown(self) {
             eprintln!("Polling scheduler could not stop cleanly: {error}");
+        }
+    }
+}
+
+impl StagedWorker for StartupDeliveryWorker {
+    fn shutdown(&self) {
+        if let Err(error) = StartupDeliveryWorker::shutdown(self) {
+            eprintln!("Startup notification delivery worker could not stop cleanly: {error}");
         }
     }
 }
@@ -380,6 +474,7 @@ impl AdmissionWorkerSet for AdmissionWorkers {
     fn activate(&self) {
         self.connect_queue.activate();
         self.scheduler.activate();
+        self.startup_delivery.activate();
     }
 }
 
@@ -390,10 +485,16 @@ impl AdmissionWorkerSet for () {
 impl Drop for AdmissionWorkers {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Err(error) = self.scheduler.shutdown() {
+        self.startup_delivery.signal_stop();
+        self.scheduler.signal_stop();
+        self.connect_queue.signal_stop();
+        if let Err(error) = self.startup_delivery.join() {
+            eprintln!("Startup notification delivery worker could not stop cleanly: {error}");
+        }
+        if let Err(error) = self.scheduler.join() {
             eprintln!("Polling scheduler could not stop cleanly: {error}");
         }
-        if let Err(error) = self.connect_queue.shutdown() {
+        if let Err(error) = self.connect_queue.join() {
             eprintln!("Connect queue scheduler could not stop cleanly: {error}");
         }
     }
@@ -402,12 +503,10 @@ impl Drop for AdmissionWorkers {
 struct AdmissionInner<W> {
     state: AdmissionState,
     workers: Option<W>,
-    startup_delivery_started: bool,
 }
 
 struct AdmissionTransition {
     status: ConfigAdmissionStatus,
-    start_startup_delivery: bool,
 }
 
 struct AdmissionCoordinator<W = AdmissionWorkers> {
@@ -428,7 +527,6 @@ impl<W> AdmissionCoordinator<W> {
             inner: Arc::new(Mutex::new(AdmissionInner {
                 state: AdmissionState::Inspecting,
                 workers: None,
-                startup_delivery_started: false,
             })),
         }
     }
@@ -459,19 +557,13 @@ impl<W> AdmissionCoordinator<W> {
     {
         inner.state = attempt.state;
         inner.workers = attempt.workers;
-        let mut start_startup_delivery = false;
         if inner.state == AdmissionState::Admitted
             && let Some(workers) = inner.workers.as_ref()
         {
             workers.activate();
-            if !inner.startup_delivery_started {
-                inner.startup_delivery_started = true;
-                start_startup_delivery = true;
-            }
         }
         AdmissionTransition {
             status: inner.state.public_status(),
-            start_startup_delivery,
         }
     }
 
@@ -489,7 +581,6 @@ impl<W> AdmissionCoordinator<W> {
         if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
             return Ok(AdmissionTransition {
                 status: ConfigAdmissionStatus::Admitted,
-                start_startup_delivery: false,
             });
         }
         inner.state = AdmissionState::Inspecting;
@@ -538,50 +629,27 @@ fn stage_admitted_workers(
             Ok(scheduler)
         },
     )?;
+    let startup_delivery = match StartupDeliveryWorker::stage(
+        engine.clone(),
+        startup_delivery.clone(),
+        cancellation.clone(),
+    ) {
+        Ok(worker) => worker,
+        Err(_) => {
+            StagedWorker::shutdown(&scheduler);
+            StagedWorker::shutdown(&connect_queue);
+            return Err(EngineError::host(
+                "host_error",
+                "Startup notification delivery worker could not be started",
+            ));
+        }
+    };
     Ok(AdmissionWorkers {
         cancellation,
         connect_queue,
         scheduler,
+        startup_delivery,
     })
-}
-
-fn start_startup_delivery(engine: Engine, delivery: NotificationDelivery) {
-    if thread::Builder::new()
-        .name("email-watcher-startup-delivery".into())
-        .spawn(
-            move || match delivery.deliver_bounded(engine, STARTUP_DELIVERY_TIMEOUT) {
-                BoundedOperation::Completed(Ok(outcome)) if outcome.failed > 0 => eprintln!(
-                    "{} watcher startup notification deliveries failed; {} remain queued",
-                    outcome.failed, outcome.remaining
-                ),
-                BoundedOperation::Completed(Ok(_)) => {}
-                BoundedOperation::Completed(Err(error)) => eprintln!(
-                    "watcher startup notification delivery failed ({}): {}",
-                    error.code, error.message
-                ),
-                BoundedOperation::TimedOut => {
-                    eprintln!("watcher startup notification delivery timed out")
-                }
-                BoundedOperation::WorkerStopped => {
-                    eprintln!("watcher startup notification delivery worker stopped")
-                }
-            },
-        )
-        .is_err()
-    {
-        eprintln!("watcher startup notification delivery could not be started");
-    }
-}
-
-fn finish_admission_transition(
-    transition: AdmissionTransition,
-    engine: &Engine,
-    delivery: &NotificationDelivery,
-) -> ConfigAdmissionStatus {
-    if transition.start_startup_delivery {
-        start_startup_delivery(engine.clone(), delivery.clone());
-    }
-    transition.status
 }
 
 impl AdmissionCoordinator<AdmissionWorkers> {
@@ -595,7 +663,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             || engine.ntfy_disclosure_status(),
             || stage_admitted_workers(app, engine, delivery),
         )?;
-        Ok(finish_admission_transition(transition, engine, delivery))
+        Ok(transition.status)
     }
 
     fn initialize(
@@ -624,7 +692,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             );
             (initialization, Self::install_attempt(&mut inner, attempt))
         };
-        let status = finish_admission_transition(transition, engine, delivery);
+        let status = transition.status;
         match initialization {
             Ok(_) => Ok(status),
             Err(_) if status == ConfigAdmissionStatus::Admitted => Ok(status),
@@ -667,7 +735,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             };
             Self::install_attempt(&mut inner, attempt)
         };
-        Ok(finish_admission_transition(transition, engine, delivery))
+        Ok(transition.status)
     }
 
     fn wake_connect_queue(&self) -> Result<(), EngineError> {
@@ -1409,8 +1477,78 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::thread;
+    #[cfg(unix)]
+    use std::time::Instant;
+
+    #[cfg(unix)]
+    fn wait_for_process_id(path: &Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(value) = fs::read_to_string(path)
+                && let Ok(process_id) = value.trim().parse()
+            {
+                return process_id;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("startup delivery probe did not record its process id");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_stopped(process_id: i32) {
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable child PID recorded by
+            // this test and does not signal an unrelated process.
+            if unsafe { libc::kill(process_id, 0) } != 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("cancelled startup engine process {process_id} is still running");
+    }
+
+    #[cfg(unix)]
+    fn stalled_startup_engine(process_id_path: &Path) -> Engine {
+        Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from("startup-delivery-shutdown-probe"),
+                process_id_path.as_os_str().to_owned(),
+            ],
+            "unused.toml".into(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn successful_delivery_engine() -> Engine {
+        Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *notifications.pending_under_host_lock*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.pending_under_host_lock","data":{"items":[]}}'
+    ;;
+  *notifications.count_under_host_lock*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'
+    ;;
+  *) exit 2 ;;
+esac"#,
+                ),
+            ],
+            "unused.toml".into(),
+        )
+    }
 
     #[derive(Clone)]
     struct ProbeStagedWorker {
@@ -1426,12 +1564,15 @@ mod tests {
     struct ProbeAdmissionWorkers {
         queue_activations: Arc<AtomicUsize>,
         poll_activations: Arc<AtomicUsize>,
+        startup_delivery_activations: Arc<AtomicUsize>,
     }
 
     impl AdmissionWorkerSet for ProbeAdmissionWorkers {
         fn activate(&self) {
             self.queue_activations.fetch_add(1, Ordering::SeqCst);
             self.poll_activations.fetch_add(1, Ordering::SeqCst);
+            self.startup_delivery_activations
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1573,10 +1714,183 @@ mod tests {
         assert_eq!(poll_stage_attempts.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn quit_during_startup_delivery_kills_child_releases_lock_and_allows_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let process_id_path = directory.path().join("startup-delivery.pid");
+        let delivery = NotificationDelivery::default();
+        let cancellation = CancellationToken::new();
+        let worker = StartupDeliveryWorker::stage(
+            stalled_startup_engine(&process_id_path),
+            delivery.clone(),
+            cancellation.clone(),
+        )
+        .expect("stage startup delivery");
+        worker.activate();
+        let process_id = wait_for_process_id(&process_id_path);
+
+        let started = Instant::now();
+        cancellation.cancel();
+        worker.signal_stop();
+        worker.join().expect("startup delivery joins");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_process_stopped(process_id);
+        assert!(worker.is_joined());
+        delivery
+            .run_exclusive_with_timeout(Duration::from_millis(100), |_| Ok(()))
+            .expect("delivery lock is released after startup shutdown");
+
+        let restarted = StartupDeliveryWorker::stage(
+            successful_delivery_engine(),
+            delivery,
+            CancellationToken::new(),
+        )
+        .expect("stage fresh startup delivery");
+        restarted.activate();
+        restarted.join().expect("fresh startup delivery joins");
+        assert!(restarted.is_joined());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_drop_signals_all_three_workers_before_deterministic_join() {
+        let cancellation = CancellationToken::new();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+
+        let queue_started = started_sender.clone();
+        let queue_stopped = stopped_sender.clone();
+        let connect_queue = ConnectQueueScheduler::stage_probe_with_cancellation(
+            cancellation.clone(),
+            move |token| {
+                queue_started.send("queue").expect("queue started");
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                queue_stopped.send("queue").expect("queue stopped");
+            },
+        )
+        .expect("stage queue");
+
+        let scheduler = PollScheduler::with_cancellation(1, true, cancellation.clone());
+        let poll_started = started_sender.clone();
+        let poll_stopped = stopped_sender.clone();
+        scheduler
+            .stage_probe(move |token| {
+                poll_started.send("poll").expect("poll started");
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                poll_stopped.send("poll").expect("poll stopped");
+            })
+            .expect("stage poll");
+
+        let startup_delivery =
+            StartupDeliveryWorker::stage_probe(cancellation.clone(), move |token| {
+                started_sender.send("startup").expect("startup started");
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+                stopped_sender.send("startup").expect("startup stopped");
+            })
+            .expect("stage startup delivery");
+
+        let queue_probe = connect_queue.clone();
+        let poll_probe = scheduler.clone();
+        let startup_probe = startup_delivery.clone();
+        let workers = AdmissionWorkers {
+            cancellation,
+            connect_queue,
+            scheduler,
+            startup_delivery,
+        };
+        workers.activate();
+        let mut started = [
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first worker starts"),
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second worker starts"),
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("third worker starts"),
+        ];
+        started.sort_unstable();
+        assert_eq!(started, ["poll", "queue", "startup"]);
+
+        let stopped_at = Instant::now();
+        drop(workers);
+        assert!(stopped_at.elapsed() < Duration::from_secs(1));
+        let mut stopped = [
+            stopped_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first worker stops"),
+            stopped_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second worker stops"),
+            stopped_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("third worker stops"),
+        ];
+        stopped.sort_unstable();
+        assert_eq!(stopped, ["poll", "queue", "startup"]);
+        assert!(startup_probe.is_joined());
+        assert!(poll_probe.is_joined());
+        assert!(queue_probe.is_joined());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_racing_activation_runs_no_worker_and_leaves_no_handle() {
+        let cancellation = CancellationToken::new();
+        let work = Arc::new(AtomicUsize::new(0));
+        let queue_work = Arc::clone(&work);
+        let connect_queue =
+            ConnectQueueScheduler::stage_probe_with_cancellation(cancellation.clone(), move |_| {
+                queue_work.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("stage queue");
+        let scheduler = PollScheduler::with_cancellation(1, true, cancellation.clone());
+        let poll_work = Arc::clone(&work);
+        scheduler
+            .stage_probe(move |_| {
+                poll_work.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("stage poll");
+        let startup_work = Arc::clone(&work);
+        let startup_delivery =
+            StartupDeliveryWorker::stage_probe(cancellation.clone(), move |_| {
+                startup_work.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("stage startup delivery");
+        let queue_probe = connect_queue.clone();
+        let poll_probe = scheduler.clone();
+        let startup_probe = startup_delivery.clone();
+        let workers = AdmissionWorkers {
+            cancellation: cancellation.clone(),
+            connect_queue,
+            scheduler,
+            startup_delivery,
+        };
+
+        cancellation.cancel();
+        workers.activate();
+        drop(workers);
+
+        assert_eq!(work.load(Ordering::SeqCst), 0);
+        assert!(startup_probe.is_joined());
+        assert!(poll_probe.is_joined());
+        assert!(queue_probe.is_joined());
+    }
+
     #[test]
     fn repeated_admission_refresh_activates_one_worker_pair_and_one_delivery() {
         let queue_activations = Arc::new(AtomicUsize::new(0));
         let poll_activations = Arc::new(AtomicUsize::new(0));
+        let startup_delivery_activations = Arc::new(AtomicUsize::new(0));
         let admission = AdmissionCoordinator::<ProbeAdmissionWorkers>::new();
 
         let first = admission
@@ -1586,6 +1900,7 @@ mod tests {
                     Ok(ProbeAdmissionWorkers {
                         queue_activations: Arc::clone(&queue_activations),
                         poll_activations: Arc::clone(&poll_activations),
+                        startup_delivery_activations: Arc::clone(&startup_delivery_activations),
                     })
                 },
             )
@@ -1598,11 +1913,10 @@ mod tests {
             .expect("repeated admission succeeds");
 
         assert_eq!(first.status, ConfigAdmissionStatus::Admitted);
-        assert!(first.start_startup_delivery);
         assert_eq!(second.status, ConfigAdmissionStatus::Admitted);
-        assert!(!second.start_startup_delivery);
         assert_eq!(queue_activations.load(Ordering::SeqCst), 1);
         assert_eq!(poll_activations.load(Ordering::SeqCst), 1);
+        assert_eq!(startup_delivery_activations.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1615,11 +1929,12 @@ mod tests {
                     Ok(ProbeAdmissionWorkers {
                         queue_activations: Arc::new(AtomicUsize::new(0)),
                         poll_activations: Arc::new(AtomicUsize::new(0)),
+                        startup_delivery_activations: Arc::new(AtomicUsize::new(0)),
                     })
                 },
             )
             .expect("admission succeeds");
-        assert!(transition.start_startup_delivery);
+        assert_eq!(transition.status, ConfigAdmissionStatus::Admitted);
 
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
         let delivery = thread::spawn(move || {
@@ -1642,10 +1957,9 @@ mod tests {
             )
             .expect("repair UI remains usable during delivery");
         assert_eq!(repeated.status, ConfigAdmissionStatus::Admitted);
-        assert!(!repeated.start_startup_delivery);
         assert_eq!(
             delivery.join().expect("delivery waiter joins"),
-            BoundedOperation::TimedOut
+            delivery::BoundedOperation::TimedOut
         );
     }
 

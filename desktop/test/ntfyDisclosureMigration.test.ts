@@ -42,7 +42,7 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
 
   const stagedWorkers = libSource.slice(
     libSource.indexOf("fn stage_admitted_workers"),
-    libSource.indexOf("fn start_startup_delivery"),
+    libSource.indexOf("impl AdmissionCoordinator<AdmissionWorkers>"),
   );
   const settings = stagedWorkers.indexOf("settings_with_timeout");
   const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage_with_cancellation");
@@ -50,26 +50,19 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   assert.ok(settings >= 0, "worker startup must begin with normal settings admission");
   assert.ok(settings < queue, "settings admission must precede staged Connect queue startup");
   assert.ok(queue < poller, "Connect queue staging must precede poll staging");
-  assert.doesNotMatch(
-    stagedWorkers,
-    /startup_delivery\.deliver/,
-    "startup delivery must not run while admission stages workers",
-  );
+  assert.match(stagedWorkers, /StartupDeliveryWorker::stage/);
+  assert.match(libSource, /startup_delivery: StartupDeliveryWorker/);
 
   const installAttempt = libSource.slice(
     libSource.indexOf("fn install_attempt"),
     libSource.indexOf("fn refresh_with"),
   );
   assert.match(installAttempt, /workers\.activate\(\)/);
-  assert.match(installAttempt, /startup_delivery_started/);
-
-  const boundedDelivery = libSource.slice(
-    libSource.indexOf("fn start_startup_delivery"),
-    libSource.indexOf("fn finish_admission_transition"),
-  );
+  assert.doesNotMatch(libSource, /fn start_startup_delivery/);
+  assert.match(libSource, /delivery\.deliver_with_cancellation/);
   assert.match(
-    boundedDelivery,
-    /delivery\.deliver_bounded\(engine, STARTUP_DELIVERY_TIMEOUT\)/,
+    libSource,
+    /self\.cancellation\.cancel\(\);[\s\S]*self\.startup_delivery\.signal_stop\(\)[\s\S]*self\.scheduler\.signal_stop\(\)[\s\S]*self\.connect_queue\.signal_stop\(\)[\s\S]*self\.startup_delivery\.join\(\)[\s\S]*self\.scheduler\.join\(\)[\s\S]*self\.connect_queue\.join\(\)/,
   );
   assert.match(deliverySource, /deadline\.cancel\(\);[\s\S]*worker\.join\(\)/);
   assert.match(deliverySource, /Command::new\(&self\.program\)/);
@@ -174,7 +167,7 @@ test("scheduler shutdown cancellation reaches queue, delivery, and engine childr
   assert.match(engineSource, /struct CancellationToken/);
   assert.match(engineSource, /with_cancellation/);
   assert.match(engineSource, /cancellation\.is_cancelled\(\)[\s\S]*child\.terminate\(\)/);
-  assert.match(schedulerSource, /cancellation\.cancel\(\)/);
+  assert.match(libSource, /self\.cancellation\.cancel\(\)/);
   assert.match(schedulerSource, /pump_connect_queue/);
   assert.match(schedulerSource, /check_and_deliver_with_cancellation/);
   assert.match(deliverySource, /check_and_deliver_with_cancellation/);
