@@ -1313,7 +1313,6 @@ pub fn run() {
     });
     builder
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .setup(move |app| {

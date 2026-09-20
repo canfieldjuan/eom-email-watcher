@@ -10,7 +10,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri_plugin_notification::NotificationExt;
 
 const DELIVERY_BATCH_LIMIT: u16 = 25;
 const DEFAULT_DELIVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -183,6 +182,80 @@ struct NotificationHelperRequest {
     protocol: u8,
     title: String,
     body: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlatformNotificationAccepted;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlatformNotificationError {
+    #[cfg(test)]
+    AcceptancePending,
+    Rejected,
+    #[cfg(not(target_os = "linux"))]
+    Unsupported,
+}
+
+impl std::fmt::Display for PlatformNotificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            #[cfg(test)]
+            Self::AcceptancePending => "platform notification acceptance is pending",
+            Self::Rejected => "platform notification was rejected",
+            #[cfg(not(target_os = "linux"))]
+            Self::Unsupported => "platform notification acceptance is unsupported",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for PlatformNotificationError {}
+
+trait PlatformNotificationSink {
+    fn show(
+        &self,
+        title: &str,
+        body: &str,
+    ) -> Result<PlatformNotificationAccepted, PlatformNotificationError>;
+}
+
+struct NativePlatformNotification;
+
+#[cfg(target_os = "linux")]
+impl PlatformNotificationSink for NativePlatformNotification {
+    fn show(
+        &self,
+        title: &str,
+        body: &str,
+    ) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
+        notify_rust::Notification::new()
+            .appname("Email Watcher")
+            .summary(title)
+            .body(body)
+            .show()
+            .map_err(|_| PlatformNotificationError::Rejected)?;
+        Ok(PlatformNotificationAccepted)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PlatformNotificationSink for NativePlatformNotification {
+    fn show(
+        &self,
+        _title: &str,
+        _body: &str,
+    ) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
+        // Windows acceptance remains deferred until it can be exercised on the target OS.
+        // Fail closed so the durable intent stays queued instead of claiming delivery.
+        Err(PlatformNotificationError::Unsupported)
+    }
+}
+
+fn deliver_platform_notification(
+    sink: &impl PlatformNotificationSink,
+    request: &NotificationHelperRequest,
+) -> Result<(), PlatformNotificationError> {
+    sink.show(&request.title, &request.body).map(|_| ())
 }
 
 struct NotificationProcess {
@@ -381,20 +454,7 @@ pub(crate) fn run_notification_helper() -> Result<(), Box<dyn std::error::Error>
         .into());
     }
 
-    let mut context = tauri::generate_context!();
-    context.config_mut().app.windows.clear();
-    tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
-        .setup(move |app| {
-            app.notification()
-                .builder()
-                .title(request.title)
-                .body(request.body)
-                .show()?;
-            app.handle().exit(0);
-            Ok(())
-        })
-        .run(context)?;
+    deliver_platform_notification(&NativePlatformNotification, &request)?;
     Ok(())
 }
 
@@ -607,6 +667,20 @@ mod tests {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
+
+    struct FakePlatformNotification {
+        outcome: Result<PlatformNotificationAccepted, PlatformNotificationError>,
+    }
+
+    impl PlatformNotificationSink for FakePlatformNotification {
+        fn show(
+            &self,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
+            self.outcome
+        }
+    }
 
     struct FakeQueue {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -1072,6 +1146,88 @@ mod tests {
                 .expect("manual delivery remains usable after helper timeout"),
             "manual"
         );
+    }
+
+    #[test]
+    fn helper_rejects_asynchronous_platform_nonacceptance() {
+        let request = NotificationHelperRequest {
+            protocol: NOTIFICATION_HELPER_PROTOCOL,
+            title: "Watched sender".into(),
+            body: "Private local summary".into(),
+        };
+        let error = deliver_platform_notification(
+            &FakePlatformNotification {
+                outcome: Err(PlatformNotificationError::AcceptancePending),
+            },
+            &request,
+        )
+        .expect_err("pending platform delivery is not acceptance");
+
+        assert_eq!(error, PlatformNotificationError::AcceptancePending);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unproved_platform_notification_fails_closed() {
+        assert_eq!(
+            NativePlatformNotification.show("Watched sender", "Private local summary"),
+            Err(PlatformNotificationError::Unsupported)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_platform_process_keeps_intent_unacknowledged() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let queue = FakeQueue {
+            events: Arc::clone(&events),
+            intents: vec![intent("message-1")],
+            check_error: false,
+            check_pending: 1,
+        };
+        let notifier = NotificationProcess::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; exit 2"),
+            ],
+        );
+
+        assert_eq!(
+            deliver_batch(&queue, &notifier).expect("delivery failure remains a queue outcome"),
+            DeliveryOutcome {
+                delivered: 0,
+                failed: 1,
+                remaining: 1,
+            }
+        );
+        assert!(!events.lock().expect("events lock").contains(&"acknowledge"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_platform_process_acknowledges_after_acceptance() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let queue = FakeQueue {
+            events: Arc::clone(&events),
+            intents: vec![intent("message-1")],
+            check_error: false,
+            check_pending: 1,
+        };
+        let notifier = NotificationProcess::with_command(
+            "sh",
+            vec![OsString::from("-c"), OsString::from("cat >/dev/null")],
+        );
+
+        assert_eq!(
+            deliver_batch(&queue, &notifier).expect("confirmed delivery is acknowledged"),
+            DeliveryOutcome {
+                delivered: 1,
+                failed: 0,
+                remaining: 0,
+            }
+        );
+        assert_eq!(*events.lock().expect("events lock"), ["acknowledge"]);
     }
 
     #[test]

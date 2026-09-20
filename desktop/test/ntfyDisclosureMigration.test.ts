@@ -72,6 +72,12 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   assert.match(deliverySource, /child\.kill\(\)/);
   assert.match(deliverySource, /child\.wait\(\)/);
   assert.match(deliverySource, /run_notification_helper/);
+  assert.match(deliverySource, /notify_rust::Notification::new\(\)/);
+  assert.match(
+    deliverySource,
+    /cfg\(not\(target_os = "linux"\)\)[\s\S]*PlatformNotificationError::Unsupported/,
+  );
+  assert.doesNotMatch(deliverySource, /tauri_plugin_notification::NotificationExt/);
   assert.match(deliverySource, /self\.lock\.try_lock\(\)/);
   assert.match(deliverySource, /deadline\.bounded_engine\(engine\)/);
   assert.match(schedulerSource, /fn wait_for_activation/);
