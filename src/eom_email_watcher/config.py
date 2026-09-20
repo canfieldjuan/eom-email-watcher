@@ -24,6 +24,7 @@ DEFAULT_POLL_INTERVAL_MINUTES = 120
 DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650
+MAX_SENDER_NAME_BYTES = 1024
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
@@ -166,6 +167,10 @@ def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -
     ):
         raise InvalidSenderError("sender name must not contain control characters")
     name = name_value.strip() if name_value and name_value.strip() else None
+    if name is not None and len(name.encode("utf-8")) > MAX_SENDER_NAME_BYTES:
+        raise InvalidSenderError(
+            f"sender name must be at most {MAX_SENDER_NAME_BYTES} UTF-8 bytes"
+        )
     return Sender(email=email, name=name)
 
 

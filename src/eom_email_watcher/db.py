@@ -32,7 +32,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -1783,6 +1783,7 @@ class GmailLabelValidationSnapshot:
     mailbox_identity_key: str = field(repr=False)
     selector_revision: int
     validated_at: str
+    catalog_state: str
     selectors: tuple[GmailLabelSelectorValidation, ...]
 
 
@@ -2348,6 +2349,7 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
             db.execute(
                 "ALTER TABLE gmail_recovery_state RENAME TO gmail_recovery_state_v24"
             )
+    db.execute("DROP TRIGGER IF EXISTS gmail_label_validations_require_snapshot_selector")
     _execute_transactional_script(
         db,
         """
@@ -2406,6 +2408,9 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
           ),
           selector_revision INTEGER NOT NULL CHECK (selector_revision >= 0),
           validated_at TEXT NOT NULL CHECK (validated_at <> ''),
+          catalog_state TEXT NOT NULL CHECK (
+            catalog_state IN ('current', 'invalid_catalog')
+          ),
           PRIMARY KEY (provider, account_id)
         );
         CREATE TABLE IF NOT EXISTS gmail_label_selector_validations (
@@ -2454,6 +2459,7 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
           JOIN gmail_label_selectors AS l
             ON l.provider = v.provider AND l.account_id = v.account_id
           WHERE v.provider = NEW.provider AND v.account_id = NEW.account_id
+            AND v.catalog_state = 'current'
             AND v.mailbox_identity_key = NEW.mailbox_identity_key
             AND v.selector_revision = NEW.selector_revision
             AND l.selector_id = NEW.selector_id
@@ -2553,6 +2559,16 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
         END;
         """,
     )
+    validation_set_columns = {
+        str(row["name"])
+        for row in db.execute("PRAGMA table_info(gmail_label_validation_sets)").fetchall()
+    }
+    if "catalog_state" not in validation_set_columns:
+        db.execute(
+            "ALTER TABLE gmail_label_validation_sets ADD COLUMN catalog_state "
+            "TEXT NOT NULL DEFAULT 'current' "
+            "CHECK (catalog_state IN ('current', 'invalid_catalog'))"
+        )
     if legacy_recovery_table:
         # The old row did not record the exact retention boundary, so it cannot
         # be resumed without changing admission based on the current setting.
@@ -2590,6 +2606,7 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
     for column, definition in columns.items():
         if column not in message_columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+    db.execute("DROP TRIGGER IF EXISTS messages_admission_provenance_immutable")
     _execute_transactional_script(
         db,
         """
@@ -2603,21 +2620,30 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
         BEGIN
           SELECT RAISE(ABORT, 'message admission provenance is required');
         END;
-        CREATE TRIGGER IF NOT EXISTS messages_admission_provenance_immutable
+        CREATE TRIGGER messages_admission_provenance_immutable
         BEFORE UPDATE OF admission_kind, admission_selector_id,
           admission_display_name, admission_mailbox_identity_key, admitted_at,
           mailbox_identity_key ON messages
-        WHEN (OLD.admission_kind IS NOT NULL
-          OR OLD.admission_selector_id IS NOT NULL
-          OR OLD.admission_display_name IS NOT NULL
-          OR OLD.admission_mailbox_identity_key IS NOT NULL
-          OR OLD.admitted_at IS NOT NULL)
-          AND (NEW.admission_kind IS NOT OLD.admission_kind
-            OR NEW.admission_selector_id IS NOT OLD.admission_selector_id
-            OR NEW.admission_display_name IS NOT OLD.admission_display_name
-            OR NEW.admission_mailbox_identity_key IS NOT OLD.admission_mailbox_identity_key
-            OR NEW.admitted_at IS NOT OLD.admitted_at
-            OR NEW.mailbox_identity_key IS NOT OLD.mailbox_identity_key)
+        WHEN NEW.admission_kind IS NOT OLD.admission_kind
+          OR NEW.admission_selector_id IS NOT OLD.admission_selector_id
+          OR NEW.admission_display_name IS NOT OLD.admission_display_name
+          OR NEW.admission_mailbox_identity_key IS NOT OLD.admission_mailbox_identity_key
+          OR NEW.admitted_at IS NOT OLD.admitted_at
+          OR (
+            NEW.mailbox_identity_key IS NOT OLD.mailbox_identity_key
+            AND NOT (
+              OLD.admission_kind IS NULL
+              AND OLD.admission_selector_id IS NULL
+              AND OLD.admission_display_name IS NULL
+              AND OLD.admission_mailbox_identity_key IS NULL
+              AND OLD.admitted_at IS NULL
+              AND NEW.admission_kind IS NULL
+              AND NEW.admission_selector_id IS NULL
+              AND NEW.admission_display_name IS NULL
+              AND NEW.admission_mailbox_identity_key IS NULL
+              AND NEW.admitted_at IS NULL
+            )
+          )
         BEGIN
           SELECT RAISE(ABORT, 'message admission provenance is immutable');
         END;
@@ -4163,8 +4189,8 @@ class Store:
             db.execute(
                 """INSERT INTO gmail_label_validation_sets(
                     provider, account_id, mailbox_identity_key,
-                    selector_revision, validated_at
-                ) VALUES ('gmail', ?, ?, ?, ?)""",
+                    selector_revision, validated_at, catalog_state
+                ) VALUES ('gmail', ?, ?, ?, ?, 'current')""",
                 (account_id, mailbox_identity_key, expected, stamp),
             )
             db.executemany(
@@ -4191,7 +4217,46 @@ class Store:
             mailbox_identity_key=mailbox_identity_key,
             selector_revision=expected,
             validated_at=stamp,
+            catalog_state="current",
             selectors=tuple(validations),
+        )
+
+    def persist_gmail_label_invalid_catalog(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        expected_revision: int,
+        *,
+        now: datetime | None = None,
+    ) -> GmailLabelValidationSnapshot:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        expected = _require_revision(expected_revision)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selector_set = self._require_current_gmail_selector_set(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if int(selector_set["revision"]) != expected:
+                raise GmailLabelStoreError("stale_revision")
+            self._delete_gmail_label_validation(db, account_id)
+            db.execute(
+                """INSERT INTO gmail_label_validation_sets(
+                    provider, account_id, mailbox_identity_key,
+                    selector_revision, validated_at, catalog_state
+                ) VALUES ('gmail', ?, ?, ?, ?, 'invalid_catalog')""",
+                (account_id, mailbox_identity_key, expected, stamp),
+            )
+        return GmailLabelValidationSnapshot(
+            provider="gmail",
+            account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            selector_revision=expected,
+            validated_at=stamp,
+            catalog_state="invalid_catalog",
+            selectors=(),
         )
 
     def gmail_label_validation_snapshot(
@@ -4205,7 +4270,7 @@ class Store:
         with self.connection() as db:
             snapshot = db.execute(
                 """SELECT v.provider, v.account_id, v.mailbox_identity_key,
-                    v.selector_revision, v.validated_at
+                    v.selector_revision, v.validated_at, v.catalog_state
                 FROM gmail_label_validation_sets AS v
                 JOIN gmail_label_selector_sets AS s
                   ON s.provider = v.provider AND s.account_id = v.account_id
@@ -4236,13 +4301,16 @@ class Store:
                 ORDER BY selector_id""",
                 (account_id, mailbox_identity_key, revision),
             ).fetchall()
+        catalog_state = str(snapshot["catalog_state"])
         expected_selectors = [
             (str(row["selector_id"]), str(row["label_id"])) for row in selectors
         ]
         validated_selectors = [
             (str(row["selector_id"]), str(row["label_id"])) for row in rows
         ]
-        if validated_selectors != expected_selectors:
+        if catalog_state == "current" and validated_selectors != expected_selectors:
+            return None
+        if catalog_state == "invalid_catalog" and rows:
             return None
         return GmailLabelValidationSnapshot(
             provider=str(snapshot["provider"]),
@@ -4250,6 +4318,7 @@ class Store:
             mailbox_identity_key=str(snapshot["mailbox_identity_key"]),
             selector_revision=int(snapshot["selector_revision"]),
             validated_at=str(snapshot["validated_at"]),
+            catalog_state=catalog_state,
             selectors=tuple(
                 GmailLabelSelectorValidation(
                     selector_id=str(row["selector_id"]),

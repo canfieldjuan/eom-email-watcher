@@ -73,6 +73,41 @@ test("Gmail label settings use typed backend operations and no free-form label i
   assert.doesNotMatch(source, /<input[^>]+id="gmail-label-(?:id|name|provider)"/);
 });
 
+test("sender name byte limit is enforced before watchlist mutation", () => {
+  const helper = source.match(
+    /function senderNameWithinByteLimit\(value: string\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const withinLimit = Function(
+    `const MAX_SENDER_NAME_BYTES = 1024;
+     return function senderNameWithinByteLimit(value) {${helper[1]}\n}`,
+  )() as (value: string) => boolean;
+  assert.equal(withinLimit("é".repeat(512)), true);
+  assert.equal(withinLimit(`${"é".repeat(512)}a`), false);
+
+  const handler = source.match(
+    /form\.addEventListener\("submit", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(handler);
+  assert.ok(handler[1].indexOf("senderNameWithinByteLimit") < handler[1].indexOf("watchlist_add"));
+  assert.match(handler[1], /at most 1024 UTF-8 bytes/);
+});
+
+test("Gmail catalog state gives invalid and transient failures distinct retry guidance", () => {
+  const helper = source.match(
+    /function gmailLabelCatalogStateMessage\([\s\S]*?\): string \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const message = Function(
+    `return function gmailLabelCatalogStateMessage(catalogState) {${helper[1]}\n}`,
+  )() as (catalogState: string) => string;
+
+  assert.match(message("invalid_catalog"), /invalid label data/);
+  assert.match(message("invalid_catalog"), /Correct the Gmail connection/);
+  assert.match(message("unavailable"), /temporarily unavailable/);
+  assert.match(message("unavailable"), /retry/);
+});
+
 test("active account generation invalidates late Gmail label responses", () => {
   assert.match(source, /gmailLabelGeneration \+= 1/);
   assert.match(source, /generation === gmailLabelGeneration/);

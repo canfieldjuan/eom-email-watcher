@@ -772,6 +772,11 @@ const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const watchlistStatus = requiredElement<HTMLParagraphElement>("#watchlist-status");
+const MAX_SENDER_NAME_BYTES = 1024;
+
+function senderNameWithinByteLimit(value: string): boolean {
+  return new TextEncoder().encode(value.trim()).byteLength <= MAX_SENDER_NAME_BYTES;
+}
 const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
 const checkNow = requiredElement<HTMLButtonElement>("#check-now");
 const mailHealth = requiredElement<HTMLElement>("#mail-health");
@@ -2310,6 +2315,15 @@ function gmailLabelStatusText(status: GmailLabelSelectorStatus): string {
   return labels[status];
 }
 
+function gmailLabelCatalogStateMessage(
+  catalogState: GmailLabelSelectors["catalog_state"],
+): string {
+  if (catalogState === "invalid_catalog") {
+    return "Gmail returned invalid label data. Correct the Gmail connection, then refresh labels.";
+  }
+  return "Gmail validation is temporarily unavailable. Refresh labels to retry.";
+}
+
 async function gmailLabelIdDigest(labelId: string): Promise<string> {
   const bytes = new TextEncoder().encode(labelId);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -2557,7 +2571,7 @@ async function loadGmailLabelState(): Promise<void> {
     gmailLabelStatus.textContent =
       selectors.catalog_state === "current"
         ? "Selected Gmail labels are up to date."
-        : "Selected labels remain visible, but Gmail validation is currently unavailable.";
+        : gmailLabelCatalogStateMessage(selectors.catalog_state);
     gmailLabelStatus.dataset.kind =
       selectors.catalog_state === "current" ? "success" : "error";
 
@@ -2590,7 +2604,7 @@ async function loadGmailLabelState(): Promise<void> {
         selectors.revision !== catalog.revision ||
         catalog.revision !== revalidatedSelectors.revision
           ? "Gmail label settings changed. Refresh labels before editing."
-          : "Selected labels remain visible, but Gmail validation is currently unavailable.";
+          : gmailLabelCatalogStateMessage(revalidatedSelectors.catalog_state);
       gmailLabelStatus.dataset.kind = "error";
       return;
     }
@@ -3922,13 +3936,19 @@ async function removeSender(email: string): Promise<void> {
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   void (async () => {
+    const name = nameInput.value.trim();
+    if (!senderNameWithinByteLimit(name)) {
+      watchlistStatus.textContent = "Sender name must be at most 1024 UTF-8 bytes.";
+      watchlistStatus.dataset.kind = "error";
+      return;
+    }
     if (!beginOperation()) return;
     watchlistStatus.textContent = "Adding sender…";
     let addedSuccessfully = false;
     try {
       const sender = await invoke<WatchedSender>("watchlist_add", {
         email: emailInput.value,
-        name: nameInput.value.trim() || null,
+        name: name || null,
       });
       form.reset();
       renderSenders([...watchedSenders, sender]);

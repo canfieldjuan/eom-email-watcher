@@ -2192,10 +2192,10 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
 
-    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 25)
-    with pytest.raises(RuntimeError, match="newer than supported version 25"):
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 26)
+    with pytest.raises(RuntimeError, match="newer than supported version 26"):
         Store(database).initialize()
 
 
@@ -2215,7 +2215,7 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
         tables = {
             str(row["name"])
             for row in db.execute(
@@ -2229,6 +2229,55 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     }
     assert migrated.gmail_label_selectors("gmail-default") == (selector,)
     assert migrated.gmail_label_validation_snapshot("gmail-default", identity, revision) is None
+
+
+def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, _selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    expected = store.persist_gmail_label_validation(
+        "gmail-default",
+        identity,
+        revision,
+        (("Label_1", "Invoices", "user"),),
+    )
+    with store.connection() as db:
+        db.execute("ALTER TABLE gmail_label_validation_sets RENAME TO validation_sets_v27")
+        db.execute(
+            """CREATE TABLE gmail_label_validation_sets (
+                provider TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                mailbox_identity_key TEXT NOT NULL,
+                selector_revision INTEGER NOT NULL,
+                validated_at TEXT NOT NULL,
+                PRIMARY KEY (provider, account_id)
+            )"""
+        )
+        db.execute(
+            """INSERT INTO gmail_label_validation_sets(
+                provider, account_id, mailbox_identity_key,
+                selector_revision, validated_at
+            ) SELECT provider, account_id, mailbox_identity_key,
+                selector_revision, validated_at
+            FROM validation_sets_v27"""
+        )
+        db.execute("DROP TABLE validation_sets_v27")
+        db.execute("PRAGMA user_version = 26")
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    with migrated.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert db.execute(
+            "SELECT catalog_state FROM gmail_label_validation_sets"
+        ).fetchone()[0] == "current"
+    assert migrated.gmail_label_validation_snapshot(
+        "gmail-default", identity, revision
+    ) == expected
 
 
 def test_gmail_label_validation_is_revision_bound_durable_and_invalidated_by_mutation(
@@ -2810,6 +2859,88 @@ def test_message_insert_atomically_persists_deterministic_admission_provenance(
                 "UPDATE messages SET admission_selector_id='sender:other@example.com' "
                 "WHERE message_id='message-1'"
             )
+
+
+def test_legacy_message_admission_provenance_rejects_partial_population(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_require_admission_provenance_insert")
+        db.execute(
+            """INSERT INTO messages(
+                message_id, provider, account_id, mailbox_identity_key,
+                provider_message_id, sender, subject, received_at, discovered_at
+            ) VALUES (
+                'legacy-null-admission', 'gmail', 'gmail-default', ?,
+                'legacy-provider-id', 'trusted@example.com', 'Legacy',
+                '2026-09-19T11:59:00+00:00', '2026-09-19T12:00:00+00:00'
+            )""",
+            (identity,),
+        )
+        for update in (
+            "admission_kind = 'exact_sender'",
+            "admission_selector_id = 'sender:trusted@example.com'",
+            "admission_display_name = 'Trusted'",
+            f"admission_mailbox_identity_key = '{identity}'",
+            "admitted_at = '2026-09-19T12:00:00+00:00'",
+            "admission_kind = 'exact_sender', "
+            "admission_selector_id = 'sender:trusted@example.com'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="admission provenance"):
+                db.execute(
+                    f"UPDATE messages SET {update} "
+                    "WHERE message_id = 'legacy-null-admission'"
+                )
+
+        replacement_identity = "f" * 64
+        db.execute(
+            "UPDATE messages SET mailbox_identity_key = ? "
+            "WHERE message_id = 'legacy-null-admission'",
+            (replacement_identity,),
+        )
+        row = db.execute(
+            """SELECT mailbox_identity_key, admission_kind, admission_selector_id,
+                admission_display_name, admission_mailbox_identity_key, admitted_at
+            FROM messages WHERE message_id = 'legacy-null-admission'"""
+        ).fetchone()
+    assert tuple(row) == (replacement_identity, None, None, None, None, None)
+
+
+def test_legacy_partial_admission_row_cannot_change_or_rebind_identity(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_require_admission_provenance_insert")
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
+        db.execute(
+            """INSERT INTO messages(
+                message_id, provider, account_id, mailbox_identity_key,
+                provider_message_id, sender, subject, received_at, discovered_at,
+                admission_display_name
+            ) VALUES (
+                'legacy-partial-admission', 'gmail', 'gmail-default', ?,
+                'legacy-partial-provider-id', 'trusted@example.com', 'Legacy partial',
+                '2026-09-19T11:59:00+00:00', '2026-09-19T12:00:00+00:00',
+                'Historical name'
+            )""",
+            (identity,),
+        )
+
+    store.initialize()
+    with store.connection() as db:
+        for update in (
+            "admission_display_name = NULL",
+            "admission_kind = 'exact_sender'",
+            f"mailbox_identity_key = '{'f' * 64}'",
+            "admission_display_name = NULL, admission_kind = 'exact_sender'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="admission provenance"):
+                db.execute(
+                    f"UPDATE messages SET {update} "
+                    "WHERE message_id = 'legacy-partial-admission'"
+                )
 
 
 def test_recovery_terminal_insert_revocation_and_cursor_commit_are_atomic(

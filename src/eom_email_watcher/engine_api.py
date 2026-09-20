@@ -1013,6 +1013,19 @@ def _gmail_labels_catalog(request: dict[str, object]) -> dict[str, object]:
 
     def catalog(runtime: Runtime) -> dict[str, object]:
         validation_scope: tuple[str, str, int] | None = None
+
+        def record_failure(error: ApiError) -> None:
+            if validation_scope is None:
+                return
+            if error.code == "gmail_label_catalog_invalid":
+                try:
+                    runtime.store.persist_gmail_label_invalid_catalog(*validation_scope)
+                except (GmailLabelStoreError, MailboxIdentityChanged):
+                    # The failure belongs to an older selector revision or identity.
+                    return
+            else:
+                runtime.store.invalidate_gmail_label_validation(*validation_scope)
+
         try:
             stored_account = _require_active_gmail_label_account(
                 runtime,
@@ -1037,9 +1050,8 @@ def _gmail_labels_catalog(request: dict[str, object]) -> dict[str, object]:
                 raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed")
             validation_scope = (account.account_id, identity_key, selector_set.revision)
             labels = _read_gmail_label_catalog(mailbox)
-        except ApiError:
-            if validation_scope is not None:
-                runtime.store.invalidate_gmail_label_validation(*validation_scope)
+        except ApiError as exc:
+            record_failure(exc)
             raise
         try:
             validation = runtime.store.persist_gmail_label_validation(
@@ -1050,6 +1062,14 @@ def _gmail_labels_catalog(request: dict[str, object]) -> dict[str, object]:
                     (label.label_id, label.display_name, label.label_type) for label in labels
                 ),
             )
+        except ValueError as exc:
+            invalid = ApiError(
+                "gmail_label_catalog_invalid",
+                "Gmail returned an invalid label catalog",
+                retryable=False,
+            )
+            record_failure(invalid)
+            raise invalid from exc
         except GmailLabelStoreError as exc:
             raise _gmail_label_store_error(exc) from exc
         except MailboxIdentityChanged as exc:
@@ -1119,10 +1139,10 @@ def _gmail_label_selectors_list(request: dict[str, object]) -> dict[str, object]
         )
         validated_by_selector = (
             {item.selector_id: item for item in validation.selectors}
-            if validation is not None
+            if validation is not None and validation.catalog_state == "current"
             else {}
         )
-        catalog_state = "current" if validation is not None else "unavailable"
+        catalog_state = validation.catalog_state if validation is not None else "unavailable"
         items: list[dict[str, object]] = []
         for selector in selectors:
             if not selector_set_is_current or selector.mailbox_identity_key != identity_key:

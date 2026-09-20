@@ -343,6 +343,30 @@ def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
     assert load_config(path).allowlist == frozenset({"trusted@example.com"})
 
 
+def test_sender_name_is_bounded_by_utf8_bytes_on_load_and_add(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+
+    accepted_name = "é" * 512
+    accepted = add_sender(path, "accepted@example.com", accepted_name)
+    assert accepted.name == accepted_name
+
+    original = path.read_bytes()
+    with pytest.raises(InvalidSenderError, match="at most 1024 UTF-8 bytes"):
+        add_sender(path, "rejected@example.com", ("é" * 512) + "a")
+    assert path.read_bytes() == original
+
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '\n[[senders]]\nemail = "legacy@example.com"\nname = "'
+        + (("é" * 512) + "a")
+        + '"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="at most 1024 UTF-8 bytes"):
+        load_config(path)
+
+
 def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path)
