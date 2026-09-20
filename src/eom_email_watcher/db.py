@@ -1926,6 +1926,22 @@ _CERTIFICATE_POLICY_REASONS = (
     "ASSOCIATION_UNCLEAR",
 )
 _CERTIFICATE_DATE_REASONS = frozenset(_CERTIFICATE_POLICY_REASONS[:5])
+_CERTIFICATE_WITHHELD_REASONS = frozenset(
+    {
+        "SPAN_UNKNOWN",
+        "VALUE_NOT_VERBATIM",
+        "VALUE_AMBIGUOUS_IN_SPAN",
+        "VALUE_BOUNDARY_INVALID",
+        "DATE_UNPARSEABLE",
+        "POLICY_ASSOCIATION_UNCLEAR",
+        "CONFLICTING_VALUES",
+    }
+)
+_CERTIFICATE_WITHHELD_FIELD_RE = re.compile(
+    r"(?:insured|certificate_holder|producer|"
+    r"policies\[(?:0|[1-9]\d?)\]\."
+    r"(?:coverage|insurer|policy_number|effective_date|expiration_date))\Z"
+)
 _CERTIFICATE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 _CERTIFICATE_TIMESTAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z"
@@ -2211,7 +2227,7 @@ def _validate_certificate_record(
     if type(raw_policies) is not list or len(raw_policies) > MAX_CERTIFICATE_POLICY_ROWS:
         raise CertificateResultInvalid("certificate policy rows are invalid")
     policies: list[dict[str, object]] = []
-    policy_keys: set[tuple[tuple[str, str, int, int], ...]] = set()
+    policy_keys: set[bytes] = set()
     for ordinal, raw_policy in enumerate(raw_policies):
         policy = _certificate_object(
             raw_policy,
@@ -2253,27 +2269,7 @@ def _validate_certificate_record(
         )
         if reasons != expected_reasons:
             raise CertificateResultInvalid("certificate policy review reasons contradict its dates")
-        policy_key: list[tuple[str, str, int, int]] = []
-        for name in (
-            "coverage",
-            "insurer",
-            "policy_number",
-            "effective_date",
-            "expiration_date",
-        ):
-            item = text_fields[name] if name in text_fields else dates[name]
-            if item is None:
-                continue
-            provenance = item["provenance"]
-            policy_key.append(
-                (
-                    name,
-                    str(provenance["span_id"]),
-                    int(provenance["token_start"]),
-                    int(provenance["token_end"]),
-                )
-            )
-        canonical_key = tuple(policy_key)
+        canonical_key = _certificate_canonical_json(policy)
         if canonical_key in policy_keys:
             raise CertificateResultInvalid("certificate policy rows contain a duplicate row")
         policy_keys.add(canonical_key)
@@ -2290,6 +2286,10 @@ def _validate_certificate_record(
         )
         for key in ("field", "reason", "detail"):
             _certificate_string(withheld_item[key], label=f"withheld {key}")
+        if _CERTIFICATE_WITHHELD_FIELD_RE.fullmatch(str(withheld_item["field"])) is None:
+            raise CertificateResultInvalid("certificate withheld field is invalid")
+        if withheld_item["reason"] not in _CERTIFICATE_WITHHELD_REASONS:
+            raise CertificateResultInvalid("certificate withheld reason is invalid")
 
     review = _certificate_object(
         record["review"],
@@ -2480,7 +2480,6 @@ def _certificate_source_for_job(
         ).fetchone()
         if (
             attempt is None
-            or attempt["dispatch_request_id"] != job.job_id
             or attempt["job_id"] != job.job_id
         ):
             raise CertificateResultInvalid(

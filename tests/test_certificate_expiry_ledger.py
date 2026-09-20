@@ -160,7 +160,11 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
     )
 
 
-def _certificate_fire_job(store: Store) -> tuple[object, str]:
+def _certificate_fire_job(
+    store: Store,
+    *,
+    joined_job_id: str | None = None,
+) -> tuple[object, str]:
     selected = capability(
         app_id="invoice-processor",
         app_version="0.1.0",
@@ -189,7 +193,7 @@ def _certificate_fire_job(store: Store) -> tuple[object, str]:
     )
     fire = store.automation_fires_for_message("message-1")[0]
     attempt = store.automation_fire_attempts(fire.fire_id)[0]
-    job_id = attempt.dispatch_request_id
+    job_id = joined_job_id or attempt.dispatch_request_id
     _certificate_job(store, job_id)
     submitted = store.transition_automation_fire(
         fire_id=fire.fire_id,
@@ -251,6 +255,34 @@ def test_completed_certificate_projects_once_and_lists_all_expiry_states(tmp_pat
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
+
+
+def test_completed_certificate_projects_for_joined_job_with_distinct_dispatch_id(
+    tmp_path: Path,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    joined_job_id = "20000000-0000-4000-8000-000000000099"
+    fire, job_id = _certificate_fire_job(runtime.store, joined_job_id=joined_job_id)
+    attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+    original_job_id = attempt.dispatch_request_id
+    assert job_id == joined_job_id
+    assert original_job_id != joined_job_id
+
+    runtime.store.transition_connect_job(
+        job_id=joined_job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None and settled.state == "completed"
+    attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
+    assert attempt.dispatch_request_id == original_job_id
+    assert attempt.job_id == joined_job_id
+    assert len(runtime.store.list_certificate_expiry_ledger(today="2026-09-20")) == 4
 
 
 def test_conflicting_terminal_replay_fails_fire_without_replacing_evidence(tmp_path: Path) -> None:
@@ -531,6 +563,41 @@ def test_certificate_validator_rejects_duplicate_keys_and_policy_overflow() -> N
         validate_certificate_result_json(
             json.dumps(overflow, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [("policies[0].unknown", "SPAN_UNKNOWN"), ("insured", "UNKNOWN_REASON")],
+)
+def test_certificate_validator_rejects_unknown_withheld_values(field: str, reason: str) -> None:
+    record = _record()
+    record["withheld"] = [{"field": field, "reason": reason, "detail": "unresolved"}]
+
+    with pytest.raises(CertificateResultInvalid, match="withheld"):
+        validate_certificate_result_json(
+            json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
+        )
+
+
+def test_certificate_validator_uses_full_canonical_policy_for_duplicate_identity() -> None:
+    exact_duplicate = _record(policies=[_policy(0, _date("2027-01-01", "expiration"))])
+    exact_duplicate["policies"].append(exact_duplicate["policies"][0])
+    with pytest.raises(CertificateResultInvalid, match="duplicate row"):
+        validate_certificate_result_json(
+            json.dumps(exact_duplicate, separators=(",", ":"), sort_keys=True).encode()
+        )
+
+    first = _policy(0, _date("2027-01-01", "expiration"))
+    second = _policy(1, _date("2027-02-01", "expiration"))
+    for name in ("coverage", "insurer", "policy_number", "effective_date"):
+        second_value = second[name]
+        first_value = first[name]
+        assert isinstance(second_value, dict) and isinstance(first_value, dict)
+        second_value["provenance"]["span_id"] = first_value["provenance"]["span_id"]
+    distinct = _record(policies=[first, second])
+    validate_certificate_result_json(
+        json.dumps(distinct, separators=(",", ":"), sort_keys=True).encode()
+    )
 
 
 @pytest.mark.parametrize(
