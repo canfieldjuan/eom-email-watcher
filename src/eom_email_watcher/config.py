@@ -4,6 +4,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,7 +28,6 @@ from tomlkit import aot, document, dumps, inline_table, parse, table
 from tomlkit.items import AoT, Array
 
 DEFAULT_CONFIG = Path("~/.config/eom-email-watcher/config.toml").expanduser()
-DEFAULT_STATE = Path("~/.local/state/eom-email-watcher").expanduser()
 DEFAULT_POLL_INTERVAL_MINUTES = 120
 DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
@@ -44,6 +44,8 @@ MUTABLE_DESKTOP_SETTINGS = frozenset(
         "retention_days",
     }
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
@@ -206,6 +208,22 @@ def _path(value: object, key: str) -> Path:
     return Path(os.path.expandvars(value)).expanduser()
 
 
+def _runtime_state_root() -> Path:
+    if "STATE_DIRECTORY" in os.environ:
+        configured = os.environ["STATE_DIRECTORY"]
+        if not configured or os.pathsep in configured or not Path(configured).is_absolute():
+            raise _UnsafeConfigPath
+        return Path(configured)
+    configured_state_home = os.environ.get("XDG_STATE_HOME")
+    if configured_state_home:
+        state_home = Path(configured_state_home).expanduser()
+        if not state_home.is_absolute():
+            raise _UnsafeConfigPath
+    else:
+        state_home = Path.home() / ".local" / "state"
+    return state_home / "eom-email-watcher"
+
+
 def normalize_address(value: str) -> str:
     _name, address = parseaddr(value)
     return address.strip().casefold()
@@ -332,6 +350,10 @@ def _float_setting(data: dict[str, object], key: str, default: float) -> float:
 
 def _load_config_bytes(content: bytes, config_path: Path) -> Config:
     try:
+        state_root = _runtime_state_root()
+    except _UnsafeConfigPath as exc:
+        raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+    try:
         text = content.decode("utf-8")
         data = tomllib.loads(text)
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
@@ -408,7 +430,10 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
     if backend == "gateway" and raw_require_auth is not True:
         raise ConfigError("gateway model_require_auth must be true")
     raw_token_file = data.get("model_api_token_file")
-    token_file = _path(raw_token_file, "model_api_token_file") if raw_token_file else None
+    if raw_token_file is None:
+        token_file = state_root / "lmstudio-api-token" if require_auth else None
+    else:
+        token_file = _path(raw_token_file, "model_api_token_file") if raw_token_file else None
     if require_auth and token_file is None:
         raise ConfigError("model_api_token_file is required when model_require_auth is true")
     raw_ca_file = data.get("model_ca_file")
@@ -442,22 +467,22 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
         retention_days=retention,
         poll_interval_minutes=poll_interval,
         gmail_credentials_file=_path(
-            data.get("gmail_credentials_file", DEFAULT_STATE / "credentials.json"),
+            data.get("gmail_credentials_file", state_root / "credentials.json"),
             "gmail_credentials_file",
         ),
         microsoft_credentials_file=_path(
             data.get(
                 "microsoft_credentials_file",
-                DEFAULT_STATE / "microsoft-oauth-client.json",
+                state_root / "microsoft-oauth-client.json",
             ),
             "microsoft_credentials_file",
         ),
         gmail_token_file=_path(
-            data.get("gmail_token_file", DEFAULT_STATE / "token.json"),
+            data.get("gmail_token_file", state_root / "token.json"),
             "gmail_token_file",
         ),
         gmail_send_token_file=_path(
-            data.get("gmail_send_token_file", DEFAULT_STATE / "send-token.json"),
+            data.get("gmail_send_token_file", state_root / "send-token.json"),
             "gmail_send_token_file",
         ),
         monthly_hours_recipient=(
@@ -466,7 +491,7 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
             else None
         ),
         database_file=_path(
-            data.get("database_file", DEFAULT_STATE / "watcher.sqlite3"),
+            data.get("database_file", state_root / "watcher.sqlite3"),
             "database_file",
         ),
         model_backend=backend,
@@ -603,23 +628,7 @@ def _open_or_create_safe_parent(path: Path) -> tuple[Path, int, str]:
 
 
 def _config_serialization_lock_path() -> Path:
-    if "STATE_DIRECTORY" in os.environ:
-        configured_state_directory = os.environ["STATE_DIRECTORY"]
-        if (
-            not configured_state_directory
-            or os.pathsep in configured_state_directory
-            or not Path(configured_state_directory).is_absolute()
-        ):
-            raise _UnsafeConfigPath
-        return Path(configured_state_directory) / "config-serialization.lock"
-    configured_state_home = os.environ.get("XDG_STATE_HOME")
-    if configured_state_home:
-        state_home = Path(configured_state_home).expanduser()
-        if not state_home.is_absolute():
-            raise _UnsafeConfigPath
-    else:
-        state_home = Path.home() / ".local" / "state"
-    return state_home / "eom-email-watcher" / "config-serialization.lock"
+    return _runtime_state_root() / "config-serialization.lock"
 
 
 def _safe_lock_file_stat(file_stat: os.stat_result) -> bool:
@@ -648,10 +657,22 @@ def _config_serialization_lock():
             lock.acquire()
         except OSError as exc:
             raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+        body_failed = False
         try:
             yield
+        except BaseException:
+            body_failed = True
+            raise
         finally:
-            lock.release()
+            try:
+                lock.release()
+            except Exception as exc:
+                if body_failed:
+                    logger.warning("Configuration lock release failed after operation failure")
+                else:
+                    raise ConfigError(
+                        "Configuration is unavailable or requires manual repair"
+                    ) from exc
         return
 
     parent_fd: int | None = None
@@ -3320,12 +3341,19 @@ def _publish_config_mutation(source: _ConfigMutationSource, content: bytes) -> N
         return
     assert source.parent_fd is not None
     assert source.name is not None
-    _durable_replace_at(
-        source.parent_fd,
-        source.name,
-        content,
-        before_replace=lambda: _verify_config_mutation_source(source),
-    )
+    assert source.parent is not None
+    try:
+        _durable_exchange_at(
+            source.parent_fd,
+            source.name,
+            content,
+            source.identity,
+            source.content,
+            parent_path=source.parent.path,
+            before_replace=lambda: _verify_config_mutation_source(source),
+        )
+    except NtfyDisclosureConflictError as exc:
+        raise ConfigAdmissionStaleError("Configuration admission snapshot changed") from exc
 
 
 def _atomic_create(path: Path, content: str) -> None:

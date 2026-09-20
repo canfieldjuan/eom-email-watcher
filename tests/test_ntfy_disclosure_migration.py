@@ -2348,3 +2348,83 @@ def test_non_posix_lock_fallback_preserves_publication_oserror(
         config_module._config_serialization_lock(),
     ):
         raise OSError("publication failed")
+
+
+@pytest.mark.parametrize(
+    "release_failure",
+    [OSError("PRIVATE_RELEASE_DETAIL"), RuntimeError("PRIVATE_RELEASE_DETAIL")],
+    ids=["os-error", "runtime-error"],
+)
+def test_non_posix_lock_release_failure_preserves_body_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    release_failure: Exception,
+) -> None:
+    class NonPosixOs:
+        name = "nt"
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
+    class BrokenReleaseLock:
+        def acquire(self) -> None:
+            return None
+
+        def release(self) -> None:
+            raise release_failure
+
+    monkeypatch.setattr(config_module, "os", NonPosixOs())
+    monkeypatch.setattr(config_module, "FileLock", lambda _path: BrokenReleaseLock())
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(ValueError, match="body classification"),
+        config_module._config_serialization_lock(),
+    ):
+        raise ValueError("body classification")
+
+    assert "PRIVATE_RELEASE_DETAIL" not in caplog.text
+    assert "Configuration lock release failed after operation failure" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "release_failure",
+    [OSError("PRIVATE_RELEASE_DETAIL"), RuntimeError("PRIVATE_RELEASE_DETAIL")],
+    ids=["os-error", "runtime-error"],
+)
+def test_non_posix_lock_release_failure_after_success_is_fixed_and_secret_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_failure: Exception,
+) -> None:
+    class NonPosixOs:
+        name = "nt"
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
+    class BrokenReleaseLock:
+        def acquire(self) -> None:
+            return None
+
+        def release(self) -> None:
+            raise release_failure
+
+    monkeypatch.setattr(config_module, "os", NonPosixOs())
+    monkeypatch.setattr(config_module, "FileLock", lambda _path: BrokenReleaseLock())
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with (
+        pytest.raises(
+            ConfigError,
+            match="Configuration is unavailable or requires manual repair",
+        ) as failure,
+        config_module._config_serialization_lock(),
+    ):
+        pass
+
+    assert "PRIVATE_RELEASE_DETAIL" not in str(failure.value)

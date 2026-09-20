@@ -53,11 +53,18 @@ discarded after each local inference request.
 
 ```bash
 uv sync --locked --all-groups
-mkdir -p ~/.config/eom-email-watcher ~/.local/state/eom-email-watcher
+state_dir="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}/eom-email-watcher}"
+mkdir -p ~/.config/eom-email-watcher "$state_dir"
 cp config.example.toml ~/.config/eom-email-watcher/config.toml
-chmod 700 ~/.config/eom-email-watcher ~/.local/state/eom-email-watcher
+chmod 700 ~/.config/eom-email-watcher "$state_dir"
 chmod 600 ~/.config/eom-email-watcher/config.toml
 ```
+
+Email Watcher resolves that state directory for every database, credential, token, operation lock,
+and scheduled monthly-hours artifact. A systemd user service uses its absolute
+`$STATE_DIRECTORY`; interactive CLI and desktop runs use `$XDG_STATE_HOME/eom-email-watcher`, or
+`~/.local/state/eom-email-watcher` when XDG state is unset. The supplied user units and interactive
+runs therefore converge when the user manager has a custom XDG state home.
 
 Edit the private config with the real exact sender list and one of the inference configurations
 below. Never commit that config; the repository example intentionally contains placeholders.
@@ -131,7 +138,8 @@ In LM Studio 0.4+, open **Developer > Server Settings**, enable **Require Authen
 a token for this watcher, and paste only the token value into:
 
 ```bash
-install -m 600 /dev/null ~/.local/state/eom-email-watcher/lmstudio-api-token
+state_dir="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}/eom-email-watcher}"
+install -m 600 /dev/null "$state_dir/lmstudio-api-token"
 # Edit the file and paste the token on one line; do not put it in config.toml.
 ```
 
@@ -144,12 +152,13 @@ file is missing. LM Studio's CLI can start the server but token creation is curr
 2. Enable the Gmail API.
 3. Configure the OAuth consent screen as Internal for the Workspace organization when available.
 4. Create an OAuth Client ID with application type **Desktop app**.
-5. Download the client JSON to:
-   `~/.local/state/eom-email-watcher/credentials.json`
+5. Download the client JSON to `credentials.json` inside the runtime state directory resolved during
+   installation.
 6. Lock it down and authorize:
 
 ```bash
-chmod 600 ~/.local/state/eom-email-watcher/credentials.json
+state_dir="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}/eom-email-watcher}"
+chmod 600 "$state_dir/credentials.json"
 uv run eom-mail-watch setup
 ```
 
@@ -161,7 +170,7 @@ current Gmail cursor, so only future arrivals are processed.
 
 Microsoft 365 uses the same native **Add account** control in the desktop Health view. A release
 build may embed this non-secret public-client file; a source build can place it at
-`~/.local/state/eom-email-watcher/microsoft-oauth-client.json`:
+`microsoft-oauth-client.json` inside the resolved runtime state directory:
 
 ```json
 {

@@ -97,6 +97,124 @@ def test_systemd_and_interactive_roles_share_custom_state_lock_path(
     assert observed == {role: expected for role in observed}
 
 
+def test_systemd_and_interactive_roles_share_every_default_state_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    state_home = tmp_path / "custom-state"
+    service_state = state_home / "eom-email-watcher"
+    config_bytes = b'model_base_url = "http://127.0.0.1:1234/v1"\nmodel_name = "local-model"\n'
+    monkeypatch.setenv("HOME", str(home))
+
+    observed: dict[str, tuple[Path, ...]] = {}
+    for role in ("watcher", "monthly"):
+        monkeypatch.setenv("STATE_DIRECTORY", str(service_state))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "ignored-state"))
+        loaded = config_module._load_config_bytes(config_bytes, tmp_path / f"{role}.toml")
+        observed[role] = (
+            loaded.database_file,
+            loaded.gmail_credentials_file,
+            loaded.microsoft_credentials_file,
+            loaded.gmail_token_file,
+            loaded.gmail_send_token_file,
+            loaded.model_api_token_file,
+            config_module._config_serialization_lock_path(),
+        )
+    for role in ("cli", "desktop"):
+        monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        loaded = config_module._load_config_bytes(config_bytes, tmp_path / f"{role}.toml")
+        observed[role] = (
+            loaded.database_file,
+            loaded.gmail_credentials_file,
+            loaded.microsoft_credentials_file,
+            loaded.gmail_token_file,
+            loaded.gmail_send_token_file,
+            loaded.model_api_token_file,
+            config_module._config_serialization_lock_path(),
+        )
+
+    expected = (
+        service_state / "watcher.sqlite3",
+        service_state / "credentials.json",
+        service_state / "microsoft-oauth-client.json",
+        service_state / "token.json",
+        service_state / "send-token.json",
+        service_state / "lmstudio-api-token",
+        service_state / "config-serialization.lock",
+    )
+    assert observed == {role: expected for role in observed}
+    assert "ProtectHome=read-only" in WATCHER_SERVICE.read_text()
+    assert "ProtectHome=read-only" in MONTHLY_SERVICE.read_text()
+
+
+def test_default_state_paths_keep_home_compatibility_without_xdg_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    loaded = config_module._load_config_bytes(
+        (b'model_base_url = "http://127.0.0.1:1234/v1"\nmodel_name = "local-model"\n'),
+        tmp_path / "config.toml",
+    )
+    expected = home / ".local/state/eom-email-watcher"
+
+    assert loaded.database_file == expected / "watcher.sqlite3"
+    assert loaded.gmail_credentials_file == expected / "credentials.json"
+    assert loaded.gmail_token_file == expected / "token.json"
+    assert loaded.model_api_token_file == expected / "lmstudio-api-token"
+    assert config_module._config_serialization_lock_path() == (
+        expected / "config-serialization.lock"
+    )
+
+
+def test_explicit_absolute_state_paths_override_runtime_state_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit = tmp_path / "explicit"
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path / "service-state"))
+    loaded = config_module._load_config_bytes(
+        (
+            b'model_base_url = "http://127.0.0.1:1234/v1"\n'
+            b'model_name = "local-model"\n'
+            + f'database_file = "{explicit / "watcher.sqlite3"}"\n'.encode()
+            + f'gmail_token_file = "{explicit / "token.json"}"\n'.encode()
+            + f'model_api_token_file = "{explicit / "model-token"}"\n'.encode()
+        ),
+        tmp_path / "config.toml",
+    )
+
+    assert loaded.database_file == explicit / "watcher.sqlite3"
+    assert loaded.gmail_token_file == explicit / "token.json"
+    assert loaded.model_api_token_file == explicit / "model-token"
+
+
+def test_explicit_empty_model_token_path_does_not_select_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with pytest.raises(
+        config_module.ConfigError,
+        match="model_api_token_file is required",
+    ):
+        config_module._load_config_bytes(
+            (
+                b'model_base_url = "http://127.0.0.1:1234/v1"\n'
+                b'model_name = "local-model"\n'
+                b'model_api_token_file = ""\n'
+            ),
+            tmp_path / "config.toml",
+        )
+
+
 @pytest.mark.parametrize("value", ["relative/state", "", "relative:other"])
 def test_systemd_state_directory_must_be_one_absolute_path(
     monkeypatch: pytest.MonkeyPatch,

@@ -459,16 +459,16 @@ def test_watchlist_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(source: Path, destination: Path, **_kwargs: object) -> None:
+    def fail_replace(_parent_fd: int, _source: str, _destination: str) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)
+    monkeypatch.setattr("eom_email_watcher.config._rename_exchange_at", fail_replace)
 
     with pytest.raises(OSError, match="replace failed"):
         add_sender(path, "new@example.com", "New")
 
     assert path.read_bytes() == original
-    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
 
 
 def test_settings_update_preserves_unrelated_config(tmp_path: Path) -> None:
@@ -596,16 +596,16 @@ def test_settings_update_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(source: Path, destination: Path, **_kwargs: object) -> None:
+    def fail_replace(_parent_fd: int, _source: str, _destination: str) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)
+    monkeypatch.setattr("eom_email_watcher.config._rename_exchange_at", fail_replace)
 
     with pytest.raises(OSError, match="replace failed"):
         update_settings(path, {"poll_interval_minutes": 60})
 
     assert path.read_bytes() == original
-    assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
 
 
 def test_watchlist_mutation_rejects_symlinked_config_alias(tmp_path: Path) -> None:
@@ -670,6 +670,183 @@ def test_config_mutation_never_overwrites_editor_atomic_replacement(
     assert (path.stat().st_dev, path.stat().st_ino) == replaced_identity
     assert path.read_bytes() == manual
     assert list(path.parent.glob(".config.toml.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exchange publication is POSIX-only")
+@pytest.mark.parametrize("mutation", ["settings", "add", "remove"])
+@pytest.mark.parametrize("same_bytes", [False, True])
+def test_config_mutation_preserves_editor_replacement_at_final_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    same_bytes: bool,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+    manual = original if same_bytes else original + b"\n# final editor replacement\n"
+    replaced_identity: tuple[int, int] | None = None
+
+    def replace_at_exchange(stage: str) -> None:
+        nonlocal replaced_identity
+        if stage != "before_exchange" or replaced_identity is not None:
+            return
+        replacement = path.with_name("operator-final.toml")
+        replacement.write_bytes(manual)
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        current = path.stat()
+        replaced_identity = (current.st_dev, current.st_ino)
+
+    monkeypatch.setattr(config_module, "_transaction_probe", replace_at_exchange)
+
+    with pytest.raises(ConfigAdmissionStaleError, match="snapshot changed"):
+        if mutation == "settings":
+            update_settings(path, {"poll_interval_minutes": 45})
+        elif mutation == "add":
+            add_sender(path, "new@example.com", "New")
+        else:
+            remove_sender(path, "trusted@example.com")
+
+    assert replaced_identity is not None
+    assert (path.stat().st_dev, path.stat().st_ino) == replaced_identity
+    assert path.read_bytes() == manual
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exchange publication is POSIX-only")
+@pytest.mark.parametrize("mutation", ["settings", "add", "remove"])
+def test_config_mutation_preserves_symlink_alias_at_final_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    target = tmp_path / "operator.toml"
+    target.write_bytes(path.read_bytes() + b"\n# operator alias target\n")
+    target.chmod(0o600)
+    injected = False
+
+    def replace_at_exchange(stage: str) -> None:
+        nonlocal injected
+        if stage != "before_exchange" or injected:
+            return
+        path.unlink()
+        path.symlink_to(target)
+        injected = True
+
+    monkeypatch.setattr(config_module, "_transaction_probe", replace_at_exchange)
+
+    with pytest.raises(ConfigAdmissionStaleError, match="snapshot changed"):
+        if mutation == "settings":
+            update_settings(path, {"poll_interval_minutes": 45})
+        elif mutation == "add":
+            add_sender(path, "new@example.com", "New")
+        else:
+            remove_sender(path, "trusted@example.com")
+
+    assert injected
+    assert path.is_symlink()
+    assert path.resolve() == target
+    assert b"operator alias target" in target.read_bytes()
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
+
+
+def _apply_config_mutation(path: Path, mutation: str) -> None:
+    if mutation == "settings":
+        update_settings(path, {"poll_interval_minutes": 45})
+    elif mutation == "add":
+        add_sender(path, "new@example.com", "New")
+    else:
+        remove_sender(path, "trusted@example.com")
+
+
+def _assert_config_mutation_state(path: Path, mutation: str, *, applied: bool) -> None:
+    loaded = load_config(path)
+    if mutation == "settings":
+        assert loaded.poll_interval_minutes == (45 if applied else 120)
+    elif mutation == "add":
+        assert ("new@example.com" in loaded.allowlist) is applied
+    else:
+        assert ("trusted@example.com" not in loaded.allowlist) is applied
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exchange recovery is POSIX-only")
+@pytest.mark.parametrize("mutation", ["settings", "add", "remove"])
+@pytest.mark.parametrize(
+    ("crash_stage", "applied"),
+    [("before_exchange", False), ("after_exchange", True)],
+)
+def test_config_mutation_recovers_crash_before_or_after_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    crash_stage: str,
+    applied: bool,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    child = os.fork()
+    if child == 0:
+
+        def crash(stage: str) -> None:
+            if stage == crash_stage:
+                os._exit(86)
+
+        config_module._transaction_probe = crash
+        _apply_config_mutation(path, mutation)
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    _assert_config_mutation_state(path, mutation, applied=applied)
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exchange recovery is POSIX-only")
+@pytest.mark.parametrize("mutation", ["settings", "add", "remove"])
+def test_config_mutation_recovers_crash_after_external_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+    manual = original + b"\n# external replacement survived crash\n"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    child = os.fork()
+    if child == 0:
+        replaced = False
+
+        def replace_then_crash(stage: str) -> None:
+            nonlocal replaced
+            if stage == "before_exchange" and not replaced:
+                replacement = path.with_name("operator-crash.toml")
+                replacement.write_bytes(manual)
+                replacement.chmod(0o600)
+                os.replace(replacement, path)
+                replaced = True
+            if stage == "after_mismatch_rollback":
+                os._exit(86)
+
+        config_module._transaction_probe = replace_then_crash
+        _apply_config_mutation(path, mutation)
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    _assert_config_mutation_state(path, mutation, applied=False)
+    assert path.read_bytes() == manual
+    assert not list(path.parent.glob(f".{path.name}.ntfy-disclosure-*"))
 
 
 @pytest.mark.skipif(os.name != "posix", reason="state lock concurrency is POSIX-only")
