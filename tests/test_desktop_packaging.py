@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import json
 import stat
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -35,6 +36,12 @@ def _load_smoke() -> ModuleType:
 
 smoke_packaged_engine = _load_smoke()
 
+ADMISSION_TOKEN = {
+    "version": 1,
+    "revision": f"sha256:{'a' * 64}",
+    "identity": f"sha256:{'b' * 64}",
+}
+
 
 def test_packaged_smoke_uses_owner_private_config_parent(
     tmp_path: Path,
@@ -42,37 +49,61 @@ def test_packaged_smoke_uses_owner_private_config_parent(
 ) -> None:
     binary = tmp_path / "engine"
     binary.write_bytes(b"engine")
-    responses = iter(
-        [
-            {"data": {"settings": {"timezone": "America/Chicago"}}},
-            {"data": {"items": []}},
-            {
-                "data": {
-                    "watchlist_count": 0,
-                    "mail": {
-                        "providers": [
-                            {
-                                "provider": "microsoft365",
-                                "connection_available": False,
-                            }
-                        ]
-                    },
-                }
+    responses = {
+        "config.initialize": {"data": {"settings": {"timezone": "America/Chicago"}}},
+        "config.admission.snapshot": {
+            "data": {
+                "settings": {"timezone": "America/Chicago"},
+                "token": ADMISSION_TOKEN,
             },
-            {"data": {"state": "authority_unavailable", "active": False}},
-            {"data": {"active": False}},
-        ]
-    )
+        },
+        "watchlist.list": {"data": {"items": []}},
+        "health.get": {
+            "data": {
+                "watchlist_count": 0,
+                "mail": {
+                    "providers": [
+                        {
+                            "provider": "microsoft365",
+                            "connection_available": False,
+                        }
+                    ]
+                },
+            }
+        },
+        "connect.entitlement.status": {
+            "data": {"state": "authority_unavailable", "active": False}
+        },
+        "watcher.check": {"data": {"active": False}},
+    }
+    operations: list[str] = []
+    watcher_tokens: list[object] = []
 
     def request(*_args: object, **kwargs: object) -> dict[str, object]:
         config_path = kwargs["config_path"]
         assert isinstance(config_path, Path)
         assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
-        return next(responses)
+        operation = kwargs["operation"]
+        assert isinstance(operation, str)
+        operations.append(operation)
+        if operation == "watcher.check":
+            watcher_tokens.append(kwargs.get("admission_token"))
+        else:
+            assert kwargs.get("admission_token") is None
+        return responses[operation]
 
     monkeypatch.setattr(smoke_packaged_engine, "_request", request)
 
     smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
+    assert operations == [
+        "config.initialize",
+        "config.admission.snapshot",
+        "watchlist.list",
+        "health.get",
+        "connect.entitlement.status",
+        "watcher.check",
+    ]
+    assert watcher_tokens == [ADMISSION_TOKEN]
 
 
 def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:
@@ -112,6 +143,12 @@ def test_packaged_smoke_rejects_unavailable_expected_mail_provider(
     responses = iter(
         [
             {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": ADMISSION_TOKEN,
+                }
+            },
             {"data": {"items": []}},
             {
                 "data": {
@@ -158,6 +195,12 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
     responses = iter(
         [
             {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": ADMISSION_TOKEN,
+                }
+            },
             {"data": {"items": []}},
             {
                 "data": {
@@ -188,6 +231,70 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
         "missing",
         ("gmail", "microsoft365"),
     )
+
+
+def test_packaged_smoke_rejects_malformed_admission_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = iter(
+        [
+            {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": {"version": 1, "revision": f"sha256:{'a' * 64}"},
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        smoke_packaged_engine,
+        "_request",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="invalid public shape",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
+
+
+def test_token_bound_smoke_failure_does_not_render_admission_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    token_text = json.dumps(ADMISSION_TOKEN, sort_keys=True)
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout="",
+            stderr=token_text,
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="watcher.check",
+            payload={"dry_run": False},
+            working_directory=tmp_path,
+            environment={},
+            admission_token=ADMISSION_TOKEN,
+        )
+
+    rendered = str(failure.value)
+    assert ADMISSION_TOKEN["revision"] not in rendered
+    assert ADMISSION_TOKEN["identity"] not in rendered
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ def _request(
     payload: dict[str, object] | None,
     working_directory: Path,
     environment: dict[str, str],
+    admission_token: dict[str, object] | None = None,
 ) -> dict[str, object]:
     request = {
         "config_path": str(config_path),
@@ -35,6 +37,8 @@ def _request(
         "payload": payload or {},
         "protocol": PROTOCOL_VERSION,
     }
+    if admission_token is not None:
+        request["admission_token"] = admission_token
     result = subprocess.run(
         [str(binary)],
         input=json.dumps(request, separators=(",", ":")),
@@ -45,7 +49,11 @@ def _request(
         timeout=ENGINE_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
-        detail = result.stderr.strip()[-1000:] or "no stderr"
+        detail = (
+            "diagnostic omitted for token-bound request"
+            if admission_token is not None
+            else result.stderr.strip()[-1000:] or "no stderr"
+        )
         raise PackagedEngineSmokeError(
             f"Packaged engine {operation} exited {result.returncode}: {detail}"
         )
@@ -69,6 +77,27 @@ def _request(
             f"Packaged engine {operation} did not return a successful v1 response"
         )
     return response
+
+
+def _snapshot_admission_token(response: dict[str, object]) -> dict[str, object]:
+    data = response.get("data")
+    token = data.get("token") if isinstance(data, dict) else None
+    settings = data.get("settings") if isinstance(data, dict) else None
+    digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+    if (
+        not isinstance(settings, dict)
+        or not isinstance(token, dict)
+        or set(token) != {"version", "revision", "identity"}
+        or token.get("version") != 1
+        or not isinstance(token.get("revision"), str)
+        or digest_pattern.fullmatch(token["revision"]) is None
+        or not isinstance(token.get("identity"), str)
+        or digest_pattern.fullmatch(token["identity"]) is None
+    ):
+        raise PackagedEngineSmokeError(
+            "Packaged engine admission snapshot returned an invalid public shape"
+        )
+    return dict(token)
 
 
 def smoke_packaged_engine(
@@ -118,6 +147,16 @@ def smoke_packaged_engine(
             raise PackagedEngineSmokeError(
                 "Packaged engine did not preserve the initialized timezone"
             )
+
+        admission = _request(
+            isolated_binary,
+            config_path=config_path,
+            operation="config.admission.snapshot",
+            payload=None,
+            working_directory=temporary,
+            environment=environment,
+        )
+        admission_token = _snapshot_admission_token(admission)
 
         watchlist = _request(
             isolated_binary,
@@ -184,6 +223,7 @@ def smoke_packaged_engine(
             payload={"dry_run": False},
             working_directory=temporary,
             environment=environment,
+            admission_token=admission_token,
         )
         if inactive_check["data"].get("active") is not False:
             raise PackagedEngineSmokeError(
