@@ -73,7 +73,59 @@ def test_systemd_config_lock_resolves_inside_only_writable_state_path(
     assert "StateDirectoryMode=0700" in watcher
     assert "StateDirectory=eom-email-watcher" in MONTHLY_SERVICE.read_text()
     assert "StateDirectoryMode=0700" in MONTHLY_SERVICE.read_text()
-    assert "ReadWritePaths=%h/.config/eom-email-watcher" not in watcher
+
+
+def _read_write_paths(service: Path) -> set[str]:
+    return {
+        line.removeprefix("ReadWritePaths=")
+        for line in service.read_text().splitlines()
+        if line.startswith("ReadWritePaths=")
+    }
+
+
+def test_systemd_services_grant_only_runtime_config_and_legacy_state_parents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    legacy_state = home / ".local/state/eom-email-watcher"
+    config_path = home / ".config/eom-email-watcher/config.toml"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path / "service-state"))
+
+    loaded = config_module._load_config_bytes(
+        (
+            b'model_base_url = "http://127.0.0.1:1234/v1"\n'
+            b'model_name = "local-model"\n'
+            + f'database_file = "{legacy_state / "watcher.sqlite3"}"\n'.encode()
+            + f'gmail_token_file = "{legacy_state / "token.json"}"\n'.encode()
+            + f'model_api_token_file = "{legacy_state / "model-token"}"\n'.encode()
+        ),
+        config_path,
+    )
+    expected = {
+        "%h/.config/eom-email-watcher",
+        "-%h/.local/state/eom-email-watcher",
+    }
+
+    assert loaded.path.parent == config_path.parent
+    assert loaded.database_file.parent == legacy_state
+    assert loaded.gmail_token_file.parent == legacy_state
+    assert loaded.model_api_token_file is not None
+    assert loaded.model_api_token_file.parent == legacy_state
+    assert _read_write_paths(WATCHER_SERVICE) == expected
+    assert _read_write_paths(MONTHLY_SERVICE) == expected
+
+
+def test_systemd_config_write_preflight_matches_runtime_default_parent() -> None:
+    runtime_parent = config_module.DEFAULT_CONFIG.parent
+    home = Path.home()
+    relative = runtime_parent.relative_to(home)
+    expected = f"%h/{relative.as_posix()}"
+
+    assert expected == "%h/.config/eom-email-watcher"
+    assert expected in _read_write_paths(WATCHER_SERVICE)
+    assert expected in _read_write_paths(MONTHLY_SERVICE)
 
 
 def test_systemd_and_interactive_roles_share_custom_state_lock_path(

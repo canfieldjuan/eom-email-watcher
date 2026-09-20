@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 from pathlib import Path
@@ -83,7 +84,9 @@ def test_packaged_smoke_uses_owner_private_config_parent(
     def request(*_args: object, **kwargs: object) -> dict[str, object]:
         config_path = kwargs["config_path"]
         assert isinstance(config_path, Path)
-        assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
+        assert config_path.parent.is_dir()
+        if os.name == "posix":
+            assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
         operation = kwargs["operation"]
         assert isinstance(operation, str)
         operations.append(operation)
@@ -92,7 +95,9 @@ def test_packaged_smoke_uses_owner_private_config_parent(
         assert "STATE_DIRECTORY" not in environment
         state_home = Path(environment["XDG_STATE_HOME"])
         assert state_home.is_absolute()
-        assert stat.S_IMODE(state_home.stat().st_mode) == 0o700
+        assert state_home.is_dir()
+        if os.name == "posix":
+            assert stat.S_IMODE(state_home.stat().st_mode) == 0o700
         observed_state_homes.append(state_home)
         if operation == "watcher.check":
             watcher_tokens.append(kwargs.get("admission_token"))

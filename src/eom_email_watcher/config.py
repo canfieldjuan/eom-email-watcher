@@ -1206,7 +1206,12 @@ def _root_boolean_token_spans(content: bytes, key: str) -> list[tuple[int, int]]
                 continue
         elif quote is not None:
             marker = bytes([quote]) * 3
-            if multiline and content[index : index + 3] == marker:
+            delimiter_is_escaped = quote == ord('"') and escaped
+            if (
+                multiline
+                and not delimiter_is_escaped
+                and content[index : index + 3] == marker
+            ):
                 quote = None
                 multiline = False
                 index += 3

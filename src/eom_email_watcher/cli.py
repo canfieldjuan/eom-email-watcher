@@ -334,34 +334,37 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    os.umask(0o077)
+    previous_umask = os.umask(0o077)
     try:
-        if args.command == "doctor":
-            code = _doctor(args.config)
-        elif args.command == "setup":
-            code = _setup(args.config)
-        elif args.command == "setup-send":
-            code = _setup_send(args.config)
-        elif args.command == "check":
-            code = _check(args.config, args.dry_run)
-        elif args.command == "send-hours":
-            code = _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
-        elif args.command == "outbound-status":
-            code = _outbound_status(args.config, args.dedupe_key)
-        elif args.command == "outbound-resolve":
-            code = _outbound_resolve(
-                args.config,
-                args.dedupe_key,
-                confirm_sent=args.confirm_sent,
-                confirm_unsent=args.confirm_unsent,
-            )
-        elif args.command == "requeue-analysis":
-            code = _requeue_analysis(args.config, args.message_id)
-        else:
-            code = _recent(args.config, args.limit)
-    except (ConfigError, MailboxError, SendError, RuntimeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        code = 2
+        try:
+            if args.command == "doctor":
+                code = _doctor(args.config)
+            elif args.command == "setup":
+                code = _setup(args.config)
+            elif args.command == "setup-send":
+                code = _setup_send(args.config)
+            elif args.command == "check":
+                code = _check(args.config, args.dry_run)
+            elif args.command == "send-hours":
+                code = _send_hours(args.config, test_to=args.test_to, dry_run=args.dry_run)
+            elif args.command == "outbound-status":
+                code = _outbound_status(args.config, args.dedupe_key)
+            elif args.command == "outbound-resolve":
+                code = _outbound_resolve(
+                    args.config,
+                    args.dedupe_key,
+                    confirm_sent=args.confirm_sent,
+                    confirm_unsent=args.confirm_unsent,
+                )
+            elif args.command == "requeue-analysis":
+                code = _requeue_analysis(args.config, args.message_id)
+            else:
+                code = _recent(args.config, args.limit)
+        except (ConfigError, MailboxError, SendError, RuntimeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            code = 2
+    finally:
+        os.umask(previous_umask)
     raise SystemExit(code)
 
 

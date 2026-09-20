@@ -938,6 +938,38 @@ def test_ntfy_defaults_to_disabled(tmp_path: Path) -> None:
     assert config.ntfy_content_disclosure_acknowledged is False
 
 
+def test_root_boolean_scanner_keeps_odd_escaped_triple_inside_multiline_string() -> None:
+    content = (
+        b'notes = """prefix\\\"""\n'
+        b"ntfy_content_disclosure_acknowledged = false\n"
+        b'"""\n'
+        b"ntfy_content_disclosure_acknowledged = false\n"
+    )
+
+    spans = config_module._root_boolean_token_spans(
+        content,
+        "ntfy_content_disclosure_acknowledged",
+    )
+
+    expected = content.rindex(b"false")
+    assert spans == [(expected, expected + len(b"false"))]
+
+
+def test_root_boolean_scanner_closes_multiline_string_after_even_backslashes() -> None:
+    content = (
+        b'notes = """prefix\\\\"""\n'
+        b"ntfy_content_disclosure_acknowledged = false\n"
+    )
+
+    spans = config_module._root_boolean_token_spans(
+        content,
+        "ntfy_content_disclosure_acknowledged",
+    )
+
+    expected = content.index(b"false")
+    assert spans == [(expected, expected + len(b"false"))]
+
+
 def test_short_ntfy_topic_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(

@@ -402,3 +402,43 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
 
     assert missing.value.code == 2
     assert capsys.readouterr().err.strip() == "error: Message was not found"
+
+
+@pytest.mark.parametrize(("raise_error", "exit_code"), [(False, 0), (True, 2)])
+def test_main_restores_process_umask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_error: bool,
+    exit_code: int,
+) -> None:
+    calls: list[int] = []
+
+    def fake_umask(value: int) -> int:
+        calls.append(value)
+        return 0o022 if len(calls) == 1 else 0o077
+
+    args = SimpleNamespace(
+        command="recent",
+        config=tmp_path / "config.toml",
+        limit=1,
+        verbose=False,
+    )
+    monkeypatch.setattr(cli.os, "umask", fake_umask)
+    monkeypatch.setattr(
+        cli,
+        "_parser",
+        lambda: SimpleNamespace(parse_args=lambda _argv: args),
+    )
+
+    def recent(_config_path: Path, _limit: int) -> int:
+        if raise_error:
+            raise cli.ConfigError("invalid configuration")
+        return 0
+
+    monkeypatch.setattr(cli, "_recent", recent)
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["recent"])
+
+    assert exited.value.code == exit_code
+    assert calls == [0o077, 0o022]
