@@ -99,8 +99,10 @@ On Unix, an existing file is eligible for either `normal_admission` or
   one hard link, is owned by the effective user, and has exact mode `0600`;
 - the immediate parent is opened as a no-follow directory, is owned by the
   effective user, and has exact mode `0700`; and
-- candidate creation, replacement, and directory sync remain relative to that
-  held directory descriptor, so a pathname swap cannot redirect the write.
+- candidate creation, linking, replacement, and directory sync remain relative
+  to that held directory descriptor; immediately before each mutation, the
+  current parent pathname is reopened without following links and must still
+  resolve to the held directory identity with the expected owner and mode.
 
 A symlink, hardlink, special file, mismatched owner, broader permission mode,
 unsafe immediate parent, or identity change yields `manual_repair_required`
@@ -112,10 +114,11 @@ legacy acknowledgement shape is `manual_repair_required`; the mutation is not
 offered. Windows migration proof remains deferred.
 
 The legacy shape is also `manual_repair_required` when the running platform
-does not expose atomic rename exchange. A filesystem that rejects exchange at
-commit leaves the config unchanged and records a secret-free, owner-private
-unsupported marker. Later status calls remain `manual_repair_required`; they do
-not return to `acknowledgement_required` or invite a retry loop.
+does not expose Linux `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, or atomic rename
+exchange. A filesystem that rejects any required primitive leaves the config
+unchanged and records a secret-free, owner-private unsupported marker. Later
+status calls remain `manual_repair_required`; they do not return to
+`acknowledgement_required` or invite a retry loop.
 
 After the path checks, the state is `acknowledgement_required` only when all of
 these are true:
@@ -210,34 +213,40 @@ The acknowledgement is one config-wide transaction:
 3. Under the lock, read the exact original bytes, compare the revision, recheck
    path identity and the repairable shape, perform the one allowed byte edit,
    and run the full hypothetical document through the shared normal validator.
-4. Before creating any secret-bearing candidate, create and `fsync` a fixed,
-   owner-private, secret-free transaction marker, then `fsync` its directory
-   entry. The marker records the exact original identity and digest plus the
-   derived candidate digest and safe-file shape. Revalidate the held parent
-   identity, owner, and exact `0700` mode immediately before marker creation,
-   marker permission setting, each marker write, file sync, and directory
-   durability.
-5. Only after marker provenance is durable, create the fixed candidate with
-   owner-only mode `0600`. Write and flush all bytes, `fsync` the candidate and
-   its directory entry, and revalidate the held parent before candidate
-   creation, permission setting, each write, file sync, and directory
-   durability.
-6. Recheck the destination identity and exact original bytes, then revalidate
-   the held parent immediately before `RENAME_EXCHANGE`. The exchange makes the
-   candidate the config and places the displaced original at the fixed
-   candidate name. Recovery removes that displaced file only when the marker,
-   inode metadata, safe-file predicate, and digest prove it is the recorded
-   original.
-7. Reconcile and clean exact transaction states before returning: marker-only
-   and marker-plus-candidate are aborted; candidate-at-target plus recorded
-   original-at-candidate is committed; a manual target plus recorded
-   original-at-candidate preserves the manual target while securely removing
-   only the old displaced secret and marker. A fixed candidate without a valid
-   marker is manual state and is never deleted by byte coincidence.
-8. If the exact filesystem rejects exchange with an unsupported-operation
-   result, durably bind a secret-free unsupported marker to the transaction,
-   securely remove only the provenance-owned candidate, leave the config
-   unchanged, and make later status calls stable `manual_repair_required`.
+4. Create the candidate as an unnamed inode on the exact config filesystem with
+   Linux `O_TMPFILE`, owner-only mode `0600`, and link count zero. Revalidate the
+   held parent and its current pathname before permission changes, every
+   short-write-loop iteration, and file sync. A crash at any partial write
+   closes the inode without ever creating a secret-bearing pathname.
+5. After the unnamed candidate is fully written and synced, `fstat` it and
+   create a fixed, owner-private, secret-free transaction marker. The marker
+   records the exact original identity and digest plus the candidate device,
+   inode, safe metadata, size, timestamp, and digest. It contains no config
+   bytes. Sync the marker and its directory while the candidate remains
+   unnamed.
+6. Revalidate the held parent and current parent pathname, then link that exact
+   open inode to the fixed candidate name with `linkat(AT_EMPTY_PATH)`. Linking
+   never replaces an existing name. Verify the linked entry has the marker's
+   exact device and inode plus the recorded safe metadata and digest, then sync
+   its directory entry. A manual fixed-name collision has a different inode,
+   survives, and forces manual repair.
+7. Recheck the destination identity and exact original bytes, then revalidate
+   the held parent and current pathname immediately before `RENAME_EXCHANGE`.
+   The exchange makes the candidate the config and places the displaced
+   original at the fixed candidate name. Recovery removes that displaced file
+   only when marker identity, metadata, safe-file predicates, and digests prove
+   it is the recorded original.
+8. Reconcile exact states before returning: marker-only before link and
+   marker-plus-exact-candidate before exchange are aborted; candidate-at-target
+   plus recorded original-at-candidate is committed; a manual target plus the
+   exact displaced original preserves the manual target while securely
+   removing only the old secret and marker. A fixed candidate without a valid
+   exact-inode marker is manual state and is never deleted by byte coincidence.
+9. If `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, or exchange is unavailable on the
+   exact filesystem, durably write a secret-free unsupported marker, close any
+   unnamed inode, remove only an exactly proven linked candidate and
+   transaction marker, leave the config unchanged, and make later status calls
+   stable `manual_repair_required`.
 
 Ordinary settings and watchlist writes keep their platform-specific atomic
 replacement path. Disclosure acknowledgement uses the stronger exchange and
@@ -254,6 +263,15 @@ unprovable response loss returns the fixed secret-free `outcome_unknown` class
 when the process can still respond. Ambiguous or tampered states preserve every
 file and surface `manual_repair_required`; recovery never deletes a manual
 concurrent write.
+
+The parent pathname is reopened from the filesystem root and compared with the
+held descriptor immediately before each mutation. Linux does not provide a
+single `linkat` or `renameat2` operation that also asserts that a directory fd
+still has one particular pathname. A hostile same-user rename in the
+instruction gap after that final comparison remains an unavoidable kernel
+primitive limit; no-follow resolution, exact identity checks, and dir-fd
+relative mutations minimize that gap and prevent redirection through a
+replacement pathname observed before the syscall.
 
 Two concurrent calls for one revision have at most one replacement. A caller
 that acquires the lock after another success observes a stale revision or a
@@ -476,15 +494,17 @@ an unexpected pass stops implementation for diagnosis.
 | Malformed or duplicate-root-key TOML | `manual_repair_required` | unavailable; no mutation |
 | Legacy ntfy shape plus unrelated invalid setting | `manual_repair_required` | unavailable; no mutation |
 | Config/ancestor/parent symlink, hardlink, special file, wrong owner, or broad mode | `manual_repair_required` | unavailable; no read-through or mutation |
-| Rename exchange symbol absent, or persisted unsupported-filesystem marker present | `manual_repair_required` | unavailable; no config mutation |
-| Fixed candidate present without a valid transaction marker | `manual_repair_required` | unavailable; candidate preserved |
+| `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, or rename exchange unavailable; or persisted unsupported marker present | `manual_repair_required` | unavailable; no config mutation |
+| Fixed candidate present without a valid marker for its exact device and inode | `manual_repair_required` | unavailable; candidate preserved |
 | Quoted/comment/nested acknowledgement decoy; root member absent | `acknowledgement_required` if otherwise valid | insert root member; decoy bytes unchanged |
 | Revision changed after status | previously required | conflict; exact current bytes preserved |
-| Candidate validation or any pre-replace write/sync step fails | required | error; exact old bytes remain |
-| Filesystem rejects exchange as unsupported | `manual_repair_required` after attempt | config unchanged; secret candidate removed; no retry loop |
-| Process exits after durable marker or candidate, before exchange | reconcile | exact old config remains; provenance-owned files cleaned |
+| Candidate validation or any pre-replace write/sync step fails | required | error; exact old bytes remain; partial unnamed inode has no pathname |
+| Filesystem rejects unnamed creation, linking, or exchange as unsupported | `manual_repair_required` after attempt | config unchanged; exact linked candidate removed; no retry loop |
+| Process exits during any candidate short write | reconcile | unnamed inode disappears; no named secret; exact old config remains |
+| Process exits after marker durability but before link, or after link before exchange | reconcile | exact old config remains; only exact-inode artifacts are cleaned |
 | Process exits immediately after exchange | reconcile | exact candidate retained; displaced original and marker cleaned only after exact proof |
 | Manual target replacement after exchange | reconcile current manual target | manual target preserved; exact displaced original and marker securely removed |
+| Parent pathname is renamed or replaced at a mutation boundary | conflict/error | held and current identities differ; no config mutation; exact owned artifacts cleaned |
 | Replace may have occurred, then sync/load/response fails | reconcile | old or fully validated new; no blind retry |
 | Two actions race with one revision | required | at most one success; loser conflicts |
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import stat
 import threading
@@ -538,6 +539,7 @@ def test_manual_edit_during_precommit_wins_without_lost_update(
         expected_stat,
         expected_content,
         *,
+        parent_path,
         before_replace,
     ):
         _write_bytes(path, edited)
@@ -547,6 +549,7 @@ def test_manual_edit_during_precommit_wins_without_lost_update(
             content,
             expected_stat,
             expected_content,
+            parent_path=parent_path,
             before_replace=before_replace,
         )
 
@@ -583,6 +586,7 @@ def test_manual_edit_after_precommit_check_is_atomically_preserved(
         expected_stat,
         expected_content,
         *,
+        parent_path,
         before_replace,
     ):
         def check_then_edit() -> None:
@@ -596,6 +600,7 @@ def test_manual_edit_after_precommit_check_is_atomically_preserved(
             content,
             expected_stat,
             expected_content,
+            parent_path=parent_path,
             before_replace=check_then_edit,
         )
 
@@ -631,6 +636,7 @@ def test_metadata_change_after_precommit_check_is_atomically_preserved(
         expected_stat,
         expected_content,
         *,
+        parent_path,
         before_replace,
     ):
         def check_then_broaden() -> None:
@@ -644,6 +650,7 @@ def test_metadata_change_after_precommit_check_is_atomically_preserved(
             content,
             expected_stat,
             expected_content,
+            parent_path=parent_path,
             before_replace=check_then_broaden,
         )
 
@@ -724,6 +731,7 @@ def test_exchange_rollback_failure_retains_fixed_private_transaction_without_dis
         expected_stat,
         expected_content,
         *,
+        parent_path,
         before_replace,
     ):
         def check_then_edit() -> None:
@@ -737,6 +745,7 @@ def test_exchange_rollback_failure_retains_fixed_private_transaction_without_dis
             content,
             expected_stat,
             expected_content,
+            parent_path=parent_path,
             before_replace=check_then_edit,
         )
 
@@ -888,6 +897,212 @@ def test_no_marker_equal_byte_candidate_is_preserved_as_manual_state(
     assert path.read_bytes() == original
 
 
+def test_marker_only_recovery_preserves_equal_byte_manual_candidate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    status, derived_candidate = config_module._classify_ntfy_disclosure(original, path)
+    assert status.expected_revision is not None
+    assert derived_candidate is not None
+    _crash_at_transaction_stage(
+        path,
+        status.expected_revision,
+        "after_marker_durable",
+    )
+    marker, candidate = _transaction_paths(path)
+    assert marker.exists()
+    _write_bytes(candidate, derived_candidate)
+
+    assert ntfy_disclosure_status(path).state == "manual_repair_required"
+    assert candidate.read_bytes() == derived_candidate
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("crash_after_write", [1, 2, 3])
+def test_crash_during_unnamed_candidate_short_write_leaves_no_named_secret(
+    tmp_path: Path, crash_after_write: int
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    child = os.fork()
+    if child == 0:
+        real_write = config_module.os.write
+        candidate_writes = 0
+
+        def short_write_then_crash(fd: int, content) -> int:
+            nonlocal candidate_writes
+            fd_target = os.readlink(f"/proc/self/fd/{fd}")
+            if (
+                os.fstat(fd).st_nlink == 0
+                or fd_target.endswith(".config.toml.ntfy-disclosure-candidate")
+            ):
+                written = real_write(fd, content[:17])
+                candidate_writes += 1
+                if candidate_writes == crash_after_write:
+                    os._exit(86)
+                return written
+            return real_write(fd, content)
+
+        config_module.os.write = short_write_then_crash
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+
+    marker, candidate = _transaction_paths(path)
+    assert not candidate.exists()
+    assert path.read_bytes() == original
+    assert ntfy_disclosure_status(path).state == "acknowledgement_required"
+    assert not marker.exists()
+
+
+def test_crash_after_candidate_inode_is_marked_but_before_link_recovers(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+
+    _crash_at_transaction_stage(
+        path,
+        revision,
+        "after_candidate_marker_durable",
+    )
+
+    marker, candidate = _transaction_paths(path)
+    assert marker.exists()
+    assert not candidate.exists()
+    assert ntfy_disclosure_status(path).state == "acknowledgement_required"
+    assert path.read_bytes() == original
+    assert not marker.exists()
+
+
+def test_fixed_candidate_collision_at_link_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    _marker, candidate = _transaction_paths(path)
+    manual = b"manual fixed-name collision"
+
+    def create_collision(stage: str) -> None:
+        if stage == "before_candidate_link":
+            _write_bytes(candidate, manual)
+
+    monkeypatch.setattr(config_module, "_transaction_probe", create_collision)
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert path.read_bytes() == original
+    assert candidate.read_bytes() == manual
+    assert ntfy_disclosure_status(path).state == "manual_repair_required"
+
+
+@pytest.mark.parametrize(
+    ("primitive", "error_number"),
+    [
+        ("_open_unnamed_candidate_at", errno.EOPNOTSUPP),
+        ("_link_unnamed_candidate_at", errno.ENOSYS),
+    ],
+)
+def test_unnamed_candidate_primitive_unsupported_is_stable_manual_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primitive: str,
+    error_number: int,
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+
+    def unsupported(*_args, **_kwargs):
+        raise OSError(error_number, "injected unsupported primitive")
+
+    monkeypatch.setattr(config_module, primitive, unsupported, raising=False)
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert path.read_bytes() == original
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+    assert _unsupported_path(path).exists()
+    assert ntfy_disclosure_status(path).state == "manual_repair_required"
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "before_marker_create",
+        "before_marker_directory_fsync",
+        "before_candidate_link",
+        "before_candidate_directory_fsync",
+        "before_exchange",
+    ],
+)
+def test_parent_path_replacement_stops_each_transaction_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    parent = tmp_path / "config-parent"
+    path = parent / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    displaced = tmp_path / "displaced-parent"
+    replaced = False
+
+    def replace_parent(observed: str) -> None:
+        nonlocal replaced
+        if observed != stage or replaced:
+            return
+        replaced = True
+        parent.rename(displaced)
+        parent.mkdir(mode=0o700)
+        _write_bytes(path, original)
+
+    monkeypatch.setattr(config_module, "_transaction_probe", replace_parent)
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert replaced is True
+    assert response["ok"] is False
+    assert path.read_bytes() == original
+    assert (displaced / path.name).read_bytes() == original
+    assert not any(displaced.glob(".config.toml.ntfy-disclosure-*"))
+
+
 @pytest.mark.parametrize(
     "stage",
     [
@@ -917,10 +1132,10 @@ def test_parent_mode_is_revalidated_before_each_transaction_mutation(
         "marker_write": "before_marker_write",
         "marker_fsync": "before_marker_fsync",
         "marker_directory_fsync": "before_marker_directory_fsync",
-        "candidate": "before_candidate_create",
-        "candidate_fchmod": "before_candidate_fchmod",
-        "candidate_write": "before_candidate_write",
-        "candidate_fsync": "before_candidate_fsync",
+        "candidate": "before_unnamed_candidate_create",
+        "candidate_fchmod": "before_unnamed_candidate_fchmod",
+        "candidate_write": "before_unnamed_candidate_write",
+        "candidate_fsync": "before_unnamed_candidate_fsync",
         "candidate_directory_fsync": "before_candidate_directory_fsync",
         "exchange": "before_exchange",
     }
@@ -985,7 +1200,7 @@ def test_unsupported_filesystem_persists_stable_manual_status(
     assert path.read_bytes() == original
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
     marker, candidate = _transaction_paths(path)
-    assert marker.exists()
+    assert not marker.exists()
     assert not candidate.exists()
     assert _unsupported_path(path).exists()
 
@@ -1024,7 +1239,54 @@ def test_restart_recovers_crash_after_unsupported_marker_is_durable(
     assert path.read_bytes() == original
     assert ntfy_disclosure_status(path).state == "manual_repair_required"
     marker, candidate = _transaction_paths(path)
-    assert marker.exists()
+    assert not marker.exists()
+    assert not candidate.exists()
+    assert _unsupported_path(path).exists()
+
+
+def test_unsupported_recovery_preserves_manual_target_and_cleans_exact_candidate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    child = os.fork()
+    if child == 0:
+        def unsupported_exchange(*_args) -> None:
+            raise OSError(errno.EOPNOTSUPP, "injected unsupported filesystem")
+
+        def crash_probe(observed: str) -> None:
+            if observed == "after_unsupported_marker_durable":
+                os._exit(86)
+
+        config_module._rename_exchange_at = unsupported_exchange
+        config_module._transaction_probe = crash_probe
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+
+    manual = _config_bytes(
+        acknowledgement="ntfy_content_disclosure_acknowledged = true",
+        extra="# manual replacement after unsupported result",
+    )
+    replacement = path.parent / "manual.toml"
+    _write_bytes(replacement, manual)
+    os.replace(replacement, path)
+
+    assert ntfy_disclosure_status(path).state == "manual_repair_required"
+    assert path.read_bytes() == manual
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
     assert not candidate.exists()
     assert _unsupported_path(path).exists()
 
@@ -1043,11 +1305,14 @@ def test_marker_is_private_durable_and_precedes_candidate(
             return
         marker, candidate = _transaction_paths(path)
         marker_stat = marker.stat()
+        marker_payload = json.loads(marker.read_bytes())
         observed.update(
             regular=stat.S_ISREG(marker_stat.st_mode),
             mode=stat.S_IMODE(marker_stat.st_mode),
             owner=marker_stat.st_uid,
             candidate_exists=candidate.exists(),
+            candidate_inode=marker_payload["candidate"]["inode"],
+            marker_contains_topic=TOPIC.encode() in marker.read_bytes(),
         )
 
     monkeypatch.setattr(config_module, "_transaction_probe", inspect_marker)
@@ -1061,18 +1326,20 @@ def test_marker_is_private_durable_and_precedes_candidate(
     )
 
     assert response["ok"] is True
-    assert observed == {
-        "regular": True,
-        "mode": 0o600,
-        "owner": os.geteuid(),
-        "candidate_exists": False,
-    }
+    assert observed["regular"] is True
+    assert observed["mode"] == 0o600
+    assert observed["owner"] == os.geteuid()
+    assert observed["candidate_exists"] is False
+    assert isinstance(observed["candidate_inode"], int)
+    assert observed["candidate_inode"] > 0
+    assert observed["marker_contains_topic"] is False
 
 
 @pytest.mark.parametrize(
     ("stage", "expected_state"),
     [
         ("after_marker_durable", "acknowledgement_required"),
+        ("after_candidate_link", "acknowledgement_required"),
         ("after_candidate_durable", "acknowledgement_required"),
         ("after_exchange", "normal_admission"),
     ],
