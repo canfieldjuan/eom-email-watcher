@@ -211,10 +211,12 @@ The acknowledgement is one config-wide transaction:
 1. Resolve the config path exactly as the existing engine does, then hold the
    safe parent directory descriptor and open the config without following
    links as specified above.
-2. Acquire the existing cross-process config lock at `<config_path>.lock`.
-   Every config writer must continue to use that same lock namespace; existing
-   sender and settings mutations already do so
-   (`src/eom_email_watcher/config.py:497-515,519-538,596-611`).
+2. Acquire the canonical owner-private cross-process config lock in Email
+   Watcher's runtime state directory. systemd uses its validated absolute
+   `STATE_DIRECTORY`; interactive processes use
+   `$XDG_STATE_HOME/eom-email-watcher`, with the existing
+   `~/.local/state/eom-email-watcher` fallback. Every config reader and writer
+   uses that same lock namespace.
 3. Under the lock, read the exact original bytes, compare the revision, recheck
    path identity and the repairable shape, perform the one allowed byte edit,
    and run the full hypothetical document through the shared normal validator.
@@ -263,10 +265,12 @@ The acknowledgement is one config-wide transaction:
    transaction marker, leave the config unchanged, and make later status calls
    stable `manual_repair_required`.
 
-Ordinary settings and watchlist writes keep their platform-specific atomic
-replacement path. Disclosure acknowledgement uses the stronger exchange and
-recovery protocol because it must prove compare-and-swap disposition of both
-the new config and displaced secret-bearing original.
+On POSIX, ordinary settings and watchlist writes use this same exchange and
+recovery protocol so the final destination rename cannot erase a concurrent
+manual replacement. The marker, disposition, and linked candidate remain on
+the exact config filesystem because their atomic exchange and directory
+durability depend on that shared filesystem. Windows retains its native
+held-source atomic replacement path.
 
 Every normal runtime config load is also a transaction recovery boundary. The
 public `load_config` path acquires the same config lock, safely opens the held
