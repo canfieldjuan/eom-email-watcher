@@ -15,7 +15,21 @@ type MailboxMutationHarness = {
   observe: (revision: unknown) => boolean;
   observeError: (error: unknown) => boolean;
   accepts: (event: { mailbox_operation_revision?: number }) => boolean;
-  snapshot: () => { inFlight: boolean; ready: boolean; revision: number; active: number };
+  scope: () => { mutation_epoch: number; mailbox_operation_revision: number } | null;
+  requestIsCurrent: (
+    requestGeneration: number,
+    currentGeneration: number,
+    scope: { mutation_epoch: number; mailbox_operation_revision: number } | null,
+  ) => boolean;
+  snapshot: () => {
+    inFlight: boolean;
+    ready: boolean;
+    revision: number;
+    active: number;
+    mutationEpoch: number;
+    healthGeneration: number;
+    inboxGeneration: number;
+  };
 };
 
 function mailboxMutationHarness(): MailboxMutationHarness {
@@ -36,23 +50,46 @@ function mailboxMutationHarness(): MailboxMutationHarness {
       /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/,
       "function observeMailboxOperationRevisionFromError(error)",
     )
+    .replace(
+      /function currentMailboxEffectScope\(\): MailboxEffectScope \| null/,
+      "function currentMailboxEffectScope()",
+    )
+    .replace(
+      /function mailboxEffectScopeIsCurrent\(scope: MailboxEffectScope \| null\): boolean/,
+      "function mailboxEffectScopeIsCurrent(scope)",
+    )
+    .replace(
+      /function mailboxEffectRequestIsCurrent\(\s*requestGeneration: number,\s*currentGeneration: number,\s*scope: MailboxEffectScope \| null,\s*\): boolean/,
+      "function mailboxEffectRequestIsCurrent(requestGeneration, currentGeneration, scope)",
+    )
     .replace(/\(error as \{ mailbox_operation_revision\?: unknown \}\)/g, "error")
     .replace(
       /async function runMailAccountMutation<T extends \{ mailbox_operation_revision: number \}>\(\s*operation: \(\) => Promise<T>,\s*\): Promise<T>/,
       "async function runMailAccountMutation(operation)",
     );
   return Function(
-    `let mailboxOperationRevision = 0;${executable}
+    `let healthRequestGeneration = 0;
+     let inboxRequestGeneration = 0;
+     let checkSupported = true;
+     const checkNow = { disabled: false };
+     function inboxMutationInFlight() { return false; }
+     function setInboxControlsBusy(_busy) {}
+     let mailboxOperationRevision = 0;${executable}
      return {
        run: runMailAccountMutation,
        observe: observeMailboxOperationRevision,
        observeError: observeMailboxOperationRevisionFromError,
        accepts: scheduledCheckEventIsCurrent,
+       scope: currentMailboxEffectScope,
+       requestIsCurrent: mailboxEffectRequestIsCurrent,
        snapshot: () => ({
          inFlight: mailOperationInFlight,
          ready: mailboxOperationRevisionReady,
          revision: mailboxOperationRevision,
          active: mailAccountMutationsInFlight,
+         mutationEpoch: mailAccountMutationEpoch,
+         healthGeneration: healthRequestGeneration,
+         inboxGeneration: inboxRequestGeneration,
        }),
      };`,
   )() as MailboxMutationHarness;
@@ -291,7 +328,7 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
   assert.ok(listener);
   assert.ok(
     listener[1].indexOf("scheduledCheckEventIsCurrent(event.payload)") <
-      listener[1].indexOf("loadInbox()"),
+      listener[1].indexOf("loadInbox(false, effectScope)"),
   );
   assert.match(listener[1], /if \(!configurationReady/);
   assert.match(
@@ -345,6 +382,9 @@ test("scheduled success and error stay inert until a stamped failed mutation set
     ready: true,
     revision: 1,
     active: 0,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
   });
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
   assert.equal(guidance, "Gmail authorization was rejected");
@@ -366,6 +406,136 @@ test("scheduled events resume at the successful mutation revision", async () => 
   assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
 });
 
+test("accepted scheduled inbox and health effects are invalidated across overlapping mutations", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const acceptedScope = harness.scope();
+  assert.deepEqual(acceptedScope, {
+    mutation_epoch: 0,
+    mailbox_operation_revision: 0,
+  });
+  const requestGeneration = harness.snapshot();
+  const staleSuccess = deferred<{ mailbox_operation_revision: number }>();
+  const staleFailure = deferred<{ mailbox_operation_revision: number }>();
+  const firstMutation = harness.run(() => staleSuccess.promise);
+  const overlappingMutation = harness.run(() => staleFailure.promise);
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: true,
+    ready: true,
+    revision: 0,
+    active: 2,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
+  });
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+
+  let healthMessage = "Authorizing account";
+  let inboxState = "mutation owns loading state";
+  let inboxBusy = true;
+  if (
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    )
+  ) {
+    healthMessage = "stale scheduled success";
+  }
+  if (
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    )
+  ) {
+    inboxState = "stale scheduled failure";
+    inboxBusy = false;
+  }
+  assert.equal(healthMessage, "Authorizing account");
+  assert.equal(inboxState, "mutation owns loading state");
+  assert.equal(inboxBusy, true);
+
+  staleSuccess.resolve({ mailbox_operation_revision: 1 });
+  await firstMutation;
+  assert.equal(harness.snapshot().inFlight, true);
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+
+  staleFailure.reject({
+    code: "gmail_authorization_rejected",
+    mailbox_operation_revision: 2,
+  });
+  await assert.rejects(overlappingMutation);
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.snapshot().revision, 2);
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+});
+
+test("scheduled inbox and health consumers retain their effect scope through cleanup", () => {
+  const inbox = source.match(
+    /async function loadInbox\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function refreshLoadedInboxSpan/,
+  );
+  assert.ok(inbox);
+  assert.match(inbox[1], /mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)/);
+  assert.ok(
+    inbox[1].lastIndexOf(
+      "mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)",
+    ) > inbox[1].lastIndexOf("await loadAttachmentCapabilities"),
+  );
+  assert.match(
+    inbox[1],
+    /if \(mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) \{\s*setInboxControlsBusy\(false\);\s*\}/,
+  );
+
+  const health = source.match(
+    /async function loadHealth\([\s\S]*?effectScope: MailboxEffectScope \| null = null,[\s\S]*?\): Promise<boolean> \{([\s\S]*?)\n\}\n\nfunction recoveryStatusMessage/,
+  );
+  assert.ok(health);
+  assert.ok(
+    health[1].match(
+      /mailboxEffectRequestIsCurrent\(\s*requestGeneration,\s*healthRequestGeneration,\s*effectScope,?\s*\)/g,
+    )?.length === 2,
+  );
+
+  const listener = source.match(
+    /listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(listener);
+  assert.match(listener[1], /const effectScope = currentMailboxEffectScope\(\)/);
+  assert.match(listener[1], /loadInbox\(false, effectScope\)/);
+  assert.match(listener[1], /loadHealth\([\s\S]*?effectScope\)/);
+});
+
 test("overlapping account mutations keep the scheduled-event gate closed", async () => {
   const harness = mailboxMutationHarness();
   harness.observe(0);
@@ -382,6 +552,9 @@ test("overlapping account mutations keep the scheduled-event gate closed", async
     ready: true,
     revision: 2,
     active: 1,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
   });
   assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
 
@@ -410,6 +583,9 @@ test("synchronous and legacy mutation errors fail closed without stranding the g
     ready: false,
     revision: 0,
     active: 0,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
   });
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
   harness.observe(0);
@@ -422,6 +598,88 @@ test("startup rejects scheduled events until even an empty account catalog seeds
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
   harness.observe(0);
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+});
+
+function configuredDesktopStartupHarness() {
+  const match = source.match(
+    /async function startConfiguredDesktop\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function initializeDesktop/,
+  );
+  assert.ok(match);
+  let resolveAccounts!: (loaded: boolean) => void;
+  const accounts = new Promise<boolean>((resolve) => {
+    resolveAccounts = resolve;
+  });
+  return {
+    ...Function(
+      "loadMailAccounts",
+      `let configurationReady = false;
+       const calls = [];
+       const configInitializeForm = { hidden: false };
+       const settingsForm = { hidden: true };
+       function setConfiguredNavigation(enabled) { calls.push(["navigation", enabled]); }
+       function loadInbox() { calls.push(["inbox"]); }
+       function loadHealth() { calls.push(["health"]); }
+       function loadAutostart() { calls.push(["autostart"]); }
+       function loadSenders() { calls.push(["senders"]); return Promise.resolve(true); }
+       function finishOperation() { calls.push(["finish"]); }
+       async function startConfiguredDesktop() {${match[1]}\n}
+       return {
+         start: startConfiguredDesktop,
+         snapshot: () => ({ calls: structuredClone(calls), ready: configurationReady }),
+       };`,
+    )(() => accounts),
+    resolveAccounts,
+  } as {
+    start: () => Promise<void>;
+    snapshot: () => { calls: unknown[][]; ready: boolean };
+    resolveAccounts: (loaded: boolean) => void;
+  };
+}
+
+test("startup seeds stamped accounts before health and inbox work", async () => {
+  const startup = configuredDesktopStartupHarness();
+  const started = startup.start();
+  assert.deepEqual(startup.snapshot(), {
+    calls: [],
+    ready: false,
+  });
+
+  startup.resolveAccounts(true);
+  await started;
+  assert.equal(startup.snapshot().ready, true);
+  assert.deepEqual(startup.snapshot().calls.slice(0, 5), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+    ["autostart"],
+    ["senders"],
+  ]);
+});
+
+test("startup failure stays fail closed and a restarted no-account desktop reseeds", async () => {
+  const failed = configuredDesktopStartupHarness();
+  const failedStart = failed.start();
+  failed.resolveAccounts(false);
+  await failedStart;
+  assert.equal(failed.snapshot().ready, false);
+  assert.deepEqual(failed.snapshot().calls, []);
+
+  const restartedNoAccount = configuredDesktopStartupHarness();
+  const restarted = restartedNoAccount.start();
+  assert.equal(restartedNoAccount.snapshot().ready, false);
+  restartedNoAccount.resolveAccounts(true);
+  await restarted;
+  assert.equal(restartedNoAccount.snapshot().ready, true);
+  assert.deepEqual(restartedNoAccount.snapshot().calls.slice(0, 3), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+  ]);
+  assert.ok(restartedNoAccount.snapshot().calls.some(([operation]) => operation === "inbox"));
+  assert.match(
+    source,
+    /observeMailboxOperationRevision\(accounts\.mailbox_operation_revision\);[\s\S]*renderMailAccounts\(accounts\)/,
+  );
 });
 
 test("label admission contract publishes exact Gmail authorization retry semantics", () => {
@@ -737,7 +995,7 @@ test("health captures sender version and preserves health request generation ord
   );
   const invokeHealth = loadHealthSource[1].indexOf('await invoke<HealthStatus>("health_get")');
   const generationGuard = loadHealthSource[1].indexOf(
-    "if (requestGeneration !== healthRequestGeneration) return false",
+    "!mailboxEffectRequestIsCurrent(",
   );
   const render = loadHealthSource[1].indexOf(
     "renderHealth(health, senderObservationVersion)",

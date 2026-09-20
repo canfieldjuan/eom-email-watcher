@@ -430,6 +430,11 @@ interface ScheduledCheckEvent extends GmailRecoveryStatus {
   error_retryable?: boolean;
 }
 
+interface MailboxEffectScope {
+  mutation_epoch: number;
+  mailbox_operation_revision: number;
+}
+
 interface WatcherSettings {
   local_model: {
     editable: boolean;
@@ -927,6 +932,7 @@ let mailboxOperationRevision = 0;
 let mailboxOperationRevisionReady = false;
 let mailOperationInFlight = false;
 let mailAccountMutationsInFlight = 0;
+let mailAccountMutationEpoch = 0;
 
 function observeMailboxOperationRevision(revision: unknown): boolean {
   if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
@@ -946,6 +952,32 @@ function scheduledCheckEventIsCurrent(event: ScheduledCheckEvent): boolean {
   return true;
 }
 
+function currentMailboxEffectScope(): MailboxEffectScope | null {
+  if (mailOperationInFlight || !mailboxOperationRevisionReady) return null;
+  return {
+    mutation_epoch: mailAccountMutationEpoch,
+    mailbox_operation_revision: mailboxOperationRevision,
+  };
+}
+
+function mailboxEffectScopeIsCurrent(scope: MailboxEffectScope | null): boolean {
+  if (scope === null) return true;
+  return (
+    !mailOperationInFlight &&
+    mailboxOperationRevisionReady &&
+    scope.mutation_epoch === mailAccountMutationEpoch &&
+    scope.mailbox_operation_revision === mailboxOperationRevision
+  );
+}
+
+function mailboxEffectRequestIsCurrent(
+  requestGeneration: number,
+  currentGeneration: number,
+  scope: MailboxEffectScope | null,
+): boolean {
+  return requestGeneration === currentGeneration && mailboxEffectScopeIsCurrent(scope);
+}
+
 function observeMailboxOperationRevisionFromError(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("mailbox_operation_revision" in error)) {
     return false;
@@ -958,6 +990,14 @@ function observeMailboxOperationRevisionFromError(error: unknown): boolean {
 async function runMailAccountMutation<T extends { mailbox_operation_revision: number }>(
   operation: () => Promise<T>,
 ): Promise<T> {
+  if (mailAccountMutationsInFlight === 0) {
+    mailAccountMutationEpoch += 1;
+    healthRequestGeneration += 1;
+    inboxRequestGeneration += 1;
+    if (!inboxMutationInFlight()) setInboxControlsBusy(false);
+    checkSupported = false;
+    checkNow.disabled = true;
+  }
   mailAccountMutationsInFlight += 1;
   mailOperationInFlight = true;
   try {
@@ -2233,7 +2273,11 @@ function inboxStatusLabel(): string {
   return `Showing ${count} matching message${count === 1 ? "" : "s"}.${more}${availability}`;
 }
 
-async function loadInbox(append = false): Promise<void> {
+async function loadInbox(
+  append = false,
+  effectScope: MailboxEffectScope | null = null,
+): Promise<void> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return;
   if (inboxMutationInFlight()) return;
   if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
@@ -2245,7 +2289,7 @@ async function loadInbox(append = false): Promise<void> {
       query: { ...activeInboxQuery, cursor },
     });
   } catch (error) {
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     if (!append) {
       inboxNextCursor = null;
       inboxLoadMore.hidden = true;
@@ -2255,7 +2299,7 @@ async function loadInbox(append = false): Promise<void> {
     setInboxControlsBusy(false);
     return;
   }
-  if (generation !== inboxRequestGeneration) return;
+  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
 
   if (!append) {
     attachmentCapabilities.clear();
@@ -2273,7 +2317,7 @@ async function loadInbox(append = false): Promise<void> {
   delete inboxStatus.dataset.kind;
   try {
     const discovery = await loadAttachmentCapabilities(page.items);
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
     }
@@ -2285,12 +2329,14 @@ async function loadInbox(append = false): Promise<void> {
     inboxStatus.textContent = inboxStatusLabel();
     inboxStatus.dataset.kind = "success";
   } catch (error) {
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     renderInbox(inboxItems);
     inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
     inboxStatus.dataset.kind = "warning";
   }
-  if (generation === inboxRequestGeneration) setInboxControlsBusy(false);
+  if (mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
+    setInboxControlsBusy(false);
+  }
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
@@ -3601,7 +3647,9 @@ function renderHealth(health: HealthStatus, senderObservationVersion: number): v
 async function loadHealth(
   message = "Health is up to date.",
   kind: "success" | "error" = "success",
+  effectScope: MailboxEffectScope | null = null,
 ): Promise<boolean> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return false;
   const requestGeneration = ++healthRequestGeneration;
   const senderObservationVersion = gmailLabelSenderCount.observation_version;
   checkSupported = false;
@@ -3609,13 +3657,29 @@ async function loadHealth(
   healthStatus.textContent = "Refreshing health…";
   try {
     const health = await invoke<HealthStatus>("health_get");
-    if (requestGeneration !== healthRequestGeneration) return false;
+    if (
+      !mailboxEffectRequestIsCurrent(
+        requestGeneration,
+        healthRequestGeneration,
+        effectScope,
+      )
+    ) {
+      return false;
+    }
     renderHealth(health, senderObservationVersion);
     healthStatus.textContent = message;
     healthStatus.dataset.kind = kind;
     return true;
   } catch (error) {
-    if (requestGeneration !== healthRequestGeneration) return false;
+    if (
+      !mailboxEffectRequestIsCurrent(
+        requestGeneration,
+        healthRequestGeneration,
+        effectScope,
+      )
+    ) {
+      return false;
+    }
     checkSupported = false;
     checkNow.disabled = true;
     renderHealthUnknown();
@@ -3732,14 +3796,15 @@ function setConfiguredNavigation(enabled: boolean): void {
   healthTab.disabled = !enabled;
 }
 
-function startConfiguredDesktop(): void {
-  configurationReady = true;
-  setConfiguredNavigation(true);
+async function startConfiguredDesktop(): Promise<void> {
+  configurationReady = false;
   configInitializeForm.hidden = true;
   settingsForm.hidden = false;
-  void loadMailAccounts().then((loaded) => {
-    if (loaded) return loadInbox();
-  });
+  const accountsLoaded = await loadMailAccounts();
+  if (!accountsLoaded) return;
+  configurationReady = true;
+  setConfiguredNavigation(true);
+  void loadInbox();
   void loadHealth();
   void loadAutostart();
   void loadSenders().then((loaded) => {
@@ -3754,7 +3819,7 @@ async function initializeDesktop(): Promise<void> {
   try {
     const status = await invoke<ConfigStatus>("config_status");
     if (status.present) {
-      startConfiguredDesktop();
+      await startConfiguredDesktop();
       return;
     }
     initialTimezoneInput.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -3785,7 +3850,7 @@ configInitializeForm.addEventListener("submit", (event) => {
       });
       if (!result.created) throw new Error("Watcher configuration was not created.");
       renderSettings(result.settings);
-      startConfiguredDesktop();
+      await startConfiguredDesktop();
       settingsStatus.textContent =
         "Configuration created. Restart the app once to enable automatic polling.";
       settingsStatus.dataset.kind = "success";
@@ -4125,7 +4190,9 @@ checkNow.addEventListener("click", () => void runCheck());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
 void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
   if (!configurationReady || !scheduledCheckEventIsCurrent(event.payload)) return;
-  void loadInbox();
+  const effectScope = currentMailboxEffectScope();
+  if (effectScope === null) return;
+  void loadInbox(false, effectScope);
   if (!healthView.hidden) {
     const recoveryMessage = recoveryStatusMessage({
       ...event.payload,
@@ -4146,19 +4213,20 @@ void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
         event.payload.recovery_state === "degraded"
           ? "error"
           : "success";
-      void loadHealth(`Automatic check: ${recoveryMessage}${deliveryMessage}`, kind);
+      void loadHealth(`Automatic check: ${recoveryMessage}${deliveryMessage}`, kind, effectScope);
     } else if (inactiveMessage !== null) {
-      void loadHealth(`Automatic check paused: ${inactiveMessage}`, "error");
+      void loadHealth(`Automatic check paused: ${inactiveMessage}`, "error", effectScope);
     } else if (event.payload.status === "complete") {
-      void loadHealth("Automatic check complete.", "success");
+      void loadHealth("Automatic check complete.", "success", effectScope);
     } else if (event.payload.status === "delivery_failed") {
       const count = event.payload.failed_notifications;
       void loadHealth(
         `Automatic check complete, but ${count} notification${count === 1 ? "" : "s"} remain queued.`,
         "error",
+        effectScope,
       );
     } else {
-      void loadHealth(scheduledCheckFailureMessage(event.payload), "error");
+      void loadHealth(scheduledCheckFailureMessage(event.payload), "error", effectScope);
     }
   }
 });
