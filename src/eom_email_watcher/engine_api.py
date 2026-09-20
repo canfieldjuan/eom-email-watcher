@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from connect_automate import connect, entitlement
@@ -5121,6 +5121,27 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
     return {"status": status}
 
 
+def _certificate_expiry_ledger_list(
+    request: dict[str, object],
+) -> dict[str, object]:
+    payload = _payload(request, {"today", "limit"})
+    today = payload.get("today")
+    if not isinstance(today, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", today) is None:
+        raise ApiError("invalid_request", "today must be a valid YYYY-MM-DD date")
+    try:
+        date.fromisoformat(today)
+    except ValueError as exc:
+        raise ApiError("invalid_request", "today must be a valid YYYY-MM-DD date") from exc
+    limit = _bounded_limit(payload, default=100)
+    runtime = _runtime(request)
+    return {
+        "items": runtime.store.list_certificate_expiry_ledger(
+            today=today,
+            limit=limit,
+        )
+    }
+
+
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "analysis.requeue": _analysis_requeue,
     "automation.fire.decide": _automation_fire_decide,
@@ -5142,6 +5163,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.disconnect": _calendar_write_disconnect,
     "calendar.write.status": _calendar_write_status,
     "calendar.automation.decide": _calendar_automation_decide,
+    "certificate.expiry_ledger.list": _certificate_expiry_ledger_list,
     "config.initialize": _config_initialize,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,

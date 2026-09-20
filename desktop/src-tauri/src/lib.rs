@@ -4,11 +4,11 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
-    ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
-    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
-    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
-    MailAccounts, MailServerConnection, WatchedSender,
+    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CertificateExpiryLedger,
+    CheckResult, ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef,
+    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, MailServerConnection, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -282,6 +282,20 @@ async fn inbox_query(
     tauri::async_runtime::spawn_blocking(move || engine.query_inbox(query))
         .await
         .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn certificate_expiry_ledger_list(
+    engine: State<'_, Engine>,
+    today: String,
+    limit: u32,
+) -> Result<CertificateExpiryLedger, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.list_certificate_expiry_ledger(today, limit)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -850,6 +864,7 @@ pub fn run() {
             calendar_consent_disconnect,
             calendar_consent_status,
             calendar_proposal_decide,
+            certificate_expiry_ledger_list,
             capability_output_export,
             capability_output_present,
             connect_entitlement_install,

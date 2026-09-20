@@ -5,12 +5,13 @@ import binascii
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,7 +32,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -91,6 +92,11 @@ AUTOMATION_FIRE_TRANSITIONS = frozenset(
 AUTOMATION_FIRE_MAX_ATTEMPTS = 2
 AUTOMATION_FIRE_PENDING_WINDOW = timedelta(hours=2)
 MAX_AUTOMATION_PREPARED_IDENTITY_BYTES = 32 * 1024
+CERTIFICATE_RESULT_MEDIA_TYPE = "application/vnd.local-connect.certificate+json"
+CERTIFICATE_CAPABILITY_ID = "certificate.extract"
+CERTIFICATE_CAPABILITY_VERSION = "1.0"
+CERTIFICATE_RECORD_VERSION = "1.0"
+MAX_CERTIFICATE_POLICY_ROWS = 100
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -890,6 +896,163 @@ BEGIN
     DELETE FROM automation_calendar_writes WHERE run_id = OLD.run_id;
 END;
 """
+
+_CERTIFICATE_LEDGER_TABLES_SQL = (
+    """CREATE TABLE IF NOT EXISTS automation_fire_source_identities (
+        fire_id TEXT PRIMARY KEY CHECK (length(fire_id) = 36),
+        provider TEXT NOT NULL CHECK (provider <> ''),
+        account_id TEXT NOT NULL CHECK (account_id <> ''),
+        mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        message_id TEXT NOT NULL CHECK (message_id <> ''),
+        part_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TRIGGER IF NOT EXISTS automation_fire_source_identities_immutable
+    BEFORE UPDATE ON automation_fire_source_identities
+    BEGIN
+        SELECT RAISE(ABORT, 'automation fire source identities are immutable');
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS automation_fires_delete_source_identity
+    AFTER DELETE ON automation_fires
+    BEGIN
+        DELETE FROM automation_fire_source_identities WHERE fire_id = OLD.fire_id;
+    END""",
+    """CREATE TABLE IF NOT EXISTS certificate_records (
+        certificate_id TEXT PRIMARY KEY CHECK (length(certificate_id) = 36),
+        provider TEXT NOT NULL CHECK (provider <> ''),
+        account_id TEXT NOT NULL CHECK (account_id <> ''),
+        mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+        ),
+        source_message_id TEXT NOT NULL CHECK (source_message_id <> ''),
+        source_part_id TEXT NOT NULL,
+        connect_job_id TEXT NOT NULL CHECK (length(connect_job_id) = 36),
+        source_display_reference TEXT,
+        result_sha256 TEXT NOT NULL CHECK (
+            length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        canonical_result_json BLOB NOT NULL CHECK (
+            typeof(canonical_result_json) = 'blob'
+            AND length(canonical_result_json) BETWEEN 2 AND 2097152
+        ),
+        certificate_holder TEXT,
+        certificate_holder_provenance_json BLOB,
+        insured TEXT,
+        insured_provenance_json BLOB,
+        producer TEXT,
+        producer_provenance_json BLOB,
+        review_reasons_json BLOB NOT NULL CHECK (
+            typeof(review_reasons_json) = 'blob'
+            AND length(review_reasons_json) BETWEEN 2 AND 8192
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (
+            provider, account_id, mailbox_identity_key,
+            source_message_id, source_part_id, connect_job_id
+        ),
+        CHECK (
+            (certificate_holder IS NULL AND certificate_holder_provenance_json IS NULL)
+            OR (certificate_holder IS NOT NULL
+                AND typeof(certificate_holder_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (insured IS NULL AND insured_provenance_json IS NULL)
+            OR (insured IS NOT NULL AND typeof(insured_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (producer IS NULL AND producer_provenance_json IS NULL)
+            OR (producer IS NOT NULL AND typeof(producer_provenance_json) = 'blob')
+        )
+    )""",
+    """CREATE TABLE IF NOT EXISTS certificate_policy_rows (
+        policy_id TEXT PRIMARY KEY CHECK (length(policy_id) = 36),
+        certificate_id TEXT NOT NULL CHECK (length(certificate_id) = 36),
+        ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 99),
+        coverage TEXT,
+        coverage_provenance_json BLOB,
+        insurer TEXT,
+        insurer_provenance_json BLOB,
+        policy_number TEXT,
+        policy_number_provenance_json BLOB,
+        effective_date_iso TEXT,
+        effective_date_ambiguous INTEGER CHECK (
+            effective_date_ambiguous IS NULL OR effective_date_ambiguous IN (0, 1)
+        ),
+        effective_date_candidates_json BLOB,
+        effective_date_provenance_json BLOB,
+        expiration_date_iso TEXT,
+        expiration_date_ambiguous INTEGER CHECK (
+            expiration_date_ambiguous IS NULL OR expiration_date_ambiguous IN (0, 1)
+        ),
+        expiration_date_candidates_json BLOB,
+        expiration_date_provenance_json BLOB,
+        review_reasons_json BLOB NOT NULL CHECK (
+            typeof(review_reasons_json) = 'blob'
+            AND length(review_reasons_json) BETWEEN 2 AND 8192
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (certificate_id, ordinal),
+        CHECK (
+            (coverage IS NULL AND coverage_provenance_json IS NULL)
+            OR (coverage IS NOT NULL AND typeof(coverage_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (insurer IS NULL AND insurer_provenance_json IS NULL)
+            OR (insurer IS NOT NULL AND typeof(insurer_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (policy_number IS NULL AND policy_number_provenance_json IS NULL)
+            OR (policy_number IS NOT NULL
+                AND typeof(policy_number_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (effective_date_iso IS NULL AND effective_date_ambiguous IS NULL
+                AND effective_date_candidates_json IS NULL
+                AND effective_date_provenance_json IS NULL)
+            OR (effective_date_ambiguous = 0 AND effective_date_iso IS NOT NULL
+                AND typeof(effective_date_candidates_json) = 'blob'
+                AND typeof(effective_date_provenance_json) = 'blob')
+            OR (effective_date_ambiguous = 1 AND effective_date_iso IS NULL
+                AND typeof(effective_date_candidates_json) = 'blob'
+                AND typeof(effective_date_provenance_json) = 'blob')
+        ),
+        CHECK (
+            (expiration_date_iso IS NULL AND expiration_date_ambiguous IS NULL
+                AND expiration_date_candidates_json IS NULL
+                AND expiration_date_provenance_json IS NULL)
+            OR (expiration_date_ambiguous = 0 AND expiration_date_iso IS NOT NULL
+                AND typeof(expiration_date_candidates_json) = 'blob'
+                AND typeof(expiration_date_provenance_json) = 'blob')
+            OR (expiration_date_ambiguous = 1 AND expiration_date_iso IS NULL
+                AND typeof(expiration_date_candidates_json) = 'blob'
+                AND typeof(expiration_date_provenance_json) = 'blob')
+        )
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_certificate_policy_expiration
+    ON certificate_policy_rows(expiration_date_iso, certificate_id, ordinal)""",
+)
+
+
+def _ensure_certificate_ledger_schema(db: sqlite3.Connection) -> None:
+    for statement in _CERTIFICATE_LEDGER_TABLES_SQL:
+        db.execute(statement)
+    db.execute(
+        """INSERT OR IGNORE INTO automation_fire_source_identities(
+            fire_id, provider, account_id, mailbox_identity_key,
+            message_id, part_id, created_at
+        )
+        SELECT fire.fire_id, message.provider, message.account_id,
+            message.mailbox_identity_key, fire.message_id, fire.part_id, fire.created_at
+        FROM automation_fires AS fire
+        JOIN messages AS message ON message.message_id = fire.message_id
+        WHERE message.mailbox_identity_key IS NOT NULL"""
+    )
 
 
 def _microsoft_principal_key_v1(
@@ -1730,6 +1893,734 @@ class ConnectDispatch:
 
 class ConnectQueueFull(RuntimeError):
     pass
+
+
+class CertificateResultInvalid(ValueError):
+    """A completed provider result does not satisfy the certificate record contract."""
+
+
+class CertificateResultConflict(RuntimeError):
+    """A source and Connect job already have a different certificate result."""
+
+
+@dataclass(frozen=True)
+class _ValidatedCertificateResult:
+    record: dict[str, object]
+    canonical_json: bytes
+    sha256: str
+
+
+_CERTIFICATE_TOP_REASONS = (
+    "INSURED_MISSING",
+    "NO_POLICY_ROWS",
+    "POLICY_DATE_REVIEW",
+    "POLICY_ASSOCIATION_UNCLEAR",
+    "CONFLICTING_VALUES",
+)
+_CERTIFICATE_POLICY_REASONS = (
+    "EFFECTIVE_DATE_MISSING",
+    "EFFECTIVE_DATE_AMBIGUOUS",
+    "EXPIRATION_DATE_MISSING",
+    "EXPIRATION_DATE_AMBIGUOUS",
+    "DATE_RANGE_INVALID",
+    "ASSOCIATION_UNCLEAR",
+)
+_CERTIFICATE_DATE_REASONS = frozenset(_CERTIFICATE_POLICY_REASONS[:5])
+_CERTIFICATE_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+_CERTIFICATE_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z"
+)
+
+
+def _certificate_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CertificateResultInvalid("certificate result contains duplicate JSON keys")
+        value[key] = item
+    return value
+
+
+def _certificate_reject_constant(value: str) -> object:
+    raise CertificateResultInvalid(f"certificate result contains invalid JSON constant {value}")
+
+
+def _certificate_canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            separators=(",", ":"),
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise CertificateResultInvalid("certificate result cannot be canonically encoded") from exc
+
+
+def _certificate_object(
+    value: object,
+    *,
+    keys: set[str],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != keys:
+        raise CertificateResultInvalid(f"certificate {label} has invalid members")
+    return value
+
+
+def _certificate_string(value: object, *, label: str, nonempty: bool = True) -> str:
+    if not isinstance(value, str) or (nonempty and not value):
+        raise CertificateResultInvalid(f"certificate {label} is invalid")
+    return value
+
+
+def _certificate_iso_date(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _CERTIFICATE_DATE_RE.fullmatch(value) is None:
+        raise CertificateResultInvalid(f"certificate {label} is not an ISO date")
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        raise CertificateResultInvalid(f"certificate {label} is not a valid date") from exc
+    if parsed.isoformat() != value:
+        raise CertificateResultInvalid(f"certificate {label} is not canonical")
+    return value
+
+
+def _certificate_provenance(value: object, *, label: str) -> dict[str, object]:
+    provenance = _certificate_object(
+        value,
+        keys={"span_id", "page", "bbox", "exact_text", "token_start", "token_end"},
+        label=f"{label} provenance",
+    )
+    _certificate_string(provenance["span_id"], label=f"{label} span id")
+    page = provenance["page"]
+    if type(page) is not int or page < 1:
+        raise CertificateResultInvalid(f"certificate {label} page is invalid")
+    bbox = provenance["bbox"]
+    if type(bbox) is not list or len(bbox) != 4 or any(
+        type(coordinate) not in {int, float} for coordinate in bbox
+    ):
+        raise CertificateResultInvalid(f"certificate {label} coordinates are invalid")
+    try:
+        finite_bbox = all(math.isfinite(float(coordinate)) for coordinate in bbox)
+    except (OverflowError, ValueError):
+        finite_bbox = False
+    if not finite_bbox or bbox[0] > bbox[2] or bbox[1] > bbox[3]:
+        raise CertificateResultInvalid(f"certificate {label} coordinates are invalid")
+    exact_text = _certificate_string(provenance["exact_text"], label=f"{label} source text")
+    token_start = provenance["token_start"]
+    token_end = provenance["token_end"]
+    if (
+        type(token_start) is not int
+        or type(token_end) is not int
+        or token_start < 0
+        or token_end <= token_start
+    ):
+        raise CertificateResultInvalid(f"certificate {label} token range is invalid")
+    if not exact_text:
+        raise CertificateResultInvalid(f"certificate {label} source text is empty")
+    return provenance
+
+
+def _certificate_text_value(value: object, *, label: str) -> dict[str, object] | None:
+    if value is None:
+        return None
+    text_value = _certificate_object(
+        value,
+        keys={"text", "whole_span", "provenance"},
+        label=f"{label} value",
+    )
+    text = _certificate_string(text_value["text"], label=f"{label} text")
+    whole_span = text_value["whole_span"]
+    if type(whole_span) is not bool:
+        raise CertificateResultInvalid(f"certificate {label} whole_span is invalid")
+    provenance = _certificate_provenance(text_value["provenance"], label=label)
+    source_text = str(provenance["exact_text"])
+    if text not in source_text or (whole_span and text != source_text):
+        raise CertificateResultInvalid(f"certificate {label} text does not match its provenance")
+    return text_value
+
+
+def _certificate_date_value(value: object, *, label: str) -> dict[str, object] | None:
+    if value is None:
+        return None
+    date_value = _certificate_object(
+        value,
+        keys={"iso", "ambiguous", "candidates", "provenance"},
+        label=f"{label} value",
+    )
+    iso = date_value["iso"]
+    ambiguous = date_value["ambiguous"]
+    candidates = date_value["candidates"]
+    if type(ambiguous) is not bool or type(candidates) is not list:
+        raise CertificateResultInvalid(f"certificate {label} date state is invalid")
+    parsed_candidates = [
+        _certificate_iso_date(candidate, label=f"{label} candidate") for candidate in candidates
+    ]
+    if len(set(parsed_candidates)) != len(parsed_candidates):
+        raise CertificateResultInvalid(f"certificate {label} candidates are duplicated")
+    if ambiguous:
+        if iso is not None or len(parsed_candidates) < 2:
+            raise CertificateResultInvalid(f"certificate {label} ambiguous date is inconsistent")
+    else:
+        parsed_iso = _certificate_iso_date(iso, label=label)
+        if parsed_candidates != [parsed_iso]:
+            raise CertificateResultInvalid(f"certificate {label} unambiguous date is inconsistent")
+    _certificate_provenance(date_value["provenance"], label=label)
+    return date_value
+
+
+def _certificate_reason_list(value: object, *, allowed: tuple[str, ...], label: str) -> list[str]:
+    if type(value) is not list or any(
+        not isinstance(item, str) or item not in allowed for item in value
+    ):
+        raise CertificateResultInvalid(f"certificate {label} reasons are invalid")
+    reasons = list(value)
+    ordered = [reason for reason in allowed if reason in reasons]
+    if len(set(reasons)) != len(reasons) or reasons != ordered:
+        raise CertificateResultInvalid(f"certificate {label} reasons are not unique and ordered")
+    return reasons
+
+
+def _certificate_policy_review(
+    effective_date: dict[str, object] | None,
+    expiration_date: dict[str, object] | None,
+    reasons: list[str],
+) -> list[str]:
+    expected: set[str] = set()
+    if effective_date is None:
+        expected.add("EFFECTIVE_DATE_MISSING")
+    elif effective_date["ambiguous"] is True:
+        expected.add("EFFECTIVE_DATE_AMBIGUOUS")
+    if expiration_date is None:
+        expected.add("EXPIRATION_DATE_MISSING")
+    elif expiration_date["ambiguous"] is True:
+        expected.add("EXPIRATION_DATE_AMBIGUOUS")
+    if (
+        effective_date is not None
+        and expiration_date is not None
+        and effective_date["iso"] is not None
+        and expiration_date["iso"] is not None
+        and expiration_date["iso"] < effective_date["iso"]
+    ):
+        expected.add("DATE_RANGE_INVALID")
+    if "ASSOCIATION_UNCLEAR" in reasons:
+        expected.add("ASSOCIATION_UNCLEAR")
+    return [reason for reason in _CERTIFICATE_POLICY_REASONS if reason in expected]
+
+
+def _validate_certificate_record(
+    payload: bytes,
+    *,
+    input_sha256: str | None = None,
+    input_byte_size: int | None = None,
+    input_display_name: str | None = None,
+) -> _ValidatedCertificateResult:
+    if not isinstance(payload, bytes) or not 0 < len(payload) <= MAX_CONNECT_OUTPUT_BYTES:
+        raise CertificateResultInvalid("certificate result size is invalid")
+    try:
+        decoded = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_certificate_json_object,
+            parse_constant=_certificate_reject_constant,
+        )
+    except CertificateResultInvalid:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise CertificateResultInvalid("certificate result JSON is invalid") from exc
+    record = _certificate_object(
+        decoded,
+        keys={
+            "record_version",
+            "source",
+            "insured",
+            "certificate_holder",
+            "producer",
+            "policies",
+            "withheld",
+            "review",
+            "extracted_at",
+        },
+        label="record",
+    )
+    if record["record_version"] != CERTIFICATE_RECORD_VERSION:
+        raise CertificateResultInvalid("certificate record version is unsupported")
+
+    source = _certificate_object(
+        record["source"],
+        keys={"sha256", "byte_size", "page_count", "display_name", "parser"},
+        label="source",
+    )
+    source_sha256 = _certificate_string(source["sha256"], label="source digest")
+    if len(source_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in source_sha256
+    ):
+        raise CertificateResultInvalid("certificate source digest is invalid")
+    byte_size = source["byte_size"]
+    page_count = source["page_count"]
+    if type(byte_size) is not int or byte_size < 0 or type(page_count) is not int or page_count < 0:
+        raise CertificateResultInvalid("certificate source dimensions are invalid")
+    display_name = _certificate_string(source["display_name"], label="source display name")
+    parser = _certificate_object(
+        source["parser"],
+        keys={"id", "version", "settings"},
+        label="source parser",
+    )
+    for key in ("id", "version", "settings"):
+        _certificate_string(parser[key], label=f"source parser {key}")
+    if (
+        (input_sha256 is not None and source_sha256 != input_sha256)
+        or (input_byte_size is not None and byte_size != input_byte_size)
+        or (input_display_name is not None and display_name != input_display_name)
+    ):
+        raise CertificateResultInvalid("certificate source does not match its Connect job")
+
+    insured = _certificate_text_value(record["insured"], label="insured")
+    _certificate_text_value(record["certificate_holder"], label="certificate holder")
+    _certificate_text_value(record["producer"], label="producer")
+
+    raw_policies = record["policies"]
+    if type(raw_policies) is not list or len(raw_policies) > MAX_CERTIFICATE_POLICY_ROWS:
+        raise CertificateResultInvalid("certificate policy rows are invalid")
+    policies: list[dict[str, object]] = []
+    policy_keys: set[tuple[tuple[str, str, int, int], ...]] = set()
+    for ordinal, raw_policy in enumerate(raw_policies):
+        policy = _certificate_object(
+            raw_policy,
+            keys={
+                "coverage",
+                "insurer",
+                "policy_number",
+                "effective_date",
+                "expiration_date",
+                "review_reasons",
+            },
+            label=f"policy {ordinal}",
+        )
+        text_fields = {
+            name: _certificate_text_value(policy[name], label=f"policy {ordinal} {name}")
+            for name in ("coverage", "insurer", "policy_number")
+        }
+        dates = {
+            name: _certificate_date_value(policy[name], label=f"policy {ordinal} {name}")
+            for name in ("effective_date", "expiration_date")
+        }
+        if all(value is None for value in (*text_fields.values(), *dates.values())):
+            raise CertificateResultInvalid("certificate policy row contains no extracted field")
+        reasons = _certificate_reason_list(
+            policy["review_reasons"],
+            allowed=_CERTIFICATE_POLICY_REASONS,
+            label=f"policy {ordinal}",
+        )
+        expected_reasons = _certificate_policy_review(
+            dates["effective_date"], dates["expiration_date"], reasons
+        )
+        if reasons != expected_reasons:
+            raise CertificateResultInvalid("certificate policy review reasons contradict its dates")
+        policy_key: list[tuple[str, str, int, int]] = []
+        for name in (
+            "coverage",
+            "insurer",
+            "policy_number",
+            "effective_date",
+            "expiration_date",
+        ):
+            item = text_fields[name] if name in text_fields else dates[name]
+            if item is None:
+                continue
+            provenance = item["provenance"]
+            policy_key.append(
+                (
+                    name,
+                    str(provenance["span_id"]),
+                    int(provenance["token_start"]),
+                    int(provenance["token_end"]),
+                )
+            )
+        canonical_key = tuple(policy_key)
+        if canonical_key in policy_keys:
+            raise CertificateResultInvalid("certificate policy rows contain a duplicate row")
+        policy_keys.add(canonical_key)
+        policies.append(policy)
+
+    withheld = record["withheld"]
+    if type(withheld) is not list:
+        raise CertificateResultInvalid("certificate withheld values are invalid")
+    for ordinal, item in enumerate(withheld):
+        withheld_item = _certificate_object(
+            item,
+            keys={"field", "reason", "detail"},
+            label=f"withheld item {ordinal}",
+        )
+        for key in ("field", "reason", "detail"):
+            _certificate_string(withheld_item[key], label=f"withheld {key}")
+
+    review = _certificate_object(
+        record["review"],
+        keys={"required", "reasons"},
+        label="review",
+    )
+    top_reasons = _certificate_reason_list(
+        review["reasons"], allowed=_CERTIFICATE_TOP_REASONS, label="top-level"
+    )
+    if type(review["required"]) is not bool:
+        raise CertificateResultInvalid("certificate review flag is invalid")
+    date_review = any(
+        _CERTIFICATE_DATE_REASONS.intersection(
+            policy["review_reasons"]  # type: ignore[arg-type]
+        )
+        for policy in policies
+    )
+    association_review = any(
+        "ASSOCIATION_UNCLEAR" in policy["review_reasons"] for policy in policies
+    ) or any(item["reason"] == "POLICY_ASSOCIATION_UNCLEAR" for item in withheld)
+    conflicting_values = any(item["reason"] == "CONFLICTING_VALUES" for item in withheld)
+    expected_top_reasons: set[str] = set()
+    if insured is None:
+        expected_top_reasons.add("INSURED_MISSING")
+    if not policies:
+        expected_top_reasons.add("NO_POLICY_ROWS")
+    if date_review:
+        expected_top_reasons.add("POLICY_DATE_REVIEW")
+    if association_review:
+        expected_top_reasons.add("POLICY_ASSOCIATION_UNCLEAR")
+    if conflicting_values:
+        expected_top_reasons.add("CONFLICTING_VALUES")
+    expected_top_order = [
+        reason for reason in _CERTIFICATE_TOP_REASONS if reason in expected_top_reasons
+    ]
+    if top_reasons != expected_top_order or review["required"] is not bool(top_reasons):
+        raise CertificateResultInvalid("certificate review contradicts the extracted record")
+
+    extracted_at = _certificate_string(record["extracted_at"], label="extracted_at")
+    if _CERTIFICATE_TIMESTAMP_RE.fullmatch(extracted_at) is None:
+        raise CertificateResultInvalid("certificate extracted_at is not UTC RFC 3339")
+    try:
+        timestamp = datetime.fromisoformat(extracted_at[:-1] + "+00:00")
+    except ValueError as exc:
+        raise CertificateResultInvalid("certificate extracted_at is invalid") from exc
+    if timestamp.utcoffset() != UTC.utcoffset(timestamp):
+        raise CertificateResultInvalid("certificate extracted_at is not UTC")
+
+    canonical_json = _certificate_canonical_json(record)
+    if len(canonical_json) > MAX_CONNECT_OUTPUT_BYTES:
+        raise CertificateResultInvalid("canonical certificate result is too large")
+    return _ValidatedCertificateResult(
+        record=record,
+        canonical_json=canonical_json,
+        sha256=hashlib.sha256(canonical_json).hexdigest(),
+    )
+
+
+def validate_certificate_result_json(
+    payload: bytes,
+    *,
+    input_sha256: str | None = None,
+    input_byte_size: int | None = None,
+    input_display_name: str | None = None,
+) -> tuple[dict[str, object], bytes, str]:
+    """Validate and canonicalize a provider-owned certificate.extract v1.0 result."""
+    result = _validate_certificate_record(
+        payload,
+        input_sha256=input_sha256,
+        input_byte_size=input_byte_size,
+        input_display_name=input_display_name,
+    )
+    return result.record, result.canonical_json, result.sha256
+
+
+def _certificate_json_bytes(value: object) -> bytes:
+    return _certificate_canonical_json(value)
+
+
+def _certificate_party_projection(
+    value: dict[str, object] | None,
+) -> tuple[str | None, bytes | None]:
+    if value is None:
+        return None, None
+    return str(value["text"]), _certificate_json_bytes(value["provenance"])
+
+
+def _certificate_date_projection(
+    value: dict[str, object] | None,
+) -> tuple[str | None, int | None, bytes | None, bytes | None]:
+    if value is None:
+        return None, None, None, None
+    return (
+        str(value["iso"]) if value["iso"] is not None else None,
+        int(bool(value["ambiguous"])),
+        _certificate_json_bytes(value["candidates"]),
+        _certificate_json_bytes(value["provenance"]),
+    )
+
+
+def _certificate_parent_projection(
+    record: dict[str, object],
+) -> dict[str, object]:
+    holder, holder_provenance = _certificate_party_projection(record["certificate_holder"])
+    insured, insured_provenance = _certificate_party_projection(record["insured"])
+    producer, producer_provenance = _certificate_party_projection(record["producer"])
+    review = record["review"]
+    assert isinstance(review, dict)
+    return {
+        "certificate_holder": holder,
+        "certificate_holder_provenance_json": holder_provenance,
+        "insured": insured,
+        "insured_provenance_json": insured_provenance,
+        "producer": producer,
+        "producer_provenance_json": producer_provenance,
+        "review_reasons_json": _certificate_json_bytes(review["reasons"]),
+    }
+
+
+def _certificate_child_projection(policy: dict[str, object]) -> dict[str, object]:
+    row: dict[str, object] = {}
+    for name in ("coverage", "insurer", "policy_number"):
+        value = policy[name]
+        if value is None:
+            row[name] = None
+            row[f"{name}_provenance_json"] = None
+        else:
+            assert isinstance(value, dict)
+            row[name] = value["text"]
+            row[f"{name}_provenance_json"] = _certificate_json_bytes(value["provenance"])
+    for name in ("effective_date", "expiration_date"):
+        value = policy[name]
+        iso, ambiguous, candidates, provenance = _certificate_date_projection(value)
+        row[f"{name}_iso"] = iso
+        row[f"{name}_ambiguous"] = ambiguous
+        row[f"{name}_candidates_json"] = candidates
+        row[f"{name}_provenance_json"] = provenance
+    row["review_reasons_json"] = _certificate_json_bytes(policy["review_reasons"])
+    return row
+
+
+def _certificate_assert_projection(
+    db: sqlite3.Connection,
+    parent: sqlite3.Row,
+    record: dict[str, object],
+) -> None:
+    for column, expected in _certificate_parent_projection(record).items():
+        if parent[column] != expected:
+            raise RuntimeError("Stored certificate parent projection is inconsistent")
+    expected_rows = [_certificate_child_projection(policy) for policy in record["policies"]]
+    stored_rows = db.execute(
+        "SELECT * FROM certificate_policy_rows WHERE certificate_id = ? ORDER BY ordinal",
+        (parent["certificate_id"],),
+    ).fetchall()
+    if len(stored_rows) != len(expected_rows):
+        raise RuntimeError("Stored certificate policy projection is incomplete")
+    for ordinal, (stored, expected) in enumerate(zip(stored_rows, expected_rows, strict=True)):
+        if int(stored["ordinal"]) != ordinal or any(
+            stored[key] != value for key, value in expected.items()
+        ):
+            raise RuntimeError("Stored certificate policy projection is inconsistent")
+
+
+def _certificate_source_for_job(
+    db: sqlite3.Connection,
+    job: ConnectJob,
+) -> tuple[dict[str, str], str | None]:
+    fire_rows = db.execute(
+        "SELECT * FROM automation_fires WHERE job_id = ? ORDER BY fire_id", (job.job_id,)
+    ).fetchall()
+    if len(fire_rows) > 1:
+        raise CertificateResultInvalid("certificate job is linked to multiple automation fires")
+    fire_id: str | None = None
+    if fire_rows:
+        fire = fire_rows[0]
+        fire_id = str(fire["fire_id"])
+        if (
+            fire["action_kind"] != "connect.invoke"
+            or fire["message_id"] != job.message_id
+            or fire["part_id"] != job.part_id
+            or fire["state"] not in {"submitted", "entitlement_paused"}
+        ):
+            raise CertificateResultInvalid("certificate job and automation fire binding disagree")
+        attempt = db.execute(
+            """SELECT dispatch_request_id, job_id FROM automation_fire_attempts
+            WHERE fire_id = ? AND attempt_no = ?""",
+            (fire_id, fire["current_attempt_no"]),
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["dispatch_request_id"] != job.job_id
+            or attempt["job_id"] != job.job_id
+        ):
+            raise CertificateResultInvalid(
+                "certificate job and automation attempt binding disagree"
+            )
+        identity = db.execute(
+            "SELECT * FROM automation_fire_source_identities WHERE fire_id = ?", (fire_id,)
+        ).fetchone()
+    else:
+        identity = None
+
+    live_source = db.execute(
+        """SELECT message.provider, message.account_id, message.mailbox_identity_key,
+            EXISTS (
+                SELECT 1 FROM message_attachments AS attachment
+                WHERE attachment.message_id = message.message_id AND attachment.part_id = ?
+            ) AS attachment_available
+        FROM messages AS message WHERE message.message_id = ?""",
+        (job.part_id, job.message_id),
+    ).fetchone()
+    if identity is None:
+        if live_source is None or not bool(live_source["attachment_available"]):
+            raise CertificateResultInvalid("certificate source identity is unavailable")
+        source = {
+            "provider": str(live_source["provider"]),
+            "account_id": str(live_source["account_id"]),
+            "mailbox_identity_key": str(live_source["mailbox_identity_key"]),
+        }
+        if fire_id is not None:
+            if not source["mailbox_identity_key"]:
+                raise CertificateResultInvalid("certificate source mailbox identity is unavailable")
+            db.execute(
+                """INSERT INTO automation_fire_source_identities(
+                    fire_id, provider, account_id, mailbox_identity_key,
+                    message_id, part_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fire_id,
+                    source["provider"],
+                    source["account_id"],
+                    source["mailbox_identity_key"],
+                    job.message_id,
+                    job.part_id,
+                    str(fire_rows[0]["created_at"]),
+                ),
+            )
+    else:
+        source = {
+            "provider": str(identity["provider"]),
+            "account_id": str(identity["account_id"]),
+            "mailbox_identity_key": str(identity["mailbox_identity_key"]),
+        }
+        if identity["message_id"] != job.message_id or identity["part_id"] != job.part_id:
+            raise CertificateResultInvalid("certificate source identity and job binding disagree")
+        if live_source is not None and (
+            not bool(live_source["attachment_available"])
+            or live_source["provider"] != source["provider"]
+            or live_source["account_id"] != source["account_id"]
+            or live_source["mailbox_identity_key"] != source["mailbox_identity_key"]
+        ):
+            raise CertificateResultInvalid("certificate retained source identity changed")
+    mailbox_key = source["mailbox_identity_key"]
+    if (
+        len(mailbox_key) != 64
+        or any(character not in "0123456789abcdef" for character in mailbox_key)
+    ):
+        raise CertificateResultInvalid("certificate source mailbox identity is invalid")
+    return source, fire_id
+
+
+def _persist_certificate_projection(
+    db: sqlite3.Connection,
+    *,
+    job: ConnectJob,
+    result: _ValidatedCertificateResult,
+    stamp: str,
+) -> tuple[str, str | None]:
+    source, fire_id = _certificate_source_for_job(db, job)
+    source_tuple = (
+        source["provider"],
+        source["account_id"],
+        source["mailbox_identity_key"],
+        job.message_id,
+        job.part_id,
+        job.job_id,
+    )
+    existing = db.execute(
+        """SELECT * FROM certificate_records WHERE provider = ? AND account_id = ?
+            AND mailbox_identity_key = ? AND source_message_id = ? AND source_part_id = ?
+            AND connect_job_id = ?""",
+        source_tuple,
+    ).fetchone()
+    if existing is not None:
+        if (
+            existing["result_sha256"] != result.sha256
+            or bytes(existing["canonical_result_json"]) != result.canonical_json
+        ):
+            raise CertificateResultConflict(
+                "certificate result digest conflicts with prior evidence"
+            )
+        _certificate_assert_projection(db, existing, result.record)
+        return str(existing["certificate_id"]), fire_id
+
+    certificate_id = str(uuid.uuid4())
+    parent = _certificate_parent_projection(result.record)
+    db.execute(
+        """INSERT INTO certificate_records(
+            certificate_id, provider, account_id, mailbox_identity_key,
+            source_message_id, source_part_id, connect_job_id, source_display_reference,
+            result_sha256, canonical_result_json, certificate_holder,
+            certificate_holder_provenance_json, insured, insured_provenance_json,
+            producer, producer_provenance_json, review_reasons_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            certificate_id,
+            *source_tuple[:3],
+            job.message_id,
+            job.part_id,
+            job.job_id,
+            job.input_display_name,
+            result.sha256,
+            result.canonical_json,
+            parent["certificate_holder"],
+            parent["certificate_holder_provenance_json"],
+            parent["insured"],
+            parent["insured_provenance_json"],
+            parent["producer"],
+            parent["producer_provenance_json"],
+            parent["review_reasons_json"],
+            stamp,
+            stamp,
+        ),
+    )
+    for ordinal, policy in enumerate(result.record["policies"]):
+        assert isinstance(policy, dict)
+        projected = _certificate_child_projection(policy)
+        db.execute(
+            """INSERT INTO certificate_policy_rows(
+                policy_id, certificate_id, ordinal, coverage, coverage_provenance_json,
+                insurer, insurer_provenance_json, policy_number, policy_number_provenance_json,
+                effective_date_iso, effective_date_ambiguous, effective_date_candidates_json,
+                effective_date_provenance_json, expiration_date_iso, expiration_date_ambiguous,
+                expiration_date_candidates_json, expiration_date_provenance_json,
+                review_reasons_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                certificate_id,
+                ordinal,
+                projected["coverage"],
+                projected["coverage_provenance_json"],
+                projected["insurer"],
+                projected["insurer_provenance_json"],
+                projected["policy_number"],
+                projected["policy_number_provenance_json"],
+                projected["effective_date_iso"],
+                projected["effective_date_ambiguous"],
+                projected["effective_date_candidates_json"],
+                projected["effective_date_provenance_json"],
+                projected["expiration_date_iso"],
+                projected["expiration_date_ambiguous"],
+                projected["expiration_date_candidates_json"],
+                projected["expiration_date_provenance_json"],
+                projected["review_reasons_json"],
+                stamp,
+                stamp,
+            ),
+        )
+    inserted = db.execute(
+        "SELECT * FROM certificate_records WHERE certificate_id = ?", (certificate_id,)
+    ).fetchone()
+    if inserted is None:
+        raise RuntimeError("Certificate parent was not readable after insertion")
+    _certificate_assert_projection(db, inserted, result.record)
+    return certificate_id, fire_id
 
 
 @dataclass(frozen=True)
@@ -2867,6 +3758,7 @@ class Store:
             _ensure_connect_jobs_schema(db, version)
             _ensure_connect_dispatch_schema(db)
             _ensure_automate_core_schema(db, version)
+            _ensure_certificate_ledger_schema(db)
             if version < 18:
                 _migrate_microsoft_principal_keys_v2(db)
             automation_run_columns = {
@@ -3008,6 +3900,210 @@ class Store:
                     db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
+
+    def list_certificate_expiry_ledger(
+        self,
+        *,
+        today: str,
+        limit: int = 100,
+    ) -> list[dict[str, object]]:
+        if not isinstance(today, str) or _CERTIFICATE_DATE_RE.fullmatch(today) is None:
+            raise ValueError("Certificate ledger today must be YYYY-MM-DD")
+        try:
+            calendar_today = date.fromisoformat(today)
+        except ValueError as exc:
+            raise ValueError("Certificate ledger today must be a valid YYYY-MM-DD date") from exc
+        if calendar_today.isoformat() != today:
+            raise ValueError("Certificate ledger today must be canonical YYYY-MM-DD")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("Certificate ledger limit must be between 1 and 500")
+
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT certificate.*, policy.policy_id, policy.ordinal,
+                    CASE WHEN COALESCE(dispatch.source_available, 1) = 1 AND EXISTS (
+                        SELECT 1 FROM messages AS message
+                        JOIN message_attachments AS attachment
+                          ON attachment.message_id = message.message_id
+                        WHERE message.message_id = certificate.source_message_id
+                          AND message.provider = certificate.provider
+                          AND message.account_id = certificate.account_id
+                          AND message.mailbox_identity_key = certificate.mailbox_identity_key
+                          AND attachment.part_id = certificate.source_part_id
+                    ) THEN 1 ELSE 0 END AS source_available
+                FROM certificate_records AS certificate
+                LEFT JOIN certificate_policy_rows AS policy
+                  ON policy.certificate_id = certificate.certificate_id
+                LEFT JOIN connect_job_dispatch AS dispatch
+                  ON dispatch.job_id = certificate.connect_job_id
+                ORDER BY CASE WHEN policy.expiration_date_iso IS NULL THEN 1 ELSE 0 END,
+                    policy.expiration_date_iso, certificate.certificate_id, policy.ordinal
+                LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            record_cache: dict[str, dict[str, object]] = {}
+            values: list[dict[str, object]] = []
+            for row in rows:
+                certificate_id = str(row["certificate_id"])
+                record = record_cache.get(certificate_id)
+                if record is None:
+                    try:
+                        canonical_json = bytes(row["canonical_result_json"])
+                        validated = _validate_certificate_record(canonical_json)
+                    except (CertificateResultInvalid, TypeError, ValueError) as exc:
+                        raise RuntimeError("Stored certificate ledger record is invalid") from exc
+                    if (
+                        validated.canonical_json != canonical_json
+                        or validated.sha256 != row["result_sha256"]
+                    ):
+                        raise RuntimeError("Stored certificate ledger digest is invalid")
+                    mailbox_identity_key = str(row["mailbox_identity_key"])
+                    if (
+                        len(mailbox_identity_key) != 64
+                        or any(
+                            character not in "0123456789abcdef"
+                            for character in mailbox_identity_key
+                        )
+                        or not row["provider"]
+                        or not row["account_id"]
+                        or not row["source_message_id"]
+                        or not row["connect_job_id"]
+                    ):
+                        raise RuntimeError("Stored certificate source identity is invalid")
+                    _certificate_assert_projection(db, row, validated.record)
+                    record = validated.record
+                    record_cache[certificate_id] = record
+
+                policy: dict[str, object] | None = None
+                policy_id: str | None = None
+                policy_ordinal: int | None = None
+                if row["policy_id"] is not None:
+                    policy_id = str(row["policy_id"])
+                    policy_ordinal = int(row["ordinal"])
+                    stored_policies = record["policies"]
+                    if (
+                        type(stored_policies) is not list
+                        or not 0 <= policy_ordinal < len(stored_policies)
+                    ):
+                        raise RuntimeError("Stored certificate policy ordinal is invalid")
+                    policy = stored_policies[policy_ordinal]
+                    if type(policy) is not dict:
+                        raise RuntimeError("Stored certificate policy is invalid")
+
+                review = record["review"]
+                assert isinstance(review, dict)
+                review_reasons = list(review["reasons"])
+                if policy is None:
+                    expiry_status = "review"
+                else:
+                    policy_reasons = list(policy["review_reasons"])
+                    review_reasons.extend(policy_reasons)
+                    expiration = policy["expiration_date"]
+                    if expiration is None or expiration["iso"] is None:
+                        expiry_status = "review"
+                    else:
+                        expiry_date = date.fromisoformat(str(expiration["iso"]))
+                        if expiry_date < calendar_today:
+                            expiry_status = "expired"
+                        elif expiry_date == calendar_today:
+                            expiry_status = "expires_today"
+                        else:
+                            expiry_status = "upcoming"
+                values.append(
+                    {
+                        "certificate_id": certificate_id,
+                        "certificate_holder": self._certificate_text_value_from_record(
+                            record, "certificate_holder"
+                        ),
+                        "insured": self._certificate_text_value_from_record(record, "insured"),
+                        "producer": self._certificate_text_value_from_record(record, "producer"),
+                        "policy_id": policy_id,
+                        "policy_ordinal": policy_ordinal,
+                        "coverage": self._certificate_text_from_policy(policy, "coverage"),
+                        "insurer": self._certificate_text_from_policy(policy, "insurer"),
+                        "policy_number": self._certificate_text_from_policy(
+                            policy, "policy_number"
+                        ),
+                        "effective_date_iso": self._certificate_date_field(
+                            policy, "effective_date", "iso"
+                        ),
+                        "effective_date_ambiguous": self._certificate_date_field(
+                            policy, "effective_date", "ambiguous"
+                        ),
+                        "effective_date_candidates": self._certificate_date_candidates(
+                            policy, "effective_date"
+                        ),
+                        "expiration_date_iso": self._certificate_date_field(
+                            policy, "expiration_date", "iso"
+                        ),
+                        "expiration_date_ambiguous": self._certificate_date_field(
+                            policy, "expiration_date", "ambiguous"
+                        ),
+                        "expiration_date_candidates": self._certificate_date_candidates(
+                            policy, "expiration_date"
+                        ),
+                        "expiry_status": expiry_status,
+                        "review_state": "needs_review" if review_reasons else "extracted",
+                        "review_reasons": review_reasons,
+                        "source_message_id": str(row["source_message_id"]),
+                        "source_part_id": str(row["source_part_id"]),
+                        "connect_job_id": str(row["connect_job_id"]),
+                        "source_available": bool(row["source_available"]),
+                    }
+                )
+        return values
+
+    @staticmethod
+    def _certificate_text_value_from_record(
+        record: dict[str, object],
+        name: str,
+    ) -> str | None:
+        value = record[name]
+        if value is None:
+            return None
+        if type(value) is not dict or not isinstance(value.get("text"), str):
+            raise RuntimeError("Stored certificate party text is invalid")
+        return str(value["text"])
+
+    @staticmethod
+    def _certificate_text_from_policy(
+        policy: dict[str, object] | None,
+        name: str,
+    ) -> str | None:
+        if policy is None or policy[name] is None:
+            return None
+        value = policy[name]
+        if type(value) is not dict or not isinstance(value.get("text"), str):
+            raise RuntimeError("Stored certificate policy text is invalid")
+        return str(value["text"])
+
+    @staticmethod
+    def _certificate_date_field(
+        policy: dict[str, object] | None,
+        name: str,
+        field_name: str,
+    ) -> str | bool | None:
+        if policy is None or policy[name] is None:
+            return None
+        value = policy[name]
+        if type(value) is not dict:
+            raise RuntimeError("Stored certificate policy date is invalid")
+        field_value = value[field_name]
+        if field_name == "iso":
+            return str(field_value) if field_value is not None else None
+        return bool(field_value)
+
+    @staticmethod
+    def _certificate_date_candidates(
+        policy: dict[str, object] | None,
+        name: str,
+    ) -> list[str] | None:
+        if policy is None or policy[name] is None:
+            return []
+        value = policy[name]
+        if type(value) is not dict or type(value.get("candidates")) is not list:
+            raise RuntimeError("Stored certificate policy date candidates are invalid")
+        return [str(candidate) for candidate in value["candidates"]]
 
     def mail_accounts(self) -> list[MailAccount]:
         with self.connection() as db:
@@ -5608,6 +6704,11 @@ class Store:
                 ).fetchone()
                 if dispatch_before is None:
                     raise RuntimeError("Connect job transition is missing dispatch state")
+            certificate_job = bool(
+                current_job.protocol_version == 2
+                and current_job.capability_id == CERTIFICATE_CAPABILITY_ID
+            )
+            certificate_outcome: str | None = None
             if next_state == "completed" and current_job.protocol_version == 1:
                 assert result is not None
                 output = result.get("output") if isinstance(result.get("output"), dict) else None
@@ -5640,6 +6741,37 @@ class Store:
                     None,
                     None,
                 )
+                if certificate_job:
+                    try:
+                        if current_job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
+                            raise CertificateResultInvalid(
+                                "certificate capability version is unsupported"
+                            )
+                        outputs = _validate_generic_result(result)
+                        if (
+                            len(outputs) != 1
+                            or outputs[0].media_type != CERTIFICATE_RESULT_MEDIA_TYPE
+                        ):
+                            raise CertificateResultInvalid(
+                                "certificate result output is invalid"
+                            )
+                        certificate_result = _validate_certificate_record(
+                            outputs[0].payload,
+                            input_sha256=current_job.input_sha256,
+                            input_byte_size=current_job.input_byte_size,
+                            input_display_name=current_job.input_display_name,
+                        )
+                        _persist_certificate_projection(
+                            db,
+                            job=current_job,
+                            result=certificate_result,
+                            stamp=stamp,
+                        )
+                        certificate_outcome = "valid"
+                    except CertificateResultConflict:
+                        certificate_outcome = "conflict"
+                    except CertificateResultInvalid:
+                        certificate_outcome = "invalid"
             elif next_state == "failed":
                 assert error is not None
                 values = (None,) * 9 + (
@@ -5702,6 +6834,7 @@ class Store:
             )
             discard_terminal = bool(
                 terminal_job is not None
+                and not certificate_job
                 and dispatch_before is not None
                 and not bool(dispatch_before["source_available"])
                 and not deferred_interactive_fire
@@ -5786,6 +6919,28 @@ class Store:
                 )
                 if dispatch_cursor.rowcount != 1:
                     raise RuntimeError("Connect job transition is missing dispatch state")
+            if certificate_outcome is not None:
+                if certificate_outcome == "valid":
+                    db.execute(
+                        """UPDATE automation_fires SET state = 'completed',
+                            state_version = state_version + 1, reason = 'connect_completed',
+                            pending_since = NULL, updated_at = ?
+                        WHERE job_id = ? AND state = 'submitted'""",
+                        (stamp, job_id),
+                    )
+                else:
+                    reason = (
+                        "CERTIFICATE_RESULT_CONFLICT"
+                        if certificate_outcome == "conflict"
+                        else "CERTIFICATE_RESULT_INVALID"
+                    )
+                    db.execute(
+                        """UPDATE automation_fires SET state = 'failed',
+                            state_version = state_version + 1, reason = ?,
+                            pending_since = NULL, updated_at = ?
+                        WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
+                        (reason, stamp, job_id),
+                    )
             row = None
             if not discard_terminal:
                 row = db.execute(
@@ -7615,6 +8770,21 @@ class Store:
                             fire.part_id,
                             stamp,
                             stamp,
+                            stamp,
+                        ),
+                    )
+                    db.execute(
+                        """INSERT INTO automation_fire_source_identities(
+                            fire_id, provider, account_id, mailbox_identity_key,
+                            message_id, part_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            fire_id,
+                            str(source["provider"]),
+                            str(source["account_id"]),
+                            mailbox_identity_key,
+                            message_id,
+                            fire.part_id,
                             stamp,
                         ),
                     )
