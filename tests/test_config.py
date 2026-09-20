@@ -405,7 +405,7 @@ def test_watchlist_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(source: Path, destination: Path) -> None:
+    def fail_replace(source: Path, destination: Path, **_kwargs: object) -> None:
         raise OSError("replace failed")
 
     monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)
@@ -546,7 +546,7 @@ def test_settings_update_atomic_replace_failure_preserves_original(
     write_config(path)
     original = path.read_bytes()
 
-    def fail_replace(source: Path, destination: Path) -> None:
+    def fail_replace(source: Path, destination: Path, **_kwargs: object) -> None:
         raise OSError("replace failed")
 
     monkeypatch.setattr("eom_email_watcher.config.os.replace", fail_replace)

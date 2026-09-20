@@ -44,11 +44,16 @@ from .config import (
     InvalidConfigInitializationError,
     InvalidSenderError,
     InvalidSettingsUpdateError,
+    NtfyDisclosureConflictError,
+    NtfyDisclosureOutcomeUnknownError,
+    NtfyDisclosureWriteError,
     Sender,
     SenderNotFoundError,
+    acknowledge_ntfy_disclosure,
     add_sender,
     initialize_config,
     load_config,
+    ntfy_disclosure_status,
     remove_sender,
     update_settings,
 )
@@ -4962,6 +4967,37 @@ def _config_initialize(request: dict[str, object]) -> dict[str, object]:
     return {"created": True, "settings": _settings_data(config)}
 
 
+def _config_ntfy_disclosure_status(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    status = ntfy_disclosure_status(_config_path(request))
+    result: dict[str, object] = {"state": status.state}
+    if status.expected_revision is not None:
+        result["expected_revision"] = status.expected_revision
+    return result
+
+
+def _config_ntfy_disclosure_acknowledge(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"expected_revision"})
+    expected_revision = payload.get("expected_revision")
+    if not isinstance(expected_revision, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", expected_revision
+    ) is None:
+        raise ApiError("invalid_request", "expected_revision must be a SHA-256 revision")
+    try:
+        acknowledge_ntfy_disclosure(_config_path(request), expected_revision)
+    except NtfyDisclosureConflictError as exc:
+        raise ApiError("conflict", "Configuration disclosure state changed") from exc
+    except NtfyDisclosureOutcomeUnknownError as exc:
+        raise ApiError(
+            "outcome_unknown", "Disclosure acknowledgement outcome is unknown"
+        ) from exc
+    except NtfyDisclosureWriteError as exc:
+        raise ApiError(
+            "configuration_error", "Disclosure acknowledgement was not written"
+        ) from exc
+    return {"acknowledged": True}
+
+
 def _settings(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     return _settings_data(load_config(_config_path(request)))
@@ -5143,6 +5179,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.status": _calendar_write_status,
     "calendar.automation.decide": _calendar_automation_decide,
     "config.initialize": _config_initialize,
+    "config.ntfy_disclosure.acknowledge": _config_ntfy_disclosure_acknowledge,
+    "config.ntfy_disclosure.status": _config_ntfy_disclosure_status,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,
     "connect.attachment.summarize": _connect_attachment_summarize,

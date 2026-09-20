@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import errno
+import hashlib
 import os
 import re
+import secrets
+import stat
 import tempfile
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from email.utils import parseaddr
 from ipaddress import ip_address
@@ -66,6 +71,30 @@ class ConfigAlreadyExistsError(ConfigError):
     """First-run initialization cannot replace an existing configuration."""
 
 
+class NtfyDisclosureConflictError(ConfigError):
+    """The disclosure acknowledgement no longer applies to the current file."""
+
+
+class NtfyDisclosureOutcomeUnknownError(ConfigError):
+    """The replacement may have committed but final durability is unknown."""
+
+
+class NtfyDisclosureWriteError(ConfigError):
+    """The disclosure acknowledgement failed before replacement."""
+
+
+class _MissingConfigPath(Exception):
+    """The configured path does not exist."""
+
+
+class _UnsafeConfigPath(Exception):
+    """The configured path cannot be accessed under the migration policy."""
+
+
+class _PostReplaceDurabilityError(OSError):
+    """Atomic replacement returned, but a later durability step failed."""
+
+
 @dataclass(frozen=True)
 class Sender:
     email: str
@@ -105,6 +134,31 @@ class Config:
     @property
     def zone(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+
+@dataclass(frozen=True)
+class NtfyDisclosureStatus:
+    state: Literal[
+        "missing",
+        "normal_admission",
+        "acknowledgement_required",
+        "manual_repair_required",
+    ]
+    expected_revision: str | None = None
+
+
+@dataclass
+class _SafeConfigHandle:
+    path: Path
+    parent_fd: int
+    name: str
+    file_fd: int
+    identity: os.stat_result
+    content: bytes
+
+    def close(self) -> None:
+        os.close(self.file_fd)
+        os.close(self.parent_fd)
 
 
 def _path(value: object, key: str) -> Path:
@@ -239,15 +293,11 @@ def _float_setting(data: dict[str, object], key: str, default: float) -> float:
         raise ConfigError(f"{key} must be numeric") from exc
 
 
-def load_config(path: Path | None = None) -> Config:
-    config_path = (path or DEFAULT_CONFIG).expanduser()
+def _load_config_bytes(content: bytes, config_path: Path) -> Config:
     try:
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
-        ) from exc
-    except tomllib.TOMLDecodeError as exc:
+        text = content.decode("utf-8")
+        data = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"Invalid TOML in {config_path}: {exc}") from exc
 
     timezone = data.get("timezone", "America/Chicago")
@@ -399,25 +449,516 @@ def load_config(path: Path | None = None) -> Config:
     )
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    temporary: Path | None = None
+def load_config(path: Path | None = None) -> Config:
+    config_path = (path or DEFAULT_CONFIG).expanduser()
     try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        content = config_path.read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigError(
+            f"Configuration not found: {config_path}. Copy config.example.toml and edit it."
+        ) from exc
+    return _load_config_bytes(content, config_path)
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _file_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_safe_parent(path: Path) -> tuple[Path, int, str]:
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        raise _UnsafeConfigPath
+    absolute = _absolute_lexical_path(path)
+    if not absolute.name:
+        raise _UnsafeConfigPath
+    current_fd = os.open("/", _directory_open_flags())
+    try:
+        for component in absolute.parent.parts[1:]:
+            try:
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            except FileNotFoundError as exc:
+                raise _MissingConfigPath from exc
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
+                    raise _UnsafeConfigPath from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        parent_stat = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        ):
+            raise _UnsafeConfigPath
+        return absolute, current_fd, absolute.name
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _read_fd_bytes(file_fd: int) -> bytes:
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(file_fd, 64 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _safe_file_identity(file_stat: os.stat_result) -> tuple[int, int]:
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _safe_file_version(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _read_safe_file_at(parent_fd: int, name: str) -> tuple[int, os.stat_result, bytes]:
+    try:
+        inspected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise _MissingConfigPath from exc
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    if (
+        not stat.S_ISREG(inspected.st_mode)
+        or inspected.st_nlink != 1
+        or inspected.st_uid != os.geteuid()
+        or stat.S_IMODE(inspected.st_mode) != 0o600
+    ):
+        raise _UnsafeConfigPath
+    try:
+        file_fd = os.open(name, _file_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    try:
+        opened = os.fstat(file_fd)
+        if _safe_file_identity(opened) != _safe_file_identity(inspected):
+            raise _UnsafeConfigPath
+        content = _read_fd_bytes(file_fd)
+        completed = os.fstat(file_fd)
+        if _safe_file_version(completed) != _safe_file_version(opened):
+            raise _UnsafeConfigPath
+        return file_fd, completed, content
+    except Exception:
+        os.close(file_fd)
+        raise
+
+
+def _open_safe_config(path: Path) -> _SafeConfigHandle:
+    absolute, parent_fd, name = _open_safe_parent(path)
+    try:
+        file_fd, identity, content = _read_safe_file_at(parent_fd, name)
+    except Exception:
+        os.close(parent_fd)
+        raise
+    return _SafeConfigHandle(
+        path=absolute,
+        parent_fd=parent_fd,
+        name=name,
+        file_fd=file_fd,
+        identity=identity,
+        content=content,
+    )
+
+
+def _revision(content: bytes) -> str:
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _statement_assignment_offset(statement: bytes) -> int | None:
+    quote: int | None = None
+    escaped = False
+    for index, value in enumerate(statement):
+        if quote is not None:
+            if quote == ord('"') and escaped:
+                escaped = False
+            elif quote == ord('"') and value == ord("\\"):
+                escaped = True
+            elif value == quote:
+                quote = None
+            continue
+        if value in {ord('"'), ord("'")}:
+            quote = value
+        elif value == ord("="):
+            return index
+        elif value == ord("#"):
+            return None
+    return None
+
+
+def _simple_key_is(statement_key: bytes, expected: str) -> bool:
+    try:
+        parsed = tomllib.loads(
+            statement_key.decode("utf-8") + " = false"
+        )
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    return parsed == {expected: False}
+
+
+def _root_boolean_token_spans(content: bytes, key: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    statement_start = 0
+    index = 0
+    quote: int | None = None
+    multiline = False
+    escaped = False
+    comment = False
+    nesting = 0
+    root = True
+    while index < len(content):
+        value = content[index]
+        if comment:
+            if value == ord("\n"):
+                comment = False
+            else:
+                index += 1
+                continue
+        elif quote is not None:
+            marker = bytes([quote]) * 3
+            if multiline and content[index : index + 3] == marker:
+                quote = None
+                multiline = False
+                index += 3
+                continue
+            if not multiline and value == quote and not escaped:
+                quote = None
+            if quote == ord('"'):
+                if escaped:
+                    escaped = False
+                elif value == ord("\\"):
+                    escaped = True
+            index += 1
+            continue
+        elif value == ord("#"):
+            comment = True
+        elif value in {ord('"'), ord("'")}:
+            if content[index : index + 3] == bytes([value]) * 3:
+                quote = value
+                multiline = True
+                index += 3
+                continue
+            quote = value
+        elif value in {ord("["), ord("{")}:
+            nesting += 1
+        elif value in {ord("]"), ord("}")} and nesting:
+            nesting -= 1
+
+        if value == ord("\n") and quote is None and nesting == 0:
+            statement = content[statement_start : index + 1]
+            stripped = statement.lstrip(b" \t\r\n")
+            if stripped.startswith(b"["):
+                root = False
+            elif root:
+                assignment = _statement_assignment_offset(statement)
+                if assignment is not None and _simple_key_is(statement[:assignment], key):
+                    value_start = assignment + 1
+                    while value_start < len(statement) and statement[value_start] in b" \t":
+                        value_start += 1
+                    if statement[value_start : value_start + 5] == b"false":
+                        spans.append(
+                            (statement_start + value_start, statement_start + value_start + 5)
+                        )
+            statement_start = index + 1
+        index += 1
+
+    if statement_start < len(content):
+        statement = content[statement_start:]
+        stripped = statement.lstrip(b" \t\r\n")
+        if not stripped.startswith(b"[") and root:
+            assignment = _statement_assignment_offset(statement)
+            if assignment is not None and _simple_key_is(statement[:assignment], key):
+                value_start = assignment + 1
+                while value_start < len(statement) and statement[value_start] in b" \t":
+                    value_start += 1
+                if statement[value_start : value_start + 5] == b"false":
+                    spans.append(
+                        (statement_start + value_start, statement_start + value_start + 5)
+                    )
+    return spans
+
+
+def _acknowledged_candidate(content: bytes, data: dict[str, object]) -> bytes | None:
+    key = "ntfy_content_disclosure_acknowledged"
+    if key not in data:
+        first_newline = content.find(b"\n")
+        newline = (
+            b"\r\n"
+            if first_newline > 0 and content[first_newline - 1 : first_newline] == b"\r"
+            else b"\n"
+        )
+        return key.encode() + b" = true" + newline + content
+    if data[key] is not False:
+        return None
+    spans = _root_boolean_token_spans(content, key)
+    if len(spans) != 1:
+        return None
+    start, end = spans[0]
+    candidate = content[:start] + b"true" + content[end:]
+    return candidate
+
+
+def _classify_ntfy_disclosure(
+    content: bytes, config_path: Path
+) -> tuple[NtfyDisclosureStatus, bytes | None]:
+    try:
+        data = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return NtfyDisclosureStatus("manual_repair_required"), None
+
+    topic_present = "ntfy_topic" in data
+    raw_topic = data.get("ntfy_topic")
+    acknowledgement = data.get("ntfy_content_disclosure_acknowledged", False)
+    if topic_present and (
+        not isinstance(raw_topic, str)
+        or NTFY_TOPIC_RE.fullmatch(raw_topic.strip()) is None
+    ):
+        return NtfyDisclosureStatus("manual_repair_required"), None
+    if not isinstance(acknowledgement, bool):
+        return NtfyDisclosureStatus("manual_repair_required"), None
+
+    if topic_present and acknowledgement is False:
+        candidate = _acknowledged_candidate(content, data)
+        if candidate is None:
+            return NtfyDisclosureStatus("manual_repair_required"), None
+        try:
+            validated = _load_config_bytes(candidate, config_path)
+        except ConfigError:
+            return NtfyDisclosureStatus("manual_repair_required"), None
+        if validated.ntfy_content_disclosure_acknowledged is not True:
+            return NtfyDisclosureStatus("manual_repair_required"), None
+        return NtfyDisclosureStatus(
+            "acknowledgement_required", _revision(content)
+        ), candidate
+
+    try:
+        _load_config_bytes(content, config_path)
+    except ConfigError:
+        return NtfyDisclosureStatus("manual_repair_required"), None
+    return NtfyDisclosureStatus("normal_admission"), None
+
+
+def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
+    if os.name != "posix":
+        config_path = path.expanduser()
+        try:
+            content = config_path.read_bytes()
+        except FileNotFoundError:
+            return NtfyDisclosureStatus("missing")
+        status, _candidate = _classify_ntfy_disclosure(content, config_path)
+        if status.state == "acknowledgement_required":
+            return NtfyDisclosureStatus("manual_repair_required")
+        return status
+    try:
+        handle = _open_safe_config(path)
+    except _MissingConfigPath:
+        return NtfyDisclosureStatus("missing")
+    except (OSError, _UnsafeConfigPath):
+        return NtfyDisclosureStatus("manual_repair_required")
+    try:
+        try:
+            status, _candidate = _classify_ntfy_disclosure(handle.content, handle.path)
+            return status
+        except Exception:
+            return NtfyDisclosureStatus("manual_repair_required")
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        handle.close()
+
+
+def _durable_replace_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
+    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+    temporary_fd: int | None = None
+    replaced = False
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(temporary_fd, 0o600)
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("candidate write did not make progress")
+            remaining = remaining[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        if before_replace is not None:
+            before_replace()
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        replaced = True
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise _PostReplaceDurabilityError from exc
+    except Exception as exc:
+        if replaced and not isinstance(exc, _PostReplaceDurabilityError):
+            raise _PostReplaceDurabilityError from exc
+        raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
+    if os.name != "posix":
+        raise NtfyDisclosureConflictError("Disclosure acknowledgement is unavailable")
+    try:
+        handle = _open_safe_config(path)
+    except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
+        raise NtfyDisclosureConflictError(
+            "Configuration is not eligible for acknowledgement"
+        ) from exc
+    replacement_completed = False
+    try:
+        with FileLock(f"{handle.path}.lock"):
+            os.close(handle.file_fd)
+            handle.file_fd = -1
+            try:
+                current_fd, current_identity, current = _read_safe_file_at(
+                    handle.parent_fd, handle.name
+                )
+            except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
+                raise NtfyDisclosureConflictError(
+                    "Configuration is not eligible for acknowledgement"
+                ) from exc
+            handle.file_fd = current_fd
+            handle.identity = current_identity
+            handle.content = current
+            if _revision(current) != expected_revision:
+                raise NtfyDisclosureConflictError("Configuration revision changed")
+            status, candidate = _classify_ntfy_disclosure(current, handle.path)
+            if status.state != "acknowledgement_required" or candidate is None:
+                raise NtfyDisclosureConflictError(
+                    "Configuration is not eligible for acknowledgement"
+                )
+            try:
+                _load_config_bytes(candidate, handle.path)
+            except ConfigError as exc:
+                raise NtfyDisclosureConflictError(
+                    "Configuration is not eligible for acknowledgement"
+                ) from exc
+
+            def verify_precommit() -> None:
+                try:
+                    verify_fd, verify_identity, verify_content = _read_safe_file_at(
+                        handle.parent_fd, handle.name
+                    )
+                except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
+                    raise NtfyDisclosureConflictError(
+                        "Configuration revision changed"
+                    ) from exc
+                try:
+                    if (
+                        _safe_file_identity(verify_identity)
+                        != _safe_file_identity(handle.identity)
+                        or verify_content != current
+                    ):
+                        raise NtfyDisclosureConflictError("Configuration revision changed")
+                finally:
+                    os.close(verify_fd)
+
+            try:
+                _durable_replace_at(
+                    handle.parent_fd,
+                    handle.name,
+                    candidate,
+                    before_replace=verify_precommit,
+                )
+                replacement_completed = True
+            except NtfyDisclosureConflictError:
+                raise
+            except _PostReplaceDurabilityError as exc:
+                raise NtfyDisclosureOutcomeUnknownError(
+                    "Disclosure acknowledgement outcome is unknown"
+                ) from exc
+            except OSError as exc:
+                raise NtfyDisclosureWriteError(
+                    "Disclosure acknowledgement was not written"
+                ) from exc
+            try:
+                final_handle = _open_safe_config(handle.path)
+                try:
+                    if final_handle.content != candidate:
+                        raise ConfigError("final configuration did not match candidate")
+                finally:
+                    final_handle.close()
+                load_config(handle.path)
+                confirmed_handle = _open_safe_config(handle.path)
+                try:
+                    if confirmed_handle.content != candidate:
+                        raise ConfigError("final configuration did not match candidate")
+                finally:
+                    confirmed_handle.close()
+            except (ConfigError, OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+                raise NtfyDisclosureOutcomeUnknownError(
+                    "Disclosure acknowledgement outcome is unknown"
+                ) from exc
+    except (
+        NtfyDisclosureConflictError,
+        NtfyDisclosureOutcomeUnknownError,
+        NtfyDisclosureWriteError,
+    ):
+        raise
+    except Exception as exc:
+        if replacement_completed:
+            raise NtfyDisclosureOutcomeUnknownError(
+                "Disclosure acknowledgement outcome is unknown"
+            ) from exc
+        raise NtfyDisclosureWriteError(
+            "Disclosure acknowledgement was not written"
+        ) from exc
+    finally:
+        if handle.file_fd >= 0:
+            os.close(handle.file_fd)
+        os.close(handle.parent_fd)
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    parent_fd = os.open(path.parent, _directory_open_flags())
+    try:
+        _durable_replace_at(parent_fd, path.name, content.encode("utf-8"))
+    finally:
+        os.close(parent_fd)
 
 
 def _atomic_create(path: Path, content: str) -> None:
