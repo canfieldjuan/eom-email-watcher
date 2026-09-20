@@ -4,6 +4,7 @@ import { webcrypto } from "node:crypto";
 import test from "node:test";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 
 test("Gmail label settings use typed backend operations and no free-form label input", () => {
   assert.match(source, /invoke<GmailLabelSelectors>\("gmail_label_selectors_list"/);
@@ -139,6 +140,61 @@ test("Gmail label proof surface shows safe selector evidence without the opaque 
   const digest = await digestLabelId(rawLabelId);
   assert.equal(digest, "cd467470d08281da13ee3acd5fe743544fdf2e92e3de8b125c4dcdab4402dbd9");
   assert.doesNotMatch(digest, /Label_private-proof-123/);
+});
+
+test("Gmail proof evidence spans the section and wraps without changing sender-card truncation", () => {
+  assert.match(source, /item\.className = "sender-card gmail-label-selector-card"/);
+  assert.match(source, /className = "gmail-label-evidence"/);
+  assert.match(
+    styles,
+    /#gmail-label-settings\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
+  );
+  assert.match(
+    styles,
+    /\.gmail-label-selector-card \.gmail-label-evidence\s*\{[^}]*overflow:\s*visible[^}]*text-overflow:\s*clip[^}]*white-space:\s*normal[^}]*overflow-wrap:\s*anywhere/s,
+  );
+  assert.match(
+    styles,
+    /\.sender-card strong,\s*\.sender-card span\s*\{[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
+  );
+});
+
+test("local sender observations stay authoritative across stale health responses", () => {
+  assert.match(
+    source,
+    /const exactSenderCount = gmailLabelSenderCount\.count \?\? health\.watchlist_count/,
+  );
+  assert.match(source, /watchlist_count: exactSenderCount/);
+  assert.match(source, /watchlistCount\.textContent = String\(exactSenderCount\)/);
+  assert.doesNotMatch(source, /watchlistCount\.textContent = String\(health\.watchlist_count\)/);
+  const reducerSource = source.match(
+    /function gmailLabelSenderCountAfterObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelPollingStateMessage/,
+  );
+  assert.ok(reducerSource);
+  const observe = Function(
+    `return function gmailLabelSenderCountAfterObservation(current, incomingCount, source) {${reducerSource[1]}\n}`,
+  )() as (
+    current: { count: number | null; local_authoritative: boolean },
+    incomingCount: number,
+    source: "health" | "local",
+  ) => { count: number | null; local_authoritative: boolean };
+
+  let healthFirst = observe({ count: null, local_authoritative: false }, 0, "health");
+  assert.deepEqual(healthFirst, { count: 0, local_authoritative: false });
+  healthFirst = observe(healthFirst, 0, "local");
+  healthFirst = observe(healthFirst, 1, "local");
+  assert.deepEqual(observe(healthFirst, 0, "health"), {
+    count: 1,
+    local_authoritative: true,
+  });
+
+  let listFirst = observe({ count: null, local_authoritative: false }, 1, "local");
+  listFirst = observe(listFirst, 0, "health");
+  assert.deepEqual(listFirst, { count: 1, local_authoritative: true });
+
+  let removed = observe({ count: 1, local_authoritative: true }, 0, "local");
+  removed = observe(removed, 1, "health");
+  assert.deepEqual(removed, { count: 0, local_authoritative: true });
 });
 
 test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {

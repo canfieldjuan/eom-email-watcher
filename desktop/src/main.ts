@@ -340,6 +340,11 @@ interface GmailLabelPollingState {
   message: string;
 }
 
+interface GmailLabelSenderCountState {
+  count: number | null;
+  local_authoritative: boolean;
+}
+
 interface MailAccounts {
   providers: MailProviderStatus[];
   accounts: MailAccountStatus[];
@@ -892,6 +897,10 @@ let gmailLabelMutationInFlight = false;
 let gmailLabelCatalogVerified = false;
 let gmailLabelHealth: GmailLabelPollingHealth | null = null;
 let gmailLabelSelectorRenderSequence = 0;
+let gmailLabelSenderCount: GmailLabelSenderCountState = {
+  count: null,
+  local_authoritative: false,
+};
 
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
@@ -2292,6 +2301,15 @@ async function gmailLabelIdDigest(labelId: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function gmailLabelSenderCountAfterObservation(
+  current: GmailLabelSenderCountState,
+  incomingCount: number,
+  source: "health" | "local",
+): GmailLabelSenderCountState {
+  if (source === "health" && current.local_authoritative) return current;
+  return { count: incomingCount, local_authoritative: source === "local" };
+}
+
 function gmailLabelPollingStateMessage(
   activeSelectorCount: number | null,
   health: GmailLabelPollingHealth | null,
@@ -2396,17 +2414,20 @@ function renderGmailLabelSelectors(items: GmailLabelSelector[]): void {
   }
   for (const selector of items) {
     const item = document.createElement("li");
-    item.className = "sender-card";
+    item.className = "sender-card gmail-label-selector-card";
     const identity = document.createElement("div");
     const title = document.createElement("strong");
     title.textContent = selector.display_name;
     const status = document.createElement("span");
     status.textContent = gmailLabelStatusText(selector.status);
     const selectorId = document.createElement("span");
+    selectorId.className = "gmail-label-evidence";
     selectorId.textContent = `Selector UUID: ${selector.selector_id}`;
     const labelIdDigest = document.createElement("span");
+    labelIdDigest.className = "gmail-label-evidence";
     labelIdDigest.textContent = "Label ID SHA-256: Calculating…";
     const revision = document.createElement("span");
+    revision.className = "gmail-label-evidence";
     revision.textContent = `Selector-set revision: ${gmailLabelRevision ?? "Unavailable"}`;
     identity.append(title, status, selectorId, labelIdDigest, revision);
     void gmailLabelIdDigest(selector.label_id).then(
@@ -3283,7 +3304,8 @@ function renderHealthUnknown(): void {
     description.textContent = detail;
   }
   lastCheck.textContent = "Unknown";
-  watchlistCount.textContent = "Unknown";
+  watchlistCount.textContent =
+    gmailLabelSenderCount.count === null ? "Unknown" : String(gmailLabelSenderCount.count);
   pollingCadence.textContent = "Unknown";
   nextCheck.textContent = "Unknown";
 }
@@ -3291,8 +3313,14 @@ function renderHealthUnknown(): void {
 function renderHealth(health: HealthStatus): void {
   const inboxScopeChanged = renderMailAccounts(health.mail);
   if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
+  gmailLabelSenderCount = gmailLabelSenderCountAfterObservation(
+    gmailLabelSenderCount,
+    health.watchlist_count,
+    "health",
+  );
+  const exactSenderCount = gmailLabelSenderCount.count ?? health.watchlist_count;
   gmailLabelHealth = {
-    watchlist_count: health.watchlist_count,
+    watchlist_count: exactSenderCount,
     polling: health.polling,
   };
   renderGmailLabelPollingState();
@@ -3337,7 +3365,7 @@ function renderHealth(health: HealthStatus): void {
       : "Analysis will still appear in the local inbox.";
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
-  watchlistCount.textContent = String(health.watchlist_count);
+  watchlistCount.textContent = String(exactSenderCount);
   if (health.polling.enabled && health.polling.next_check_unix_ms !== null) {
     pollingCadence.textContent = intervalLabel(health.polling.interval_minutes);
     nextCheck.textContent = receivedLabel(
@@ -3714,10 +3742,20 @@ function finishOperation(): void {
 
 function renderSenders(senders: WatchedSender[]): void {
   watchedSenders = senders;
+  gmailLabelSenderCount = gmailLabelSenderCountAfterObservation(
+    gmailLabelSenderCount,
+    senders.length,
+    "local",
+  );
+  const exactSenderCount = gmailLabelSenderCount.count ?? senders.length;
   if (gmailLabelHealth !== null) {
-    gmailLabelHealth = { ...gmailLabelHealth, watchlist_count: senders.length };
+    gmailLabelHealth = {
+      ...gmailLabelHealth,
+      watchlist_count: exactSenderCount,
+    };
     renderGmailLabelPollingState();
   }
+  watchlistCount.textContent = String(exactSenderCount);
   list.replaceChildren();
   if (senders.length === 0) {
     const empty = document.createElement("li");
