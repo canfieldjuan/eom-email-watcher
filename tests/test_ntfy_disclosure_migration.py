@@ -619,7 +619,7 @@ def test_displaced_validation_failure_rolls_back_and_reports_unknown(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
-def test_exchange_rollback_failure_restores_manual_bytes_without_temp_leak(
+def test_exchange_rollback_failure_retains_private_manual_recovery_without_disclosure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "config.toml"
@@ -669,11 +669,16 @@ def test_exchange_rollback_failure_restores_manual_bytes_without_temp_leak(
             {"expected_revision": revision},
         )
     )
+    recovery_files = list(path.parent.glob(f".{path.name}.*.tmp"))
     assert response["ok"] is False
     assert response["error"]["code"] == "outcome_unknown"
-    assert path.read_bytes() == edited
-    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
-    assert TOPIC not in repr(response) + caplog.text
+    assert load_config(path).ntfy_content_disclosure_acknowledged is True
+    assert len(recovery_files) == 1
+    assert recovery_files[0].read_bytes() == edited
+    assert stat.S_IMODE(recovery_files[0].stat().st_mode) == 0o600
+    rendered = repr(response) + caplog.text
+    assert TOPIC not in rendered
+    assert recovery_files[0].name not in rendered
 
 
 @pytest.mark.parametrize("failure", ["write", "file_fsync", "exchange"])

@@ -835,25 +835,10 @@ def _reconcile_failed_exchange_rollback(
             and temporary_content == candidate_content
         )
         if destination_is_candidate and not temporary_is_candidate:
-            destination_now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            temporary_now = os.stat(
-                temporary_name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if (
-                _safe_file_version(destination_now)
-                != _safe_file_version(destination_stat)
-                or _safe_file_version(temporary_now)
-                != _safe_file_version(temporary_stat)
-            ):
-                return False
-            os.replace(
-                temporary_name,
-                name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
-            os.fsync(parent_fd)
-            return True
+            # Only another atomic exchange could restore this inode without a
+            # fresh pathname race. Preserve the private displaced file rather
+            # than risk overwriting an edit that arrived during recovery.
+            return False
         if temporary_is_candidate and not destination_is_candidate:
             temporary_now = os.stat(
                 temporary_name, dir_fd=parent_fd, follow_symlinks=False
