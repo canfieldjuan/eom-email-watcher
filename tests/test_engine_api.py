@@ -924,9 +924,8 @@ def test_watchlist_rejects_sender_selector_over_byte_limit(tmp_path: Path) -> No
     assert config_path.read_bytes() == before_rejected
 
 
-def test_existing_overlong_sender_selector_fails_before_watcher_polling(
+def test_existing_overlong_sender_selector_can_be_listed_removed_and_replaced(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "config.toml"
     write_config(config_path, include_senders=False)
@@ -937,15 +936,19 @@ def test_existing_overlong_sender_selector_fails_before_watcher_polling(
         encoding="utf-8",
     )
 
-    def reject_poll(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("Watcher polling started before sender selector validation")
+    listed = engine_api._response(request(config_path, "watchlist.list"))
+    assert listed["data"]["items"] == [{"email": rejected_address, "name": None}]
 
-    monkeypatch.setattr(engine_api, "run_watcher_check", reject_poll)
-    response = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
-    assert response["error"] == {
-        "code": "configuration_error",
-        "message": "sender email creates an admission selector over 512 UTF-8 bytes",
-    }
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": rejected_address})
+    )
+    assert removed["data"]["item"] == {"email": rejected_address, "name": None}
+
+    replacement_address = f"{'é' * 246}a@example.com"
+    replaced = engine_api._response(
+        request(config_path, "watchlist.add", {"email": replacement_address})
+    )
+    assert replaced["data"]["item"] == {"email": replacement_address, "name": None}
 
 
 def test_existing_overlong_sender_name_can_be_listed_removed_and_shortened(

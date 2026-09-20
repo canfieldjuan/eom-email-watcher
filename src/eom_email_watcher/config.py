@@ -103,7 +103,11 @@ class Config:
 
     @property
     def allowlist(self) -> frozenset[str]:
-        return frozenset(sender.email for sender in self.senders)
+        return frozenset(
+            sender.email
+            for sender in self.senders
+            if _exact_sender_selector_id_or_none(sender.email) is not None
+        )
 
     @property
     def zone(self) -> ZoneInfo:
@@ -150,6 +154,13 @@ def exact_sender_selector_id(value: str) -> str:
     return selector_id
 
 
+def _exact_sender_selector_id_or_none(value: str) -> str | None:
+    try:
+        return exact_sender_selector_id(value)
+    except ValueError:
+        return None
+
+
 def _valid_domain(domain: str) -> bool:
     try:
         ascii_domain = domain.encode("idna").decode("ascii")
@@ -183,15 +194,17 @@ def _sender(
     *,
     invalid_message: str,
     enforce_name_limit: bool = True,
+    enforce_selector_limit: bool = True,
 ) -> Sender:
     try:
         email = normalize_validated_address(email_value)
     except ValueError as exc:
         raise InvalidSenderError(invalid_message) from exc
-    try:
-        exact_sender_selector_id(email)
-    except ValueError as exc:
-        raise InvalidSenderError(str(exc)) from exc
+    if enforce_selector_limit:
+        try:
+            exact_sender_selector_id(email)
+        except ValueError as exc:
+            raise InvalidSenderError(str(exc)) from exc
     if name_value is not None and any(
         character in "\r\n" or not character.isprintable() for character in name_value
     ):
@@ -317,6 +330,7 @@ def load_config(path: Path | None = None) -> Config:
                 name,
                 invalid_message=f"senders entry {index} has an invalid email",
                 enforce_name_limit=False,
+                enforce_selector_limit=False,
             )
         except InvalidSenderError as exc:
             raise ConfigError(str(exc)) from exc
@@ -557,7 +571,12 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
 
 
 def remove_sender(path: Path, email: str) -> Sender:
-    requested = _sender(email, None, invalid_message="email must be a valid email address")
+    requested = _sender(
+        email,
+        None,
+        invalid_message="email must be a valid email address",
+        enforce_selector_limit=False,
+    )
     config_path = path.expanduser().resolve()
     with FileLock(f"{config_path}.lock"):
         config = load_config(config_path)

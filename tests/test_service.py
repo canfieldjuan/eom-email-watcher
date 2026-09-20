@@ -982,6 +982,26 @@ def test_legacy_sender_name_is_bounded_only_in_immutable_admission_provenance(
     assert len(provenance["display_name"].encode("utf-8")) == 1024
 
 
+def test_legacy_overlong_sender_address_is_not_an_admission_grant(
+    tmp_path: Path,
+) -> None:
+    legacy_address = f"{'é' * 246}ab@example.com"
+    cfg = replace(config(tmp_path), senders=(Sender(legacy_address, "Legacy"),))
+    store = Store(cfg.database_file)
+    store.initialize()
+
+    class LegacyOnlyGmail(FreshGmail):
+        def mailbox_identity_key(self) -> str:
+            pytest.fail("legacy-only watchlist polled the mailbox")
+
+    watcher = Watcher(cfg, store, LegacyOnlyGmail(), FakeModel())
+    result = watcher.check()
+
+    assert watcher.sender_names == {legacy_address: "Legacy"}
+    assert watcher.admission_sender_names == {}
+    assert result["active"] is False
+
+
 def test_due_recovery_retry_crash_preserves_degraded_backoff_state(
     tmp_path: Path,
 ) -> None:

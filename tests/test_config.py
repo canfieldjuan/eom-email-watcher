@@ -415,8 +415,15 @@ def test_exact_sender_selector_utf8_boundary_after_canonicalization(
         + f'\n[[senders]]\nemail = "{rejected}"\n',
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="admission selector"):
-        load_config(path)
+    loaded = load_config(path)
+    legacy = next(sender for sender in loaded.senders if sender.email == rejected.casefold())
+    assert legacy.name is None
+    assert legacy.email not in loaded.allowlist
+
+    removed = remove_sender(path, rejected)
+    assert removed == legacy
+    replacement = add_sender(path, "replacement@example.com")
+    assert replacement.email == "replacement@example.com"
 
 
 def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: Path) -> None:

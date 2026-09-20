@@ -673,6 +673,24 @@ def test_gmail_catalog_rejects_duplicate_id_and_duplicate_json_keys() -> None:
         )
 
 
+@pytest.mark.parametrize("constant", [b"NaN", b"Infinity", b"-Infinity"])
+def test_gmail_catalog_rejects_non_json_numeric_constants(constant: bytes) -> None:
+    body = (
+        b'{"labels":[{"id":"Label_a","name":"A","type":"user",'
+        b'"ignored":'
+        + constant
+        + b'}]}'
+    )
+
+    with pytest.raises(
+        gmail_module.GmailLabelCatalogInvalid,
+        match="gmail_label_catalog_invalid: malformed JSON",
+    ) as error:
+        gmail_module.decode_gmail_label_catalog(body)
+
+    assert error.value.code == "gmail_label_catalog_invalid"
+
+
 def test_gmail_catalog_rejects_normalized_document_over_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

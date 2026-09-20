@@ -107,6 +107,10 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
     return result
 
 
+def _reject_non_json_numeric_constant(value: str) -> object:
+    raise ValueError(f"non-JSON numeric constant: {value}")
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -235,6 +239,7 @@ def decode_gmail_label_catalog(
         document = json.loads(
             body.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_json_numeric_constant,
         )
     except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: malformed JSON") from exc

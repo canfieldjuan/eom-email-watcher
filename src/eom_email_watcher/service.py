@@ -1254,6 +1254,7 @@ class Watcher:
         self.admission_sender_names = {
             address: admission_sender_display_name(name)
             for address, name in self.sender_names.items()
+            if address in config.allowlist
         }
 
     def _active_gmail_label_selectors(
@@ -1332,10 +1333,10 @@ class Watcher:
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool | str]:
-        if not self.config.senders and self.mailbox.provider != "gmail":
+        if not self.admission_sender_names and self.mailbox.provider != "gmail":
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         if (
-            not self.config.senders
+            not self.admission_sender_names
             and self.mailbox.provider == "gmail"
             and not _gmail_label_watch_configured(self.store)
         ):
@@ -1356,7 +1357,11 @@ class Watcher:
                 if recovery_state is not None
                 else self._active_gmail_label_selectors(mailbox_identity_key)
             )
-            if not self.config.senders and not label_selectors and recovery_state is None:
+            if (
+                not self.admission_sender_names
+                and not label_selectors
+                and recovery_state is None
+            ):
                 current_label_rows = self.store.gmail_current_label_selectors(
                     self.mailbox.account_id,
                     mailbox_identity_key,
@@ -1427,7 +1432,7 @@ class Watcher:
         frozen_senders = dict(state.sender_snapshot)
         current_senders = {
             address: frozen_senders[address]
-            for address in self.sender_names
+            for address in self.admission_sender_names
             if address in frozen_senders
         }
         frozen_selectors = {
@@ -2341,7 +2346,7 @@ def run_watcher_check(
     dry_run: bool = False,
     deliver_notifications: bool = True,
 ) -> dict[str, int | bool | str]:
-    watch_configured = bool(config.senders) or _gmail_label_watch_configured(store)
+    watch_configured = bool(config.allowlist) or _gmail_label_watch_configured(store)
     if dry_run:
         if not watch_configured:
             result = Watcher.inactive_result(config, store, dry_run=True)
