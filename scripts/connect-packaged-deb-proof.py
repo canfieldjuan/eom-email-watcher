@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from eom_email_watcher.db import Store
+from eom_email_watcher.db import AdmissionProvenance, Store
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
 
@@ -155,6 +155,13 @@ def seed_attachment(database_path: Path) -> None:
         subject="Packaged Local Connect proof",
         received_at="2026-01-01T00:00:00+00:00",
         mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:fixture@example.com",
+            display_name="Packaged proof",
+            mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
     )
     if not inserted:
         raise PackagedConnectProofError("Packaged proof fixture message already exists")
