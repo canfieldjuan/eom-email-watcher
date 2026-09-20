@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -338,9 +339,7 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
 
     body_limit = _integer_setting(data, "body_char_limit", 20_000)
     retention = _integer_setting(data, "retention_days", DEFAULT_RETENTION_DAYS)
-    poll_interval = _integer_setting(
-        data, "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES
-    )
+    poll_interval = _integer_setting(data, "poll_interval_minutes", DEFAULT_POLL_INTERVAL_MINUTES)
     timeout = _float_setting(data, "model_timeout_seconds", 60)
     if not 1_000 <= body_limit <= 100_000:
         raise ConfigError("body_char_limit must be between 1000 and 100000")
@@ -522,13 +521,28 @@ def _safe_file_identity(file_stat: os.stat_result) -> tuple[int, int]:
     return file_stat.st_dev, file_stat.st_ino
 
 
-def _safe_file_version(file_stat: os.stat_result) -> tuple[int, int, int, int, int]:
+def _safe_file_version(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
     return (
         file_stat.st_dev,
         file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_uid,
+        file_stat.st_gid,
         file_stat.st_size,
         file_stat.st_mtime_ns,
         file_stat.st_ctime_ns,
+    )
+
+
+def _is_safe_file_stat(file_stat: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and file_stat.st_uid == os.geteuid()
+        and stat.S_IMODE(file_stat.st_mode) == 0o600
     )
 
 
@@ -539,12 +553,7 @@ def _read_safe_file_at(parent_fd: int, name: str) -> tuple[int, os.stat_result, 
         raise _MissingConfigPath from exc
     except OSError as exc:
         raise _UnsafeConfigPath from exc
-    if (
-        not stat.S_ISREG(inspected.st_mode)
-        or inspected.st_nlink != 1
-        or inspected.st_uid != os.geteuid()
-        or stat.S_IMODE(inspected.st_mode) != 0o600
-    ):
+    if not _is_safe_file_stat(inspected):
         raise _UnsafeConfigPath
     try:
         file_fd = os.open(name, _file_open_flags(), dir_fd=parent_fd)
@@ -552,11 +561,15 @@ def _read_safe_file_at(parent_fd: int, name: str) -> tuple[int, os.stat_result, 
         raise _UnsafeConfigPath from exc
     try:
         opened = os.fstat(file_fd)
-        if _safe_file_identity(opened) != _safe_file_identity(inspected):
+        if not _is_safe_file_stat(opened) or _safe_file_version(opened) != _safe_file_version(
+            inspected
+        ):
             raise _UnsafeConfigPath
         content = _read_fd_bytes(file_fd)
         completed = os.fstat(file_fd)
-        if _safe_file_version(completed) != _safe_file_version(opened):
+        if not _is_safe_file_stat(completed) or _safe_file_version(completed) != _safe_file_version(
+            opened
+        ):
             raise _UnsafeConfigPath
         return file_fd, completed, content
     except Exception:
@@ -608,9 +621,7 @@ def _statement_assignment_offset(statement: bytes) -> int | None:
 
 def _simple_key_is(statement_key: bytes, expected: str) -> bool:
     try:
-        parsed = tomllib.loads(
-            statement_key.decode("utf-8") + " = false"
-        )
+        parsed = tomllib.loads(statement_key.decode("utf-8") + " = false")
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
         return False
     return parsed == {expected: False}
@@ -692,9 +703,7 @@ def _root_boolean_token_spans(content: bytes, key: str) -> list[tuple[int, int]]
                 while value_start < len(statement) and statement[value_start] in b" \t":
                     value_start += 1
                 if statement[value_start : value_start + 5] == b"false":
-                    spans.append(
-                        (statement_start + value_start, statement_start + value_start + 5)
-                    )
+                    spans.append((statement_start + value_start, statement_start + value_start + 5))
     return spans
 
 
@@ -730,8 +739,7 @@ def _classify_ntfy_disclosure(
     raw_topic = data.get("ntfy_topic")
     acknowledgement = data.get("ntfy_content_disclosure_acknowledged", False)
     if topic_present and (
-        not isinstance(raw_topic, str)
-        or NTFY_TOPIC_RE.fullmatch(raw_topic.strip()) is None
+        not isinstance(raw_topic, str) or NTFY_TOPIC_RE.fullmatch(raw_topic.strip()) is None
     ):
         return NtfyDisclosureStatus("manual_repair_required"), None
     if not isinstance(acknowledgement, bool):
@@ -747,9 +755,7 @@ def _classify_ntfy_disclosure(
             return NtfyDisclosureStatus("manual_repair_required"), None
         if validated.ntfy_content_disclosure_acknowledged is not True:
             return NtfyDisclosureStatus("manual_repair_required"), None
-        return NtfyDisclosureStatus(
-            "acknowledgement_required", _revision(content)
-        ), candidate
+        return NtfyDisclosureStatus("acknowledgement_required", _revision(content)), candidate
 
     try:
         _load_config_bytes(content, config_path)
@@ -777,12 +783,22 @@ def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
         return NtfyDisclosureStatus("manual_repair_required")
     try:
         try:
-            status, _candidate = _classify_ntfy_disclosure(handle.content, handle.path)
-            return status
+            with FileLock(f"{handle.path}.lock"):
+                _recover_ntfy_transaction_at(handle.parent_fd, handle.name)
+                os.close(handle.file_fd)
+                handle.file_fd = -1
+                file_fd, identity, content = _read_safe_file_at(handle.parent_fd, handle.name)
+                handle.file_fd = file_fd
+                handle.identity = identity
+                handle.content = content
+                status, _candidate = _classify_ntfy_disclosure(handle.content, handle.path)
+                return status
         except Exception:
             return NtfyDisclosureStatus("manual_repair_required")
     finally:
-        handle.close()
+        if handle.file_fd >= 0:
+            os.close(handle.file_fd)
+        os.close(handle.parent_fd)
 
 
 def _rename_exchange_at(parent_fd: int, first: str, second: str) -> None:
@@ -810,67 +826,237 @@ def _rename_exchange_at(parent_fd: int, first: str, second: str) -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
-def _reconcile_failed_exchange_rollback(
-    parent_fd: int,
-    name: str,
-    temporary_name: str,
-    candidate_identity: tuple[int, int],
-    candidate_content: bytes,
-) -> bool:
-    destination_fd: int | None = None
-    temporary_fd: int | None = None
+_NTFY_TRANSACTION_VERSION = 1
+_NTFY_TRANSACTION_SUFFIX = ".ntfy-disclosure-transaction"
+_NTFY_CANDIDATE_SUFFIX = ".ntfy-disclosure-candidate"
+_FINGERPRINT_KEYS = frozenset(
+    {
+        "device",
+        "inode",
+        "mode",
+        "links",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "revision",
+    }
+)
+
+
+def _transaction_names(name: str) -> tuple[str, str]:
+    return f".{name}{_NTFY_TRANSACTION_SUFFIX}", f".{name}{_NTFY_CANDIDATE_SUFFIX}"
+
+
+def _file_fingerprint(file_stat: os.stat_result, content: bytes) -> dict[str, object]:
+    return {
+        "device": file_stat.st_dev,
+        "inode": file_stat.st_ino,
+        "mode": file_stat.st_mode,
+        "links": file_stat.st_nlink,
+        "uid": file_stat.st_uid,
+        "gid": file_stat.st_gid,
+        "size": file_stat.st_size,
+        "mtime_ns": file_stat.st_mtime_ns,
+        "revision": _revision(content),
+    }
+
+
+def _valid_fingerprint(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _FINGERPRINT_KEYS:
+        return False
+    integer_keys = _FINGERPRINT_KEYS - {"revision"}
+    if any(type(value[key]) is not int or value[key] < 0 for key in integer_keys):
+        return False
+    revision = value["revision"]
+    return isinstance(revision, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+
+
+def _fingerprint_matches(file_stat: os.stat_result, content: bytes, expected: object) -> bool:
+    return _valid_fingerprint(expected) and _file_fingerprint(file_stat, content) == expected
+
+
+def _read_optional_safe_file_at(parent_fd: int, name: str) -> tuple[os.stat_result, bytes] | None:
     try:
-        destination_fd, destination_stat, destination_content = _read_safe_file_at(
-            parent_fd, name
-        )
-        temporary_fd, temporary_stat, temporary_content = _read_safe_file_at(
-            parent_fd, temporary_name
-        )
-        destination_is_candidate = (
-            _safe_file_identity(destination_stat) == candidate_identity
-            and destination_content == candidate_content
-        )
-        temporary_is_candidate = (
-            _safe_file_identity(temporary_stat) == candidate_identity
-            and temporary_content == candidate_content
-        )
-        if destination_is_candidate and not temporary_is_candidate:
-            # Only another atomic exchange could restore this inode without a
-            # fresh pathname race. Preserve the private displaced file rather
-            # than risk overwriting an edit that arrived during recovery.
-            return False
-        if temporary_is_candidate and not destination_is_candidate:
-            temporary_now = os.stat(
-                temporary_name, dir_fd=parent_fd, follow_symlinks=False
-            )
-            if _safe_file_version(temporary_now) != _safe_file_version(temporary_stat):
-                return False
-            os.unlink(temporary_name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-            return True
-        return False
-    except (OSError, _MissingConfigPath, _UnsafeConfigPath):
-        return False
+        file_fd, file_stat, content = _read_safe_file_at(parent_fd, name)
+    except _MissingConfigPath:
+        return None
+    try:
+        return file_stat, content
     finally:
-        if destination_fd is not None:
-            os.close(destination_fd)
-        if temporary_fd is not None:
-            os.close(temporary_fd)
+        os.close(file_fd)
 
 
-def _durable_replace_at(
+def _create_private_file_at(parent_fd: int, name: str, content: bytes) -> os.stat_result:
+    file_fd: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        file_fd = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        created_identity = _safe_file_identity(os.fstat(file_fd))
+        os.fchmod(file_fd, 0o600)
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(file_fd, remaining)
+            if written <= 0:
+                raise OSError("private file write did not make progress")
+            remaining = remaining[written:]
+        os.fsync(file_fd)
+        file_stat = os.fstat(file_fd)
+        if not _is_safe_file_stat(file_stat):
+            raise _UnsafeConfigPath
+        return file_stat
+    except Exception:
+        if created_identity is not None:
+            with suppress(OSError):
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _safe_file_identity(current) == created_identity:
+                    os.unlink(name, dir_fd=parent_fd)
+        raise
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+
+
+def _unlink_verified_file_at(parent_fd: int, name: str, expected: object) -> None:
+    snapshot = _read_optional_safe_file_at(parent_fd, name)
+    if snapshot is None:
+        raise _UnsafeConfigPath
+    file_stat, content = snapshot
+    if not _fingerprint_matches(file_stat, content, expected):
+        raise _UnsafeConfigPath
+    inspected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _safe_file_version(inspected) != _safe_file_version(file_stat):
+        raise _UnsafeConfigPath
+    os.unlink(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _transaction_marker_bytes(
+    temporary_name: str,
+    expected: dict[str, object],
+    candidate: dict[str, object],
+) -> bytes:
+    payload = {
+        "version": _NTFY_TRANSACTION_VERSION,
+        "temporary_name": temporary_name,
+        "expected": expected,
+        "candidate": candidate,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _parse_transaction_marker(content: bytes, expected_temporary_name: str) -> dict[str, object]:
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _UnsafeConfigPath from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "temporary_name", "expected", "candidate"}
+        or payload["version"] != _NTFY_TRANSACTION_VERSION
+        or payload["temporary_name"] != expected_temporary_name
+        or not _valid_fingerprint(payload["expected"])
+        or not _valid_fingerprint(payload["candidate"])
+    ):
+        raise _UnsafeConfigPath
+    return payload
+
+
+def _cleanup_transaction_at(
     parent_fd: int,
-    name: str,
-    content: bytes,
-    *,
-    before_replace: Callable[[], None] | None = None,
-    validate_displaced: Callable[[int, str], None] | None = None,
+    marker_name: str,
+    marker_fingerprint: dict[str, object],
+    temporary_name: str,
+    temporary_fingerprint: dict[str, object] | None,
 ) -> None:
+    if temporary_fingerprint is not None:
+        _unlink_verified_file_at(parent_fd, temporary_name, temporary_fingerprint)
+    _unlink_verified_file_at(parent_fd, marker_name, marker_fingerprint)
+
+
+def _recover_orphan_candidate_at(parent_fd: int, name: str, candidate_name: str) -> None:
+    candidate_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
+    if candidate_snapshot is None:
+        return
+    target_snapshot = _read_optional_safe_file_at(parent_fd, name)
+    if target_snapshot is None:
+        raise _UnsafeConfigPath
+    target_stat, target_content = target_snapshot
+    status, derived_candidate = _classify_ntfy_disclosure(target_content, Path(name))
+    candidate_stat, candidate_content = candidate_snapshot
+    if (
+        status.state != "acknowledgement_required"
+        or derived_candidate is None
+        or candidate_content != derived_candidate
+    ):
+        raise _UnsafeConfigPath
+    _unlink_verified_file_at(
+        parent_fd,
+        candidate_name,
+        _file_fingerprint(candidate_stat, candidate_content),
+    )
+
+
+def _recover_ntfy_transaction_at(parent_fd: int, name: str) -> str:
+    marker_name, candidate_name = _transaction_names(name)
+    marker_snapshot = _read_optional_safe_file_at(parent_fd, marker_name)
+    if marker_snapshot is None:
+        _recover_orphan_candidate_at(parent_fd, name, candidate_name)
+        return "none"
+    marker_stat, marker_content = marker_snapshot
+    marker = _parse_transaction_marker(marker_content, candidate_name)
+    marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
+    expected = marker["expected"]
+    candidate = marker["candidate"]
+    target_snapshot = _read_optional_safe_file_at(parent_fd, name)
+    temporary_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
+    target_is_expected = target_snapshot is not None and _fingerprint_matches(
+        *target_snapshot, expected
+    )
+    target_is_candidate = target_snapshot is not None and _fingerprint_matches(
+        *target_snapshot, candidate
+    )
+    temporary_is_expected = temporary_snapshot is not None and _fingerprint_matches(
+        *temporary_snapshot, expected
+    )
+    temporary_is_candidate = temporary_snapshot is not None and _fingerprint_matches(
+        *temporary_snapshot, candidate
+    )
+
+    if target_is_candidate and (temporary_is_expected or temporary_snapshot is None):
+        _cleanup_transaction_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            candidate_name,
+            expected if temporary_is_expected else None,
+        )
+        return "committed"
+    if target_is_expected and (temporary_is_candidate or temporary_snapshot is None):
+        _cleanup_transaction_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            candidate_name,
+            candidate if temporary_is_candidate else None,
+        )
+        return "aborted"
+    raise _UnsafeConfigPath
+
+
+def _durable_replace_at(parent_fd: int, name: str, content: bytes) -> None:
     temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
     temporary_fd: int | None = None
     replaced = False
-    preserve_temporary = False
-    candidate_identity: tuple[int, int] | None = None
     try:
         temporary_fd = os.open(
             temporary_name,
@@ -890,55 +1076,19 @@ def _durable_replace_at(
                 raise OSError("candidate write did not make progress")
             remaining = remaining[written:]
         os.fsync(temporary_fd)
-        candidate_identity = _safe_file_identity(os.fstat(temporary_fd))
         os.close(temporary_fd)
         temporary_fd = None
-        if before_replace is not None:
-            before_replace()
-        if validate_displaced is None:
-            os.replace(
-                temporary_name,
-                name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
-            replaced = True
-        else:
-            _rename_exchange_at(parent_fd, temporary_name, name)
-            replaced = True
-            try:
-                validate_displaced(parent_fd, temporary_name)
-            except Exception as validation_error:
-                try:
-                    _rename_exchange_at(parent_fd, temporary_name, name)
-                    replaced = False
-                    os.fsync(parent_fd)
-                except Exception as rollback_error:
-                    if candidate_identity is None or not _reconcile_failed_exchange_rollback(
-                        parent_fd,
-                        name,
-                        temporary_name,
-                        candidate_identity,
-                        content,
-                    ):
-                        preserve_temporary = True
-                    else:
-                        replaced = False
-                    raise _PostReplaceDurabilityError from rollback_error
-                if isinstance(validation_error, NtfyDisclosureConflictError):
-                    raise
-                raise _PostReplaceDurabilityError from validation_error
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        replaced = True
         try:
             os.fsync(parent_fd)
         except OSError as exc:
             raise _PostReplaceDurabilityError from exc
-        if validate_displaced is not None:
-            os.unlink(temporary_name, dir_fd=parent_fd)
-            replaced = False
-            try:
-                os.fsync(parent_fd)
-            except OSError as exc:
-                raise _PostReplaceDurabilityError from exc
     except Exception as exc:
         if replaced and not isinstance(exc, _PostReplaceDurabilityError):
             raise _PostReplaceDurabilityError from exc
@@ -946,9 +1096,104 @@ def _durable_replace_at(
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
-        if not preserve_temporary:
-            with suppress(OSError):
-                os.unlink(temporary_name, dir_fd=parent_fd)
+        with suppress(OSError):
+            os.unlink(temporary_name, dir_fd=parent_fd)
+
+
+def _durable_exchange_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    expected_stat: os.stat_result,
+    expected_content: bytes,
+    *,
+    before_replace: Callable[[], None],
+) -> None:
+    marker_name, candidate_name = _transaction_names(name)
+    candidate_stat = _create_private_file_at(parent_fd, candidate_name, content)
+    candidate = _file_fingerprint(candidate_stat, content)
+    expected = _file_fingerprint(expected_stat, expected_content)
+    marker_stat: os.stat_result | None = None
+    marker_content = _transaction_marker_bytes(candidate_name, expected, candidate)
+    try:
+        marker_stat = _create_private_file_at(parent_fd, marker_name, marker_content)
+        os.fsync(parent_fd)
+    except Exception:
+        with suppress(Exception):
+            _unlink_verified_file_at(parent_fd, candidate_name, candidate)
+        if marker_stat is not None:
+            with suppress(Exception):
+                _unlink_verified_file_at(
+                    parent_fd,
+                    marker_name,
+                    _file_fingerprint(marker_stat, marker_content),
+                )
+        raise
+
+    marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
+    try:
+        before_replace()
+    except Exception:
+        _cleanup_transaction_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            candidate_name,
+            candidate,
+        )
+        raise
+
+    try:
+        _rename_exchange_at(parent_fd, candidate_name, name)
+    except OSError as exchange_error:
+        try:
+            disposition = _recover_ntfy_transaction_at(parent_fd, name)
+        except (OSError, _MissingConfigPath, _UnsafeConfigPath) as recovery_error:
+            raise _PostReplaceDurabilityError from recovery_error
+        if disposition == "committed":
+            return
+        raise exchange_error
+
+    validation_error: Exception | None = None
+    try:
+        displaced_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
+        if displaced_snapshot is None or not _fingerprint_matches(*displaced_snapshot, expected):
+            validation_error = NtfyDisclosureConflictError("Configuration revision changed")
+    except _UnsafeConfigPath:
+        validation_error = NtfyDisclosureConflictError("Configuration revision changed")
+    except OSError as exc:
+        validation_error = _PostReplaceDurabilityError()
+        validation_error.__cause__ = exc
+
+    if validation_error is None:
+        try:
+            if _recover_ntfy_transaction_at(parent_fd, name) != "committed":
+                raise _UnsafeConfigPath
+        except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+            raise _PostReplaceDurabilityError from exc
+        return
+
+    try:
+        target_snapshot = _read_optional_safe_file_at(parent_fd, name)
+        if target_snapshot is None or not _fingerprint_matches(*target_snapshot, candidate):
+            raise _UnsafeConfigPath
+        try:
+            _rename_exchange_at(parent_fd, candidate_name, name)
+        except OSError:
+            rolled_back = _read_optional_safe_file_at(parent_fd, candidate_name)
+            if rolled_back is None or not _fingerprint_matches(*rolled_back, candidate):
+                raise
+        os.fsync(parent_fd)
+        _cleanup_transaction_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            candidate_name,
+            candidate,
+        )
+    except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+        raise _PostReplaceDurabilityError from exc
+    raise validation_error
 
 
 def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
@@ -963,6 +1208,12 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
     replacement_completed = False
     try:
         with FileLock(f"{handle.path}.lock"):
+            try:
+                _recover_ntfy_transaction_at(handle.parent_fd, handle.name)
+            except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+                raise NtfyDisclosureConflictError(
+                    "Configuration is not eligible for acknowledgement"
+                ) from exc
             os.close(handle.file_fd)
             handle.file_fd = -1
             try:
@@ -996,52 +1247,24 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
                         handle.parent_fd, handle.name
                     )
                 except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
-                    raise NtfyDisclosureConflictError(
-                        "Configuration revision changed"
-                    ) from exc
+                    raise NtfyDisclosureConflictError("Configuration revision changed") from exc
                 try:
                     if (
-                        _safe_file_identity(verify_identity)
-                        != _safe_file_identity(handle.identity)
+                        _safe_file_identity(verify_identity) != _safe_file_identity(handle.identity)
                         or verify_content != current
                     ):
                         raise NtfyDisclosureConflictError("Configuration revision changed")
                 finally:
                     os.close(verify_fd)
 
-            def validate_displaced(parent_fd: int, displaced_name: str) -> None:
-                try:
-                    displaced_fd, displaced_identity, displaced_content = (
-                        _read_safe_file_at(parent_fd, displaced_name)
-                    )
-                except _UnsafeConfigPath as exc:
-                    raise NtfyDisclosureConflictError(
-                        "Configuration revision changed"
-                    ) from exc
-                except (_MissingConfigPath, OSError) as exc:
-                    raise NtfyDisclosureOutcomeUnknownError(
-                        "Disclosure acknowledgement outcome is unknown"
-                    ) from exc
-                try:
-                    if (
-                        _safe_file_identity(displaced_identity)
-                        != _safe_file_identity(handle.identity)
-                        or displaced_content != current
-                        or _revision(displaced_content) != expected_revision
-                    ):
-                        raise NtfyDisclosureConflictError(
-                            "Configuration revision changed"
-                        )
-                finally:
-                    os.close(displaced_fd)
-
             try:
-                _durable_replace_at(
+                _durable_exchange_at(
                     handle.parent_fd,
                     handle.name,
                     candidate,
+                    handle.identity,
+                    current,
                     before_replace=verify_precommit,
-                    validate_displaced=validate_displaced,
                 )
                 replacement_completed = True
             except NtfyDisclosureConflictError:
@@ -1083,16 +1306,150 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
             raise NtfyDisclosureOutcomeUnknownError(
                 "Disclosure acknowledgement outcome is unknown"
             ) from exc
-        raise NtfyDisclosureWriteError(
-            "Disclosure acknowledgement was not written"
-        ) from exc
+        raise NtfyDisclosureWriteError("Disclosure acknowledgement was not written") from exc
     finally:
         if handle.file_fd >= 0:
             os.close(handle.file_fd)
         os.close(handle.parent_fd)
 
 
+def _windows_stat_version(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_nlink,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+        int(getattr(file_stat, "st_file_attributes", 0)),
+    )
+
+
+def _windows_replacement_identity(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_nlink,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        int(getattr(file_stat, "st_file_attributes", 0)),
+    )
+
+
+def _is_safe_windows_file_stat(file_stat: os.stat_result) -> bool:
+    reparse_point = 0x400
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and not int(getattr(file_stat, "st_file_attributes", 0)) & reparse_point
+    )
+
+
+def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
+    try:
+        inspected = os.lstat(path)
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    if not _is_safe_windows_file_stat(inspected):
+        raise _UnsafeConfigPath
+    try:
+        file_fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    try:
+        opened = os.fstat(file_fd)
+        if not _is_safe_windows_file_stat(opened) or _windows_stat_version(
+            opened
+        ) != _windows_stat_version(inspected):
+            raise _UnsafeConfigPath
+        content = _read_fd_bytes(file_fd)
+        completed = os.fstat(file_fd)
+        if not _is_safe_windows_file_stat(completed) or _windows_stat_version(
+            completed
+        ) != _windows_stat_version(opened):
+            raise _UnsafeConfigPath
+        return completed, content
+    finally:
+        os.close(file_fd)
+
+
+def _atomic_write_windows(path: Path, content: bytes) -> None:
+    parent_stat = os.lstat(path.parent)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or int(getattr(parent_stat, "st_file_attributes", 0)) & 0x400
+    ):
+        raise _UnsafeConfigPath
+    original_stat, _original_content = _read_safe_windows_file(path)
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+    temporary_fd: int | None = None
+    temporary_identity: tuple[int, int] | None = None
+    replaced = False
+    try:
+        temporary_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        temporary_identity = _safe_file_identity(os.fstat(temporary_fd))
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("candidate write did not make progress")
+            remaining = remaining[written:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.chmod(temporary, 0o600)
+        candidate_stat, candidate_content = _read_safe_windows_file(temporary)
+        if candidate_content != content:
+            raise _UnsafeConfigPath
+        current_stat, _current_content = _read_safe_windows_file(path)
+        if _windows_stat_version(current_stat) != _windows_stat_version(original_stat):
+            raise ConfigError("Configuration changed during update")
+        current_parent = os.lstat(path.parent)
+        if (
+            not stat.S_ISDIR(current_parent.st_mode)
+            or _safe_file_identity(current_parent) != _safe_file_identity(parent_stat)
+            or int(getattr(current_parent, "st_file_attributes", 0)) & 0x400
+        ):
+            raise _UnsafeConfigPath
+        os.replace(temporary, path)
+        replaced = True
+        installed_stat, installed_content = _read_safe_windows_file(path)
+        if installed_content != content or _windows_replacement_identity(
+            installed_stat
+        ) != _windows_replacement_identity(candidate_stat):
+            raise _PostReplaceDurabilityError
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if not replaced:
+            with suppress(OSError):
+                current = os.lstat(temporary)
+                if _safe_file_identity(current) == temporary_identity:
+                    os.unlink(temporary)
+
+
 def _atomic_write(path: Path, content: str) -> None:
+    if os.name == "nt":
+        try:
+            _atomic_write_windows(path, content.encode("utf-8"))
+        except _UnsafeConfigPath as exc:
+            raise ConfigError("Configuration path is unsafe") from exc
+        return
     parent_fd = os.open(path.parent, _directory_open_flags())
     try:
         _durable_replace_at(parent_fd, path.name, content.encode("utf-8"))
@@ -1232,9 +1589,7 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
         if type(poll_interval) is not int:
             raise InvalidSettingsUpdateError("poll_interval_minutes must be an integer")
         if not 1 <= poll_interval <= 1440:
-            raise InvalidSettingsUpdateError(
-                "poll_interval_minutes must be between 1 and 1440"
-            )
+            raise InvalidSettingsUpdateError("poll_interval_minutes must be between 1 and 1440")
 
     retention = updates.get("retention_days")
     if "retention_days" in updates:
@@ -1242,8 +1597,7 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
             raise InvalidSettingsUpdateError("retention_days must be an integer")
         if not MIN_RETENTION_DAYS <= retention <= MAX_RETENTION_DAYS:
             raise InvalidSettingsUpdateError(
-                f"retention_days must be between {MIN_RETENTION_DAYS} "
-                f"and {MAX_RETENTION_DAYS}"
+                f"retention_days must be between {MIN_RETENTION_DAYS} and {MAX_RETENTION_DAYS}"
             )
 
     notifications = updates.get("notifications_enabled")
@@ -1268,19 +1622,17 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
         if not normalized_model_name or any(
             not character.isprintable() for character in normalized_model_name
         ):
-            raise InvalidSettingsUpdateError(
-                "model_name must be a non-empty printable string"
-            )
+            raise InvalidSettingsUpdateError("model_name must be a non-empty printable string")
         normalized_updates["model_name"] = normalized_model_name
 
     config_path = path.expanduser().resolve()
     try:
         with FileLock(f"{config_path}.lock"):
             config = load_config(config_path)
-            if (
-                {"model_base_url", "model_name"} & updates.keys()
-                and config.model_backend != "loopback"
-            ):
+            if {
+                "model_base_url",
+                "model_name",
+            } & updates.keys() and config.model_backend != "loopback":
                 raise InvalidSettingsUpdateError(
                     "Model endpoint and identifier are managed by the inference gateway"
                 )

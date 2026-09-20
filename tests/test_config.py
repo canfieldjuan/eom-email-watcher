@@ -1,8 +1,11 @@
+import os
+import stat
 from pathlib import Path
 from zoneinfo import ZoneInfo, reset_tzpath
 
 import pytest
 
+import eom_email_watcher.config as config_module
 from eom_email_watcher.config import (
     ConfigAlreadyExistsError,
     ConfigError,
@@ -28,10 +31,10 @@ def write_config(
     include_sender: bool = True,
 ) -> None:
     sender = (
-        '''[[senders]]
+        """[[senders]]
 email = "Trusted@Example.com"
 name = "Trusted Person"
-'''
+"""
         if include_sender
         else ""
     )
@@ -93,9 +96,7 @@ def test_remote_model_url_is_rejected(tmp_path: Path) -> None:
         "http://local\\nhost:1234/v1",
     ],
 )
-def test_deceptive_or_incomplete_local_model_url_is_rejected(
-    tmp_path: Path, base_url: str
-) -> None:
+def test_deceptive_or_incomplete_local_model_url_is_rejected(tmp_path: Path, base_url: str) -> None:
     path = tmp_path / "config.toml"
     write_config(path, base_url=base_url)
     with pytest.raises(ConfigError, match="model_base_url"):
@@ -333,14 +334,61 @@ def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
     assert "# operator comment" in text
     assert "retention_days = 90" in text
     assert "Trusted@Example.com" in text
-    assert load_config(path).allowlist == frozenset(
-        {"trusted@example.com", "new@example.com"}
-    )
+    assert load_config(path).allowlist == frozenset({"trusted@example.com", "new@example.com"})
 
     removed = remove_sender(path, "NEW@example.com")
 
     assert removed == added
     assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+
+
+def test_windows_settings_and_watchlist_mutations_avoid_posix_only_apis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    real_open = os.open
+    real_replace = os.replace
+    real_fsync = os.fsync
+
+    def windows_open(name, flags, mode=0o777, *, dir_fd=None):
+        assert dir_fd is None, "Windows mutation used a dir_fd-relative open"
+        return real_open(name, flags, mode)
+
+    def windows_replace(source, destination, **kwargs):
+        assert not kwargs, "Windows mutation used dir_fd-relative replace"
+        return real_replace(source, destination)
+
+    def windows_fsync(fd: int) -> None:
+        assert not stat.S_ISDIR(os.fstat(fd).st_mode), "Windows mutation attempted directory fsync"
+        real_fsync(fd)
+
+    class WindowsOsProxy:
+        name = "nt"
+        open = staticmethod(windows_open)
+        replace = staticmethod(windows_replace)
+        fsync = staticmethod(windows_fsync)
+        fchmod = staticmethod(lambda *_args: pytest.fail("Windows mutation called os.fchmod"))
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
+    monkeypatch.setattr(config_module, "os", WindowsOsProxy())
+
+    updated = update_settings(path, {"poll_interval_minutes": 45})
+    added = add_sender(path, "new@example.com", "New")
+    removed = remove_sender(path, "new@example.com")
+
+    assert updated.poll_interval_minutes == 45
+    assert added.email == "new@example.com"
+    assert removed == added
+    assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+
+    original = path.read_bytes()
+    os.link(path, tmp_path / "second-link.toml")
+    with pytest.raises(ConfigError, match="path is unsafe"):
+        update_settings(path, {"poll_interval_minutes": 60})
+    assert path.read_bytes() == original
 
 
 def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: Path) -> None:
@@ -524,11 +572,7 @@ def test_settings_update_keeps_gateway_model_configuration_read_only(
         extra=f'model_backend = "gateway"\nmodel_ca_file = "{ca_file}"',
     )
     original = path.read_bytes()
-    value = (
-        "http://127.0.0.1:8080/v1"
-        if model_update == "model_base_url"
-        else "replacement-model"
-    )
+    value = "http://127.0.0.1:8080/v1" if model_update == "model_base_url" else "replacement-model"
 
     with pytest.raises(InvalidSettingsUpdateError, match="managed"):
         update_settings(path, {model_update: value})
@@ -569,9 +613,7 @@ def test_watchlist_mutation_preserves_symlinked_config_target(tmp_path: Path) ->
 
     assert link.is_symlink()
     assert added.email == "new@example.com"
-    assert load_config(target).allowlist == frozenset(
-        {"trusted@example.com", "new@example.com"}
-    )
+    assert load_config(target).allowlist == frozenset({"trusted@example.com", "new@example.com"})
 
     removed = remove_sender(link, "new@example.com")
 
@@ -610,9 +652,7 @@ def test_malformed_numeric_settings_raise_config_error(
         load_config(path)
 
 
-@pytest.mark.parametrize(
-    ("minutes", "valid"), [(0, False), (1, True), (1440, True), (1441, False)]
-)
+@pytest.mark.parametrize(("minutes", "valid"), [(0, False), (1, True), (1440, True), (1441, False)])
 def test_poll_interval_boundaries(tmp_path: Path, minutes: int, valid: bool) -> None:
     path = tmp_path / "config.toml"
     write_config(path, extra=f"poll_interval_minutes = {minutes}")
@@ -624,9 +664,7 @@ def test_poll_interval_boundaries(tmp_path: Path, minutes: int, valid: bool) -> 
 
 
 @pytest.mark.parametrize("timezone", ["", "/tmp/foo"])
-def test_invalid_timezone_keys_raise_config_error(
-    tmp_path: Path, timezone: str
-) -> None:
+def test_invalid_timezone_keys_raise_config_error(tmp_path: Path, timezone: str) -> None:
     path = tmp_path / "config.toml"
     write_config(path, extra=f'timezone = "{timezone}"')
     with pytest.raises(ConfigError, match="Unknown timezone"):
