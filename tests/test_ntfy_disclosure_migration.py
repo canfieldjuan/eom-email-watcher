@@ -2116,7 +2116,7 @@ def test_lock_failure_uses_fixed_secret_free_error(
         def __exit__(self, *_args):
             return False
 
-    monkeypatch.setattr(config_module, "FileLock", lambda _path: BrokenLock())
+    monkeypatch.setattr(config_module, "_config_serialization_lock", BrokenLock)
 
     response = engine_api._response(
         _request(
@@ -2133,3 +2133,197 @@ def test_lock_failure_uses_fixed_secret_free_error(
     }
     assert "PRIVATE_PATH_CANARY" not in rendered
     assert TOPIC not in rendered
+
+
+@pytest.mark.skipif(os.name != "posix", reason="systemd writable-state contract is POSIX-only")
+def test_config_serialization_lock_uses_private_state_not_config_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config" / "config.toml"
+    original = _write_legacy_config(path)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    legacy_target = tmp_path / "legacy-lock-target"
+    legacy_target.write_bytes(b"legacy")
+    path.with_name(f"{path.name}.lock").symlink_to(legacy_target)
+
+    class ReadOnlyAdjacentLock:
+        def __enter__(self):
+            raise OSError("the configuration mount is read-only")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(config_module, "FileLock", lambda _path: ReadOnlyAdjacentLock())
+
+    status = ntfy_disclosure_status(path)
+
+    lock_path = state_home / "eom-email-watcher" / "config-serialization.lock"
+    assert status.state == "acknowledgement_required"
+    assert path.read_bytes() == original
+    assert path.with_name(f"{path.name}.lock").is_symlink()
+    assert legacy_target.read_bytes() == b"legacy"
+    assert stat.S_IMODE(lock_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    assert lock_path.stat().st_nlink == 1
+    assert lock_path.read_bytes() == b""
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@pytest.mark.parametrize("unsafe_mode", [0o755, 0o500])
+def test_config_serialization_lock_rejects_unsafe_state_before_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_mode: int,
+) -> None:
+    path = tmp_path / "config" / "config.toml"
+    original = _write_legacy_config(path)
+    state_home = tmp_path / "state"
+    lock_parent = state_home / "eom-email-watcher"
+    lock_parent.mkdir(parents=True, mode=unsafe_mode)
+    lock_parent.chmod(unsafe_mode)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+    status = ntfy_disclosure_status(path)
+
+    assert status.state == "manual_repair_required"
+    assert path.read_bytes() == original
+    assert not (lock_parent / "config-serialization.lock").exists()
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+def test_config_serialization_lock_blocks_on_one_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    lock_path = state_home / "eom-email-watcher" / "config-serialization.lock"
+    holder_acquired = threading.Event()
+    release_holder = threading.Event()
+    waiter_entered = threading.Event()
+    identities: list[tuple[int, int]] = []
+
+    def holder() -> None:
+        with config_module._config_serialization_lock():
+            locked = lock_path.stat()
+            identities.append((locked.st_dev, locked.st_ino))
+            holder_acquired.set()
+            assert release_holder.wait(timeout=5)
+
+    def waiter() -> None:
+        assert holder_acquired.wait(timeout=5)
+        with config_module._config_serialization_lock():
+            locked = lock_path.stat()
+            identities.append((locked.st_dev, locked.st_ino))
+            waiter_entered.set()
+
+    holder_thread = threading.Thread(target=holder)
+    waiter_thread = threading.Thread(target=waiter)
+    holder_thread.start()
+    waiter_thread.start()
+    assert holder_acquired.wait(timeout=5)
+    assert not waiter_entered.wait(timeout=0.1)
+    release_holder.set()
+    holder_thread.join(timeout=5)
+    waiter_thread.join(timeout=5)
+
+    assert not holder_thread.is_alive()
+    assert not waiter_thread.is_alive()
+    assert waiter_entered.is_set()
+    assert len(identities) == 2
+    assert identities[0] == identities[1]
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+@pytest.mark.parametrize("attack", ["parent_symlink", "lock_symlink", "lock_hardlink"])
+def test_config_serialization_lock_rejects_unsafe_lock_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    path = tmp_path / "config" / "config.toml"
+    original = _write_legacy_config(path)
+    state_home = tmp_path / "state"
+    lock_parent = state_home / "eom-email-watcher"
+    state_home.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    target_parent = tmp_path / "other-state"
+    target_parent.mkdir(mode=0o700)
+
+    if attack == "parent_symlink":
+        lock_parent.symlink_to(target_parent, target_is_directory=True)
+    else:
+        lock_parent.mkdir(mode=0o700)
+        lock_path = lock_parent / "config-serialization.lock"
+        target = tmp_path / "lock-target"
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        if attack == "lock_symlink":
+            lock_path.symlink_to(target)
+        else:
+            os.link(target, lock_path)
+
+    status = ntfy_disclosure_status(path)
+
+    assert status.state == "manual_repair_required"
+    assert path.read_bytes() == original
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+def test_config_serialization_lock_rejects_replacement_after_acquire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config" / "config.toml"
+    original = _write_legacy_config(path)
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    replaced = False
+
+    def replace_lock(stage: str) -> None:
+        nonlocal replaced
+        if stage != "after_acquire" or replaced:
+            return
+        replaced = True
+        lock_path = state_home / "eom-email-watcher" / "config-serialization.lock"
+        displaced = lock_path.with_name("displaced.lock")
+        os.replace(lock_path, displaced)
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o600)
+
+    monkeypatch.setattr(config_module, "_config_serialization_lock_probe", replace_lock)
+
+    status = ntfy_disclosure_status(path)
+
+    assert replaced
+    assert status.state == "manual_repair_required"
+    assert path.read_bytes() == original
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="secure state lock is POSIX-only")
+def test_custom_config_paths_share_the_state_lock_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_home = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    first = tmp_path / "first" / "config.toml"
+    second = tmp_path / "second" / "config.toml"
+    _write_legacy_config(first)
+    _write_legacy_config(second)
+    lock_path = state_home / "eom-email-watcher" / "config-serialization.lock"
+
+    assert ntfy_disclosure_status(first).state == "acknowledgement_required"
+    initial = lock_path.stat()
+    assert ntfy_disclosure_status(second).state == "acknowledgement_required"
+    completed = lock_path.stat()
+
+    assert (initial.st_dev, initial.st_ino) == (completed.st_dev, completed.st_ino)
+    assert lock_path.read_bytes() == b""

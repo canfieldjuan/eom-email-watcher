@@ -11,6 +11,8 @@ from connect_automate import entitlement
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+import eom_email_watcher.config as config_module
+
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-user-services.sh"
 WATCHER_SERVICE = ROOT / "systemd" / "eom-email-watcher.service"
@@ -51,6 +53,23 @@ def test_systemd_services_use_stable_cli_snapshot() -> None:
     working_directory = "WorkingDirectory=%h/Desktop/01 - Effingham Office Maids/eom-email-watcher"
     assert working_directory in watcher
     assert working_directory in monthly
+
+
+def test_systemd_config_lock_resolves_inside_only_writable_state_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    watcher = WATCHER_SERVICE.read_text()
+
+    assert config_module._config_serialization_lock_path() == (
+        home / ".local/state/eom-email-watcher/config-serialization.lock"
+    )
+    assert "ProtectHome=read-only" in watcher
+    assert "ReadWritePaths=%h/.local/state/eom-email-watcher" in watcher
+    assert "ReadWritePaths=%h/.config/eom-email-watcher" not in watcher
 
 
 LEGACY_RELEASE_KEYRING = Path(".local/share/eom-email-watcher/connect-entitlement-keyring.json")

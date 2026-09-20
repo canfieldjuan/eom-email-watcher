@@ -742,3 +742,31 @@ def test_ntfy_url_must_be_https(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="https"):
         load_config(path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="state lock ordering is POSIX-only")
+def test_initialization_locks_before_creating_config_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "new-config" / "config.toml"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    observed: list[str] = []
+
+    def observe_lock(stage: str) -> None:
+        if stage == "after_acquire":
+            assert not path.parent.exists()
+            observed.append(stage)
+
+    monkeypatch.setattr(config_module, "_config_serialization_lock_probe", observe_lock)
+
+    initialize_config(
+        path,
+        timezone="America/Chicago",
+        model_base_url="http://127.0.0.1:1234/v1",
+        model_name="local-model",
+    )
+
+    assert observed == ["after_acquire"]
+    assert path.is_file()
+    assert normalize_address("Person <TRUSTED@example.com>") == "trusted@example.com"

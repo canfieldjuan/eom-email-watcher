@@ -12,7 +12,7 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from email.utils import parseaddr
 from ipaddress import ip_address
@@ -592,6 +592,117 @@ def _open_or_create_safe_parent(path: Path) -> tuple[Path, int, str]:
         raise
 
 
+def _config_serialization_lock_path() -> Path:
+    configured_state_home = os.environ.get("XDG_STATE_HOME")
+    if configured_state_home:
+        state_home = Path(configured_state_home).expanduser()
+        if not state_home.is_absolute():
+            raise _UnsafeConfigPath
+    else:
+        state_home = Path.home() / ".local" / "state"
+    return state_home / "eom-email-watcher" / "config-serialization.lock"
+
+
+def _safe_lock_file_stat(file_stat: os.stat_result) -> bool:
+    mode = stat.S_IMODE(file_stat.st_mode)
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and file_stat.st_uid == os.geteuid()
+        and mode & ~0o600 == 0
+    )
+
+
+def _config_serialization_lock_probe(_stage: str) -> None:
+    """Test seam for state-lock path and inode replacement boundaries."""
+
+
+@contextmanager
+def _config_serialization_lock():
+    """Serialize every config snapshot and mutation outside the read-only config tree."""
+
+    lock_path = _config_serialization_lock_path()
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with FileLock(str(lock_path)):
+                yield
+        except OSError as exc:
+            raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+        return
+
+    parent_fd: int | None = None
+    lock_fd: int | None = None
+    locked = False
+    try:
+        absolute, parent_fd, name = _open_or_create_safe_parent(lock_path)
+        held_parent = _validate_held_parent(
+            parent_fd,
+            parent_path=absolute.parent,
+        )
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(name, flags | os.O_EXCL, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            lock_fd = os.open(name, flags, dir_fd=parent_fd)
+
+        def validate_lock() -> None:
+            opened = os.fstat(lock_fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not _safe_lock_file_stat(opened)
+                or not _safe_lock_file_stat(current)
+                or _safe_file_identity(opened) != _safe_file_identity(current)
+            ):
+                raise _UnsafeConfigPath
+
+        validate_lock()
+        _validate_held_parent(parent_fd, held_parent)
+        import fcntl
+
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        locked = True
+        _config_serialization_lock_probe("after_acquire")
+        validate_lock()
+        _validate_held_parent(parent_fd, held_parent)
+    except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+        if locked and lock_fd is not None:
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+
+    body_failed = False
+    try:
+        yield
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        validation_error: Exception | None = None
+        if not body_failed:
+            try:
+                _config_serialization_lock_probe("before_release")
+                validate_lock()
+                _validate_held_parent(parent_fd, held_parent)
+            except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+                validation_error = exc
+        if locked and lock_fd is not None:
+            with suppress(OSError):
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if validation_error is not None:
+            raise ConfigError(
+                "Configuration is unavailable or requires manual repair"
+            ) from validation_error
+
+
 def _read_fd_bytes(file_fd: int) -> bytes:
     os.lseek(file_fd, 0, os.SEEK_SET)
     chunks: list[bytes] = []
@@ -727,7 +838,7 @@ def _read_admission_config(
     if os.name == "posix":
         absolute, parent_fd, name = _open_safe_parent(absolute)
         try:
-            with FileLock(f"{absolute}.lock"):
+            with _config_serialization_lock():
                 return _read_recovered_posix_config_at(
                     absolute,
                     parent_fd,
@@ -830,7 +941,7 @@ def _load_runtime_config(path: Path, *, lock_held: bool = False) -> Config:
                 "Configuration is unavailable or requires manual repair"
             ) from exc
         try:
-            with FileLock(f"{absolute}.lock"):
+            with _config_serialization_lock():
                 return _load_runtime_config_from_reader(
                     config_path,
                     lambda: _read_recovered_posix_config_at(
@@ -846,7 +957,7 @@ def _load_runtime_config(path: Path, *, lock_held: bool = False) -> Config:
         finally:
             os.close(parent_fd)
     try:
-        with FileLock(f"{absolute}.lock"):
+        with _config_serialization_lock():
             return _load_runtime_config_from_reader(
                 config_path,
                 lambda: _read_admission_config_under_lock(absolute),
@@ -1101,7 +1212,7 @@ def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
 
     file_fd: int | None = None
     try:
-        with FileLock(f"{absolute}.lock"):
+        with _config_serialization_lock():
             recovery = _recover_ntfy_transaction_at(
                 parent_fd,
                 name,
@@ -2796,7 +2907,7 @@ def acknowledge_ntfy_disclosure(
     current_fd: int | None = None
     replacement_completed = False
     try:
-        with FileLock(f"{absolute}.lock"):
+        with _config_serialization_lock():
             try:
                 recovery = _recover_ntfy_transaction_at(
                     parent_fd,
@@ -3234,15 +3345,15 @@ def initialize_config(
     if os.name != "posix":
         config_path = path.expanduser().resolve()
         config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(f"{config_path}.lock"):
+        with _config_serialization_lock():
             _atomic_create(config_path, content.decode("utf-8"))
         return load_config(config_path)
 
     parent_fd: int | None = None
     created_identity: tuple[int, int] | None = None
     try:
-        config_path, parent_fd, name = _open_or_create_safe_parent(path)
-        with FileLock(f"{config_path}.lock"):
+        with _config_serialization_lock():
+            config_path, parent_fd, name = _open_or_create_safe_parent(path)
             held_parent = _validate_held_parent(
                 parent_fd,
                 parent_path=config_path.parent,
@@ -3290,7 +3401,7 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
     config_path = path.expanduser().resolve()
     if not config_path.exists():
         load_config(config_path)
-    with FileLock(f"{config_path}.lock"):
+    with _config_serialization_lock():
         config = _load_runtime_config(config_path, lock_held=True)
         if sender.email in config.allowlist:
             raise DuplicateSenderError(f"Sender is already watched: {sender.email}")
@@ -3314,7 +3425,7 @@ def remove_sender(path: Path, email: str) -> Sender:
     config_path = path.expanduser().resolve()
     if not config_path.exists():
         load_config(config_path)
-    with FileLock(f"{config_path}.lock"):
+    with _config_serialization_lock():
         config = _load_runtime_config(config_path, lock_held=True)
         try:
             index = next(
@@ -3387,7 +3498,7 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
     if not config_path.exists():
         load_config(config_path)
     try:
-        with FileLock(f"{config_path}.lock"):
+        with _config_serialization_lock():
             config = _load_runtime_config(config_path, lock_held=True)
             if {
                 "model_base_url",
