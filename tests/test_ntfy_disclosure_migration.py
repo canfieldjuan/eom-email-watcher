@@ -70,6 +70,10 @@ def _unsupported_path(path: Path) -> Path:
     return path.parent / f".{path.name}.ntfy-disclosure-unsupported"
 
 
+def _disposition_path(path: Path) -> Path:
+    return path.parent / f".{path.name}.ntfy-disclosure-disposition"
+
+
 def _crash_at_transaction_stage(path: Path, revision: str, stage: str) -> None:
     child = os.fork()
     if child == 0:
@@ -198,6 +202,63 @@ def test_status_reports_missing_without_creating_parent(tmp_path: Path) -> None:
 
     assert ntfy_disclosure_status(path).state == "missing"
     assert not path.parent.exists()
+
+
+@pytest.mark.parametrize("failure", [PermissionError("denied"), IsADirectoryError("dir")])
+def test_non_posix_status_classifies_path_read_errors_generically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: OSError,
+) -> None:
+    path = tmp_path / "sensitive-config-name.toml"
+    monkeypatch.setattr(config_module.os, "name", "nt")
+    monkeypatch.setattr(Path, "read_bytes", lambda _path: (_ for _ in ()).throw(failure))
+
+    response = engine_api._response(
+        _request(path, "config.ntfy_disclosure.status")
+    )
+
+    assert response["data"] == {"state": "manual_repair_required"}
+    assert str(path) not in json.dumps(response)
+
+
+def test_non_posix_admission_rejects_atomic_swap_during_same_fd_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_bytes(path, _config_bytes(topic=None))
+
+    class NonPosixOsProxy:
+        name = "nt"
+
+        def __getattr__(self, attribute: str):
+            return getattr(os, attribute)
+
+    real_read = config_module._read_fd_bytes
+    swapped = False
+
+    def swap_after_read(file_fd: int) -> bytes:
+        nonlocal swapped
+        content = real_read(file_fd)
+        if not swapped:
+            replacement = tmp_path / "replacement.toml"
+            _write_bytes(replacement, original)
+            os.replace(replacement, path)
+            swapped = True
+        return content
+
+    monkeypatch.setattr(config_module, "os", NonPosixOsProxy())
+    monkeypatch.setattr(config_module, "_read_fd_bytes", swap_after_read)
+
+    response = engine_api._response(
+        _request(path, "config.admission.snapshot")
+    )
+
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": "Configuration admission snapshot is unavailable",
+    }
+    assert str(path) not in json.dumps(response)
 
 
 @pytest.mark.parametrize("unsafe", ["file_mode", "parent_mode", "hardlink", "fifo"])
@@ -620,6 +681,301 @@ def test_manual_edit_after_precommit_check_is_atomically_preserved(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
+def test_atomic_replacement_after_final_precheck_is_restored_without_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra="# atomic manual replacement")
+    real_exchange = config_module._durable_exchange_at
+
+    def replace_after_check(
+        parent_fd,
+        name,
+        content,
+        expected_stat,
+        expected_content,
+        *,
+        parent_path,
+        before_replace,
+    ):
+        def check_then_replace() -> None:
+            before_replace()
+            replacement = path.parent / "manual.toml"
+            _write_bytes(replacement, manual)
+            os.replace(replacement, path)
+
+        return real_exchange(
+            parent_fd,
+            name,
+            content,
+            expected_stat,
+            expected_content,
+            parent_path=parent_path,
+            before_replace=check_then_replace,
+        )
+
+    monkeypatch.setattr(config_module, "_durable_exchange_at", replace_after_check)
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == manual
+    assert ntfy_disclosure_status(path).state == "normal_admission"
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+
+
+@pytest.mark.parametrize("crash_point", ["after_exchange", "after_rollback"])
+def test_restart_restores_atomic_replacement_across_mismatch_rollback(
+    tmp_path: Path, crash_point: str
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra=f"# crash {crash_point}")
+    child = os.fork()
+    if child == 0:
+        real_exchange = config_module._rename_exchange_at
+        exchange_calls = 0
+        replaced = False
+
+        def replace_before_exchange(stage: str) -> None:
+            nonlocal replaced
+            if stage == "before_exchange" and not replaced:
+                replacement = path.parent / "manual.toml"
+                _write_bytes(replacement, manual)
+                os.replace(replacement, path)
+                replaced = True
+
+        def exchange_then_crash(parent_fd: int, first: str, second: str) -> None:
+            nonlocal exchange_calls
+            exchange_calls += 1
+            real_exchange(parent_fd, first, second)
+            if crash_point == "after_exchange" and exchange_calls == 1:
+                os._exit(86)
+            if crash_point == "after_rollback" and exchange_calls == 2:
+                os._exit(86)
+
+        config_module._transaction_probe = replace_before_exchange
+        config_module._rename_exchange_at = exchange_then_crash
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+
+    assert ntfy_disclosure_status(path).state == "normal_admission"
+    assert path.read_bytes() == manual
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+
+
+def test_post_exchange_displaced_replacement_is_restored_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra="# post exchange replacement")
+    real_exchange = config_module._rename_exchange_at
+    exchange_calls = 0
+
+    def exchange_then_replace(parent_fd: int, first: str, second: str) -> None:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        real_exchange(parent_fd, first, second)
+        if exchange_calls == 1:
+            replacement = path.parent / "manual.toml"
+            _write_bytes(replacement, manual)
+            os.replace(replacement, _transaction_paths(path)[1])
+
+    monkeypatch.setattr(config_module, "_rename_exchange_at", exchange_then_replace)
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == manual
+    assert ntfy_disclosure_status(path).state == "normal_admission"
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+
+
+def test_restart_restores_manual_replacement_after_disposition_is_durable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra="# disposition crash")
+    child = os.fork()
+    if child == 0:
+        replaced = False
+
+        def replace_then_crash(stage: str) -> None:
+            nonlocal replaced
+            if stage == "before_exchange" and not replaced:
+                replacement = path.parent / "manual.toml"
+                _write_bytes(replacement, manual)
+                os.replace(replacement, path)
+                replaced = True
+            if stage == "after_disposition_durable":
+                os._exit(86)
+
+        config_module._transaction_probe = replace_then_crash
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    assert _disposition_path(path).exists()
+
+    snapshot = engine_api._response(_request(path, "config.admission.snapshot"))
+
+    assert snapshot["ok"] is True
+    assert snapshot["data"]["settings"]["polling_supported"] is True
+    assert path.read_bytes() == manual
+    assert ntfy_disclosure_status(path).state == "normal_admission"
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+    assert not _disposition_path(path).exists()
+
+
+def test_mismatch_rollback_response_loss_restores_manual_without_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra="# rollback response loss")
+    real_exchange = config_module._rename_exchange_at
+    exchange_calls = 0
+    replaced = False
+
+    def replace_before_exchange(stage: str) -> None:
+        nonlocal replaced
+        if stage == "before_exchange" and not replaced:
+            replacement = path.parent / "manual.toml"
+            _write_bytes(replacement, manual)
+            os.replace(replacement, path)
+            replaced = True
+
+    def lose_rollback_response(parent_fd: int, first: str, second: str) -> None:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        real_exchange(parent_fd, first, second)
+        if exchange_calls == 2:
+            raise OSError("injected rollback response loss")
+
+    monkeypatch.setattr(config_module, "_transaction_probe", replace_before_exchange)
+    monkeypatch.setattr(config_module, "_rename_exchange_at", lose_rollback_response)
+
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == manual
+    assert ntfy_disclosure_status(path).state == "normal_admission"
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
+    assert not _disposition_path(path).exists()
+
+
+def test_tampered_mismatch_disposition_fails_closed_without_deleting_manual(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    manual = _config_bytes(topic=None, extra="# preserved manual")
+    child = os.fork()
+    if child == 0:
+        replaced = False
+
+        def replace_then_crash(stage: str) -> None:
+            nonlocal replaced
+            if stage == "before_exchange" and not replaced:
+                replacement = path.parent / "manual.toml"
+                _write_bytes(replacement, manual)
+                os.replace(replacement, path)
+                replaced = True
+            if stage == "after_disposition_durable":
+                os._exit(86)
+
+        config_module._transaction_probe = replace_then_crash
+        engine_api._response(
+            _request(
+                path,
+                "config.ntfy_disclosure.acknowledge",
+                {"expected_revision": revision},
+            )
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    marker, candidate = _transaction_paths(path)
+    disposition = _disposition_path(path)
+    disposition.write_bytes(b'{"tampered":true}\n')
+    disposition.chmod(0o600)
+    displaced = candidate.read_bytes()
+
+    first = ntfy_disclosure_status(path)
+    second = ntfy_disclosure_status(path)
+    snapshot = engine_api._response(_request(path, "config.admission.snapshot"))
+
+    assert first.state == "manual_repair_required"
+    assert second.state == "manual_repair_required"
+    assert snapshot["error"]["code"] == "configuration_error"
+    assert marker.exists()
+    assert candidate.read_bytes() == displaced == manual
+    assert disposition.read_bytes() == b'{"tampered":true}\n'
+
+
 def test_metadata_change_after_precommit_check_is_atomically_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -671,7 +1027,7 @@ def test_metadata_change_after_precommit_check_is_atomically_preserved(
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
-def test_displaced_validation_failure_rolls_back_and_reports_unknown(
+def test_displaced_validation_failure_rolls_back_without_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "config.toml"
@@ -707,12 +1063,12 @@ def test_displaced_validation_failure_rolls_back_and_reports_unknown(
     )
 
     assert response["ok"] is False
-    assert response["error"]["code"] == "outcome_unknown"
+    assert response["error"]["code"] == "conflict"
     assert path.read_bytes() == original
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
-def test_exchange_rollback_failure_retains_fixed_private_transaction_without_disclosure(
+def test_exchange_rollback_response_failure_retries_and_restores_manual_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     path = tmp_path / "config.toml"
@@ -766,13 +1122,12 @@ def test_exchange_rollback_failure_retains_fixed_private_transaction_without_dis
             {"expected_revision": revision},
         )
     )
-    marker, candidate = _transaction_paths(path)
     assert response["ok"] is False
-    assert response["error"]["code"] == "outcome_unknown"
-    assert load_config(path).ntfy_content_disclosure_acknowledged is True
-    assert marker.exists()
-    assert candidate.read_bytes() == edited
-    assert stat.S_IMODE(candidate.stat().st_mode) == 0o600
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == edited
+    marker, candidate = _transaction_paths(path)
+    assert not marker.exists()
+    assert not candidate.exists()
     assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
     rendered = repr(response) + caplog.text
     assert TOPIC not in rendered

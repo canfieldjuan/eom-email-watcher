@@ -86,6 +86,14 @@ class NtfyDisclosureWriteError(ConfigError):
     """The disclosure acknowledgement failed before replacement."""
 
 
+class ConfigAdmissionUnavailableError(ConfigError):
+    """A safe atomic configuration snapshot could not be produced."""
+
+
+class ConfigAdmissionStaleError(ConfigError):
+    """An admission token no longer describes the current configuration."""
+
+
 class _MissingConfigPath(Exception):
     """The configured path does not exist."""
 
@@ -152,6 +160,12 @@ class NtfyDisclosureStatus:
         "manual_repair_required",
     ]
     expected_revision: str | None = None
+
+
+@dataclass(frozen=True)
+class ConfigAdmissionSnapshot:
+    config: Config
+    token: dict[str, object]
 
 
 @dataclass
@@ -617,6 +631,141 @@ def _open_safe_config(path: Path) -> _SafeConfigHandle:
     )
 
 
+def _non_posix_admission_file_is_safe(file_stat: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(file_stat, "st_file_attributes", 0)
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and not file_attributes & reparse_attribute
+    )
+
+
+def _read_admission_config(
+    path: Path,
+) -> tuple[Path, os.stat_result, bytes]:
+    absolute = _absolute_lexical_path(path)
+    if os.name == "posix":
+        absolute, parent_fd, name = _open_safe_parent(absolute)
+        file_fd: int | None = None
+        try:
+            with FileLock(f"{absolute}.lock"):
+                recovery = _recover_ntfy_transaction_at(
+                    parent_fd,
+                    name,
+                    parent_path=absolute.parent,
+                )
+                if recovery in {"unsupported", "manual_artifact"}:
+                    raise _UnsafeConfigPath
+                parent = _validate_held_parent(
+                    parent_fd,
+                    parent_path=absolute.parent,
+                )
+                file_fd, identity, content = _read_safe_file_at(parent_fd, name)
+                _validate_held_parent(parent_fd, parent)
+                current = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if _safe_file_version(current) != _safe_file_version(identity):
+                    raise _UnsafeConfigPath
+                return absolute, identity, content
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            os.close(parent_fd)
+
+    try:
+        inspected = os.stat(absolute, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise _MissingConfigPath from exc
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    if not _non_posix_admission_file_is_safe(inspected):
+        raise _UnsafeConfigPath
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOINHERIT", 0)
+    )
+    try:
+        file_fd = os.open(absolute, flags)
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    try:
+        opened = os.fstat(file_fd)
+        if (
+            not _non_posix_admission_file_is_safe(opened)
+            or _safe_file_version(opened) != _safe_file_version(inspected)
+        ):
+            raise _UnsafeConfigPath
+        content = _read_fd_bytes(file_fd)
+        completed = os.fstat(file_fd)
+        if (
+            not _non_posix_admission_file_is_safe(completed)
+            or _safe_file_version(completed) != _safe_file_version(opened)
+        ):
+            raise _UnsafeConfigPath
+        current = os.stat(absolute, follow_symlinks=False)
+        if _safe_file_version(current) != _safe_file_version(completed):
+            raise _UnsafeConfigPath
+        return absolute, completed, content
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    finally:
+        os.close(file_fd)
+
+
+def _config_admission_token(
+    file_stat: os.stat_result, content: bytes
+) -> dict[str, object]:
+    revision = _revision(content)
+    identity_payload = json.dumps(
+        {
+            "ctime_ns": file_stat.st_ctime_ns,
+            "device": file_stat.st_dev,
+            "gid": file_stat.st_gid,
+            "inode": file_stat.st_ino,
+            "links": file_stat.st_nlink,
+            "mode": file_stat.st_mode,
+            "mtime_ns": file_stat.st_mtime_ns,
+            "revision": revision,
+            "size": file_stat.st_size,
+            "uid": file_stat.st_uid,
+            "version": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return {
+        "version": 1,
+        "revision": revision,
+        "identity": _revision(identity_payload),
+    }
+
+
+def config_admission_snapshot(path: Path) -> ConfigAdmissionSnapshot:
+    try:
+        absolute, file_stat, content = _read_admission_config(path)
+        config = _load_config_bytes(content, absolute)
+    except (ConfigError, OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+        raise ConfigAdmissionUnavailableError(
+            "Configuration admission snapshot is unavailable"
+        ) from exc
+    return ConfigAdmissionSnapshot(
+        config=config,
+        token=_config_admission_token(file_stat, content),
+    )
+
+
+def admitted_config(path: Path, expected_token: Mapping[str, object]) -> Config:
+    snapshot = config_admission_snapshot(path)
+    if dict(expected_token) != snapshot.token:
+        raise ConfigAdmissionStaleError("Configuration admission snapshot changed")
+    return snapshot.config
+
+
 def _revision(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
@@ -794,6 +943,8 @@ def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
             content = config_path.read_bytes()
         except FileNotFoundError:
             return NtfyDisclosureStatus("missing")
+        except OSError:
+            return NtfyDisclosureStatus("manual_repair_required")
         status, _candidate = _classify_ntfy_disclosure(
             content, config_path
         )
@@ -1004,9 +1155,11 @@ def _transaction_boundary(
 
 
 _NTFY_TRANSACTION_VERSION = 3
+_NTFY_DISPOSITION_VERSION = 1
 _NTFY_UNSUPPORTED_VERSION = 2
 _NTFY_TRANSACTION_SUFFIX = ".ntfy-disclosure-transaction"
 _NTFY_CANDIDATE_SUFFIX = ".ntfy-disclosure-candidate"
+_NTFY_DISPOSITION_SUFFIX = ".ntfy-disclosure-disposition"
 _NTFY_UNSUPPORTED_SUFFIX = ".ntfy-disclosure-unsupported"
 _FINGERPRINT_KEYS = frozenset(
     {
@@ -1041,6 +1194,10 @@ def _transaction_names(name: str) -> tuple[str, str, str]:
         f".{name}{_NTFY_CANDIDATE_SUFFIX}",
         f".{name}{_NTFY_UNSUPPORTED_SUFFIX}",
     )
+
+
+def _transaction_disposition_name(name: str) -> str:
+    return f".{name}{_NTFY_DISPOSITION_SUFFIX}"
 
 
 def _file_fingerprint(file_stat: os.stat_result, content: bytes) -> dict[str, object]:
@@ -1452,6 +1609,131 @@ def _parse_transaction_marker(
     return payload
 
 
+def _displaced_guard(
+    file_stat: os.stat_result,
+    content: bytes | None,
+) -> dict[str, object]:
+    return {
+        "device": file_stat.st_dev,
+        "inode": file_stat.st_ino,
+        "mode": file_stat.st_mode,
+        "links": file_stat.st_nlink,
+        "uid": file_stat.st_uid,
+        "gid": file_stat.st_gid,
+        "size": file_stat.st_size,
+        "mtime_ns": file_stat.st_mtime_ns,
+        "revision": _revision(content) if content is not None else None,
+    }
+
+
+def _valid_displaced_guard(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _FINGERPRINT_KEYS:
+        return False
+    integer_keys = _FINGERPRINT_KEYS - {"revision"}
+    if any(type(value[key]) is not int or value[key] < 0 for key in integer_keys):
+        return False
+    revision = value["revision"]
+    return revision is None or (
+        isinstance(revision, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+    )
+
+
+def _disposition_bytes(
+    temporary_name: str,
+    expected: dict[str, object],
+    candidate: dict[str, object],
+    phase: str,
+    displaced: dict[str, object],
+) -> bytes:
+    payload = {
+        "version": _NTFY_DISPOSITION_VERSION,
+        "temporary_name": temporary_name,
+        "expected": expected,
+        "candidate": candidate,
+        "phase": phase,
+        "displaced": displaced,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _parse_disposition(
+    content: bytes,
+    expected_temporary_name: str,
+) -> dict[str, object]:
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _UnsafeConfigPath from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {
+            "version",
+            "temporary_name",
+            "expected",
+            "candidate",
+            "phase",
+            "displaced",
+        }
+        or payload["version"] != _NTFY_DISPOSITION_VERSION
+        or payload["temporary_name"] != expected_temporary_name
+        or not _valid_fingerprint(payload["expected"])
+        or not _valid_candidate_descriptor(payload["candidate"])
+        or payload["phase"] not in {"commit", "rollback"}
+        or not _valid_displaced_guard(payload["displaced"])
+    ):
+        raise _UnsafeConfigPath
+    return payload
+
+
+def _persist_disposition_at(
+    parent_fd: int,
+    parent: _HeldParent,
+    disposition_name: str,
+    content: bytes,
+) -> dict[str, object]:
+    disposition_fd, disposition_stat = _prepare_unnamed_candidate_at(
+        parent_fd,
+        parent,
+        content,
+    )
+    descriptor = _candidate_descriptor(disposition_stat, content)
+    linked = False
+    try:
+        _transaction_boundary("before_disposition_link", parent_fd, parent)
+        _link_unnamed_candidate_at(disposition_fd, parent_fd, disposition_name)
+        linked = True
+        linked_snapshot = _read_optional_safe_file_at(parent_fd, disposition_name)
+        if (
+            linked_snapshot is None
+            or not _candidate_descriptor_matches(*linked_snapshot, descriptor)
+        ):
+            raise _UnsafeConfigPath
+        _fsync_transaction_parent_at(
+            parent_fd,
+            parent,
+            "before_disposition_directory_fsync",
+        )
+        _transaction_probe("after_disposition_durable")
+        return _file_fingerprint(*linked_snapshot)
+    except Exception:
+        if linked:
+            with suppress(OSError, _UnsafeConfigPath):
+                _unlink_verified_candidate_at(
+                    parent_fd,
+                    disposition_name,
+                    descriptor,
+                    expected_parent=parent,
+                    stage="before_failed_disposition_cleanup",
+                    require_private_parent=False,
+                    require_current_path=False,
+                )
+        raise
+    finally:
+        os.close(disposition_fd)
+
+
 def _unsupported_marker_bytes(expected: dict[str, object]) -> bytes:
     payload = {
         "version": _NTFY_UNSUPPORTED_VERSION,
@@ -1505,6 +1787,214 @@ def _cleanup_active_transaction_at(
         )
 
 
+def _displaced_guard_matches_at(
+    parent_fd: int,
+    name: str,
+    expected: object,
+) -> bool:
+    if not _valid_displaced_guard(expected):
+        return False
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    actual = _displaced_guard(current, None)
+    revision = expected["revision"]
+    actual["revision"] = revision
+    if actual != expected:
+        return False
+    if revision is None:
+        return True
+    try:
+        snapshot = _read_optional_safe_file_at(parent_fd, name)
+    except (OSError, _UnsafeConfigPath):
+        return False
+    return snapshot is not None and _revision(snapshot[1]) == revision
+
+
+def _ensure_disposition_at(
+    parent_fd: int,
+    parent: _HeldParent,
+    disposition_name: str,
+    content: bytes,
+) -> dict[str, object]:
+    snapshot = _read_optional_safe_file_at(parent_fd, disposition_name)
+    if snapshot is not None:
+        if snapshot[1] != content:
+            raise _UnsafeConfigPath
+        return _file_fingerprint(*snapshot)
+    return _persist_disposition_at(
+        parent_fd,
+        parent,
+        disposition_name,
+        content,
+    )
+
+
+def _entry_version_without_ctime(
+    file_stat: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_uid,
+        file_stat.st_gid,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+    )
+
+
+def _rollback_mismatched_exchange_at(
+    parent_fd: int,
+    parent: _HeldParent,
+    name: str,
+    candidate_name: str,
+    candidate: dict[str, object],
+    marker_name: str,
+    marker_fingerprint: dict[str, object] | None,
+    disposition_name: str,
+    disposition_fingerprint: dict[str, object],
+    displaced: dict[str, object],
+    displaced_snapshot: tuple[os.stat_result, bytes] | None,
+) -> str:
+    try:
+        displaced_stat = os.stat(
+            candidate_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise _UnsafeConfigPath from exc
+    displaced_version = _entry_version_without_ctime(displaced_stat)
+    displaced_fingerprint = (
+        _file_fingerprint(*displaced_snapshot)
+        if displaced_snapshot is not None
+        else None
+    )
+    if not _displaced_guard_matches_at(parent_fd, candidate_name, displaced):
+        raise _UnsafeConfigPath
+
+    def entry_matches_displaced(entry_name: str) -> bool:
+        try:
+            current = os.stat(
+                entry_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        if _entry_version_without_ctime(current) != displaced_version:
+            return False
+        if displaced_fingerprint is None:
+            return True
+        try:
+            snapshot = _read_optional_safe_file_at(parent_fd, entry_name)
+        except (OSError, _UnsafeConfigPath):
+            return False
+        return snapshot is not None and _fingerprint_matches(
+            *snapshot,
+            displaced_fingerprint,
+        )
+
+    def entry_is_candidate(entry_name: str) -> bool:
+        try:
+            snapshot = _read_optional_safe_file_at(parent_fd, entry_name)
+        except (OSError, _UnsafeConfigPath):
+            return False
+        return snapshot is not None and _candidate_descriptor_matches(
+            *snapshot,
+            candidate,
+        )
+
+    rollback_complete = False
+    for attempt in range(2):
+        _transaction_boundary(
+            f"before_mismatch_rollback_exchange_{attempt + 1}",
+            parent_fd,
+            parent,
+        )
+        try:
+            _rename_exchange_at(parent_fd, candidate_name, name)
+        except OSError as rollback_error:
+            if entry_matches_displaced(name) and entry_is_candidate(candidate_name):
+                rollback_complete = True
+                break
+            if not (
+                entry_is_candidate(name)
+                and entry_matches_displaced(candidate_name)
+            ):
+                raise _UnsafeConfigPath from rollback_error
+        else:
+            rollback_complete = True
+            break
+
+    if not rollback_complete:
+        if not entry_is_candidate(name) or not entry_matches_displaced(candidate_name):
+            raise _UnsafeConfigPath
+        _transaction_boundary(
+            "before_mismatch_rollback_replace",
+            parent_fd,
+            parent,
+        )
+        os.replace(
+            candidate_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+
+    _transaction_probe("after_mismatch_rollback")
+    _fsync_transaction_parent_at(
+        parent_fd,
+        parent,
+        "before_mismatch_rollback_directory_fsync",
+    )
+    live_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if displaced_fingerprint is None:
+        if _entry_version_without_ctime(live_stat) != displaced_version:
+            raise _UnsafeConfigPath
+    else:
+        live_snapshot = _read_optional_safe_file_at(parent_fd, name)
+        if (
+            live_snapshot is None
+            or not _fingerprint_matches(
+                *live_snapshot,
+                displaced_fingerprint,
+            )
+        ):
+            raise _UnsafeConfigPath
+
+    isolated_candidate = _read_optional_safe_file_at(parent_fd, candidate_name)
+    if isolated_candidate is not None:
+        if not _candidate_descriptor_matches(*isolated_candidate, candidate):
+            raise _UnsafeConfigPath
+        _unlink_verified_candidate_at(
+            parent_fd,
+            candidate_name,
+            candidate,
+            expected_parent=parent,
+            stage="before_mismatch_candidate_cleanup",
+        )
+    _unlink_verified_file_at(
+        parent_fd,
+        disposition_name,
+        disposition_fingerprint,
+        expected_parent=parent,
+        stage="before_mismatch_disposition_cleanup",
+    )
+    if marker_fingerprint is not None:
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_mismatch_marker_cleanup",
+        )
+    return "manual_target"
+
+
 def _recover_ntfy_transaction_at(
     parent_fd: int,
     name: str,
@@ -1518,7 +2008,12 @@ def _recover_ntfy_transaction_at(
         parent_path=parent_path,
     )
     marker_name, candidate_name, unsupported_name = _transaction_names(name)
+    disposition_name = _transaction_disposition_name(name)
     marker_snapshot = _read_optional_safe_file_at(parent_fd, marker_name)
+    disposition_snapshot = _read_optional_safe_file_at(
+        parent_fd,
+        disposition_name,
+    )
     candidate_read_error = False
     candidate_unsafe = False
     try:
@@ -1533,7 +2028,11 @@ def _recover_ntfy_transaction_at(
         candidate_read_error = True
     unsupported_snapshot = _read_optional_safe_file_at(parent_fd, unsupported_name)
 
-    if marker_snapshot is None and unsupported_snapshot is None:
+    if (
+        marker_snapshot is None
+        and disposition_snapshot is None
+        and unsupported_snapshot is None
+    ):
         if candidate_snapshot is not None or candidate_unsafe or candidate_read_error:
             raise _UnsafeConfigPath
         return "none"
@@ -1545,6 +2044,8 @@ def _recover_ntfy_transaction_at(
         target_snapshot = None
         target_unsafe = True
     if unsupported_snapshot is not None:
+        if disposition_snapshot is not None:
+            raise _UnsafeConfigPath
         _unsupported_stat, unsupported_content = unsupported_snapshot
         unsupported_expected = _parse_unsupported_marker(unsupported_content)
         if marker_snapshot is not None:
@@ -1577,14 +2078,72 @@ def _recover_ntfy_transaction_at(
             )
         return "unsupported"
 
-    if marker_snapshot is None:
-        raise _UnsafeConfigPath
+    marker_fingerprint: dict[str, object] | None = None
+    marker: dict[str, object] | None = None
+    if marker_snapshot is not None:
+        marker_stat, marker_content = marker_snapshot
+        marker = _parse_transaction_marker(marker_content, candidate_name)
+        marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
 
-    marker_stat, marker_content = marker_snapshot
-    marker = _parse_transaction_marker(marker_content, candidate_name)
-    marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
-    expected = marker["expected"]
-    candidate = marker["candidate"]
+    disposition_fingerprint: dict[str, object] | None = None
+    disposition: dict[str, object] | None = None
+    if disposition_snapshot is not None:
+        disposition_stat, disposition_content = disposition_snapshot
+        disposition = _parse_disposition(disposition_content, candidate_name)
+        disposition_fingerprint = _file_fingerprint(
+            disposition_stat,
+            disposition_content,
+        )
+        if marker is not None and (
+            marker["expected"] != disposition["expected"]
+            or marker["candidate"] != disposition["candidate"]
+        ):
+            raise _UnsafeConfigPath
+
+    transaction = marker if marker is not None else disposition
+    if transaction is None:
+        raise _UnsafeConfigPath
+    expected = transaction["expected"]
+    candidate = transaction["candidate"]
+    phase = disposition["phase"] if disposition is not None else "prepared"
+    displaced = disposition["displaced"] if disposition is not None else None
+
+    def cleanup_metadata(stage: str) -> None:
+        if marker_fingerprint is not None:
+            _unlink_verified_file_at(
+                parent_fd,
+                marker_name,
+                marker_fingerprint,
+                expected_parent=parent,
+                stage=f"before_{stage}_marker_cleanup",
+            )
+        if disposition_fingerprint is not None:
+            _unlink_verified_file_at(
+                parent_fd,
+                disposition_name,
+                disposition_fingerprint,
+                expected_parent=parent,
+                stage=f"before_{stage}_disposition_cleanup",
+            )
+
+    def ensure_disposition(
+        requested_phase: str,
+        requested_displaced: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        content = _disposition_bytes(
+            candidate_name,
+            expected,
+            candidate,
+            requested_phase,
+            requested_displaced,
+        )
+        fingerprint = _ensure_disposition_at(
+            parent_fd,
+            parent,
+            disposition_name,
+            content,
+        )
+        return fingerprint, requested_displaced
     target_is_expected = (
         target_snapshot is not None
         and _fingerprint_matches(*target_snapshot, expected)
@@ -1603,6 +2162,23 @@ def _recover_ntfy_transaction_at(
     )
 
     if target_is_expected:
+        if phase != "prepared":
+            if (
+                phase != "rollback"
+                or displaced is None
+                or not _displaced_guard_matches_at(parent_fd, name, displaced)
+                or not temporary_is_candidate
+            ):
+                raise _UnsafeConfigPath
+            _unlink_verified_candidate_at(
+                parent_fd,
+                candidate_name,
+                candidate,
+                expected_parent=parent,
+                stage="before_exact_rollback_candidate_cleanup",
+            )
+            cleanup_metadata("exact_rollback")
+            return "manual_target"
         if temporary_is_candidate:
             _unlink_verified_candidate_at(
                 parent_fd,
@@ -1612,26 +2188,22 @@ def _recover_ntfy_transaction_at(
                 stage="before_aborted_candidate_cleanup",
             )
         elif candidate_snapshot is not None:
-            _unlink_verified_file_at(
-                parent_fd,
-                marker_name,
-                marker_fingerprint,
-                expected_parent=parent,
-                stage="before_collision_marker_cleanup",
-            )
+            cleanup_metadata("collision")
             return "manual_artifact"
         elif candidate_unsafe or candidate_read_error:
             raise _UnsafeConfigPath
-        _unlink_verified_file_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            expected_parent=parent,
-            stage="before_aborted_marker_cleanup",
-        )
+        cleanup_metadata("aborted")
         return "aborted"
 
     if temporary_is_expected:
+        if phase == "rollback":
+            raise _UnsafeConfigPath
+        if phase == "prepared":
+            disposition_fingerprint, displaced = ensure_disposition(
+                "commit",
+                expected,
+            )
+            phase = "commit"
         if target_snapshot is None and not target_unsafe:
             raise _UnsafeConfigPath
         _unlink_verified_file_at(
@@ -1641,117 +2213,87 @@ def _recover_ntfy_transaction_at(
             expected_parent=parent,
             stage="before_displaced_original_cleanup",
         )
-        _unlink_verified_file_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            expected_parent=parent,
-            stage="before_committed_marker_cleanup",
-        )
+        cleanup_metadata("committed")
         return "committed" if target_is_candidate else "manual_target"
 
     if target_is_candidate and candidate_snapshot is None:
         if candidate_unsafe or candidate_read_error:
-            if not _relaxed_identity_matches_at(
-                parent_fd, candidate_name, expected
-            ):
+            if phase == "commit":
                 raise _UnsafeConfigPath
-            _transaction_boundary(
-                "before_recovery_exchange",
-                parent_fd,
-                parent,
-            )
-            _rename_exchange_at(parent_fd, candidate_name, name)
-            _fsync_transaction_parent_at(
-                parent_fd,
-                parent,
-                "before_recovery_exchange_fsync",
-            )
-            restored_candidate = _read_optional_safe_file_at(
-                parent_fd, candidate_name
-            )
-            if (
-                restored_candidate is None
-                or not _candidate_descriptor_matches(
-                    *restored_candidate, candidate
+            if phase == "prepared":
+                displaced_stat = os.stat(
+                    candidate_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
                 )
-            ):
-                raise _UnsafeConfigPath
-            _unlink_verified_candidate_at(
+                disposition_fingerprint, displaced = ensure_disposition(
+                    "rollback",
+                    _displaced_guard(displaced_stat, None),
+                )
+                phase = "rollback"
+            assert disposition_fingerprint is not None
+            assert displaced is not None
+            return _rollback_mismatched_exchange_at(
                 parent_fd,
+                parent,
+                name,
                 candidate_name,
                 candidate,
-                expected_parent=parent,
-                stage="before_rollback_candidate_cleanup",
-            )
-            _unlink_verified_file_at(
-                parent_fd,
                 marker_name,
                 marker_fingerprint,
-                expected_parent=parent,
-                stage="before_rollback_marker_cleanup",
+                disposition_name,
+                disposition_fingerprint,
+                displaced,
+                None,
             )
-            return (
-                "rollback_unknown"
-                if candidate_read_error
-                else "manual_target"
-            )
-        _unlink_verified_file_at(
+        if phase == "commit":
+            cleanup_metadata("response_loss_commit")
+            return "committed"
+        _unlink_verified_candidate_at(
             parent_fd,
-            marker_name,
-            marker_fingerprint,
+            name,
+            candidate,
             expected_parent=parent,
-            stage="before_response_loss_marker_cleanup",
+            stage="before_missing_displaced_ack_cleanup",
         )
-        return "committed"
+        cleanup_metadata("missing_displaced")
+        return "manual_target"
 
     if target_is_candidate and candidate_snapshot is not None:
         if temporary_is_candidate:
             raise _UnsafeConfigPath
-        if not _relaxed_identity_matches_at(
-            parent_fd, candidate_name, expected
-        ):
+        if phase == "commit":
             raise _UnsafeConfigPath
-        if not _rename_exchange_available():
-            raise _UnsafeConfigPath
-        _transaction_boundary(
-            "before_recovery_exchange",
-            parent_fd,
-            parent,
-        )
-        _rename_exchange_at(parent_fd, candidate_name, name)
-        _fsync_transaction_parent_at(
-            parent_fd,
-            parent,
-            "before_recovery_exchange_fsync",
-        )
-        restored_candidate = _read_optional_safe_file_at(
-            parent_fd, candidate_name
-        )
-        if (
-            restored_candidate is None
-            or not _candidate_descriptor_matches(
-                *restored_candidate, candidate
+        if phase == "prepared":
+            disposition_fingerprint, displaced = ensure_disposition(
+                "rollback",
+                _displaced_guard(*candidate_snapshot),
             )
-        ):
-            raise _UnsafeConfigPath
-        _unlink_verified_candidate_at(
+            phase = "rollback"
+        assert disposition_fingerprint is not None
+        assert displaced is not None
+        return _rollback_mismatched_exchange_at(
             parent_fd,
+            parent,
+            name,
             candidate_name,
             candidate,
-            expected_parent=parent,
-            stage="before_rollback_candidate_cleanup",
-        )
-        _unlink_verified_file_at(
-            parent_fd,
             marker_name,
             marker_fingerprint,
-            expected_parent=parent,
-            stage="before_rollback_marker_cleanup",
+            disposition_name,
+            disposition_fingerprint,
+            displaced,
+            candidate_snapshot,
         )
-        return "manual_target"
 
-    if temporary_is_candidate and target_snapshot is not None:
+    if temporary_is_candidate and (target_snapshot is not None or target_unsafe):
+        if phase == "commit":
+            raise _UnsafeConfigPath
+        if phase == "rollback" and (
+            displaced is None
+            or not _displaced_guard_matches_at(parent_fd, name, displaced)
+        ):
+            raise _UnsafeConfigPath
         _unlink_verified_candidate_at(
             parent_fd,
             candidate_name,
@@ -1759,23 +2301,14 @@ def _recover_ntfy_transaction_at(
             expected_parent=parent,
             stage="before_completed_rollback_candidate_cleanup",
         )
-        _unlink_verified_file_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            expected_parent=parent,
-            stage="before_completed_rollback_marker_cleanup",
-        )
+        cleanup_metadata("completed_rollback")
         return "manual_target"
 
     if candidate_snapshot is None and target_snapshot is not None:
-        _unlink_verified_file_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            expected_parent=parent,
-            stage="before_marker_only_manual_cleanup",
-        )
+        if phase == "commit":
+            cleanup_metadata("commit_with_manual_target")
+            return "manual_target"
+        cleanup_metadata("marker_only_manual")
         return "manual_target"
 
     raise _UnsafeConfigPath
@@ -1911,9 +2444,15 @@ def _durable_exchange_at(
         parent_path=parent_path,
     )
     marker_name, candidate_name, unsupported_name = _transaction_names(name)
+    disposition_name = _transaction_disposition_name(name)
     if any(
         _read_optional_safe_file_at(parent_fd, reserved) is not None
-        for reserved in (marker_name, candidate_name, unsupported_name)
+        for reserved in (
+            marker_name,
+            candidate_name,
+            disposition_name,
+            unsupported_name,
+        )
     ):
         raise _UnsafeConfigPath
 
@@ -2065,6 +2604,10 @@ def _durable_exchange_at(
             raise _PostReplaceDurabilityError from recovery_error
         if disposition == "committed":
             return
+        if disposition == "manual_target":
+            raise NtfyDisclosureConflictError(
+                "Configuration revision changed"
+            ) from exchange_error
         raise exchange_error
 
     try:
@@ -2078,6 +2621,10 @@ def _durable_exchange_at(
             raise _PostReplaceDurabilityError from recovery_error
         if disposition == "committed":
             return
+        if disposition == "manual_target":
+            raise NtfyDisclosureConflictError(
+                "Configuration revision changed"
+            ) from probe_error
         raise _PostReplaceDurabilityError from probe_error
 
     try:
@@ -2591,7 +3138,9 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
         raise
 
 
-def secure_runtime_paths(config: Config) -> None:
+def secure_runtime_paths(
+    config: Config, *, secure_config_path: bool = True
+) -> None:
     for path in {
         config.path.parent,
         config.gmail_token_file.parent,
@@ -2599,6 +3148,11 @@ def secure_runtime_paths(config: Config) -> None:
         config.database_file.parent,
     }:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.chmod(0o700)
-    if config.path.exists():
+        if stat.S_IMODE(path.stat().st_mode) != 0o700:
+            path.chmod(0o700)
+    if (
+        secure_config_path
+        and config.path.exists()
+        and stat.S_IMODE(config.path.stat().st_mode) != 0o600
+    ):
         config.path.chmod(0o600)

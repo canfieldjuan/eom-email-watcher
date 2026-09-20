@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,7 @@ from connect_automate import connect
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
-from eom_email_watcher.config import load_config
+from eom_email_watcher.config import config_admission_snapshot, load_config
 from eom_email_watcher.db import Store
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
@@ -48,7 +49,7 @@ from eom_email_watcher.microsoft_calendar import (
     StaleCalendarCursor,
 )
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
-from eom_email_watcher.model import Analysis
+from eom_email_watcher.model import Analysis, LocalModel
 from eom_email_watcher.runtime import (
     Runtime,
     load_runtime,
@@ -159,15 +160,202 @@ notifications_enabled = {notifications_setting}
 ''',
         encoding="utf-8",
     )
+    path.parent.chmod(0o700)
+    path.chmod(0o600)
 
 
-def request(config_path: Path, operation: str, payload: dict[str, object] | None = None):
-    return {
+def request(
+    config_path: Path,
+    operation: str,
+    payload: dict[str, object] | None = None,
+    *,
+    admission: bool = True,
+):
+    value = {
         "protocol": 1,
         "operation": operation,
         "config_path": str(config_path),
         "payload": payload or {},
     }
+    if admission and operation in engine_api.ADMISSION_REQUIRED_OPERATIONS:
+        value["admission_token"] = config_admission_snapshot(config_path).token
+    return value
+
+
+def patch_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: Runtime,
+) -> None:
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "runtime_from_config",
+        lambda _config, **_kwargs: runtime,
+    )
+
+
+def test_config_admission_snapshot_is_sanitized_and_compares_current(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    topic = "private-topic-canary-0123456789"
+    write_config(config_path, ntfy_topic=topic)
+
+    snapshot = engine_api._response(
+        request(config_path, "config.admission.snapshot")
+    )
+    token = snapshot["data"]["token"]
+    compared = engine_api._response(
+        request(
+            config_path,
+            "config.admission.compare",
+            {"token": token},
+        )
+    )
+
+    assert snapshot["ok"] is True
+    assert set(snapshot["data"]) == {"settings", "token"}
+    assert set(token) == {"version", "revision", "identity"}
+    assert token["version"] == 1
+    assert compared["data"] == {"current": True}
+    rendered = json.dumps(snapshot, sort_keys=True)
+    assert topic not in rendered
+    assert str(config_path) not in rendered
+
+
+def test_config_admission_token_survives_safe_read_runtime_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    monkeypatch.setattr(LocalModel, "health", lambda _self: (True, "test"))
+    snapshot = engine_api._response(
+        request(config_path, "config.admission.snapshot")
+    )
+    token = snapshot["data"]["token"]
+
+    health = engine_api._response(request(config_path, "health.get"))
+    settings = engine_api._response(request(config_path, "settings.get"))
+    accounts = engine_api._response(request(config_path, "mail.accounts.list"))
+    compared = engine_api._response(
+        request(
+            config_path,
+            "config.admission.compare",
+            {"token": token},
+        )
+    )
+
+    assert health["ok"] is True
+    assert settings["ok"] is True
+    assert accounts["ok"] is True
+    assert compared["data"] == {"current": True}
+
+
+def test_config_admission_compare_rejects_same_byte_atomic_replacement(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    token = engine_api._response(
+        request(config_path, "config.admission.snapshot")
+    )["data"]["token"]
+    replacement = tmp_path / "replacement.toml"
+    replacement.write_bytes(config_path.read_bytes())
+    replacement.chmod(0o600)
+    os.replace(replacement, config_path)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.admission.compare",
+            {"token": token},
+        )
+    )
+
+    assert response["error"] == {
+        "code": "conflict",
+        "message": "Configuration admission snapshot changed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("host.operation_lock", {}),
+        ("watcher.check", {"dry_run": True}),
+        ("connect.queue.pump", {"limit": 1}),
+        ("notifications.pending", {"limit": 1}),
+        ("notifications.pending_under_host_lock", {"limit": 1}),
+        ("notifications.count_under_host_lock", {}),
+        (
+            "notifications.ack",
+            {"message_id": "one", "kind": "fallback", "analysis_at": None},
+        ),
+    ],
+)
+def test_worker_effect_operations_require_admission_token(
+    tmp_path: Path,
+    operation: str,
+    payload: dict[str, object],
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+
+    response = engine_api._response(
+        request(config_path, operation, payload, admission=False)
+    )
+
+    assert response["error"] == {
+        "code": "invalid_request",
+        "message": "admission_token is invalid",
+    }
+
+
+def test_stale_admission_token_prevents_notification_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    guarded = request(
+        config_path,
+        "notifications.ack",
+        {"message_id": "one", "kind": "fallback", "analysis_at": None},
+    )
+    replacement = tmp_path / "replacement.toml"
+    replacement.write_bytes(config_path.read_bytes())
+    replacement.chmod(0o600)
+    os.replace(replacement, config_path)
+    called = False
+
+    def unexpected_effect(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("notification acknowledgement must not run")
+
+    monkeypatch.setattr(Store, "acknowledge_notification", unexpected_effect)
+
+    response = engine_api._response(guarded)
+
+    assert response["error"]["code"] == "conflict"
+    assert called is False
+
+
+def test_config_admission_snapshot_rejects_unsafe_path_generically(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "sensitive-name.toml"
+    write_config(config_path)
+    config_path.chmod(0o640)
+
+    response = engine_api._response(
+        request(config_path, "config.admission.snapshot")
+    )
+
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": "Configuration admission snapshot is unavailable",
+    }
+    assert str(config_path) not in json.dumps(response)
 
 
 def microsoft_principal(*, object_id: str = "object-1") -> MicrosoftPrincipal:
@@ -279,7 +467,7 @@ def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
             "confidence": 0.9,
         },
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     def reject_external_access(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Inbox query attempted external provider access")
@@ -333,7 +521,7 @@ def test_inbox_exposes_calendar_proposal_only_with_automation_entitlement(
         "state": "awaiting_confirmation",
         "proposal_version": 1,
     }
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         runtime.store,
         "query_inbox",
@@ -367,7 +555,7 @@ def test_inbox_preserves_durable_calendar_write_outcomes_after_entitlement_expir
     write_config(config_path)
     runtime = load_runtime(config_path)
     proposal = {"run_id": "run-1", "state": state, "proposal_version": 1}
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         runtime.store,
         "query_inbox",
@@ -394,7 +582,7 @@ def test_calendar_proposal_decision_binds_message_and_exact_proposal(
     write_config(config_path)
     runtime = load_runtime(config_path)
     run_id = "77d9c691-1c91-4e23-8f03-92973e12c385"
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         runtime.store,
         "automation_run_for_message",
@@ -463,7 +651,7 @@ def test_calendar_proposal_decision_rejects_cross_message_run_binding(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         runtime.store,
         "automation_run_for_message",
@@ -582,7 +770,7 @@ def test_inbox_delete_and_clear_are_local_only_and_explicit(
             subject="Invoice status",
             received_at=datetime.now(UTC).isoformat(),
         )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     def reject_external_access(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Local inbox mutation attempted external provider access")
@@ -646,7 +834,7 @@ def test_legacy_gmail_health_reports_only_the_active_account_connection(
         address="active@example.com",
         active=True,
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
     )
@@ -3887,7 +4075,7 @@ def test_settings_update_applies_shortened_retention_immediately(
     assert [row["message_id"] for row in runtime.store.recent(10)] == ["current"]
 
 
-def test_production_check_reloads_retention_after_acquiring_operation_lock(
+def test_production_check_rejects_config_change_while_acquiring_operation_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = tmp_path / "config.toml"
@@ -3936,7 +4124,6 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
     def shorten_retention_before_lock_entry(lock_path: Path, busy_message: str):
         nonlocal lock_entered
         engine_api.update_settings(config_path, {"retention_days": 1})
-        stale_runtime.store.purge(1)
         lock_entered = True
         yield
 
@@ -3946,9 +4133,11 @@ def test_production_check_reloads_retention_after_acquiring_operation_lock(
 
     response = engine_api._response(request(config_path, "watcher.check"))
 
-    assert response["ok"] is True
-    assert response["data"]["discovered"] == 0
-    assert load_count == 1
+    assert response["error"] == {
+        "code": "conflict",
+        "message": "Configuration admission snapshot changed",
+    }
+    assert load_count == 0
     assert load_config(config_path).retention_days == 1
     assert stale_runtime.store.recent(10) == []
 
@@ -3986,7 +4175,7 @@ def test_notifications_pending_purges_expired_intents_before_host_delivery(
             "confidence": 0.9,
         },
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     count_response = None
     if operation == "notifications.pending_under_host_lock":
@@ -4275,7 +4464,7 @@ def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
         "from_token",
         lambda _credentials, token: opened_tokens.append(token) or FakeAttachmentGmail(),
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     response = engine_api._response(
         request(
@@ -4383,7 +4572,7 @@ def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
         "from_credentials_file",
         lambda path: FakeAttachmentImap() if path == credentials_file else pytest.fail(path),
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     response = engine_api._response(
         request(
@@ -4427,7 +4616,7 @@ def test_attachment_export_rejects_an_unconfigured_account_before_provider_acces
     )
     destination = tmp_path / "exports"
     destination.mkdir()
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "load_mailbox_account",
@@ -4505,7 +4694,7 @@ def test_connect_paths_reject_an_unconfigured_account_before_provider_interactio
         local_message_id,
         (AttachmentDescriptor("2", "attachment", "file.pdf", "application/pdf", 4, 0),),
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     def reject_provider_interaction(*_args: object, **_kwargs: object) -> None:
         pytest.fail("An unavailable mailbox must be rejected before provider interaction")
@@ -4540,7 +4729,7 @@ def test_attachment_export_fails_closed_before_gmail_or_file_write(
     runtime = load_runtime(config_path)
     destination = tmp_path / "exports"
     destination.mkdir()
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -4601,7 +4790,7 @@ def test_attachment_export_reports_provider_neutral_byte_count_mismatch(
         def attachment_bytes(self, *args) -> bytes:
             return b"bad"
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -4690,7 +4879,7 @@ def test_zero_sender_check_is_inactive_without_gmail_and_uses_operation_lock(
         received_at="2026-07-18T14:00:00+00:00",
     )
     _mark_test_analyzed(runtime.store, "queued", FakeModel().analyze().model_dump())
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -4732,7 +4921,7 @@ def test_zero_sender_check_still_rejects_incompatible_host_delivery(
         ntfy_topic="configured-private-topic",
     )
     runtime = load_runtime(config_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -4806,7 +4995,7 @@ def test_check_defers_delivery_until_state_checked_ack(
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     loaded.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
     checked = engine_api._response(request(config_path, "watcher.check"))
@@ -4866,7 +5055,7 @@ def test_check_maps_unresolved_legacy_recovery_to_retryable_error(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "run_watcher_check",
@@ -4891,7 +5080,7 @@ def test_check_maps_mailbox_identity_change_to_domain_error(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "run_watcher_check",
@@ -5007,7 +5196,7 @@ def test_rule_put_then_real_watcher_check_dispatches_matching_connect_fire(
         "confirm_each": False,
     }
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: InvoiceGmail())
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     monkeypatch.setattr(engine_api.connect, "require_connect_entitlement", lambda: None)
@@ -5100,7 +5289,7 @@ def test_host_notification_contract_delivers_and_state_checks_automation_review(
         next_state="manual_review",
         failure_code="source_invalid",
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     pending = engine_api._response(request(config_path, "notifications.pending"))
     intent = pending["data"]["items"][0]
@@ -5166,7 +5355,7 @@ def test_check_rejects_ntfy_before_gmail_or_state_mutation(
         received_at="2026-07-18T14:00:00+00:00",
     )
     loaded.store.record_failure("queued", "local model unavailable", 0)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.GmailGateway,
         "from_token",
@@ -5216,7 +5405,7 @@ def test_unsupported_platform_is_reported_before_production_check(
         gmail_calls += 1
         return FakeGmail()
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     checked_lock_paths: list[Path] = []
 
     def operation_lock_unsupported(lock_path: Path) -> bool:
@@ -5287,7 +5476,7 @@ def test_disabled_notifications_hide_analysis_and_fallback_intents(
         },
     )
     runtime.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
 
     pending = engine_api._response(request(config_path, "notifications.pending"))
@@ -5311,7 +5500,7 @@ def test_check_reports_complete_notification_backlog(
     loaded.store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     _bind_test_mailbox(loaded.store, "gmail", "gmail-default")
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
     monkeypatch.setattr(runtime.store, "notification_intent_count", lambda: 501)
 
@@ -5335,7 +5524,7 @@ def test_protocol_rejects_unknown_top_level_fields_before_check(
         gmail_calls += 1
         return FakeGmail()
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", gmail_from_token)
 
     for field, value in (("dry_run", True), ("paylod", {"dry_run": True})):
@@ -5363,7 +5552,7 @@ def test_gmail_error_response_redacts_configured_path(
     def fail_from_token(*args):
         raise GmailError(f"Invalid OAuth token file: {sensitive_path}")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", fail_from_token)
 
     with caplog.at_level(logging.WARNING, logger=engine_api.__name__):
@@ -5724,7 +5913,7 @@ def test_account_scoped_rule_create_rejects_limit_before_mailbox_reconciliation(
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
     monkeypatch.setattr(engine_api, "operation_lock", available_lock)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "load_mailbox_account",
@@ -5745,7 +5934,7 @@ def test_account_scoped_rule_distinguishes_unknown_and_transient_identity_failur
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     definition = _automation_definition()
     definition["scope"] = {"provider": "gmail", "account_id": "missing"}
 
@@ -5818,7 +6007,7 @@ def test_account_scoped_rule_edit_rejects_before_mailbox_reconciliation(
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
     monkeypatch.setattr(engine_api, "operation_lock", available_lock)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "load_mailbox_account",
@@ -5878,7 +6067,7 @@ def test_account_scoped_rule_verification_and_commit_share_operation_lock(
 
     monkeypatch.setattr(engine_api, "operation_lock_supported", lambda path: True)
     monkeypatch.setattr(engine_api, "operation_lock", operation_lock)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api,
         "load_mailbox_account",

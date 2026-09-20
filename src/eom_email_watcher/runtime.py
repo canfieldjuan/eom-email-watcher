@@ -168,9 +168,13 @@ def load_configured_mailbox(config: Config, store: Store) -> MailboxSession:
     return load_mailbox_account(config, store, account.provider, account.account_id)
 
 
-def load_runtime(config_path: Path) -> Runtime:
-    config = load_config(config_path)
-    secure_runtime_paths(config)
+def runtime_from_config(
+    config: Config, *, config_path_already_safe: bool = False
+) -> Runtime:
+    secure_runtime_paths(
+        config,
+        secure_config_path=not config_path_already_safe,
+    )
     store = Store(config.database_file)
     store.initialize()
     if config.model_backend == "gateway":
@@ -191,3 +195,7 @@ def load_runtime(config_path: Path) -> Runtime:
             config.model_require_auth,
         )
     return Runtime(config=config, store=store, model=model)
+
+
+def load_runtime(config_path: Path) -> Runtime:
+    return runtime_from_config(load_config(config_path))

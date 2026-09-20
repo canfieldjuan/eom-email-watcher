@@ -139,6 +139,11 @@ acknowledgement, malformed TOML, unrelated config error, or unsafe path yields
 `manual_repair_required`. None of these reads grant consent or mutate the
 config.
 
+On non-POSIX hosts, every remaining path-read failure, including a directory,
+ACL denial, sharing violation, and I/O error, is also
+`manual_repair_required`. Responses use only the fixed classification and never
+include the rejected path or operating-system error.
+
 Candidate validation must call the same parser/validator used by
 `load_config`; do not copy a partial list of config checks into the migration.
 The shared seam may accept candidate bytes plus the logical final config path
@@ -232,17 +237,27 @@ The acknowledgement is one config-wide transaction:
    survives, and forces manual repair.
 7. Recheck the destination identity and exact original bytes, then revalidate
    the held parent and current pathname immediately before `RENAME_EXCHANGE`.
-   The exchange makes the candidate the config and places the displaced
-   original at the fixed candidate name. Recovery removes that displaced file
-   only when marker identity, metadata, safe-file predicates, and digests prove
-   it is the recorded original.
-8. Reconcile exact states before returning: marker-only before link and
-   marker-plus-exact-candidate before exchange are aborted; candidate-at-target
-   plus recorded original-at-candidate is committed; a manual target plus the
-   exact displaced original preserves the manual target while securely
-   removing only the old secret and marker. A fixed candidate without a valid
-   exact-inode marker is manual state and is never deleted by byte coincidence.
-9. If `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, or exchange is unavailable on the
+   The exchange makes the candidate the config and places the displaced entry
+   at the fixed candidate name. Consent commits only when that displaced entry
+   is the marker's exact original inode, safe metadata, and digest.
+8. Before deleting a verified original, durably link a fully written unnamed,
+   owner-private, secret-free `commit` disposition. Before rolling back any
+   other displaced entry, durably link a `rollback` disposition with its exact
+   device, inode, mode, link count, owner, size, timestamp, and digest when it
+   can be safely read. It repeats the original and acknowledgement descriptors
+   but contains no config bytes. A crash cannot expose a partial named record.
+9. On a displaced mismatch, atomically exchange the entries back. Verify that
+   the captured manual inode and bytes are live again and that the exact
+   provenance-owned acknowledgement inode is isolated before removing the
+   acknowledgement and transaction files. Exchange response loss is reconciled
+   from both namespaces; no result with an unverified acknowledgement live is
+   reported as consent.
+10. Reconcile exact states before returning: pre-exchange marker states abort;
+   a `commit` disposition accepts only the exact committed arrangement; a
+   `rollback` disposition accepts only the exact pre-rollback or completed
+   rollback arrangement. A manual target is preserved. A fixed candidate
+   without valid provenance is never deleted by byte coincidence.
+11. If `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, or exchange is unavailable on the
    exact filesystem, durably write a secret-free unsupported marker, close any
    unnamed inode, remove only an exactly proven linked candidate and
    transaction marker, leave the config unchanged, and make later status calls
@@ -257,12 +272,13 @@ The durability invariant is **exact old bytes or fully prevalidated new bytes**.
 A failure before exchange leaves the exact old config at the path and removes
 only files whose marker provenance and identities prove they belong to that
 attempt. Once exchange may have succeeded, recovery classifies the exact marker,
-target, and candidate disposition before deleting or restoring anything. A
-directory-sync failure, final-read failure, sidecar termination, timeout, or
-unprovable response loss returns the fixed secret-free `outcome_unknown` class
-when the process can still respond. Ambiguous or tampered states preserve every
-file and surface `manual_repair_required`; recovery never deletes a manual
-concurrent write.
+disposition, target, and candidate before deleting or restoring anything. A
+mismatched displaced entry never grants consent: recovery restores it live and
+returns conflict. A directory-sync failure, final-read failure, sidecar
+termination, timeout, or unprovable response loss after a verified commit
+returns the fixed secret-free `outcome_unknown` class when the process can still
+respond. Ambiguous or tampered states preserve every unproven file and surface
+`manual_repair_required`; recovery never deletes a manual concurrent write.
 
 The parent pathname is reopened from the filesystem root and compared with the
 held descriptor immediately before each mutation. Linux does not provide a
@@ -310,7 +326,8 @@ Add one native admission coordinator with these states:
 - `Missing`;
 - `AwaitingAcknowledgement { expected_revision }`;
 - `ManualRepairRequired`; and
-- `Admitted`, with config-dependent workers started exactly once.
+- `Admitted { admission_token }`, with config-dependent workers started exactly
+  once.
 
 The bridge and startup sequence are:
 
@@ -323,28 +340,46 @@ The bridge and startup sequence are:
    matching held state. If a background/autostart launch reaches either held
    repair state, show the main window so the operator can see the required
    action or fixed repair message.
-3. Only `normal_admission` permits the coordinator to call normal
-   `settings_with_timeout`. If it fails, transition to
-   `ManualRepairRequired`, retain no returned config data, and keep every worker
-   held. If it succeeds, create/start `ConnectQueueScheduler`, run the one
-   startup notification-delivery pass, construct/start `PollScheduler` from the
-   admitted settings, and transition atomically to `Admitted`.
-4. Expose one secret-free Tauri `config_admission_status` command that refreshes
+3. Only `normal_admission` permits `config.admission.snapshot`. That operation
+   recovers a pending disclosure transaction under the config lock, safely
+   opens the config once, parses the bytes from that descriptor, and returns
+   sanitized settings plus a non-secret `{version, revision, identity}` token
+   derived from those same bytes and complete file identity. Unsafe, unreadable,
+   invalid, or still-repairable config returns one generic configuration error.
+4. Native code immediately calls `config.admission.compare` with that token. A
+   same-byte inode replacement is stale because identity participates in the
+   token. If snapshot or compare fails, transition to `ManualRepairRequired`,
+   retain no settings, and keep workers held. If both succeed, start the queue,
+   startup notification pass, and poll scheduler from the snapshot settings,
+   then transition atomically to `Admitted { admission_token }`.
+5. Expose one secret-free Tauri `config_admission_status` command that refreshes
    through this coordinator and returns only `missing`,
    `acknowledgement_required` plus its revision, `manual_repair_required`, or
    `admitted`. The old filesystem-existence-only `config_status` is no longer a
    startup authority (`desktop/src-tauri/src/engine.rs:1314-1322`;
    `desktop/src-tauri/src/lib.rs:249-259`).
-5. `config_initialize` is allowed only from `Missing`. After it creates the
+6. `config_initialize` is allowed only from `Missing`. After it creates the
    config, the coordinator restarts at secret-free inspection, performs normal
    admission, and starts workers only on success. The acknowledgement command
    is allowed only from `AwaitingAcknowledgement` and always enters the
    reconciliation sequence above, even when its engine request errors.
-6. Every config-dependent Tauri command, including `settings_get`, mailbox,
+7. Every config-dependent Tauri command, including `settings_get`, mailbox,
    Inbox, watcher-check, notification, Connect, and watchlist operations,
    checks the native gate and returns fixed `configuration_not_admitted` unless
    the state is `Admitted`. Frontend visibility is not the authority.
-7. Worker start is serialized with admission and idempotent. Concurrent status
+8. Every worker effect request supplies the admitted token at the top level.
+   `host.operation_lock`, `watcher.check`, `connect.queue.pump`,
+   `notifications.pending`, `notifications.pending_under_host_lock`,
+   `notifications.count_under_host_lock`, and `notifications.ack` require it.
+   Each compares it inside the same safe-open config load used to construct that
+   request's runtime, before its operation lock or effect. Missing or malformed
+   tokens are invalid requests, stale tokens are conflicts, and unsafe current
+   config is a generic configuration error with zero effect.
+9. Successful settings or watchlist mutation takes and compares a new snapshot,
+   then replaces the shared worker token before returning. Other operations
+   tolerate an omitted token. Status, acknowledgement, snapshot, and compare
+   remain unbound so recovery can run while admission is held.
+10. Worker start is serialized with admission and idempotent. Concurrent status
    refreshes, initialization, or acknowledgement completion cannot create a
    second queue pump, delivery pass, or poll scheduler. Closing/hiding the
    window does not release the gate or start work.
@@ -451,19 +486,26 @@ behavior and then pass without weakening `load_config`:
    simultaneous actions produce no lost update and at most one replacement.
    Repeating the stale request is non-mutating.
 8. **Durability injection:** candidate create/write/`fsync`, validation,
-   precommit identity/CAS, replace, directory `fsync`, final-load, process exit,
-   and response-loss points prove the old-or-fully-validated-new invariant.
-   Pre-replace failures preserve exact old bytes; post-replace uncertainty is
-   reported as `outcome_unknown`, never as successful rollback.
+   precommit identity/CAS, exchange, commit/rollback disposition durability,
+   rollback exchange, each directory `fsync`, final-load, process exit, and
+   response loss prove the old-or-fully-validated-new invariant. Atomic
+   replacement immediately before exchange, death after exchange or during
+   rollback, rollback response loss, repeated recovery, candidate/disposition
+   tamper, and topic-removing manual replacement never grant consent or hide or
+   delete the manual entry.
 9. **Indeterminate reconciliation:** success, conflict, `outcome_unknown`,
    timeout, broken pipe, and response loss all refresh status and normal
    admission. A loadable acknowledged result proceeds, a remaining repairable
    revision needs another click, and every other result holds workers with a
    fixed error. No path automatically retries.
-10. **Engine protocol:** both operations reject unknown payload fields and
-   malformed revisions; status and every error response are secret-free. The
-   tests seed canary topic/config values and assert those canaries appear in no
-   response or captured log/stderr.
+10. **Engine protocol:** disclosure and admission operations reject unknown
+   payload fields and malformed revisions or tokens. Snapshot settings contain
+   no topic, config path, or secret. All seven worker effects reject missing
+   tokens and a stale token produces zero store, mailbox, notification, or queue
+   effect. Non-POSIX directory, permission, sharing, and I/O errors are generic
+   manual repair or configuration errors. Status and every error response are
+   secret-free; canary topic/config values appear in no response or captured
+   log/stderr.
 11. **Rust bridge:** the engine deserializes only the documented secret-free
    states, passes the expected revision unchanged, maps stable errors, owns the
    serialized admission/worker state, and exposes no config values.

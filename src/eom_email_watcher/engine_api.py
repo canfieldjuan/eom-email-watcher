@@ -38,6 +38,8 @@ from .automation.rules import (
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
+    ConfigAdmissionStaleError,
+    ConfigAdmissionUnavailableError,
     ConfigAlreadyExistsError,
     ConfigError,
     DuplicateSenderError,
@@ -51,6 +53,8 @@ from .config import (
     SenderNotFoundError,
     acknowledge_ntfy_disclosure,
     add_sender,
+    admitted_config,
+    config_admission_snapshot,
     initialize_config,
     load_config,
     ntfy_disclosure_status,
@@ -141,6 +145,7 @@ from .runtime import (
     mail_provider_connection_available,
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
+    runtime_from_config,
 )
 from .service import (
     LegacyMailboxIdentityUnverified,
@@ -168,7 +173,20 @@ INBOX_CATEGORIES = frozenset(
     }
 )
 INBOX_STATUSES = frozenset({"pending", "analyzed", "summarized", "skipped"})
-REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
+REQUEST_FIELDS = frozenset(
+    {"protocol", "operation", "config_path", "payload", "admission_token"}
+)
+ADMISSION_REQUIRED_OPERATIONS = frozenset(
+    {
+        "connect.queue.pump",
+        "host.operation_lock",
+        "notifications.ack",
+        "notifications.count_under_host_lock",
+        "notifications.pending",
+        "notifications.pending_under_host_lock",
+        "watcher.check",
+    }
+)
 
 logger = logging.getLogger(__name__)
 SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
@@ -293,7 +311,47 @@ def _decode_inbox_cursor(value: object) -> tuple[str, str] | None:
     return received_at, message_id
 
 
+def _admission_token(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "revision",
+        "identity",
+    }:
+        raise ApiError("invalid_request", "admission_token is invalid")
+    revision = value.get("revision")
+    identity = value.get("identity")
+    if (
+        type(value.get("version")) is not int
+        or value["version"] != 1
+        or not isinstance(revision, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is None
+        or not isinstance(identity, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", identity) is None
+    ):
+        raise ApiError("invalid_request", "admission_token is invalid")
+    return dict(value)
+
+
+def _admitted_config(request: dict[str, object]) -> Config:
+    token = _admission_token(request.get("admission_token"))
+    try:
+        return admitted_config(_config_path(request), token)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration admission snapshot changed") from exc
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+
+
 def _runtime(request: dict[str, object]) -> Runtime:
+    operation = request.get("operation")
+    if operation in ADMISSION_REQUIRED_OPERATIONS:
+        return runtime_from_config(
+            _admitted_config(request),
+            config_path_already_safe=True,
+        )
     return load_runtime(_config_path(request))
 
 
@@ -1666,7 +1724,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "pending_notifications": _host_notification_intent_count(active_runtime),
         }
 
-    config = load_config(_config_path(request))
+    config = _admitted_config(request)
     lock_path = _production_check_lock_path(config)
     if not operation_lock_supported(lock_path):
         raise ApiError(
@@ -4967,6 +5025,36 @@ def _config_initialize(request: dict[str, object]) -> dict[str, object]:
     return {"created": True, "settings": _settings_data(config)}
 
 
+def _config_admission_snapshot(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    try:
+        snapshot = config_admission_snapshot(_config_path(request))
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+    return {
+        "settings": _settings_data(snapshot.config),
+        "token": snapshot.token,
+    }
+
+
+def _config_admission_compare(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"token"})
+    token = _admission_token(payload.get("token"))
+    try:
+        admitted_config(_config_path(request), token)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration admission snapshot changed") from exc
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+    return {"current": True}
+
+
 def _config_ntfy_disclosure_status(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     status = ntfy_disclosure_status(_config_path(request))
@@ -5178,6 +5266,8 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.disconnect": _calendar_write_disconnect,
     "calendar.write.status": _calendar_write_status,
     "calendar.automation.decide": _calendar_automation_decide,
+    "config.admission.compare": _config_admission_compare,
+    "config.admission.snapshot": _config_admission_snapshot,
     "config.initialize": _config_initialize,
     "config.ntfy_disclosure.acknowledge": _config_ntfy_disclosure_acknowledge,
     "config.ntfy_disclosure.status": _config_ntfy_disclosure_status,
