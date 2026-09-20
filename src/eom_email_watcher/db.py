@@ -1987,7 +1987,12 @@ def _certificate_iso_date(value: object, *, label: str) -> str:
     return value
 
 
-def _certificate_provenance(value: object, *, label: str) -> dict[str, object]:
+def _certificate_provenance(
+    value: object,
+    *,
+    label: str,
+    page_count: int,
+) -> dict[str, object]:
     provenance = _certificate_object(
         value,
         keys={"span_id", "page", "bbox", "exact_text", "token_start", "token_end"},
@@ -1995,7 +2000,7 @@ def _certificate_provenance(value: object, *, label: str) -> dict[str, object]:
     )
     _certificate_string(provenance["span_id"], label=f"{label} span id")
     page = provenance["page"]
-    if type(page) is not int or page < 1:
+    if type(page) is not int or not 1 <= page <= page_count:
         raise CertificateResultInvalid(f"certificate {label} page is invalid")
     bbox = provenance["bbox"]
     if type(bbox) is not list or len(bbox) != 4 or any(
@@ -2023,7 +2028,12 @@ def _certificate_provenance(value: object, *, label: str) -> dict[str, object]:
     return provenance
 
 
-def _certificate_text_value(value: object, *, label: str) -> dict[str, object] | None:
+def _certificate_text_value(
+    value: object,
+    *,
+    label: str,
+    page_count: int,
+) -> dict[str, object] | None:
     if value is None:
         return None
     text_value = _certificate_object(
@@ -2035,14 +2045,23 @@ def _certificate_text_value(value: object, *, label: str) -> dict[str, object] |
     whole_span = text_value["whole_span"]
     if type(whole_span) is not bool:
         raise CertificateResultInvalid(f"certificate {label} whole_span is invalid")
-    provenance = _certificate_provenance(text_value["provenance"], label=label)
+    provenance = _certificate_provenance(
+        text_value["provenance"],
+        label=label,
+        page_count=page_count,
+    )
     source_text = str(provenance["exact_text"])
     if text not in source_text or (whole_span and text != source_text):
         raise CertificateResultInvalid(f"certificate {label} text does not match its provenance")
     return text_value
 
 
-def _certificate_date_value(value: object, *, label: str) -> dict[str, object] | None:
+def _certificate_date_value(
+    value: object,
+    *,
+    label: str,
+    page_count: int,
+) -> dict[str, object] | None:
     if value is None:
         return None
     date_value = _certificate_object(
@@ -2067,7 +2086,11 @@ def _certificate_date_value(value: object, *, label: str) -> dict[str, object] |
         parsed_iso = _certificate_iso_date(iso, label=label)
         if parsed_candidates != [parsed_iso]:
             raise CertificateResultInvalid(f"certificate {label} unambiguous date is inconsistent")
-    _certificate_provenance(date_value["provenance"], label=label)
+    _certificate_provenance(
+        date_value["provenance"],
+        label=label,
+        page_count=page_count,
+    )
     return date_value
 
 
@@ -2159,7 +2182,7 @@ def _validate_certificate_record(
         raise CertificateResultInvalid("certificate source digest is invalid")
     byte_size = source["byte_size"]
     page_count = source["page_count"]
-    if type(byte_size) is not int or byte_size < 0 or type(page_count) is not int or page_count < 0:
+    if type(byte_size) is not int or byte_size < 0 or type(page_count) is not int or page_count < 1:
         raise CertificateResultInvalid("certificate source dimensions are invalid")
     display_name = _certificate_string(source["display_name"], label="source display name")
     parser = _certificate_object(
@@ -2176,9 +2199,13 @@ def _validate_certificate_record(
     ):
         raise CertificateResultInvalid("certificate source does not match its Connect job")
 
-    insured = _certificate_text_value(record["insured"], label="insured")
-    _certificate_text_value(record["certificate_holder"], label="certificate holder")
-    _certificate_text_value(record["producer"], label="producer")
+    insured = _certificate_text_value(record["insured"], label="insured", page_count=page_count)
+    _certificate_text_value(
+        record["certificate_holder"],
+        label="certificate holder",
+        page_count=page_count,
+    )
+    _certificate_text_value(record["producer"], label="producer", page_count=page_count)
 
     raw_policies = record["policies"]
     if type(raw_policies) is not list or len(raw_policies) > MAX_CERTIFICATE_POLICY_ROWS:
@@ -2199,11 +2226,19 @@ def _validate_certificate_record(
             label=f"policy {ordinal}",
         )
         text_fields = {
-            name: _certificate_text_value(policy[name], label=f"policy {ordinal} {name}")
+            name: _certificate_text_value(
+                policy[name],
+                label=f"policy {ordinal} {name}",
+                page_count=page_count,
+            )
             for name in ("coverage", "insurer", "policy_number")
         }
         dates = {
-            name: _certificate_date_value(policy[name], label=f"policy {ordinal} {name}")
+            name: _certificate_date_value(
+                policy[name],
+                label=f"policy {ordinal} {name}",
+                page_count=page_count,
+            )
             for name in ("effective_date", "expiration_date")
         }
         if all(value is None for value in (*text_fields.values(), *dates.values())):
@@ -3920,7 +3955,7 @@ class Store:
 
         with self.connection() as db:
             rows = db.execute(
-                """SELECT certificate.*, policy.policy_id, policy.ordinal,
+                """SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
                     CASE WHEN COALESCE(dispatch.source_available, 1) = 1 AND EXISTS (
                         SELECT 1 FROM messages AS message
                         JOIN message_attachments AS attachment
@@ -3941,76 +3976,80 @@ class Store:
                 LIMIT ?""",
                 (limit,),
             ).fetchall()
-            record_cache: dict[str, dict[str, object]] = {}
-            values: list[dict[str, object]] = []
-            for row in rows:
-                certificate_id = str(row["certificate_id"])
-                record = record_cache.get(certificate_id)
-                if record is None:
-                    try:
-                        canonical_json = bytes(row["canonical_result_json"])
-                        validated = _validate_certificate_record(canonical_json)
-                    except (CertificateResultInvalid, TypeError, ValueError) as exc:
-                        raise RuntimeError("Stored certificate ledger record is invalid") from exc
-                    if (
-                        validated.canonical_json != canonical_json
-                        or validated.sha256 != row["result_sha256"]
-                    ):
-                        raise RuntimeError("Stored certificate ledger digest is invalid")
-                    mailbox_identity_key = str(row["mailbox_identity_key"])
-                    if (
-                        len(mailbox_identity_key) != 64
-                        or any(
-                            character not in "0123456789abcdef"
-                            for character in mailbox_identity_key
-                        )
-                        or not row["provider"]
-                        or not row["account_id"]
-                        or not row["source_message_id"]
-                        or not row["connect_job_id"]
-                    ):
-                        raise RuntimeError("Stored certificate source identity is invalid")
-                    _certificate_assert_projection(db, row, validated.record)
-                    record = validated.record
-                    record_cache[certificate_id] = record
+            grouped: dict[str, list[tuple[int, sqlite3.Row]]] = {}
+            for index, row in enumerate(rows):
+                grouped.setdefault(str(row["certificate_id"]), []).append((index, row))
+            values: list[dict[str, object] | None] = [None] * len(rows)
+            for certificate_id, selections in grouped.items():
+                parent = db.execute(
+                    "SELECT * FROM certificate_records WHERE certificate_id = ?",
+                    (certificate_id,),
+                ).fetchone()
+                if parent is None:
+                    raise RuntimeError("Stored certificate ledger parent is missing")
+                try:
+                    canonical_json = bytes(parent["canonical_result_json"])
+                    validated = _validate_certificate_record(canonical_json)
+                except (CertificateResultInvalid, TypeError, ValueError) as exc:
+                    raise RuntimeError("Stored certificate ledger record is invalid") from exc
+                if (
+                    validated.canonical_json != canonical_json
+                    or validated.sha256 != parent["result_sha256"]
+                ):
+                    raise RuntimeError("Stored certificate ledger digest is invalid")
+                mailbox_identity_key = str(parent["mailbox_identity_key"])
+                if (
+                    len(mailbox_identity_key) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in mailbox_identity_key
+                    )
+                    or not parent["provider"]
+                    or not parent["account_id"]
+                    or not parent["source_message_id"]
+                    or not parent["connect_job_id"]
+                ):
+                    raise RuntimeError("Stored certificate source identity is invalid")
+                record = validated.record
+                _certificate_assert_projection(db, parent, record)
 
-                policy: dict[str, object] | None = None
-                policy_id: str | None = None
-                policy_ordinal: int | None = None
-                if row["policy_id"] is not None:
-                    policy_id = str(row["policy_id"])
-                    policy_ordinal = int(row["ordinal"])
-                    stored_policies = record["policies"]
-                    if (
-                        type(stored_policies) is not list
-                        or not 0 <= policy_ordinal < len(stored_policies)
-                    ):
-                        raise RuntimeError("Stored certificate policy ordinal is invalid")
-                    policy = stored_policies[policy_ordinal]
-                    if type(policy) is not dict:
-                        raise RuntimeError("Stored certificate policy is invalid")
+                for index, selection in selections:
+                    policy: dict[str, object] | None = None
+                    policy_id: str | None = None
+                    policy_ordinal: int | None = None
+                    if selection["policy_id"] is not None:
+                        policy_id = str(selection["policy_id"])
+                        policy_ordinal = int(selection["ordinal"])
+                        stored_policies = record["policies"]
+                        if (
+                            type(stored_policies) is not list
+                            or not 0 <= policy_ordinal < len(stored_policies)
+                        ):
+                            raise RuntimeError("Stored certificate policy ordinal is invalid")
+                        policy = stored_policies[policy_ordinal]
+                        if type(policy) is not dict:
+                            raise RuntimeError("Stored certificate policy is invalid")
 
-                review = record["review"]
-                assert isinstance(review, dict)
-                review_reasons = list(review["reasons"])
-                if policy is None:
-                    expiry_status = "review"
-                else:
-                    policy_reasons = list(policy["review_reasons"])
-                    review_reasons.extend(policy_reasons)
-                    expiration = policy["expiration_date"]
-                    if expiration is None or expiration["iso"] is None:
+                    review = record["review"]
+                    assert isinstance(review, dict)
+                    review_reasons = list(review["reasons"])
+                    if policy is None:
                         expiry_status = "review"
                     else:
-                        expiry_date = date.fromisoformat(str(expiration["iso"]))
-                        if expiry_date < calendar_today:
-                            expiry_status = "expired"
-                        elif expiry_date == calendar_today:
-                            expiry_status = "expires_today"
+                        policy_reasons = list(policy["review_reasons"])
+                        review_reasons.extend(policy_reasons)
+                        expiration = policy["expiration_date"]
+                        if expiration is None or expiration["iso"] is None:
+                            expiry_status = "review"
                         else:
-                            expiry_status = "upcoming"
-                values.append(
-                    {
+                            expiry_date = date.fromisoformat(str(expiration["iso"]))
+                            if expiry_date < calendar_today:
+                                expiry_status = "expired"
+                            elif expiry_date == calendar_today:
+                                expiry_status = "expires_today"
+                            else:
+                                expiry_status = "upcoming"
+                    values[index] = {
                         "certificate_id": certificate_id,
                         "certificate_holder": self._certificate_text_value_from_record(
                             record, "certificate_holder"
@@ -4045,13 +4084,14 @@ class Store:
                         "expiry_status": expiry_status,
                         "review_state": "needs_review" if review_reasons else "extracted",
                         "review_reasons": review_reasons,
-                        "source_message_id": str(row["source_message_id"]),
-                        "source_part_id": str(row["source_part_id"]),
-                        "connect_job_id": str(row["connect_job_id"]),
-                        "source_available": bool(row["source_available"]),
+                        "source_message_id": str(parent["source_message_id"]),
+                        "source_part_id": str(parent["source_part_id"]),
+                        "connect_job_id": str(parent["connect_job_id"]),
+                        "source_available": bool(selection["source_available"]),
                     }
-                )
-        return values
+        if any(value is None for value in values):
+            raise RuntimeError("Stored certificate ledger row was not rendered")
+        return [value for value in values if value is not None]
 
     @staticmethod
     def _certificate_text_value_from_record(
@@ -6952,6 +6992,97 @@ class Store:
         if row is None:
             raise RuntimeError("Connect job was not readable after transition")
         return self._connect_job(row)
+
+    def reconcile_certificate_completed_replay(
+        self,
+        *,
+        job_id: str,
+        provider_app_id: str,
+        provider_instance_id: str,
+        result: dict[str, object],
+    ) -> ConnectJob:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("Certificate replay job is missing")
+            job = self._connect_job(current)
+            if (
+                job.protocol_version != 2
+                or job.capability_id != CERTIFICATE_CAPABILITY_ID
+                or job.status != "completed"
+            ):
+                raise RuntimeError("Certificate replay job is not a completed certificate job")
+            if (
+                job.provider_app_id != provider_app_id
+                or job.provider_instance_id != provider_instance_id
+            ):
+                raise ValueError("Connect v2 provider provenance cannot change")
+
+            parents = db.execute(
+                "SELECT * FROM certificate_records WHERE connect_job_id = ?",
+                (job_id,),
+            ).fetchall()
+            fires = db.execute(
+                "SELECT fire_id, state, reason FROM automation_fires WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()
+            if len(parents) != 1:
+                if (
+                    not parents
+                    and len(fires) == 1
+                    and fires[0]["state"] == "failed"
+                    and fires[0]["reason"] == "CERTIFICATE_RESULT_INVALID"
+                ):
+                    return job
+                raise RuntimeError("Completed certificate job is missing its durable projection")
+
+            outcome: str | None = None
+            try:
+                if job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
+                    raise CertificateResultInvalid("certificate capability version is unsupported")
+                outputs = _validate_generic_result(result)
+                if len(outputs) != 1 or outputs[0].media_type != CERTIFICATE_RESULT_MEDIA_TYPE:
+                    raise CertificateResultInvalid("certificate result output is invalid")
+                replay = _validate_certificate_record(
+                    outputs[0].payload,
+                    input_sha256=job.input_sha256,
+                    input_byte_size=job.input_byte_size,
+                    input_display_name=job.input_display_name,
+                )
+                parent = parents[0]
+                if (
+                    parent["result_sha256"] != replay.sha256
+                    or bytes(parent["canonical_result_json"]) != replay.canonical_json
+                ):
+                    raise CertificateResultConflict(
+                        "certificate result digest conflicts with prior evidence"
+                    )
+                _certificate_assert_projection(db, parent, replay.record)
+            except CertificateResultConflict:
+                outcome = "CERTIFICATE_RESULT_CONFLICT"
+            except (CertificateResultInvalid, ValueError):
+                outcome = "CERTIFICATE_RESULT_INVALID"
+
+            if outcome is not None:
+                changed = db.execute(
+                    """UPDATE automation_fires SET state = 'failed',
+                        state_version = state_version + 1, reason = ?, updated_at = ?
+                    WHERE job_id = ? AND state = 'completed'""",
+                    (outcome, stamp, job_id),
+                )
+                if changed.rowcount != 1:
+                    existing = db.execute(
+                        "SELECT state, reason FROM automation_fires WHERE job_id = ?", (job_id,)
+                    ).fetchall()
+                    if len(existing) != 1 or existing[0]["state"] != "failed":
+                        raise RuntimeError(
+                            "Certificate replay could not settle its automation fire"
+                        )
+            return job
 
     def reset_connect_job_for_resubmission(
         self,

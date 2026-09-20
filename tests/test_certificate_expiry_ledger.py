@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from test_connect_v2_engine_api import (
     seeded_runtime,
 )
 
+from eom_email_watcher import engine_api
 from eom_email_watcher.db import CertificateResultInvalid, Store, validate_certificate_result_json
 
 CERTIFICATE_MEDIA_TYPE = "application/vnd.local-connect.certificate+json"
@@ -103,7 +105,7 @@ def _record(*, policies: list[dict[str, object]] | None = None) -> dict[str, obj
     }
 
 
-def _result(record: dict[str, object]) -> dict[str, object]:
+def _capability_result(record: dict[str, object]) -> connect.CapabilityResult:
     payload = json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
     output = connect.CapabilityOutput(
         artifact_id=OUTPUT_ID,
@@ -113,7 +115,11 @@ def _result(record: dict[str, object]) -> dict[str, object]:
         sha256=hashlib.sha256(payload).hexdigest(),
         payload=payload,
     )
-    return connect.CapabilityResult((output,)).store_dict()
+    return connect.CapabilityResult((output,))
+
+
+def _result(record: dict[str, object]) -> dict[str, object]:
+    return _capability_result(record).store_dict()
 
 
 def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
@@ -247,6 +253,73 @@ def test_completed_certificate_projects_once_and_lists_all_expiry_states(tmp_pat
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
 
 
+def test_conflicting_terminal_replay_fails_fire_without_replacing_evidence(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    original = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(original),
+    )
+    conflicting = _record()
+    conflicting["insured"] = _text("Different Insured LLC", "different-insured")
+
+    replayed = engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(conflicting),
+            error=None,
+        ),
+    )
+
+    assert replayed.status == "completed"
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == "failed"
+    assert settled.reason == "CERTIFICATE_RESULT_CONFLICT"
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+    assert {row["insured"] for row in rows} == {"Northstar Services LLC"}
+
+
+def test_matching_terminal_replay_preserves_completed_fire(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+
+    engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(record),
+            error=None,
+        ),
+    )
+
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == "completed"
+    assert settled.reason == "connect_completed"
+
+
 def test_invalid_certificate_result_completes_provider_job_without_partial_ledger(
     tmp_path: Path,
 ) -> None:
@@ -349,6 +422,46 @@ def test_zero_policy_certificate_is_visible_as_review_placeholder(tmp_path: Path
     ]
 
 
+def test_ledger_query_loads_parent_blob_once_per_certificate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _fire, job_id = _certificate_fire_job(runtime.store)
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+
+    assert len(runtime.store.list_certificate_expiry_ledger(today="2026-09-20")) == 4
+    selection = [
+        statement
+        for statement in statements
+        if "FROM certificate_records AS certificate" in statement
+    ]
+    assert len(selection) == 1
+    assert "certificate.*" not in selection[0]
+    parent_reads = [
+        statement
+        for statement in statements
+        if "SELECT * FROM certificate_records WHERE certificate_id" in statement
+    ]
+    assert len(parent_reads) == 1
+
+
 @pytest.mark.parametrize("limit", [False, 0, -1, 501])
 def test_certificate_ledger_rejects_invalid_limits(tmp_path: Path, limit: object) -> None:
     store = Store(tmp_path / "watcher.sqlite3")
@@ -417,6 +530,31 @@ def test_certificate_validator_rejects_duplicate_keys_and_policy_overflow() -> N
     with pytest.raises(CertificateResultInvalid, match="policy rows"):
         validate_certificate_result_json(
             json.dumps(overflow, separators=(",", ":"), sort_keys=True).encode()
+        )
+
+
+@pytest.mark.parametrize(
+    ("page_count", "page", "error"),
+    [(0, 1, "dimensions"), (1, 0, "page"), (1, 2, "page")],
+)
+def test_certificate_validator_rejects_provenance_outside_source_pages(
+    page_count: int,
+    page: int,
+    error: str,
+) -> None:
+    record = _record()
+    source = record["source"]
+    assert isinstance(source, dict)
+    source["page_count"] = page_count
+    insured = record["insured"]
+    assert isinstance(insured, dict)
+    provenance = insured["provenance"]
+    assert isinstance(provenance, dict)
+    provenance["page"] = page
+
+    with pytest.raises(CertificateResultInvalid, match=error):
+        validate_certificate_result_json(
+            json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
         )
 
 

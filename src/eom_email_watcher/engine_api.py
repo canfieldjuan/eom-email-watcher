@@ -2713,6 +2713,18 @@ def _apply_connect_update(
         if current is None:
             raise RuntimeError("Connect job disappeared before its status could persist")
         if current.status == update.status:
+            if (
+                current.status == "completed"
+                and current.capability_id == "certificate.extract"
+                and isinstance(update, connect.CapabilityJobUpdate)
+                and update.result is not None
+            ):
+                return store.reconcile_certificate_completed_replay(
+                    job_id=update.job_id,
+                    provider_app_id=update.provider_app_id,
+                    provider_instance_id=update.provider_instance_id,
+                    result=update.result.store_dict(),
+                )
             return current
         if update.status in active_rank and (
             current.status in {"completed", "failed"}
