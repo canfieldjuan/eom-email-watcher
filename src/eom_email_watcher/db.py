@@ -7080,16 +7080,21 @@ class Store:
                 outcome = "CERTIFICATE_RESULT_INVALID"
 
             if outcome is not None:
-                changed = db.execute(
+                db.execute(
                     """UPDATE automation_fires SET state = 'failed',
-                        state_version = state_version + 1, reason = ?, updated_at = ?
-                    WHERE job_id = ? AND state = 'completed'""",
+                        state_version = state_version + 1, reason = ?,
+                        pending_since = NULL, updated_at = ?
+                    WHERE job_id = ?
+                        AND state IN ('completed', 'submitted', 'entitlement_paused')""",
                     (outcome, stamp, job_id),
                 )
                 existing = db.execute(
                     "SELECT state, reason FROM automation_fires WHERE job_id = ?", (job_id,)
                 ).fetchall()
-                if changed.rowcount == 0 and any(fire["state"] != "failed" for fire in existing):
+                if any(
+                    fire["state"] in {"completed", "submitted", "entitlement_paused"}
+                    for fire in existing
+                ):
                     raise RuntimeError("Certificate replay could not settle its automation fires")
             return job
 

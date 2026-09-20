@@ -435,6 +435,62 @@ def test_conflicting_terminal_replay_fails_fire_without_replacing_evidence(tmp_p
     assert {row["insured"] for row in rows} == {"Northstar Services LLC"}
 
 
+def test_conflicting_terminal_replay_fails_completed_and_later_submitted_fires(
+    tmp_path: Path,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    original = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(original),
+    )
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    conflicting = _record()
+    conflicting["insured"] = _text("Different Insured LLC", "different-insured")
+
+    engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(conflicting),
+            error=None,
+        ),
+    )
+
+    settled = [runtime.store.automation_fire(fire.fire_id) for fire in fires]
+    assert [fire.state for fire in settled] == ["failed", "failed"]
+    assert [fire.reason for fire in settled] == [
+        "CERTIFICATE_RESULT_CONFLICT",
+        "CERTIFICATE_RESULT_CONFLICT",
+    ]
+
+
 def test_matching_terminal_replay_preserves_completed_fire(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
