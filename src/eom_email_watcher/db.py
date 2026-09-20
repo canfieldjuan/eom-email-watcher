@@ -410,6 +410,14 @@ BEGIN
                 )
               )
           )
+          AND NOT (
+            capability_id = 'certificate.extract'
+            AND EXISTS (
+              SELECT 1 FROM automation_fires AS fire
+              WHERE fire.job_id = connect_attachment_jobs.job_id
+                AND fire.state IN ('submitted', 'entitlement_paused')
+            )
+          )
         )
         OR job_id IN (
             SELECT job_id FROM connect_job_dispatch
@@ -2024,11 +2032,18 @@ def _certificate_provenance(
     ):
         raise CertificateResultInvalid(f"certificate {label} coordinates are invalid")
     try:
-        finite_bbox = all(math.isfinite(float(coordinate)) for coordinate in bbox)
+        normalized_bbox = [float(coordinate) for coordinate in bbox]
+        finite_bbox = all(math.isfinite(coordinate) for coordinate in normalized_bbox)
     except (OverflowError, ValueError):
+        normalized_bbox = []
         finite_bbox = False
-    if not finite_bbox or bbox[0] > bbox[2] or bbox[1] > bbox[3]:
+    if (
+        not finite_bbox
+        or normalized_bbox[0] > normalized_bbox[2]
+        or normalized_bbox[1] > normalized_bbox[3]
+    ):
         raise CertificateResultInvalid(f"certificate {label} coordinates are invalid")
+    provenance["bbox"] = [0.0 if coordinate == 0 else coordinate for coordinate in normalized_bbox]
     exact_text = _certificate_string(provenance["exact_text"], label=f"{label} source text")
     token_start = provenance["token_start"]
     token_end = provenance["token_end"]
@@ -4044,6 +4059,11 @@ class Store:
                     if policy is None:
                         expiry_status = "review"
                     else:
+                        review_reasons = [
+                            reason
+                            for reason in review_reasons
+                            if reason != "POLICY_DATE_REVIEW"
+                        ]
                         policy_reasons = list(policy["review_reasons"])
                         review_reasons.extend(policy_reasons)
                         expiration = policy["expiration_date"]

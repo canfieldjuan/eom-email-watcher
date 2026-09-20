@@ -105,6 +105,22 @@ def _record(*, policies: list[dict[str, object]] | None = None) -> dict[str, obj
     }
 
 
+def _use_integer_bbox_spellings(record: dict[str, object]) -> None:
+    values: list[object] = [
+        record["insured"],
+        record["certificate_holder"],
+        record["producer"],
+    ]
+    for policy in record["policies"]:
+        assert isinstance(policy, dict)
+        values.extend(policy.values())
+    for value in values:
+        if isinstance(value, dict) and isinstance(value.get("provenance"), dict):
+            bbox = value["provenance"]["bbox"]
+            assert isinstance(bbox, list)
+            value["provenance"]["bbox"] = [int(coordinate) for coordinate in bbox]
+
+
 def _capability_result(record: dict[str, object]) -> connect.CapabilityResult:
     payload = json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
     output = connect.CapabilityOutput(
@@ -260,6 +276,12 @@ def test_completed_certificate_projects_once_and_lists_all_expiry_states(tmp_pat
     assert [row["policy_ordinal"] for row in rows] == [0, 1, 2, 3]
     assert rows[3]["expiration_date_candidates"] == ["2026-09-22", "2026-10-09"]
     assert rows[3]["review_state"] == "needs_review"
+    assert [row["review_state"] for row in rows] == [
+        "extracted",
+        "extracted",
+        "extracted",
+        "needs_review",
+    ]
     with runtime.store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
@@ -360,6 +382,46 @@ def test_invalid_completed_certificate_fails_a_later_joined_fire(
     settled = runtime.store.automation_fire(submitted.fire_id)
     assert settled is not None
     assert settled.state == "failed"
+    assert settled.reason == "CERTIFICATE_RESULT_INVALID"
+    assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
+
+
+def test_source_cleanup_cannot_complete_an_unreconciled_certificate_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _certificate_job(runtime.store, JOB_ID)
+    invalid = _record()
+    invalid["unexpected"] = True
+    runtime.store.transition_connect_job(
+        job_id=JOB_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(invalid),
+    )
+    fire = _certificate_pending_fires(runtime.store)[0]
+    submitted = runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=fire.state,
+        expected_version=fire.state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=JOB_ID,
+    )
+
+    assert runtime.store.delete_message("message-1") is True
+    retained = runtime.store.automation_fire(submitted.fire_id)
+    assert retained is not None and retained.state == "submitted"
+    assert runtime.store.connect_job(JOB_ID) is not None
+
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+    engine_api._settle_submitted_automation_fires(runtime, limit=1)
+
+    settled = runtime.store.automation_fire(submitted.fire_id)
+    assert settled is not None and settled.state == "failed"
     assert settled.reason == "CERTIFICATE_RESULT_INVALID"
     assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
 
@@ -519,6 +581,38 @@ def test_matching_terminal_replay_preserves_completed_fire(tmp_path: Path) -> No
     settled = runtime.store.automation_fire(fire.fire_id)
     assert settled is not None
     assert settled.state == "completed"
+    assert settled.reason == "connect_completed"
+
+
+def test_numeric_json_spellings_do_not_create_a_terminal_replay_conflict(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+    equivalent = json.loads(json.dumps(record))
+    _use_integer_bbox_spellings(equivalent)
+
+    engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(equivalent),
+            error=None,
+        ),
+    )
+
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None and settled.state == "completed"
     assert settled.reason == "connect_completed"
 
 
@@ -790,6 +884,15 @@ def test_certificate_validator_uses_full_canonical_policy_for_duplicate_identity
     validate_certificate_result_json(
         json.dumps(distinct, separators=(",", ":"), sort_keys=True).encode()
     )
+
+    numeric_duplicate = _policy(0, _date("2027-01-01", "expiration"))
+    same_policy = json.loads(json.dumps(numeric_duplicate))
+    numeric_record = _record(policies=[numeric_duplicate, same_policy])
+    _use_integer_bbox_spellings({**numeric_record, "policies": [same_policy]})
+    with pytest.raises(CertificateResultInvalid, match="duplicate row"):
+        validate_certificate_result_json(
+            json.dumps(numeric_record, separators=(",", ":"), sort_keys=True).encode()
+        )
 
 
 @pytest.mark.parametrize(
