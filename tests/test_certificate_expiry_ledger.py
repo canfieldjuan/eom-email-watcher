@@ -160,11 +160,7 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
     )
 
 
-def _certificate_fire_job(
-    store: Store,
-    *,
-    joined_job_id: str | None = None,
-) -> tuple[object, str]:
+def _certificate_pending_fires(store: Store, *, count: int = 1) -> list[object]:
     selected = capability(
         app_id="invoice-processor",
         app_version="0.1.0",
@@ -172,11 +168,13 @@ def _certificate_fire_job(
         produces=(CERTIFICATE_MEDIA_TYPE,),
         parameters=(),
     )
-    rule = contract_rule_definition(selected, name="Certificate tracker")
-    action = rule["action"]
-    assert isinstance(action, dict)
-    action["parameters"] = {}
-    store.put_automation_rule(rule)
+    for index in range(count):
+        name = "Certificate tracker" if index == 0 else f"Certificate tracker {index + 1}"
+        rule = contract_rule_definition(selected, name=name)
+        action = rule["action"]
+        assert isinstance(action, dict)
+        action["parameters"] = {}
+        store.put_automation_rule(rule)
     store.mark_analyzed(
         "message-1",
         {
@@ -191,19 +189,42 @@ def _certificate_fire_job(
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
     )
-    fire = store.automation_fires_for_message("message-1")[0]
-    attempt = store.automation_fire_attempts(fire.fire_id)[0]
+    fires = store.automation_fires_for_message("message-1")
+    assert len(fires) == count
+    return list(fires)
+
+
+def _certificate_fire_jobs(
+    store: Store,
+    *,
+    count: int = 1,
+    joined_job_id: str | None = None,
+) -> tuple[list[object], str]:
+    fires = _certificate_pending_fires(store, count=count)
+    attempt = store.automation_fire_attempts(fires[0].fire_id)[0]
     job_id = joined_job_id or attempt.dispatch_request_id
     _certificate_job(store, job_id)
-    submitted = store.transition_automation_fire(
-        fire_id=fire.fire_id,
-        expected_state=fire.state,
-        expected_version=fire.state_version,
-        next_state="submitted",
-        reason="connect_admitted",
-        job_id=job_id,
-    )
+    submitted = [
+        store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="connect_admitted",
+            job_id=job_id,
+        )
+        for fire in fires
+    ]
     return submitted, job_id
+
+
+def _certificate_fire_job(
+    store: Store,
+    *,
+    joined_job_id: str | None = None,
+) -> tuple[object, str]:
+    fires, job_id = _certificate_fire_jobs(store, joined_job_id=joined_job_id)
+    return fires[0], job_id
 
 
 def test_certificate_expiry_ledger_empty_list(tmp_path: Path) -> None:
@@ -283,6 +304,99 @@ def test_completed_certificate_projects_for_joined_job_with_distinct_dispatch_id
     assert attempt.dispatch_request_id == original_job_id
     assert attempt.job_id == joined_job_id
     assert len(runtime.store.list_certificate_expiry_ledger(today="2026-09-20")) == 4
+
+
+def test_completed_certificate_projects_once_for_multiple_joined_fires(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires, job_id = _certificate_fire_jobs(runtime.store, count=2)
+
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+
+    assert [runtime.store.automation_fire(fire.fire_id).state for fire in fires] == [
+        "completed",
+        "completed",
+    ]
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
+
+
+def test_invalid_completed_certificate_fails_a_later_joined_fire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _certificate_job(runtime.store, JOB_ID)
+    invalid = _record()
+    invalid["unexpected"] = True
+    runtime.store.transition_connect_job(
+        job_id=JOB_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(invalid),
+    )
+    fire = _certificate_pending_fires(runtime.store)[0]
+    submitted = runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=fire.state,
+        expected_version=fire.state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=JOB_ID,
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    engine_api._settle_submitted_automation_fires(runtime, limit=1)
+
+    settled = runtime.store.automation_fire(submitted.fire_id)
+    assert settled is not None
+    assert settled.state == "failed"
+    assert settled.reason == "CERTIFICATE_RESULT_INVALID"
+    assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
+
+
+def test_valid_completed_certificate_completes_a_later_joined_fire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _certificate_job(runtime.store, JOB_ID)
+    runtime.store.transition_connect_job(
+        job_id=JOB_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    fire = _certificate_pending_fires(runtime.store)[0]
+    submitted = runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=fire.state,
+        expected_version=fire.state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=JOB_ID,
+    )
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    engine_api._settle_submitted_automation_fires(runtime, limit=1)
+
+    settled = runtime.store.automation_fire(submitted.fire_id)
+    assert settled is not None
+    assert settled.state == "completed"
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
 
 
 def test_conflicting_terminal_replay_fails_fire_without_replacing_evidence(tmp_path: Path) -> None:

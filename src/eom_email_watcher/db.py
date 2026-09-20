@@ -2456,21 +2456,21 @@ def _certificate_assert_projection(
 def _certificate_source_for_job(
     db: sqlite3.Connection,
     job: ConnectJob,
-) -> tuple[dict[str, str], str | None]:
+) -> tuple[dict[str, str], tuple[str, ...]]:
     fire_rows = db.execute(
         "SELECT * FROM automation_fires WHERE job_id = ? ORDER BY fire_id", (job.job_id,)
     ).fetchall()
-    if len(fire_rows) > 1:
-        raise CertificateResultInvalid("certificate job is linked to multiple automation fires")
-    fire_id: str | None = None
-    if fire_rows:
-        fire = fire_rows[0]
+    fire_ids: list[str] = []
+    identities: list[tuple[sqlite3.Row, sqlite3.Row | None]] = []
+    for fire in fire_rows:
         fire_id = str(fire["fire_id"])
+        fire_ids.append(fire_id)
         if (
             fire["action_kind"] != "connect.invoke"
             or fire["message_id"] != job.message_id
             or fire["part_id"] != job.part_id
-            or fire["state"] not in {"submitted", "entitlement_paused"}
+            or fire["state"]
+            not in {"submitted", "entitlement_paused", "completed", "failed"}
         ):
             raise CertificateResultInvalid("certificate job and automation fire binding disagree")
         attempt = db.execute(
@@ -2488,8 +2488,7 @@ def _certificate_source_for_job(
         identity = db.execute(
             "SELECT * FROM automation_fire_source_identities WHERE fire_id = ?", (fire_id,)
         ).fetchone()
-    else:
-        identity = None
+        identities.append((fire, identity))
 
     live_source = db.execute(
         """SELECT message.provider, message.account_id, message.mailbox_identity_key,
@@ -2500,54 +2499,64 @@ def _certificate_source_for_job(
         FROM messages AS message WHERE message.message_id = ?""",
         (job.part_id, job.message_id),
     ).fetchone()
-    if identity is None:
-        if live_source is None or not bool(live_source["attachment_available"]):
-            raise CertificateResultInvalid("certificate source identity is unavailable")
-        source = {
-            "provider": str(live_source["provider"]),
-            "account_id": str(live_source["account_id"]),
-            "mailbox_identity_key": str(live_source["mailbox_identity_key"]),
-        }
-        if fire_id is not None:
-            if not source["mailbox_identity_key"]:
-                raise CertificateResultInvalid("certificate source mailbox identity is unavailable")
-            db.execute(
-                """INSERT INTO automation_fire_source_identities(
-                    fire_id, provider, account_id, mailbox_identity_key,
-                    message_id, part_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    fire_id,
-                    source["provider"],
-                    source["account_id"],
-                    source["mailbox_identity_key"],
-                    job.message_id,
-                    job.part_id,
-                    str(fire_rows[0]["created_at"]),
-                ),
-            )
-    else:
-        source = {
+    retained_sources: list[dict[str, str]] = []
+    for _fire, identity in identities:
+        if identity is None:
+            continue
+        retained = {
             "provider": str(identity["provider"]),
             "account_id": str(identity["account_id"]),
             "mailbox_identity_key": str(identity["mailbox_identity_key"]),
         }
         if identity["message_id"] != job.message_id or identity["part_id"] != job.part_id:
             raise CertificateResultInvalid("certificate source identity and job binding disagree")
-        if live_source is not None and (
-            not bool(live_source["attachment_available"])
-            or live_source["provider"] != source["provider"]
-            or live_source["account_id"] != source["account_id"]
-            or live_source["mailbox_identity_key"] != source["mailbox_identity_key"]
-        ):
+        retained_sources.append(retained)
+    if retained_sources and any(source != retained_sources[0] for source in retained_sources[1:]):
+        raise CertificateResultInvalid("certificate retained source identities disagree")
+
+    live = None
+    if live_source is not None and bool(live_source["attachment_available"]):
+        live = {
+            "provider": str(live_source["provider"]),
+            "account_id": str(live_source["account_id"]),
+            "mailbox_identity_key": str(live_source["mailbox_identity_key"]),
+        }
+    if retained_sources:
+        source = retained_sources[0]
+        if live_source is not None and (live is None or live != source):
             raise CertificateResultInvalid("certificate retained source identity changed")
+    elif live is not None:
+        source = live
+    else:
+        raise CertificateResultInvalid("certificate source identity is unavailable")
+
+    for fire, identity in identities:
+        if identity is not None:
+            continue
+        if not source["mailbox_identity_key"]:
+            raise CertificateResultInvalid("certificate source mailbox identity is unavailable")
+        db.execute(
+            """INSERT INTO automation_fire_source_identities(
+                fire_id, provider, account_id, mailbox_identity_key,
+                message_id, part_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(fire["fire_id"]),
+                source["provider"],
+                source["account_id"],
+                source["mailbox_identity_key"],
+                job.message_id,
+                job.part_id,
+                str(fire["created_at"]),
+            ),
+        )
     mailbox_key = source["mailbox_identity_key"]
     if (
         len(mailbox_key) != 64
         or any(character not in "0123456789abcdef" for character in mailbox_key)
     ):
         raise CertificateResultInvalid("certificate source mailbox identity is invalid")
-    return source, fire_id
+    return source, tuple(fire_ids)
 
 
 def _persist_certificate_projection(
@@ -2556,8 +2565,8 @@ def _persist_certificate_projection(
     job: ConnectJob,
     result: _ValidatedCertificateResult,
     stamp: str,
-) -> tuple[str, str | None]:
-    source, fire_id = _certificate_source_for_job(db, job)
+) -> tuple[str, tuple[str, ...]]:
+    source, fire_ids = _certificate_source_for_job(db, job)
     source_tuple = (
         source["provider"],
         source["account_id"],
@@ -2581,7 +2590,7 @@ def _persist_certificate_projection(
                 "certificate result digest conflicts with prior evidence"
             )
         _certificate_assert_projection(db, existing, result.record)
-        return str(existing["certificate_id"]), fire_id
+        return str(existing["certificate_id"]), fire_ids
 
     certificate_id = str(uuid.uuid4())
     parent = _certificate_parent_projection(result.record)
@@ -2654,7 +2663,7 @@ def _persist_certificate_projection(
     if inserted is None:
         raise RuntimeError("Certificate parent was not readable after insertion")
     _certificate_assert_projection(db, inserted, result.record)
-    return certificate_id, fire_id
+    return certificate_id, fire_ids
 
 
 @dataclass(frozen=True)
@@ -7029,12 +7038,16 @@ class Store:
                 "SELECT fire_id, state, reason FROM automation_fires WHERE job_id = ?",
                 (job_id,),
             ).fetchall()
-            if len(parents) != 1:
+            if len(parents) > 1:
+                raise RuntimeError("Completed certificate job has multiple durable projections")
+            if not parents:
                 if (
-                    not parents
-                    and len(fires) == 1
-                    and fires[0]["state"] == "failed"
-                    and fires[0]["reason"] == "CERTIFICATE_RESULT_INVALID"
+                    fires
+                    and all(
+                        fire["state"] == "failed"
+                        and fire["reason"] == "CERTIFICATE_RESULT_INVALID"
+                        for fire in fires
+                    )
                 ):
                     return job
                 raise RuntimeError("Completed certificate job is missing its durable projection")
@@ -7073,14 +7086,68 @@ class Store:
                     WHERE job_id = ? AND state = 'completed'""",
                     (outcome, stamp, job_id),
                 )
-                if changed.rowcount != 1:
-                    existing = db.execute(
-                        "SELECT state, reason FROM automation_fires WHERE job_id = ?", (job_id,)
-                    ).fetchall()
-                    if len(existing) != 1 or existing[0]["state"] != "failed":
-                        raise RuntimeError(
-                            "Certificate replay could not settle its automation fire"
-                        )
+                existing = db.execute(
+                    "SELECT state, reason FROM automation_fires WHERE job_id = ?", (job_id,)
+                ).fetchall()
+                if changed.rowcount == 0 and any(fire["state"] != "failed" for fire in existing):
+                    raise RuntimeError("Certificate replay could not settle its automation fires")
+            return job
+
+    def reconcile_certificate_completed_join(self, *, job_id: str) -> ConnectJob:
+        stamp = datetime.now(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT * FROM connect_attachment_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("Certificate join job is missing")
+            job = self._connect_job(current)
+            if (
+                job.protocol_version != 2
+                or job.capability_id != CERTIFICATE_CAPABILITY_ID
+                or job.status != "completed"
+            ):
+                raise RuntimeError("Certificate join job is not a completed certificate job")
+
+            outcome = "valid"
+            try:
+                _certificate_source_for_job(db, job)
+                if job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
+                    raise CertificateResultInvalid("certificate capability version is unsupported")
+                if job.result_json is None:
+                    raise CertificateResultInvalid("certificate result output is unavailable")
+                outputs = _decode_generic_result(job.result_json)
+                if len(outputs) != 1 or outputs[0].media_type != CERTIFICATE_RESULT_MEDIA_TYPE:
+                    raise CertificateResultInvalid("certificate result output is invalid")
+                result = _validate_certificate_record(
+                    outputs[0].payload,
+                    input_sha256=job.input_sha256,
+                    input_byte_size=job.input_byte_size,
+                    input_display_name=job.input_display_name,
+                )
+                _persist_certificate_projection(db, job=job, result=result, stamp=stamp)
+            except CertificateResultConflict:
+                outcome = "CERTIFICATE_RESULT_CONFLICT"
+            except (CertificateResultInvalid, RuntimeError, ValueError):
+                outcome = "CERTIFICATE_RESULT_INVALID"
+
+            if outcome == "valid":
+                db.execute(
+                    """UPDATE automation_fires SET state = 'completed',
+                        state_version = state_version + 1, reason = 'connect_completed',
+                        pending_since = NULL, updated_at = ?
+                    WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
+                    (stamp, job_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE automation_fires SET state = 'failed',
+                        state_version = state_version + 1, reason = ?,
+                        pending_since = NULL, updated_at = ?
+                    WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
+                    (outcome, stamp, job_id),
+                )
             return job
 
     def reset_connect_job_for_resubmission(

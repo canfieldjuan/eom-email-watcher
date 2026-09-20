@@ -54,6 +54,7 @@ from .config import (
 )
 from .db import (
     AUTOMATION_FIRE_PENDING_WINDOW,
+    CERTIFICATE_CAPABILITY_ID,
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
     CONNECT_RETRY_DELAYS_SECONDS,
     AutomationRuleDetail,
@@ -4237,6 +4238,9 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 )
             continue
         if job.status == "completed":
+            if job.capability_id == CERTIFICATE_CAPABILITY_ID:
+                runtime.store.reconcile_certificate_completed_join(job_id=job.job_id)
+                continue
             runtime.store.transition_automation_fire(
                 fire_id=fire.fire_id,
                 expected_state=fire.state,
