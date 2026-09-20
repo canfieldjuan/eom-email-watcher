@@ -10,6 +10,68 @@ const contract = await readFile(
   "utf8",
 );
 
+type MailboxMutationHarness = {
+  run: <T extends { mailbox_operation_revision: number }>(operation: () => Promise<T>) => Promise<T>;
+  observe: (revision: unknown) => boolean;
+  observeError: (error: unknown) => boolean;
+  accepts: (event: { mailbox_operation_revision?: number }) => boolean;
+  snapshot: () => { inFlight: boolean; ready: boolean; revision: number; active: number };
+};
+
+function mailboxMutationHarness(): MailboxMutationHarness {
+  const match = source.match(
+    /let mailboxOperationRevision = 0;([\s\S]*?)\n\nfunction errorMessage/,
+  );
+  assert.ok(match);
+  const executable = match[1]
+    .replace(
+      /function observeMailboxOperationRevision\(revision: unknown\): boolean/,
+      "function observeMailboxOperationRevision(revision)",
+    )
+    .replace(
+      /function scheduledCheckEventIsCurrent\(event: ScheduledCheckEvent\): boolean/,
+      "function scheduledCheckEventIsCurrent(event)",
+    )
+    .replace(
+      /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/,
+      "function observeMailboxOperationRevisionFromError(error)",
+    )
+    .replace(/\(error as \{ mailbox_operation_revision\?: unknown \}\)/g, "error")
+    .replace(
+      /async function runMailAccountMutation<T extends \{ mailbox_operation_revision: number \}>\(\s*operation: \(\) => Promise<T>,\s*\): Promise<T>/,
+      "async function runMailAccountMutation(operation)",
+    );
+  return Function(
+    `let mailboxOperationRevision = 0;${executable}
+     return {
+       run: runMailAccountMutation,
+       observe: observeMailboxOperationRevision,
+       observeError: observeMailboxOperationRevisionFromError,
+       accepts: scheduledCheckEventIsCurrent,
+       snapshot: () => ({
+         inFlight: mailOperationInFlight,
+         ready: mailboxOperationRevisionReady,
+         revision: mailboxOperationRevision,
+         active: mailAccountMutationsInFlight,
+       }),
+     };`,
+  )() as MailboxMutationHarness;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function gmailLabelLoadHarness(
   invoke: (operation: string) => Promise<Record<string, unknown>>,
 ) {
@@ -198,39 +260,7 @@ test("Gmail authorization and throttling keep distinct operator guidance", () =>
 });
 
 test("scheduled check events cannot overwrite a newer mailbox account operation", () => {
-  const helpers = source.match(
-    /let mailboxOperationRevision = 0;([\s\S]*?)\n\nfunction errorMessage/,
-  );
-  assert.ok(helpers);
-  const executableHelpers = helpers[1]
-    .replace(/revision: number/g, "revision")
-    .replace(/event: ScheduledCheckEvent/g, "event")
-    .replace(/\): void/g, ")")
-    .replace(/\): boolean/g, ")");
-  const errorObserver = source.match(
-    /function observeMailboxOperationRevisionFromError\(error: unknown\): void \{([\s\S]*?)\n\}/,
-  );
-  assert.ok(errorObserver);
-  const executableErrorObserver = errorObserver[1].replace(
-    /\(error as \{ mailbox_operation_revision\?: unknown \}\)/g,
-    "error",
-  );
-  const harness = Function(
-    `let mailboxOperationRevision = 0;${executableHelpers}
-     function observeMailboxOperationRevisionFromError(error) {${executableErrorObserver}
-     }
-     return {
-       observe: observeMailboxOperationRevision,
-       observeError: observeMailboxOperationRevisionFromError,
-       accepts: scheduledCheckEventIsCurrent,
-       current: () => mailboxOperationRevision,
-     };`,
-  )() as {
-    observe: (revision: number) => void;
-    observeError: (error: Record<string, unknown>) => void;
-    accepts: (event: { mailbox_operation_revision?: number }) => boolean;
-    current: () => number;
-  };
+  const harness = mailboxMutationHarness();
 
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
   harness.observe(0);
@@ -239,7 +269,7 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
   assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
   assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
   assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
-  assert.equal(harness.current(), 2);
+  assert.equal(harness.snapshot().revision, 2);
   assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
   assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
   assert.equal(harness.accepts({}), false);
@@ -250,7 +280,7 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
     mailbox_operation_revision: 3,
   };
   harness.observeError({ code: "legacy_error" });
-  assert.equal(harness.current(), 2);
+  assert.equal(harness.snapshot().revision, 2);
   harness.observeError(failedReconnect);
   assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
   assert.equal(harness.accepts({ mailbox_operation_revision: 3 }), true);
@@ -280,23 +310,118 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
     assert.notEqual(start, -1);
     const next = source.indexOf("\nasync function ", start + 1);
     const body = source.slice(start, next === -1 ? source.length : next);
-    assert.match(body, /observeMailboxOperationRevision\(result\.mailbox_operation_revision\)/);
-    assert.ok(
-      body.indexOf("observeMailboxOperationRevision(result.mailbox_operation_revision)") <
-        body.indexOf("refreshAfterMailMutation"),
-      `${operation} must observe the mutation revision before refreshing health`,
-    );
-    assert.match(
-      body,
-      /catch \(error\) \{\s*observeMailboxOperationRevisionFromError\(error\);[\s\S]*?loadHealth/,
-      `${operation} must observe failed mutation revisions before refreshing health`,
-    );
+    assert.match(body, /runMailAccountMutation\(\(\) => \{/);
   }
 
-  assert.match(
-    source,
-    /function observeMailboxOperationRevisionFromError\(error: unknown\): void/,
+  assert.match(source, /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/);
+  assert.match(source, /const result = await operation\(\);/);
+  assert.match(source, /observeMailboxOperationRevision\(result\.mailbox_operation_revision\)/);
+  assert.match(source, /observeMailboxOperationRevisionFromError\(error\)/);
+});
+
+test("scheduled success and error stay inert until a stamped failed mutation settles", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const failed = deferred<{ mailbox_operation_revision: number }>();
+  const attempt = harness.run(() => failed.promise);
+  let guidance = "Complete email authorization in your browser";
+
+  assert.equal(harness.snapshot().inFlight, true);
+  for (const staleGuidance of ["Automatic check complete", "Automatic check failed"]) {
+    if (harness.accepts({ mailbox_operation_revision: 0 })) guidance = staleGuidance;
+  }
+  assert.equal(guidance, "Complete email authorization in your browser");
+
+  failed.reject({
+    code: "gmail_authorization_rejected",
+    mailbox_operation_revision: 1,
+    retryable: false,
+  });
+  await assert.rejects(attempt);
+  guidance = "Gmail authorization was rejected";
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: false,
+    ready: true,
+    revision: 1,
+    active: 0,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(guidance, "Gmail authorization was rejected");
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+});
+
+test("scheduled events resume at the successful mutation revision", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const succeeded = deferred<{ mailbox_operation_revision: number }>();
+  const attempt = harness.run(() => succeeded.promise);
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  succeeded.resolve({ mailbox_operation_revision: 1 });
+  await attempt;
+
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+});
+
+test("overlapping account mutations keep the scheduled-event gate closed", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const older = deferred<{ mailbox_operation_revision: number }>();
+  const newer = deferred<{ mailbox_operation_revision: number }>();
+  const olderAttempt = harness.run(() => older.promise);
+  const newerAttempt = harness.run(() => newer.promise);
+
+  assert.equal(harness.snapshot().active, 2);
+  newer.resolve({ mailbox_operation_revision: 2 });
+  await newerAttempt;
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: true,
+    ready: true,
+    revision: 2,
+    active: 1,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
+
+  older.resolve({ mailbox_operation_revision: 1 });
+  await olderAttempt;
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.snapshot().revision, 2);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+});
+
+test("synchronous and legacy mutation errors fail closed without stranding the gate", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const legacyError = { code: "legacy_error" };
+
+  await assert.rejects(
+    harness.run(() => {
+      throw legacyError;
+    }),
+    (error) => error === legacyError,
   );
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: false,
+    ready: false,
+    revision: 0,
+    active: 0,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+});
+
+test("startup rejects scheduled events until even an empty account catalog seeds revision zero", () => {
+  const harness = mailboxMutationHarness();
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
 });
 
 test("label admission contract publishes exact Gmail authorization retry semantics", () => {

@@ -862,7 +862,6 @@ let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
-let mailOperationInFlight = false;
 let mailProviders: MailProviderStatus[] = [];
 let mailAccounts: MailAccountStatus[] = [];
 let mailServerProvider: MailProviderStatus | null = null;
@@ -926,20 +925,56 @@ let gmailLabelSenderCount: GmailLabelSenderCountState = {
 };
 let mailboxOperationRevision = 0;
 let mailboxOperationRevisionReady = false;
+let mailOperationInFlight = false;
+let mailAccountMutationsInFlight = 0;
 
-function observeMailboxOperationRevision(revision: number): void {
-  if (!Number.isSafeInteger(revision) || revision < 0) return;
+function observeMailboxOperationRevision(revision: unknown): boolean {
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
+    return false;
+  }
   mailboxOperationRevision = Math.max(mailboxOperationRevision, revision);
   mailboxOperationRevisionReady = true;
+  return true;
 }
 
 function scheduledCheckEventIsCurrent(event: ScheduledCheckEvent): boolean {
-  if (!mailboxOperationRevisionReady) return false;
+  if (mailOperationInFlight || !mailboxOperationRevisionReady) return false;
   const revision = event.mailbox_operation_revision;
   if (revision === undefined || !Number.isSafeInteger(revision) || revision < 0) return false;
   if (revision < mailboxOperationRevision) return false;
   mailboxOperationRevision = revision;
   return true;
+}
+
+function observeMailboxOperationRevisionFromError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("mailbox_operation_revision" in error)) {
+    return false;
+  }
+  const revision = (error as { mailbox_operation_revision?: unknown })
+    .mailbox_operation_revision;
+  return observeMailboxOperationRevision(revision);
+}
+
+async function runMailAccountMutation<T extends { mailbox_operation_revision: number }>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  mailAccountMutationsInFlight += 1;
+  mailOperationInFlight = true;
+  try {
+    const result = await operation();
+    if (!observeMailboxOperationRevision(result.mailbox_operation_revision)) {
+      mailboxOperationRevisionReady = false;
+    }
+    return result;
+  } catch (error) {
+    if (!observeMailboxOperationRevisionFromError(error)) {
+      mailboxOperationRevisionReady = false;
+    }
+    throw error;
+  } finally {
+    mailAccountMutationsInFlight -= 1;
+    mailOperationInFlight = mailAccountMutationsInFlight > 0;
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -948,15 +983,6 @@ function errorMessage(error: unknown): string {
     if (typeof message === "string") return message;
   }
   return "The watcher engine could not complete that request.";
-}
-
-function observeMailboxOperationRevisionFromError(error: unknown): void {
-  if (typeof error !== "object" || error === null || !("mailbox_operation_revision" in error)) {
-    return;
-  }
-  const revision = (error as { mailbox_operation_revision?: unknown })
-    .mailbox_operation_revision;
-  if (typeof revision === "number") observeMailboxOperationRevision(revision);
 }
 
 function errorCode(error: unknown): string | null {
@@ -2980,22 +3006,20 @@ async function connectMailProvider(provider: string): Promise<void> {
   if (mailOperationInFlight) return;
   invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = "Complete email authorization in your browser…";
-  delete healthStatus.dataset.kind;
   try {
-    const result = await invoke<MailAccountResult>("mail_account_connect", { provider });
-    observeMailboxOperationRevision(result.mailbox_operation_revision);
+    const result = await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = "Complete email authorization in your browser…";
+      delete healthStatus.dataset.kind;
+      return invoke<MailAccountResult>("mail_account_connect", { provider });
+    });
     const message = result.baseline_initialized
       ? "Email account connected. Watching begins from its current mailbox state."
       : "Email account connected. Its saved mailbox position was preserved.";
     await refreshAfterMailMutation(message);
   } catch (error) {
-    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -3014,33 +3038,31 @@ async function submitMailServerConnection(): Promise<void> {
   const account = mailServerAccount;
   invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = account
-    ? "Verifying the replacement mail server credentials…"
-    : "Verifying the mail server credentials…";
-  delete healthStatus.dataset.kind;
   try {
-    const result = account
-      ? await invoke<MailAccountResult>("mail_account_reconnect", {
-          provider: provider.provider,
-          accountId: account.account_id,
-          connection,
-        })
-      : await invoke<MailAccountResult>("mail_account_connect", {
-          provider: provider.provider,
-          connection,
-        });
-    observeMailboxOperationRevision(result.mailbox_operation_revision);
+    const result = await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = account
+        ? "Verifying the replacement mail server credentials…"
+        : "Verifying the mail server credentials…";
+      delete healthStatus.dataset.kind;
+      return account
+        ? invoke<MailAccountResult>("mail_account_reconnect", {
+            provider: provider.provider,
+            accountId: account.account_id,
+            connection,
+          })
+        : invoke<MailAccountResult>("mail_account_connect", {
+            provider: provider.provider,
+            connection,
+          });
+    });
     const message = result.baseline_initialized
       ? "Mail server connected. Watching begins from its current mailbox state."
       : "Mail server connected. Its saved mailbox position was preserved.";
     await refreshAfterMailMutation(message);
   } catch (error) {
-    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -3049,22 +3071,20 @@ async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
   invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = "Complete email authorization in your browser…";
-  delete healthStatus.dataset.kind;
   try {
-    const result = await invoke<MailAccountResult>("mail_account_reconnect", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = "Complete email authorization in your browser…";
+      delete healthStatus.dataset.kind;
+      return invoke<MailAccountResult>("mail_account_reconnect", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
-    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account reconnected. Its saved mailbox position was preserved.");
   } catch (error) {
-    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -3077,20 +3097,18 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
   if (!confirmed) return;
   invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    const result = await invoke<MailAccountResult>("mail_account_disconnect", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      return invoke<MailAccountResult>("mail_account_disconnect", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
-    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account disconnected. Its local history was retained.");
   } catch (error) {
-    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -3099,20 +3117,18 @@ async function activateMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
   invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    const result = await invoke<MailAccountResult>("mail_account_activate", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      return invoke<MailAccountResult>("mail_account_activate", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
-    observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Active email account changed.");
   } catch (error) {
-    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
