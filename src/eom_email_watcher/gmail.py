@@ -66,6 +66,8 @@ class GmailError(MailboxError):
 class GmailAuthorizationRejected(GmailError):
     """Gmail rejected credentials that appeared usable locally."""
 
+    code = "gmail_authorization_rejected"
+
 
 class GmailLabelCatalogInvalid(GmailError):
     """Gmail returned a label catalog that cannot safely be used."""

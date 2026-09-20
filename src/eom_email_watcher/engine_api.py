@@ -931,6 +931,12 @@ def _gmail_label_catalog_error(error: GmailError) -> ApiError:
         return ApiError(error.code, "Gmail returned an invalid label catalog", retryable=False)
     if isinstance(error, GmailLabelCatalogUnavailable):
         return ApiError(error.code, "Gmail labels are temporarily unavailable", retryable=True)
+    if isinstance(error, GmailAuthorizationRejected):
+        return ApiError(
+            error.code,
+            "Gmail authorization was rejected; reconnect the account",
+            retryable=False,
+        )
     return ApiError("account_unavailable", "The active Gmail account could not be opened")
 
 
@@ -972,7 +978,9 @@ def _gmail_label_session(
             )
     except MailboxIdentityChanged as exc:
         raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed") from exc
-    except (GmailAuthorizationRejected, MailboxError) as exc:
+    except GmailAuthorizationRejected as exc:
+        raise _gmail_label_catalog_error(exc) from exc
+    except MailboxError as exc:
         raise ApiError(
             "account_unavailable",
             "The active Gmail account could not be opened",
@@ -5711,6 +5719,18 @@ def _response(request: object) -> dict[str, object]:
     except MailboxAccountUnavailable as exc:
         return {
             "error": {"code": "account_unavailable", "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except GmailAuthorizationRejected:
+        logger.warning("Gmail authorization was rejected")
+        return {
+            "error": {
+                "code": GmailAuthorizationRejected.code,
+                "message": "Gmail authorization was rejected; reconnect the account",
+                "retryable": False,
+            },
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

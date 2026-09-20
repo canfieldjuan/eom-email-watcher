@@ -31,6 +31,7 @@ function gmailLabelLoadHarness(
      function renderGmailLabelPollingState() {}
      function refreshGmailLabelControls() {}
      function errorMessage(error) { return String(error); }
+     function gmailOperationErrorMessage(error) { return errorMessage(error); }
      function gmailLabelScopeMatches(response, scope, generation) {
        return generation === gmailLabelGeneration &&
          gmailLabelScope?.provider === scope.provider &&
@@ -132,6 +133,64 @@ test("Gmail catalog state gives invalid and transient failures distinct retry gu
   assert.match(message("invalid_catalog"), /Correct the Gmail connection/);
   assert.match(message("unavailable"), /temporarily unavailable/);
   assert.match(message("unavailable"), /retry/);
+});
+
+test("Gmail authorization and throttling keep distinct operator guidance", () => {
+  assert.match(source, /function gmailOperationErrorMessage\(error: unknown\): string/);
+  assert.match(source, /errorCode\(error\) === "gmail_authorization_rejected"/);
+  assert.match(source, /errorRetryable\(error\) === false/);
+  assert.match(source, /Reconnect the Gmail account/);
+  assert.match(source, /errorCode\(error\) === "gmail_label_catalog_unavailable"/);
+  assert.match(source, /errorRetryable\(error\) === true/);
+  assert.match(source, /Retry Gmail labels/);
+  assert.match(source, /gmailLabelStatus\.textContent = gmailOperationErrorMessage\(error\)/);
+  assert.match(source, /function scheduledCheckFailureMessage\(event: ScheduledCheckEvent\): string/);
+  assert.match(source, /error_code\?: string/);
+  assert.match(source, /error_retryable\?: boolean/);
+  assert.match(source, /scheduledCheckFailureMessage\(event\.payload\)/);
+
+  const gmailHelper = source.match(
+    /function gmailOperationErrorMessage\(error: unknown\): string \{([\s\S]*?)\n\}\n\nfunction scheduledCheckFailureMessage/,
+  );
+  assert.ok(gmailHelper);
+  const gmailMessage = Function(
+    `function errorCode(error) { return typeof error?.code === "string" ? error.code : null; }
+     function errorRetryable(error) { return typeof error?.retryable === "boolean" ? error.retryable : null; }
+     function errorMessage(error) { return typeof error?.message === "string" ? error.message : "fallback"; }
+     return function gmailOperationErrorMessage(error) {${gmailHelper[1]}\n}`,
+  )() as (error: Record<string, unknown>) => string;
+  assert.match(
+    gmailMessage({ code: "gmail_authorization_rejected", retryable: false }),
+    /Reconnect the Gmail account/,
+  );
+  assert.match(
+    gmailMessage({ code: "gmail_label_catalog_unavailable", retryable: true }),
+    /Retry Gmail labels/,
+  );
+  assert.equal(
+    gmailMessage({ code: "gmail_authorization_rejected", retryable: true, message: "safe" }),
+    "safe",
+  );
+  assert.equal(gmailMessage({ code: "unknown", message: "safe" }), "safe");
+
+  const scheduledHelper = source.match(
+    /function scheduledCheckFailureMessage\(event: ScheduledCheckEvent\): string \{([\s\S]*?)\n\}\n\nfunction showView/,
+  );
+  assert.ok(scheduledHelper);
+  const scheduledMessage = Function(
+    `return function scheduledCheckFailureMessage(event) {${scheduledHelper[1]}\n}`,
+  )() as (event: Record<string, unknown>) => string;
+  assert.match(
+    scheduledMessage({
+      error_code: "gmail_authorization_rejected",
+      error_retryable: false,
+    }),
+    /Reconnect the Gmail account/,
+  );
+  assert.match(scheduledMessage({ error_retryable: true }), /retry on schedule/);
+  assert.match(scheduledMessage({ error_retryable: false }), /manual attention/);
+  assert.match(scheduledMessage({}), /Open Health/);
+  assert.doesNotMatch(scheduledMessage({}), /retry on schedule/);
 });
 
 test("active account generation invalidates late Gmail label responses", () => {

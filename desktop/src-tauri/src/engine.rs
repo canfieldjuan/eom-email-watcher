@@ -932,6 +932,8 @@ pub struct ConfigInitialization {
 pub struct EngineError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -991,15 +993,17 @@ impl EngineError {
         Self {
             code: code.to_owned(),
             message: message.into(),
+            retryable: None,
         }
     }
 
     fn for_frontend(self) -> Self {
         if self.code == "configuration_error" {
-            return Self::host(
-                "configuration_error",
-                "Watcher configuration is missing or invalid; inspect desktop logs",
-            );
+            return Self {
+                message: "Watcher configuration is missing or invalid; inspect desktop logs"
+                    .to_owned(),
+                ..self
+            };
         }
         self
     }
@@ -1886,6 +1890,7 @@ mod tests {
         let error = EngineError {
             code: "configuration_error".into(),
             message: "Configuration not found: /home/private/config.toml".into(),
+            retryable: Some(false),
         };
 
         assert_eq!(
@@ -1893,8 +1898,26 @@ mod tests {
             EngineError {
                 code: "configuration_error".into(),
                 message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
+                retryable: Some(false),
             }
         );
+    }
+
+    #[test]
+    fn engine_error_retryability_round_trips_true_false_and_missing() {
+        for expected in [Some(true), Some(false), None] {
+            let mut value = json!({"code": "failure", "message": "safe message"});
+            if let Some(retryable) = expected {
+                value["retryable"] = json!(retryable);
+            }
+            let error: EngineError =
+                serde_json::from_value(value).expect("deserialize typed engine error");
+            assert_eq!(error.retryable, expected);
+            assert_eq!(
+                serde_json::to_value(error.for_frontend()).expect("serialize frontend error")["retryable"],
+                expected.map_or(serde_json::Value::Null, serde_json::Value::Bool)
+            );
+        }
     }
 
     #[test]

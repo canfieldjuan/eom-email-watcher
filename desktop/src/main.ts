@@ -423,6 +423,8 @@ interface ScheduledCheckEvent extends GmailRecoveryStatus {
   status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending" | "inactive";
   failed_notifications: number;
   reason?: string;
+  error_code?: string;
+  error_retryable?: boolean;
 }
 
 interface WatcherSettings {
@@ -932,6 +934,50 @@ function errorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null || !("code" in error)) return null;
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" ? code : null;
+}
+
+function errorRetryable(error: unknown): boolean | null {
+  if (typeof error !== "object" || error === null || !("retryable" in error)) return null;
+  const retryable = (error as { retryable?: unknown }).retryable;
+  return typeof retryable === "boolean" ? retryable : null;
+}
+
+function gmailOperationErrorMessage(error: unknown): string {
+  if (
+    errorCode(error) === "gmail_authorization_rejected" &&
+    errorRetryable(error) === false
+  ) {
+    return "Gmail authorization was rejected. Reconnect the Gmail account, then refresh labels.";
+  }
+  if (
+    errorCode(error) === "gmail_label_catalog_unavailable" &&
+    errorRetryable(error) === true
+  ) {
+    return "Gmail labels are temporarily unavailable. Retry Gmail labels.";
+  }
+  return errorMessage(error);
+}
+
+function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
+  if (
+    event.error_code === "gmail_authorization_rejected" &&
+    event.error_retryable === false
+  ) {
+    return "Automatic check stopped because Gmail authorization was rejected. Reconnect the Gmail account.";
+  }
+  if (
+    event.error_code === "gmail_label_catalog_unavailable" &&
+    event.error_retryable === true
+  ) {
+    return "Automatic check could not load Gmail labels; it will retry on schedule.";
+  }
+  if (event.error_retryable === true) {
+    return "Automatic check failed temporarily; it will retry on schedule.";
+  }
+  if (event.error_retryable === false) {
+    return "Automatic check stopped and needs manual attention. Open Health for details.";
+  }
+  return "Automatic check failed. Open Health for details.";
 }
 
 function showView(view: "inbox" | "watchlist" | "health" | "settings"): void {
@@ -2649,7 +2695,7 @@ async function loadGmailLabelState(): Promise<void> {
       }
       gmailLabelRevision = unavailableSelectors.revision;
       renderGmailLabelSelectors(unavailableSelectors.items);
-      gmailLabelStatus.textContent = errorMessage(error);
+      gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
     } catch (relistError) {
       if (loadSequence !== gmailLabelLoadSequence || generation !== gmailLabelGeneration) return;
       gmailLabelRevision = null;
@@ -2659,7 +2705,7 @@ async function loadGmailLabelState(): Promise<void> {
         admission_active: false,
       }));
       renderGmailLabelSelectors(inertSelectors);
-      gmailLabelStatus.textContent = `Selected Gmail labels are inactive because their current state could not be loaded. ${errorMessage(relistError)}`;
+      gmailLabelStatus.textContent = `Selected Gmail labels are inactive because their current state could not be loaded. ${gmailOperationErrorMessage(relistError)}`;
     }
     renderGmailLabelPollingState();
     gmailLabelStatus.dataset.kind = "error";
@@ -2696,7 +2742,7 @@ async function addGmailLabelSelector(): Promise<void> {
     gmailLabelStatus.dataset.kind = "success";
   } catch (error) {
     if (generation !== gmailLabelGeneration) return;
-    gmailLabelStatus.textContent = errorMessage(error);
+    gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
     gmailLabelStatus.dataset.kind = "error";
     if (
       [
@@ -2740,7 +2786,7 @@ async function removeGmailLabelSelector(selector: GmailLabelSelector): Promise<v
     gmailLabelStatus.dataset.kind = "success";
   } catch (error) {
     if (generation !== gmailLabelGeneration) return;
-    gmailLabelStatus.textContent = errorMessage(error);
+    gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
     gmailLabelStatus.dataset.kind = "error";
   } finally {
     if (generation === gmailLabelGeneration) {
@@ -4054,7 +4100,7 @@ void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
         "error",
       );
     } else {
-      void loadHealth("Automatic check failed; it will retry on schedule.", "error");
+      void loadHealth(scheduledCheckFailureMessage(event.payload), "error");
     }
   }
 });

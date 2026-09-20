@@ -602,7 +602,16 @@ def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
             b'{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}',
             gmail_module.GmailLabelCatalogUnavailable,
         ),
-        (403, b'{"error":{"errors":[{"reason":"forbidden"}]}}', GmailAuthorizationRejected),
+        (
+            403,
+            b'{"error":{"errors":[{"reason":"quotaExceeded"},{"reason":"rateLimitExceeded"}]}}',
+            gmail_module.GmailLabelCatalogUnavailable,
+        ),
+        (
+            403,
+            b'{"error":{"message":"private provider body","errors":[{"reason":"forbidden"}]}}',
+            GmailAuthorizationRejected,
+        ),
         (403, b'{"error":{"errors":[{"reason":"unknownReason"}]}}', GmailAuthorizationRejected),
         (
             403,
@@ -623,10 +632,11 @@ def test_gmail_catalog_classifies_http_auth_and_quota_boundaries(
     monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
     gateway = GmailGateway(None, credentials=SimpleNamespace())
 
-    with pytest.raises(error_type):
+    with pytest.raises(error_type) as raised:
         gateway.label_catalog()
 
     assert response.read_started is (status_code == 403)
+    assert "private provider body" not in str(raised.value)
 
 
 def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:

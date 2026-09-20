@@ -677,6 +677,24 @@ def test_gmail_catalog_failure_invalidates_only_matching_durable_validation(
     )
     assert response["error"]["code"] == "gmail_label_catalog_unavailable"
 
+    def authorization_rejected() -> tuple[GmailLabel, ...]:
+        raise GmailAuthorizationRejected("provider detail must stay private")
+
+    gateway.label_catalog = authorization_rejected  # type: ignore[method-assign]
+    rejected = engine_api._response(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert rejected["error"] == {
+        "code": "gmail_authorization_rejected",
+        "message": "Gmail authorization was rejected; reconnect the account",
+        "retryable": False,
+    }
+    assert "provider detail" not in json.dumps(rejected)
+
     def reject_provider_access(*_args: object, **_kwargs: object) -> None:
         pytest.fail("Offline selector listing attempted Gmail provider access")
 
@@ -6071,6 +6089,35 @@ def test_check_maps_unresolved_legacy_recovery_to_retryable_error(
     }
 
 
+def test_watcher_check_maps_gmail_authorization_rejection_without_provider_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GmailAuthorizationRejected("private provider response body")
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=engine_api.__name__):
+        response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["error"] == {
+        "code": "gmail_authorization_rejected",
+        "message": "Gmail authorization was rejected; reconnect the account",
+        "retryable": False,
+    }
+    assert "private provider response body" not in json.dumps(response)
+    assert "private provider response body" not in caplog.text
+
+
 def test_check_maps_mailbox_identity_change_to_domain_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6619,6 +6666,11 @@ def test_gmail_error_response_redacts_configured_path(
             GmailLabelCatalogUnavailable("provider offline"),
             "gmail_label_catalog_unavailable",
             True,
+        ),
+        (
+            GmailAuthorizationRejected("provider detail must stay private"),
+            "gmail_authorization_rejected",
+            False,
         ),
         (
             GmailRecoveryPageInvalid("malformed recovery page"),

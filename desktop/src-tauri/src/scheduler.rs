@@ -1,5 +1,5 @@
 use crate::delivery::NotificationDelivery;
-use crate::engine::{CheckResult, Engine};
+use crate::engine::{CheckResult, Engine, EngineError};
 use serde::Serialize;
 use std::io;
 use std::sync::{
@@ -41,6 +41,10 @@ struct ScheduledCheckEvent {
     recovery_failure_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_next_retry_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_retryable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -187,10 +191,12 @@ impl ScheduledCheckEvent {
             recovery_next_retry_at: recovery_pending
                 .then(|| check.recovery_next_retry_at.clone())
                 .flatten(),
+            error_code: None,
+            error_retryable: None,
         }
     }
 
-    fn check_failed() -> Self {
+    fn check_failed(error: &EngineError) -> Self {
         Self {
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
@@ -199,6 +205,8 @@ impl ScheduledCheckEvent {
             recovery_state: None,
             recovery_failure_code: None,
             recovery_next_retry_at: None,
+            error_code: Some(error.code.clone()),
+            error_retryable: error.retryable,
         }
     }
 }
@@ -305,7 +313,7 @@ impl PollScheduler {
                             "scheduled watcher check failed ({}): {}",
                             error.code, error.message
                         );
-                        ScheduledCheckEvent::check_failed()
+                        ScheduledCheckEvent::check_failed(&error)
                     }
                 };
                 connect_queue.wake();
@@ -393,6 +401,8 @@ mod tests {
                 recovery_state: None,
                 recovery_failure_code: None,
                 recovery_next_retry_at: None,
+                error_code: None,
+                error_retryable: None,
             }
         );
         assert_eq!(
@@ -405,6 +415,8 @@ mod tests {
                 recovery_state: None,
                 recovery_failure_code: None,
                 recovery_next_retry_at: None,
+                error_code: None,
+                error_retryable: None,
             }
         );
         assert_eq!(
@@ -415,6 +427,26 @@ mod tests {
                 "failed_notifications": 2,
             })
         );
+    }
+
+    #[test]
+    fn scheduled_failure_preserves_code_and_retryability_boundaries() {
+        for retryable in [Some(true), Some(false), None] {
+            let error = crate::engine::EngineError {
+                code: "gmail_authorization_rejected".to_owned(),
+                message: "provider detail must stay private".to_owned(),
+                retryable,
+            };
+            let event = serde_json::to_value(ScheduledCheckEvent::check_failed(&error))
+                .expect("serialize scheduled error");
+            assert_eq!(event["status"], "check_failed");
+            assert_eq!(event["error_code"], "gmail_authorization_rejected");
+            assert_eq!(
+                event["error_retryable"],
+                retryable.map_or(serde_json::Value::Null, serde_json::Value::Bool)
+            );
+            assert!(!event.to_string().contains("provider detail"));
+        }
     }
 
     #[test]
