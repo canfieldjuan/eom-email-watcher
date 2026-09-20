@@ -1,5 +1,5 @@
 use crate::delivery::NotificationDelivery;
-use crate::engine::Engine;
+use crate::engine::{CheckResult, Engine};
 use serde::Serialize;
 use std::io;
 use std::sync::{
@@ -23,12 +23,21 @@ enum ScheduledCheckStatus {
     Complete,
     DeliveryFailed,
     CheckFailed,
+    RecoveryPending,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ScheduledCheckEvent {
     status: ScheduledCheckStatus,
     failed_notifications: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_pending: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_failure_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_next_retry_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -151,14 +160,27 @@ impl ConnectQueueScheduler {
 }
 
 impl ScheduledCheckEvent {
-    fn completed(failed_notifications: u64) -> Self {
+    fn from_check(check: &CheckResult, failed_notifications: u64) -> Self {
+        let recovery_pending = check.recovery_pending == Some(true);
         Self {
-            status: if failed_notifications == 0 {
+            status: if recovery_pending {
+                ScheduledCheckStatus::RecoveryPending
+            } else if failed_notifications == 0 {
                 ScheduledCheckStatus::Complete
             } else {
                 ScheduledCheckStatus::DeliveryFailed
             },
             failed_notifications,
+            recovery_pending: recovery_pending.then_some(true),
+            recovery_state: recovery_pending
+                .then(|| check.recovery_state.clone())
+                .flatten(),
+            recovery_failure_code: recovery_pending
+                .then(|| check.recovery_failure_code.clone())
+                .flatten(),
+            recovery_next_retry_at: recovery_pending
+                .then(|| check.recovery_next_retry_at.clone())
+                .flatten(),
         }
     }
 
@@ -166,6 +188,10 @@ impl ScheduledCheckEvent {
         Self {
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
+            recovery_pending: None,
+            recovery_state: None,
+            recovery_failure_code: None,
+            recovery_next_retry_at: None,
         }
     }
 }
@@ -262,7 +288,10 @@ impl PollScheduler {
                                 outcome.delivery.failed
                             );
                         }
-                        ScheduledCheckEvent::completed(outcome.delivery.failed)
+                        ScheduledCheckEvent::from_check(
+                            &outcome.check,
+                            outcome.delivery.failed,
+                        )
                     }
                     Err(error) => {
                         eprintln!(
@@ -288,7 +317,30 @@ impl PollScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::CheckResult;
     use std::cell::Cell;
+
+    fn check_result_with_recovery(
+        recovery_state: Option<&str>,
+        recovery_failure_code: Option<&str>,
+        recovery_next_retry_at: Option<&str>,
+    ) -> CheckResult {
+        CheckResult {
+            active: true,
+            discovered: 2,
+            summarized: 1,
+            fallback_notified: 0,
+            purged: 0,
+            stale_cursor_recovered: recovery_state.is_some(),
+            pending_notifications: 0,
+            automation_processed: 0,
+            automation_review_required: 0,
+            recovery_pending: recovery_state.map(|_| true),
+            recovery_state: recovery_state.map(str::to_owned),
+            recovery_failure_code: recovery_failure_code.map(str::to_owned),
+            recovery_next_retry_at: recovery_next_retry_at.map(str::to_owned),
+        }
+    }
 
     #[test]
     fn next_check_uses_configured_interval() {
@@ -322,27 +374,72 @@ mod tests {
 
     #[test]
     fn scheduled_event_distinguishes_delivery_failure_from_complete_check() {
+        let check = check_result_with_recovery(None, None, None);
         assert_eq!(
-            ScheduledCheckEvent::completed(2),
+            ScheduledCheckEvent::from_check(&check, 2),
             ScheduledCheckEvent {
                 status: ScheduledCheckStatus::DeliveryFailed,
                 failed_notifications: 2,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             }
         );
         assert_eq!(
-            ScheduledCheckEvent::completed(0),
+            ScheduledCheckEvent::from_check(&check, 0),
             ScheduledCheckEvent {
                 status: ScheduledCheckStatus::Complete,
                 failed_notifications: 0,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             }
         );
         assert_eq!(
-            serde_json::to_value(ScheduledCheckEvent::completed(2)).expect("serialize event"),
+            serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2))
+                .expect("serialize event"),
             serde_json::json!({
                 "status": "delivery_failed",
                 "failed_notifications": 2,
             })
         );
+    }
+
+    #[test]
+    fn scheduled_recovery_states_never_emit_completion() {
+        for (state, failure_code, next_retry_at) in [
+            ("collecting", None, None),
+            (
+                "backoff",
+                Some("gmail_recovery_page_token_invalid"),
+                Some("2026-09-20T03:00:00+00:00"),
+            ),
+            (
+                "degraded",
+                Some("gmail_recovery_page_token_invalid"),
+                Some("2026-09-20T04:00:00+00:00"),
+            ),
+        ] {
+            let check = check_result_with_recovery(Some(state), failure_code, next_retry_at);
+            let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2))
+                .expect("serialize scheduled recovery event");
+
+            assert_eq!(event["status"], "recovery_pending");
+            assert_eq!(event["failed_notifications"], 2);
+            assert_eq!(event["recovery_pending"], true);
+            assert_eq!(event["recovery_state"], state);
+            assert_eq!(
+                event["recovery_failure_code"],
+                failure_code.map_or(serde_json::Value::Null, serde_json::Value::from)
+            );
+            assert_eq!(
+                event["recovery_next_retry_at"],
+                next_retry_at.map_or(serde_json::Value::Null, serde_json::Value::from)
+            );
+            assert_ne!(event["status"], "complete");
+        }
     }
 
     #[test]

@@ -4,13 +4,14 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from eom_email_watcher import db as db_module
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
-from eom_email_watcher.db import MailboxIdentityChanged, Store
+from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
     MessageMetadata,
     MessageUnavailable,
@@ -56,6 +57,7 @@ from eom_email_watcher.scheduling import (
 from eom_email_watcher.service import (
     Watcher,
     decide_scheduling_proposal,
+    match_mailbox_admission,
     process_scheduling_automations,
     process_scheduling_proposals,
     process_scheduling_writes,
@@ -97,7 +99,27 @@ class FakeGmail:
     def recover_since(self, addresses, since) -> MailboxChanges:
         return MailboxChanges(tuple(self.search_since(addresses, since)), self.initial_cursor())
 
-    def metadata(self, message_id: str) -> MessageMetadata:
+    def recovery_page(
+        self,
+        page_token: str | None,
+        after_exclusive_epoch: int,
+        before_exclusive_epoch: int,
+        max_results: int = 200,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[tuple[str, ...], str | None]:
+        assert page_token is None
+        assert before_exclusive_epoch > after_exclusive_epoch
+        assert max_results == 200
+        since = datetime.fromtimestamp(after_exclusive_epoch, tz=UTC)
+        return tuple(self.search_since(frozenset(), since)), None
+
+    def metadata(
+        self,
+        message_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> MessageMetadata:
         sender = "trusted@example.com" if message_id == "allowed" else "stranger@example.com"
         return MessageMetadata(
             message_id,
@@ -379,6 +401,19 @@ def config(tmp_path: Path) -> Config:
     )
 
 
+def exact_sender_admission(
+    sender: str = "trusted@example.com",
+    mailbox_identity_key: str = TEST_MAILBOX_IDENTITY_KEY,
+) -> AdmissionProvenance:
+    return AdmissionProvenance(
+        kind="exact_sender",
+        selector_id=f"sender:{sender}",
+        display_name=None,
+        mailbox_identity_key=mailbox_identity_key,
+        admitted_at=datetime.now(UTC).isoformat(),
+    )
+
+
 def valid_scheduling_output(intent: str = "new_meeting") -> str:
     return json.dumps(
         {
@@ -470,6 +505,7 @@ def admit_scheduling_run(
         subject="Meeting request",
         received_at=received_at or SCHEDULING_FIXTURE_RECEIVED_AT,
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission(),
     )
     store.mark_analyzed(
         message_id,
@@ -579,6 +615,379 @@ def test_exact_allowlist_and_dedup(tmp_path: Path) -> None:
     assert result["summarized"] == 1
     assert len(store.recent(10)) == 1
     assert watcher.check()["discovered"] == 0
+
+
+def test_label_only_configuration_runs_check_with_zero_senders(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+
+    class LabelOnlyGmail(FreshGmail):
+        def label_catalog(self):
+            return (
+                    SimpleNamespace(
+                        label_id="Label_123",
+                        display_name="Renamed Invoices",
+                        label_type="user",
+                ),
+            )
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            metadata = super().metadata(message_id)
+            labels = (
+                frozenset({"INBOX", "Label_123"})
+                if message_id == "allowed"
+                else frozenset({"INBOX"})
+            )
+            return replace(metadata, labels=labels)
+
+    model = FakeModel()
+    gateway = LabelOnlyGmail()
+    result = Watcher(cfg, store, gateway, model).check()
+
+    assert result["active"] is True
+    assert result["discovered"] == 1
+    assert result["summarized"] == 1
+    assert gateway.full_payload_calls == 1
+    assert model.calls == 1
+    assert store.recent(1)[0]["admission"]["display_name"] == "Renamed Invoices"
+
+
+def test_open_recovery_keeps_watch_configured_after_last_selector_is_removed(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        1,
+        2,
+        "200",
+    )
+    store.remove_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        selector.selector_id,
+        revision,
+    )
+
+    assert store.gmail_label_selectors("gmail-default") == ()
+    assert store.gmail_recovery_state("gmail-default") is not None
+    assert service_module._gmail_label_watch_configured(store) is True
+
+
+def test_common_admission_matcher_enforces_inbox_provider_and_deterministic_winner() -> None:
+    admitted_at = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    selectors = (
+        SimpleNamespace(
+            selector_id="22222222-2222-4222-8222-222222222222",
+            provider="gmail",
+            account_id="gmail-default",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            label_id="Label_123",
+            selected_display_name="Invoices B",
+        ),
+        SimpleNamespace(
+            selector_id="11111111-1111-4111-8111-111111111111",
+            provider="gmail",
+            account_id="gmail-default",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            label_id="Label_456",
+            selected_display_name="Invoices A",
+        ),
+    )
+    metadata = MessageMetadata(
+        "message-1",
+        None,
+        "trusted@example.com",
+        None,
+        "Subject",
+        admitted_at.isoformat(),
+        frozenset({"INBOX", "Label_123", "Label_456"}),
+    )
+
+    exact = match_mailbox_admission(
+        metadata=metadata,
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        exact_senders={"trusted@example.com": "Trusted"},
+        label_selectors=selectors,
+        admitted_at=admitted_at,
+    )
+    assert exact is not None
+    assert exact.kind == "exact_sender"
+    assert exact.selector_id == "sender:trusted@example.com"
+
+    label = match_mailbox_admission(
+        metadata=replace(metadata, sender="stranger@example.com"),
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        exact_senders={},
+        label_selectors=selectors,
+        admitted_at=admitted_at,
+    )
+    assert label is not None
+    assert label.kind == "gmail_user_label"
+    assert label.selector_id == "11111111-1111-4111-8111-111111111111"
+
+    assert (
+        match_mailbox_admission(
+            metadata=replace(metadata, labels=frozenset({"Label_123"})),
+            provider="gmail",
+            account_id="gmail-default",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            exact_senders={"trusted@example.com": "Trusted"},
+            label_selectors=selectors,
+            admitted_at=admitted_at,
+        )
+        is None
+    )
+    assert (
+        match_mailbox_admission(
+            metadata=metadata,
+            provider="microsoft365",
+            account_id="gmail-default",
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            exact_senders={},
+            label_selectors=selectors,
+            admitted_at=admitted_at,
+        )
+        is None
+    )
+
+
+def test_stale_label_only_recovery_uses_broad_durable_page(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC) - timedelta(minutes=10),
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    _revision, _selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+
+    class StaleLabelGmail(FreshGmail):
+        def __init__(self):
+            super().__init__(stale=True)
+            self.recovery_page_calls = 0
+            self.recovery_timeouts: list[float | None] = []
+            self.metadata_timeouts: list[float | None] = []
+
+        def label_catalog(self):
+            return (
+                SimpleNamespace(
+                    label_id="Label_123",
+                    display_name="Invoices",
+                    label_type="user",
+                ),
+            )
+
+        def recover_since(self, addresses, since) -> MailboxChanges:
+            return MailboxChanges((), self.initial_cursor())
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.recovery_page_calls += 1
+            self.recovery_timeouts.append(timeout_seconds)
+            assert page_token is None
+            assert before_exclusive_epoch > after_exclusive_epoch
+            assert max_results == 200
+            return ("allowed",), None
+
+        def metadata(
+            self,
+            message_id: str,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> MessageMetadata:
+            self.metadata_timeouts.append(timeout_seconds)
+            return replace(
+                super().metadata(message_id),
+                labels=frozenset({"INBOX", "Label_123"}),
+            )
+
+    gateway = StaleLabelGmail()
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+
+    assert gateway.recovery_page_calls == 1
+    assert result["stale_cursor_recovered"] is True
+    assert result["discovered"] == 1
+    assert len(gateway.recovery_timeouts) == 1
+    assert len(gateway.metadata_timeouts) == 1
+    assert all(
+        isinstance(timeout, float) and 0 < timeout <= 30
+        for timeout in (*gateway.recovery_timeouts, *gateway.metadata_timeouts)
+    )
+    assert store.gmail_recovery_state("gmail-default") is None
+    state = store.state(provider="gmail", account_id="gmail-default")
+    assert state is not None
+    assert state[0] == "200"
+
+
+def test_recovery_backoff_is_visible_in_check_result(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC) - timedelta(minutes=10),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class FailingRecoveryGmail(FreshGmail):
+        def __init__(self):
+            super().__init__(stale=True)
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            raise MailboxError("provider unavailable")
+
+    result = Watcher(cfg, store, FailingRecoveryGmail(), FakeModel()).check()
+    recovery = store.gmail_recovery_state("gmail-default")
+
+    assert recovery is not None
+    assert result["recovery_pending"] is True
+    assert result["recovery_state"] == "backoff"
+    assert result["recovery_failure_code"] == "gmail_recovery_provider_unavailable"
+    assert result["recovery_next_retry_at"] == recovery.next_retry_at
+    assert store.state()[0] == "100"
+
+
+def test_dry_run_stale_recovery_reads_one_broad_page_and_reports_truncated(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "old",
+        datetime.now(UTC) - timedelta(minutes=10),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class DryRunStaleGmail(FreshGmail):
+        def __init__(self):
+            super().__init__(stale=True)
+            self.recovery_page_calls = 0
+
+        def recover_since(self, addresses, since) -> MailboxChanges:
+            return MailboxChanges((), self.initial_cursor())
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.recovery_page_calls += 1
+            return ("allowed",), "next-page"
+
+    gateway = DryRunStaleGmail()
+    result = Watcher(cfg, store, gateway, FakeModel()).check(dry_run=True)
+
+    assert gateway.recovery_page_calls == 1
+    assert result["discovered"] == 1
+    assert result["incomplete"] is True
+    assert result["reason"] == "recovery_truncated"
+    assert store.state()[0] == "old"
+    assert store.gmail_recovery_state("gmail-default") is None
+    assert store.recent(1) == []
 
 
 @pytest.mark.parametrize(
@@ -2022,16 +2431,21 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
     )
     with store.connection() as db:
         db.executemany(
-            """INSERT INTO messages (
-                    message_id, provider, account_id, mailbox_identity_key,
-                    provider_message_id,
-                    sender, subject, received_at, discovered_at, status, last_error
-                ) VALUES (
-                    ?1, 'gmail', 'gmail-default',
-                    (SELECT mailbox_identity_key FROM mail_accounts
-                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
-                    'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable'
-                )""",
+                """INSERT INTO messages (
+                        message_id, provider, account_id, mailbox_identity_key,
+                        provider_message_id,
+                        sender, subject, received_at, discovered_at, status, last_error,
+                        admission_kind, admission_selector_id,
+                        admission_mailbox_identity_key, admitted_at
+                    ) VALUES (
+                        ?1, 'gmail', 'gmail-default',
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
+                        'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable',
+                        'exact_sender', 'sender:a@b.com',
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?2
+                    )""",
             [(f"backlog-{index}", older) for index in range(25)],
         )
     delivered: list[tuple[str, bool]] = []
@@ -2433,6 +2847,7 @@ def test_watcher_does_not_fetch_pending_content_from_another_account(
         subject="Other account",
         received_at=datetime.now(UTC).isoformat(),
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission(),
     )
     gateway = FakeGmail()
     gateway.history_message_ids = lambda cursor: ([], "200")
@@ -2530,6 +2945,7 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
             subject=message_id,
             received_at="2020-01-01T00:00:00+00:00",
             mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admission=exact_sender_admission("former@example.com"),
         )
     store.mark_skipped("expired")
     store.mark_analyzed(
@@ -2587,6 +3003,7 @@ def test_unresolved_legacy_identity_blocks_stale_recovery_only_for_retained_mark
     store.set_state("old", observed_at - timedelta(minutes=10))
     with store.connection() as db:
         db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
+        db.execute("DROP TRIGGER messages_require_admission_provenance_insert")
         db.execute(
             """INSERT INTO messages(
                 message_id, provider, account_id, provider_message_id,
@@ -2716,6 +3133,7 @@ def test_expired_pending_message_is_excluded_before_content_fetch(
         subject="Expired",
         received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission(),
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -2751,6 +3169,7 @@ def test_dry_run_ignores_pending_source_time_that_overflows_utc(
         subject="Malformed",
         received_at="0001-01-01T00:00:00+23:59",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission(),
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -3144,6 +3563,7 @@ def test_expired_notification_intent_is_removed_before_cli_delivery(
         subject="Action needed",
         received_at=(datetime.now(UTC) - service_module.timedelta(days=2)).isoformat(),
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission(),
     )
     store.mark_analyzed(
         "old-analysis",
@@ -3258,6 +3678,7 @@ def test_replacement_mailbox_fails_stale_pending_before_provider_fetch(
         sender_name="Trusted",
         subject="Old source",
         received_at=datetime.now(UTC).isoformat(),
+        admission=exact_sender_admission(mailbox_identity_key=old_identity),
     )
 
     class ReplacementGateway(FakeGmail):

@@ -14,11 +14,16 @@ from connect_automate import connect
 from eom_email_watcher import engine_api
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
-from eom_email_watcher.db import Store
+from eom_email_watcher.db import AdmissionProvenance, GmailLabelStoreError, Store
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
+    GmailLabel,
+    GmailLabelCatalogInvalid,
+    GmailLabelCatalogUnavailable,
     GmailProfile,
+    GmailRecoveryPageInvalid,
+    GmailRecoveryPageTokenInvalid,
     MessageMetadata,
 )
 from eom_email_watcher.imap import (
@@ -95,6 +100,20 @@ def _add_test_message(store: Store, **values: object) -> bool:
         "mailbox_identity_key",
         _bind_test_mailbox(store, provider, account_id),
     )
+    values.setdefault(
+        "admission",
+        AdmissionProvenance(
+            kind="exact_sender",
+            selector_id=f"sender:{values.get('sender', 'sender@example.com')}",
+            display_name=(
+                str(values["sender_name"])
+                if values.get("sender_name") is not None
+                else None
+            ),
+            mailbox_identity_key=str(values["mailbox_identity_key"]),
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
+    )
     return store.add_message(**values)  # type: ignore[arg-type]
 
 
@@ -168,6 +187,369 @@ def request(config_path: Path, operation: str, payload: dict[str, object] | None
         "config_path": str(config_path),
         "payload": payload or {},
     }
+
+
+def test_gmail_label_engine_operations_enforce_payload_shape_before_runtime(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+
+    with pytest.raises(engine_api.ApiError, match="Unsupported payload fields: secret"):
+        engine_api.dispatch(
+            request(
+                config_path,
+                "gmail.labels.catalog",
+                {
+                    "provider": "gmail",
+                    "account_id": "gmail-default",
+                    "secret": "must-not-be-accepted",
+                },
+            )
+        )
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "GMAIL", "account_id": "gmail-default"},
+        )
+    )
+    assert response["error"]["code"] == "unsupported_provider"
+
+
+@pytest.mark.parametrize("revision", [False, -1, 1.5, "0", None])
+def test_gmail_label_mutations_require_exact_non_negative_integer_revision(
+    tmp_path: Path,
+    revision: object,
+) -> None:
+    config_path = tmp_path / "config.toml"
+
+    with pytest.raises(
+        engine_api.ApiError,
+        match="expected_revision must be a non-negative integer",
+    ):
+        engine_api.dispatch(
+            request(
+                config_path,
+                "gmail.label_selectors.add",
+                {
+                    "provider": "gmail",
+                    "account_id": "gmail-default",
+                    "label_id": "Label_123",
+                    "expected_revision": revision,
+                },
+            )
+        )
+
+
+class FakeGmailLabelGateway:
+    def __init__(self, identity_key: str, labels: tuple[GmailLabel, ...]):
+        self.identity_key = identity_key
+        self.labels = labels
+        self.catalog_calls = 0
+
+    def mailbox_identity_key(self) -> str:
+        return self.identity_key
+
+    def label_catalog(self) -> tuple[GmailLabel, ...]:
+        self.catalog_calls += 1
+        return self.labels
+
+
+def test_gmail_label_catalog_add_list_remove_are_account_and_revision_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    gateway = FakeGmailLabelGateway(
+        identity_key,
+        (
+            GmailLabel("Label_456", "Receipts", "user"),
+            GmailLabel("INBOX", "Inbox", "system"),
+            GmailLabel("Label_123", "Invoices", "user"),
+        ),
+    )
+    mailbox = MailboxSession("gmail", "gmail-default", gateway)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+
+    catalog = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert catalog == {
+        "provider": "gmail",
+        "account_id": "gmail-default",
+        "revision": 0,
+        "items": [
+            {
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "selected": False,
+                "selector_id": None,
+            },
+            {
+                "label_id": "Label_456",
+                "display_name": "Receipts",
+                "selected": False,
+                "selector_id": None,
+            },
+        ],
+    }
+
+    system_label = engine_api._response(
+        request(
+            config_path,
+            "gmail.label_selectors.add",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "INBOX",
+                "expected_revision": 0,
+            },
+        )
+    )
+    assert system_label["error"]["code"] == "label_not_user"
+    assert runtime.store.gmail_label_selector_set("gmail-default").revision == 0
+
+    added = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.add",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "Label_123",
+                "expected_revision": 0,
+            },
+        )
+    )
+    assert added["revision"] == 1
+    assert added["item"] == {
+        "selector_id": added["item"]["selector_id"],
+        "label_id": "Label_123",
+        "display_name": "Invoices",
+        "status": "active",
+        "admission_active": True,
+    }
+
+    listed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert listed["revision"] == 1
+    assert listed["catalog_state"] == "current"
+    assert listed["items"] == [added["item"]]
+
+    removed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.remove",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "selector_id": added["item"]["selector_id"],
+                "expected_revision": 1,
+            },
+        )
+    )
+    assert removed == {
+        "revision": 2,
+        "removed_selector_id": added["item"]["selector_id"],
+    }
+
+
+def test_gmail_label_add_reopens_identity_and_fails_closed_on_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_x = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    identity_y = "f" * 64
+    first = MailboxSession(
+        "gmail",
+        "gmail-default",
+        FakeGmailLabelGateway(
+            identity_x,
+            (GmailLabel("Label_123", "Invoices", "user"),),
+        ),
+    )
+    second = MailboxSession(
+        "gmail",
+        "gmail-default",
+        FakeGmailLabelGateway(identity_y, ()),
+    )
+    sessions = iter((first, second))
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: next(sessions))
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.label_selectors.add",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "Label_123",
+                "expected_revision": 0,
+            },
+        )
+    )
+    assert response["error"]["code"] == "mailbox_identity_changed"
+    assert runtime.store.gmail_label_selectors("gmail-default") == ()
+    assert runtime.store.gmail_label_selector_set("gmail-default").revision == 0
+
+
+def test_gmail_label_list_keeps_selector_visible_when_catalog_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, selector = runtime.store.add_gmail_label_selector(
+        "gmail-default",
+        identity_key,
+        "Label_123",
+        "Invoices",
+        0,
+    )
+
+    gateway = FakeGmailLabelGateway(identity_key, ())
+
+    def unavailable() -> tuple[GmailLabel, ...]:
+        raise GmailLabelCatalogUnavailable("offline")
+
+    gateway.label_catalog = unavailable  # type: ignore[method-assign]
+    mailbox = MailboxSession("gmail", "gmail-default", gateway)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+
+    listed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.list",
+            {"provider": "gmail", "account_id": "gmail-default"},
+        )
+    )
+    assert listed == {
+        "provider": "gmail",
+        "account_id": "gmail-default",
+        "revision": revision,
+        "catalog_state": "unavailable",
+        "items": [
+            {
+                "selector_id": selector.selector_id,
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "status": "validation_unavailable",
+                "admission_active": False,
+            }
+        ],
+    }
+
+
+def test_gmail_label_remove_is_provider_network_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    revision, selector = runtime.store.add_gmail_label_selector(
+        "gmail-default",
+        identity_key,
+        "Label_123",
+        "Invoices",
+        0,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Remove attempted Gmail provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    removed = engine_api.dispatch(
+        request(
+            config_path,
+            "gmail.label_selectors.remove",
+            {
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "selector_id": selector.selector_id,
+                "expected_revision": revision,
+            },
+        )
+    )
+    assert removed == {"revision": 2, "removed_selector_id": selector.selector_id}
+
+
+@pytest.mark.parametrize("label_id", ["x" * 513, "Label_123\u0000"])
+def test_gmail_label_add_rejects_oversized_or_control_character_ids(
+    tmp_path: Path,
+    label_id: str,
+) -> None:
+    with pytest.raises(engine_api.ApiError, match="label_id is invalid"):
+        engine_api.dispatch(
+            request(
+                tmp_path / "config.toml",
+                "gmail.label_selectors.add",
+                {
+                    "provider": "gmail",
+                    "account_id": "gmail-default",
+                    "label_id": label_id,
+                    "expected_revision": 0,
+                },
+            )
+        )
+
+
+def test_gmail_label_operations_reject_non_active_account_before_provider_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.register_mail_account(
+        "gmail",
+        "gmail-retained",
+        display_name="Gmail",
+        address="retained@example.com",
+        active=False,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+
+    def reject_provider_access(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Non-active account reached provider access")
+
+    monkeypatch.setattr(engine_api, "load_mailbox_account", reject_provider_access)
+    response = engine_api._response(
+        request(
+            config_path,
+            "gmail.labels.catalog",
+            {"provider": "gmail", "account_id": "gmail-retained"},
+        )
+    )
+    assert response["error"]["code"] == "account_not_active"
 
 
 def microsoft_principal(*, object_id: str = "object-1") -> MicrosoftPrincipal:
@@ -247,6 +629,13 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert inbox["data"]["items"][0]["provider"] == "gmail"
     assert inbox["data"]["items"][0]["account_id"] == "gmail-default"
     assert inbox["data"]["items"][0]["attachments"] == []
+    assert inbox["data"]["items"][0]["admission"] == {
+        "kind": "exact_sender",
+        "selector_id": "sender:a@example.com",
+        "display_name": None,
+        "admitted_at": "2026-09-19T12:00:00+00:00",
+    }
+    assert "mailbox_identity" not in json.dumps(inbox)
 
 
 def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
@@ -4213,6 +4602,83 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
     assert listed["data"]["items"] == []
 
 
+def test_watchlist_mutations_hold_production_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    lock_held = False
+    lock_paths: list[Path] = []
+    original_add_sender = engine_api.add_sender
+    original_remove_sender = engine_api.remove_sender
+
+    @contextmanager
+    def mailbox_operation_lock(lock_path: Path, busy_message: str):
+        nonlocal lock_held
+        assert busy_message == "Another mailbox operation is already running"
+        assert lock_held is False
+        lock_paths.append(lock_path)
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    def add_sender_while_locked(path: Path, email: str, name: str | None):
+        assert lock_held is True
+        return original_add_sender(path, email, name)
+
+    def remove_sender_while_locked(path: Path, email: str):
+        assert lock_held is True
+        return original_remove_sender(path, email)
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", mailbox_operation_lock)
+    monkeypatch.setattr(engine_api, "add_sender", add_sender_while_locked)
+    monkeypatch.setattr(engine_api, "remove_sender", remove_sender_while_locked)
+
+    added = engine_api._response(
+        request(config_path, "watchlist.add", {"email": "new@example.com"})
+    )
+    removed = engine_api._response(
+        request(config_path, "watchlist.remove", {"email": "new@example.com"})
+    )
+
+    assert added["ok"] is True
+    assert removed["ok"] is True
+    expected_lock_path = engine_api._production_check_lock_path(load_config(config_path))
+    assert lock_paths == [expected_lock_path, expected_lock_path]
+    assert lock_held is False
+
+
+@pytest.mark.parametrize("operation", ["watchlist.add", "watchlist.remove"])
+def test_watchlist_mutations_fail_closed_when_production_lock_is_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+
+    @contextmanager
+    def busy_operation_lock(_lock_path: Path, _busy_message: str):
+        raise engine_api.OperationLockBusy("mailbox operation is busy")
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+    monkeypatch.setattr(engine_api, "operation_lock", busy_operation_lock)
+    response = engine_api._response(
+        request(config_path, operation, {"email": "new@example.com"})
+    )
+
+    assert response["error"] == {
+        "code": "mailbox_busy",
+        "message": "mailbox operation is busy",
+        "retryable": True,
+    }
+    assert load_config(config_path).senders == ()
+
+
 def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4342,6 +4808,13 @@ def test_attachment_export_uses_downloaded_size_for_imap_provider_metadata(
         subject="Attachment",
         received_at="2026-09-12T14:00:00+00:00",
         mailbox_identity_key=mailbox_identity_key,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:a@example.com",
+            display_name=None,
+            mailbox_identity_key=mailbox_identity_key,
+            admitted_at="2026-09-12T14:00:00+00:00",
+        ),
     )
     runtime.store.replace_attachments(
         local_message_id,
@@ -4908,6 +5381,49 @@ def test_check_maps_mailbox_identity_change_to_domain_error(
     }
 
 
+def test_check_preserves_gmail_recovery_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *args, **kwargs: {
+            "active": True,
+            "discovered": 2,
+            "summarized": 1,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": True,
+            "recovery_pending": True,
+            "recovery_state": "backoff",
+            "recovery_failure_code": "gmail_recovery_page_invalid",
+            "recovery_next_retry_at": "2026-09-20T03:00:00+00:00",
+        },
+    )
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["ok"] is True
+    assert response["data"] == {
+        "active": True,
+        "discovered": 2,
+        "summarized": 1,
+        "fallback_notified": 0,
+        "purged": 0,
+        "stale_cursor_recovered": True,
+        "recovery_pending": True,
+        "recovery_state": "backoff",
+        "recovery_failure_code": "gmail_recovery_page_invalid",
+        "recovery_next_retry_at": "2026-09-20T03:00:00+00:00",
+        "pending_notifications": 0,
+    }
+
+
 @pytest.mark.parametrize(
     ("sender", "expected_messages", "expected_fires"),
     [
@@ -5375,6 +5891,61 @@ def test_gmail_error_response_redacts_configured_path(
     }
     assert str(sensitive_path) not in json.dumps(response)
     assert str(sensitive_path) in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "retryable"),
+    [
+        (
+            GmailLabelCatalogInvalid("malformed label payload"),
+            "gmail_label_catalog_invalid",
+            False,
+        ),
+        (
+            GmailLabelCatalogUnavailable("provider offline"),
+            "gmail_label_catalog_unavailable",
+            True,
+        ),
+        (
+            GmailRecoveryPageInvalid("malformed recovery page"),
+            "gmail_recovery_page_invalid",
+            True,
+        ),
+        (
+            GmailRecoveryPageTokenInvalid("rejected page token"),
+            "gmail_recovery_page_token_invalid",
+            True,
+        ),
+        (
+            GmailLabelStoreError("gmail_recovery_snapshot_too_large"),
+            "gmail_recovery_snapshot_too_large",
+            False,
+        ),
+        (
+            GmailLabelStoreError("gmail_recovery_counter_overflow"),
+            "gmail_recovery_counter_overflow",
+            False,
+        ),
+    ],
+)
+def test_visible_gmail_integrity_errors_preserve_stable_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    code: str,
+    retryable: bool,
+) -> None:
+    def fail_dispatch(_request: object) -> dict[str, object]:
+        raise error
+
+    monkeypatch.setattr(engine_api, "dispatch", fail_dispatch)
+
+    response = engine_api._response(
+        {"protocol": 1, "operation": "watcher.check", "payload": {}}
+    )
+
+    assert response["error"]["code"] == code
+    assert response["error"]["retryable"] is retryable
+    assert str(error) not in response["error"]["message"]
 
 
 @pytest.mark.parametrize(

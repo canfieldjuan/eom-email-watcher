@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import unicodedata
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
@@ -91,6 +92,102 @@ AUTOMATION_FIRE_TRANSITIONS = frozenset(
 AUTOMATION_FIRE_MAX_ATTEMPTS = 2
 AUTOMATION_FIRE_PENDING_WINDOW = timedelta(hours=2)
 MAX_AUTOMATION_PREPARED_IDENTITY_BYTES = 32 * 1024
+MAX_GMAIL_LABEL_SELECTORS = 100
+MAX_GMAIL_LABEL_ID_BYTES = 512
+MAX_GMAIL_LABEL_NAME_BYTES = 1024
+MAX_GMAIL_RECOVERY_SNAPSHOT_BYTES = 1024 * 1024
+MAX_GMAIL_RECOVERY_PAGE_JSON_BYTES = 512 * 1024
+MAX_GMAIL_RECOVERY_PAGE_IDS = 200
+MAX_GMAIL_RECOVERY_PAGE_TOKEN_BYTES = 8192
+MAX_GMAIL_RECOVERY_CURSOR_BYTES = 4096
+SQLITE_MAX_INTEGER = (1 << 63) - 1
+
+
+class GmailLabelStoreError(RuntimeError):
+    """Stable store failure surfaced through the engine protocol."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def _utf8_size(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def _has_control_character(value: str) -> bool:
+    return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _require_bounded_text(
+    value: object,
+    *,
+    maximum_bytes: int,
+    field: str,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or _utf8_size(value) > maximum_bytes
+        or _has_control_character(value)
+    ):
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def _require_mailbox_identity_key(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("mailbox identity key must be a lower-case SHA-256 digest")
+    return value
+
+
+def _require_revision(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= SQLITE_MAX_INTEGER:
+        raise ValueError("revision must be a non-negative SQLite integer")
+    return value
+
+
+def _validate_utc_timestamp(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or _utf8_size(value) > 64:
+        raise ValueError(f"{field} must be a UTC ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a UTC ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"{field} must be a UTC ISO-8601 timestamp")
+    return value
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _decode_json_bytes(value: object, *, field: str) -> object:
+    if not isinstance(value, bytes):
+        raise RuntimeError(f"{field} is invalid")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        decoded: dict[str, object] = {}
+        for key, item in pairs:
+            if key in decoded:
+                raise ValueError("duplicate JSON key")
+            decoded[key] = item
+        return decoded
+
+    try:
+        return json.loads(value.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"{field} is invalid") from exc
 
 
 def _sqlite_casefold(value: object) -> str:
@@ -1650,6 +1747,79 @@ class MailAccount:
     legacy_identity_key: str | None = None
 
 
+@dataclass(frozen=True)
+class GmailLabelSelectorSet:
+    provider: str
+    account_id: str
+    current_mailbox_identity_key: str = field(repr=False)
+    revision: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class GmailLabelSelector:
+    selector_id: str
+    provider: str
+    account_id: str
+    mailbox_identity_key: str = field(repr=False)
+    label_id: str
+    selected_display_name: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class GmailLabelSelectorSnapshot:
+    selector_id: str
+    label_id: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class AdmissionProvenance:
+    kind: str
+    selector_id: str
+    display_name: str | None
+    mailbox_identity_key: str = field(repr=False)
+    admitted_at: str
+
+
+@dataclass(frozen=True)
+class GmailRecoveryMessage:
+    message_id: str
+    thread_id: str | None
+    sender: str
+    sender_name: str | None
+    subject: str
+    received_at: str
+
+
+@dataclass(frozen=True)
+class GmailRecoveryState:
+    provider: str
+    account_id: str
+    mailbox_identity_key: str = field(repr=False)
+    selector_revision: int
+    sender_snapshot: tuple[tuple[str, str | None], ...]
+    selector_snapshot: tuple[GmailLabelSelectorSnapshot, ...]
+    recovery_after_exclusive_epoch: int
+    recovery_before_exclusive_epoch: int
+    replacement_history_cursor: str
+    page_token: str | None
+    current_page_ids: tuple[str, ...]
+    page_loaded: bool
+    next_index: int
+    page_count: int
+    terminal_candidate_count: int
+    invalid_page_token_count: int
+    consecutive_retry_count: int
+    state: str
+    failure_code: str | None
+    next_retry_at: str | None
+    created_at: str
+    updated_at: str
+
+
 def _mail_account(row: sqlite3.Row) -> MailAccount:
     return MailAccount(
         provider=str(row["provider"]),
@@ -1666,6 +1836,64 @@ def _mail_account(row: sqlite3.Row) -> MailAccount:
         legacy_identity_key=(
             str(row["legacy_identity_key"]) if row["legacy_identity_key"] is not None else None
         ),
+    )
+
+
+def _gmail_label_selector_set(row: sqlite3.Row) -> GmailLabelSelectorSet:
+    return GmailLabelSelectorSet(
+        provider=str(row["provider"]),
+        account_id=str(row["account_id"]),
+        current_mailbox_identity_key=str(row["current_mailbox_identity_key"]),
+        revision=int(row["revision"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _gmail_label_selector(row: sqlite3.Row) -> GmailLabelSelector:
+    return GmailLabelSelector(
+        selector_id=str(row["selector_id"]),
+        provider=str(row["provider"]),
+        account_id=str(row["account_id"]),
+        mailbox_identity_key=str(row["mailbox_identity_key"]),
+        label_id=str(row["label_id"]),
+        selected_display_name=str(row["selected_display_name"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _gmail_recovery_state(row: sqlite3.Row) -> GmailRecoveryState:
+    page_ids = decode_gmail_recovery_page(row["current_page_ids_json"])
+    page_loaded = bool(row["page_loaded"])
+    next_index = int(row["next_index"])
+    if (not page_loaded and (page_ids or next_index != 0)) or next_index > len(page_ids):
+        raise RuntimeError("gmail recovery page state is invalid")
+    page_token = str(row["page_token"]) if row["page_token"] is not None else None
+    if page_token is not None and _utf8_size(page_token) > MAX_GMAIL_RECOVERY_PAGE_TOKEN_BYTES:
+        raise RuntimeError("gmail recovery page token is invalid")
+    return GmailRecoveryState(
+        provider=str(row["provider"]),
+        account_id=str(row["account_id"]),
+        mailbox_identity_key=str(row["mailbox_identity_key"]),
+        selector_revision=int(row["selector_revision"]),
+        sender_snapshot=decode_gmail_sender_snapshot(row["sender_snapshot_json"]),
+        selector_snapshot=decode_gmail_selector_snapshot(row["selector_snapshot_json"]),
+        recovery_after_exclusive_epoch=int(row["recovery_after_exclusive_epoch"]),
+        recovery_before_exclusive_epoch=int(row["recovery_before_exclusive_epoch"]),
+        replacement_history_cursor=str(row["replacement_history_cursor"]),
+        page_token=page_token,
+        current_page_ids=page_ids,
+        page_loaded=page_loaded,
+        next_index=next_index,
+        page_count=int(row["page_count"]),
+        terminal_candidate_count=int(row["terminal_candidate_count"]),
+        invalid_page_token_count=int(row["invalid_page_token_count"]),
+        consecutive_retry_count=int(row["consecutive_retry_count"]),
+        state=str(row["state"]),
+        failure_code=(str(row["failure_code"]) if row["failure_code"] is not None else None),
+        next_retry_at=(str(row["next_retry_at"]) if row["next_retry_at"] is not None else None),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
     )
 
 
@@ -2082,6 +2310,194 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
     )
 
 
+def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
+    _execute_transactional_script(
+        db,
+        """
+        CREATE TABLE IF NOT EXISTS gmail_label_selector_sets (
+          provider TEXT NOT NULL CHECK (provider = 'gmail'),
+          account_id TEXT NOT NULL CHECK (
+            account_id <> '' AND length(CAST(account_id AS BLOB)) <= 128
+          ),
+          current_mailbox_identity_key TEXT NOT NULL CHECK (
+            length(current_mailbox_identity_key) = 64
+            AND current_mailbox_identity_key = lower(current_mailbox_identity_key)
+            AND current_mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+          ),
+          revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (provider, account_id)
+        );
+        CREATE TABLE IF NOT EXISTS gmail_label_selectors (
+          selector_id TEXT PRIMARY KEY CHECK (length(selector_id) = 36),
+          provider TEXT NOT NULL CHECK (provider = 'gmail'),
+          account_id TEXT NOT NULL CHECK (
+            account_id <> '' AND length(CAST(account_id AS BLOB)) <= 128
+          ),
+          mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key = lower(mailbox_identity_key)
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+          ),
+          label_id TEXT NOT NULL CHECK (
+            label_id <> '' AND length(CAST(label_id AS BLOB)) <= 512
+          ),
+          selected_display_name TEXT NOT NULL CHECK (
+            selected_display_name <> ''
+            AND length(CAST(selected_display_name AS BLOB)) <= 1024
+          ),
+          created_at TEXT NOT NULL,
+          UNIQUE (provider, account_id, mailbox_identity_key, label_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gmail_label_selectors_account
+          ON gmail_label_selectors(provider, account_id, selector_id);
+        CREATE TRIGGER IF NOT EXISTS gmail_label_selectors_immutable
+        BEFORE UPDATE ON gmail_label_selectors
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail label selectors are immutable');
+        END;
+        CREATE TABLE IF NOT EXISTS gmail_recovery_state (
+          provider TEXT NOT NULL CHECK (provider = 'gmail'),
+          account_id TEXT NOT NULL CHECK (
+            account_id <> '' AND length(CAST(account_id AS BLOB)) <= 128
+          ),
+          mailbox_identity_key TEXT NOT NULL CHECK (
+            length(mailbox_identity_key) = 64
+            AND mailbox_identity_key = lower(mailbox_identity_key)
+            AND mailbox_identity_key NOT GLOB '*[^0-9a-f]*'
+          ),
+          selector_revision INTEGER NOT NULL CHECK (selector_revision >= 0),
+          sender_snapshot_json BLOB NOT NULL CHECK (
+            typeof(sender_snapshot_json) = 'blob'
+            AND length(sender_snapshot_json) <= 1048576
+          ),
+          selector_snapshot_json BLOB NOT NULL CHECK (
+            typeof(selector_snapshot_json) = 'blob'
+            AND length(selector_snapshot_json) <= 1048576
+          ),
+          recovery_after_exclusive_epoch INTEGER NOT NULL CHECK (
+            recovery_after_exclusive_epoch >= 0
+          ),
+          recovery_before_exclusive_epoch INTEGER NOT NULL CHECK (
+            recovery_before_exclusive_epoch > recovery_after_exclusive_epoch
+          ),
+          replacement_history_cursor TEXT NOT NULL CHECK (
+            replacement_history_cursor <> ''
+            AND length(CAST(replacement_history_cursor AS BLOB)) <= 4096
+          ),
+          page_token TEXT CHECK (
+            page_token IS NULL OR length(CAST(page_token AS BLOB)) <= 8192
+          ),
+          current_page_ids_json BLOB NOT NULL CHECK (
+            typeof(current_page_ids_json) = 'blob'
+            AND length(current_page_ids_json) <= 524288
+          ),
+          page_loaded INTEGER NOT NULL DEFAULT 0 CHECK (page_loaded IN (0, 1)),
+          next_index INTEGER NOT NULL DEFAULT 0 CHECK (next_index BETWEEN 0 AND 200),
+          page_count INTEGER NOT NULL DEFAULT 0 CHECK (page_count >= 0),
+          terminal_candidate_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            terminal_candidate_count >= 0
+          ),
+          invalid_page_token_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            invalid_page_token_count >= 0
+          ),
+          consecutive_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            consecutive_retry_count BETWEEN 0 AND 31
+          ),
+          state TEXT NOT NULL CHECK (state IN ('collecting', 'backoff', 'degraded')),
+          failure_code TEXT,
+          next_retry_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (provider, account_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS gmail_recovery_state_immutable
+        BEFORE UPDATE ON gmail_recovery_state
+        WHEN NEW.provider IS NOT OLD.provider
+          OR NEW.account_id IS NOT OLD.account_id
+          OR NEW.mailbox_identity_key IS NOT OLD.mailbox_identity_key
+          OR NEW.selector_revision IS NOT OLD.selector_revision
+          OR NEW.sender_snapshot_json IS NOT OLD.sender_snapshot_json
+          OR NEW.selector_snapshot_json IS NOT OLD.selector_snapshot_json
+          OR NEW.recovery_after_exclusive_epoch IS NOT OLD.recovery_after_exclusive_epoch
+          OR NEW.recovery_before_exclusive_epoch IS NOT OLD.recovery_before_exclusive_epoch
+          OR NEW.replacement_history_cursor IS NOT OLD.replacement_history_cursor
+          OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.page_count < OLD.page_count
+          OR NEW.terminal_candidate_count < OLD.terminal_candidate_count
+          OR NEW.invalid_page_token_count < OLD.invalid_page_token_count
+        BEGIN
+          SELECT RAISE(ABORT, 'gmail recovery state is immutable');
+        END;
+        """,
+    )
+    message_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    columns = {
+        "admission_kind": (
+            "TEXT CHECK (admission_kind IS NULL OR "
+            "admission_kind IN ('exact_sender', 'gmail_user_label'))"
+        ),
+        "admission_selector_id": (
+            "TEXT CHECK (admission_selector_id IS NULL OR "
+            "(admission_selector_id <> '' AND "
+            "length(CAST(admission_selector_id AS BLOB)) <= 512))"
+        ),
+        "admission_display_name": (
+            "TEXT CHECK (admission_display_name IS NULL OR "
+            "length(CAST(admission_display_name AS BLOB)) <= 1024)"
+        ),
+        "admission_mailbox_identity_key": (
+            "TEXT CHECK (admission_mailbox_identity_key IS NULL OR "
+            "(length(admission_mailbox_identity_key) = 64 "
+            "AND admission_mailbox_identity_key = lower(admission_mailbox_identity_key) "
+            "AND admission_mailbox_identity_key NOT GLOB '*[^0-9a-f]*'))"
+        ),
+        "admitted_at": (
+            "TEXT CHECK (admitted_at IS NULL OR "
+            "(admitted_at <> '' AND length(CAST(admitted_at AS BLOB)) <= 64))"
+        ),
+    }
+    for column, definition in columns.items():
+        if column not in message_columns:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+    _execute_transactional_script(
+        db,
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_require_admission_provenance_insert
+        BEFORE INSERT ON messages
+        WHEN NEW.admission_kind IS NULL
+          OR NEW.admission_selector_id IS NULL
+          OR NEW.admission_mailbox_identity_key IS NULL
+          OR NEW.admitted_at IS NULL
+          OR NEW.admission_mailbox_identity_key <> NEW.mailbox_identity_key
+        BEGIN
+          SELECT RAISE(ABORT, 'message admission provenance is required');
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_admission_provenance_immutable
+        BEFORE UPDATE OF admission_kind, admission_selector_id,
+          admission_display_name, admission_mailbox_identity_key, admitted_at,
+          mailbox_identity_key ON messages
+        WHEN (OLD.admission_kind IS NOT NULL
+          OR OLD.admission_selector_id IS NOT NULL
+          OR OLD.admission_display_name IS NOT NULL
+          OR OLD.admission_mailbox_identity_key IS NOT NULL
+          OR OLD.admitted_at IS NOT NULL)
+          AND (NEW.admission_kind IS NOT OLD.admission_kind
+            OR NEW.admission_selector_id IS NOT OLD.admission_selector_id
+            OR NEW.admission_display_name IS NOT OLD.admission_display_name
+            OR NEW.admission_mailbox_identity_key IS NOT OLD.admission_mailbox_identity_key
+            OR NEW.admitted_at IS NOT OLD.admitted_at
+            OR NEW.mailbox_identity_key IS NOT OLD.mailbox_identity_key)
+        BEGIN
+          SELECT RAISE(ABORT, 'message admission provenance is immutable');
+        END;
+        """,
+    )
+
+
 def _valid_uuid_v4(value: object) -> bool:
     if not isinstance(value, str):
         return False
@@ -2127,6 +2543,225 @@ def _decode_connect_capability_produces(value: object) -> tuple[str, ...]:
     if _encode_connect_capability_produces(canonical) != value:
         raise RuntimeError("Stored Connect capability output authority is invalid")
     return canonical
+
+
+def encode_gmail_selector_snapshot(
+    selectors: Sequence[object],
+) -> bytes:
+    if len(selectors) > MAX_GMAIL_LABEL_SELECTORS:
+        raise ValueError("gmail selector snapshot exceeds its item limit")
+    items: list[dict[str, str]] = []
+    selector_ids: set[str] = set()
+    for selector in selectors:
+        selector_id = getattr(selector, "selector_id", None)
+        label_id = getattr(selector, "label_id", None)
+        display_name = getattr(
+            selector,
+            "selected_display_name",
+            getattr(selector, "display_name", None),
+        )
+        if not _valid_uuid_v4(selector_id) or selector_id in selector_ids:
+            raise ValueError("gmail selector snapshot has an invalid selector id")
+        selector_ids.add(selector_id)
+        items.append(
+            {
+                "selector_id": selector_id,
+                "label_id": _require_bounded_text(
+                    label_id,
+                    maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                    field="gmail label id",
+                ),
+                "display_name": _require_bounded_text(
+                    display_name,
+                    maximum_bytes=MAX_GMAIL_LABEL_NAME_BYTES,
+                    field="gmail label display name",
+                ),
+            }
+        )
+    items.sort(key=lambda item: item["selector_id"])
+    encoded = _canonical_json_bytes(items)
+    if len(encoded) > MAX_GMAIL_RECOVERY_SNAPSHOT_BYTES:
+        raise GmailLabelStoreError("gmail_recovery_snapshot_too_large")
+    return encoded
+
+
+def decode_gmail_selector_snapshot(value: object) -> tuple[GmailLabelSelectorSnapshot, ...]:
+    if not isinstance(value, bytes) or len(value) > MAX_GMAIL_RECOVERY_SNAPSHOT_BYTES:
+        raise RuntimeError("gmail selector snapshot is invalid")
+    decoded = _decode_json_bytes(value, field="gmail selector snapshot")
+    if not isinstance(decoded, list) or len(decoded) > MAX_GMAIL_LABEL_SELECTORS:
+        raise RuntimeError("gmail selector snapshot is invalid")
+    selectors: list[GmailLabelSelectorSnapshot] = []
+    selector_ids: set[str] = set()
+    for item in decoded:
+        if not isinstance(item, dict) or set(item) != {
+            "selector_id",
+            "label_id",
+            "display_name",
+        }:
+            raise RuntimeError("gmail selector snapshot is invalid")
+        selector_id = item["selector_id"]
+        try:
+            label_id = _require_bounded_text(
+                item["label_id"],
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="gmail label id",
+            )
+            display_name = _require_bounded_text(
+                item["display_name"],
+                maximum_bytes=MAX_GMAIL_LABEL_NAME_BYTES,
+                field="gmail label display name",
+            )
+        except ValueError as exc:
+            raise RuntimeError("gmail selector snapshot is invalid") from exc
+        if not _valid_uuid_v4(selector_id) or selector_id in selector_ids:
+            raise RuntimeError("gmail selector snapshot is invalid")
+        selector_ids.add(selector_id)
+        selectors.append(
+            GmailLabelSelectorSnapshot(
+                selector_id=str(selector_id),
+                label_id=label_id,
+                display_name=display_name,
+            )
+        )
+    if tuple(selector.selector_id for selector in selectors) != tuple(
+        sorted(selector_ids)
+    ):
+        raise RuntimeError("gmail selector snapshot is not canonical")
+    if _canonical_json_bytes(decoded) != value:
+        raise RuntimeError("gmail selector snapshot is not canonical")
+    return tuple(selectors)
+
+
+def encode_gmail_sender_snapshot(
+    senders: Sequence[tuple[str, str | None]],
+) -> bytes:
+    items: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for raw_email, raw_name in senders:
+        email = normalize_validated_address(raw_email)
+        if email != raw_email or email in seen:
+            raise ValueError("gmail sender snapshot is invalid")
+        seen.add(email)
+        if raw_name is not None and (
+            not isinstance(raw_name, str)
+            or not raw_name.strip()
+            or raw_name != raw_name.strip()
+            or any(not character.isprintable() for character in raw_name)
+        ):
+            raise ValueError("gmail sender snapshot is invalid")
+        items.append({"email": email, "name": raw_name})
+    items.sort(key=lambda item: (str(item["email"]), str(item["name"] or "")))
+    encoded = _canonical_json_bytes(items)
+    if len(encoded) > MAX_GMAIL_RECOVERY_SNAPSHOT_BYTES:
+        raise GmailLabelStoreError("gmail_recovery_snapshot_too_large")
+    return encoded
+
+
+def decode_gmail_sender_snapshot(value: object) -> tuple[tuple[str, str | None], ...]:
+    if not isinstance(value, bytes) or len(value) > MAX_GMAIL_RECOVERY_SNAPSHOT_BYTES:
+        raise RuntimeError("gmail sender snapshot is invalid")
+    decoded = _decode_json_bytes(value, field="gmail sender snapshot")
+    if not isinstance(decoded, list):
+        raise RuntimeError("gmail sender snapshot is invalid")
+    senders: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for item in decoded:
+        if not isinstance(item, dict) or set(item) != {"email", "name"}:
+            raise RuntimeError("gmail sender snapshot is invalid")
+        email = item["email"]
+        name = item["name"]
+        try:
+            if not isinstance(email, str) or normalize_validated_address(email) != email:
+                raise ValueError("invalid email")
+        except ValueError as exc:
+            raise RuntimeError("gmail sender snapshot is invalid") from exc
+        if email in seen or (
+            name is not None
+            and (
+                not isinstance(name, str)
+                or not name.strip()
+                or name != name.strip()
+                or any(not character.isprintable() for character in name)
+            )
+        ):
+            raise RuntimeError("gmail sender snapshot is invalid")
+        seen.add(email)
+        senders.append((email, name))
+    if senders != sorted(senders, key=lambda item: (item[0], item[1] or "")):
+        raise RuntimeError("gmail sender snapshot is not canonical")
+    if _canonical_json_bytes(decoded) != value:
+        raise RuntimeError("gmail sender snapshot is not canonical")
+    return tuple(senders)
+
+
+def encode_gmail_recovery_page(message_ids: Sequence[str]) -> bytes:
+    if len(message_ids) > MAX_GMAIL_RECOVERY_PAGE_IDS:
+        raise GmailLabelStoreError("gmail_recovery_page_invalid")
+    seen: set[str] = set()
+    validated: list[str] = []
+    for message_id in message_ids:
+        try:
+            bounded = _require_bounded_text(
+                message_id,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="gmail provider message id",
+            )
+        except ValueError as exc:
+            raise GmailLabelStoreError("gmail_recovery_page_invalid") from exc
+        if bounded in seen:
+            raise GmailLabelStoreError("gmail_recovery_page_invalid")
+        seen.add(bounded)
+        validated.append(bounded)
+    encoded = json.dumps(validated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > MAX_GMAIL_RECOVERY_PAGE_JSON_BYTES:
+        raise GmailLabelStoreError("gmail_recovery_page_invalid")
+    return encoded
+
+
+def decode_gmail_recovery_page(value: object) -> tuple[str, ...]:
+    if not isinstance(value, bytes) or len(value) > MAX_GMAIL_RECOVERY_PAGE_JSON_BYTES:
+        raise RuntimeError("gmail recovery page is invalid")
+    decoded = _decode_json_bytes(value, field="gmail recovery page")
+    if not isinstance(decoded, list) or len(decoded) > MAX_GMAIL_RECOVERY_PAGE_IDS:
+        raise RuntimeError("gmail recovery page is invalid")
+    try:
+        encoded = encode_gmail_recovery_page(decoded)
+    except (GmailLabelStoreError, ValueError) as exc:
+        raise RuntimeError("gmail recovery page is invalid") from exc
+    if encoded != value:
+        raise RuntimeError("gmail recovery page is not canonical")
+    return tuple(decoded)
+
+
+def _validate_admission_provenance(
+    admission: AdmissionProvenance,
+    *,
+    mailbox_identity_key: str,
+) -> None:
+    if admission.kind not in {"exact_sender", "gmail_user_label"}:
+        raise ValueError("admission kind is invalid")
+    _require_bounded_text(
+        admission.selector_id,
+        maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+        field="admission selector id",
+    )
+    if admission.display_name is not None and _utf8_size(admission.display_name) > 1024:
+        raise ValueError("admission display name is invalid")
+    if admission.display_name is not None and _has_control_character(admission.display_name):
+        raise ValueError("admission display name is invalid")
+    if admission.kind == "gmail_user_label" and not _valid_uuid_v4(admission.selector_id):
+        raise ValueError("gmail label admission selector id is invalid")
+    if admission.kind == "exact_sender":
+        prefix = "sender:"
+        if not admission.selector_id.startswith(prefix):
+            raise ValueError("exact sender admission selector id is invalid")
+        address = admission.selector_id[len(prefix) :]
+        if normalize_validated_address(address) != address:
+            raise ValueError("exact sender admission selector id is invalid")
+    if _require_mailbox_identity_key(admission.mailbox_identity_key) != mailbox_identity_key:
+        raise MailboxIdentityChanged("mailbox identity changed")
+    _validate_utc_timestamp(admission.admitted_at, field="admitted_at")
 
 
 def _decode_v2_request(request_json: bytes) -> dict[str, object]:
@@ -2867,6 +3502,7 @@ class Store:
             _ensure_connect_jobs_schema(db, version)
             _ensure_connect_dispatch_schema(db)
             _ensure_automate_core_schema(db, version)
+            _ensure_gmail_label_schema(db)
             if version < 18:
                 _migrate_microsoft_principal_keys_v2(db)
             automation_run_columns = {
@@ -3134,10 +3770,7 @@ class Store:
         legacy_status: str | None = None,
         preserve_cursor: bool = False,
     ) -> MailAccount:
-        if len(mailbox_identity_key) != 64 or any(
-            character not in "0123456789abcdef" for character in mailbox_identity_key
-        ):
-            raise ValueError("mailbox identity key must be a lower-case SHA-256 digest")
+        _require_mailbox_identity_key(mailbox_identity_key)
         if legacy_status not in {None, "continuity_proven", "replacement", "unresolved"}:
             raise ValueError("legacy mailbox identity status is invalid")
         stamp = datetime.now(UTC).isoformat()
@@ -3184,6 +3817,36 @@ class Store:
                       AND mailbox_identity_key IS NULL AND status = 'pending'""",
                     (mailbox_identity_key, provider, account_id),
                 )
+            if provider == "gmail":
+                selector_set = db.execute(
+                    """SELECT current_mailbox_identity_key, revision
+                    FROM gmail_label_selector_sets
+                    WHERE provider = 'gmail' AND account_id = ?""",
+                    (account_id,),
+                ).fetchone()
+                if selector_set is None:
+                    db.execute(
+                        """INSERT INTO gmail_label_selector_sets(
+                            provider, account_id, current_mailbox_identity_key,
+                            revision, created_at, updated_at
+                        ) VALUES ('gmail', ?, ?, 0, ?, ?)""",
+                        (account_id, mailbox_identity_key, stamp, stamp),
+                    )
+                elif selector_set["current_mailbox_identity_key"] != mailbox_identity_key:
+                    revision = int(selector_set["revision"])
+                    if revision == SQLITE_MAX_INTEGER:
+                        raise GmailLabelStoreError("gmail_selector_revision_overflow")
+                    db.execute(
+                        """UPDATE gmail_label_selector_sets
+                        SET current_mailbox_identity_key = ?, revision = ?, updated_at = ?
+                        WHERE provider = 'gmail' AND account_id = ?""",
+                        (mailbox_identity_key, revision + 1, stamp, account_id),
+                    )
+                    db.execute(
+                        """DELETE FROM gmail_recovery_state
+                        WHERE provider = 'gmail' AND account_id = ?""",
+                        (account_id,),
+                    )
         account = self.mail_account(provider, account_id)
         assert account is not None
         return account
@@ -3199,6 +3862,775 @@ class Store:
             ).fetchone()
         if row is None:
             raise MailboxIdentityChanged("mailbox identity changed")
+
+    def gmail_label_selector_set(self, account_id: str) -> GmailLabelSelectorSet | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT provider, account_id, current_mailbox_identity_key,
+                    revision, created_at, updated_at
+                FROM gmail_label_selector_sets
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (account_id,),
+            ).fetchone()
+        return _gmail_label_selector_set(row) if row is not None else None
+
+    def gmail_label_selectors(
+        self,
+        account_id: str,
+        *,
+        mailbox_identity_key: str | None = None,
+    ) -> tuple[GmailLabelSelector, ...]:
+        parameters: list[object] = [account_id]
+        identity_clause = ""
+        if mailbox_identity_key is not None:
+            _require_mailbox_identity_key(mailbox_identity_key)
+            identity_clause = " AND mailbox_identity_key = ?"
+            parameters.append(mailbox_identity_key)
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT selector_id, provider, account_id, mailbox_identity_key,
+                    label_id, selected_display_name, created_at
+                FROM gmail_label_selectors
+                WHERE provider = 'gmail' AND account_id = ?"""
+                + identity_clause
+                + " ORDER BY selector_id",
+                parameters,
+            ).fetchall()
+        return tuple(_gmail_label_selector(row) for row in rows)
+
+    def gmail_current_label_selectors(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+    ) -> tuple[GmailLabelSelector, ...]:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        with self.connection() as db:
+            selector_set = db.execute(
+                """SELECT current_mailbox_identity_key
+                FROM gmail_label_selector_sets
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            account = db.execute(
+                """SELECT mailbox_identity_key FROM mail_accounts
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            if (
+                selector_set is None
+                or account is None
+                or selector_set["current_mailbox_identity_key"] != mailbox_identity_key
+                or account["mailbox_identity_key"] != mailbox_identity_key
+            ):
+                raise MailboxIdentityChanged("mailbox identity changed")
+            rows = db.execute(
+                """SELECT selector_id, provider, account_id, mailbox_identity_key,
+                    label_id, selected_display_name, created_at
+                FROM gmail_label_selectors
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ?
+                ORDER BY selector_id""",
+                (account_id, mailbox_identity_key),
+            ).fetchall()
+        return tuple(_gmail_label_selector(row) for row in rows)
+
+    @staticmethod
+    def _require_current_gmail_selector_set(
+        db: sqlite3.Connection,
+        *,
+        account_id: str,
+        mailbox_identity_key: str,
+    ) -> sqlite3.Row:
+        row = db.execute(
+            """SELECT s.current_mailbox_identity_key, s.revision
+            FROM gmail_label_selector_sets AS s
+            JOIN mail_accounts AS a
+              ON a.provider = s.provider AND a.account_id = s.account_id
+            WHERE s.provider = 'gmail' AND s.account_id = ?""",
+            (account_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["current_mailbox_identity_key"] != mailbox_identity_key
+            or db.execute(
+                """SELECT 1 FROM mail_accounts
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ?""",
+                (account_id, mailbox_identity_key),
+            ).fetchone()
+            is None
+        ):
+            raise MailboxIdentityChanged("mailbox identity changed")
+        return row
+
+    def add_gmail_label_selector(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        label_id: str,
+        display_name: str,
+        expected_revision: int,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[int, GmailLabelSelector]:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        expected = _require_revision(expected_revision)
+        bounded_label_id = _require_bounded_text(
+            label_id,
+            maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+            field="gmail label id",
+        )
+        bounded_display_name = _require_bounded_text(
+            display_name,
+            maximum_bytes=MAX_GMAIL_LABEL_NAME_BYTES,
+            field="gmail label display name",
+        )
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        selector_id = str(uuid.uuid4())
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selector_set = self._require_current_gmail_selector_set(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            revision = int(selector_set["revision"])
+            if revision != expected:
+                raise GmailLabelStoreError("stale_revision")
+            if revision == SQLITE_MAX_INTEGER:
+                raise GmailLabelStoreError("gmail_selector_revision_overflow")
+            if (
+                db.execute(
+                    """SELECT 1 FROM gmail_label_selectors
+                    WHERE provider = 'gmail' AND account_id = ?
+                      AND mailbox_identity_key = ? AND label_id = ?""",
+                    (account_id, mailbox_identity_key, bounded_label_id),
+                ).fetchone()
+                is not None
+            ):
+                raise GmailLabelStoreError("conflict")
+            count = int(
+                db.execute(
+                    """SELECT COUNT(*) FROM gmail_label_selectors
+                    WHERE provider = 'gmail' AND account_id = ?""",
+                    (account_id,),
+                ).fetchone()[0]
+            )
+            if count >= MAX_GMAIL_LABEL_SELECTORS:
+                raise GmailLabelStoreError("limit_exceeded")
+            db.execute(
+                """INSERT INTO gmail_label_selectors(
+                    selector_id, provider, account_id, mailbox_identity_key,
+                    label_id, selected_display_name, created_at
+                ) VALUES (?, 'gmail', ?, ?, ?, ?, ?)""",
+                (
+                    selector_id,
+                    account_id,
+                    mailbox_identity_key,
+                    bounded_label_id,
+                    bounded_display_name,
+                    stamp,
+                ),
+            )
+            new_revision = revision + 1
+            changed = db.execute(
+                """UPDATE gmail_label_selector_sets
+                SET revision = ?, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND current_mailbox_identity_key = ? AND revision = ?""",
+                (new_revision, stamp, account_id, mailbox_identity_key, revision),
+            )
+            if changed.rowcount != 1:
+                raise GmailLabelStoreError("stale_revision")
+        selector = GmailLabelSelector(
+            selector_id=selector_id,
+            provider="gmail",
+            account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            label_id=bounded_label_id,
+            selected_display_name=bounded_display_name,
+            created_at=stamp,
+        )
+        return new_revision, selector
+
+    def remove_gmail_label_selector(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        selector_id: str,
+        expected_revision: int,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        if not _valid_uuid_v4(selector_id):
+            raise ValueError("selector id must be a canonical UUIDv4")
+        expected = _require_revision(expected_revision)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selector_set = self._require_current_gmail_selector_set(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            revision = int(selector_set["revision"])
+            if revision != expected:
+                raise GmailLabelStoreError("stale_revision")
+            if revision == SQLITE_MAX_INTEGER:
+                raise GmailLabelStoreError("gmail_selector_revision_overflow")
+            deleted = db.execute(
+                """DELETE FROM gmail_label_selectors
+                WHERE provider = 'gmail' AND account_id = ? AND selector_id = ?""",
+                (account_id, selector_id),
+            )
+            if deleted.rowcount != 1:
+                raise GmailLabelStoreError("not_found")
+            new_revision = revision + 1
+            changed = db.execute(
+                """UPDATE gmail_label_selector_sets
+                SET revision = ?, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND current_mailbox_identity_key = ? AND revision = ?""",
+                (new_revision, stamp, account_id, mailbox_identity_key, revision),
+            )
+            if changed.rowcount != 1:
+                raise GmailLabelStoreError("stale_revision")
+        return new_revision
+
+    def gmail_label_selector_is_current(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        selector_id: str,
+        label_id: str,
+    ) -> bool:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        if not _valid_uuid_v4(selector_id):
+            return False
+        with self.connection() as db:
+            return (
+                db.execute(
+                    """SELECT 1 FROM gmail_label_selectors AS l
+                    JOIN gmail_label_selector_sets AS s
+                      ON s.provider = l.provider AND s.account_id = l.account_id
+                    JOIN mail_accounts AS a
+                      ON a.provider = l.provider AND a.account_id = l.account_id
+                    WHERE l.provider = 'gmail' AND l.account_id = ?
+                      AND l.mailbox_identity_key = ?
+                      AND l.selector_id = ? AND l.label_id = ?
+                      AND s.current_mailbox_identity_key = l.mailbox_identity_key
+                      AND a.mailbox_identity_key = l.mailbox_identity_key""",
+                    (account_id, mailbox_identity_key, selector_id, label_id),
+                ).fetchone()
+                is not None
+            )
+
+    def create_gmail_recovery_state(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        selector_revision: int,
+        sender_snapshot: Sequence[tuple[str, str | None]],
+        selector_snapshot: Sequence[object],
+        recovery_after_exclusive_epoch: int,
+        recovery_before_exclusive_epoch: int,
+        replacement_history_cursor: str,
+        *,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        revision = _require_revision(selector_revision)
+        if (
+            type(recovery_after_exclusive_epoch) is not int
+            or type(recovery_before_exclusive_epoch) is not int
+            or recovery_after_exclusive_epoch < 0
+            or recovery_before_exclusive_epoch <= recovery_after_exclusive_epoch
+            or recovery_before_exclusive_epoch > SQLITE_MAX_INTEGER
+        ):
+            raise ValueError("gmail recovery window is invalid")
+        cursor = _require_bounded_text(
+            replacement_history_cursor,
+            maximum_bytes=MAX_GMAIL_RECOVERY_CURSOR_BYTES,
+            field="gmail replacement history cursor",
+        )
+        sender_json = encode_gmail_sender_snapshot(sender_snapshot)
+        selector_json = encode_gmail_selector_snapshot(selector_snapshot)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selector_set = self._require_current_gmail_selector_set(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            active = db.execute(
+                """SELECT active FROM mail_accounts
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (account_id,),
+            ).fetchone()
+            if active is None or not bool(active["active"]):
+                raise GmailLabelStoreError("account_not_active")
+            if int(selector_set["revision"]) != revision:
+                raise GmailLabelStoreError("stale_revision")
+            for frozen_selector in decode_gmail_selector_snapshot(selector_json):
+                if (
+                    db.execute(
+                        """SELECT 1 FROM gmail_label_selectors
+                        WHERE provider = 'gmail' AND account_id = ?
+                          AND mailbox_identity_key = ? AND selector_id = ?
+                          AND label_id = ?""",
+                        (
+                            account_id,
+                            mailbox_identity_key,
+                            frozen_selector.selector_id,
+                            frozen_selector.label_id,
+                        ),
+                    ).fetchone()
+                    is None
+                ):
+                    raise GmailLabelStoreError("gmail_recovery_grant_revoked")
+            try:
+                db.execute(
+                    """INSERT INTO gmail_recovery_state(
+                        provider, account_id, mailbox_identity_key, selector_revision,
+                        sender_snapshot_json, selector_snapshot_json,
+                        recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
+                        replacement_history_cursor, page_token, current_page_ids_json,
+                        page_loaded, next_index, page_count, terminal_candidate_count,
+                        invalid_page_token_count, consecutive_retry_count,
+                        state, failure_code, next_retry_at, created_at, updated_at
+                    ) VALUES (
+                        'gmail', ?, ?, ?, ?, ?, ?, ?, ?, NULL, X'5B5D',
+                        0, 0, 0, 0, 0, 0, 'collecting', NULL, NULL, ?, ?
+                    )""",
+                    (
+                        account_id,
+                        mailbox_identity_key,
+                        revision,
+                        sender_json,
+                        selector_json,
+                        recovery_after_exclusive_epoch,
+                        recovery_before_exclusive_epoch,
+                        cursor,
+                        stamp,
+                        stamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise GmailLabelStoreError("conflict") from exc
+            row = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        assert row is not None
+        return _gmail_recovery_state(row)
+
+    def gmail_recovery_state(self, account_id: str) -> GmailRecoveryState | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        return _gmail_recovery_state(row) if row is not None else None
+
+    @staticmethod
+    def _require_current_gmail_recovery(
+        db: sqlite3.Connection,
+        *,
+        account_id: str,
+        mailbox_identity_key: str,
+    ) -> tuple[sqlite3.Row, GmailRecoveryState]:
+        Store._require_current_gmail_selector_set(
+            db,
+            account_id=account_id,
+            mailbox_identity_key=mailbox_identity_key,
+        )
+        row = db.execute(
+            "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+            (account_id,),
+        ).fetchone()
+        if row is None:
+            raise GmailLabelStoreError("not_found")
+        state = _gmail_recovery_state(row)
+        if state.mailbox_identity_key != mailbox_identity_key:
+            raise MailboxIdentityChanged("mailbox identity changed")
+        active = db.execute(
+            """SELECT active FROM mail_accounts
+            WHERE provider = 'gmail' AND account_id = ?""",
+            (account_id,),
+        ).fetchone()
+        if active is None or not bool(active["active"]):
+            raise GmailLabelStoreError("account_not_active")
+        return row, state
+
+    def store_gmail_recovery_page(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        message_ids: Sequence[str],
+        next_page_token: str | None,
+        *,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        page_json = encode_gmail_recovery_page(message_ids)
+        if next_page_token is not None:
+            next_page_token = _require_bounded_text(
+                next_page_token,
+                maximum_bytes=MAX_GMAIL_RECOVERY_PAGE_TOKEN_BYTES,
+                field="gmail recovery page token",
+            )
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if state.page_loaded:
+                raise GmailLabelStoreError("gmail_recovery_page_already_loaded")
+            if state.page_count == SQLITE_MAX_INTEGER:
+                raise GmailLabelStoreError("gmail_recovery_counter_overflow")
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET page_token = ?, current_page_ids_json = ?, page_loaded = 1,
+                    next_index = 0, page_count = page_count + 1,
+                    consecutive_retry_count = 0, state = 'collecting',
+                    failure_code = NULL, next_retry_at = NULL, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (next_page_token, page_json, stamp, account_id),
+            )
+            updated = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        assert updated is not None
+        return _gmail_recovery_state(updated)
+
+    def finish_gmail_recovery_page(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Retire a drained non-final page; return True when the final page is ready."""
+        _require_mailbox_identity_key(mailbox_identity_key)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if not state.page_loaded or state.next_index != len(state.current_page_ids):
+                raise GmailLabelStoreError("gmail_recovery_page_not_drained")
+            if state.page_token is None:
+                return True
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET current_page_ids_json = X'5B5D', page_loaded = 0,
+                    next_index = 0, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (stamp, account_id),
+            )
+        return False
+
+    def record_gmail_recovery_backoff(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        failure_code: str,
+        next_retry_at: str,
+        degraded: bool = False,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        if failure_code not in {
+            "gmail_recovery_provider_unavailable",
+            "gmail_recovery_page_invalid",
+        }:
+            raise ValueError("gmail recovery failure code is invalid")
+        _require_mailbox_identity_key(mailbox_identity_key)
+        _validate_utc_timestamp(next_retry_at, field="next_retry_at")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            retry_count = min(31, state.consecutive_retry_count + 1)
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET consecutive_retry_count = ?, state = ?, failure_code = ?,
+                    next_retry_at = ?, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (
+                    retry_count,
+                    "degraded" if degraded else "backoff",
+                    failure_code,
+                    next_retry_at,
+                    stamp,
+                    account_id,
+                ),
+            )
+            updated = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        assert updated is not None
+        return _gmail_recovery_state(updated)
+
+    def record_gmail_recovery_invalid_page_token(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        next_retry_at: str,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        _validate_utc_timestamp(next_retry_at, field="next_retry_at")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if state.invalid_page_token_count == SQLITE_MAX_INTEGER:
+                raise GmailLabelStoreError("gmail_recovery_counter_overflow")
+            invalid_count = state.invalid_page_token_count + 1
+            retry_count = min(31, state.consecutive_retry_count + 1)
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET page_token = NULL, current_page_ids_json = X'5B5D',
+                    page_loaded = 0, next_index = 0,
+                    invalid_page_token_count = ?, consecutive_retry_count = ?,
+                    state = ?, failure_code = 'gmail_recovery_page_token_invalid',
+                    next_retry_at = ?, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (
+                    invalid_count,
+                    retry_count,
+                    "degraded" if invalid_count >= 5 else "backoff",
+                    next_retry_at,
+                    stamp,
+                    account_id,
+                ),
+            )
+            updated = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        assert updated is not None
+        return _gmail_recovery_state(updated)
+
+    def clear_gmail_recovery_backoff(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET consecutive_retry_count = 0, state = 'collecting',
+                    failure_code = NULL, next_retry_at = NULL, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (stamp, account_id),
+            )
+            updated = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        assert updated is not None
+        return _gmail_recovery_state(updated)
+
+    def finish_gmail_recovery_candidate(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        provider_message_id: str,
+        *,
+        message: GmailRecoveryMessage | None = None,
+        admission: AdmissionProvenance | None = None,
+        metadata_label_ids: frozenset[str] | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Advance one terminal candidate, atomically inserting an admitted message."""
+        _require_mailbox_identity_key(mailbox_identity_key)
+        bounded_provider_message_id = _require_bounded_text(
+            provider_message_id,
+            maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+            field="gmail provider message id",
+        )
+        if (message is None) != (admission is None) or (
+            message is None and metadata_label_ids is not None
+        ):
+            raise ValueError("message, admission, and metadata labels are inconsistent")
+        if message is not None and (
+            not isinstance(metadata_label_ids, frozenset)
+            or not all(isinstance(label_id, str) for label_id in metadata_label_ids)
+            or "INBOX" not in metadata_label_ids
+        ):
+            raise ValueError("admitted recovery metadata must include INBOX labels")
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if (
+                not state.page_loaded
+                or state.next_index >= len(state.current_page_ids)
+                or state.current_page_ids[state.next_index] != bounded_provider_message_id
+            ):
+                raise GmailLabelStoreError("gmail_recovery_candidate_mismatch")
+            if state.terminal_candidate_count == SQLITE_MAX_INTEGER:
+                raise GmailLabelStoreError("gmail_recovery_counter_overflow")
+            inserted = False
+            if message is not None and admission is not None:
+                _validate_admission_provenance(
+                    admission,
+                    mailbox_identity_key=mailbox_identity_key,
+                )
+                if admission.kind == "gmail_user_label":
+                    frozen_by_id = {
+                        selector.selector_id: selector
+                        for selector in state.selector_snapshot
+                    }
+                    current_rows = db.execute(
+                        """SELECT selector_id, label_id
+                        FROM gmail_label_selectors
+                        WHERE provider = 'gmail' AND account_id = ?
+                          AND mailbox_identity_key = ?
+                        ORDER BY selector_id""",
+                        (account_id, mailbox_identity_key),
+                    ).fetchall()
+                    matching_ids = [
+                        str(row["selector_id"])
+                        for row in current_rows
+                        if str(row["selector_id"]) in frozen_by_id
+                        and str(row["label_id"])
+                        == frozen_by_id[str(row["selector_id"])].label_id
+                        and str(row["label_id"]) in metadata_label_ids
+                    ]
+                    winning_id = min(matching_ids) if matching_ids else None
+                    frozen = frozen_by_id.get(admission.selector_id)
+                    if (
+                        frozen is None
+                        or winning_id != admission.selector_id
+                        or frozen.display_name != admission.display_name
+                    ):
+                        raise GmailLabelStoreError("gmail_recovery_grant_revoked")
+                else:
+                    prefix = "sender:"
+                    sender_address = (
+                        admission.selector_id[len(prefix) :]
+                        if admission.selector_id.startswith(prefix)
+                        else ""
+                    )
+                    frozen_sender = next(
+                        (
+                            item
+                            for item in state.sender_snapshot
+                            if item[0] == sender_address
+                        ),
+                        None,
+                    )
+                    if frozen_sender is None or frozen_sender[1] != admission.display_name:
+                        raise GmailLabelStoreError("gmail_recovery_grant_revoked")
+                inserted = self._insert_message_in_transaction(
+                    db,
+                    message_id=message.message_id,
+                    provider="gmail",
+                    account_id=account_id,
+                    provider_message_id=bounded_provider_message_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    thread_id=message.thread_id,
+                    sender=message.sender,
+                    sender_name=message.sender_name,
+                    subject=message.subject,
+                    received_at=message.received_at,
+                    admission=admission,
+                    discovered_at=stamp,
+                )
+            changed = db.execute(
+                """UPDATE gmail_recovery_state
+                SET next_index = next_index + 1,
+                    terminal_candidate_count = terminal_candidate_count + 1,
+                    consecutive_retry_count = 0, state = 'collecting',
+                    failure_code = NULL, next_retry_at = NULL, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ? AND next_index = ?
+                  AND terminal_candidate_count = ?""",
+                (
+                    stamp,
+                    account_id,
+                    mailbox_identity_key,
+                    state.next_index,
+                    state.terminal_candidate_count,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise GmailLabelStoreError("gmail_recovery_candidate_mismatch")
+        return inserted
+
+    def complete_gmail_recovery(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> str:
+        _require_mailbox_identity_key(mailbox_identity_key)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _row, state = self._require_current_gmail_recovery(
+                db,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            if (
+                not state.page_loaded
+                or state.page_token is not None
+                or state.next_index != len(state.current_page_ids)
+            ):
+                raise GmailLabelStoreError("gmail_recovery_page_not_drained")
+            db.execute(
+                """INSERT INTO mailbox_state(provider, account_id, cursor, last_success_at)
+                VALUES ('gmail', ?, ?, ?)
+                ON CONFLICT(provider, account_id) DO UPDATE SET
+                  cursor=excluded.cursor, last_success_at=excluded.last_success_at""",
+                (account_id, state.replacement_history_cursor, state.created_at),
+            )
+            deleted = db.execute(
+                """DELETE FROM gmail_recovery_state
+                WHERE provider = 'gmail' AND account_id = ?
+                  AND mailbox_identity_key = ?""",
+                (account_id, mailbox_identity_key),
+            )
+            if deleted.rowcount != 1:
+                raise GmailLabelStoreError("not_found")
+        return state.replacement_history_cursor
 
     @staticmethod
     def _automation_rule_detail(row: sqlite3.Row) -> AutomationRuleDetail:
@@ -4579,6 +6011,101 @@ class Store:
                 is not None
             )
 
+    @staticmethod
+    def _insert_message_in_transaction(
+        db: sqlite3.Connection,
+        *,
+        message_id: str,
+        thread_id: str | None,
+        sender: str,
+        sender_name: str | None,
+        subject: str,
+        received_at: str,
+        provider: str = DEFAULT_MAIL_PROVIDER,
+        account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
+        provider_message_id: str | None = None,
+        mailbox_identity_key: str | None = None,
+        admission: AdmissionProvenance,
+        discovered_at: str,
+    ) -> bool:
+        if mailbox_identity_key is None:
+            raise ValueError("mailbox identity key is required")
+        _validate_admission_provenance(
+            admission,
+            mailbox_identity_key=mailbox_identity_key,
+        )
+        source_message_id = provider_message_id or message_id
+        message_key = _message_suppression_key(
+            provider, account_id, source_message_id, mailbox_identity_key
+        )
+        account = db.execute(
+            """SELECT mailbox_identity_key, legacy_identity_status, legacy_identity_key
+            FROM mail_accounts WHERE provider = ? AND account_id = ?""",
+            (provider, account_id),
+        ).fetchone()
+        if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
+            raise MailboxIdentityChanged("mailbox identity changed")
+        if admission.kind == "gmail_user_label" and (
+            db.execute(
+                """SELECT 1 FROM gmail_label_selectors AS l
+                JOIN gmail_label_selector_sets AS s
+                  ON s.provider = l.provider AND s.account_id = l.account_id
+                WHERE l.provider = ? AND l.account_id = ?
+                  AND l.mailbox_identity_key = ? AND l.selector_id = ?
+                  AND s.current_mailbox_identity_key = l.mailbox_identity_key""",
+                (provider, account_id, mailbox_identity_key, admission.selector_id),
+            ).fetchone()
+            is None
+        ):
+            raise GmailLabelStoreError("gmail_recovery_grant_revoked")
+        suppression_keys = [message_key]
+        if (
+            account["legacy_identity_status"] == "continuity_proven"
+            and account["legacy_identity_key"] == mailbox_identity_key
+        ):
+            suppression_keys.extend(
+                (
+                    _message_suppression_key(provider, account_id, source_message_id),
+                    _legacy_message_suppression_key(source_message_id),
+                )
+            )
+        placeholders = ", ".join("?" for _ in suppression_keys)
+        cursor = db.execute(
+            f"""INSERT OR IGNORE INTO messages(
+                message_id, provider, account_id, mailbox_identity_key, provider_message_id,
+                thread_id, sender, sender_name, subject, received_at, discovered_at,
+                admission_kind, admission_selector_id, admission_display_name,
+                admission_mailbox_identity_key, admitted_at
+            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM suppressed_messages
+                WHERE provider = ? AND account_id = ?
+                  AND message_key IN ({placeholders})
+            )""",
+            (
+                message_id,
+                provider,
+                account_id,
+                mailbox_identity_key,
+                source_message_id,
+                thread_id,
+                sender,
+                sender_name,
+                subject,
+                received_at,
+                discovered_at,
+                admission.kind,
+                admission.selector_id,
+                admission.display_name,
+                admission.mailbox_identity_key,
+                admission.admitted_at,
+                provider,
+                account_id,
+                *suppression_keys,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def add_message(
         self,
         *,
@@ -4592,62 +6119,25 @@ class Store:
         account_id: str = DEFAULT_MAIL_ACCOUNT_ID,
         provider_message_id: str | None = None,
         mailbox_identity_key: str | None = None,
+        admission: AdmissionProvenance,
     ) -> bool:
-        if mailbox_identity_key is None:
-            raise ValueError("mailbox identity key is required")
-        source_message_id = provider_message_id or message_id
-        message_key = _message_suppression_key(
-            provider, account_id, source_message_id, mailbox_identity_key
-        )
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            account = db.execute(
-                """SELECT mailbox_identity_key, legacy_identity_status, legacy_identity_key
-                FROM mail_accounts WHERE provider = ? AND account_id = ?""",
-                (provider, account_id),
-            ).fetchone()
-            if account is None or account["mailbox_identity_key"] != mailbox_identity_key:
-                raise MailboxIdentityChanged("mailbox identity changed")
-            suppression_keys = [message_key]
-            if (
-                account["legacy_identity_status"] == "continuity_proven"
-                and account["legacy_identity_key"] == mailbox_identity_key
-            ):
-                suppression_keys.extend(
-                    (
-                        _message_suppression_key(provider, account_id, source_message_id),
-                        _legacy_message_suppression_key(source_message_id),
-                    )
-                )
-            placeholders = ", ".join("?" for _ in suppression_keys)
-            cursor = db.execute(
-                f"""INSERT OR IGNORE INTO messages(
-                    message_id, provider, account_id, mailbox_identity_key, provider_message_id,
-                    thread_id, sender, sender_name, subject, received_at, discovered_at
-                ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM suppressed_messages
-                    WHERE provider = ? AND account_id = ?
-                      AND message_key IN ({placeholders})
-                )""",
-                (
-                    message_id,
-                    provider,
-                    account_id,
-                    mailbox_identity_key,
-                    source_message_id,
-                    thread_id,
-                    sender,
-                    sender_name,
-                    subject,
-                    received_at,
-                    datetime.now(UTC).isoformat(),
-                    provider,
-                    account_id,
-                    *suppression_keys,
-                ),
+            return self._insert_message_in_transaction(
+                db,
+                message_id=message_id,
+                provider=provider,
+                account_id=account_id,
+                provider_message_id=provider_message_id,
+                mailbox_identity_key=mailbox_identity_key,
+                thread_id=thread_id,
+                sender=sender,
+                sender_name=sender_name,
+                subject=subject,
+                received_at=received_at,
+                admission=admission,
+                discovered_at=datetime.now(UTC).isoformat(),
             )
-        return cursor.rowcount == 1
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
@@ -7889,7 +9379,8 @@ class Store:
                 analysis_at, category, priority, summary, action_required, suggested_action,
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
                 fallback_notified_at, notified_at, last_error, analysis_retryable,
-                analysis_error_code, analysis_retry_after_seconds
+                analysis_error_code, analysis_retry_after_seconds,
+                admission_kind, admission_selector_id, admission_display_name, admitted_at
                 FROM messages{where}
                 ORDER BY received_at DESC, message_id DESC LIMIT ?""",
                 parameters,
@@ -7910,6 +9401,20 @@ class Store:
         for item in items:
             if item["analysis_retryable"] is not None:
                 item["analysis_retryable"] = bool(item["analysis_retryable"])
+            admission_kind = item.pop("admission_kind")
+            admission_selector_id = item.pop("admission_selector_id")
+            admission_display_name = item.pop("admission_display_name")
+            admitted_at = item.pop("admitted_at")
+            item["admission"] = (
+                {
+                    "kind": admission_kind,
+                    "selector_id": admission_selector_id,
+                    "display_name": admission_display_name,
+                    "admitted_at": admitted_at,
+                }
+                if admission_kind is not None
+                else None
+            )
         if not items:
             return []
         message_ids = [str(item["message_id"]) for item in items]

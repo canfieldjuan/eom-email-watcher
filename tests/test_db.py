@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -66,6 +67,18 @@ class Store(ProductionStore):
                     preserve_cursor=True,
                 )
             values["mailbox_identity_key"] = identity_key
+        if "admission" not in values:
+            values["admission"] = db_module.AdmissionProvenance(
+                kind="exact_sender",
+                selector_id=f"sender:{values.get('sender', 'sender@example.com')}",
+                display_name=(
+                    str(values["sender_name"])
+                    if values.get("sender_name") is not None
+                    else None
+                ),
+                mailbox_identity_key=str(values["mailbox_identity_key"]),
+                admitted_at="2026-09-19T12:00:00+00:00",
+            )
         return super().add_message(**values)  # type: ignore[arg-type]
 
     def mark_analyzed(
@@ -2136,6 +2149,764 @@ def test_mail_account_registry_rejects_duplicate_provider_identity(tmp_path: Pat
     ]
 
 
+def test_selector_set_tracks_current_identity_and_replacement_increments_revision_once(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    first_identity = "1" * 64
+    replacement_identity = "2" * 64
+
+    store.reconcile_mailbox_identity("gmail", "gmail-default", first_identity)
+    initial = store.gmail_label_selector_set("gmail-default")
+    assert initial is not None
+    assert initial.current_mailbox_identity_key == first_identity
+    assert initial.revision == 0
+
+    store.reconcile_mailbox_identity("gmail", "gmail-default", first_identity)
+    assert store.gmail_label_selector_set("gmail-default") == initial
+
+    store.reconcile_mailbox_identity("gmail", "gmail-default", replacement_identity)
+    replaced = store.gmail_label_selector_set("gmail-default")
+    assert replaced is not None
+    assert replaced.current_mailbox_identity_key == replacement_identity
+    assert replaced.revision == 1
+
+    store.reconcile_mailbox_identity("gmail", "gmail-default", replacement_identity)
+    assert store.gmail_label_selector_set("gmail-default") == replaced
+
+
+def _gmail_selector_store(tmp_path: Path) -> tuple[Store, str]:
+    store = Store(tmp_path / "state" / "watcher.sqlite3")
+    store.initialize()
+    identity = "a" * 64
+    store.reconcile_mailbox_identity("gmail", "gmail-default", identity)
+    return store, identity
+
+
+def test_gmail_label_selector_cas_bounds_and_immutable_identity(tmp_path: Path) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+
+    revision, first = store.add_gmail_label_selector(
+        "gmail-default",
+        identity,
+        "L" * 512,
+        "N" * 1024,
+        0,
+    )
+    assert revision == 1
+    assert store.gmail_label_selector_is_current(
+        "gmail-default", identity, first.selector_id, first.label_id
+    )
+
+    invalid_fields = (
+        ("", "Name"),
+        ("L" * 513, "Name"),
+        ("L2", ""),
+        ("L2", "N" * 1025),
+    )
+    for label_id, display_name in invalid_fields:
+        with pytest.raises(ValueError):
+            store.add_gmail_label_selector(
+                "gmail-default", identity, label_id, display_name, revision
+            )
+    assert store.gmail_label_selector_set("gmail-default").revision == revision  # type: ignore[union-attr]
+
+    with pytest.raises(db_module.GmailLabelStoreError, match="stale_revision"):
+        store.add_gmail_label_selector("gmail-default", identity, "stale", "Stale", 0)
+    with pytest.raises(db_module.GmailLabelStoreError, match="conflict"):
+        store.add_gmail_label_selector(
+            "gmail-default", identity, first.label_id, "Duplicate", revision
+        )
+
+    for index in range(1, 100):
+        revision, _selector = store.add_gmail_label_selector(
+            "gmail-default",
+            identity,
+            f"Label_{index}",
+            f"Label {index}",
+            revision,
+        )
+    assert revision == 100
+    assert len(store.gmail_label_selectors("gmail-default")) == 100
+    with pytest.raises(db_module.GmailLabelStoreError, match="limit_exceeded"):
+        store.add_gmail_label_selector(
+            "gmail-default", identity, "Label_101", "Label 101", revision
+        )
+    assert store.gmail_label_selector_set("gmail-default").revision == 100  # type: ignore[union-attr]
+
+    with store.connection() as db, pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "UPDATE gmail_label_selectors SET label_id='rebound' WHERE selector_id=?",
+            (first.selector_id,),
+        )
+
+    with pytest.raises(db_module.GmailLabelStoreError, match="stale_revision"):
+        store.remove_gmail_label_selector(
+            "gmail-default", identity, first.selector_id, revision - 1
+        )
+    revision = store.remove_gmail_label_selector(
+        "gmail-default", identity, first.selector_id, revision
+    )
+    assert revision == 101
+    assert not store.gmail_label_selector_is_current(
+        "gmail-default", identity, first.selector_id, first.label_id
+    )
+
+
+def test_identity_reconciliation_removes_recovery_without_advancing_mailbox_cursor(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    store.set_state(
+        "old-history",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        revision,
+        [],
+        [selector],
+        10,
+        20,
+        "replacement-history",
+    )
+
+    replacement = "b" * 64
+    store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", replacement, preserve_cursor=True
+    )
+
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    assert selector_set.current_mailbox_identity_key == replacement
+    assert selector_set.revision == revision + 1
+    assert store.gmail_recovery_state("gmail-default") is None
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "old-history"
+    retained = store.gmail_label_selectors("gmail-default")
+    assert retained == (selector,)
+    assert store.gmail_current_label_selectors("gmail-default", replacement) == ()
+
+
+def test_label_admission_and_recovery_snapshot_recheck_current_selector_grants(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    fabricated = db_module.GmailLabelSelectorSnapshot(
+        selector_id=str(uuid.uuid4()),
+        label_id="Label_2",
+        display_name="Fabricated",
+    )
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_grant_revoked"
+    ):
+        store.create_gmail_recovery_state(
+            "gmail-default", identity, revision, [], [fabricated], 1, 2, "replacement"
+        )
+
+    revision = store.remove_gmail_label_selector(
+        "gmail-default", identity, selector.selector_id, revision
+    )
+    assert revision == 2
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_grant_revoked"
+    ):
+        ProductionStore.add_message(
+            store,
+            message_id="message-1",
+            provider="gmail",
+            account_id="gmail-default",
+            provider_message_id="provider-1",
+            mailbox_identity_key=identity,
+            thread_id=None,
+            sender="sender@example.com",
+            sender_name=None,
+            subject="Revoked",
+            received_at="2026-09-19T11:59:00+00:00",
+            admission=db_module.AdmissionProvenance(
+                kind="gmail_user_label",
+                selector_id=selector.selector_id,
+                display_name="Invoices",
+                mailbox_identity_key=identity,
+                admitted_at="2026-09-19T12:00:00+00:00",
+            ),
+        )
+    assert not store.has_message("message-1")
+
+
+def test_recovery_page_200_max_escaped_ids_is_exactly_205401_and_fits_column() -> None:
+    message_ids = []
+    for index in range(200):
+        bits = f"{index:08b}"
+        prefix = "".join('"' if bit == "0" else "\\" for bit in bits)
+        message_ids.append(prefix + '"' * (512 - len(prefix)))
+
+    encoded = db_module.encode_gmail_recovery_page(message_ids)
+
+    assert len(encoded) == 205_401
+    assert db_module.decode_gmail_recovery_page(encoded) == tuple(message_ids)
+
+
+def test_recovery_state_is_one_strict_account_row_with_bounded_page_and_index(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    state = store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        0,
+        [("sender@example.com", "Sender")],
+        [],
+        100,
+        200,
+        "replacement-history",
+    )
+    assert state.current_page_ids == ()
+    assert state.page_loaded is False
+    with pytest.raises(db_module.GmailLabelStoreError, match="conflict"):
+        store.create_gmail_recovery_state(
+            "gmail-default", identity, 0, [], [], 100, 200, "other-history"
+        )
+
+    with pytest.raises(db_module.GmailLabelStoreError, match="gmail_recovery_page_invalid"):
+        store.store_gmail_recovery_page(
+            "gmail-default", identity, [f"m{index}" for index in range(201)], None
+        )
+    with pytest.raises(db_module.GmailLabelStoreError, match="gmail_recovery_page_invalid"):
+        store.store_gmail_recovery_page("gmail-default", identity, ["valid", "bad\x85"], None)
+    assert store.gmail_recovery_state("gmail-default") == state
+
+    ids = [f"message-{index}" for index in range(200)]
+    loaded = store.store_gmail_recovery_page(
+        "gmail-default", identity, ids, "next-page"
+    )
+    assert loaded.current_page_ids == tuple(ids)
+    assert loaded.page_count == 1
+    assert loaded.page_loaded is True
+    assert loaded.next_index == 0
+
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "UPDATE gmail_recovery_state SET current_page_ids_json=? WHERE account_id=?",
+            (b" " * 524_288, "gmail-default"),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "UPDATE gmail_recovery_state SET current_page_ids_json=? WHERE account_id=?",
+                (b" " * 524_289, "gmail-default"),
+            )
+        db.execute(
+            "UPDATE gmail_recovery_state SET current_page_ids_json=? WHERE account_id=?",
+            (db_module.encode_gmail_recovery_page(ids), "gmail-default"),
+        )
+
+    with store.connection() as db, pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "UPDATE gmail_recovery_state SET replacement_history_cursor='changed' "
+            "WHERE account_id='gmail-default'"
+        )
+
+
+def test_selector_snapshot_worst_case_fits_and_oversized_sender_snapshot_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    selectors = []
+    for index in range(100):
+        selector_id = str(uuid.UUID(int=index + 1, version=4))
+        selectors.append(
+            db_module.GmailLabelSelectorSnapshot(
+                selector_id=selector_id,
+                label_id=('"\\' * 256),
+                display_name=('"\\' * 512),
+            )
+        )
+    encoded = db_module.encode_gmail_selector_snapshot(selectors)
+    assert len(encoded) <= 1_048_576
+    assert db_module.decode_gmail_selector_snapshot(encoded) == tuple(selectors)
+    with pytest.raises(RuntimeError, match="selector snapshot is invalid"):
+        db_module.decode_gmail_selector_snapshot(b" " * 1_048_577)
+    with pytest.raises(RuntimeError, match="sender snapshot is invalid"):
+        db_module.decode_gmail_sender_snapshot(b" " * 1_048_577)
+    with pytest.raises(RuntimeError, match="recovery page is invalid"):
+        db_module.decode_gmail_recovery_page(b" " * 524_289)
+
+    store, identity = _gmail_selector_store(tmp_path)
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_snapshot_too_large"
+    ):
+        store.create_gmail_recovery_state(
+            "gmail-default",
+            identity,
+            0,
+            [("sender@example.com", "X" * 1_048_576)],
+            [],
+            1,
+            2,
+            "replacement-history",
+        )
+    assert store.gmail_recovery_state("gmail-default") is None
+
+    with store.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        values = (
+            "gmail",
+            "raw-cap-account",
+            identity,
+            0,
+            b"[]",
+            b" " * 1_048_576,
+            1,
+            2,
+            "replacement",
+            b"[]",
+            "2026-09-19T12:00:00+00:00",
+        )
+        db.execute(
+            """INSERT INTO gmail_recovery_state(
+                provider, account_id, mailbox_identity_key, selector_revision,
+                sender_snapshot_json, selector_snapshot_json,
+                recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
+                replacement_history_cursor, current_page_ids_json,
+                created_at, updated_at, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
+            (*values, values[-1]),
+        )
+        db.execute("DELETE FROM gmail_recovery_state WHERE account_id='raw-cap-account'")
+        oversized = list(values)
+        oversized[5] = b" " * 1_048_577
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                """INSERT INTO gmail_recovery_state(
+                    provider, account_id, mailbox_identity_key, selector_revision,
+                    sender_snapshot_json, selector_snapshot_json,
+                    recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
+                    replacement_history_cursor, current_page_ids_json,
+                    created_at, updated_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
+                (*oversized, oversized[-1]),
+            )
+
+
+def test_recovery_counters_have_no_normal_cap_and_overflow_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 1, 2, "replacement-history"
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE gmail_recovery_state SET page_count=? WHERE account_id='gmail-default'",
+            (db_module.SQLITE_MAX_INTEGER - 1,),
+        )
+    state = store.store_gmail_recovery_page("gmail-default", identity, [], None)
+    assert state.page_count == db_module.SQLITE_MAX_INTEGER
+    assert store.finish_gmail_recovery_page("gmail-default", identity) is True
+    assert store.complete_gmail_recovery("gmail-default", identity) == "replacement-history"
+
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 2, 3, "second-history"
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE gmail_recovery_state SET page_count=? WHERE account_id='gmail-default'",
+            (db_module.SQLITE_MAX_INTEGER,),
+        )
+    before = store.gmail_recovery_state("gmail-default")
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_counter_overflow"
+    ):
+        store.store_gmail_recovery_page("gmail-default", identity, [], None)
+    assert store.gmail_recovery_state("gmail-default") == before
+
+    terminal_store, terminal_identity = _gmail_selector_store(tmp_path / "terminal")
+    terminal_store.create_gmail_recovery_state(
+        "gmail-default", terminal_identity, 0, [], [], 1, 2, "terminal-history"
+    )
+    terminal_store.store_gmail_recovery_page(
+        "gmail-default", terminal_identity, ["candidate"], None
+    )
+    with terminal_store.connection() as db:
+        db.execute(
+            "UPDATE gmail_recovery_state SET terminal_candidate_count=? "
+            "WHERE account_id='gmail-default'",
+            (db_module.SQLITE_MAX_INTEGER,),
+        )
+    terminal_before = terminal_store.gmail_recovery_state("gmail-default")
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_counter_overflow"
+    ):
+        terminal_store.finish_gmail_recovery_candidate(
+            "gmail-default", terminal_identity, "candidate"
+        )
+    assert terminal_store.gmail_recovery_state("gmail-default") == terminal_before
+
+    token_store, token_identity = _gmail_selector_store(tmp_path / "token")
+    token_store.create_gmail_recovery_state(
+        "gmail-default", token_identity, 0, [], [], 1, 2, "token-history"
+    )
+    with token_store.connection() as db:
+        db.execute(
+            "UPDATE gmail_recovery_state SET invalid_page_token_count=? "
+            "WHERE account_id='gmail-default'",
+            (db_module.SQLITE_MAX_INTEGER,),
+        )
+    token_before = token_store.gmail_recovery_state("gmail-default")
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_counter_overflow"
+    ):
+        token_store.record_gmail_recovery_invalid_page_token(
+            "gmail-default",
+            token_identity,
+            next_retry_at="2026-09-19T12:01:00+00:00",
+        )
+    assert token_store.gmail_recovery_state("gmail-default") == token_before
+
+
+def test_recovery_backoff_is_durable_bounded_and_clears_on_success(tmp_path: Path) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 1, 2, "replacement-history"
+    )
+    backed_off = store.record_gmail_recovery_backoff(
+        "gmail-default",
+        identity,
+        failure_code="gmail_recovery_provider_unavailable",
+        next_retry_at="2026-09-19T12:01:00+00:00",
+    )
+    assert (backed_off.state, backed_off.consecutive_retry_count) == ("backoff", 1)
+    assert backed_off.next_retry_at == "2026-09-19T12:01:00+00:00"
+
+    cleared = store.clear_gmail_recovery_backoff("gmail-default", identity)
+    assert (cleared.state, cleared.consecutive_retry_count, cleared.next_retry_at) == (
+        "collecting",
+        0,
+        None,
+    )
+
+    for count in range(1, 6):
+        reset = store.record_gmail_recovery_invalid_page_token(
+            "gmail-default",
+            identity,
+            next_retry_at=f"2026-09-19T12:0{count}:00+00:00",
+        )
+        assert reset.invalid_page_token_count == count
+        assert reset.state == ("degraded" if count >= 5 else "backoff")
+        assert reset.page_loaded is False
+        assert reset.current_page_ids == ()
+
+    resumed = store.store_gmail_recovery_page("gmail-default", identity, [], None)
+    assert resumed.state == "collecting"
+    assert resumed.failure_code is None
+    assert resumed.next_retry_at is None
+    assert resumed.consecutive_retry_count == 0
+    assert resumed.invalid_page_token_count == 5
+
+
+def test_message_insert_atomically_persists_deterministic_admission_provenance(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    admission = db_module.AdmissionProvenance(
+        kind="exact_sender",
+        selector_id="sender:trusted@example.com",
+        display_name="Trusted",
+        mailbox_identity_key=identity,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
+    assert ProductionStore.add_message(
+        store,
+        message_id="message-1",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="provider-1",
+        mailbox_identity_key=identity,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Invoice",
+        received_at="2026-09-19T11:59:00+00:00",
+        admission=admission,
+    )
+    assert store.recent(1)[0]["admission"] == {
+        "kind": "exact_sender",
+        "selector_id": "sender:trusted@example.com",
+        "display_name": "Trusted",
+        "admitted_at": "2026-09-19T12:00:00+00:00",
+    }
+    with store.connection() as db:
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                """INSERT INTO messages(
+                    message_id, provider, account_id, mailbox_identity_key,
+                    provider_message_id, sender, subject, received_at, discovered_at
+                ) VALUES (
+                    'missing-provenance', 'gmail', 'gmail-default', ?,
+                    'provider-2', 'trusted@example.com', 'Missing',
+                    '2026-09-19T11:59:00+00:00', '2026-09-19T12:00:00+00:00'
+                )""",
+                (identity,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "UPDATE messages SET admission_selector_id='sender:other@example.com' "
+                "WHERE message_id='message-1'"
+            )
+
+
+def test_recovery_terminal_insert_revocation_and_cursor_commit_are_atomic(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    store.set_state(
+        "old-history",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        revision,
+        [],
+        [selector],
+        1,
+        2,
+        "replacement-history",
+    )
+    store.store_gmail_recovery_page("gmail-default", identity, ["m1", "m2"], None)
+    admission = db_module.AdmissionProvenance(
+        kind="gmail_user_label",
+        selector_id=selector.selector_id,
+        display_name="Invoices",
+        mailbox_identity_key=identity,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
+    message = db_module.GmailRecoveryMessage(
+        message_id="local-m1",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Invoice",
+        received_at="2026-09-19T11:59:00+00:00",
+    )
+
+    assert store.finish_gmail_recovery_candidate(
+        "gmail-default",
+        identity,
+        "m1",
+        message=message,
+        admission=admission,
+        metadata_label_ids=frozenset({"INBOX", "Label_1"}),
+    )
+    state = store.gmail_recovery_state("gmail-default")
+    assert state is not None
+    assert (state.next_index, state.terminal_candidate_count) == (1, 1)
+    item = store.recent(1)[0]
+    assert item["admission"] == {
+        "kind": "gmail_user_label",
+        "selector_id": selector.selector_id,
+        "display_name": "Invoices",
+        "admitted_at": "2026-09-19T12:00:00+00:00",
+    }
+
+    revision = store.remove_gmail_label_selector(
+        "gmail-default", identity, selector.selector_id, revision
+    )
+    assert revision == 2
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_grant_revoked"
+    ):
+        store.finish_gmail_recovery_candidate(
+            "gmail-default",
+            identity,
+            "m2",
+            message=db_module.GmailRecoveryMessage(
+                message_id="local-m2",
+                thread_id=None,
+                sender="sender@example.com",
+                sender_name=None,
+                subject="Revoked",
+                received_at="2026-09-19T11:59:30+00:00",
+            ),
+            admission=admission,
+            metadata_label_ids=frozenset({"INBOX", "Label_1"}),
+        )
+    unchanged = store.gmail_recovery_state("gmail-default")
+    assert unchanged is not None
+    assert (unchanged.next_index, unchanged.terminal_candidate_count) == (1, 1)
+    assert not store.has_message("local-m2")
+
+    assert not store.finish_gmail_recovery_candidate(
+        "gmail-default", identity, "m2"
+    )
+    assert store.finish_gmail_recovery_page("gmail-default", identity) is True
+    assert store.complete_gmail_recovery("gmail-default", identity) == "replacement-history"
+    assert store.gmail_recovery_state("gmail-default") is None
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == (
+        "replacement-history"
+    )
+
+
+def test_recovery_cursor_commit_keeps_capture_timestamp_after_long_drain(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    captured_at = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    completed_at = captured_at + timedelta(days=2)
+    store.set_state(
+        "old-history",
+        at=captured_at - timedelta(days=1),
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    recovery = store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        0,
+        [],
+        [],
+        1,
+        2,
+        "replacement-history",
+        now=captured_at,
+    )
+    assert recovery.created_at == captured_at.isoformat()
+
+    store.store_gmail_recovery_page(
+        "gmail-default", identity, [], None, now=completed_at
+    )
+    assert store.finish_gmail_recovery_page(
+        "gmail-default", identity, now=completed_at
+    )
+    assert (
+        store.complete_gmail_recovery(
+            "gmail-default", identity, now=completed_at
+        )
+        == "replacement-history"
+    )
+
+    assert store.state(provider="gmail", account_id="gmail-default") == (
+        "replacement-history",
+        captured_at.isoformat(),
+    )
+    assert store.gmail_recovery_state("gmail-default") is None
+
+
+def test_recovery_terminal_recomputes_smallest_current_frozen_label_winner(
+    tmp_path: Path,
+) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, first = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "First", 0
+    )
+    revision, second = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_2", "Second", revision
+    )
+    smaller, larger = sorted((first, second), key=lambda selector: selector.selector_id)
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        identity,
+        revision,
+        [],
+        [first, second],
+        1,
+        2,
+        "replacement-history",
+    )
+    store.store_gmail_recovery_page("gmail-default", identity, ["m1"], None)
+    message = db_module.GmailRecoveryMessage(
+        message_id="local-m1",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Overlap",
+        received_at="2026-09-19T11:59:00+00:00",
+    )
+    metadata_labels = frozenset({"INBOX", first.label_id, second.label_id})
+
+    with pytest.raises(
+        db_module.GmailLabelStoreError, match="gmail_recovery_grant_revoked"
+    ):
+        store.finish_gmail_recovery_candidate(
+            "gmail-default",
+            identity,
+            "m1",
+            message=message,
+            admission=db_module.AdmissionProvenance(
+                kind="gmail_user_label",
+                selector_id=larger.selector_id,
+                display_name=larger.selected_display_name,
+                mailbox_identity_key=identity,
+                admitted_at="2026-09-19T12:00:00+00:00",
+            ),
+            metadata_label_ids=metadata_labels,
+        )
+    unchanged = store.gmail_recovery_state("gmail-default")
+    assert unchanged is not None
+    assert (unchanged.next_index, unchanged.terminal_candidate_count) == (0, 0)
+    assert not store.has_message("local-m1")
+
+    assert store.finish_gmail_recovery_candidate(
+        "gmail-default",
+        identity,
+        "m1",
+        message=message,
+        admission=db_module.AdmissionProvenance(
+            kind="gmail_user_label",
+            selector_id=smaller.selector_id,
+            display_name=smaller.selected_display_name,
+            mailbox_identity_key=identity,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
+        metadata_label_ids=metadata_labels,
+    )
+
+
+def test_inactive_recovery_account_cannot_advance_or_commit_cursor(tmp_path: Path) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    store.set_state(
+        "old-history",
+        provider="gmail",
+        account_id="gmail-default",
+        mailbox_identity_key=identity,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 1, 2, "replacement-history"
+    )
+    store.store_gmail_recovery_page("gmail-default", identity, [], None)
+    assert store.finish_gmail_recovery_page("gmail-default", identity) is True
+    store.register_mail_account(
+        "microsoft365",
+        "other-account",
+        display_name="Other",
+        address="other@example.com",
+    )
+    store.activate_mail_account("microsoft365", "other-account")
+
+    with pytest.raises(db_module.GmailLabelStoreError, match="account_not_active"):
+        store.complete_gmail_recovery("gmail-default", identity)
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "old-history"
+    assert store.gmail_recovery_state("gmail-default") is not None
+
+    store.activate_mail_account("gmail", "gmail-default")
+    assert store.complete_gmail_recovery("gmail-default", identity) == "replacement-history"
+
+
 def test_calendar_disconnect_clears_only_selected_read_state(tmp_path: Path) -> None:
     store = Store(tmp_path / "state" / "watcher.sqlite3")
     store.initialize()
@@ -2306,16 +3077,21 @@ def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     )
     with store.connection() as db:
         db.executemany(
-            """INSERT INTO messages(
-                    message_id, provider, account_id, mailbox_identity_key,
-                    provider_message_id,
-                    sender, subject, received_at, discovered_at, category
-                ) VALUES (
-                    ?1, 'gmail', 'gmail-default',
-                    (SELECT mailbox_identity_key FROM mail_accounts
-                     WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
-                    'sender@example.com', 'Update', ?2, ?3, 'informational'
-                )""",
+                """INSERT INTO messages(
+                        message_id, provider, account_id, mailbox_identity_key,
+                        provider_message_id,
+                        sender, subject, received_at, discovered_at, category,
+                        admission_kind, admission_selector_id,
+                        admission_mailbox_identity_key, admitted_at
+                    ) VALUES (
+                        ?1, 'gmail', 'gmail-default',
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
+                        'sender@example.com', 'Update', ?2, ?3, 'informational',
+                        'exact_sender', 'sender:sender@example.com',
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?3
+                    )""",
             [(f"message-{index:03}", stamp, stamp) for index in range(55)],
         )
 
@@ -2348,14 +3124,19 @@ def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
             """INSERT INTO messages(
                     message_id, provider, account_id, mailbox_identity_key,
                     provider_message_id,
-                    sender, sender_name, subject, received_at, discovered_at,
-                    status, category, priority, summary
-                ) VALUES (
+                        sender, sender_name, subject, received_at, discovered_at,
+                        status, category, priority, summary,
+                        admission_kind, admission_selector_id,
+                        admission_mailbox_identity_key, admitted_at
+                    ) VALUES (
                     ?1, 'gmail', 'gmail-default',
                     (SELECT mailbox_identity_key FROM mail_accounts
                      WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
-                    ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-                )""",
+                        ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                        'exact_sender', ('sender:' || ?2),
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?6
+                    )""",
             [
                 (
                     f"noise-{index:03}",
@@ -2541,14 +3322,19 @@ def test_notification_intent_count_is_not_limited_to_retrieval_page(
         db.executemany(
             """INSERT INTO messages (
                     message_id, provider, account_id, mailbox_identity_key,
-                    provider_message_id,
-                    sender, subject, received_at, discovered_at, status, last_error
-                ) VALUES (
+                        provider_message_id,
+                        sender, subject, received_at, discovered_at, status, last_error,
+                        admission_kind, admission_selector_id,
+                        admission_mailbox_identity_key, admitted_at
+                    ) VALUES (
                     ?1, 'gmail', 'gmail-default',
                     (SELECT mailbox_identity_key FROM mail_accounts
                      WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
-                    'a@b.com', 'Update', ?2, ?3, 'pending', 'model unavailable'
-                )""",
+                        'a@b.com', 'Update', ?2, ?3, 'pending', 'model unavailable',
+                        'exact_sender', 'sender:a@b.com',
+                        (SELECT mailbox_identity_key FROM mail_accounts
+                         WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?3
+                    )""",
             [(f"m{index}", stamp, stamp) for index in range(501)],
         )
 
@@ -3523,6 +4309,8 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
         )
         db.execute("DROP TRIGGER messages_require_mailbox_identity_insert")
         db.execute("DROP TRIGGER messages_require_rule_revision_completion")
+        db.execute("DROP TRIGGER messages_require_admission_provenance_insert")
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
         db.execute("DROP TRIGGER messages_delete_pending_automation_fires")
         db.execute("DROP TABLE automation_fire_attempts")
         db.execute("DROP TABLE automation_fires")
@@ -3539,7 +4327,9 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
         db.execute(
             """UPDATE messages
             SET mailbox_identity_key = NULL, rules_revision_at_analysis = NULL,
-                rules_evaluation_error = NULL"""
+                rules_evaluation_error = NULL, admission_kind = NULL,
+                admission_selector_id = NULL, admission_display_name = NULL,
+                admission_mailbox_identity_key = NULL, admitted_at = NULL"""
         )
         db.execute(
             """UPDATE mail_accounts
@@ -3579,7 +4369,7 @@ def test_schema_19_to_20_marks_history_and_installs_cross_version_fences(
             scheduling_columns_before
         )
         assert db.execute("SELECT revision FROM automation_rule_set").fetchone()[0] == 0
-        with pytest.raises(sqlite3.IntegrityError, match="mailbox identity"):
+        with pytest.raises(sqlite3.IntegrityError, match="admission provenance"):
             db.execute(
                 """INSERT INTO messages(
                     message_id, provider, account_id, provider_message_id,

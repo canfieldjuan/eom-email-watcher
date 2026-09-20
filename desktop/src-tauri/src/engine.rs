@@ -602,6 +602,21 @@ pub struct CalendarDecisionResult {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxAdmissionKind {
+    ExactSender,
+    GmailUserLabel,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxAdmission {
+    pub kind: InboxAdmissionKind,
+    pub selector_id: String,
+    pub display_name: Option<String>,
+    pub admitted_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
     #[serde(default = "default_mail_provider")]
@@ -635,6 +650,8 @@ pub struct InboxItem {
     pub attachments: Vec<InboxAttachment>,
     #[serde(default)]
     pub calendar_proposal: Option<CalendarProposalPreview>,
+    #[serde(default)]
+    pub admission: Option<InboxAdmission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -738,6 +755,70 @@ pub struct MailAccounts {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelCatalogItem {
+    pub label_id: String,
+    pub display_name: String,
+    pub selected: bool,
+    pub selector_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelCatalog {
+    pub provider: String,
+    pub account_id: String,
+    pub revision: u64,
+    pub items: Vec<GmailLabelCatalogItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailLabelCatalogState {
+    Current,
+    Unavailable,
+    InvalidCatalog,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailLabelSelectorStatus {
+    Active,
+    Deleted,
+    NotUser,
+    IdentityMismatch,
+    ValidationUnavailable,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelector {
+    pub selector_id: String,
+    pub label_id: String,
+    pub display_name: String,
+    pub status: GmailLabelSelectorStatus,
+    pub admission_active: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectors {
+    pub provider: String,
+    pub account_id: String,
+    pub revision: u64,
+    pub catalog_state: GmailLabelCatalogState,
+    pub items: Vec<GmailLabelSelector>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectorAdded {
+    pub revision: u64,
+    pub item: GmailLabelSelector,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectorRemoved {
+    pub revision: u64,
+    pub removed_selector_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MailServerSecurity {
     Tls,
@@ -794,6 +875,14 @@ pub struct CheckResult {
     pub automation_processed: u64,
     #[serde(default)]
     pub automation_review_required: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_next_retry_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1150,6 +1239,108 @@ impl Engine {
         self.request("mail.accounts.list", json!({}))
     }
 
+    pub fn gmail_label_catalog(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<GmailLabelCatalog, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelCatalog = self.request(
+            "gmail.labels.catalog",
+            json!({"provider": provider, "account_id": account_id}),
+        )?;
+        if result.provider != provider || result.account_id != account_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched Gmail label catalog",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn gmail_label_selectors(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<GmailLabelSelectors, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectors = self.request(
+            "gmail.label_selectors.list",
+            json!({"provider": provider, "account_id": account_id}),
+        )?;
+        if result.provider != provider || result.account_id != account_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned mismatched Gmail label selectors",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn add_gmail_label_selector(
+        &self,
+        provider: String,
+        account_id: String,
+        label_id: String,
+        expected_revision: u64,
+    ) -> Result<GmailLabelSelectorAdded, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectorAdded = self.request(
+            "gmail.label_selectors.add",
+            json!({
+                "provider": provider,
+                "account_id": account_id,
+                "label_id": label_id,
+                "expected_revision": expected_revision,
+            }),
+        )?;
+        if result.item.label_id != label_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched Gmail label selector",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn remove_gmail_label_selector(
+        &self,
+        provider: String,
+        account_id: String,
+        selector_id: String,
+        expected_revision: u64,
+    ) -> Result<GmailLabelSelectorRemoved, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectorRemoved = self.request(
+            "gmail.label_selectors.remove",
+            json!({
+                "provider": provider,
+                "account_id": account_id,
+                "selector_id": selector_id,
+                "expected_revision": expected_revision,
+            }),
+        )?;
+        if result.removed_selector_id != selector_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched removed Gmail label selector",
+            ));
+        }
+        Ok(result)
+    }
+
     fn calendar_consent_request(
         &self,
         action: &str,
@@ -1433,11 +1624,19 @@ impl Engine {
     }
 
     pub fn add(&self, email: String, name: Option<String>) -> Result<WatchedSender, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request::<SenderItem>("watchlist.add", json!({"email": email, "name": name}))
             .map(|data| data.item)
     }
 
     pub fn remove(&self, email: String) -> Result<WatchedSender, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request::<SenderItem>("watchlist.remove", json!({"email": email}))
             .map(|data| data.item)
     }
@@ -1650,6 +1849,32 @@ mod tests {
 
         drop(active);
         HostOperationLock::acquire(&path).expect("released lock is reusable");
+    }
+
+    #[test]
+    fn watchlist_mutations_fail_closed_when_mailbox_coordinator_stops() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let gate = Arc::clone(&engine.mailbox_operation_gate);
+        let _ = std::thread::spawn(move || {
+            let _guard = gate.lock().expect("acquire mailbox coordinator");
+            panic!("poison mailbox coordinator for the boundary probe");
+        })
+        .join();
+
+        assert_eq!(
+            engine
+                .add("sender@example.com".into(), None)
+                .expect_err("watchlist add must fail closed")
+                .code,
+            "host_error"
+        );
+        assert_eq!(
+            engine
+                .remove("sender@example.com".into())
+                .expect_err("watchlist remove must fail closed")
+                .code,
+            "host_error"
+        );
     }
 
     #[test]
@@ -2073,6 +2298,150 @@ mod tests {
         assert_eq!(result.baseline_initialized, Some(false));
         let encoded = serde_json::to_string(&result).expect("serialize account result");
         assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn gmail_label_contract_is_typed_and_secret_free() {
+        let catalog: GmailLabelCatalog = serde_json::from_value(json!({
+            "provider": "gmail",
+            "account_id": "gmail-default",
+            "revision": 3,
+            "items": [{
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "selected": true,
+                "selector_id": "11111111-1111-4111-8111-111111111111"
+            }]
+        }))
+        .expect("deserialize Gmail label catalog");
+        assert_eq!(catalog.items[0].label_id, "Label_123");
+
+        let selectors: GmailLabelSelectors = serde_json::from_value(json!({
+            "provider": "gmail",
+            "account_id": "gmail-default",
+            "revision": 3,
+            "catalog_state": "unavailable",
+            "items": [{
+                "selector_id": "11111111-1111-4111-8111-111111111111",
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "status": "validation_unavailable",
+                "admission_active": false
+            }]
+        }))
+        .expect("deserialize Gmail label selectors");
+        assert_eq!(
+            selectors.items[0].status,
+            GmailLabelSelectorStatus::ValidationUnavailable
+        );
+        let encoded = serde_json::to_string(&selectors).expect("serialize Gmail label selectors");
+        assert!(!encoded.contains("mailbox_identity"));
+        assert!(!encoded.contains("token"));
+
+        let admission: InboxAdmission = serde_json::from_value(json!({
+            "kind": "gmail_user_label",
+            "selector_id": "11111111-1111-4111-8111-111111111111",
+            "display_name": "Invoices",
+            "admitted_at": "2026-09-19T12:00:00+00:00"
+        }))
+        .expect("deserialize Inbox admission provenance");
+        assert_eq!(admission.kind, InboxAdmissionKind::GmailUserLabel);
+        let encoded = serde_json::to_string(&admission).expect("serialize Inbox admission");
+        assert!(encoded.contains("gmail_user_label"));
+        assert!(!encoded.contains("mailbox_identity"));
+    }
+
+    #[test]
+    fn check_result_carries_optional_gmail_recovery_status() {
+        let result: CheckResult = serde_json::from_value(json!({
+            "active": true,
+            "discovered": 2,
+            "summarized": 1,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": true,
+            "pending_notifications": 0,
+            "recovery_pending": true,
+            "recovery_state": "backoff",
+            "recovery_failure_code": "gmail_recovery_page_token_invalid",
+            "recovery_next_retry_at": "2026-09-20T03:00:00+00:00"
+        }))
+        .expect("deserialize Gmail recovery status");
+
+        assert_eq!(result.recovery_pending, Some(true));
+        assert_eq!(result.recovery_state.as_deref(), Some("backoff"));
+        assert_eq!(
+            result.recovery_failure_code.as_deref(),
+            Some("gmail_recovery_page_token_invalid")
+        );
+        assert_eq!(
+            result.recovery_next_retry_at.as_deref(),
+            Some("2026-09-20T03:00:00+00:00")
+        );
+        let encoded = serde_json::to_value(result).expect("serialize Gmail recovery status");
+        assert_eq!(encoded["recovery_pending"], true);
+        assert_eq!(encoded["recovery_state"], "backoff");
+
+        let legacy: CheckResult = serde_json::from_value(json!({
+            "active": false,
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": false,
+            "pending_notifications": 0
+        }))
+        .expect("deserialize check result without recovery status");
+        assert_eq!(legacy.recovery_pending, None);
+        let encoded = serde_json::to_value(legacy).expect("serialize legacy check result");
+        assert!(encoded.get("recovery_pending").is_none());
+        assert!(encoded.get("recovery_state").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gmail_label_add_forwards_only_scope_label_and_revision() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.label_selectors.add","data":{"revision":4,"item":{"selector_id":"11111111-1111-4111-8111-111111111111","label_id":"Label_123","display_name":"Invoices","status":"active","admission_active":true}}}'"#,
+                ),
+                OsString::from("engine-gmail-label-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let result = engine
+            .add_gmail_label_selector(
+                "gmail".into(),
+                "gmail-default".into(),
+                "Label_123".into(),
+                3,
+            )
+            .expect("add Gmail label through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert_eq!(result.revision, 4);
+        assert_eq!(
+            request["payload"],
+            json!({
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "Label_123",
+                "expected_revision": 3
+            })
+        );
+        assert!(request["payload"].get("display_name").is_none());
+        assert!(request["payload"].get("mailbox_identity_key").is_none());
     }
 
     #[cfg(unix)]
@@ -2770,6 +3139,10 @@ notifications_enabled = true
                 pending_notifications: 0,
                 automation_processed: 0,
                 automation_review_required: 0,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             }
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);

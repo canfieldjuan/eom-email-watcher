@@ -211,7 +211,7 @@ class FakeHistoryService:
 
 def history_response(message_count: int) -> dict[str, object]:
     return {
-        "historyId": "next-cursor",
+        "historyId": "99999",
         "history": [
             {
                 "messagesAdded": [
@@ -227,29 +227,39 @@ def test_gmail_history_accepts_exact_incremental_metadata_limit() -> None:
         FakeHistoryService(history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS))
     )
 
-    message_ids, cursor = gateway.history_message_ids("saved-cursor")
+    message_ids, cursor = gateway.history_message_ids("12345")
 
     assert len(message_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
-    assert cursor == "next-cursor"
+    assert cursor == "99999"
 
 
-def test_gmail_history_resumes_limit_plus_one_in_next_chunk() -> None:
+def test_gmail_history_request_is_broad_and_identical_for_sender_label_and_union_configs() -> None:
+    calls: list[dict[str, object]] = []
+    for _configuration in ("sender", "label", "sender-and-label"):
+        service = FakeHistoryService(history_response(1))
+        GmailGateway(service).history_message_ids("12345")
+        calls.append(service.history.calls[0])
+
+    assert calls[0] == calls[1] == calls[2]
+    assert calls[0]["historyTypes"] == ["messageAdded", "labelAdded"]
+    assert "labelId" not in calls[0]
+
+
+def test_gmail_history_v2_resumes_more_than_200_unique_ids_without_skip_or_duplicate() -> None:
     service = FakeHistoryService(history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1))
     gateway = GmailGateway(service)
 
-    first_ids, continuation = gateway.history_message_ids("saved-cursor")
+    first_ids, continuation = gateway.history_message_ids("12345")
     remaining_ids, cursor = gateway.history_message_ids(continuation)
 
     assert len(first_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
-    assert continuation == (
-        f"{gmail_module.HISTORY_CONTINUATION_PREFIX}saved-cursor:"
-        f"{gmail_module.MAX_INCREMENTAL_MESSAGE_IDS}"
-    )
+    assert continuation.startswith(gmail_module.HISTORY_CONTINUATION_PREFIX)
+    assert len(continuation.encode("utf-8")) <= gmail_module.MAX_HISTORY_CONTINUATION_BYTES
     assert remaining_ids == [f"message-{gmail_module.MAX_INCREMENTAL_MESSAGE_IDS}"]
-    assert cursor == "next-cursor"
+    assert cursor == "99999"
     assert [call["startHistoryId"] for call in service.history.calls] == [
-        "saved-cursor",
-        "saved-cursor",
+        "12345",
+        "12345",
     ]
 
 
@@ -264,7 +274,7 @@ def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
     messages.append({"message": {"id": "message-0"}})
     gateway = GmailGateway(FakeHistoryService(response))
 
-    message_ids, _ = gateway.history_message_ids("saved-cursor")
+    message_ids, _ = gateway.history_message_ids("12345")
 
     assert len(message_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
 
@@ -273,23 +283,91 @@ def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
     "cursor",
     [
         gmail_module.HISTORY_CONTINUATION_PREFIX,
-        f"{gmail_module.HISTORY_CONTINUATION_PREFIX}saved-cursor:not-a-number",
-        f"{gmail_module.HISTORY_CONTINUATION_PREFIX}saved-cursor:0",
+        f"{gmail_module.HISTORY_CONTINUATION_PREFIX}{{}}",
+        f"{gmail_module.HISTORY_CONTINUATION_PREFIX}not-json",
     ],
 )
 def test_gmail_history_rejects_invalid_continuation_cursor(cursor: str) -> None:
     gateway = GmailGateway(FakeHistoryService(history_response(1)))
 
-    with pytest.raises(GmailError, match="continuation cursor is invalid"):
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="continuation cursor is invalid"):
         gateway.history_message_ids(cursor)
 
 
 def test_gmail_history_rejects_continuation_past_available_ids() -> None:
     gateway = GmailGateway(FakeHistoryService(history_response(1)))
-    cursor = f"{gmail_module.HISTORY_CONTINUATION_PREFIX}saved-cursor:2"
+    cursor = gmail_module._history_continuation_cursor(
+        "12345", ["message-0", "message-1"]
+    )
 
-    with pytest.raises(GmailError, match="cannot be resumed"):
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="cannot be resumed"):
         gateway.history_message_ids(cursor)
+
+
+def test_gmail_history_deduplicates_message_and_label_added_in_canonical_order() -> None:
+    response = {
+        "historyId": "99999",
+        "history": [
+            {
+                "messagesAdded": [
+                    {"message": {"id": "delivered"}},
+                    {"message": {"id": "overlap"}},
+                ],
+                "labelsAdded": [
+                    {"message": {"id": "overlap"}},
+                    {"message": {"id": "labeled-later"}},
+                ],
+            }
+        ],
+    }
+
+    message_ids, cursor = GmailGateway(FakeHistoryService(response)).history_message_ids("12345")
+
+    assert message_ids == ["delivered", "overlap", "labeled-later"]
+    assert cursor == "99999"
+
+
+def test_gmail_history_v2_rejects_changed_prefix_digest_and_legacy_v1_token_as_stale() -> None:
+    response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1)
+    gateway = GmailGateway(FakeHistoryService(response))
+    _, continuation = gateway.history_message_ids("12345")
+    changed = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1)
+    history = changed["history"]
+    assert isinstance(history, list)
+    first = history[0]
+    assert isinstance(first, dict)
+    additions = first["messagesAdded"]
+    assert isinstance(additions, list)
+    additions[0] = {"message": {"id": "changed-prefix"}}
+
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="prefix changed"):
+        GmailGateway(FakeHistoryService(changed)).history_message_ids(continuation)
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="retired stream"):
+        gateway.history_message_ids("eom-gmail-history-v1:12345:200")
+
+    empty_continuation = gmail_module._history_continuation_cursor("12345", [])
+    corrupted_empty = empty_continuation.replace(
+        gmail_module._history_prefix_digest([]),
+        "0" * 64,
+    )
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="prefix changed"):
+        gateway.history_message_ids(corrupted_empty)
+
+
+def test_gmail_label_added_after_delivery_is_returned_without_inbox_history_filter() -> None:
+    service = FakeHistoryService(
+        {
+            "historyId": "99999",
+            "history": [
+                {"labelsAdded": [{"message": {"id": "labeled-after-delivery"}}]}
+            ],
+        }
+    )
+
+    message_ids, _ = GmailGateway(service).history_message_ids("12345")
+
+    assert message_ids == ["labeled-after-delivery"]
+    assert "labelId" not in service.history.calls[0]
 
 
 def test_gmail_recovery_captures_cursor_before_search() -> None:
@@ -304,6 +382,361 @@ def test_gmail_recovery_captures_cursor_before_search() -> None:
 
     assert calls == ["cursor", "search"]
     assert recovered == gmail_module.MailboxChanges(("message-1",), "recovery-cursor")
+
+
+class FakeRecoveryMessages:
+    def __init__(self, response: dict[str, object]):
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    def list(self, **kwargs: object) -> FakeRequest:
+        self.calls.append(kwargs)
+        return FakeRequest(self.response)
+
+
+class FakeRecoveryUsers:
+    def __init__(self, messages: FakeRecoveryMessages):
+        self._messages = messages
+
+    def messages(self) -> FakeRecoveryMessages:
+        return self._messages
+
+
+class FakeRecoveryService:
+    def __init__(self, response: dict[str, object]):
+        self.messages = FakeRecoveryMessages(response)
+        self._users = FakeRecoveryUsers(self.messages)
+
+    def users(self) -> FakeRecoveryUsers:
+        return self._users
+
+
+def test_gmail_recovery_page_is_one_broad_inbox_window_query_without_rule_filters() -> None:
+    service = FakeRecoveryService(
+        {"messages": [{"id": "second"}, {"id": "first"}], "nextPageToken": "next"}
+    )
+
+    ids, next_page_token = GmailGateway(service).recovery_page("current", 100, 200)
+
+    assert ids == ("second", "first")
+    assert next_page_token == "next"
+    assert service.messages.calls == [
+        {
+            "userId": "me",
+            "q": "in:inbox after:100 before:200",
+            "pageToken": "current",
+            "maxResults": 200,
+        }
+    ]
+
+
+def test_gmail_recovery_page_applies_caller_timeout_to_http_transport() -> None:
+    class TimeoutRequest:
+        def __init__(self) -> None:
+            self.http = None
+
+        def execute(self, http=None):
+            self.http = http
+            return {"messages": []}
+
+    request = TimeoutRequest()
+    messages = SimpleNamespace(list=lambda **_kwargs: request)
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: messages))
+    gateway = GmailGateway(service, credentials=SimpleNamespace())
+
+    gateway.recovery_page(None, 100, 200, timeout_seconds=12.5)
+
+    assert request.http is not None
+    assert request.http.http.timeout == 12.5
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"id": f"message-{index}"} for index in range(201)],
+        [{"id": ""}],
+        [{"id": "a"}, {"id": "a"}],
+        [{"id": "x" * 513}],
+        [{"missing": "id"}],
+    ],
+)
+def test_gmail_recovery_page_rejects_more_than_200_or_malformed_ids(
+    messages: list[dict[str, str]],
+) -> None:
+    gateway = GmailGateway(FakeRecoveryService({"messages": messages}))
+
+    with pytest.raises(gmail_module.GmailRecoveryPageInvalid):
+        gateway.recovery_page(None, 100, 200)
+
+
+@pytest.mark.parametrize("control", ["\x00", "\x1f", "\x7f", "\x85", "\x9f"])
+def test_gmail_recovery_page_rejects_nul_c0_del_and_c1_ids_before_persistence(
+    control: str,
+) -> None:
+    gateway = GmailGateway(FakeRecoveryService({"messages": [{"id": f"a{control}b"}]}))
+
+    with pytest.raises(gmail_module.GmailRecoveryPageInvalid):
+        gateway.recovery_page(None, 100, 200)
+
+
+def catalog_body(labels: list[dict[str, object]]) -> bytes:
+    return gmail_module._canonical_json_bytes({"labels": labels})
+
+
+def test_gmail_label_catalog_returns_complete_sorted_known_type_snapshot() -> None:
+    decoded = gmail_module.decode_gmail_label_catalog(
+        catalog_body(
+            [
+                {"id": "Label_b", "name": "Bills", "type": "user", "ignored": True},
+                {"id": "INBOX", "name": "Inbox", "type": "system"},
+                {"id": "Label_a", "name": "Accounts", "type": "user"},
+            ]
+        )
+    )
+
+    assert decoded == (
+        gmail_module.GmailLabel("INBOX", "Inbox", "system"),
+        gmail_module.GmailLabel("Label_a", "Accounts", "user"),
+        gmail_module.GmailLabel("Label_b", "Bills", "user"),
+    )
+
+
+def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_parse() -> None:
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        gmail_module.decode_gmail_label_catalog(
+            b"not-json",
+            content_length=str(gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1),
+        )
+
+
+class FakeCatalogResponse:
+    def __init__(self, body: bytes, content_length: str | None = None):
+        self.status_code = 200
+        self.headers = {} if content_length is None else {"Content-Length": content_length}
+        self.body = body
+        self.read_started = False
+
+    def iter_content(self, chunk_size: int):
+        self.read_started = True
+        for start in range(0, len(self.body), chunk_size):
+            yield self.body[start : start + chunk_size]
+
+
+class FakeCatalogSession:
+    def __init__(self, response: FakeCatalogResponse):
+        self.response = response
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def get(self, url: str, **kwargs: object) -> FakeCatalogResponse:
+        self.calls.append((url, kwargs))
+        return self.response
+
+
+def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeCatalogResponse(
+        b"body must not be read",
+        str(gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1),
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        gateway.label_catalog()
+
+    assert response.read_started is False
+    assert session.calls == [
+        (
+            gmail_module.GMAIL_LABELS_URL,
+            {"stream": True, "timeout": 120},
+        )
+    ]
+
+
+def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = FakeCatalogResponse(
+        b"x" * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1)
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        gateway.label_catalog()
+
+    assert response.read_started is True
+
+
+def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:
+    base = catalog_body([])
+    exact = base + b" " * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES - len(base))
+
+    assert gmail_module.decode_gmail_label_catalog(exact) == ()
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        gmail_module.decode_gmail_label_catalog(exact + b" ")
+
+
+def test_gmail_catalog_accepts_10000_items_and_rejects_10001_whole() -> None:
+    accepted = [
+        {"id": f"Label_{index:05d}", "name": "A", "type": "user"}
+        for index in range(gmail_module.MAX_GMAIL_LABEL_COUNT)
+    ]
+
+    assert (
+        len(gmail_module.decode_gmail_label_catalog(catalog_body(accepted)))
+        == gmail_module.MAX_GMAIL_LABEL_COUNT
+    )
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too many"):
+        gmail_module.decode_gmail_label_catalog(
+            catalog_body(
+                [
+                    *accepted,
+                    {"id": "Label_overflow", "name": "C", "type": "user"},
+                ]
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        {"id": "", "name": "A", "type": "user"},
+        {"id": "x" * 513, "name": "A", "type": "user"},
+        {"id": "Label_a", "name": "", "type": "user"},
+        {"id": "Label_a", "name": "x" * 1025, "type": "user"},
+        {"id": "Label_a", "name": "A", "type": "unknown"},
+        {"id": "Label_\x00", "name": "A", "type": "user"},
+        {"id": "Label_a", "name": "A\x9f", "type": "user"},
+    ],
+)
+def test_gmail_catalog_rejects_invalid_item_fields_whole(label: dict[str, object]) -> None:
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid):
+        gmail_module.decode_gmail_label_catalog(catalog_body([label]))
+
+
+def test_gmail_catalog_accepts_exact_item_utf8_byte_limits() -> None:
+    decoded = gmail_module.decode_gmail_label_catalog(
+        catalog_body(
+            [
+                {
+                    "id": "i" * gmail_module.MAX_GMAIL_LABEL_ID_BYTES,
+                    "name": "n" * gmail_module.MAX_GMAIL_LABEL_NAME_BYTES,
+                    "type": "user",
+                }
+            ]
+        )
+    )
+
+    assert len(decoded[0].label_id.encode("utf-8")) == gmail_module.MAX_GMAIL_LABEL_ID_BYTES
+    assert (
+        len(decoded[0].display_name.encode("utf-8"))
+        == gmail_module.MAX_GMAIL_LABEL_NAME_BYTES
+    )
+
+
+def test_gmail_recovery_page_accepts_200_maximum_length_ids() -> None:
+    messages = [
+        {"id": f"{index:03d}" + "x" * (gmail_module.MAX_GMAIL_LABEL_ID_BYTES - 3)}
+        for index in range(gmail_module.MAX_GMAIL_RECOVERY_PAGE_IDS)
+    ]
+
+    ids, next_page_token = GmailGateway(
+        FakeRecoveryService({"messages": messages})
+    ).recovery_page(None, 100, 200)
+
+    assert len(ids) == gmail_module.MAX_GMAIL_RECOVERY_PAGE_IDS
+    assert all(len(message_id.encode("utf-8")) == 512 for message_id in ids)
+    assert next_page_token is None
+
+
+def test_gmail_catalog_rejects_duplicate_id_and_duplicate_json_keys() -> None:
+    duplicate_ids = [
+        {"id": "same", "name": "A", "type": "user"},
+        {"id": "same", "name": "B", "type": "system"},
+    ]
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="duplicate label ID"):
+        gmail_module.decode_gmail_label_catalog(catalog_body(duplicate_ids))
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="malformed JSON"):
+        gmail_module.decode_gmail_label_catalog(
+            b'{"labels":[],"labels":[{"id":"x","name":"X","type":"user"}]}'
+        )
+
+
+def test_gmail_catalog_rejects_normalized_document_over_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_encoder = gmail_module._canonical_json_bytes
+    body = original_encoder({"labels": [{"id": "x", "name": "A", "type": "user"}]})
+    monkeypatch.setattr(gmail_module, "MAX_GMAIL_LABEL_CATALOG_BYTES", len(body))
+
+    def oversized_normalized(value: object) -> bytes:
+        return original_encoder(value) + b"x"
+
+    monkeypatch.setattr(gmail_module, "_canonical_json_bytes", oversized_normalized)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="normalized response"):
+        gmail_module.decode_gmail_label_catalog(body)
+
+
+def test_gmail_catalog_canonical_one_mib_accepts_exact_and_rejects_plus_one_whole() -> None:
+    labels = [
+        {"id": f"Label_{index:04d}", "name": "n", "type": "user"}
+        for index in range(1_000)
+    ]
+    base_size = len(catalog_body(labels))
+    remaining = gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES - base_size
+    for label in labels:
+        added = min(remaining, gmail_module.MAX_GMAIL_LABEL_NAME_BYTES - 1)
+        label["name"] = "n" * (1 + added)
+        remaining -= added
+        if remaining == 0:
+            break
+    exact = catalog_body(labels)
+    assert len(exact) == gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES
+
+    assert len(gmail_module.decode_gmail_label_catalog(exact)) == len(labels)
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        gmail_module.decode_gmail_label_catalog(exact + b" ")
+
+
+@pytest.mark.parametrize(
+    ("page_token", "after_epoch", "before_epoch", "max_results"),
+    [
+        ("x" * (gmail_module.MAX_GMAIL_PAGE_TOKEN_BYTES + 1), 100, 200, 200),
+        (None, -1, 200, 200),
+        (None, 100, 100, 200),
+        (None, 100, 200, 199),
+        (None, True, 200, 200),
+    ],
+)
+def test_gmail_recovery_page_rejects_outbound_boundary_violations(
+    page_token: str | None,
+    after_epoch: int,
+    before_epoch: int,
+    max_results: int,
+) -> None:
+    service = FakeRecoveryService({"messages": []})
+
+    with pytest.raises(gmail_module.GmailRecoveryPageInvalid):
+        GmailGateway(service).recovery_page(
+            page_token,
+            after_epoch,
+            before_epoch,
+            max_results,
+        )
+
+    assert service.messages.calls == []
 
 
 class FakeAttachments:

@@ -204,6 +204,10 @@ mod tests {
                 pending_notifications: self.check_pending,
                 automation_processed: 0,
                 automation_review_required: 0,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             })
         }
 

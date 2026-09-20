@@ -7,8 +7,9 @@ use engine::{
     CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
     ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
     ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
-    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
-    MailAccounts, MailServerConnection, WatchedSender,
+    EngineSettings, GmailAuthorization, GmailLabelCatalog, GmailLabelSelectorAdded,
+    GmailLabelSelectorRemoved, GmailLabelSelectors, HealthStatus, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, MailServerConnection, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -598,6 +599,62 @@ async fn mail_accounts_list(engine: State<'_, Engine>) -> Result<MailAccounts, E
 }
 
 #[tauri::command]
+async fn gmail_labels_catalog(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<GmailLabelCatalog, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.gmail_label_catalog(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selectors_list(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<GmailLabelSelectors, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.gmail_label_selectors(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selector_add(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+    label_id: String,
+    expected_revision: u64,
+) -> Result<GmailLabelSelectorAdded, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.add_gmail_label_selector(provider, account_id, label_id, expected_revision)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selector_remove(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+    selector_id: String,
+    expected_revision: u64,
+) -> Result<GmailLabelSelectorRemoved, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.remove_gmail_label_selector(provider, account_id, selector_id, expected_revision)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn mail_account_connect(
     engine: State<'_, Engine>,
     provider: String,
@@ -857,6 +914,10 @@ pub fn run() {
             config_initialize,
             config_status,
             gmail_authorize,
+            gmail_label_selector_add,
+            gmail_label_selector_remove,
+            gmail_label_selectors_list,
+            gmail_labels_catalog,
             health_get,
             inbox_clear,
             inbox_delete,
