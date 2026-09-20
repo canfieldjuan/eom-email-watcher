@@ -32,7 +32,7 @@ from .config import MAX_RETENTION_DAYS, normalize_validated_address
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
@@ -1804,6 +1804,7 @@ class GmailRecoveryState:
     selector_snapshot: tuple[GmailLabelSelectorSnapshot, ...]
     recovery_after_exclusive_epoch: int
     recovery_before_exclusive_epoch: int
+    retention_cutoff: str
     replacement_history_cursor: str
     page_token: str | None
     current_page_ids: tuple[str, ...]
@@ -1880,6 +1881,9 @@ def _gmail_recovery_state(row: sqlite3.Row) -> GmailRecoveryState:
         selector_snapshot=decode_gmail_selector_snapshot(row["selector_snapshot_json"]),
         recovery_after_exclusive_epoch=int(row["recovery_after_exclusive_epoch"]),
         recovery_before_exclusive_epoch=int(row["recovery_before_exclusive_epoch"]),
+        retention_cutoff=_validate_utc_timestamp(
+            row["retention_cutoff"], field="gmail recovery retention cutoff"
+        ),
         replacement_history_cursor=str(row["replacement_history_cursor"]),
         page_token=page_token,
         current_page_ids=page_ids,
@@ -2311,6 +2315,21 @@ def _ensure_automate_core_schema(db: sqlite3.Connection, current_version: int) -
 
 
 def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
+    recovery_table = db.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='gmail_recovery_state'"
+    ).fetchone()
+    legacy_recovery_table = False
+    if recovery_table is not None:
+        recovery_columns = {
+            str(row["name"])
+            for row in db.execute("PRAGMA table_info(gmail_recovery_state)").fetchall()
+        }
+        legacy_recovery_table = "retention_cutoff" not in recovery_columns
+        if legacy_recovery_table:
+            db.execute("DROP TRIGGER IF EXISTS gmail_recovery_state_immutable")
+            db.execute(
+                "ALTER TABLE gmail_recovery_state RENAME TO gmail_recovery_state_v24"
+            )
     _execute_transactional_script(
         db,
         """
@@ -2382,6 +2401,10 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
           recovery_before_exclusive_epoch INTEGER NOT NULL CHECK (
             recovery_before_exclusive_epoch > recovery_after_exclusive_epoch
           ),
+          retention_cutoff TEXT NOT NULL CHECK (
+            aware_iso_epoch(retention_cutoff) IS NOT NULL
+            AND aware_iso_epoch(retention_cutoff) >= 0
+          ),
           replacement_history_cursor TEXT NOT NULL CHECK (
             replacement_history_cursor <> ''
             AND length(CAST(replacement_history_cursor AS BLOB)) <= 4096
@@ -2422,6 +2445,7 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
           OR NEW.selector_snapshot_json IS NOT OLD.selector_snapshot_json
           OR NEW.recovery_after_exclusive_epoch IS NOT OLD.recovery_after_exclusive_epoch
           OR NEW.recovery_before_exclusive_epoch IS NOT OLD.recovery_before_exclusive_epoch
+          OR NEW.retention_cutoff IS NOT OLD.retention_cutoff
           OR NEW.replacement_history_cursor IS NOT OLD.replacement_history_cursor
           OR NEW.created_at IS NOT OLD.created_at
           OR NEW.page_count < OLD.page_count
@@ -2432,6 +2456,12 @@ def _ensure_gmail_label_schema(db: sqlite3.Connection) -> None:
         END;
         """,
     )
+    if legacy_recovery_table:
+        # The old row did not record the exact retention boundary, so it cannot
+        # be resumed without changing admission based on the current setting.
+        # Dropping only that row is fail closed: the unchanged mailbox cursor
+        # will re-enter stale recovery with a complete schema-25 capture.
+        db.execute("DROP TABLE gmail_recovery_state_v24")
     message_columns = {
         str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()
     }
@@ -4137,6 +4167,7 @@ class Store:
         recovery_before_exclusive_epoch: int,
         replacement_history_cursor: str,
         *,
+        retention_cutoff: datetime | None = None,
         now: datetime | None = None,
     ) -> GmailRecoveryState:
         _require_mailbox_identity_key(mailbox_identity_key)
@@ -4154,6 +4185,18 @@ class Store:
             maximum_bytes=MAX_GMAIL_RECOVERY_CURSOR_BYTES,
             field="gmail replacement history cursor",
         )
+        if retention_cutoff is None:
+            retention_cutoff = datetime.fromtimestamp(
+                recovery_after_exclusive_epoch, tz=UTC
+            )
+        if (
+            not isinstance(retention_cutoff, datetime)
+            or retention_cutoff.tzinfo is None
+            or retention_cutoff.utcoffset() != timedelta(0)
+            or retention_cutoff < datetime(1970, 1, 1, tzinfo=UTC)
+        ):
+            raise ValueError("gmail recovery retention cutoff is invalid")
+        retention_cutoff_stamp = retention_cutoff.astimezone(UTC).isoformat()
         sender_json = encode_gmail_sender_snapshot(sender_snapshot)
         selector_json = encode_gmail_selector_snapshot(selector_snapshot)
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
@@ -4196,12 +4239,13 @@ class Store:
                         provider, account_id, mailbox_identity_key, selector_revision,
                         sender_snapshot_json, selector_snapshot_json,
                         recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
-                        replacement_history_cursor, page_token, current_page_ids_json,
+                        retention_cutoff, replacement_history_cursor,
+                        page_token, current_page_ids_json,
                         page_loaded, next_index, page_count, terminal_candidate_count,
                         invalid_page_token_count, consecutive_retry_count,
                         state, failure_code, next_retry_at, created_at, updated_at
                     ) VALUES (
-                        'gmail', ?, ?, ?, ?, ?, ?, ?, ?, NULL, X'5B5D',
+                        'gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, X'5B5D',
                         0, 0, 0, 0, 0, 0, 'collecting', NULL, NULL, ?, ?
                     )""",
                     (
@@ -4212,6 +4256,7 @@ class Store:
                         selector_json,
                         recovery_after_exclusive_epoch,
                         recovery_before_exclusive_epoch,
+                        retention_cutoff_stamp,
                         cursor,
                         stamp,
                         stamp,
@@ -4450,7 +4495,7 @@ class Store:
             )
             db.execute(
                 """UPDATE gmail_recovery_state
-                SET consecutive_retry_count = 0, state = 'collecting',
+                SET state = 'collecting',
                     failure_code = NULL, next_retry_at = NULL, updated_at = ?
                 WHERE provider = 'gmail' AND account_id = ?""",
                 (stamp, account_id),

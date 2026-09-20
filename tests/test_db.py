@@ -2184,6 +2184,21 @@ def _gmail_selector_store(tmp_path: Path) -> tuple[Store, str]:
     return store, identity
 
 
+def test_gmail_admission_schema_bump_rejects_previous_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "state" / "watcher.sqlite3"
+    store = Store(database)
+    store.initialize()
+
+    with store.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 25
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 24)
+    with pytest.raises(RuntimeError, match="newer than supported version 24"):
+        Store(database).initialize()
+
+
 def test_gmail_label_selector_cas_bounds_and_immutable_identity(tmp_path: Path) -> None:
     store, identity = _gmail_selector_store(tmp_path)
 
@@ -2467,6 +2482,7 @@ def test_selector_snapshot_worst_case_fits_and_oversized_sender_snapshot_writes_
             b" " * 1_048_576,
             1,
             2,
+            "1970-01-01T00:00:01+00:00",
             "replacement",
             b"[]",
             "2026-09-19T12:00:00+00:00",
@@ -2476,9 +2492,9 @@ def test_selector_snapshot_worst_case_fits_and_oversized_sender_snapshot_writes_
                 provider, account_id, mailbox_identity_key, selector_revision,
                 sender_snapshot_json, selector_snapshot_json,
                 recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
-                replacement_history_cursor, current_page_ids_json,
+                retention_cutoff, replacement_history_cursor, current_page_ids_json,
                 created_at, updated_at, state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
             (*values, values[-1]),
         )
         db.execute("DELETE FROM gmail_recovery_state WHERE account_id='raw-cap-account'")
@@ -2490,9 +2506,9 @@ def test_selector_snapshot_worst_case_fits_and_oversized_sender_snapshot_writes_
                     provider, account_id, mailbox_identity_key, selector_revision,
                     sender_snapshot_json, selector_snapshot_json,
                     recovery_after_exclusive_epoch, recovery_before_exclusive_epoch,
-                    replacement_history_cursor, current_page_ids_json,
+                    retention_cutoff, replacement_history_cursor, current_page_ids_json,
                     created_at, updated_at, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'collecting')""",
                 (*oversized, oversized[-1]),
             )
 
@@ -2590,7 +2606,7 @@ def test_recovery_backoff_is_durable_bounded_and_clears_on_success(tmp_path: Pat
     cleared = store.clear_gmail_recovery_backoff("gmail-default", identity)
     assert (cleared.state, cleared.consecutive_retry_count, cleared.next_retry_at) == (
         "collecting",
-        0,
+        1,
         None,
     )
 
@@ -2611,6 +2627,35 @@ def test_recovery_backoff_is_durable_bounded_and_clears_on_success(tmp_path: Pat
     assert resumed.next_retry_at is None
     assert resumed.consecutive_retry_count == 0
     assert resumed.invalid_page_token_count == 5
+
+
+def test_due_recovery_backoff_preserves_retry_count_until_progress(tmp_path: Path) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 1, 2, "replacement-history"
+    )
+    first = store.record_gmail_recovery_backoff(
+        "gmail-default",
+        identity,
+        failure_code="gmail_recovery_provider_unavailable",
+        next_retry_at="2026-09-19T12:01:00+00:00",
+    )
+    assert first.consecutive_retry_count == 1
+
+    due = store.clear_gmail_recovery_backoff("gmail-default", identity)
+    assert due.consecutive_retry_count == 1
+    second = store.record_gmail_recovery_backoff(
+        "gmail-default",
+        identity,
+        failure_code="gmail_recovery_provider_unavailable",
+        next_retry_at="2026-09-19T12:03:00+00:00",
+    )
+    assert second.consecutive_retry_count == 2
+
+    progressed = store.store_gmail_recovery_page(
+        "gmail-default", identity, [], None
+    )
+    assert progressed.consecutive_retry_count == 0
 
 
 def test_message_insert_atomically_persists_deterministic_admission_provenance(

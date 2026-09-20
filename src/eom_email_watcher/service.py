@@ -1300,9 +1300,15 @@ class Watcher:
         return cursor
 
     @staticmethod
-    def inactive_result(config: Config, store: Store, *, dry_run: bool) -> dict[str, int | bool]:
+    def inactive_result(
+        config: Config,
+        store: Store,
+        *,
+        dry_run: bool,
+        reason: str | None = None,
+    ) -> dict[str, int | bool | str]:
         purged = 0 if dry_run else store.purge(config.retention_days)
-        return {
+        result: dict[str, int | bool | str] = {
             "active": False,
             "discovered": 0,
             "summarized": 0,
@@ -1310,6 +1316,9 @@ class Watcher:
             "purged": purged,
             "stale_cursor_recovered": False,
         }
+        if reason is not None:
+            result["reason"] = reason
+        return result
 
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
@@ -1319,8 +1328,7 @@ class Watcher:
         if (
             not self.config.senders
             and self.mailbox.provider == "gmail"
-            and not self.store.gmail_label_selectors(self.mailbox.account_id)
-            and self.store.gmail_recovery_state(self.mailbox.account_id) is None
+            and not _gmail_label_watch_configured(self.store)
         ):
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
@@ -1331,7 +1339,7 @@ class Watcher:
             )
             recovery_state = (
                 self.store.gmail_recovery_state(self.mailbox.account_id)
-                if self.mailbox.provider == "gmail" and not dry_run
+                if self.mailbox.provider == "gmail"
                 else None
             )
             label_selectors = (
@@ -1340,7 +1348,20 @@ class Watcher:
                 else self._active_gmail_label_selectors(mailbox_identity_key)
             )
             if not self.config.senders and not label_selectors and recovery_state is None:
-                return self.inactive_result(self.config, self.store, dry_run=dry_run)
+                current_label_rows = self.store.gmail_current_label_selectors(
+                    self.mailbox.account_id,
+                    mailbox_identity_key,
+                )
+                return self.inactive_result(
+                    self.config,
+                    self.store,
+                    dry_run=dry_run,
+                    reason=(
+                        "gmail_label_selectors_inactive"
+                        if current_label_rows
+                        else None
+                    ),
+                )
             if (
                 not dry_run
                 and self.store.state(
@@ -1423,16 +1444,136 @@ class Watcher:
         )
         return current_senders, label_grants
 
+    @staticmethod
+    def _recovery_retention_cutoff(state: GmailRecoveryState) -> datetime:
+        try:
+            cutoff = datetime.fromisoformat(state.retention_cutoff).astimezone(UTC)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Gmail recovery retention cutoff is invalid") from exc
+        return cutoff
+
+    def _preview_gmail_recovery(
+        self,
+        *,
+        state: GmailRecoveryState,
+        mailbox_identity_key: str,
+        checked_at: datetime,
+        deliver_notifications: bool,
+    ) -> dict[str, int | bool | str]:
+        """Preview the frozen recovery window without changing durable progress."""
+        deadline = time.monotonic() + 30.0
+        if state.page_loaded:
+            message_ids = state.current_page_ids[state.next_index :]
+        elif not self._retry_due(state.next_retry_at, checked_at):
+            message_ids = ()
+        else:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                message_ids = ()
+            else:
+                message_ids, _next_page_token = self.gateway.recovery_page(
+                    state.page_token,
+                    state.recovery_after_exclusive_epoch,
+                    state.recovery_before_exclusive_epoch,
+                    200,
+                    timeout_seconds=remaining_seconds,
+                )
+
+        current_senders, current_selectors = self._current_recovery_grants(
+            state,
+            mailbox_identity_key,
+        )
+        retention_cutoff = self._recovery_retention_cutoff(state)
+        dry_run_messages: list[PendingMessage] = []
+        for provider_message_id in message_ids:
+            if time.monotonic() >= deadline:
+                break
+            if self.store.has_seen_message(
+                provider_message_id,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            ):
+                continue
+            try:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    break
+                metadata = self.gateway.metadata(
+                    provider_message_id,
+                    timeout_seconds=remaining_seconds,
+                )
+            except (MailboxMessageUnavailable, MailboxMessageInvalid):
+                continue
+            if metadata.message_id != provider_message_id:
+                raise RuntimeError(
+                    "Mailbox metadata identity did not match the recovery page"
+                )
+            admission = match_mailbox_admission(
+                metadata=metadata,
+                provider="gmail",
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                exact_senders=current_senders,
+                label_selectors=current_selectors,
+                admitted_at=checked_at,
+            )
+            received_at = _received_at_or_none(
+                metadata.received_at,
+                observed_at=checked_at,
+            )
+            if admission is None or received_at is None or received_at < retention_cutoff:
+                continue
+            dry_run_messages.append(
+                PendingMessage(
+                    message_id=scoped_message_id(
+                        "gmail",
+                        self.mailbox.account_id,
+                        metadata.message_id,
+                        mailbox_identity_key,
+                    ),
+                    provider="gmail",
+                    account_id=self.mailbox.account_id,
+                    provider_message_id=metadata.message_id,
+                    thread_id=metadata.thread_id,
+                    sender=metadata.sender,
+                    sender_name=(
+                        metadata.sender_name or self.sender_names.get(metadata.sender)
+                    ),
+                    subject=metadata.subject,
+                    received_at=received_at.isoformat(),
+                    attempts=0,
+                    fallback_notified_at=None,
+                    analysis_request_id=None,
+                    analysis_context_at=None,
+                    analysis_body_char_limit=None,
+                    mailbox_identity_key=mailbox_identity_key,
+                )
+            )
+
+        return self._finish_active_result(
+            added=len(dry_run_messages),
+            purged=0,
+            recovered=True,
+            dry_run=True,
+            deliver_notifications=deliver_notifications,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run_messages=dry_run_messages,
+            recovery_status=state,
+        )
+
     def _run_gmail_recovery(
         self,
         *,
         mailbox_identity_key: str,
-        retention_cutoff: datetime,
         checked_at: datetime,
     ) -> tuple[int, bool]:
         state = self.store.gmail_recovery_state(self.mailbox.account_id)
         if state is None:
             raise RuntimeError("Gmail recovery state was not initialized")
+        retention_cutoff = self._recovery_retention_cutoff(state)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
         if state.state in {"backoff", "degraded"}:
@@ -1676,9 +1817,11 @@ class Watcher:
         if self.mailbox.provider == "gmail" and not dry_run:
             recovery_state = self.store.gmail_recovery_state(self.mailbox.account_id)
             if recovery_state is not None:
+                recovery_retention_cutoff = self._recovery_retention_cutoff(
+                    recovery_state
+                )
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
-                    retention_cutoff=retention_cutoff,
                     checked_at=checked_at,
                 )
                 pending_recovery = (
@@ -1697,9 +1840,18 @@ class Watcher:
                     dry_run=False,
                     deliver_notifications=deliver_notifications,
                     checked_at=checked_at,
-                    retention_cutoff=retention_cutoff,
+                    retention_cutoff=recovery_retention_cutoff,
                     mailbox_identity_key=mailbox_identity_key,
                     recovery_status=pending_recovery,
+                )
+        if self.mailbox.provider == "gmail" and dry_run:
+            recovery_state = self.store.gmail_recovery_state(self.mailbox.account_id)
+            if recovery_state is not None:
+                return self._preview_gmail_recovery(
+                    state=recovery_state,
+                    mailbox_identity_key=mailbox_identity_key,
+                    checked_at=checked_at,
+                    deliver_notifications=deliver_notifications,
                 )
         try:
             changes = self.gateway.changes_since(cursor)
@@ -1777,11 +1929,11 @@ class Watcher:
                     after_epoch,
                     before_epoch,
                     replacement_cursor,
+                    retention_cutoff=retention_cutoff,
                     now=sampled_at,
                 )
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
-                    retention_cutoff=retention_cutoff,
                     checked_at=sampled_at,
                 )
                 pending_recovery = (
@@ -2158,10 +2310,17 @@ def _gmail_label_watch_configured(store: Store) -> bool:
     account = store.active_mail_account()
     if account is None or account.provider != "gmail":
         return False
-    reader = getattr(store, "gmail_label_selectors", None)
-    if callable(reader) and reader(account.account_id):
+    if store.gmail_recovery_state(account.account_id) is not None:
         return True
-    return store.gmail_recovery_state(account.account_id) is not None
+    if account.mailbox_identity_key is None:
+        return False
+    reader = getattr(store, "gmail_current_label_selectors", None)
+    if not callable(reader):
+        return False
+    try:
+        return bool(reader(account.account_id, account.mailbox_identity_key))
+    except MailboxIdentityChanged:
+        return False
 
 
 def run_watcher_check(
