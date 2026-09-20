@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import stat
 from pathlib import Path
 from types import ModuleType
 
@@ -33,6 +34,45 @@ def _load_smoke() -> ModuleType:
 
 
 smoke_packaged_engine = _load_smoke()
+
+
+def test_packaged_smoke_uses_owner_private_config_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = iter(
+        [
+            {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {"data": {"items": []}},
+            {
+                "data": {
+                    "watchlist_count": 0,
+                    "mail": {
+                        "providers": [
+                            {
+                                "provider": "microsoft365",
+                                "connection_available": False,
+                            }
+                        ]
+                    },
+                }
+            },
+            {"data": {"state": "authority_unavailable", "active": False}},
+            {"data": {"active": False}},
+        ]
+    )
+
+    def request(*_args: object, **kwargs: object) -> dict[str, object]:
+        config_path = kwargs["config_path"]
+        assert isinstance(config_path, Path)
+        assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
+        return next(responses)
+
+    monkeypatch.setattr(smoke_packaged_engine, "_request", request)
+
+    smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
 
 
 def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:

@@ -91,7 +91,9 @@ def smoke_packaged_engine(
             isolated_binary.chmod(0o755)
 
         private_root = temporary / "private"
-        private_root.mkdir()
+        private_root.mkdir(mode=0o700)
+        if os.name != "nt":
+            private_root.chmod(0o700)
         config_path = private_root / "config.toml"
         environment = os.environ.copy()
         environment.pop("PYTHONHOME", None)

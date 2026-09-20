@@ -518,6 +518,38 @@ def _open_directory_nofollow(path: Path) -> int:
         raise
 
 
+def _open_or_create_directory_nofollow(path: Path) -> int:
+    absolute = _absolute_lexical_path(path)
+    if not absolute.is_absolute():
+        raise _UnsafeConfigPath
+    current_fd = os.open("/", _directory_open_flags())
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise _UnsafeConfigPath from exc
+                try:
+                    next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+                except OSError as exc:
+                    raise _UnsafeConfigPath from exc
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
+                    raise _UnsafeConfigPath from exc
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
 def _open_safe_parent(path: Path) -> tuple[Path, int, str]:
     if os.name != "posix" or not hasattr(os, "getuid"):
         raise _UnsafeConfigPath
@@ -525,6 +557,27 @@ def _open_safe_parent(path: Path) -> tuple[Path, int, str]:
     if not absolute.name:
         raise _UnsafeConfigPath
     current_fd = _open_directory_nofollow(absolute.parent)
+    try:
+        parent_stat = os.fstat(current_fd)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        ):
+            raise _UnsafeConfigPath
+        return absolute, current_fd, absolute.name
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_or_create_safe_parent(path: Path) -> tuple[Path, int, str]:
+    if os.name != "posix" or not hasattr(os, "getuid"):
+        raise _UnsafeConfigPath
+    absolute = _absolute_lexical_path(path)
+    if not absolute.name:
+        raise _UnsafeConfigPath
+    current_fd = _open_or_create_directory_nofollow(absolute.parent)
     try:
         parent_stat = os.fstat(current_fd)
         if (
@@ -3061,6 +3114,87 @@ def _atomic_create(path: Path, content: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _initialization_probe(_stage: str) -> None:
+    """Test seam for first-run parent replacement probes."""
+
+
+def _unlink_exact_at(parent_fd: int, name: str, identity: tuple[int, int]) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if _safe_file_identity(current) != identity:
+        return
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError:
+        pass
+
+
+def _atomic_create_at(parent_fd: int, name: str, content: bytes) -> tuple[int, int]:
+    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+    temporary_fd: int | None = None
+    temporary_identity: tuple[int, int] | None = None
+    linked = False
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        temporary_stat = os.fstat(temporary_fd)
+        temporary_identity = _safe_file_identity(temporary_stat)
+        if not _is_safe_file_stat(temporary_stat):
+            raise _UnsafeConfigPath
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("configuration initialization write did not make progress")
+            remaining = remaining[written:]
+        os.fsync(temporary_fd)
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        linked = True
+        os.fsync(parent_fd)
+        return temporary_identity
+    except FileExistsError as exc:
+        raise ConfigAlreadyExistsError("Configuration already exists") from exc
+    except Exception:
+        if linked and temporary_identity is not None:
+            _unlink_exact_at(parent_fd, name, temporary_identity)
+        raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            current = os.stat(
+                temporary_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            current = None
+        if (
+            current is not None
+            and temporary_identity is not None
+            and _safe_file_identity(current) == temporary_identity
+        ):
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
+
+
 def initialize_config(
     path: Path,
     *,
@@ -3086,8 +3220,6 @@ def initialize_config(
     ):
         raise InvalidConfigInitializationError("model_name must be a non-empty printable string")
 
-    config_path = path.expanduser().resolve()
-    config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     initial = document()
     initial["timezone"] = normalized_timezone
     initial["poll_interval_minutes"] = DEFAULT_POLL_INTERVAL_MINUTES
@@ -3097,9 +3229,52 @@ def initialize_config(
     initial["model_name"] = normalized_model_name
     initial["model_require_auth"] = False
     initial["notifications_enabled"] = True
-    with FileLock(f"{config_path}.lock"):
-        _atomic_create(config_path, dumps(initial))
-    return load_config(config_path)
+    content = dumps(initial).encode("utf-8")
+
+    if os.name != "posix":
+        config_path = path.expanduser().resolve()
+        config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with FileLock(f"{config_path}.lock"):
+            _atomic_create(config_path, content.decode("utf-8"))
+        return load_config(config_path)
+
+    parent_fd: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        config_path, parent_fd, name = _open_or_create_safe_parent(path)
+        with FileLock(f"{config_path}.lock"):
+            held_parent = _validate_held_parent(
+                parent_fd,
+                parent_path=config_path.parent,
+            )
+            _initialization_probe("before_create")
+            _validate_held_parent(parent_fd, held_parent)
+            created_identity = _atomic_create_at(parent_fd, name, content)
+            try:
+                _validate_held_parent(parent_fd, held_parent)
+                file_fd, file_stat, written = _read_safe_file_at(parent_fd, name)
+                try:
+                    if (
+                        _safe_file_identity(file_stat) != created_identity
+                        or written != content
+                    ):
+                        raise _UnsafeConfigPath
+                finally:
+                    os.close(file_fd)
+                _validate_held_parent(parent_fd, held_parent)
+                return _load_config_bytes(written, config_path)
+            except Exception:
+                _unlink_exact_at(parent_fd, name, created_identity)
+                raise
+    except ConfigAlreadyExistsError:
+        raise
+    except (_MissingConfigPath, _UnsafeConfigPath) as exc:
+        raise ConfigError(
+            "Configuration is unavailable or requires manual repair"
+        ) from exc
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _sender_table(sender: Sender, *, inline: bool):

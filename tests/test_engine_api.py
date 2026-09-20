@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 from connect_automate import connect
 
+from eom_email_watcher import config as config_module
 from eom_email_watcher import engine_api
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import config_admission_snapshot, load_config
@@ -880,6 +882,138 @@ def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> No
     encoded = json.dumps(response)
     assert "token.json" not in encoded
     assert "send-token.json" not in encoded
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix mode boundary")
+def test_config_initialize_rejects_public_parent_without_writing(tmp_path: Path) -> None:
+    parent = tmp_path / "public-config"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    config_path = parent / "config.toml"
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": "Configuration is unavailable or requires manual repair",
+    }
+    assert not config_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix no-follow boundary")
+def test_config_initialize_rejects_parent_symlink_without_writing(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    parent = tmp_path / "linked-config"
+    parent.symlink_to(target, target_is_directory=True)
+    config_path = parent / "config.toml"
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "configuration_error"
+    assert not (target / "config.toml").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix directory identity boundary")
+def test_config_initialize_rejects_parent_replacement_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "config"
+    parent.mkdir(mode=0o700)
+    displaced = tmp_path / "displaced"
+    config_path = parent / "config.toml"
+
+    def replace_parent(stage: str) -> None:
+        if stage != "before_create":
+            return
+        parent.rename(displaced)
+        parent.mkdir(mode=0o700)
+
+    monkeypatch.setattr(config_module, "_initialization_probe", replace_parent, raising=False)
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "configuration_error"
+    assert not config_path.exists()
+    assert not (displaced / "config.toml").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix mode boundary")
+def test_config_initialize_creates_missing_private_parent(tmp_path: Path) -> None:
+    parent = tmp_path / "missing" / "private-config"
+    config_path = parent / "config.toml"
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix mode boundary")
+def test_config_initialize_accepts_existing_private_parent(tmp_path: Path) -> None:
+    parent = tmp_path / "private-config"
+    parent.mkdir(mode=0o700)
+    config_path = parent / "config.toml"
+
+    response = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "model_base_url": "http://127.0.0.1:9/v1",
+                "model_name": "sidecar-build-smoke",
+                "timezone": "America/Chicago",
+            },
+        )
+    )
+
+    assert response["ok"] is True
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize(

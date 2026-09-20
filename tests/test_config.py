@@ -305,7 +305,7 @@ def test_first_run_atomic_publication_failure_leaves_no_config(
 ) -> None:
     path = tmp_path / "config.toml"
 
-    def fail_link(source: Path, destination: Path) -> None:
+    def fail_link(source: Path, destination: Path, **_kwargs: object) -> None:
         raise OSError("link failed")
 
     monkeypatch.setattr("eom_email_watcher.config.os.link", fail_link)
