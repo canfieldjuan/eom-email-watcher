@@ -1,3 +1,4 @@
+import ast
 import os
 import stat
 from pathlib import Path
@@ -254,6 +255,7 @@ def test_first_run_initialization_creates_private_zero_sender_config(
     assert config.notifications_enabled is True
     assert config.senders == ()
     assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_nlink == 1
     text = path.read_text(encoding="utf-8")
     assert "gmail_send" not in text
     assert "monthly_hours" not in text
@@ -306,10 +308,10 @@ def test_first_run_atomic_publication_failure_leaves_no_config(
 ) -> None:
     path = tmp_path / "config.toml"
 
-    def fail_link(source: Path, destination: Path, **_kwargs: object) -> None:
+    def fail_link(_source_fd: int, _parent_fd: int, _destination: str) -> None:
         raise OSError("link failed")
 
-    monkeypatch.setattr("eom_email_watcher.config.os.link", fail_link)
+    monkeypatch.setattr(config_module, "_link_unnamed_candidate_at", fail_link)
 
     with pytest.raises(OSError, match="link failed"):
         initialize_config(
@@ -321,6 +323,354 @@ def test_first_run_atomic_publication_failure_leaves_no_config(
 
     assert not path.exists()
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="unnamed publication is POSIX-only")
+def test_first_run_directory_fsync_sees_one_published_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    real_fsync = config_module.os.fsync
+    observed_directory_fsync = False
+
+    def inspect_names_before_fsync(file_fd: int) -> None:
+        nonlocal observed_directory_fsync
+        if stat.S_ISDIR(os.fstat(file_fd).st_mode):
+            observed_directory_fsync = True
+            assert sorted(item.name for item in tmp_path.iterdir()) == ["config.toml"]
+        real_fsync(file_fd)
+
+    monkeypatch.setattr(config_module.os, "fsync", inspect_names_before_fsync)
+
+    initialize_config(
+        path,
+        timezone="UTC",
+        model_base_url="http://127.0.0.1:8080/v1",
+        model_name="local-model",
+    )
+
+    assert observed_directory_fsync
+    assert path.is_file()
+
+
+def test_windows_mutation_commit_preserves_replacement_inside_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = b"original config\n"
+    candidate = b"application mutation\n"
+    manual = b"operator replacement\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    source = config_module._ConfigMutationSource(path, path.stat(), original)
+
+    monkeypatch.setattr(
+        config_module,
+        "_verify_config_mutation_source",
+        lambda _source: None,
+    )
+    injected = False
+
+    def replace_file(target: Path, replacement: Path, backup: Path) -> None:
+        nonlocal injected
+        if not injected:
+            external = tmp_path / "external.toml"
+            external.write_bytes(manual)
+            external.chmod(0o600)
+            os.replace(external, target)
+            injected = True
+        os.replace(target, backup)
+        os.replace(replacement, target)
+
+    monkeypatch.setattr(
+        config_module,
+        "_windows_replace_file",
+        replace_file,
+        raising=False,
+    )
+
+    with pytest.raises(ConfigAdmissionStaleError, match="snapshot changed"):
+        config_module._atomic_write_windows(path, candidate, source)
+
+    assert path.read_bytes() == manual
+    assert list(tmp_path.glob(".config.toml.config-publication-*")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process crash probe is POSIX-only")
+def test_first_run_crash_after_publication_leaves_one_recoverable_name(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    child = os.fork()
+    if child == 0:
+
+        def crash(stage: str) -> None:
+            if stage == "after_publish":
+                os._exit(86)
+
+        config_module._initialization_probe = crash
+        initialize_config(
+            path,
+            timezone="UTC",
+            model_base_url="http://127.0.0.1:8080/v1",
+            model_name="local-model",
+        )
+        os._exit(87)
+    waited, status = os.waitpid(child, 0)
+
+    assert waited == child
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 86
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["config.toml"]
+    assert path.stat().st_nlink == 1
+    assert load_config(path).timezone == "UTC"
+
+
+@pytest.mark.parametrize("entry_kind", ["collision", "symlink", "hardlink"])
+def test_first_run_publication_preserves_existing_entry_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_kind: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    target = tmp_path / "operator.toml"
+    operator_bytes = b"operator state\n"
+    target.write_bytes(operator_bytes)
+    target.chmod(0o600)
+
+    def install_entry(stage: str) -> None:
+        if stage != "before_publish" or path.exists() or path.is_symlink():
+            return
+        if entry_kind == "collision":
+            path.write_bytes(operator_bytes)
+            path.chmod(0o600)
+        elif entry_kind == "symlink":
+            path.symlink_to(target)
+        else:
+            os.link(target, path)
+
+    monkeypatch.setattr(config_module, "_initialization_probe", install_entry)
+
+    with pytest.raises(ConfigAlreadyExistsError, match="already exists"):
+        initialize_config(
+            path,
+            timezone="UTC",
+            model_base_url="http://127.0.0.1:8080/v1",
+            model_name="local-model",
+        )
+
+    if entry_kind == "symlink":
+        assert path.is_symlink()
+        assert path.resolve() == target
+    assert path.read_bytes() == operator_bytes
+    assert target.read_bytes() == operator_bytes
+
+
+@pytest.mark.parametrize(
+    ("crash_stage", "expected_disposition", "expected_bytes"),
+    [
+        ("after_windows_marker_staged", "aborted", b"original config\n"),
+        ("after_windows_marker_durable", "aborted", b"original config\n"),
+        ("after_windows_ready_marker_staged", "aborted", b"original config\n"),
+        ("after_windows_candidate_durable", "aborted", b"original config\n"),
+        ("after_windows_replace", "committed", b"application mutation\n"),
+    ],
+)
+def test_windows_publication_replays_each_durable_crash_cut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_stage: str,
+    expected_disposition: str,
+    expected_bytes: bytes,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    path = tmp_path / "config.toml"
+    original = b"original config\n"
+    candidate = b"application mutation\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    source = config_module._ConfigMutationSource(path, path.stat(), original)
+    monkeypatch.setattr(
+        config_module,
+        "_verify_config_mutation_source",
+        lambda _source: None,
+    )
+
+    def crash(stage: str, _path: Path) -> None:
+        if stage == crash_stage:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(config_module, "_config_mutation_probe", crash)
+
+    with pytest.raises(SimulatedCrash):
+        config_module._atomic_write_windows(path, candidate, source)
+
+    assert config_module._recover_windows_publication(path) == expected_disposition
+    assert config_module._recover_windows_publication(path) == "none"
+    assert path.read_bytes() == expected_bytes
+    assert list(tmp_path.glob(".config.toml.config-publication-*")) == []
+
+
+@pytest.mark.parametrize("external_kind", ["regular", "hardlink", "symlink"])
+def test_windows_publication_replay_restores_displaced_external_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    external_kind: str,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    path = tmp_path / "config.toml"
+    original = b"original config\n"
+    candidate = b"application mutation\n"
+    manual = b"external replacement\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    source = config_module._ConfigMutationSource(path, path.stat(), original)
+    monkeypatch.setattr(
+        config_module,
+        "_verify_config_mutation_source",
+        lambda _source: None,
+    )
+    injected = False
+
+    def replace_file(target: Path, replacement: Path, backup: Path) -> None:
+        nonlocal injected
+        if not injected:
+            external = tmp_path / "external.toml"
+            manual_target = tmp_path / "manual-target.toml"
+            manual_target.write_bytes(manual)
+            manual_target.chmod(0o600)
+            if external_kind == "regular":
+                external.write_bytes(manual)
+                external.chmod(0o600)
+            elif external_kind == "hardlink":
+                os.link(manual_target, external)
+            else:
+                external.symlink_to(manual_target)
+            os.replace(external, target)
+            injected = True
+        os.replace(target, backup)
+        os.replace(replacement, target)
+
+    def crash(stage: str, _path: Path) -> None:
+        if stage == "after_windows_replace":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(config_module, "_windows_replace_file", replace_file)
+    monkeypatch.setattr(config_module, "_config_mutation_probe", crash)
+
+    with pytest.raises(SimulatedCrash):
+        config_module._atomic_write_windows(path, candidate, source)
+
+    assert config_module._recover_windows_publication(path) == "manual_target"
+    assert config_module._recover_windows_publication(path) == "none"
+    assert path.read_bytes() == manual
+    if external_kind == "hardlink":
+        assert path.stat().st_nlink == 2
+    elif external_kind == "symlink":
+        assert path.is_symlink()
+    assert list(tmp_path.glob(".config.toml.config-publication-*")) == []
+
+
+def test_windows_publication_recovery_cleans_partial_owned_marker_staging(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(b"operator config\n")
+    path.chmod(0o600)
+    staging = tmp_path / ".config.toml.config-publication-marker-staging"
+    staging.write_bytes(b'{"partial":')
+    staging.chmod(0o600)
+
+    assert config_module._recover_windows_publication(path) == "aborted"
+    assert config_module._recover_windows_publication(path) == "none"
+    assert path.read_bytes() == b"operator config\n"
+    assert not staging.exists()
+
+
+def test_windows_publication_preserves_same_byte_replacement_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = b"original config\n"
+    candidate = b"application mutation\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    source = config_module._ConfigMutationSource(path, path.stat(), original)
+    monkeypatch.setattr(
+        config_module,
+        "_verify_config_mutation_source",
+        lambda _source: None,
+    )
+    replacement_identity: tuple[int, int] | None = None
+
+    def replace_after_commit(stage: str, _path: Path) -> None:
+        nonlocal replacement_identity
+        if stage != "after_windows_replace":
+            return
+        external = tmp_path / "same-byte-external.toml"
+        external.write_bytes(candidate)
+        external.chmod(0o600)
+        os.replace(external, path)
+        replaced = path.stat()
+        replacement_identity = replaced.st_dev, replaced.st_ino
+
+    monkeypatch.setattr(
+        config_module,
+        "_config_mutation_probe",
+        replace_after_commit,
+    )
+
+    with pytest.raises(ConfigAdmissionStaleError, match="snapshot changed"):
+        config_module._atomic_write_windows(path, candidate, source)
+
+    assert replacement_identity is not None
+    assert (path.stat().st_dev, path.stat().st_ino) == replacement_identity
+    assert path.read_bytes() == candidate
+    assert list(tmp_path.glob(".config.toml.config-publication-*")) == []
+
+
+def test_windows_publication_recovery_preserves_unsafe_marker_staging(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(b"operator config\n")
+    path.chmod(0o600)
+    manual = tmp_path / "manual-marker"
+    manual.write_bytes(b"manual reserved-name content\n")
+    staging = tmp_path / ".config.toml.config-publication-marker-staging"
+    staging.symlink_to(manual)
+
+    with pytest.raises(config_module._UnsafeConfigPath):
+        config_module._recover_windows_publication(path)
+
+    assert staging.is_symlink()
+    assert manual.read_bytes() == b"manual reserved-name content\n"
+    assert path.read_bytes() == b"operator config\n"
+
+
+def test_config_publication_primitives_have_single_owners() -> None:
+    module = ast.parse(Path(config_module.__file__).read_text(encoding="utf-8"))
+    callers: dict[str, list[str]] = {
+        "_atomic_write_windows": [],
+        "_atomic_create_at": [],
+    }
+    for function in (
+        node
+        for node in ast.walk(module)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ):
+        for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
+            if isinstance(call.func, ast.Name) and call.func.id in callers:
+                callers[call.func.id].append(function.name)
+
+    assert callers == {
+        "_atomic_write_windows": ["_publish_config_mutation"],
+        "_atomic_create_at": ["initialize_config"],
+    }
 
 
 def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
@@ -353,6 +703,7 @@ def test_windows_settings_and_watchlist_mutations_avoid_posix_only_apis(
     real_open = os.open
     real_replace = os.replace
     real_fsync = os.fsync
+    flushed: list[Path] = []
 
     def windows_open(name, flags, mode=0o777, *, dir_fd=None):
         assert dir_fd is None, "Windows mutation used a dir_fd-relative open"
@@ -376,6 +727,23 @@ def test_windows_settings_and_watchlist_mutations_avoid_posix_only_apis(
         def __getattr__(self, name: str):
             return getattr(os, name)
 
+    def replace_file(target: Path, replacement: Path, backup: Path) -> None:
+        real_replace(target, backup)
+        real_replace(replacement, target)
+
+    def move_file(source: Path, destination: Path, *, replace: bool) -> None:
+        if replace:
+            real_replace(source, destination)
+        else:
+            os.rename(source, destination)
+
+    monkeypatch.setattr(config_module, "_windows_replace_file", replace_file)
+    monkeypatch.setattr(config_module, "_windows_move_file", move_file)
+    monkeypatch.setattr(
+        config_module,
+        "_windows_flush_parent",
+        lambda parent: flushed.append(parent),
+    )
     monkeypatch.setattr(config_module, "os", WindowsOsProxy())
 
     updated = update_settings(path, {"poll_interval_minutes": 45})
@@ -386,6 +754,8 @@ def test_windows_settings_and_watchlist_mutations_avoid_posix_only_apis(
     assert added.email == "new@example.com"
     assert removed == added
     assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+    assert flushed
+    assert set(flushed) == {tmp_path}
 
     original = path.read_bytes()
     os.link(path, tmp_path / "second-link.toml")

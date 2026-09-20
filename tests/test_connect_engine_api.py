@@ -44,6 +44,7 @@ notifications_enabled = false
 ''',
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def api_request(config_path: Path, operation: str, payload: dict[str, object] | None = None):

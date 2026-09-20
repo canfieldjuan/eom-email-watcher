@@ -1028,6 +1028,9 @@ def _read_admission_config_under_lock(
     path: Path,
 ) -> tuple[Path, os.stat_result, bytes]:
     if os.name != "posix":
+        recovery = _recover_windows_publication(path)
+        if recovery == "manual_target":
+            raise _UnsafeConfigPath
         return _read_admission_config(path)
     absolute, parent_fd, name = _open_safe_parent(path)
     try:
@@ -3244,6 +3247,8 @@ def _is_safe_windows_file_stat(file_stat: os.stat_result) -> bool:
 def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
     try:
         inspected = os.lstat(path)
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise _UnsafeConfigPath from exc
     if not _is_safe_windows_file_stat(inspected):
@@ -3272,6 +3277,354 @@ def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
         os.close(file_fd)
 
 
+_WINDOWS_PUBLICATION_VERSION = 1
+_WINDOWS_PUBLICATION_SUFFIX = ".config-publication-transaction"
+_WINDOWS_MARKER_STAGING_SUFFIX = ".config-publication-marker-staging"
+_WINDOWS_CANDIDATE_PREFIX = ".config-publication-candidate-"
+_WINDOWS_BACKUP_PREFIX = ".config-publication-backup-"
+
+
+def _windows_publication_descriptor(
+    file_stat: os.stat_result,
+    content: bytes,
+) -> dict[str, object]:
+    return {
+        "identity": list(_windows_replacement_identity(file_stat)),
+        "revision": _revision(content),
+    }
+
+
+def _valid_windows_publication_descriptor(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"identity", "revision"}:
+        return False
+    identity = value["identity"]
+    revision = value["revision"]
+    return (
+        isinstance(identity, list)
+        and len(identity) == 6
+        and all(type(item) is int and item >= 0 for item in identity)
+        and isinstance(revision, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+    )
+
+
+def _windows_candidate_descriptor(
+    content: bytes,
+    file_stat: os.stat_result | None = None,
+) -> dict[str, object]:
+    return {
+        "size": len(content),
+        "revision": _revision(content),
+        "identity": (
+            list(_windows_replacement_identity(file_stat))
+            if file_stat is not None
+            else None
+        ),
+    }
+
+
+def _valid_windows_candidate_descriptor(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"size", "revision", "identity"}:
+        return False
+    identity = value["identity"]
+    return (
+        type(value["size"]) is int
+        and value["size"] >= 0
+        and isinstance(value["revision"], str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", value["revision"]) is not None
+        and (
+            identity is None
+            or isinstance(identity, list)
+            and len(identity) == 6
+            and all(type(item) is int and item >= 0 for item in identity)
+        )
+    )
+
+
+def _windows_publication_matches(
+    snapshot: tuple[os.stat_result, bytes] | None,
+    expected: object,
+) -> bool:
+    return (
+        snapshot is not None
+        and _valid_windows_publication_descriptor(expected)
+        and _windows_publication_descriptor(*snapshot) == expected
+    )
+
+
+def _windows_candidate_matches(
+    snapshot: tuple[os.stat_result, bytes] | None,
+    expected: object,
+) -> bool:
+    if snapshot is None or not _valid_windows_candidate_descriptor(expected):
+        return False
+    file_stat, content = snapshot
+    if len(content) != expected["size"] or _revision(content) != expected["revision"]:
+        return False
+    identity = expected["identity"]
+    return identity is None or list(_windows_replacement_identity(file_stat)) == identity
+
+
+def _windows_publication_marker_bytes(
+    candidate_name: str,
+    backup_name: str,
+    expected: dict[str, object],
+    candidate: dict[str, object],
+) -> bytes:
+    payload = {
+        "version": _WINDOWS_PUBLICATION_VERSION,
+        "candidate_name": candidate_name,
+        "backup_name": backup_name,
+        "expected": expected,
+        "candidate": candidate,
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _parse_windows_publication_marker(path: Path, content: bytes) -> dict[str, object]:
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _UnsafeConfigPath from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload)
+        != {"version", "candidate_name", "backup_name", "expected", "candidate"}
+        or payload["version"] != _WINDOWS_PUBLICATION_VERSION
+        or not isinstance(payload["candidate_name"], str)
+        or not payload["candidate_name"].startswith(
+            f".{path.name}{_WINDOWS_CANDIDATE_PREFIX}"
+        )
+        or not isinstance(payload["backup_name"], str)
+        or not payload["backup_name"].startswith(f".{path.name}{_WINDOWS_BACKUP_PREFIX}")
+        or Path(payload["candidate_name"]).name != payload["candidate_name"]
+        or Path(payload["backup_name"]).name != payload["backup_name"]
+        or payload["candidate_name"] == payload["backup_name"]
+        or not _valid_windows_publication_descriptor(payload["expected"])
+        or not _valid_windows_candidate_descriptor(payload["candidate"])
+    ):
+        raise _UnsafeConfigPath
+    return payload
+
+
+def _read_optional_safe_windows_file(
+    path: Path,
+) -> tuple[os.stat_result, bytes] | None:
+    try:
+        return _read_safe_windows_file(path)
+    except FileNotFoundError:
+        return None
+
+
+def _write_private_windows_file(path: Path, content: bytes) -> tuple[os.stat_result, bytes]:
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        os.chmod(path, 0o600)
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(file_fd, remaining)
+            if written <= 0:
+                raise OSError("publication write did not make progress")
+            remaining = remaining[written:]
+        os.fsync(file_fd)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+    snapshot = _read_safe_windows_file(path)
+    if snapshot[1] != content:
+        raise _UnsafeConfigPath
+    return snapshot
+
+
+def _windows_replace_file(target: Path, replacement: Path, backup: Path) -> None:
+    if os.name != "nt":
+        os.replace(target, backup)
+        os.replace(replacement, target)
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    replace_file = kernel32.ReplaceFileW
+    replace_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    replace_file.restype = ctypes.c_int
+    if not replace_file(
+        str(target),
+        str(replacement),
+        str(backup),
+        0,
+        None,
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_move_file(source: Path, destination: Path, *, replace: bool) -> None:
+    if os.name != "nt":
+        if replace:
+            os.replace(source, destination)
+        else:
+            os.rename(source, destination)
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move_file = kernel32.MoveFileExW
+    move_file.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    move_file.restype = ctypes.c_int
+    flags = 0x00000008 | (0x00000001 if replace else 0)
+    if not move_file(str(source), str(destination), flags):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_flush_parent(parent: Path) -> None:
+    if os.name != "nt":
+        parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return
+    # Windows has no documented directory FlushFileBuffers contract. File
+    # contents are flushed before publication, durable renames use
+    # MoveFileExW, and every metadata transition remains replayable.
+
+
+def _unlink_matching_windows_file(path: Path, expected: object) -> None:
+    snapshot = _read_optional_safe_windows_file(path)
+    if snapshot is None:
+        return
+    if not _windows_publication_matches(snapshot, expected):
+        raise _UnsafeConfigPath
+    os.unlink(path)
+
+
+def _unlink_matching_windows_candidate(path: Path, expected: object) -> None:
+    snapshot = _read_optional_safe_windows_file(path)
+    if snapshot is None:
+        return
+    if not _windows_candidate_matches(snapshot, expected):
+        raise _UnsafeConfigPath
+    os.unlink(path)
+
+
+def _unlink_owned_windows_candidate(path: Path) -> None:
+    if _read_optional_safe_windows_file(path) is not None:
+        os.unlink(path)
+
+
+def _recover_windows_publication(path: Path) -> Literal[
+    "none", "aborted", "committed", "manual_target"
+]:
+    marker_path = path.parent / f".{path.name}{_WINDOWS_PUBLICATION_SUFFIX}"
+    staging_path = path.parent / f".{path.name}{_WINDOWS_MARKER_STAGING_SUFFIX}"
+    marker_snapshot = _read_optional_safe_windows_file(marker_path)
+    if marker_snapshot is None:
+        staging_snapshot = _read_optional_safe_windows_file(staging_path)
+        if staging_snapshot is not None:
+            os.unlink(staging_path)
+            _windows_flush_parent(path.parent)
+            return "aborted"
+        return "none"
+    if _read_optional_safe_windows_file(staging_path) is not None:
+        _unlink_owned_windows_candidate(staging_path)
+        _windows_flush_parent(path.parent)
+    marker_stat, marker_content = marker_snapshot
+    marker = _parse_windows_publication_marker(path, marker_content)
+    marker_descriptor = _windows_publication_descriptor(marker_stat, marker_content)
+    candidate_path = path.parent / str(marker["candidate_name"])
+    backup_path = path.parent / str(marker["backup_name"])
+    try:
+        target = _read_optional_safe_windows_file(path)
+    except _UnsafeConfigPath:
+        target = None
+        target_is_manual = path.exists() or path.is_symlink()
+    else:
+        target_is_manual = target is not None and not _windows_publication_matches(
+            target, marker["expected"]
+        ) and not _windows_candidate_matches(target, marker["candidate"])
+    candidate = _read_optional_safe_windows_file(candidate_path)
+    try:
+        backup = _read_optional_safe_windows_file(backup_path)
+    except _UnsafeConfigPath:
+        backup = None
+        backup_exists = backup_path.exists() or backup_path.is_symlink()
+    else:
+        backup_exists = backup is not None
+
+    target_is_expected = _windows_publication_matches(target, marker["expected"])
+    target_is_candidate = _windows_candidate_matches(target, marker["candidate"])
+    candidate_is_candidate = _windows_candidate_matches(candidate, marker["candidate"])
+    backup_is_expected = _windows_publication_matches(backup, marker["expected"])
+
+    if target_is_expected and not backup_exists:
+        if candidate is not None:
+            _unlink_owned_windows_candidate(candidate_path)
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "aborted"
+
+    if target_is_candidate and backup_is_expected:
+        _unlink_matching_windows_file(backup_path, marker["expected"])
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "committed"
+
+    if target_is_candidate and not backup_exists:
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "committed"
+
+    if target_is_candidate and backup_exists:
+        if candidate is not None:
+            raise _UnsafeConfigPath
+        _windows_move_file(backup_path, path, replace=True)
+        try:
+            restored_target = _read_optional_safe_windows_file(path)
+        except _UnsafeConfigPath:
+            restored_target = None
+            restored_manual_exists = path.exists() or path.is_symlink()
+        else:
+            restored_manual_exists = restored_target is not None
+        if not restored_manual_exists or _windows_candidate_matches(
+            restored_target, marker["candidate"]
+        ):
+            raise _UnsafeConfigPath
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "manual_target"
+
+    if target_is_manual and candidate_is_candidate and not backup_exists:
+        _unlink_matching_windows_candidate(candidate_path, marker["candidate"])
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "manual_target"
+
+    if target_is_manual and candidate is None and not backup_exists:
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "manual_target"
+
+    if target_is_manual and candidate is None and backup_is_expected:
+        _unlink_matching_windows_file(backup_path, marker["expected"])
+        _unlink_matching_windows_file(marker_path, marker_descriptor)
+        _windows_flush_parent(path.parent)
+        return "manual_target"
+
+    raise _UnsafeConfigPath
+
+
 def _atomic_write_windows(
     path: Path,
     content: bytes,
@@ -3283,36 +3636,67 @@ def _atomic_write_windows(
         or int(getattr(parent_stat, "st_file_attributes", 0)) & 0x400
     ):
         raise _UnsafeConfigPath
+    recovery = _recover_windows_publication(path)
+    if recovery == "manual_target":
+        raise ConfigAdmissionStaleError("Configuration admission snapshot changed")
     _verify_config_mutation_source(source)
-    temporary = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
-    temporary_fd: int | None = None
-    temporary_identity: tuple[int, int] | None = None
-    replaced = False
+    token = secrets.token_hex(16)
+    candidate = path.parent / f".{path.name}{_WINDOWS_CANDIDATE_PREFIX}{token}"
+    backup = path.parent / f".{path.name}{_WINDOWS_BACKUP_PREFIX}{token}"
+    marker = path.parent / f".{path.name}{_WINDOWS_PUBLICATION_SUFFIX}"
+    marker_staging = path.parent / f".{path.name}{_WINDOWS_MARKER_STAGING_SUFFIX}"
+    candidate_descriptor = _windows_candidate_descriptor(content)
+    marker_descriptor: dict[str, object] | None = None
     try:
-        temporary_fd = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            0o600,
+        marker_content = _windows_publication_marker_bytes(
+            candidate.name,
+            backup.name,
+            _windows_publication_descriptor(source.identity, source.content),
+            candidate_descriptor,
         )
-        temporary_identity = _safe_file_identity(os.fstat(temporary_fd))
-        remaining = memoryview(content)
-        while remaining:
-            written = os.write(temporary_fd, remaining)
-            if written <= 0:
-                raise OSError("candidate write did not make progress")
-            remaining = remaining[written:]
-        os.fsync(temporary_fd)
-        os.close(temporary_fd)
-        temporary_fd = None
-        os.chmod(temporary, 0o600)
-        candidate_stat, candidate_content = _read_safe_windows_file(temporary)
-        if candidate_content != content:
+        marker_snapshot = _write_private_windows_file(marker_staging, marker_content)
+        marker_descriptor = _windows_publication_descriptor(*marker_snapshot)
+        _windows_flush_parent(path.parent)
+        _config_mutation_probe("after_windows_marker_staged", path)
+        _windows_move_file(marker_staging, marker, replace=False)
+        marker_snapshot = _read_safe_windows_file(marker)
+        if not _windows_publication_matches(marker_snapshot, marker_descriptor):
             raise _UnsafeConfigPath
-        _verify_config_mutation_source(source)
+        _windows_flush_parent(path.parent)
+        _config_mutation_probe("after_windows_marker_durable", path)
+        candidate_snapshot = _write_private_windows_file(candidate, content)
+        if not _windows_candidate_matches(candidate_snapshot, candidate_descriptor):
+            raise _UnsafeConfigPath
+        _windows_flush_parent(path.parent)
+        candidate_descriptor = _windows_candidate_descriptor(
+            content,
+            candidate_snapshot[0],
+        )
+        ready_marker_content = _windows_publication_marker_bytes(
+            candidate.name,
+            backup.name,
+            _windows_publication_descriptor(source.identity, source.content),
+            candidate_descriptor,
+        )
+        ready_marker_snapshot = _write_private_windows_file(
+            marker_staging,
+            ready_marker_content,
+        )
+        ready_marker_descriptor = _windows_publication_descriptor(
+            *ready_marker_snapshot
+        )
+        _windows_flush_parent(path.parent)
+        _config_mutation_probe("after_windows_ready_marker_staged", path)
+        _windows_move_file(marker_staging, marker, replace=True)
+        marker_snapshot = _read_safe_windows_file(marker)
+        if not _windows_publication_matches(
+            marker_snapshot,
+            ready_marker_descriptor,
+        ):
+            raise _UnsafeConfigPath
+        marker_descriptor = ready_marker_descriptor
+        _windows_flush_parent(path.parent)
+        _config_mutation_probe("after_windows_candidate_durable", path)
         current_parent = os.lstat(path.parent)
         if (
             not stat.S_ISDIR(current_parent.st_mode)
@@ -3320,21 +3704,32 @@ def _atomic_write_windows(
             or int(getattr(current_parent, "st_file_attributes", 0)) & 0x400
         ):
             raise _UnsafeConfigPath
-        os.replace(temporary, path)
-        replaced = True
-        installed_stat, installed_content = _read_safe_windows_file(path)
-        if installed_content != content or _windows_replacement_identity(
-            installed_stat
-        ) != _windows_replacement_identity(candidate_stat):
-            raise _PostReplaceDurabilityError
+        _windows_replace_file(path, candidate, backup)
+        _config_mutation_probe("after_windows_replace", path)
+        disposition = _recover_windows_publication(path)
+        if disposition == "committed":
+            return
+        if disposition == "manual_target":
+            raise ConfigAdmissionStaleError("Configuration admission snapshot changed")
+        raise _PostReplaceDurabilityError
+    except ConfigAdmissionStaleError:
+        raise
+    except Exception as exc:
+        try:
+            disposition = _recover_windows_publication(path)
+        except (_UnsafeConfigPath, OSError) as recovery_error:
+            raise _PostReplaceDurabilityError from recovery_error
+        if disposition == "committed":
+            return
+        if disposition == "manual_target":
+            raise ConfigAdmissionStaleError(
+                "Configuration admission snapshot changed"
+            ) from exc
+        raise
     finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        if not replaced:
-            with suppress(OSError):
-                current = os.lstat(temporary)
-                if _safe_file_identity(current) == temporary_identity:
-                    os.unlink(temporary)
+        if marker_descriptor is None:
+            with suppress(OSError, _UnsafeConfigPath):
+                _unlink_matching_windows_candidate(candidate, candidate_descriptor)
 
 
 def _publish_config_mutation(source: _ConfigMutationSource, content: bytes) -> None:
@@ -3404,67 +3799,41 @@ def _unlink_exact_at(parent_fd: int, name: str, identity: tuple[int, int]) -> No
         pass
 
 
-def _atomic_create_at(parent_fd: int, name: str, content: bytes) -> tuple[int, int]:
-    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
-    temporary_fd: int | None = None
-    temporary_identity: tuple[int, int] | None = None
-    linked = False
+def _atomic_create_at(
+    parent_fd: int,
+    parent: _HeldParent,
+    name: str,
+    content: bytes,
+) -> tuple[int, int]:
+    candidate_fd: int | None = None
+    candidate_identity: tuple[int, int] | None = None
+    published = False
     try:
-        temporary_fd = os.open(
-            temporary_name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=parent_fd,
+        candidate_fd, candidate_stat = _prepare_unnamed_candidate_at(
+            parent_fd,
+            parent,
+            content,
         )
-        temporary_stat = os.fstat(temporary_fd)
-        temporary_identity = _safe_file_identity(temporary_stat)
-        if not _is_safe_file_stat(temporary_stat):
-            raise _UnsafeConfigPath
-        remaining = memoryview(content)
-        while remaining:
-            written = os.write(temporary_fd, remaining)
-            if written <= 0:
-                raise OSError("configuration initialization write did not make progress")
-            remaining = remaining[written:]
-        os.fsync(temporary_fd)
-        os.link(
-            temporary_name,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-            follow_symlinks=False,
-        )
-        linked = True
+        candidate_identity = _safe_file_identity(candidate_stat)
+        _initialization_probe("before_publish")
+        _validate_held_parent(parent_fd, parent)
+        try:
+            _link_unnamed_candidate_at(candidate_fd, parent_fd, name)
+        except FileExistsError as exc:
+            raise ConfigAlreadyExistsError("Configuration already exists") from exc
+        published = True
+        _initialization_probe("after_publish")
+        _validate_held_parent(parent_fd, parent)
         os.fsync(parent_fd)
-        return temporary_identity
-    except FileExistsError as exc:
-        raise ConfigAlreadyExistsError("Configuration already exists") from exc
+        _initialization_probe("after_publish_durable")
+        return candidate_identity
     except Exception:
-        if linked and temporary_identity is not None:
-            _unlink_exact_at(parent_fd, name, temporary_identity)
+        if published and candidate_identity is not None:
+            _unlink_exact_at(parent_fd, name, candidate_identity)
         raise
     finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        try:
-            current = os.stat(
-                temporary_name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except OSError:
-            current = None
-        if (
-            current is not None
-            and temporary_identity is not None
-            and _safe_file_identity(current) == temporary_identity
-        ):
-            with suppress(OSError):
-                os.unlink(temporary_name, dir_fd=parent_fd)
+        if candidate_fd is not None:
+            os.close(candidate_fd)
 
 
 def initialize_config(
@@ -3521,7 +3890,7 @@ def initialize_config(
             )
             _initialization_probe("before_create")
             _validate_held_parent(parent_fd, held_parent)
-            created_identity = _atomic_create_at(parent_fd, name, content)
+            created_identity = _atomic_create_at(parent_fd, held_parent, name, content)
             try:
                 _validate_held_parent(parent_fd, held_parent)
                 file_fd, file_stat, written = _read_safe_file_at(parent_fd, name)
