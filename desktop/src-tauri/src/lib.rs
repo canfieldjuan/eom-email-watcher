@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 #[cfg(desktop)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -251,6 +251,7 @@ struct RevealedCapabilityOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AdmissionState {
     Inspecting,
+    Mutating,
     Missing,
     AwaitingAcknowledgement { expected_revision: String },
     ManualRepairRequired,
@@ -284,7 +285,7 @@ type AdmissionEventSink = Arc<dyn Fn(ConfigAdmissionUpdate) + Send + Sync + 'sta
 impl AdmissionState {
     fn public_status(&self) -> ConfigAdmissionStatus {
         match self {
-            Self::Inspecting | Self::ManualRepairRequired => {
+            Self::Inspecting | Self::Mutating | Self::ManualRepairRequired => {
                 ConfigAdmissionStatus::ManualRepairRequired
             }
             Self::Missing => ConfigAdmissionStatus::Missing,
@@ -529,14 +530,6 @@ impl AdmissionWorkerSet for AdmissionWorkers {
     }
 }
 
-impl AdmissionWorkers {
-    fn replace_admission_token(&mut self, token: AdmissionToken) {
-        self.admission_engine
-            .install_admission_binding(token.clone(), Arc::clone(&self.observer));
-        self.admission_token = token;
-    }
-}
-
 impl AdmissionWorkerSet for () {
     fn activate(&self) {}
 }
@@ -561,6 +554,32 @@ struct AdmissionInner<W> {
     state: AdmissionState,
     workers: Option<W>,
     generation: u64,
+    active_effects: usize,
+}
+
+struct AdmissionPermit<W: AdmissionWorkerSet> {
+    inner: Arc<Mutex<AdmissionInner<W>>>,
+    effects_quiesced: Arc<Condvar>,
+}
+
+impl<W: AdmissionWorkerSet> std::fmt::Debug for AdmissionPermit<W> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AdmissionPermit")
+    }
+}
+
+impl<W: AdmissionWorkerSet> Drop for AdmissionPermit<W> {
+    fn drop(&mut self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(inner.active_effects > 0);
+        inner.active_effects = inner.active_effects.saturating_sub(1);
+        if inner.active_effects == 0 {
+            self.effects_quiesced.notify_all();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -650,6 +669,7 @@ impl<W: AdmissionWorkerSet> Drop for AdmissionRevocationSupervisor<W> {
 struct AdmissionCoordinator<W: AdmissionWorkerSet = AdmissionWorkers> {
     inner: Arc<Mutex<AdmissionInner<W>>>,
     supervisor: Arc<AdmissionRevocationSupervisor<W>>,
+    effects_quiesced: Arc<Condvar>,
 }
 
 impl<W: AdmissionWorkerSet> Clone for AdmissionCoordinator<W> {
@@ -657,6 +677,7 @@ impl<W: AdmissionWorkerSet> Clone for AdmissionCoordinator<W> {
         Self {
             inner: Arc::clone(&self.inner),
             supervisor: Arc::clone(&self.supervisor),
+            effects_quiesced: Arc::clone(&self.effects_quiesced),
         }
     }
 }
@@ -675,20 +696,28 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
                 state: AdmissionState::Inspecting,
                 workers: None,
                 generation: 0,
+                active_effects: 0,
             })),
             supervisor,
+            effects_quiesced: Arc::new(Condvar::new()),
         })
     }
 
-    fn require_admitted(&self) -> Result<(), EngineError> {
-        let inner = self.inner.lock().map_err(|_| {
+    fn require_admitted(&self) -> Result<AdmissionPermit<W>, EngineError> {
+        let mut inner = self.inner.lock().map_err(|_| {
             EngineError::host(
                 "configuration_not_admitted",
                 "Watcher configuration is not admitted",
             )
         })?;
         if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
-            Ok(())
+            inner.active_effects = inner.active_effects.checked_add(1).ok_or_else(|| {
+                EngineError::host("host_error", "Watcher command admission is unavailable")
+            })?;
+            Ok(AdmissionPermit {
+                inner: Arc::clone(&self.inner),
+                effects_quiesced: Arc::clone(&self.effects_quiesced),
+            })
         } else {
             Err(EngineError::host(
                 "configuration_not_admitted",
@@ -777,6 +806,145 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         })
     }
 
+    fn fail_config_mutation(&self, expected_generation: u64) -> Result<(), EngineError> {
+        let update = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.generation != expected_generation
+                || inner.state != AdmissionState::Mutating
+                || inner.workers.is_some()
+            {
+                return Err(EngineError::host(
+                    "configuration_not_admitted",
+                    "Watcher configuration is not admitted",
+                ));
+            }
+            Self::next_generation(&mut inner)?;
+            inner.state = AdmissionState::ManualRepairRequired;
+            ConfigAdmissionUpdate {
+                generation: inner.generation,
+                status: ConfigAdmissionStatus::ManualRepairRequired,
+            }
+        };
+        self.supervisor.emit(update);
+        Ok(())
+    }
+
+    fn activate_mutation_workers(
+        &self,
+        expected_generation: u64,
+        staged: W,
+    ) -> Result<(), EngineError> {
+        staged.revalidate()?;
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.generation != expected_generation
+            || inner.state != AdmissionState::Mutating
+            || inner.workers.is_some()
+        {
+            return Err(EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            ));
+        }
+        Self::next_generation(&mut inner)?;
+        inner.state = AdmissionState::Admitted;
+        inner.workers = Some(staged);
+        inner
+            .workers
+            .as_ref()
+            .expect("new admission workers installed")
+            .activate();
+        let update = ConfigAdmissionUpdate {
+            generation: inner.generation,
+            status: ConfigAdmissionStatus::Admitted,
+        };
+        drop(inner);
+        self.supervisor.emit(update);
+        Ok(())
+    }
+
+    fn mutate_with<T>(
+        &self,
+        mutate: impl FnOnce() -> Result<T, EngineError>,
+        restage: impl FnOnce() -> Result<W, EngineError>,
+    ) -> Result<T, EngineError> {
+        let (workers, generation, prior_token) = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.state != AdmissionState::Admitted || inner.workers.is_none() {
+                return Err(EngineError::host(
+                    "configuration_not_admitted",
+                    "Watcher configuration is not admitted",
+                ));
+            }
+            inner.state = AdmissionState::Mutating;
+            let workers = inner
+                .workers
+                .take()
+                .expect("admitted workers checked above");
+            let prior_token = workers.admission_token().cloned();
+            workers.begin_revocation();
+            (workers, inner.generation, prior_token)
+        };
+
+        drop(workers);
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        while inner.active_effects != 0 {
+            inner = self.effects_quiesced.wait(inner).map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+        }
+        if inner.generation != generation
+            || inner.state != AdmissionState::Mutating
+            || inner.workers.is_some()
+        {
+            return Err(EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            ));
+        }
+        drop(inner);
+        let value = match mutate() {
+            Ok(value) => value,
+            Err(error) => {
+                let recovery = restage().and_then(|staged| {
+                    if prior_token.as_ref() != staged.admission_token() {
+                        return Err(EngineError::host(
+                            "conflict",
+                            "Watcher configuration changed during config mutation",
+                        ));
+                    }
+                    self.activate_mutation_workers(generation, staged)
+                });
+                return match recovery {
+                    Ok(()) => Err(error),
+                    Err(recovery_error) => {
+                        self.fail_config_mutation(generation)?;
+                        Err(recovery_error)
+                    }
+                };
+            }
+        };
+        let staged = match restage() {
+            Ok(staged) => staged,
+            Err(error) => {
+                self.fail_config_mutation(generation)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.activate_mutation_workers(generation, staged) {
+            self.fail_config_mutation(generation)?;
+            return Err(error);
+        }
+        Ok(value)
+    }
+
     fn install_attempt(
         inner: &mut AdmissionInner<W>,
         mut attempt: AdmissionAttempt<W>,
@@ -818,6 +986,12 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
             let mut inner = self.inner.lock().map_err(|_| {
                 EngineError::host("host_error", "Configuration admission coordinator stopped")
             })?;
+            if inner.state == AdmissionState::Mutating {
+                return Ok(AdmissionTransition {
+                    status: ConfigAdmissionStatus::ManualRepairRequired,
+                    generation: inner.generation,
+                });
+            }
             if inner.state == AdmissionState::Admitted
                 && let Some(workers) = inner.workers.as_ref()
             {
@@ -1020,38 +1194,18 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         Ok(update)
     }
 
-    fn renew_after_config_mutation(&self, engine: &Engine) -> Result<(), EngineError> {
-        let mut inner = self.inner.lock().map_err(|_| {
-            EngineError::host("host_error", "Configuration admission coordinator stopped")
-        })?;
-        if inner.state != AdmissionState::Admitted || inner.workers.is_none() {
-            return Err(EngineError::host(
-                "configuration_not_admitted",
-                "Watcher configuration is not admitted",
-            ));
-        }
-        let renewed = engine.admission_snapshot().and_then(|snapshot| {
-            engine.compare_admission(&snapshot.token)?;
-            Ok(snapshot.token)
-        });
-        match renewed {
-            Ok(token) => {
-                inner
-                    .workers
-                    .as_mut()
-                    .expect("admitted workers checked above")
-                    .replace_admission_token(token);
-                Ok(())
-            }
-            Err(error) => {
-                let cleanup = Self::take_for_revocation(&mut inner);
-                drop(inner);
-                if let Some(cleanup) = cleanup {
-                    Self::enqueue_cleanup(&self.inner, &self.supervisor, cleanup);
-                }
-                Err(error)
-            }
-        }
+    fn mutate_config<T>(
+        &self,
+        app: &AppHandle,
+        engine: &Engine,
+        delivery: &NotificationDelivery,
+        mutate: impl FnOnce(&Engine) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let observer = self.engine_error_observer();
+        self.mutate_with(
+            || mutate(engine),
+            || stage_admitted_workers(app, engine, delivery, observer),
+        )
     }
 
     fn wake_connect_queue(&self) -> Result<(), EngineError> {
@@ -1150,7 +1304,7 @@ async fn inbox_query(
     admission: State<'_, AdmissionCoordinator>,
     query: InboxQuery,
 ) -> Result<InboxPage, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.query_inbox(query))
         .await
@@ -1164,7 +1318,7 @@ async fn inbox_delete(
     admission: State<'_, AdmissionCoordinator>,
     message_id: String,
 ) -> Result<(), EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1180,7 +1334,7 @@ async fn inbox_clear(
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<u64, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1196,7 +1350,7 @@ async fn analysis_requeue(
     admission: State<'_, AdmissionCoordinator>,
     message_id: String,
 ) -> Result<(), EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.requeue_analysis(message_id))
         .await
@@ -1212,7 +1366,7 @@ async fn attachment_open(
     message_id: String,
     part_id: String,
 ) -> Result<OpenedAttachment, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let destination = exports.path().to_path_buf();
     let exported = tauri::async_runtime::spawn_blocking(move || {
@@ -1241,7 +1395,7 @@ async fn attachment_capabilities(
     message_id: String,
     part_id: String,
 ) -> Result<ConnectCapabilities, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.attachment_capabilities(message_id, part_id)
@@ -1264,7 +1418,7 @@ async fn attachment_capability_invoke(
     parameters: BTreeMap<String, Value>,
     confirmed: bool,
 ) -> Result<ConnectInvocationResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         engine.invoke_attachment_capability(
@@ -1286,7 +1440,7 @@ async fn capability_output_present(
     job_id: String,
     artifact_id: String,
 ) -> Result<ConnectOutputView, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.present_capability_output(message_id, part_id, job_id, artifact_id)
@@ -1308,7 +1462,7 @@ async fn capability_output_export(
     job_id: String,
     artifact_id: String,
 ) -> Result<RevealedCapabilityOutput, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let destination = std::fs::canonicalize(exports.path()).map_err(|_| {
         EngineError::host("export_failed", "Desktop export directory is unavailable")
@@ -1356,7 +1510,7 @@ async fn health_get(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<DesktopHealthStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let polling = admission.polling_status()?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -1373,7 +1527,7 @@ async fn connect_entitlement_status(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<ConnectEntitlementStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.connect_entitlement_status())
         .await
@@ -1396,7 +1550,7 @@ async fn connect_entitlement_install(
     admission: State<'_, AdmissionCoordinator>,
     source_path: String,
 ) -> Result<ConnectEntitlementStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         engine.install_connect_entitlement(PathBuf::from(source_path))
@@ -1416,7 +1570,7 @@ async fn calendar_consent_status(
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.calendar_consent_status(profile, provider, account_id)
@@ -1433,7 +1587,7 @@ async fn calendar_consent_connect(
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.connect_calendar_consent(profile, provider, account_id)
@@ -1450,7 +1604,7 @@ async fn calendar_consent_disconnect(
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.disconnect_calendar_consent(profile, provider, account_id)
@@ -1471,7 +1625,7 @@ async fn calendar_proposal_decide(
     proposal_sha256: String,
     decision: String,
 ) -> Result<CalendarDecisionResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.decide_calendar_proposal(
@@ -1492,7 +1646,7 @@ async fn gmail_authorize(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<GmailAuthorization, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
         .await
@@ -1504,7 +1658,7 @@ async fn mail_accounts_list(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<MailAccounts, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.mail_accounts())
         .await
@@ -1518,7 +1672,7 @@ async fn mail_account_connect(
     provider: String,
     connection: Option<MailServerConnection>,
 ) -> Result<MailAccountResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.connect_mail_provider(provider, connection))
         .await
@@ -1533,7 +1687,7 @@ async fn mail_account_reconnect(
     account_id: String,
     connection: Option<MailServerConnection>,
 ) -> Result<MailAccountResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.reconnect_mail_account(provider, account_id, connection)
@@ -1549,7 +1703,7 @@ async fn mail_account_disconnect(
     provider: String,
     account_id: String,
 ) -> Result<MailAccountResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.disconnect_mail_account(provider, account_id)
@@ -1565,7 +1719,7 @@ async fn mail_account_activate(
     provider: String,
     account_id: String,
 ) -> Result<MailAccountResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.activate_mail_account(provider, account_id))
         .await
@@ -1577,7 +1731,7 @@ async fn settings_get(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<EngineSettings, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.settings())
         .await
@@ -1588,6 +1742,7 @@ async fn settings_get(
 // Tauri deserializes these named fields directly from the frozen frontend command.
 #[allow(clippy::too_many_arguments)]
 async fn settings_update(
+    app: AppHandle,
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
@@ -1597,22 +1752,21 @@ async fn settings_update(
     model_base_url: Option<String>,
     model_name: Option<String>,
 ) -> Result<EngineSettings, EngineError> {
-    admission.require_admitted()?;
     let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let settings = delivery.run_engine_exclusive(&engine, |engine| {
-            engine.update_settings(
-                poll_interval_minutes,
-                retention_days,
-                notifications_enabled,
-                model_base_url,
-                model_name,
-            )
-        })?;
-        admission.renew_after_config_mutation(&engine)?;
-        Ok(settings)
+        admission.mutate_config(&app, &engine, &delivery, |engine| {
+            delivery.run_engine_exclusive(engine, |engine| {
+                engine.update_settings(
+                    poll_interval_minutes,
+                    retention_days,
+                    notifications_enabled,
+                    model_base_url,
+                    model_name,
+                )
+            })
+        })
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -1624,7 +1778,7 @@ async fn watcher_check(
     delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<DesktopCheckResult, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1647,7 +1801,7 @@ async fn watchlist_list(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
 ) -> Result<Vec<WatchedSender>, EngineError> {
-    admission.require_admitted()?;
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.list())
         .await
@@ -1656,18 +1810,18 @@ async fn watchlist_list(
 
 #[tauri::command]
 async fn watchlist_add(
+    app: AppHandle,
     engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
     email: String,
     name: Option<String>,
 ) -> Result<WatchedSender, EngineError> {
-    admission.require_admitted()?;
     let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let sender = engine.add(email, name)?;
-        admission.renew_after_config_mutation(&engine)?;
-        Ok(sender)
+        admission.mutate_config(&app, &engine, &delivery, |engine| engine.add(email, name))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -1675,17 +1829,17 @@ async fn watchlist_add(
 
 #[tauri::command]
 async fn watchlist_remove(
+    app: AppHandle,
     engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
     admission: State<'_, AdmissionCoordinator>,
     email: String,
 ) -> Result<WatchedSender, EngineError> {
-    admission.require_admitted()?;
     let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let sender = engine.remove(email)?;
-        admission.renew_after_config_mutation(&engine)?;
-        Ok(sender)
+        admission.mutate_config(&app, &engine, &delivery, |engine| engine.remove(email))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -2667,7 +2821,7 @@ esac"#,
             "configuration_not_admitted"
         );
         let blocked_effects = AtomicUsize::new(0);
-        let result = admission.require_admitted().map(|()| {
+        let result = admission.require_admitted().map(|_permit| {
             blocked_effects.fetch_add(1, Ordering::SeqCst);
         });
         assert!(result.is_err());
@@ -2748,7 +2902,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         assert!(
             admission
                 .require_admitted()
-                .map(|()| followup_effects.fetch_add(1, Ordering::SeqCst))
+                .map(|_permit| followup_effects.fetch_add(1, Ordering::SeqCst))
                 .is_err()
         );
         assert_eq!(followup_effects.load(Ordering::SeqCst), 0);
@@ -2992,6 +3146,475 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         assert!(event_receiver.try_recv().is_err());
         assert_eq!(held.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn config_mutation_quiesces_old_workers_before_commit_and_activates_new_token() {
+        struct RacingMutationWorkers {
+            token: AdmissionToken,
+            stop: mpsc::Sender<()>,
+            worker: Option<thread::JoinHandle<()>>,
+            joined: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for RacingMutationWorkers {
+            fn admission_token(&self) -> Option<&AdmissionToken> {
+                Some(&self.token)
+            }
+
+            fn begin_revocation(&self) {
+                let _ = self.stop.send(());
+            }
+
+            fn activate(&self) {}
+        }
+
+        impl Drop for RacingMutationWorkers {
+            fn drop(&mut self) {
+                self.begin_revocation();
+                self.worker
+                    .take()
+                    .expect("mutation probe worker handle")
+                    .join()
+                    .expect("mutation probe worker joins");
+                self.joined.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn mutation_worker(
+            token: AdmissionToken,
+            observer: Option<AdmissionErrorObserver>,
+            joined: Arc<AtomicUsize>,
+            faults: Arc<AtomicUsize>,
+        ) -> RacingMutationWorkers {
+            let (stop, stopped) = mpsc::channel();
+            let worker_token = token.clone();
+            let worker = thread::Builder::new()
+                .name("old-admission-mutation-race".into())
+                .spawn(move || {
+                    stopped.recv().expect("mutation worker stop");
+                    if let Some(observer) = observer {
+                        observer(
+                            &worker_token,
+                            &EngineError::host(
+                                "conflict",
+                                "Old admission token observed config mutation",
+                            ),
+                        );
+                        faults.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .expect("spawn mutation probe worker");
+            RacingMutationWorkers {
+                token,
+                stop,
+                worker: Some(worker),
+                joined,
+            }
+        }
+
+        let old_token = probe_admission_token('5', '6');
+        let new_token = probe_admission_token('7', '8');
+        let old_joined = Arc::new(AtomicUsize::new(0));
+        let new_joined = Arc::new(AtomicUsize::new(0));
+        let faults = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission = AdmissionCoordinator::<RacingMutationWorkers>::with_event_sink(Arc::new(
+            move |event| event_sender.send(event).expect("admission event"),
+        ))
+        .expect("start revocation supervisor");
+        let observer = admission.engine_error_observer();
+        let admitted_old_token = old_token.clone();
+        let old_observer = Arc::clone(&observer);
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(mutation_worker(
+                        admitted_old_token,
+                        Some(old_observer),
+                        Arc::clone(&old_joined),
+                        Arc::clone(&faults),
+                    ))
+                },
+            )
+            .expect("admit old workers");
+        let admitted = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let replacement_token = new_token.clone();
+        let result = admission.mutate_with(
+            || {
+                assert_eq!(old_joined.load(Ordering::SeqCst), 1);
+                assert_eq!(faults.load(Ordering::SeqCst), 1);
+                Ok("mutation committed")
+            },
+            || {
+                Ok(mutation_worker(
+                    replacement_token,
+                    None,
+                    Arc::clone(&new_joined),
+                    Arc::new(AtomicUsize::new(0)),
+                ))
+            },
+        );
+
+        assert_eq!(
+            result.expect("serialized mutation succeeds"),
+            "mutation committed"
+        );
+        admission
+            .require_admitted()
+            .expect("new worker generation is admitted");
+        let inner = admission.inner.lock().expect("admission state");
+        assert_eq!(inner.state, AdmissionState::Admitted);
+        assert_eq!(
+            inner
+                .workers
+                .as_ref()
+                .and_then(AdmissionWorkerSet::admission_token),
+            Some(&new_token)
+        );
+        let replacement_admitted = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement admitted event follows worker activation");
+        assert_eq!(replacement_admitted.status, ConfigAdmissionStatus::Admitted);
+        assert!(replacement_admitted.generation > admitted.generation);
+        assert_eq!(inner.generation, replacement_admitted.generation);
+        drop(inner);
+        assert!(event_receiver.try_recv().is_err());
+        drop(observer);
+        drop(admission);
+        assert_eq!(new_joined.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn config_mutation_rejection_reactivates_only_the_unchanged_token() {
+        let old_token = probe_admission_token('1', '2');
+        let held = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let restaged = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission =
+            AdmissionCoordinator::<TokenProbeWorkers>::with_event_sink(Arc::new(move |event| {
+                event_sender.send(event).expect("admission event")
+            }))
+            .expect("start revocation supervisor");
+        let admitted_old_token = old_token.clone();
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token: admitted_old_token,
+                        held: Arc::clone(&held),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("admit old workers");
+        let admitted = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let restaged_on_failure = Arc::clone(&restaged);
+        let recovery_token = old_token.clone();
+        let result: Result<(), EngineError> = admission.mutate_with(
+            || {
+                Err(EngineError::host(
+                    "invalid_request",
+                    "Config mutation was rejected",
+                ))
+            },
+            || {
+                restaged_on_failure.fetch_add(1, Ordering::SeqCst);
+                Ok(TokenProbeWorkers {
+                    token: recovery_token,
+                    held: Arc::clone(&held),
+                    drops: Arc::clone(&drops),
+                })
+            },
+        );
+
+        assert_eq!(
+            result
+                .expect_err("rejected mutation preserves its error")
+                .code,
+            "invalid_request"
+        );
+        assert_eq!(restaged.load(Ordering::SeqCst), 1);
+        assert_eq!(held.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        admission
+            .require_admitted()
+            .expect("unchanged token restores command admission");
+        let recovered = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovered admission event follows worker activation");
+        assert_eq!(recovered.status, ConfigAdmissionStatus::Admitted);
+        assert!(recovered.generation > admitted.generation);
+        let inner = admission.inner.lock().expect("admission state");
+        assert_eq!(
+            inner
+                .workers
+                .as_ref()
+                .and_then(AdmissionWorkerSet::admission_token),
+            Some(&old_token)
+        );
+    }
+
+    #[test]
+    fn config_mutation_rejection_with_changed_identity_requires_manual_repair() {
+        let old_token = probe_admission_token('5', '6');
+        let changed_token = probe_admission_token('7', '8');
+        let held = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission =
+            AdmissionCoordinator::<TokenProbeWorkers>::with_event_sink(Arc::new(move |event| {
+                event_sender.send(event).expect("admission event")
+            }))
+            .expect("start revocation supervisor");
+        let admitted_old_token = old_token;
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token: admitted_old_token,
+                        held: Arc::clone(&held),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("admit old workers");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let result: Result<(), EngineError> = admission.mutate_with(
+            || {
+                Err(EngineError::host(
+                    "invalid_request",
+                    "Config mutation was rejected",
+                ))
+            },
+            || {
+                Ok(TokenProbeWorkers {
+                    token: changed_token,
+                    held: Arc::clone(&held),
+                    drops: Arc::clone(&drops),
+                })
+            },
+        );
+
+        assert_eq!(
+            result
+                .expect_err("changed identity cannot recover rejected mutation")
+                .code,
+            "conflict"
+        );
+        assert_eq!(held.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("repair event")
+                .status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+    }
+
+    #[test]
+    fn config_mutation_snapshot_failure_keeps_committed_change_fail_closed() {
+        let token = probe_admission_token('9', 'a');
+        let held = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let committed = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission =
+            AdmissionCoordinator::<TokenProbeWorkers>::with_event_sink(Arc::new(move |event| {
+                event_sender.send(event).expect("admission event")
+            }))
+            .expect("start revocation supervisor");
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token,
+                        held: Arc::clone(&held),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("admit old workers");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let mutation_committed = Arc::clone(&committed);
+        let result = admission.mutate_with(
+            || {
+                mutation_committed.fetch_add(1, Ordering::SeqCst);
+                Ok("config committed")
+            },
+            || {
+                Err(EngineError::host(
+                    "configuration_error",
+                    "Configuration admission snapshot is unavailable",
+                ))
+            },
+        );
+
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            result
+                .expect_err("snapshot failure rejects committed mutation")
+                .code,
+            "configuration_error"
+        );
+        assert_eq!(held.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("repair event")
+                .status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+    }
+
+    #[test]
+    fn config_mutation_waits_for_active_effect_and_blocks_new_effects() {
+        struct EffectGateWorkers {
+            token: AdmissionToken,
+            held: Mutex<Option<mpsc::Sender<()>>>,
+            dropped: mpsc::Sender<String>,
+        }
+
+        impl AdmissionWorkerSet for EffectGateWorkers {
+            fn admission_token(&self) -> Option<&AdmissionToken> {
+                Some(&self.token)
+            }
+
+            fn begin_revocation(&self) {
+                if let Some(held) = self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = held.send(());
+                }
+            }
+
+            fn activate(&self) {}
+        }
+
+        impl Drop for EffectGateWorkers {
+            fn drop(&mut self) {
+                self.begin_revocation();
+                let _ = self
+                    .dropped
+                    .send(thread::current().name().unwrap_or("unnamed").to_owned());
+            }
+        }
+
+        let old_token = probe_admission_token('b', 'c');
+        let new_token = probe_admission_token('d', 'e');
+        let (held_sender, held_receiver) = mpsc::channel();
+        let (drop_sender, drop_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission =
+            AdmissionCoordinator::<EffectGateWorkers>::with_event_sink(Arc::new(move |event| {
+                event_sender.send(event).expect("admission event")
+            }))
+            .expect("start revocation supervisor");
+        let initial_drop_sender = drop_sender.clone();
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(EffectGateWorkers {
+                        token: old_token,
+                        held: Mutex::new(Some(held_sender)),
+                        dropped: initial_drop_sender,
+                    })
+                },
+            )
+            .expect("admit old workers");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+        let active_effect = admission
+            .require_admitted()
+            .expect("admitted effect starts before mutation");
+        let (commit_sender, commit_receiver) = mpsc::channel();
+        let transaction = AdmissionCoordinator::clone(&admission);
+        let replacement_drop_sender = drop_sender;
+        let transaction = thread::Builder::new()
+            .name("config-mutation-transaction".into())
+            .spawn(move || {
+                transaction.mutate_with(
+                    || {
+                        commit_sender.send(()).expect("record config mutation");
+                        Ok(())
+                    },
+                    || {
+                        let (held, _held_receiver) = mpsc::channel();
+                        Ok(EffectGateWorkers {
+                            token: new_token,
+                            held: Mutex::new(Some(held)),
+                            dropped: replacement_drop_sender,
+                        })
+                    },
+                )
+            })
+            .expect("spawn config mutation transaction");
+
+        held_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old workers held before mutation");
+        assert_eq!(
+            drop_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old workers dropped off worker thread"),
+            "config-mutation-transaction"
+        );
+        assert!(commit_receiver.try_recv().is_err());
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+
+        drop(active_effect);
+        commit_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mutation begins only after old admitted effect ends");
+        transaction
+            .join()
+            .expect("mutation transaction joins")
+            .expect("mutation transaction succeeds");
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement admitted event")
+                .status,
+            ConfigAdmissionStatus::Admitted
+        );
+        admission
+            .require_admitted()
+            .expect("new effects use the replacement generation");
     }
 
     #[test]

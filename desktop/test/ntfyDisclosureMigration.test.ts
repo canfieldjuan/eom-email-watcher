@@ -131,11 +131,8 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     "mail_account_reconnect",
     "mail_accounts_list",
     "settings_get",
-    "settings_update",
     "watcher_check",
-    "watchlist_add",
     "watchlist_list",
-    "watchlist_remove",
   ];
   for (const command of guardedCommands) {
     const start = libSource.indexOf(`async fn ${command}(`);
@@ -143,7 +140,26 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     const next = libSource.indexOf("#[tauri::command]", start);
     const block = libSource.slice(start, next < 0 ? undefined : next);
     assert.match(block, /admission: State<'_, AdmissionCoordinator>/, `${command} lacks gate state`);
-    assert.match(block, /admission\.require_admitted\(\)\?;/, `${command} bypasses admission`);
+    assert.match(
+      block,
+      /let _admission_permit = admission\.require_admitted\(\)\?;/,
+      `${command} does not retain its admission permit through the effect`,
+    );
+  }
+
+  for (const command of ["settings_update", "watchlist_add", "watchlist_remove"]) {
+    const start = libSource.indexOf(`async fn ${command}(`);
+    assert.ok(start >= 0, `missing config mutation command ${command}`);
+    const next = libSource.indexOf("#[tauri::command]", start);
+    const block = libSource.slice(start, next < 0 ? undefined : next);
+    assert.match(block, /app: AppHandle/, `${command} cannot restage native workers`);
+    assert.match(
+      block,
+      /delivery: State<'_, NotificationDelivery>/,
+      `${command} cannot restage notification delivery`,
+    );
+    assert.match(block, /admission\.mutate_config\(/, `${command} bypasses mutation transaction`);
+    assert.doesNotMatch(block, /renew_after_config_mutation/, `${command} retains split renewal`);
   }
 });
 
@@ -163,6 +179,7 @@ test("ntfy disclosure UI requires one explicit click and reconciles every outcom
   assert.match(uiSource, /await refreshConfigAdmission\(\)/);
   assert.match(uiSource, /listen<ConfigAdmissionStatus>\("watcher:\/\/config-admission"/);
   assert.match(uiSource, /status\.generation <= configAdmissionGeneration/);
+  assert.match(uiSource, /status\.state === "admitted" && configurationReady/);
   assert.match(uiSource, /renderConfigAdmission\(event\.payload\)/);
   assert.match(
     uiSource,

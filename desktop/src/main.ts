@@ -3014,6 +3014,7 @@ function renderConfigAdmissionState(status: ConfigAdmissionState): void {
 function renderConfigAdmission(status: ConfigAdmissionStatus): void {
   if (status.generation <= configAdmissionGeneration) return;
   configAdmissionGeneration = status.generation;
+  if (status.state === "admitted" && configurationReady) return;
   renderConfigAdmissionState(status);
 }
 
