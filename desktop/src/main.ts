@@ -352,11 +352,13 @@ interface WatcherSettings {
   retention_days: number;
 }
 
-type ConfigAdmissionStatus =
+type ConfigAdmissionState =
   | { state: "missing" }
   | { state: "acknowledgement_required"; expected_revision: string }
   | { state: "manual_repair_required" }
   | { state: "admitted" };
+
+type ConfigAdmissionStatus = ConfigAdmissionState & { generation: number };
 
 interface AutostartStatus {
   available: boolean;
@@ -787,6 +789,7 @@ let autostartInFlight = false;
 let autostartAvailable = false;
 let localModelSettingsEditable = false;
 let configurationReady = false;
+let configAdmissionGeneration = -1;
 let configInitializationInFlight = false;
 let ntfyDisclosureAcknowledgementInFlight = false;
 let ntfyDisclosureExpectedRevision: string | null = null;
@@ -2973,7 +2976,7 @@ function startConfiguredDesktop(): void {
   });
 }
 
-function renderConfigAdmission(status: ConfigAdmissionStatus): void {
+function renderConfigAdmissionState(status: ConfigAdmissionState): void {
   configurationReady = false;
   setConfiguredNavigation(false);
   settingsForm.hidden = true;
@@ -3008,11 +3011,17 @@ function renderConfigAdmission(status: ConfigAdmissionStatus): void {
   settingsStatus.dataset.kind = "error";
 }
 
+function renderConfigAdmission(status: ConfigAdmissionStatus): void {
+  if (status.generation <= configAdmissionGeneration) return;
+  configAdmissionGeneration = status.generation;
+  renderConfigAdmissionState(status);
+}
+
 async function refreshConfigAdmission(): Promise<void> {
   try {
     renderConfigAdmission(await invoke<ConfigAdmissionStatus>("config_admission_status"));
   } catch {
-    renderConfigAdmission({ state: "manual_repair_required" });
+    renderConfigAdmissionState({ state: "manual_repair_required" });
     settingsStatus.textContent =
       "Watcher configuration admission could not be verified. Repair the configuration and restart Email Watcher.";
     settingsStatus.dataset.kind = "error";
@@ -3020,6 +3029,7 @@ async function refreshConfigAdmission(): Promise<void> {
 }
 
 async function initializeDesktop(): Promise<void> {
+  await configAdmissionListenerReady;
   await refreshConfigAdmission();
 }
 
@@ -3364,6 +3374,9 @@ inboxLoadMore.addEventListener("click", () => void loadInbox(true));
 inboxClear.addEventListener("click", () => void clearInboxHistory());
 checkNow.addEventListener("click", () => void runCheck());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
+const configAdmissionListenerReady = listen<ConfigAdmissionStatus>("watcher://config-admission", (event) => {
+  renderConfigAdmission(event.payload);
+});
 void listen<{
   status: "complete" | "delivery_failed" | "check_failed";
   failed_notifications: number;

@@ -718,7 +718,7 @@ pub struct Engine {
     args: Vec<OsString>,
     config_path: PathBuf,
     mailbox_operation_gate: Arc<Mutex<()>>,
-    admission_token: Arc<Mutex<Option<AdmissionToken>>>,
+    admission_binding: Arc<Mutex<Option<AdmissionBinding>>>,
     request_timeout: Option<Duration>,
     cancellation: Option<CancellationToken>,
     #[cfg(test)]
@@ -1277,6 +1277,15 @@ pub struct AdmissionToken {
     pub identity: String,
 }
 
+pub(crate) type AdmissionErrorObserver =
+    Arc<dyn Fn(&AdmissionToken, &EngineError) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct AdmissionBinding {
+    token: AdmissionToken,
+    observer: AdmissionErrorObserver,
+}
+
 impl AdmissionToken {
     fn is_valid(&self) -> bool {
         fn is_sha256(value: &str) -> bool {
@@ -1404,6 +1413,10 @@ impl EngineError {
         }
     }
 
+    fn requires_admission_revocation(&self) -> bool {
+        matches!(self.code.as_str(), "conflict" | "configuration_error")
+    }
+
     fn for_frontend(self) -> Self {
         if self.code == "configuration_error" {
             return Self::host(
@@ -1427,7 +1440,7 @@ impl Engine {
                 args: Vec::new(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
-                admission_token: Arc::new(Mutex::new(None)),
+                admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
                 cancellation: None,
                 #[cfg(test)]
@@ -1443,7 +1456,7 @@ impl Engine {
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
-                admission_token: Arc::new(Mutex::new(None)),
+                admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
                 cancellation: None,
                 #[cfg(test)]
@@ -1465,7 +1478,7 @@ impl Engine {
             ],
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
-            admission_token: Arc::new(Mutex::new(None)),
+            admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
             cancellation: None,
             #[cfg(test)]
@@ -1484,7 +1497,7 @@ impl Engine {
             args,
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
-            admission_token: Arc::new(Mutex::new(None)),
+            admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
             cancellation: None,
             test_environment: Vec::new(),
@@ -1878,19 +1891,24 @@ impl Engine {
         }
     }
 
-    pub(crate) fn install_admission_token(&self, token: AdmissionToken) {
+    pub(crate) fn install_admission_binding(
+        &self,
+        token: AdmissionToken,
+        observer: AdmissionErrorObserver,
+    ) {
         *self
-            .admission_token
+            .admission_binding
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(AdmissionBinding { token, observer });
     }
 
-    pub(crate) fn clear_admission_token(&self, token: &AdmissionToken) {
+    pub(crate) fn clear_admission_binding(&self, token: &AdmissionToken) {
         let mut installed = self
-            .admission_token
+            .admission_binding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed.as_ref() == Some(token) {
+        if installed.as_ref().map(|binding| &binding.token) == Some(token) {
             *installed = None;
         }
     }
@@ -2154,8 +2172,8 @@ impl Engine {
         timeout: Option<Duration>,
     ) -> Result<T, EngineError> {
         self.check_cancellation()?;
-        let admission_token = if operation_requires_admission_token(operation) {
-            self.admission_token
+        let admission_binding = if operation_requires_admission_token(operation) {
+            self.admission_binding
                 .lock()
                 .map_err(|_| {
                     EngineError::host("host_error", "Configuration admission coordinator stopped")
@@ -2169,7 +2187,9 @@ impl Engine {
             operation,
             config_path: self.config_path.to_string_lossy().into_owned(),
             payload,
-            admission_token,
+            admission_token: admission_binding
+                .as_ref()
+                .map(|binding| binding.token.clone()),
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| {
             EngineError::host(
@@ -2291,6 +2311,11 @@ impl Engine {
                 "watcher engine {operation} failed ({}): {}",
                 error.code, error.message
             );
+            if error.requires_admission_revocation()
+                && let Some(binding) = admission_binding.as_ref()
+            {
+                (binding.observer)(&binding.token, &error);
+            }
             return Err(error.for_frontend());
         }
         if !output.status.success() {
@@ -3326,7 +3351,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_ho
             identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .into(),
         };
-        engine.install_admission_token(token.clone());
+        engine.install_admission_binding(token.clone(), Arc::new(|_, _| {}));
 
         assert_eq!(
             engine
@@ -3341,6 +3366,52 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_ho
         assert_eq!(
             request["admission_token"],
             serde_json::to_value(token).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_request_reports_admission_error_with_its_exact_token() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error":{"code":"conflict","message":"Configuration admission snapshot changed"}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
+            identity: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
+        };
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        engine.install_admission_binding(
+            token.clone(),
+            Arc::new(move |observed_token, error| {
+                observed_sender
+                    .send((observed_token.clone(), error.code.clone()))
+                    .expect("record admission error");
+            }),
+        );
+
+        assert_eq!(
+            engine
+                .pump_connect_queue()
+                .expect_err("stale guarded request must fail")
+                .code,
+            "conflict"
+        );
+        assert_eq!(
+            observed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("admission observer called"),
+            (token, "conflict".into())
         );
     }
 
@@ -3605,8 +3676,10 @@ esac"#,
             .and_then(Path::parent)
             .expect("repository root");
         let process_root = config_path
-            .parent()
-            .expect("test configuration has a parent")
+            .ancestors()
+            .skip(1)
+            .find(|candidate| candidate.exists())
+            .expect("test configuration has an existing ancestor")
             .join("isolated-process-environment");
         Engine::with_command(
             "uv",
@@ -3718,7 +3791,7 @@ notifications_enabled = true
         engine
             .compare_admission(&snapshot.token)
             .expect("snapshot remains current before guarded work");
-        engine.install_admission_token(snapshot.token);
+        engine.install_admission_binding(snapshot.token, Arc::new(|_, _| {}));
 
         let health = engine.health().expect("read engine health");
         let accounts = engine.mail_accounts().expect("read email accounts");
@@ -3844,7 +3917,7 @@ notifications_enabled = true
         engine
             .compare_admission(&refreshed_admission.token)
             .expect("refreshed admission remains current");
-        engine.install_admission_token(refreshed_admission.token);
+        engine.install_admission_binding(refreshed_admission.token, Arc::new(|_, _| {}));
 
         assert_eq!(
             engine.check().expect("inactive check without Gmail"),

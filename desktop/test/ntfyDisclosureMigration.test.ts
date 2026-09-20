@@ -44,6 +44,9 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   assert.match(engineSource, /"config\.ntfy_disclosure\.acknowledge"/);
   assert.match(libSource, /fn config_admission_status/);
   assert.match(libSource, /fn config_ntfy_disclosure_acknowledge/);
+  assert.match(libSource, /watcher:\/\/config-admission/);
+  assert.match(libSource, /fn engine_error_observer/);
+  assert.match(engineSource, /binding\.observer/);
 
   const setup = libSource.slice(libSource.indexOf(".setup(move |app|"));
   const inspect = setup.indexOf("refresh_admission");
@@ -158,6 +161,13 @@ test("ntfy disclosure UI requires one explicit click and reconciles every outcom
   );
   assert.match(uiSource, /ntfyDisclosureAcknowledge\.disabled = true/);
   assert.match(uiSource, /await refreshConfigAdmission\(\)/);
+  assert.match(uiSource, /listen<ConfigAdmissionStatus>\("watcher:\/\/config-admission"/);
+  assert.match(uiSource, /status\.generation <= configAdmissionGeneration/);
+  assert.match(uiSource, /renderConfigAdmission\(event\.payload\)/);
+  assert.match(
+    uiSource,
+    /async function initializeDesktop[\s\S]*await configAdmissionListenerReady;[\s\S]*await refreshConfigAdmission\(\)/,
+  );
 
   const acknowledgementCalls = uiSource.match(/"config_ntfy_disclosure_acknowledge"/g) ?? [];
   assert.equal(acknowledgementCalls.length, 1, "render, focus, and reconciliation must not acknowledge");
