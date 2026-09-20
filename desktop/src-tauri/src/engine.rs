@@ -36,6 +36,7 @@ use windows_sys::Win32::{
 };
 
 const PROTOCOL_VERSION: u8 = 1;
+const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -835,6 +836,20 @@ pub struct ConfigInitialization {
     pub settings: EngineSettings,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NtfyDisclosureStatus {
+    Missing,
+    NormalAdmission,
+    AcknowledgementRequired { expected_revision: String },
+    ManualRepairRequired,
+}
+
+#[derive(Deserialize)]
+struct NtfyDisclosureAcknowledgement {
+    acknowledged: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineError {
     pub code: String,
@@ -1311,6 +1326,34 @@ impl Engine {
         self.request("settings.get", json!({}))
     }
 
+    pub fn ntfy_disclosure_status(&self) -> Result<NtfyDisclosureStatus, EngineError> {
+        self.request_with_timeout(
+            "config.ntfy_disclosure.status",
+            json!({}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn acknowledge_ntfy_disclosure(
+        &self,
+        expected_revision: String,
+    ) -> Result<(), EngineError> {
+        let response: NtfyDisclosureAcknowledgement = self.request_with_timeout(
+            "config.ntfy_disclosure.acknowledge",
+            json!({"expected_revision": expected_revision}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if response.acknowledged {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid disclosure acknowledgement",
+            ))
+        }
+    }
+
+    #[cfg(test)]
     pub fn config_present(&self) -> Result<bool, EngineError> {
         match std::fs::symlink_metadata(&self.config_path) {
             Ok(_) => Ok(true),

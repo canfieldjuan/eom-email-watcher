@@ -5,10 +5,10 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
-    ConfigInitialization, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
-    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
-    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
-    MailAccounts, MailServerConnection, WatchedSender,
+    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
+    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
+    GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
+    MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -17,11 +17,11 @@ use std::collections::BTreeMap;
 #[cfg(desktop)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-const DEFAULT_POLL_INTERVAL_MINUTES: u64 = 120;
 const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(desktop)]
 const TRAY_OPEN_ID: &str = "open";
@@ -246,28 +246,357 @@ struct RevealedCapabilityOutput {
     filename: String,
 }
 
-#[derive(Serialize)]
-struct ConfigStatus {
-    present: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdmissionState {
+    Inspecting,
+    Missing,
+    AwaitingAcknowledgement { expected_revision: String },
+    ManualRepairRequired,
+    Admitted,
 }
 
-#[tauri::command]
-fn config_status(engine: State<'_, Engine>) -> Result<ConfigStatus, EngineError> {
-    engine
-        .config_present()
-        .map(|present| ConfigStatus { present })
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum ConfigAdmissionStatus {
+    Missing,
+    AcknowledgementRequired { expected_revision: String },
+    ManualRepairRequired,
+    Admitted,
+}
+
+impl AdmissionState {
+    fn public_status(&self) -> ConfigAdmissionStatus {
+        match self {
+            Self::Inspecting | Self::ManualRepairRequired => {
+                ConfigAdmissionStatus::ManualRepairRequired
+            }
+            Self::Missing => ConfigAdmissionStatus::Missing,
+            Self::AwaitingAcknowledgement { expected_revision } => {
+                ConfigAdmissionStatus::AcknowledgementRequired {
+                    expected_revision: expected_revision.clone(),
+                }
+            }
+            Self::Admitted => ConfigAdmissionStatus::Admitted,
+        }
+    }
+}
+
+struct AdmissionAttempt<W> {
+    state: AdmissionState,
+    workers: Option<W>,
+}
+
+fn run_admission_attempt<W>(
+    inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+    admit: impl FnOnce() -> Result<W, EngineError>,
+) -> AdmissionAttempt<W> {
+    match inspect() {
+        Ok(NtfyDisclosureStatus::Missing) => AdmissionAttempt {
+            state: AdmissionState::Missing,
+            workers: None,
+        },
+        Ok(NtfyDisclosureStatus::AcknowledgementRequired { expected_revision }) => {
+            AdmissionAttempt {
+                state: AdmissionState::AwaitingAcknowledgement { expected_revision },
+                workers: None,
+            }
+        }
+        Ok(NtfyDisclosureStatus::ManualRepairRequired) | Err(_) => AdmissionAttempt {
+            state: AdmissionState::ManualRepairRequired,
+            workers: None,
+        },
+        Ok(NtfyDisclosureStatus::NormalAdmission) => match admit() {
+            Ok(workers) => AdmissionAttempt {
+                state: AdmissionState::Admitted,
+                workers: Some(workers),
+            },
+            Err(_) => AdmissionAttempt {
+                state: AdmissionState::ManualRepairRequired,
+                workers: None,
+            },
+        },
+    }
+}
+
+fn run_acknowledgement_attempt<W>(
+    acknowledge: impl FnOnce() -> Result<(), EngineError>,
+    inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+    admit: impl FnOnce() -> Result<W, EngineError>,
+) -> AdmissionAttempt<W> {
+    let _outcome = acknowledge();
+    run_admission_attempt(inspect, admit)
+}
+
+struct AdmissionWorkers {
+    connect_queue: ConnectQueueScheduler,
+    scheduler: PollScheduler,
+}
+
+struct AdmissionInner<W> {
+    state: AdmissionState,
+    workers: Option<W>,
+}
+
+struct AdmissionCoordinator<W = AdmissionWorkers> {
+    inner: Arc<Mutex<AdmissionInner<W>>>,
+}
+
+impl<W> Clone for AdmissionCoordinator<W> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<W> AdmissionCoordinator<W> {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AdmissionInner {
+                state: AdmissionState::Inspecting,
+                workers: None,
+            })),
+        }
+    }
+
+    fn require_admitted(&self) -> Result<(), EngineError> {
+        let inner = self.inner.lock().map_err(|_| {
+            EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            )
+        })?;
+        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            ))
+        }
+    }
+
+    fn install_attempt(
+        inner: &mut AdmissionInner<W>,
+        attempt: AdmissionAttempt<W>,
+    ) -> ConfigAdmissionStatus {
+        inner.state = attempt.state;
+        inner.workers = attempt.workers;
+        inner.state.public_status()
+    }
+}
+
+fn start_admitted_workers(
+    app: &AppHandle,
+    engine: &Engine,
+    startup_delivery: &NotificationDelivery,
+) -> Result<AdmissionWorkers, EngineError> {
+    let settings = engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)?;
+    let connect_queue =
+        ConnectQueueScheduler::start(app.clone(), engine.clone()).map_err(|_| {
+            EngineError::host("host_error", "Connect queue scheduler could not be started")
+        })?;
+    match startup_delivery.deliver(app, engine) {
+        Ok(outcome) if outcome.failed > 0 => eprintln!(
+            "{} watcher startup notification deliveries failed; {} remain queued",
+            outcome.failed, outcome.remaining
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "watcher startup notification delivery failed ({}): {}",
+            error.code, error.message
+        ),
+    }
+    let scheduler = PollScheduler::new(settings.poll_interval_minutes, settings.polling_supported);
+    if !settings.polling_supported {
+        eprintln!("watcher automatic polling is disabled for the current host configuration");
+    }
+    scheduler
+        .start(
+            app.clone(),
+            engine.clone(),
+            startup_delivery.clone(),
+            connect_queue.clone(),
+        )
+        .map_err(|_| EngineError::host("host_error", "Polling scheduler could not be started"))?;
+    Ok(AdmissionWorkers {
+        connect_queue,
+        scheduler,
+    })
+}
+
+impl AdmissionCoordinator<AdmissionWorkers> {
+    fn refresh_admission(
+        &self,
+        app: &AppHandle,
+        engine: &Engine,
+        delivery: &NotificationDelivery,
+    ) -> Result<ConfigAdmissionStatus, EngineError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+            return Ok(ConfigAdmissionStatus::Admitted);
+        }
+        inner.state = AdmissionState::Inspecting;
+        let attempt = run_admission_attempt(
+            || engine.ntfy_disclosure_status(),
+            || start_admitted_workers(app, engine, delivery),
+        );
+        Ok(Self::install_attempt(&mut inner, attempt))
+    }
+
+    fn initialize(
+        &self,
+        app: &AppHandle,
+        engine: &Engine,
+        delivery: &NotificationDelivery,
+        timezone: String,
+        model_base_url: String,
+        model_name: String,
+    ) -> Result<ConfigAdmissionStatus, EngineError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.state != AdmissionState::Missing || inner.workers.is_some() {
+            return Err(EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration cannot be initialized in its current state",
+            ));
+        }
+        let initialization = engine.initialize_config(timezone, model_base_url, model_name);
+        let attempt = run_admission_attempt(
+            || engine.ntfy_disclosure_status(),
+            || start_admitted_workers(app, engine, delivery),
+        );
+        let status = Self::install_attempt(&mut inner, attempt);
+        match initialization {
+            Ok(_) => Ok(status),
+            Err(_) if status == ConfigAdmissionStatus::Admitted => Ok(status),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn acknowledge(
+        &self,
+        app: &AppHandle,
+        engine: &Engine,
+        delivery: &NotificationDelivery,
+        expected_revision: String,
+    ) -> Result<ConfigAdmissionStatus, EngineError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+            return Ok(ConfigAdmissionStatus::Admitted);
+        }
+        let revision_matches = match &inner.state {
+            AdmissionState::AwaitingAcknowledgement {
+                expected_revision: current,
+            } => current == &expected_revision,
+            _ => false,
+        };
+        inner.state = AdmissionState::Inspecting;
+        let attempt = if revision_matches {
+            run_acknowledgement_attempt(
+                || engine.acknowledge_ntfy_disclosure(expected_revision),
+                || engine.ntfy_disclosure_status(),
+                || start_admitted_workers(app, engine, delivery),
+            )
+        } else {
+            run_admission_attempt(
+                || engine.ntfy_disclosure_status(),
+                || start_admitted_workers(app, engine, delivery),
+            )
+        };
+        Ok(Self::install_attempt(&mut inner, attempt))
+    }
+
+    fn wake_connect_queue(&self) -> Result<(), EngineError> {
+        let inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        let workers = inner.workers.as_ref().ok_or_else(|| {
+            EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            )
+        })?;
+        workers.connect_queue.wake();
+        Ok(())
+    }
+
+    fn polling_status(&self) -> Result<PollingStatus, EngineError> {
+        let inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        let workers = inner.workers.as_ref().ok_or_else(|| {
+            EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            )
+        })?;
+        Ok(workers.scheduler.status())
+    }
 }
 
 #[tauri::command]
 async fn config_initialize(
+    app: AppHandle,
     engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
     timezone: String,
     model_base_url: String,
     model_name: String,
-) -> Result<ConfigInitialization, EngineError> {
+) -> Result<ConfigAdmissionStatus, EngineError> {
     let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    let admission = AdmissionCoordinator::clone(&*admission);
     tauri::async_runtime::spawn_blocking(move || {
-        engine.initialize_config(timezone, model_base_url, model_name)
+        admission.initialize(
+            &app,
+            &engine,
+            &delivery,
+            timezone,
+            model_base_url,
+            model_name,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn config_admission_status(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<ConfigAdmissionStatus, EngineError> {
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    let admission = AdmissionCoordinator::clone(&*admission);
+    tauri::async_runtime::spawn_blocking(move || {
+        admission.refresh_admission(&app, &engine, &delivery)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn config_ntfy_disclosure_acknowledge(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    expected_revision: String,
+) -> Result<ConfigAdmissionStatus, EngineError> {
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    let admission = AdmissionCoordinator::clone(&*admission);
+    tauri::async_runtime::spawn_blocking(move || {
+        admission.acknowledge(&app, &engine, &delivery, expected_revision)
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -276,8 +605,10 @@ async fn config_initialize(
 #[tauri::command]
 async fn inbox_query(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     query: InboxQuery,
 ) -> Result<InboxPage, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.query_inbox(query))
         .await
@@ -288,8 +619,10 @@ async fn inbox_query(
 async fn inbox_delete(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
 ) -> Result<(), EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -303,7 +636,9 @@ async fn inbox_delete(
 async fn inbox_clear(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
 ) -> Result<u64, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || delivery.run_exclusive(|| engine.clear_inbox()))
@@ -314,8 +649,10 @@ async fn inbox_clear(
 #[tauri::command]
 async fn analysis_requeue(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
 ) -> Result<(), EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.requeue_analysis(message_id))
         .await
@@ -327,9 +664,11 @@ async fn attachment_open(
     app: AppHandle,
     engine: State<'_, Engine>,
     exports: State<'_, AttachmentExports>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
     part_id: String,
 ) -> Result<OpenedAttachment, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let destination = exports.path().to_path_buf();
     let exported = tauri::async_runtime::spawn_blocking(move || {
@@ -354,9 +693,11 @@ async fn attachment_open(
 #[tauri::command]
 async fn attachment_capabilities(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
     part_id: String,
 ) -> Result<ConnectCapabilities, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.attachment_capabilities(message_id, part_id)
@@ -370,7 +711,7 @@ async fn attachment_capabilities(
 #[allow(clippy::too_many_arguments)]
 async fn attachment_capability_invoke(
     engine: State<'_, Engine>,
-    connect_queue: State<'_, ConnectQueueScheduler>,
+    admission: State<'_, AdmissionCoordinator>,
     request_id: String,
     message_id: String,
     part_id: String,
@@ -379,6 +720,7 @@ async fn attachment_capability_invoke(
     parameters: BTreeMap<String, Value>,
     confirmed: bool,
 ) -> Result<ConnectInvocationResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         engine.invoke_attachment_capability(
@@ -387,18 +729,20 @@ async fn attachment_capability_invoke(
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"));
-    connect_queue.wake();
+    admission.wake_connect_queue()?;
     result?
 }
 
 #[tauri::command]
 async fn capability_output_present(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
     part_id: String,
     job_id: String,
     artifact_id: String,
 ) -> Result<ConnectOutputView, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.present_capability_output(message_id, part_id, job_id, artifact_id)
@@ -412,11 +756,13 @@ async fn capability_output_export(
     app: AppHandle,
     engine: State<'_, Engine>,
     exports: State<'_, AttachmentExports>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
     part_id: String,
     job_id: String,
     artifact_id: String,
 ) -> Result<RevealedCapabilityOutput, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let destination = std::fs::canonicalize(exports.path()).map_err(|_| {
         EngineError::host("export_failed", "Desktop export directory is unavailable")
@@ -462,10 +808,11 @@ async fn capability_output_export(
 #[tauri::command]
 async fn health_get(
     engine: State<'_, Engine>,
-    scheduler: State<'_, PollScheduler>,
+    admission: State<'_, AdmissionCoordinator>,
 ) -> Result<DesktopHealthStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
-    let polling = scheduler.status();
+    let polling = admission.polling_status()?;
     tauri::async_runtime::spawn_blocking(move || {
         engine
             .health()
@@ -478,7 +825,9 @@ async fn health_get(
 #[tauri::command]
 async fn connect_entitlement_status(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
 ) -> Result<ConnectEntitlementStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.connect_entitlement_status())
         .await
@@ -498,25 +847,30 @@ fn wake_connect_queue_after_entitlement_install<T, E>(
 #[tauri::command]
 async fn connect_entitlement_install(
     engine: State<'_, Engine>,
-    connect_queue: State<'_, ConnectQueueScheduler>,
+    admission: State<'_, AdmissionCoordinator>,
     source_path: String,
 ) -> Result<ConnectEntitlementStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         engine.install_connect_entitlement(PathBuf::from(source_path))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?;
-    wake_connect_queue_after_entitlement_install(result, || connect_queue.wake())
+    wake_connect_queue_after_entitlement_install(result, || {
+        let _ = admission.wake_connect_queue();
+    })
 }
 
 #[tauri::command]
 async fn calendar_consent_status(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     profile: CalendarConsentProfile,
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.calendar_consent_status(profile, provider, account_id)
@@ -528,10 +882,12 @@ async fn calendar_consent_status(
 #[tauri::command]
 async fn calendar_consent_connect(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     profile: CalendarConsentProfile,
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.connect_calendar_consent(profile, provider, account_id)
@@ -543,10 +899,12 @@ async fn calendar_consent_connect(
 #[tauri::command]
 async fn calendar_consent_disconnect(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     profile: CalendarConsentProfile,
     provider: String,
     account_id: String,
 ) -> Result<CalendarConsentStatus, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.disconnect_calendar_consent(profile, provider, account_id)
@@ -559,6 +917,7 @@ async fn calendar_consent_disconnect(
 #[allow(clippy::too_many_arguments)]
 async fn calendar_proposal_decide(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     message_id: String,
     run_id: String,
     state_version: i64,
@@ -566,6 +925,7 @@ async fn calendar_proposal_decide(
     proposal_sha256: String,
     decision: String,
 ) -> Result<CalendarDecisionResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.decide_calendar_proposal(
@@ -582,7 +942,11 @@ async fn calendar_proposal_decide(
 }
 
 #[tauri::command]
-async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization, EngineError> {
+async fn gmail_authorize(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<GmailAuthorization, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.authorize_gmail())
         .await
@@ -590,7 +954,11 @@ async fn gmail_authorize(engine: State<'_, Engine>) -> Result<GmailAuthorization
 }
 
 #[tauri::command]
-async fn mail_accounts_list(engine: State<'_, Engine>) -> Result<MailAccounts, EngineError> {
+async fn mail_accounts_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<MailAccounts, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.mail_accounts())
         .await
@@ -600,9 +968,11 @@ async fn mail_accounts_list(engine: State<'_, Engine>) -> Result<MailAccounts, E
 #[tauri::command]
 async fn mail_account_connect(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     connection: Option<MailServerConnection>,
 ) -> Result<MailAccountResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.connect_mail_provider(provider, connection))
         .await
@@ -612,10 +982,12 @@ async fn mail_account_connect(
 #[tauri::command]
 async fn mail_account_reconnect(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
     connection: Option<MailServerConnection>,
 ) -> Result<MailAccountResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.reconnect_mail_account(provider, account_id, connection)
@@ -627,9 +999,11 @@ async fn mail_account_reconnect(
 #[tauri::command]
 async fn mail_account_disconnect(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
 ) -> Result<MailAccountResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.disconnect_mail_account(provider, account_id)
@@ -641,9 +1015,11 @@ async fn mail_account_disconnect(
 #[tauri::command]
 async fn mail_account_activate(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
 ) -> Result<MailAccountResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.activate_mail_account(provider, account_id))
         .await
@@ -651,7 +1027,11 @@ async fn mail_account_activate(
 }
 
 #[tauri::command]
-async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, EngineError> {
+async fn settings_get(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<EngineSettings, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.settings())
         .await
@@ -662,12 +1042,14 @@ async fn settings_get(engine: State<'_, Engine>) -> Result<EngineSettings, Engin
 async fn settings_update(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
     poll_interval_minutes: u64,
     retention_days: u64,
     notifications_enabled: bool,
     model_base_url: Option<String>,
     model_name: Option<String>,
 ) -> Result<EngineSettings, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -690,8 +1072,9 @@ async fn watcher_check(
     app: AppHandle,
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
-    connect_queue: State<'_, ConnectQueueScheduler>,
+    admission: State<'_, AdmissionCoordinator>,
 ) -> Result<DesktopCheckResult, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -705,12 +1088,16 @@ async fn watcher_check(
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"));
-    connect_queue.wake();
+    admission.wake_connect_queue()?;
     result?
 }
 
 #[tauri::command]
-async fn watchlist_list(engine: State<'_, Engine>) -> Result<Vec<WatchedSender>, EngineError> {
+async fn watchlist_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<Vec<WatchedSender>, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.list())
         .await
@@ -720,9 +1107,11 @@ async fn watchlist_list(engine: State<'_, Engine>) -> Result<Vec<WatchedSender>,
 #[tauri::command]
 async fn watchlist_add(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     email: String,
     name: Option<String>,
 ) -> Result<WatchedSender, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.add(email, name))
         .await
@@ -732,8 +1121,10 @@ async fn watchlist_add(
 #[tauri::command]
 async fn watchlist_remove(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     email: String,
 ) -> Result<WatchedSender, EngineError> {
+    admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.remove(email))
         .await
@@ -791,52 +1182,18 @@ pub fn run() {
                     .prefix("email-watcher-attachments-")
                     .tempdir()?,
             };
-            let (poll_interval_minutes, polling_supported) =
-                match engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT) {
-                    Ok(settings) => (
-                        settings.poll_interval_minutes,
-                        settings.polling_supported,
-                    ),
-                    Err(error) => {
-                        eprintln!(
-                            "watcher polling settings unavailable ({}): {}; polling disabled with {}-minute default",
-                            error.code, error.message, DEFAULT_POLL_INTERVAL_MINUTES
-                        );
-                        (DEFAULT_POLL_INTERVAL_MINUTES, false)
-                    }
-                };
-            if !polling_supported {
-                eprintln!(
-                    "watcher automatic polling is disabled for the current host configuration"
-                );
+            let admission = AdmissionCoordinator::new();
+            let admission_status = admission
+                .refresh_admission(app.handle(), &engine, &delivery)
+                .map_err(|_| std::io::Error::other("configuration admission could not start"))?;
+            #[cfg(desktop)]
+            if launch_in_background && admission_status != ConfigAdmissionStatus::Admitted {
+                show_main_window(app.handle());
             }
-            let scheduler = PollScheduler::new(poll_interval_minutes, polling_supported);
-            let connect_queue =
-                ConnectQueueScheduler::start(app.handle().clone(), engine.clone())?;
             app.manage(engine.clone());
             app.manage(delivery.clone());
             app.manage(exports);
-            app.manage(scheduler.clone());
-            app.manage(connect_queue.clone());
-            let startup_app = app.handle().clone();
-            let startup_engine = engine.clone();
-            let startup_delivery = delivery.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                match startup_delivery.deliver(&startup_app, &startup_engine) {
-                    Ok(outcome) if outcome.failed > 0 => eprintln!(
-                        "{} watcher startup notification deliveries failed; {} remain queued",
-                        outcome.failed, outcome.remaining
-                    ),
-                    Ok(_) => {}
-                    Err(error) => {
-                        eprintln!(
-                            "watcher startup notification delivery failed ({}): {}",
-                            error.code, error.message
-                        );
-                    }
-                }
-            });
-            scheduler.start(app.handle().clone(), engine, delivery, connect_queue)?;
+            app.manage(admission);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -854,8 +1211,9 @@ pub fn run() {
             capability_output_present,
             connect_entitlement_install,
             connect_entitlement_status,
+            config_admission_status,
             config_initialize,
-            config_status,
+            config_ntfy_disclosure_acknowledge,
             gmail_authorize,
             health_get,
             inbox_clear,
@@ -880,6 +1238,7 @@ pub fn run() {
 #[cfg(all(test, desktop))]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     #[test]
     fn tray_menu_routing_is_explicit() {
@@ -900,6 +1259,171 @@ mod tests {
             "email-watcher",
             "prefix--background"
         ]));
+    }
+
+    #[test]
+    fn disclosure_status_is_always_the_first_admission_operation() {
+        let held_states = [
+            (NtfyDisclosureStatus::Missing, AdmissionState::Missing),
+            (
+                NtfyDisclosureStatus::AcknowledgementRequired {
+                    expected_revision:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                },
+                AdmissionState::AwaitingAcknowledgement {
+                    expected_revision:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                },
+            ),
+            (
+                NtfyDisclosureStatus::ManualRepairRequired,
+                AdmissionState::ManualRepairRequired,
+            ),
+        ];
+        for (status, expected) in held_states {
+            let events = RefCell::new(Vec::new());
+            let attempt = run_admission_attempt(
+                || {
+                    events.borrow_mut().push("status");
+                    Ok(status)
+                },
+                || {
+                    events.borrow_mut().push("settings/workers");
+                    Ok(())
+                },
+            );
+            assert_eq!(attempt.state, expected);
+            assert!(attempt.workers.is_none());
+            assert_eq!(*events.borrow(), ["status"]);
+        }
+
+        let events = RefCell::new(Vec::new());
+        let admitted = run_admission_attempt(
+            || {
+                events.borrow_mut().push("status");
+                Ok(NtfyDisclosureStatus::NormalAdmission)
+            },
+            || {
+                events.borrow_mut().push("settings/workers");
+                Ok(())
+            },
+        );
+        assert_eq!(admitted.state, AdmissionState::Admitted);
+        assert!(admitted.workers.is_some());
+        assert_eq!(*events.borrow(), ["status", "settings/workers"]);
+    }
+
+    #[test]
+    fn admission_errors_hold_workers_and_expose_only_manual_repair() {
+        let status_error = run_admission_attempt::<()>(
+            || Err(EngineError::host("engine_timeout", "private diagnostic")),
+            || panic!("workers must remain held after a status error"),
+        );
+        assert_eq!(status_error.state, AdmissionState::ManualRepairRequired);
+        assert!(status_error.workers.is_none());
+        assert_eq!(
+            status_error.state.public_status(),
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+
+        let admission_error = run_admission_attempt::<()>(
+            || Ok(NtfyDisclosureStatus::NormalAdmission),
+            || {
+                Err(EngineError::host(
+                    "configuration_error",
+                    "private diagnostic",
+                ))
+            },
+        );
+        assert_eq!(admission_error.state, AdmissionState::ManualRepairRequired);
+        assert!(admission_error.workers.is_none());
+    }
+
+    #[test]
+    fn every_acknowledgement_outcome_reinspects_without_retrying() {
+        let outcomes = [
+            None,
+            Some("conflict"),
+            Some("outcome_unknown"),
+            Some("engine_timeout"),
+        ];
+        for outcome in outcomes {
+            let events = RefCell::new(Vec::new());
+            let attempt = run_acknowledgement_attempt(
+                || {
+                    events.borrow_mut().push("acknowledge");
+                    match outcome {
+                        None => Ok(()),
+                        Some(code) => Err(EngineError::host(code, "fixed failure")),
+                    }
+                },
+                || {
+                    events.borrow_mut().push("status");
+                    Ok(NtfyDisclosureStatus::AcknowledgementRequired {
+                        expected_revision: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    })
+                },
+                || {
+                    events.borrow_mut().push("settings/workers");
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                attempt.state,
+                AdmissionState::AwaitingAcknowledgement {
+                    expected_revision:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                }
+            );
+            assert!(attempt.workers.is_none());
+            assert_eq!(*events.borrow(), ["acknowledge", "status"]);
+        }
+
+        let events = RefCell::new(Vec::new());
+        let admitted = run_acknowledgement_attempt(
+            || {
+                events.borrow_mut().push("acknowledge");
+                Err(EngineError::host("outcome_unknown", "fixed failure"))
+            },
+            || {
+                events.borrow_mut().push("status");
+                Ok(NtfyDisclosureStatus::NormalAdmission)
+            },
+            || {
+                events.borrow_mut().push("settings/workers");
+                Ok(())
+            },
+        );
+        assert_eq!(admitted.state, AdmissionState::Admitted);
+        assert_eq!(
+            *events.borrow(),
+            ["acknowledge", "status", "settings/workers"]
+        );
+    }
+
+    #[test]
+    fn commands_require_an_installed_admitted_worker_set() {
+        let admission = AdmissionCoordinator::<()>::new();
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+        let mut inner = admission.inner.lock().expect("admission lock");
+        AdmissionCoordinator::install_attempt(
+            &mut inner,
+            AdmissionAttempt {
+                state: AdmissionState::Admitted,
+                workers: Some(()),
+            },
+        );
+        drop(inner);
+        admission
+            .require_admitted()
+            .expect("admitted commands allowed");
     }
 
     #[test]

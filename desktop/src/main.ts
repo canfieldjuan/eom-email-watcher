@@ -351,14 +351,11 @@ interface WatcherSettings {
   retention_days: number;
 }
 
-interface ConfigStatus {
-  present: boolean;
-}
-
-interface ConfigInitialization {
-  created: boolean;
-  settings: WatcherSettings;
-}
+type ConfigAdmissionStatus =
+  | { state: "missing" }
+  | { state: "acknowledgement_required"; expected_revision: string }
+  | { state: "manual_repair_required" }
+  | { state: "admitted" };
 
 interface AutostartStatus {
   available: boolean;
@@ -587,6 +584,14 @@ app.innerHTML = `
     <section id="settings-view" class="view" aria-labelledby="settings-tab" hidden>
       <h2>Watcher settings</h2>
       <p class="view-lede">Change the everyday controls that are safe to manage from this app.</p>
+      <section id="ntfy-disclosure-panel" class="ntfy-disclosure-panel" hidden>
+        <h3>Phone notification privacy</h3>
+        <p>Email Watcher sends the configured ntfy service the notification topic; the watched sender's configured label, or the message-supplied display name or email address; the email subject; and either the local-model summary with any suggested action and deadline, fixed fallback text, or scheduling review text that may contain an email-derived summary.</p>
+        <p>Email Watcher does not redact or encrypt these fields at the application layer. HTTPS protects them while they travel to the service, but the configured ntfy service can read and may retain or log them.</p>
+        <p>A long random topic limits who can subscribe or publish; it does not hide the content from that service.</p>
+        <p>For confidentiality-sensitive mail, close Email Watcher and remove the topic from the private configuration before continuing.</p>
+        <button id="ntfy-disclosure-acknowledge" type="button">I understand and allow this email-derived content to be sent to the configured ntfy service</button>
+      </section>
       <form id="config-initialize-form" class="settings-form" hidden>
         <label>
           <span>Time zone</span>
@@ -706,6 +711,10 @@ const watchlistCount = requiredElement<HTMLElement>("#watchlist-count");
 const pollingCadence = requiredElement<HTMLElement>("#polling-cadence");
 const nextCheck = requiredElement<HTMLElement>("#next-check");
 const configInitializeForm = requiredElement<HTMLFormElement>("#config-initialize-form");
+const ntfyDisclosurePanel = requiredElement<HTMLElement>("#ntfy-disclosure-panel");
+const ntfyDisclosureAcknowledge = requiredElement<HTMLButtonElement>(
+  "#ntfy-disclosure-acknowledge",
+);
 const initialTimezoneInput = requiredElement<HTMLInputElement>("#initial-timezone");
 const initialModelEndpointInput = requiredElement<HTMLInputElement>(
   "#initial-model-endpoint",
@@ -778,6 +787,8 @@ let autostartAvailable = false;
 let localModelSettingsEditable = false;
 let configurationReady = false;
 let configInitializationInFlight = false;
+let ntfyDisclosureAcknowledgementInFlight = false;
+let ntfyDisclosureExpectedRevision: string | null = null;
 let calendarConsentOperationInFlight: string | null = null;
 let calendarConsentRequestGeneration = 0;
 
@@ -2944,9 +2955,12 @@ function setConfiguredNavigation(enabled: boolean): void {
 }
 
 function startConfiguredDesktop(): void {
+  if (configurationReady) return;
   configurationReady = true;
   setConfiguredNavigation(true);
   configInitializeForm.hidden = true;
+  ntfyDisclosurePanel.hidden = true;
+  ntfyDisclosureExpectedRevision = null;
   settingsForm.hidden = false;
   void loadMailAccounts().then((loaded) => {
     if (loaded) return loadInbox();
@@ -2958,28 +2972,77 @@ function startConfiguredDesktop(): void {
   });
 }
 
-async function initializeDesktop(): Promise<void> {
+function renderConfigAdmission(status: ConfigAdmissionStatus): void {
+  configurationReady = false;
   setConfiguredNavigation(false);
   settingsForm.hidden = true;
   configInitializeForm.hidden = true;
-  try {
-    const status = await invoke<ConfigStatus>("config_status");
-    if (status.present) {
-      startConfiguredDesktop();
-      return;
-    }
+  ntfyDisclosurePanel.hidden = true;
+  ntfyDisclosureExpectedRevision = null;
+  calendarConsentSettings.hidden = true;
+  showView("settings");
+  if (status.state === "admitted") {
+    startConfiguredDesktop();
+    return;
+  }
+  if (status.state === "missing") {
     initialTimezoneInput.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    showView("settings");
     configInitializeForm.hidden = false;
     settingsStatus.textContent = "Set the local essentials to create this watcher's configuration.";
     delete settingsStatus.dataset.kind;
     initialModelEndpointInput.focus();
-  } catch (error) {
-    showView("settings");
-    settingsStatus.textContent = errorMessage(error);
+    return;
+  }
+  if (status.state === "acknowledgement_required") {
+    ntfyDisclosureExpectedRevision = status.expected_revision;
+    ntfyDisclosurePanel.hidden = false;
+    ntfyDisclosureAcknowledge.disabled = ntfyDisclosureAcknowledgementInFlight;
+    settingsStatus.textContent = "Review the phone notification privacy disclosure to continue.";
+    delete settingsStatus.dataset.kind;
+    ntfyDisclosureAcknowledge.focus();
+    return;
+  }
+  settingsStatus.textContent =
+    "Watcher configuration needs manual repair before Email Watcher can start.";
+  settingsStatus.dataset.kind = "error";
+}
+
+async function refreshConfigAdmission(): Promise<void> {
+  try {
+    renderConfigAdmission(await invoke<ConfigAdmissionStatus>("config_admission_status"));
+  } catch {
+    renderConfigAdmission({ state: "manual_repair_required" });
+    settingsStatus.textContent =
+      "Watcher configuration admission could not be verified. Repair the configuration and restart Email Watcher.";
     settingsStatus.dataset.kind = "error";
   }
 }
+
+async function initializeDesktop(): Promise<void> {
+  await refreshConfigAdmission();
+}
+
+ntfyDisclosureAcknowledge.addEventListener("click", () => {
+  void (async () => {
+    if (ntfyDisclosureAcknowledgementInFlight || !ntfyDisclosureExpectedRevision) return;
+    const expectedRevision = ntfyDisclosureExpectedRevision;
+    ntfyDisclosureAcknowledgementInFlight = true;
+    ntfyDisclosureAcknowledge.disabled = true;
+    try {
+      const status = await invoke<ConfigAdmissionStatus>(
+        "config_ntfy_disclosure_acknowledge",
+        { expectedRevision },
+      );
+      renderConfigAdmission(status);
+    } catch {
+      await refreshConfigAdmission();
+    } finally {
+      ntfyDisclosureAcknowledgementInFlight = false;
+      ntfyDisclosureAcknowledge.disabled =
+        ntfyDisclosureExpectedRevision === null || Boolean(ntfyDisclosurePanel.hidden);
+    }
+  })();
+});
 
 configInitializeForm.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -2989,17 +3052,17 @@ configInitializeForm.addEventListener("submit", (event) => {
     settingsStatus.textContent = "Creating watcher configuration…";
     delete settingsStatus.dataset.kind;
     try {
-      const result = await invoke<ConfigInitialization>("config_initialize", {
+      const status = await invoke<ConfigAdmissionStatus>("config_initialize", {
         modelBaseUrl: initialModelEndpointInput.value,
         modelName: initialModelNameInput.value,
         timezone: initialTimezoneInput.value,
       });
-      if (!result.created) throw new Error("Watcher configuration was not created.");
-      renderSettings(result.settings);
-      startConfiguredDesktop();
-      settingsStatus.textContent =
-        "Configuration created. Restart the app once to enable automatic polling.";
-      settingsStatus.dataset.kind = "success";
+      renderConfigAdmission(status);
+      if (status.state === "admitted") {
+        void loadSettings();
+        settingsStatus.textContent = "Configuration created.";
+        settingsStatus.dataset.kind = "success";
+      }
     } catch (error) {
       settingsStatus.textContent = errorMessage(error);
       settingsStatus.dataset.kind = "error";
