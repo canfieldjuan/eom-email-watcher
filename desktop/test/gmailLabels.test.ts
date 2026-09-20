@@ -207,15 +207,27 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
     .replace(/event: ScheduledCheckEvent/g, "event")
     .replace(/\): void/g, ")")
     .replace(/\): boolean/g, ")");
+  const errorObserver = source.match(
+    /function observeMailboxOperationRevisionFromError\(error: unknown\): void \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(errorObserver);
+  const executableErrorObserver = errorObserver[1].replace(
+    /\(error as \{ mailbox_operation_revision\?: unknown \}\)/g,
+    "error",
+  );
   const harness = Function(
     `let mailboxOperationRevision = 0;${executableHelpers}
+     function observeMailboxOperationRevisionFromError(error) {${executableErrorObserver}
+     }
      return {
        observe: observeMailboxOperationRevision,
+       observeError: observeMailboxOperationRevisionFromError,
        accepts: scheduledCheckEventIsCurrent,
        current: () => mailboxOperationRevision,
      };`,
   )() as {
     observe: (revision: number) => void;
+    observeError: (error: Record<string, unknown>) => void;
     accepts: (event: { mailbox_operation_revision?: number }) => boolean;
     current: () => number;
   };
@@ -231,6 +243,17 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
   assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
   assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
   assert.equal(harness.accepts({}), false);
+
+  const failedReconnect = {
+    code: "gmail_authorization_rejected",
+    retryable: false,
+    mailbox_operation_revision: 3,
+  };
+  harness.observeError({ code: "legacy_error" });
+  assert.equal(harness.current(), 2);
+  harness.observeError(failedReconnect);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 3 }), true);
 
   const listener = source.match(
     /listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/,
@@ -263,7 +286,17 @@ test("scheduled check events cannot overwrite a newer mailbox account operation"
         body.indexOf("refreshAfterMailMutation"),
       `${operation} must observe the mutation revision before refreshing health`,
     );
+    assert.match(
+      body,
+      /catch \(error\) \{\s*observeMailboxOperationRevisionFromError\(error\);[\s\S]*?loadHealth/,
+      `${operation} must observe failed mutation revisions before refreshing health`,
+    );
   }
+
+  assert.match(
+    source,
+    /function observeMailboxOperationRevisionFromError\(error: unknown\): void/,
+  );
 });
 
 test("label admission contract publishes exact Gmail authorization retry semantics", () => {

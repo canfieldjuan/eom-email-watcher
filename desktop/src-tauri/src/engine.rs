@@ -1275,10 +1275,17 @@ impl Engine {
                 "Email account operation revision is exhausted",
             )
         })?;
-        let mut result = operation()?;
         state.revision = next_revision;
-        stamp_revision(&mut result, next_revision);
-        Ok(result)
+        match operation() {
+            Ok(mut result) => {
+                stamp_revision(&mut result, next_revision);
+                Ok(result)
+            }
+            Err(mut error) => {
+                error.mailbox_operation_revision = Some(next_revision);
+                Err(error)
+            }
+        }
     }
 
     pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
@@ -1872,6 +1879,7 @@ mod tests {
     use std::fs;
     #[cfg(windows)]
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(windows)]
     use windows_sys::Win32::{
         Foundation::WAIT_TIMEOUT,
@@ -3127,6 +3135,13 @@ fi"#,
             .check_with_mailbox_revision()
             .expect_err("initial scheduled failure");
         assert_eq!(initial_failure.mailbox_operation_revision, Some(0));
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("startup account catalog establishes revision zero")
+                .mailbox_operation_revision,
+            0
+        );
 
         assert_eq!(
             engine
@@ -3135,62 +3150,164 @@ fi"#,
                 .mailbox_operation_revision,
             1
         );
-        assert_eq!(
-            engine
-                .reconnect_mail_account("gmail".into(), "fail".into(), None)
-                .expect_err("failed reconnect")
-                .code,
-            "gmail_authorization_rejected"
-        );
+        let failed_reconnect = engine
+            .reconnect_mail_account("gmail".into(), "fail".into(), None)
+            .expect_err("failed reconnect");
+        assert_eq!(failed_reconnect.code, "gmail_authorization_rejected");
+        assert_eq!(failed_reconnect.retryable, Some(false));
+        assert_eq!(failed_reconnect.mailbox_operation_revision, Some(2));
         assert_eq!(
             engine
                 .mail_accounts()
-                .expect("failed mutation leaves account revision unchanged")
+                .expect("failed mutation consumes its account revision")
                 .mailbox_operation_revision,
-            1
+            2
         );
         assert_eq!(
             engine
                 .reconnect_mail_account("gmail".into(), "gmail-default".into(), None)
                 .expect("reconnect account")
                 .mailbox_operation_revision,
-            2
+            3
         );
         assert_eq!(
             engine
                 .disconnect_mail_account("gmail".into(), "gmail-default".into())
                 .expect("disconnect account")
                 .mailbox_operation_revision,
-            3
+            4
         );
         assert_eq!(
             engine
                 .activate_mail_account("gmail".into(), "gmail-default".into())
                 .expect("activate account")
                 .mailbox_operation_revision,
-            4
+            5
         );
         assert_eq!(
             engine
                 .authorize_gmail()
                 .expect("authorize Gmail")
                 .mailbox_operation_revision,
-            5
+            6
         );
         assert_eq!(
             engine
                 .mail_accounts()
                 .expect("read stamped account catalog")
                 .mailbox_operation_revision,
-            5
+            6
         );
 
         let current_failure = engine
             .check_with_mailbox_revision()
             .expect_err("current scheduled failure");
-        assert_eq!(current_failure.mailbox_operation_revision, Some(5));
+        assert_eq!(current_failure.mailbox_operation_revision, Some(6));
         assert_eq!(current_failure.code, "gmail_authorization_rejected");
         assert_eq!(current_failure.retryable, Some(false));
+    }
+
+    #[test]
+    fn mailbox_mutation_error_after_partial_effect_consumes_and_stamps_revision() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let effect_ran = AtomicBool::new(false);
+
+        let error = engine
+            .complete_mailbox_mutation::<GmailAuthorization>(
+                || {
+                    effect_ran.store(true, Ordering::SeqCst);
+                    Err(EngineError {
+                        code: "gmail_authorization_rejected".into(),
+                        message: "safe reconnect failure".into(),
+                        retryable: Some(false),
+                        mailbox_operation_revision: None,
+                    })
+                },
+                |result, revision| result.mailbox_operation_revision = revision,
+            )
+            .expect_err("partial mutation must return its typed error");
+
+        assert!(effect_ran.load(Ordering::SeqCst));
+        assert_eq!(error.mailbox_operation_revision, Some(1));
+        assert_eq!(
+            serde_json::to_value(&error).expect("serialize typed mutation error"),
+            json!({
+                "code": "gmail_authorization_rejected",
+                "message": "safe reconnect failure",
+                "retryable": false,
+                "mailbox_operation_revision": 1,
+            })
+        );
+        assert_eq!(
+            engine
+                .mailbox_operation_gate
+                .lock()
+                .expect("mailbox state")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_mailbox_mutation_attempts_consume_distinct_revisions() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut attempts = Vec::new();
+        for succeeds in [true, false] {
+            let engine = engine.clone();
+            let start = Arc::clone(&start);
+            attempts.push(std::thread::spawn(move || {
+                start.wait();
+                engine.complete_mailbox_mutation(
+                    || {
+                        if succeeds {
+                            Ok(0_u64)
+                        } else {
+                            Err(EngineError::host("host_error", "mutation failed"))
+                        }
+                    },
+                    |result, revision| *result = revision,
+                )
+            }));
+        }
+        start.wait();
+
+        let mut revisions = attempts
+            .into_iter()
+            .map(|attempt| match attempt.join().expect("mutation thread") {
+                Ok(revision) => revision,
+                Err(error) => error
+                    .mailbox_operation_revision
+                    .expect("failed mutation revision"),
+            })
+            .collect::<Vec<_>>();
+        revisions.sort_unstable();
+        assert_eq!(revisions, [1, 2]);
+    }
+
+    #[test]
+    fn mailbox_mutation_revision_overflow_rejects_before_operation() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        engine
+            .mailbox_operation_gate
+            .lock()
+            .expect("mailbox state")
+            .revision = u64::MAX;
+        let effect_ran = AtomicBool::new(false);
+
+        let error = engine
+            .complete_mailbox_mutation(
+                || {
+                    effect_ran.store(true, Ordering::SeqCst);
+                    Ok(0_u64)
+                },
+                |result, revision| *result = revision,
+            )
+            .expect_err("revision exhaustion must fail closed");
+
+        assert_eq!(error.code, "host_error");
+        assert_eq!(error.mailbox_operation_revision, None);
+        assert!(!effect_ran.load(Ordering::SeqCst));
     }
 
     fn real_engine(config_path: PathBuf) -> Engine {

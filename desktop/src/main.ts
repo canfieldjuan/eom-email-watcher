@@ -950,6 +950,15 @@ function errorMessage(error: unknown): string {
   return "The watcher engine could not complete that request.";
 }
 
+function observeMailboxOperationRevisionFromError(error: unknown): void {
+  if (typeof error !== "object" || error === null || !("mailbox_operation_revision" in error)) {
+    return;
+  }
+  const revision = (error as { mailbox_operation_revision?: unknown })
+    .mailbox_operation_revision;
+  if (typeof revision === "number") observeMailboxOperationRevision(revision);
+}
+
 function errorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null || !("code" in error)) return null;
   const code = (error as { code?: unknown }).code;
@@ -2983,6 +2992,7 @@ async function connectMailProvider(provider: string): Promise<void> {
       : "Email account connected. Its saved mailbox position was preserved.";
     await refreshAfterMailMutation(message);
   } catch (error) {
+    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
     mailOperationInFlight = false;
@@ -3027,6 +3037,7 @@ async function submitMailServerConnection(): Promise<void> {
       : "Mail server connected. Its saved mailbox position was preserved.";
     await refreshAfterMailMutation(message);
   } catch (error) {
+    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
     mailOperationInFlight = false;
@@ -3050,6 +3061,7 @@ async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
     observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account reconnected. Its saved mailbox position was preserved.");
   } catch (error) {
+    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
     mailOperationInFlight = false;
@@ -3075,6 +3087,7 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
     observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Email account disconnected. Its local history was retained.");
   } catch (error) {
+    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
     mailOperationInFlight = false;
@@ -3096,6 +3109,7 @@ async function activateMailAccount(account: MailAccountStatus): Promise<void> {
     observeMailboxOperationRevision(result.mailbox_operation_revision);
     await refreshAfterMailMutation("Active email account changed.");
   } catch (error) {
+    observeMailboxOperationRevisionFromError(error);
     await loadHealth(errorMessage(error), "error");
   } finally {
     mailOperationInFlight = false;
