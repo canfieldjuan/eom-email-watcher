@@ -192,7 +192,7 @@ enum PlatformNotificationError {
     #[cfg(test)]
     AcceptancePending,
     Rejected,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     Unsupported,
 }
 
@@ -202,7 +202,7 @@ impl std::fmt::Display for PlatformNotificationError {
             #[cfg(test)]
             Self::AcceptancePending => "platform notification acceptance is pending",
             Self::Rejected => "platform notification was rejected",
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             Self::Unsupported => "platform notification acceptance is unsupported",
         };
         formatter.write_str(message)
@@ -238,15 +238,60 @@ impl PlatformNotificationSink for NativePlatformNotification {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+const WINDOWS_NOTIFICATION_APP_ID: &str = "com.canfieldjuan.email-watcher";
+
+#[cfg(windows)]
+trait WindowsToastTransport {
+    fn submit(&self, title: &str, body: &str) -> Result<(), ()>;
+}
+
+#[cfg(windows)]
+struct NativeWindowsToast;
+
+#[cfg(windows)]
+impl WindowsToastTransport for NativeWindowsToast {
+    fn submit(&self, title: &str, body: &str) -> Result<(), ()> {
+        tauri_winrt_notification::Toast::new(WINDOWS_NOTIFICATION_APP_ID)
+            .title(title)
+            .text1(body)
+            .show()
+            .map_err(|_| ())
+    }
+}
+
+#[cfg(windows)]
+fn submit_windows_notification(
+    transport: &impl WindowsToastTransport,
+    title: &str,
+    body: &str,
+) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
+    transport
+        .submit(title, body)
+        .map(|_| PlatformNotificationAccepted)
+        .map_err(|_| PlatformNotificationError::Rejected)
+}
+
+#[cfg(windows)]
+impl PlatformNotificationSink for NativePlatformNotification {
+    fn show(
+        &self,
+        title: &str,
+        body: &str,
+    ) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
+        submit_windows_notification(&NativeWindowsToast, title, body)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 impl PlatformNotificationSink for NativePlatformNotification {
     fn show(
         &self,
         _title: &str,
         _body: &str,
     ) -> Result<PlatformNotificationAccepted, PlatformNotificationError> {
-        // Windows acceptance remains deferred until it can be exercised on the target OS.
-        // Fail closed so the durable intent stays queued instead of claiming delivery.
+        // Product packaging currently targets Linux and Windows. Fail closed elsewhere so
+        // the durable intent stays queued instead of claiming delivery.
         Err(PlatformNotificationError::Unsupported)
     }
 }
@@ -277,7 +322,7 @@ impl NotificationProcess {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_command(program: impl Into<OsString>, args: Vec<OsString>) -> Self {
         Self {
             program: program.into(),
@@ -1166,12 +1211,50 @@ mod tests {
         assert_eq!(error, PlatformNotificationError::AcceptancePending);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     #[test]
     fn unproved_platform_notification_fails_closed() {
         assert_eq!(
             NativePlatformNotification.show("Watched sender", "Private local summary"),
             Err(PlatformNotificationError::Unsupported)
+        );
+    }
+
+    #[cfg(windows)]
+    struct FakeWindowsToast {
+        result: Result<(), ()>,
+    }
+
+    #[cfg(windows)]
+    impl WindowsToastTransport for FakeWindowsToast {
+        fn submit(&self, _title: &str, _body: &str) -> Result<(), ()> {
+            self.result
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_toast_success_maps_to_platform_acceptance() {
+        assert_eq!(
+            submit_windows_notification(
+                &FakeWindowsToast { result: Ok(()) },
+                "Watched sender",
+                "Private local summary",
+            ),
+            Ok(PlatformNotificationAccepted)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_toast_failure_maps_to_rejected_delivery() {
+        assert_eq!(
+            submit_windows_notification(
+                &FakeWindowsToast { result: Err(()) },
+                "Watched sender",
+                "Private local summary",
+            ),
+            Err(PlatformNotificationError::Rejected)
         );
     }
 

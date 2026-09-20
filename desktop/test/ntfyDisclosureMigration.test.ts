@@ -15,6 +15,9 @@ const schedulerSource = await readFile(
   new URL("../src-tauri/src/scheduler.rs", import.meta.url),
   "utf8",
 );
+const tauriConfig = JSON.parse(
+  await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+);
 const uiSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 
 const disclosureCopy =
@@ -75,7 +78,15 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
   assert.match(deliverySource, /notify_rust::Notification::new\(\)/);
   assert.match(
     deliverySource,
-    /cfg\(not\(target_os = "linux"\)\)[\s\S]*PlatformNotificationError::Unsupported/,
+    /tauri_winrt_notification::Toast::new\(WINDOWS_NOTIFICATION_APP_ID\)[\s\S]*\.show\(\)/,
+  );
+  assert.equal(
+    deliverySource.match(/WINDOWS_NOTIFICATION_APP_ID: &str = "([^"]+)"/)?.[1],
+    tauriConfig.identifier,
+  );
+  assert.match(
+    deliverySource,
+    /cfg\(not\(any\(target_os = "linux", windows\)\)\)[\s\S]*PlatformNotificationError::Unsupported/,
   );
   assert.doesNotMatch(deliverySource, /tauri_plugin_notification::NotificationExt/);
   assert.match(deliverySource, /self\.lock\.try_lock\(\)/);

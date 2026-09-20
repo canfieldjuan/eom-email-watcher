@@ -967,6 +967,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
+ "tauri-winrt-notification",
  "tempfile",
  "windows-sys 0.61.2",
 ]
