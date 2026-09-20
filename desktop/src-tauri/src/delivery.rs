@@ -1,4 +1,7 @@
-use crate::engine::{CancellationToken, CheckResult, Engine, EngineError, NotificationIntent};
+use crate::engine::{
+    CancellationParticipant, CancellationRegistration, CancellationToken, CheckResult, Engine,
+    EngineError, NotificationIntent,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -323,9 +326,89 @@ fn deliver_platform_notification(
     sink.show(&request.title, &request.body).map(|_| ())
 }
 
+#[derive(Clone)]
 struct NotificationProcess {
     program: OsString,
     args: Vec<OsString>,
+}
+
+struct NotificationChildControl {
+    child: Mutex<Option<Child>>,
+}
+
+impl NotificationChildControl {
+    fn take_stdin(&self) -> io::Result<Option<std::process::ChildStdin>> {
+        self.child
+            .lock()
+            .map_err(|_| io::Error::other("Notification helper process is unavailable"))
+            .map(|mut child| child.as_mut().and_then(|child| child.stdin.take()))
+    }
+
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .lock()
+            .map_err(|_| io::Error::other("Notification helper process is unavailable"))?
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Notification helper process is unavailable"))?
+            .try_wait()
+    }
+
+    fn stop_and_reap(&self) -> io::Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("Notification helper process is unavailable"))?;
+        let Some(child) = child.as_mut() else {
+            return Ok(());
+        };
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if let Err(kill_error) = child.kill()
+            && child.try_wait()?.is_none()
+        {
+            return Err(kill_error);
+        }
+        child.wait().map(|_| ())
+    }
+}
+
+impl CancellationParticipant for NotificationChildControl {
+    fn cancel_and_wait(&self) {
+        let _ = self.stop_and_reap();
+    }
+}
+
+struct NotificationChild {
+    control: Arc<NotificationChildControl>,
+    _registration: Option<CancellationRegistration>,
+}
+
+impl NotificationChild {
+    fn register(child: Child, deadline: &DeliveryDeadline) -> Self {
+        let control = Arc::new(NotificationChildControl {
+            child: Mutex::new(Some(child)),
+        });
+        let registration = deadline.shutdown.as_ref().map(|cancellation| {
+            cancellation.register(Arc::clone(&control) as Arc<dyn CancellationParticipant>)
+        });
+        Self {
+            control,
+            _registration: registration,
+        }
+    }
+
+    fn take_stdin(&self) -> io::Result<Option<std::process::ChildStdin>> {
+        self.control.take_stdin()
+    }
+
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.control.try_wait()
+    }
+
+    fn stop_and_reap(&self) -> io::Result<()> {
+        self.control.stop_and_reap()
+    }
 }
 
 impl NotificationProcess {
@@ -348,18 +431,6 @@ impl NotificationProcess {
             program: program.into(),
             args,
         }
-    }
-
-    fn stop_and_reap(child: &mut Child) -> io::Result<()> {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        if let Err(kill_error) = child.kill()
-            && child.try_wait()?.is_none()
-        {
-            return Err(kill_error);
-        }
-        child.wait().map(|_| ())
     }
 
     fn join_input(
@@ -410,7 +481,7 @@ impl NotificationSink for NotificationProcess {
             ));
         }
 
-        let mut child = Command::new(&self.program)
+        let child = Command::new(&self.program)
             .args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -422,8 +493,19 @@ impl NotificationSink for NotificationProcess {
                     "The desktop notification helper could not be started",
                 )
             })?;
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = Self::stop_and_reap(&mut child);
+        let child = NotificationChild::register(child, deadline);
+        if let Err(error) = deadline.check() {
+            let _ = child.stop_and_reap();
+            return Err(error);
+        }
+        let Some(mut stdin) = child.take_stdin().map_err(|_| {
+            EngineError::host(
+                "notification_error",
+                "The desktop notification helper input is unavailable",
+            )
+        })?
+        else {
+            let _ = child.stop_and_reap();
             return Err(EngineError::host(
                 "notification_error",
                 "The desktop notification helper input is unavailable",
@@ -435,7 +517,7 @@ impl NotificationSink for NotificationProcess {
         let mut input = match input {
             Ok(input) => Some(input),
             Err(_) => {
-                let _ = Self::stop_and_reap(&mut child);
+                let _ = child.stop_and_reap();
                 return Err(EngineError::host(
                     "notification_error",
                     "The desktop notification helper input worker could not start",
@@ -461,7 +543,7 @@ impl NotificationSink for NotificationProcess {
                         thread::sleep(remaining.min(NOTIFICATION_PROCESS_POLL));
                     }
                     Err(error) => {
-                        if Self::stop_and_reap(&mut child).is_err() {
+                        if child.stop_and_reap().is_err() {
                             let _ = Self::join_input(&mut input);
                             return Err(EngineError::host(
                                 "notification_error",
@@ -473,7 +555,7 @@ impl NotificationSink for NotificationProcess {
                     }
                 },
                 Err(_) => {
-                    let _ = Self::stop_and_reap(&mut child);
+                    let _ = child.stop_and_reap();
                     let _ = Self::join_input(&mut input);
                     return Err(EngineError::host(
                         "notification_error",
@@ -616,9 +698,30 @@ fn coordinated_result(
 #[derive(Clone, Default)]
 pub struct NotificationDelivery {
     lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    notification_process: Option<NotificationProcess>,
 }
 
 impl NotificationDelivery {
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_notification_command(
+        program: impl Into<OsString>,
+        args: Vec<OsString>,
+    ) -> Self {
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            notification_process: Some(NotificationProcess::with_command(program, args)),
+        }
+    }
+
+    fn notification_process(&self) -> Result<NotificationProcess, EngineError> {
+        #[cfg(test)]
+        if let Some(process) = self.notification_process.as_ref() {
+            return Ok(process.clone());
+        }
+        NotificationProcess::production()
+    }
+
     fn lock_until(&self, deadline: &DeliveryDeadline) -> Result<MutexGuard<'_, ()>, EngineError> {
         loop {
             deadline.check()?;
@@ -689,7 +792,7 @@ impl NotificationDelivery {
         deadline: &DeliveryDeadline,
     ) -> Result<DeliveryOutcome, EngineError> {
         let queue = DeadlineQueue { engine, deadline };
-        let sink = NotificationProcess::production()?;
+        let sink = self.notification_process()?;
         self.run_exclusive_until(deadline, |_| {
             deadline
                 .bounded_engine(engine)?
@@ -728,7 +831,7 @@ impl NotificationDelivery {
         deadline: &DeliveryDeadline,
     ) -> Result<CoordinatedCheck, EngineError> {
         let queue = DeadlineQueue { engine, deadline };
-        let sink = NotificationProcess::production()?;
+        let sink = self.notification_process()?;
         self.run_exclusive_until(deadline, |_| {
             let check = queue.check();
             let delivery = deadline
@@ -1225,6 +1328,47 @@ mod tests {
                 .expect("manual delivery remains usable after helper timeout"),
             "manual"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_registry_kills_and_reaps_notification_helper() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let pid_path = directory.path().join("registered-notification.pid");
+        let notifier = NotificationProcess::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from("registered-notification-probe"),
+                pid_path.as_os_str().to_owned(),
+            ],
+        );
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            notifier.show(
+                &intent("message-1"),
+                &DeliveryDeadline::with_cancellation(Duration::from_secs(30), worker_cancellation),
+            )
+        });
+        let mut process_id = None;
+        for _ in 0..200 {
+            if let Ok(value) = std::fs::read_to_string(&pid_path)
+                && let Ok(parsed_process_id) = value.trim().parse::<i32>()
+            {
+                process_id = Some(parsed_process_id);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let process_id = process_id.expect("notification helper records process id");
+
+        cancellation.cancel();
+        cancellation.wait_for_registrations();
+
+        assert!(worker.join().expect("notification worker joins").is_err());
+        assert_ne!(unsafe { libc::kill(process_id, 0) }, 0);
     }
 
     #[test]

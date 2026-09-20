@@ -16,7 +16,6 @@ pub const CONNECT_QUEUE_EVENT: &str = "watcher://connect-queue";
 const MAX_SLEEP_SLICE: Duration = Duration::from_secs(30);
 const SCHEDULED_ENGINE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CONNECT_QUEUE_ERROR_RETRY: Duration = Duration::from_secs(30);
-const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -188,16 +187,17 @@ impl OwnedWorker {
         let Some(registration) = registration else {
             return Ok(());
         };
-        match registration.completed.recv_timeout(WORKER_SHUTDOWN_GRACE) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => registration
-                .handle
-                .join()
-                .map_err(|_| io::Error::other(format!("{label} stopped unexpectedly"))),
-            Err(RecvTimeoutError::Timeout) => {
-                eprintln!("fatal: {label} did not stop within the owned worker shutdown deadline");
-                std::process::abort();
-            }
+        let completed = registration.completed.recv();
+        let joined = registration
+            .handle
+            .join()
+            .map_err(|_| io::Error::other(format!("{label} stopped unexpectedly")));
+        if completed.is_err() {
+            return Err(io::Error::other(format!(
+                "{label} completion signal was unavailable"
+            )));
         }
+        joined
     }
 
     #[cfg(all(test, unix))]
@@ -363,8 +363,10 @@ impl ConnectQueueScheduler {
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
-        self.gate.cancellation().cancel();
+        let cancellation = self.gate.cancellation();
+        cancellation.cancel();
         self.signal_stop();
+        cancellation.wait_for_registrations();
         self.join()
     }
 
@@ -572,8 +574,10 @@ impl PollScheduler {
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
-        self.gate.cancellation().cancel();
+        let cancellation = self.gate.cancellation();
+        cancellation.cancel();
         self.signal_stop();
+        cancellation.wait_for_registrations();
         self.join()
     }
 
@@ -751,6 +755,38 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{
         worker.join().expect("staged worker joins");
 
         assert_eq!(work.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owned_worker_waits_for_slow_cancel_cleanup_without_aborting() {
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (cleaned_sender, cleaned_receiver) = mpsc::sync_channel(1);
+        let worker = OwnedWorker::default();
+        worker
+            .spawn("slow-cancel-cleanup-probe", move || {
+                started_sender.send(()).expect("signal worker start");
+                while !worker_cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                thread::sleep(Duration::from_millis(2_100));
+                cleaned_sender.send(()).expect("signal cleanup");
+            })
+            .expect("spawn slow cleanup probe");
+        started_receiver.recv().expect("worker started");
+
+        let started = std::time::Instant::now();
+        cancellation.cancel();
+        worker
+            .join("Slow cleanup probe")
+            .expect("slow cleanup joins");
+
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(
+            cleaned_receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(())
+        );
     }
 
     #[test]

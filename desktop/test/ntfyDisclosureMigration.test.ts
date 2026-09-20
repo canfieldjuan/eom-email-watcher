@@ -165,10 +165,13 @@ test("admitted startup opens the populated application while held states alone f
 
 test("scheduler shutdown cancellation reaches queue, delivery, and engine children", () => {
   assert.match(engineSource, /struct CancellationToken/);
+  assert.match(engineSource, /struct CancellationRegistration/);
+  assert.match(engineSource, /wait_for_registrations/);
   assert.match(engineSource, /with_cancellation/);
   assert.match(engineSource, /cancellation\.is_cancelled\(\)[\s\S]*child\.terminate\(\)/);
   assert.match(libSource, /self\.cancellation\.cancel\(\)/);
   assert.match(schedulerSource, /pump_connect_queue/);
   assert.match(schedulerSource, /check_and_deliver_with_cancellation/);
   assert.match(deliverySource, /check_and_deliver_with_cancellation/);
+  assert.doesNotMatch(schedulerSource, /process::abort/);
 });

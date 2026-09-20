@@ -410,8 +410,10 @@ impl StartupDeliveryWorker {
     }
 
     fn shutdown(&self) -> std::io::Result<()> {
-        self.gate.cancellation().cancel();
+        let cancellation = self.gate.cancellation();
+        cancellation.cancel();
         self.signal_stop();
+        cancellation.wait_for_registrations();
         self.join()
     }
 
@@ -488,6 +490,7 @@ impl Drop for AdmissionWorkers {
         self.startup_delivery.signal_stop();
         self.scheduler.signal_stop();
         self.connect_queue.signal_stop();
+        self.cancellation.wait_for_registrations();
         if let Err(error) = self.startup_delivery.join() {
             eprintln!("Startup notification delivery worker could not stop cleanly: {error}");
         }
@@ -1528,7 +1531,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn successful_delivery_engine() -> Engine {
+    fn successful_delivery_engine(lock_path: &Path, ack_path: &Path, log_path: &Path) -> Engine {
         Engine::with_command(
             "sh",
             vec![
@@ -1536,15 +1539,35 @@ mod tests {
                 OsString::from(
                     r#"request=$(cat)
 case "$request" in
+  *host.operation_lock*)
+    printf '%s\n' 'host.operation_lock' >> "$3"
+    printf '%s\n' "{\"protocol\":1,\"ok\":true,\"operation\":\"host.operation_lock\",\"data\":{\"path\":\"$1\"}}"
+    ;;
   *notifications.pending_under_host_lock*)
-    printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.pending_under_host_lock","data":{"items":[]}}'
+    printf '%s\n' 'notifications.pending_under_host_lock' >> "$3"
+    if [ -f "$2" ]; then
+      printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.pending_under_host_lock","data":{"items":[]}}'
+    else
+      printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.pending_under_host_lock","data":{"items":[{"analysis_at":null,"body":"Private local summary","kind":"watched_sender","message_id":"message-1","priority":"default","revision":null,"subject_id":null,"subject_type":null,"title":"Watched sender"}]}}'
+    fi
+    ;;
+  *notifications.ack*)
+    printf '%s\n' 'notifications.ack' >> "$3"
+    : > "$2"
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.ack","data":{"status":"acknowledged"}}'
     ;;
   *notifications.count_under_host_lock*)
-    printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'
+    printf '%s\n' 'notifications.count_under_host_lock' >> "$3"
+    if [ -f "$2" ]; then count=0; else count=1; fi
+    printf '%s\n' "{\"protocol\":1,\"ok\":true,\"operation\":\"notifications.count_under_host_lock\",\"data\":{\"count\":$count}}"
     ;;
   *) exit 2 ;;
 esac"#,
                 ),
+                OsString::from("successful-startup-delivery-fixture"),
+                lock_path.as_os_str().to_owned(),
+                ack_path.as_os_str().to_owned(),
+                log_path.as_os_str().to_owned(),
             ],
             "unused.toml".into(),
         )
@@ -1742,15 +1765,64 @@ esac"#,
             .run_exclusive_with_timeout(Duration::from_millis(100), |_| Ok(()))
             .expect("delivery lock is released after startup shutdown");
 
+        let lock_path = directory.path().join("operation.lock");
+        let ack_path = directory.path().join("acknowledged");
+        let operation_log = directory.path().join("operations.log");
+        let accepted_log = directory.path().join("accepted.log");
+        let fixture_delivery = NotificationDelivery::with_notification_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; printf '%s\\n' accepted >> \"$1\""),
+                OsString::from("successful-notification-fixture"),
+                accepted_log.as_os_str().to_owned(),
+            ],
+        );
         let restarted = StartupDeliveryWorker::stage(
-            successful_delivery_engine(),
-            delivery,
+            successful_delivery_engine(&lock_path, &ack_path, &operation_log),
+            fixture_delivery.clone(),
             CancellationToken::new(),
         )
         .expect("stage fresh startup delivery");
         restarted.activate();
         restarted.join().expect("fresh startup delivery joins");
         assert!(restarted.is_joined());
+        assert!(ack_path.is_file(), "accepted notification is acknowledged");
+        assert_eq!(
+            fs::read_to_string(&accepted_log).expect("read platform acceptance log"),
+            "accepted\n"
+        );
+
+        let subsequent = StartupDeliveryWorker::stage(
+            successful_delivery_engine(&lock_path, &ack_path, &operation_log),
+            fixture_delivery,
+            CancellationToken::new(),
+        )
+        .expect("stage subsequent startup delivery");
+        subsequent.activate();
+        subsequent
+            .join()
+            .expect("subsequent startup delivery joins");
+        assert!(subsequent.is_joined());
+        assert_eq!(
+            fs::read_to_string(&accepted_log).expect("read deduplicated acceptance log"),
+            "accepted\n"
+        );
+        let operations = fs::read_to_string(&operation_log).expect("read engine operation log");
+        assert_eq!(operations.matches("host.operation_lock").count(), 2);
+        assert_eq!(
+            operations
+                .matches("notifications.pending_under_host_lock")
+                .count(),
+            2
+        );
+        assert_eq!(operations.matches("notifications.ack").count(), 1);
+        assert_eq!(
+            operations
+                .matches("notifications.count_under_host_lock")
+                .count(),
+            2
+        );
     }
 
     #[cfg(unix)]

@@ -7,8 +7,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{
-    Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError,
-    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex, MutexGuard, TryLockError as MutexTryLockError,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -42,9 +42,49 @@ const PROTOCOL_VERSION: u8 = 1;
 const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
 
+pub(crate) trait CancellationParticipant: Send + Sync {
+    fn cancel_and_wait(&self);
+}
+
+#[derive(Default)]
+struct CancellationRegistry {
+    next_id: AtomicU64,
+    participants: Mutex<BTreeMap<u64, Arc<dyn CancellationParticipant>>>,
+    empty: Condvar,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    registry: CancellationRegistry,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<CancellationState>,
+}
+
+pub(crate) struct CancellationRegistration {
+    state: Arc<CancellationState>,
+    id: Option<u64>,
+}
+
+impl Drop for CancellationRegistration {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        participants.remove(&id);
+        if participants.is_empty() {
+            self.state.registry.empty.notify_all();
+        }
+    }
 }
 
 impl CancellationToken {
@@ -53,11 +93,68 @@ impl CancellationToken {
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        let participants: Vec<_> = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for participant in participants {
+            participant.cancel_and_wait();
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn register(
+        &self,
+        participant: Arc<dyn CancellationParticipant>,
+    ) -> CancellationRegistration {
+        let id = self.state.registry.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = self.is_cancelled();
+        let id = if cancelled {
+            None
+        } else {
+            participants.insert(id, Arc::clone(&participant));
+            Some(id)
+        };
+        drop(participants);
+        if cancelled {
+            participant.cancel_and_wait();
+        }
+        CancellationRegistration {
+            state: Arc::clone(&self.state),
+            id,
+        }
+    }
+
+    pub(crate) fn wait_for_registrations(&self) {
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !participants.is_empty() {
+            participants = self
+                .state
+                .registry
+                .empty
+                .wait(participants)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -232,13 +329,13 @@ fn resume_suspended_process(process_id: u32) -> io::Result<()> {
     }
 }
 
-struct EngineChild {
+struct EngineChildProcess {
     process: Child,
     #[cfg(windows)]
     job: WindowsJob,
 }
 
-impl EngineChild {
+impl EngineChildProcess {
     fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
@@ -250,10 +347,7 @@ impl EngineChild {
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let process = command.spawn()?;
         #[cfg(windows)]
-        let process = match job
-            .assign(&process)
-            .and_then(|()| resume_suspended_process(process.id()))
-        {
+        let process = match job.assign(&process) {
             Ok(()) => process,
             Err(error) => {
                 let mut process = process;
@@ -287,6 +381,14 @@ impl EngineChild {
         let _ = self.process.wait();
     }
 
+    #[cfg(windows)]
+    fn resume(&mut self) -> io::Result<()> {
+        if self.process.try_wait()?.is_none() {
+            resume_suspended_process(self.process.id())?;
+        }
+        Ok(())
+    }
+
     fn wait_with_output(self) -> io::Result<Output> {
         #[cfg(windows)]
         {
@@ -303,6 +405,91 @@ impl EngineChild {
         {
             self.process.wait_with_output()
         }
+    }
+}
+
+struct EngineChildControl {
+    process: Mutex<Option<EngineChildProcess>>,
+}
+
+impl EngineChildControl {
+    fn with_process<T>(
+        &self,
+        operation: impl FnOnce(&mut EngineChildProcess) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_| io::Error::other("Engine child process is unavailable"))?;
+        let process = process
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
+        operation(process)
+    }
+
+    fn terminate(&self) {
+        if let Ok(mut process) = self.process.lock()
+            && let Some(process) = process.as_mut()
+        {
+            process.terminate();
+        }
+    }
+}
+
+impl CancellationParticipant for EngineChildControl {
+    fn cancel_and_wait(&self) {
+        self.terminate();
+    }
+}
+
+struct EngineChild {
+    control: Arc<EngineChildControl>,
+    _registration: Option<CancellationRegistration>,
+}
+
+impl EngineChild {
+    fn spawn(command: &mut Command, cancellation: Option<&CancellationToken>) -> io::Result<Self> {
+        let process = EngineChildProcess::spawn(command)?;
+        let control = Arc::new(EngineChildControl {
+            process: Mutex::new(Some(process)),
+        });
+        let registration = cancellation.map(|cancellation| {
+            cancellation.register(Arc::clone(&control) as Arc<dyn CancellationParticipant>)
+        });
+        #[cfg(windows)]
+        if let Err(error) = control.with_process(EngineChildProcess::resume) {
+            control.terminate();
+            return Err(error);
+        }
+        Ok(Self {
+            control,
+            _registration: registration,
+        })
+    }
+
+    fn take_stdin(&self) -> io::Result<Option<std::process::ChildStdin>> {
+        self.control
+            .with_process(|process| Ok(process.process.stdin.take()))
+    }
+
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.control
+            .with_process(|process| process.process.try_wait())
+    }
+
+    fn terminate(&self) {
+        self.control.terminate();
+    }
+
+    fn wait_with_output(self) -> io::Result<Output> {
+        let process = self
+            .control
+            .process
+            .lock()
+            .map_err(|_| io::Error::other("Engine child process is unavailable"))?
+            .take()
+            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
+        process.wait_with_output()
     }
 }
 
@@ -1662,7 +1849,7 @@ impl Engine {
         command.envs(self.test_environment.iter().cloned());
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = EngineChild::spawn(&mut command).map_err(|_| {
+        let child = EngineChild::spawn(&mut command, self.cancellation.as_ref()).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
                 "Watcher engine is unavailable; reinstall it or inspect desktop logs",
@@ -1670,9 +1857,8 @@ impl Engine {
         })?;
 
         let write_result = child
-            .process
-            .stdin
-            .take()
+            .take_stdin()
+            .map_err(|_| EngineError::host("host_error", "Engine stdin was unavailable"))?
             .ok_or_else(|| EngineError::host("host_error", "Engine stdin was unavailable"))
             .and_then(|mut stdin| {
                 stdin.write_all(&encoded).map_err(|_| {
@@ -1696,7 +1882,7 @@ impl Engine {
                     child.terminate();
                     return Err(engine_cancelled());
                 }
-                match child.process.try_wait() {
+                match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) => {
                         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
@@ -1836,6 +2022,38 @@ mod tests {
 
         drop(active);
         HostOperationLock::acquire(&path).expect("released lock is reusable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_wins_spawn_registration_race_and_reaps_child() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]).process_group(0);
+
+        let child = EngineChild::spawn(&mut command, Some(&cancellation))
+            .expect("spawn child into cancelled registry");
+
+        assert!(child.try_wait().expect("inspect cancelled child").is_some());
+        drop(child);
+        cancellation.wait_for_registrations();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_synchronously_kills_and_reaps_registered_child() {
+        let cancellation = CancellationToken::new();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]).process_group(0);
+        let child =
+            EngineChild::spawn(&mut command, Some(&cancellation)).expect("spawn registered child");
+
+        cancellation.cancel();
+
+        assert!(child.try_wait().expect("inspect reaped child").is_some());
+        drop(child);
+        cancellation.wait_for_registrations();
     }
 
     #[test]
