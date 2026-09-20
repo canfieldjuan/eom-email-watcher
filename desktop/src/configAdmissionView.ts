@@ -10,6 +10,13 @@ export function configAdmissionView(status: {
   return status.state === "admitted" ? "inbox" : "settings";
 }
 
+export function isCurrentConfigInitializationResult(
+  resultGeneration: number,
+  currentGeneration: number,
+): boolean {
+  return resultGeneration === currentGeneration;
+}
+
 export async function reconcileConfigAdmissionRefresh<T>(options: {
   currentGeneration: () => number;
   request: () => Promise<T>;

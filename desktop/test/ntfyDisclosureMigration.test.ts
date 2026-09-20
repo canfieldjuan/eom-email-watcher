@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   configAdmissionView,
+  isCurrentConfigInitializationResult,
   reconcileConfigAdmissionRefresh,
 } from "../src/configAdmissionView.ts";
 
@@ -237,6 +238,16 @@ test("newer admission generation suppresses a stale refresh failure", async () =
   assert.match(
     uiSource,
     /reconcileConfigAdmissionRefresh\(\{[\s\S]*currentGeneration: \(\) => configAdmissionGeneration,[\s\S]*request: \(\) => invoke<ConfigAdmissionStatus>\("config_admission_status"\),[\s\S]*renderStatus: renderConfigAdmission,[\s\S]*renderFailure:[\s\S]*renderConfigAdmissionState\(\{ state: "manual_repair_required" \}\)/,
+  );
+});
+
+test("initialization success copy requires the exact current admission generation", () => {
+  assert.equal(isCurrentConfigInitializationResult(7, 7), true);
+  assert.equal(isCurrentConfigInitializationResult(6, 7), false);
+  assert.equal(isCurrentConfigInitializationResult(8, 7), false);
+  assert.match(
+    uiSource,
+    /status\.state === "admitted"[\s\S]*isCurrentConfigInitializationResult\(status\.generation, configAdmissionGeneration\)[\s\S]*Configuration created\./,
   );
 });
 

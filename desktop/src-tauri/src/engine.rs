@@ -1253,7 +1253,7 @@ pub struct NotificationIntent {
     pub title: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LocalModelSettings {
     #[serde(default)]
     pub editable: bool,
@@ -1261,13 +1261,15 @@ pub struct LocalModelSettings {
     pub model: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
     pub local_model: LocalModelSettings,
     pub notifications_enabled: bool,
     pub poll_interval_minutes: u64,
     pub polling_supported: bool,
     pub retention_days: u64,
+    #[serde(default)]
+    pub timezone: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1336,6 +1338,18 @@ struct NtfyDisclosureAcknowledgement {
 pub struct EngineError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigInitializationFailureClass {
+    Definitive,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy)]
+enum EngineRequestCommitRisk {
+    None,
+    ConfigInitialization,
 }
 
 #[derive(Serialize)]
@@ -1425,6 +1439,26 @@ impl EngineError {
             );
         }
         self
+    }
+
+    pub(crate) fn config_initialization_failure_class(&self) -> ConfigInitializationFailureClass {
+        if self.code == "outcome_unknown" {
+            ConfigInitializationFailureClass::OutcomeUnknown
+        } else {
+            ConfigInitializationFailureClass::Definitive
+        }
+    }
+}
+
+impl EngineRequestCommitRisk {
+    fn map_post_dispatch(self, error: EngineError) -> EngineError {
+        match self {
+            Self::None => error,
+            Self::ConfigInitialization => EngineError::host(
+                "outcome_unknown",
+                "Watcher configuration initialization may have completed; refresh admission before retrying",
+            ),
+        }
     }
 }
 
@@ -1958,13 +1992,15 @@ impl Engine {
         model_base_url: String,
         model_name: String,
     ) -> Result<ConfigInitialization, EngineError> {
-        self.request(
+        self.request_inner(
             "config.initialize",
             json!({
                 "model_base_url": model_base_url,
                 "model_name": model_name,
                 "timezone": timezone,
             }),
+            self.request_timeout,
+            EngineRequestCommitRisk::ConfigInitialization,
         )
     }
 
@@ -2077,7 +2113,12 @@ impl Engine {
 
     pub fn check(&self) -> Result<CheckResult, EngineError> {
         let (_guard, remaining) = self.mailbox_operation_lock()?;
-        self.request_inner("watcher.check", json!({"dry_run": false}), remaining)
+        self.request_inner(
+            "watcher.check",
+            json!({"dry_run": false}),
+            remaining,
+            EngineRequestCommitRisk::None,
+        )
     }
 
     pub(crate) fn run_with_operation_lock<T>(
@@ -2153,7 +2194,12 @@ impl Engine {
         operation: &str,
         payload: Value,
     ) -> Result<T, EngineError> {
-        self.request_inner(operation, payload, self.request_timeout)
+        self.request_inner(
+            operation,
+            payload,
+            self.request_timeout,
+            EngineRequestCommitRisk::None,
+        )
     }
 
     fn request_with_timeout<T: DeserializeOwned>(
@@ -2162,7 +2208,12 @@ impl Engine {
         payload: Value,
         timeout: Duration,
     ) -> Result<T, EngineError> {
-        self.request_inner(operation, payload, Some(timeout))
+        self.request_inner(
+            operation,
+            payload,
+            Some(timeout),
+            EngineRequestCommitRisk::None,
+        )
     }
 
     fn request_inner<T: DeserializeOwned>(
@@ -2170,6 +2221,7 @@ impl Engine {
         operation: &str,
         payload: Value,
         timeout: Option<Duration>,
+        commit_risk: EngineRequestCommitRisk,
     ) -> Result<T, EngineError> {
         self.check_cancellation()?;
         let admission_binding = if operation_requires_admission_token(operation) {
@@ -2239,66 +2291,69 @@ impl Engine {
                 && cancellation.is_cancelled()
             {
                 child.terminate();
-                return Err(engine_cancelled());
+                return Err(commit_risk.map_post_dispatch(engine_cancelled()));
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         child.terminate();
-                        return Err(EngineError::host(
+                        return Err(commit_risk.map_post_dispatch(EngineError::host(
                             "engine_timeout",
                             "Watcher engine did not respond before its timeout",
-                        ));
+                        )));
                     }
                     std::thread::sleep(ENGINE_PIPE_POLL);
                 }
                 Err(_) => {
                     child.terminate();
-                    return Err(EngineError::host(
+                    return Err(commit_risk.map_post_dispatch(EngineError::host(
                         "engine_unavailable",
                         "Watcher engine status could not be inspected",
-                    ));
+                    )));
                 }
             }
         };
 
         let output = child
             .collect_output(status, self.cancellation.as_ref(), deadline)
-            .map_err(|error| match error {
-                EngineOutputError::Cancelled => engine_cancelled(),
-                EngineOutputError::TimedOut => EngineError::host(
-                    "engine_timeout",
-                    "Watcher engine did not respond before its timeout",
-                ),
-                EngineOutputError::StdoutTooLarge | EngineOutputError::StderrTooLarge => {
-                    EngineError::host(
-                        "engine_protocol_error",
-                        "Watcher engine returned an invalid response; inspect desktop logs",
-                    )
-                }
-                EngineOutputError::Io => EngineError::host(
-                    "engine_unavailable",
-                    "Watcher engine did not return a result",
-                ),
+            .map_err(|error| {
+                let error = match error {
+                    EngineOutputError::Cancelled => engine_cancelled(),
+                    EngineOutputError::TimedOut => EngineError::host(
+                        "engine_timeout",
+                        "Watcher engine did not respond before its timeout",
+                    ),
+                    EngineOutputError::StdoutTooLarge | EngineOutputError::StderrTooLarge => {
+                        EngineError::host(
+                            "engine_protocol_error",
+                            "Watcher engine returned an invalid response; inspect desktop logs",
+                        )
+                    }
+                    EngineOutputError::Io => EngineError::host(
+                        "engine_unavailable",
+                        "Watcher engine did not return a result",
+                    ),
+                };
+                commit_risk.map_post_dispatch(error)
             })?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
             eprintln!("watcher engine {operation} stderr: {}", stderr.trim());
         }
         let envelope: EngineEnvelope<T> = serde_json::from_slice(&output.stdout).map_err(|_| {
-            EngineError::host(
+            commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned an invalid response; inspect desktop logs",
-            )
+            ))
         })?;
 
         if envelope.protocol != PROTOCOL_VERSION || envelope.operation.as_deref() != Some(operation)
         {
-            return Err(EngineError::host(
+            return Err(commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned a mismatched response",
-            ));
+            )));
         }
         if !envelope.ok {
             let error = envelope.error.unwrap_or_else(|| {
@@ -2319,16 +2374,16 @@ impl Engine {
             return Err(error.for_frontend());
         }
         if !output.status.success() {
-            return Err(EngineError::host(
+            return Err(commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine reported success with a failing exit status",
-            ));
+            )));
         }
         envelope.data.ok_or_else(|| {
-            EngineError::host(
+            commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine omitted response data",
-            )
+            ))
         })
     }
 }
@@ -3299,6 +3354,60 @@ esac"#,
 
     #[cfg(unix)]
     #[test]
+    fn config_initialize_lost_reply_is_structured_as_outcome_unknown() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![OsString::from("-c"), OsString::from("cat >/dev/null")],
+            PathBuf::from("unused.toml"),
+        );
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+            )
+            .expect_err("missing post-dispatch reply has an unknown outcome");
+
+        assert_eq!(error.code, "outcome_unknown");
+        assert_eq!(
+            error.config_initialization_failure_class(),
+            ConfigInitializationFailureClass::OutcomeUnknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_preserves_structured_conflict_response() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":false,"operation":"config.initialize","error":{"code":"conflict","message":"Configuration already exists"}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+            )
+            .expect_err("engine conflict is definitive");
+
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            error.config_initialization_failure_class(),
+            ConfigInitializationFailureClass::Definitive
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn admission_compare_false_fails_closed() {
         let engine = Engine::with_command(
             "sh",
@@ -3735,6 +3844,7 @@ esac"#,
                     poll_interval_minutes: 120,
                     polling_supported: true,
                     retention_days: 180,
+                    timezone: "UTC".into(),
                 },
             }
         );
@@ -3866,6 +3976,7 @@ notifications_enabled = true
                 poll_interval_minutes: 120,
                 polling_supported: true,
                 retention_days: 180,
+                timezone: "UTC".into(),
             }
         );
         assert_eq!(
@@ -3895,6 +4006,7 @@ notifications_enabled = true
                 poll_interval_minutes: 45,
                 polling_supported: true,
                 retention_days: 365,
+                timezone: "UTC".into(),
             }
         );
         assert_eq!(
@@ -3909,6 +4021,7 @@ notifications_enabled = true
                 poll_interval_minutes: 45,
                 polling_supported: true,
                 retention_days: 365,
+                timezone: "UTC".into(),
             }
         );
         let refreshed_admission = engine

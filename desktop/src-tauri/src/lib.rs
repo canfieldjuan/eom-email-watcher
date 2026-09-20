@@ -5,11 +5,11 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     AdmissionErrorObserver, AdmissionToken, CalendarConsentProfile, CalendarConsentStatus,
-    CalendarDecisionResult, CancellationToken, CheckResult, ConnectCapabilities,
-    ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
-    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus,
-    InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, WatchedSender,
+    CalendarDecisionResult, CancellationToken, CheckResult, ConfigInitialization,
+    ConfigInitializationFailureClass, ConnectCapabilities, ConnectCapabilityRef,
+    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -280,6 +280,59 @@ impl ConfigAdmissionUpdate {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigInitializationIntent {
+    timezone: String,
+    model_base_url: String,
+    model_name: String,
+}
+
+impl ConfigInitializationIntent {
+    fn new(timezone: String, model_base_url: String, model_name: String) -> Self {
+        Self {
+            timezone,
+            model_base_url,
+            model_name,
+        }
+    }
+
+    fn verify(&self, settings: &EngineSettings) -> Result<(), EngineError> {
+        let matches = settings.timezone == self.timezone.trim()
+            && settings.local_model.endpoint == self.model_base_url.trim_end_matches('/')
+            && settings.local_model.model == self.model_name.trim()
+            && settings.local_model.editable
+            && settings.notifications_enabled
+            && settings.poll_interval_minutes == 120
+            && settings.retention_days == 180;
+        if matches {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "conflict",
+                "Watcher configuration does not match the requested initialization",
+            ))
+        }
+    }
+}
+
+enum InitializationAdmissionExpectation {
+    Created(EngineSettings),
+    OutcomeUnknown(ConfigInitializationIntent),
+}
+
+impl InitializationAdmissionExpectation {
+    fn verify(&self, settings: &EngineSettings) -> Result<(), EngineError> {
+        match self {
+            Self::Created(created) if created == settings => Ok(()),
+            Self::Created(_) => Err(EngineError::host(
+                "conflict",
+                "Watcher configuration changed after initialization",
+            )),
+            Self::OutcomeUnknown(intent) => intent.verify(settings),
+        }
+    }
+}
+
 type AdmissionEventSink = Arc<dyn Fn(ConfigAdmissionUpdate) + Send + Sync + 'static>;
 
 impl AdmissionState {
@@ -343,6 +396,59 @@ fn run_acknowledgement_attempt<W>(
 ) -> AdmissionAttempt<W> {
     let _outcome = acknowledge();
     run_admission_attempt(inspect, admit)
+}
+
+fn run_initialization_admission_attempt<W>(
+    inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+    admit: impl FnOnce(InitializationAdmissionExpectation) -> Result<W, EngineError>,
+    expectation: InitializationAdmissionExpectation,
+) -> (AdmissionAttempt<W>, Option<EngineError>) {
+    match inspect() {
+        Ok(NtfyDisclosureStatus::Missing) => (
+            AdmissionAttempt {
+                state: AdmissionState::Missing,
+                workers: None,
+            },
+            None,
+        ),
+        Ok(NtfyDisclosureStatus::AcknowledgementRequired { expected_revision }) => (
+            AdmissionAttempt {
+                state: AdmissionState::AwaitingAcknowledgement { expected_revision },
+                workers: None,
+            },
+            None,
+        ),
+        Ok(NtfyDisclosureStatus::ManualRepairRequired) => (
+            AdmissionAttempt {
+                state: AdmissionState::ManualRepairRequired,
+                workers: None,
+            },
+            None,
+        ),
+        Err(error) => (
+            AdmissionAttempt {
+                state: AdmissionState::ManualRepairRequired,
+                workers: None,
+            },
+            Some(error),
+        ),
+        Ok(NtfyDisclosureStatus::NormalAdmission) => match admit(expectation) {
+            Ok(workers) => (
+                AdmissionAttempt {
+                    state: AdmissionState::Admitted,
+                    workers: Some(workers),
+                },
+                None,
+            ),
+            Err(error) => (
+                AdmissionAttempt {
+                    state: AdmissionState::ManualRepairRequired,
+                    workers: None,
+                },
+                Some(error),
+            ),
+        },
+    }
 }
 
 struct AdmissionWorkers {
@@ -582,7 +688,7 @@ impl<W: AdmissionWorkerSet> Drop for AdmissionPermit<W> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AdmissionTransition {
     status: ConfigAdmissionStatus,
     generation: u64,
@@ -1028,6 +1134,69 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         Ok(transition)
     }
 
+    fn initialize_with(
+        &self,
+        intent: ConfigInitializationIntent,
+        initialize: impl FnOnce() -> Result<ConfigInitialization, EngineError>,
+        inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+        admit: impl FnOnce(InitializationAdmissionExpectation) -> Result<W, EngineError>,
+    ) -> Result<AdmissionTransition, EngineError> {
+        let (transition, completion) = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.state != AdmissionState::Missing || inner.workers.is_some() {
+                return Err(EngineError::host(
+                    "configuration_not_admitted",
+                    "Watcher configuration cannot be initialized in its current state",
+                ));
+            }
+            Self::next_generation(&mut inner)?;
+
+            let (expectation, outcome_unknown) = match initialize() {
+                Ok(initialization) => {
+                    if !initialization.created {
+                        return Err(EngineError::host(
+                            "engine_protocol_error",
+                            "Watcher engine did not confirm configuration creation",
+                        ));
+                    }
+                    intent.verify(&initialization.settings)?;
+                    (
+                        InitializationAdmissionExpectation::Created(initialization.settings),
+                        None,
+                    )
+                }
+                Err(error)
+                    if error.config_initialization_failure_class()
+                        == ConfigInitializationFailureClass::OutcomeUnknown =>
+                {
+                    (
+                        InitializationAdmissionExpectation::OutcomeUnknown(intent),
+                        Some(error),
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            inner.state = AdmissionState::Inspecting;
+            let (attempt, reconciliation_error) =
+                run_initialization_admission_attempt(inspect, admit, expectation);
+            let transition = Self::install_attempt(&mut inner, attempt);
+            let completion = match reconciliation_error {
+                Some(error) => Err(error),
+                None if outcome_unknown.is_some()
+                    && transition.status != ConfigAdmissionStatus::Admitted =>
+                {
+                    Err(outcome_unknown.expect("outcome checked above"))
+                }
+                None => Ok(()),
+            };
+            (transition, completion)
+        };
+        self.supervisor.emit((&transition).into());
+        completion.map(|()| transition)
+    }
+
     fn acknowledge_with(
         &self,
         expected_revision: &str,
@@ -1097,8 +1266,12 @@ fn stage_admitted_workers(
     engine: &Engine,
     startup_delivery: &NotificationDelivery,
     observer: AdmissionErrorObserver,
+    expectation: Option<InitializationAdmissionExpectation>,
 ) -> Result<AdmissionWorkers, EngineError> {
     let snapshot = engine.admission_snapshot()?;
+    if let Some(expectation) = expectation {
+        expectation.verify(&snapshot.settings)?;
+    }
     let settings = snapshot.settings;
     let cancellation = CancellationToken::new();
     let scheduler = PollScheduler::with_cancellation(
@@ -1170,7 +1343,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         let observer = self.engine_error_observer();
         let transition = self.refresh_with(
             || engine.ntfy_disclosure_status(),
-            || stage_admitted_workers(app, engine, delivery, observer),
+            || stage_admitted_workers(app, engine, delivery, observer, None),
         )?;
         Ok((&transition).into())
     }
@@ -1185,31 +1358,20 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         model_name: String,
     ) -> Result<ConfigAdmissionUpdate, EngineError> {
         let observer = self.engine_error_observer();
-        let (initialization, transition) = {
-            let mut inner = self.inner.lock().map_err(|_| {
-                EngineError::host("host_error", "Configuration admission coordinator stopped")
-            })?;
-            if inner.state != AdmissionState::Missing || inner.workers.is_some() {
-                return Err(EngineError::host(
-                    "configuration_not_admitted",
-                    "Watcher configuration cannot be initialized in its current state",
-                ));
-            }
-            Self::next_generation(&mut inner)?;
-            let initialization = engine.initialize_config(timezone, model_base_url, model_name);
-            let attempt = run_admission_attempt(
-                || engine.ntfy_disclosure_status(),
-                || stage_admitted_workers(app, engine, delivery, observer),
-            );
-            (initialization, Self::install_attempt(&mut inner, attempt))
-        };
-        let update: ConfigAdmissionUpdate = (&transition).into();
-        self.supervisor.emit(update.clone());
-        match initialization {
-            Ok(_) => Ok(update),
-            Err(_) if update.is_admitted() => Ok(update),
-            Err(error) => Err(error),
-        }
+        let intent = ConfigInitializationIntent::new(
+            timezone.clone(),
+            model_base_url.clone(),
+            model_name.clone(),
+        );
+        let transition = self.initialize_with(
+            intent,
+            || engine.initialize_config(timezone, model_base_url, model_name),
+            || engine.ntfy_disclosure_status(),
+            |expectation| {
+                stage_admitted_workers(app, engine, delivery, observer, Some(expectation))
+            },
+        )?;
+        Ok((&transition).into())
     }
 
     fn acknowledge(
@@ -1225,7 +1387,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             &expected_revision,
             || engine.acknowledge_ntfy_disclosure(acknowledgement_revision),
             || engine.ntfy_disclosure_status(),
-            || stage_admitted_workers(app, engine, delivery, observer),
+            || stage_admitted_workers(app, engine, delivery, observer, None),
         )?;
         Ok((&transition).into())
     }
@@ -1240,7 +1402,7 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         let observer = self.engine_error_observer();
         self.mutate_with(
             || mutate(engine),
-            || stage_admitted_workers(app, engine, delivery, observer),
+            || stage_admitted_workers(app, engine, delivery, observer, None),
         )
     }
 
@@ -2284,6 +2446,223 @@ esac"#,
         );
         assert_eq!(admission_error.state, AdmissionState::ManualRepairRequired);
         assert!(admission_error.workers.is_none());
+    }
+
+    fn initialization_settings(timezone: &str, endpoint: &str, model: &str) -> EngineSettings {
+        EngineSettings {
+            local_model: engine::LocalModelSettings {
+                editable: true,
+                endpoint: endpoint.into(),
+                model: model.into(),
+            },
+            notifications_enabled: true,
+            poll_interval_minutes: 120,
+            polling_supported: true,
+            retention_days: 180,
+            timezone: timezone.into(),
+        }
+    }
+
+    fn set_missing<W: AdmissionWorkerSet>(admission: &AdmissionCoordinator<W>) {
+        let transition = admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::Missing),
+                || panic!("missing configuration must not stage workers"),
+            )
+            .expect("missing configuration is a valid admission state");
+        assert_eq!(transition.status, ConfigAdmissionStatus::Missing);
+    }
+
+    #[test]
+    fn outcome_unknown_initialization_reconciles_only_matching_snapshot() {
+        let activations = Arc::new(AtomicUsize::new(0));
+        let admission = AdmissionCoordinator::<ProbeAdmissionWorkers>::new();
+        set_missing(&admission);
+        let intent = ConfigInitializationIntent::new(
+            " UTC ".into(),
+            "http://127.0.0.1:8080/v1/".into(),
+            " local-model ".into(),
+        );
+        let observed = initialization_settings("UTC", "http://127.0.0.1:8080/v1", "local-model");
+
+        let queue_activations = Arc::clone(&activations);
+        let poll_activations = Arc::clone(&activations);
+        let startup_delivery_activations = Arc::clone(&activations);
+        let transition = admission
+            .initialize_with(
+                intent,
+                || {
+                    Err(EngineError::host(
+                        "outcome_unknown",
+                        "initialization reply was lost",
+                    ))
+                },
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                |expectation| {
+                    expectation.verify(&observed)?;
+                    Ok(ProbeAdmissionWorkers {
+                        queue_activations,
+                        poll_activations,
+                        startup_delivery_activations,
+                    })
+                },
+            )
+            .expect("matching snapshot reconciles an outcome-unknown create");
+
+        assert_eq!(transition.status, ConfigAdmissionStatus::Admitted);
+        assert_eq!(activations.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn definitive_initialization_conflict_never_relabels_preexisting_config() {
+        let admission = AdmissionCoordinator::<()>::new();
+        set_missing(&admission);
+        let error = admission
+            .initialize_with(
+                ConfigInitializationIntent::new(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                ),
+                || {
+                    Err(EngineError::host(
+                        "conflict",
+                        "Configuration already exists",
+                    ))
+                },
+                || panic!("definitive conflict must not inspect a preexisting config"),
+                |_| panic!("definitive conflict must not stage preexisting workers"),
+            )
+            .expect_err("definitive conflict remains a failed initialization");
+
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            admission.inner.lock().expect("admission state").state,
+            AdmissionState::Missing
+        );
+    }
+
+    #[test]
+    fn outcome_unknown_initialization_mismatch_fails_closed() {
+        let admission = AdmissionCoordinator::<()>::new();
+        set_missing(&admission);
+        let observed =
+            initialization_settings("UTC", "http://127.0.0.1:8080/v1", "different-model");
+
+        let error = admission
+            .initialize_with(
+                ConfigInitializationIntent::new(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                ),
+                || Err(EngineError::host("outcome_unknown", "reply lost")),
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                |expectation| {
+                    expectation.verify(&observed)?;
+                    Ok(())
+                },
+            )
+            .expect_err("different concurrent settings cannot reconcile");
+
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+    }
+
+    #[test]
+    fn initialization_rejects_mutation_generation_without_invoking_engine() {
+        let admission = AdmissionCoordinator::<()>::new();
+        {
+            let mut inner = admission.inner.lock().expect("admission state");
+            inner.state = AdmissionState::Mutating;
+            inner.generation = 41;
+        }
+
+        let error = admission
+            .initialize_with(
+                ConfigInitializationIntent::new(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                ),
+                || panic!("mutation generation must not invoke initialization"),
+                || panic!("mutation generation must not inspect"),
+                |_| panic!("mutation generation must not stage workers"),
+            )
+            .expect_err("mutation generation is not an initialization state");
+
+        assert_eq!(error.code, "configuration_not_admitted");
+        assert_eq!(
+            admission.inner.lock().expect("admission state").generation,
+            41
+        );
+    }
+
+    #[test]
+    fn initialization_stale_token_drops_workers_without_activation() {
+        struct StaleInitializationWorkers {
+            activations: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for StaleInitializationWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                Err(EngineError::host(
+                    "conflict",
+                    "Configuration admission snapshot changed",
+                ))
+            }
+
+            fn activate(&self) {
+                self.activations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl Drop for StaleInitializationWorkers {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let activations = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let admission = AdmissionCoordinator::<StaleInitializationWorkers>::new();
+        set_missing(&admission);
+        let settings = initialization_settings("UTC", "http://127.0.0.1:8080/v1", "local-model");
+
+        let transition = admission
+            .initialize_with(
+                ConfigInitializationIntent::new(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                ),
+                || {
+                    Ok(ConfigInitialization {
+                        created: true,
+                        settings: settings.clone(),
+                    })
+                },
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                |expectation| {
+                    expectation.verify(&settings)?;
+                    Ok(StaleInitializationWorkers {
+                        activations: Arc::clone(&activations),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("created config reports its fail-closed admission state");
+
+        assert_eq!(
+            transition.status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

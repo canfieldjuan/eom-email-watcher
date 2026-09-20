@@ -15,6 +15,7 @@ import {
 } from "./connectAvailability";
 import {
   configAdmissionView,
+  isCurrentConfigInitializationResult,
   reconcileConfigAdmissionRefresh,
 } from "./configAdmissionView";
 import {
@@ -3076,7 +3077,10 @@ configInitializeForm.addEventListener("submit", (event) => {
         timezone: initialTimezoneInput.value,
       });
       renderConfigAdmission(status);
-      if (status.state === "admitted") {
+      if (
+        status.state === "admitted" &&
+        isCurrentConfigInitializationResult(status.generation, configAdmissionGeneration)
+      ) {
         void loadSettings();
         settingsStatus.textContent = "Configuration created.";
         settingsStatus.dataset.kind = "success";
