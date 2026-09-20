@@ -6,6 +6,64 @@ import test from "node:test";
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 
+function gmailLabelLoadHarness(
+  invoke: (operation: string) => Promise<Record<string, unknown>>,
+) {
+  const match = source.match(
+    /async function loadGmailLabelState\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function addGmailLabelSelector/,
+  );
+  assert.ok(match);
+  const body = match[1]
+    .replace(/invoke<[^>]+>/g, "invoke")
+    .replace(/: GmailLabelSelectors \| null/g, "")
+    .replace(/: GmailLabelSelector\[\]/g, "");
+  return Function(
+    "invoke",
+    `let gmailLabelScope = { provider: "gmail", account_id: "gmail-default" };
+     let gmailLabelGeneration = 1;
+     let gmailLabelLoadSequence = 0;
+     let gmailLabelCatalogVerified = false;
+     let gmailLabelRevision = null;
+     const gmailLabelStatus = { textContent: "", dataset: {} };
+     const selectorRenders = [];
+     function renderGmailLabelSelectors(items) { selectorRenders.push(items); }
+     function renderGmailLabelCatalog(_items) {}
+     function renderGmailLabelPollingState() {}
+     function refreshGmailLabelControls() {}
+     function errorMessage(error) { return String(error); }
+     function gmailLabelScopeMatches(response, scope, generation) {
+       return generation === gmailLabelGeneration &&
+         gmailLabelScope?.provider === scope.provider &&
+         gmailLabelScope.account_id === scope.account_id &&
+         response.provider === scope.provider &&
+         response.account_id === scope.account_id;
+     }
+     function gmailLabelRefreshIsCurrent(initial, catalog, revalidated) {
+       return initial.revision === catalog.revision &&
+         catalog.revision === revalidated.revision &&
+         revalidated.catalog_state === "current";
+     }
+     async function loadGmailLabelState() {${body}\n}
+     return {
+       load: loadGmailLabelState,
+       bumpGeneration: () => { gmailLabelGeneration += 1; },
+       snapshot: () => ({
+         selectorRenders: selectorRenders.map((items) => structuredClone(items)),
+         revision: gmailLabelRevision,
+         catalogVerified: gmailLabelCatalogVerified,
+       }),
+     };`,
+  )(invoke) as {
+    load: () => Promise<void>;
+    bumpGeneration: () => void;
+    snapshot: () => {
+      selectorRenders: Array<Array<Record<string, unknown>>>;
+      revision: number | null;
+      catalogVerified: boolean;
+    };
+  };
+}
+
 test("Gmail label settings use typed backend operations and no free-form label input", () => {
   assert.match(source, /invoke<GmailLabelSelectors>\("gmail_label_selectors_list"/);
   assert.match(source, /invoke<GmailLabelCatalog>\("gmail_labels_catalog"/);
@@ -355,14 +413,156 @@ test("catalog success revalidates selectors before declaring Gmail labels curren
   );
   assert.ok(loadSource);
   const selectorReads = [
-    ...loadSource[1].matchAll(/invoke<GmailLabelSelectors>\("gmail_label_selectors_list"/g),
+    ...loadSource[1].matchAll(
+      /invoke<GmailLabelSelectors>\(\s*"gmail_label_selectors_list"/g,
+    ),
   ].map((match) => match.index ?? -1);
   const catalogRead = loadSource[1].indexOf(
     'invoke<GmailLabelCatalog>("gmail_labels_catalog"',
   );
-  assert.equal(selectorReads.length, 2);
+  assert.equal(selectorReads.length, 3);
   assert.ok(selectorReads[0] < catalogRead && catalogRead < selectorReads[1]);
+  assert.ok(selectorReads[2] > selectorReads[1]);
   assert.match(loadSource[1], /renderGmailLabelSelectors\(revalidatedSelectors\.items\)/);
+});
+
+test("catalog failure re-lists durable selectors and renders them inert", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  const unavailable = {
+    ...active,
+    catalog_state: "unavailable",
+    items: [
+      {
+        ...active.items[0],
+        status: "validation_unavailable",
+        admission_active: false,
+      },
+    ],
+  };
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      return selectorReads === 1 ? active : unavailable;
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  await harness.load();
+
+  const snapshot = harness.snapshot();
+  assert.equal(selectorReads, 2);
+  assert.equal(snapshot.catalogVerified, false);
+  assert.equal(snapshot.revision, 7);
+  assert.deepEqual(snapshot.selectorRenders.at(-1), unavailable.items);
+});
+
+test("late catalog-failure re-list cannot overwrite a newer account generation", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  let resolveRelist: ((value: Record<string, unknown>) => void) | undefined;
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      if (selectorReads === 1) return active;
+      return new Promise<Record<string, unknown>>((resolve) => {
+        resolveRelist = resolve;
+      });
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  const loading = harness.load();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(selectorReads, 2);
+  assert.ok(resolveRelist);
+  const rendersBeforeNewGeneration = harness.snapshot().selectorRenders.length;
+  harness.bumpGeneration();
+  resolveRelist({
+    ...active,
+    catalog_state: "unavailable",
+    items: [
+      {
+        ...active.items[0],
+        status: "validation_unavailable",
+        admission_active: false,
+      },
+    ],
+  });
+  await loading;
+
+  assert.equal(harness.snapshot().selectorRenders.length, rendersBeforeNewGeneration);
+});
+
+test("failed catalog recovery renders cached selectors explicitly inert", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      if (selectorReads === 1) return active;
+      throw new Error("Selector state unavailable");
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  await harness.load();
+
+  const snapshot = harness.snapshot();
+  assert.equal(selectorReads, 2);
+  assert.equal(snapshot.revision, null);
+  assert.deepEqual(snapshot.selectorRenders.at(-1), [
+    {
+      ...active.items[0],
+      status: "validation_unavailable",
+      admission_active: false,
+    },
+  ]);
 });
 
 test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {

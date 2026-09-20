@@ -2535,6 +2535,7 @@ async function loadGmailLabelState(): Promise<void> {
   if (scope === null) return;
   const generation = gmailLabelGeneration;
   const loadSequence = ++gmailLabelLoadSequence;
+  let loadedSelectors: GmailLabelSelectors | null = null;
   gmailLabelCatalogVerified = false;
   renderGmailLabelPollingState();
   gmailLabelStatus.textContent = "Loading Gmail labels…";
@@ -2550,6 +2551,7 @@ async function loadGmailLabelState(): Promise<void> {
     ) {
       return;
     }
+    loadedSelectors = selectors;
     gmailLabelRevision = selectors.revision;
     renderGmailLabelSelectors(selectors.items);
     gmailLabelStatus.textContent =
@@ -2603,8 +2605,35 @@ async function loadGmailLabelState(): Promise<void> {
     if (loadSequence !== gmailLabelLoadSequence || generation !== gmailLabelGeneration) return;
     gmailLabelCatalogVerified = false;
     renderGmailLabelCatalog([]);
+    try {
+      const unavailableSelectors = await invoke<GmailLabelSelectors>(
+        "gmail_label_selectors_list",
+        {
+          provider: scope.provider,
+          accountId: scope.account_id,
+        },
+      );
+      if (
+        loadSequence !== gmailLabelLoadSequence ||
+        !gmailLabelScopeMatches(unavailableSelectors, scope, generation)
+      ) {
+        return;
+      }
+      gmailLabelRevision = unavailableSelectors.revision;
+      renderGmailLabelSelectors(unavailableSelectors.items);
+      gmailLabelStatus.textContent = errorMessage(error);
+    } catch (relistError) {
+      if (loadSequence !== gmailLabelLoadSequence || generation !== gmailLabelGeneration) return;
+      gmailLabelRevision = null;
+      const inertSelectors: GmailLabelSelector[] = (loadedSelectors?.items ?? []).map((item) => ({
+        ...item,
+        status: "validation_unavailable",
+        admission_active: false,
+      }));
+      renderGmailLabelSelectors(inertSelectors);
+      gmailLabelStatus.textContent = `Selected Gmail labels are inactive because their current state could not be loaded. ${errorMessage(relistError)}`;
+    }
     renderGmailLabelPollingState();
-    gmailLabelStatus.textContent = errorMessage(error);
     gmailLabelStatus.dataset.kind = "error";
   } finally {
     if (loadSequence === gmailLabelLoadSequence && generation === gmailLabelGeneration) {
