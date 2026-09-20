@@ -1,10 +1,14 @@
 import base64
+import gzip
+import zlib
 from datetime import UTC, datetime
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
 from filelock import FileLock
 from googleapiclient.errors import HttpError
+from urllib3.response import HTTPResponse
 
 from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.gmail import (
@@ -509,6 +513,26 @@ def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_parse() -
         )
 
 
+class RawWire:
+    def __init__(self, body: bytes, response=None):
+        self.body = body
+        self.response = response
+        self.decode_content_values: list[bool] = []
+
+    def stream(self, chunk_size: int, *, decode_content: bool):
+        self.decode_content_values.append(decode_content)
+        if self.response is not None:
+            self.response.read_started = True
+        for start in range(0, len(self.body), chunk_size):
+            yield self.body[start : start + chunk_size]
+
+
+class InterruptedRawWire(RawWire):
+    def stream(self, chunk_size: int, *, decode_content: bool):
+        yield from super().stream(chunk_size, decode_content=decode_content)
+        raise OSError("private provider stream failure")
+
+
 class FakeCatalogResponse:
     def __init__(
         self,
@@ -524,6 +548,7 @@ class FakeCatalogResponse:
             self.headers["Content-Encoding"] = content_encoding
         self.body = body
         self.read_started = False
+        self.raw = RawWire(body, self)
 
     def iter_content(self, chunk_size: int):
         self.read_started = True
@@ -532,6 +557,10 @@ class FakeCatalogResponse:
 
 
 class InterruptedCatalogResponse(FakeCatalogResponse):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raw = InterruptedRawWire(self.body, self)
+
     def iter_content(self, chunk_size: int):
         yield from super().iter_content(chunk_size)
         raise OSError("private provider stream failure")
@@ -551,6 +580,24 @@ class FakeCatalogSession:
     def get(self, url: str, **kwargs: object) -> FakeCatalogResponse:
         self.calls.append((url, kwargs))
         return self.response
+
+
+class CompressedWireCatalogResponse(FakeCatalogResponse):
+    def __init__(
+        self,
+        decoded_body: bytes,
+        wire_body: bytes,
+        *,
+        content_encoding: str,
+        status_code: int = 403,
+    ) -> None:
+        super().__init__(
+            decoded_body,
+            content_length=str(len(wire_body)),
+            status_code=status_code,
+            content_encoding=content_encoding,
+        )
+        self.raw = RawWire(wire_body, self)
 
 
 def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_read(
@@ -700,10 +747,10 @@ def test_gmail_catalog_compressed_rate_limit_uses_decoded_body_length(
     content_encoding: str,
 ) -> None:
     body = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
-    response = FakeCatalogResponse(
+    compress = gzip.compress if content_encoding == "gzip" else zlib.compress
+    response = CompressedWireCatalogResponse(
         body,
-        content_length="17",
-        status_code=403,
+        compress(body),
         content_encoding=content_encoding,
     )
     session = FakeCatalogSession(response)
@@ -718,9 +765,10 @@ def test_gmail_catalog_compressed_success_uses_decoded_size_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     body = catalog_body([])
-    response = FakeCatalogResponse(
+    response = CompressedWireCatalogResponse(
         body,
-        content_length=str(gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1),
+        gzip.compress(body),
+        status_code=200,
         content_encoding="gzip",
     )
     session = FakeCatalogSession(response)
@@ -729,6 +777,120 @@ def test_gmail_catalog_compressed_success_uses_decoded_size_cap(
 
     assert gateway.label_catalog() == ()
     assert response.read_started is True
+
+
+def test_gmail_catalog_rejects_compressed_decoded_cap_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = b"x" * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1)
+    response = CompressedWireCatalogResponse(
+        body,
+        gzip.compress(body),
+        status_code=200,
+        content_encoding="gzip",
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid, match="too large"):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+
+def test_gmail_catalog_identity_requires_declared_length_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = catalog_body([])
+    response = FakeCatalogResponse(body, content_length=str(len(body) + 1))
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compress"),
+    [("gzip", gzip.compress), ("deflate", zlib.compress)],
+)
+def test_gmail_catalog_accepts_complete_compressed_wire_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+    compress,
+) -> None:
+    body = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
+    response = CompressedWireCatalogResponse(
+        body,
+        compress(body),
+        content_encoding=content_encoding,
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogUnavailable, match="throttled"):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert response.raw.decode_content_values == [False]
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compress"),
+    [("gzip", gzip.compress), ("deflate", zlib.compress)],
+)
+def test_gmail_catalog_accepts_complete_urllib3_compressed_wire(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+    compress,
+) -> None:
+    body = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
+    wire = compress(body)
+    raw = HTTPResponse(
+        body=BytesIO(wire),
+        headers={
+            "Content-Encoding": content_encoding,
+            "Content-Length": str(len(wire)),
+        },
+        preload_content=False,
+        decode_content=False,
+        enforce_content_length=True,
+    )
+    response = SimpleNamespace(status_code=403, headers=raw.headers, raw=raw)
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogUnavailable, match="throttled"):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compress", "trailer_bytes"),
+    [("gzip", gzip.compress, 8), ("deflate", zlib.compress, 4)],
+)
+@pytest.mark.parametrize("wire_failure", ["truncated", "extra", "malformed"])
+def test_gmail_catalog_rejects_incomplete_or_extra_compressed_wire(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+    compress,
+    trailer_bytes: int,
+    wire_failure: str,
+) -> None:
+    body = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
+    wire = compress(body)
+    if wire_failure == "truncated":
+        wire = wire[:-trailer_bytes]
+    elif wire_failure == "extra":
+        wire += b"trailing-wire"
+    else:
+        wire = b"not-a-compressed-stream"
+    response = CompressedWireCatalogResponse(
+        body,
+        wire,
+        content_encoding=content_encoding,
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(GmailAuthorizationRejected):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
 
 
 def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:

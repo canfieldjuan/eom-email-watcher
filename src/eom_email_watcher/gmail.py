@@ -7,6 +7,7 @@ import json
 import math
 import sys
 import unicodedata
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -291,13 +292,20 @@ def decode_gmail_label_catalog(
     return tuple(labels)
 
 
-def _bounded_gmail_label_response_body(
-    response: object,
-    *,
-    require_content_length_match: bool = False,
-) -> bytes | None:
+def _bounded_gmail_label_response_body(response: object) -> bytes | None:
     headers = getattr(response, "headers", {})
-    content_length = _decoded_content_length(headers)
+    if not hasattr(headers, "get"):
+        return None
+    content_encoding = headers.get("Content-Encoding")
+    if content_encoding is None:
+        encoding = "identity"
+    elif not isinstance(content_encoding, str):
+        return None
+    else:
+        encoding = content_encoding.strip().casefold() or "identity"
+    if encoding not in {"identity", "gzip", "deflate"}:
+        return None
+    content_length = headers.get("Content-Length")
     expected_length: int | None = None
     if content_length is not None:
         if isinstance(content_length, str) and content_length.strip().isdecimal():
@@ -308,40 +316,56 @@ def _bounded_gmail_label_response_body(
             and content_length >= 0
         ):
             expected_length = content_length
-        elif require_content_length_match:
+        else:
             return None
         if (
-            expected_length is not None
+            encoding == "identity"
+            and expected_length is not None
             and expected_length > MAX_GMAIL_LABEL_CATALOG_BYTES
         ):
             return None
+    raw = getattr(response, "raw", None)
+    raw_stream = getattr(raw, "stream", None)
+    if not callable(raw_stream):
+        return None
+    decompressor = None
+    if encoding == "gzip":
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    elif encoding == "deflate":
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS)
     body = bytearray()
-    for chunk in response.iter_content(chunk_size=65_536):
-        if not chunk:
-            continue
-        remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
-        body.extend(chunk[:remaining])
-        if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+    wire_length = 0
+    try:
+        for chunk in raw_stream(65_536, decode_content=False):
+            if not isinstance(chunk, bytes):
+                return None
+            if not chunk:
+                continue
+            wire_length += len(chunk)
+            if decompressor is None:
+                body.extend(chunk[: MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)])
+            else:
+                remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
+                body.extend(decompressor.decompress(chunk, remaining))
+                if decompressor.unused_data or decompressor.unconsumed_tail:
+                    return None
+            if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+                return None
+        if expected_length is not None and wire_length != expected_length:
             return None
-    if (
-        require_content_length_match
-        and expected_length is not None
-        and len(body) != expected_length
-    ):
+        if decompressor is not None:
+            remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
+            body.extend(decompressor.flush(remaining))
+            if (
+                len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES
+                or not decompressor.eof
+                or decompressor.unused_data
+                or decompressor.unconsumed_tail
+            ):
+                return None
+    except (OSError, RuntimeError, TypeError, ValueError, zlib.error):
         return None
     return bytes(body)
-
-
-def _decoded_content_length(headers: object) -> object:
-    if not hasattr(headers, "get"):
-        return None
-    content_encoding = headers.get("Content-Encoding")
-    if content_encoding is not None and (
-        not isinstance(content_encoding, str)
-        or content_encoding.strip().casefold() not in {"", "identity"}
-    ):
-        return None
-    return headers.get("Content-Length")
 
 
 def _gmail_error_reasons(body: bytes) -> frozenset[str]:
@@ -710,10 +734,7 @@ class GmailGateway:
                     )
                 if response.status_code == 403:
                     try:
-                        body = _bounded_gmail_label_response_body(
-                            response,
-                            require_content_length_match=True,
-                        )
+                        body = _bounded_gmail_label_response_body(response)
                     except Exception as exc:
                         raise GmailAuthorizationRejected(
                             "Gmail rejected the configured authorization"
@@ -731,16 +752,12 @@ class GmailGateway:
                         "gmail_label_catalog_unavailable: "
                         f"Gmail labels request failed (HTTP {response.status_code})"
                     )
-                content_length = _decoded_content_length(response.headers)
                 body = _bounded_gmail_label_response_body(response)
                 if body is None:
                     raise GmailLabelCatalogInvalid(
                         "gmail_label_catalog_invalid: response is too large"
                     )
-                return decode_gmail_label_catalog(
-                    body,
-                    content_length=content_length,
-                )
+                return decode_gmail_label_catalog(body)
         except (GmailAuthorizationRejected, GmailLabelCatalogInvalid):
             raise
         except GmailLabelCatalogUnavailable:

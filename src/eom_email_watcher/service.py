@@ -2425,6 +2425,35 @@ def _gmail_label_watch_configured(store: Store) -> bool:
         return False
 
 
+def _current_mailbox_pending_work(store: Store) -> bool:
+    account = store.active_mail_account()
+    if account is None or account.mailbox_identity_key is None:
+        return False
+    return store.has_current_pending_mailbox_work(
+        account.provider,
+        account.account_id,
+        account.mailbox_identity_key,
+    )
+
+
+def _gmail_recovery_backoff_admission(store: Store) -> GmailRecoveryState | None:
+    account = store.active_mail_account()
+    if (
+        account is None
+        or account.provider != "gmail"
+        or account.mailbox_identity_key is None
+    ):
+        return None
+    recovery = store.gmail_recovery_state(account.account_id)
+    if (
+        recovery is None
+        or recovery.mailbox_identity_key != account.mailbox_identity_key
+        or Watcher._retry_due(recovery.next_retry_at, datetime.now(UTC))
+    ):
+        return None
+    return recovery
+
+
 def run_watcher_check(
     config: Config,
     store: Store,
@@ -2433,7 +2462,18 @@ def run_watcher_check(
     dry_run: bool = False,
     deliver_notifications: bool = True,
 ) -> dict[str, int | bool | str]:
-    watch_configured = bool(config.allowlist) or _gmail_label_watch_configured(store)
+    recovery_backoff = _gmail_recovery_backoff_admission(store)
+    if recovery_backoff is not None:
+        return {
+            **Watcher.recovery_backoff_result(recovery_backoff),
+            "automation_processed": 0,
+            "automation_review_required": 0,
+        }
+    watch_configured = (
+        bool(config.allowlist)
+        or _gmail_label_watch_configured(store)
+        or _current_mailbox_pending_work(store)
+    )
     if dry_run:
         if not watch_configured:
             result = Watcher.inactive_result(config, store, dry_run=True)

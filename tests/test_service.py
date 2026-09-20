@@ -887,6 +887,121 @@ def test_current_identity_pending_work_survives_last_selector_removal_without_po
     ]
 
 
+def test_public_check_processes_current_pending_work_without_watch_selectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    assert store.add_message(
+        message_id="current-pending-public",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="current-pending-public",
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Pending work",
+        received_at=datetime.now(UTC).isoformat(),
+        admission=exact_sender_admission(),
+    )
+
+    class PendingOnlyGmail(FreshGmail):
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            pytest.fail("public pending-only processing polled mailbox history")
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            pytest.fail("public pending-only processing fetched discovery metadata")
+
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            assert message_id == "current-pending-public"
+            return MessageContent("current mailbox body", (), ())
+
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: MailboxSession("gmail", "gmail-default", PendingOnlyGmail()),
+    )
+
+    result = run_watcher_check(
+        cfg,
+        store,
+        FakeModel(),
+        deliver_notifications=False,
+    )
+
+    assert result["active"] is True
+    assert result["discovered"] == 0
+    assert result["summarized"] == 1
+    assert store.state()[0] == "100"
+
+
+def test_public_check_ignores_only_superseded_pending_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    old_identity = "a" * 64
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        old_identity,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    assert store.add_message(
+        message_id="superseded-pending-public",
+        provider="gmail",
+        account_id="gmail-default",
+        provider_message_id="superseded-pending-public",
+        mailbox_identity_key=old_identity,
+        thread_id=None,
+        sender="trusted@example.com",
+        sender_name="Trusted",
+        subject="Superseded pending work",
+        received_at=datetime.now(UTC).isoformat(),
+        admission=exact_sender_admission(mailbox_identity_key=old_identity),
+    )
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: pytest.fail("superseded pending work activated the mailbox"),
+    )
+
+    result = run_watcher_check(
+        cfg,
+        store,
+        FakeModel(),
+        deliver_notifications=False,
+    )
+
+    assert result["active"] is False
+    assert store.pending()[0].message_id == "superseded-pending-public"
+
+
 @pytest.mark.parametrize("page_loaded", [False, True])
 def test_dry_run_recovery_backoff_performs_zero_provider_calls(
     tmp_path: Path,
@@ -958,6 +1073,80 @@ def test_dry_run_recovery_backoff_performs_zero_provider_calls(
     assert result["recovery_pending"] is True
     assert before is not None
     assert result["recovery_next_retry_at"] == before.next_retry_at
+    assert store.gmail_recovery_state("gmail-default") == before
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_public_recovery_backoff_precedes_mailbox_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    checked_at = datetime.now(UTC)
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        checked_at,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        0,
+        (("trusted@example.com", "Trusted"),),
+        (),
+        1,
+        2,
+        "200",
+        now=checked_at,
+    )
+    store.record_gmail_recovery_backoff(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        failure_code="gmail_recovery_provider_unavailable",
+        next_retry_at=(checked_at + timedelta(minutes=10)).isoformat(),
+        degraded=True,
+        now=checked_at,
+    )
+    before = store.gmail_recovery_state("gmail-default")
+    monkeypatch.setattr(
+        service_module,
+        "load_configured_mailbox",
+        lambda *args: pytest.fail("recovery backoff loaded provider credentials"),
+    )
+    for operation in (
+        "process_scheduling_writes",
+        "process_scheduling_automations",
+        "process_scheduling_proposals",
+    ):
+        monkeypatch.setattr(
+            service_module,
+            operation,
+            lambda *args, operation=operation, **kwargs: pytest.fail(
+                f"recovery backoff ran {operation}"
+            ),
+        )
+
+    result = run_watcher_check(
+        cfg,
+        store,
+        FakeModel(),
+        dry_run=dry_run,
+        deliver_notifications=False,
+    )
+
+    assert result["active"] is True
+    assert result["recovery_pending"] is True
+    assert result["automation_processed"] == 0
     assert store.gmail_recovery_state("gmail-default") == before
 
 
@@ -3227,13 +3416,14 @@ def test_canonical_check_delivers_automation_review_beyond_mixed_intent_page(
                         message_id, provider, account_id, mailbox_identity_key,
                         provider_message_id,
                         sender, subject, received_at, discovered_at, status, last_error,
+                        analysis_retryable,
                         admission_kind, admission_selector_id,
                         admission_mailbox_identity_key, admitted_at
                     ) VALUES (
                         ?1, 'gmail', 'gmail-default',
                         (SELECT mailbox_identity_key FROM mail_accounts
                          WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?1,
-                        'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable',
+                        'a@b.com', 'Update', ?2, ?2, 'pending', 'model unavailable', 0,
                         'exact_sender', 'sender:a@b.com',
                         (SELECT mailbox_identity_key FROM mail_accounts
                          WHERE provider = 'gmail' AND account_id = 'gmail-default'), ?2
