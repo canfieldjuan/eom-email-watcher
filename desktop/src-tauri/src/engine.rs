@@ -6,7 +6,7 @@ use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -37,6 +37,7 @@ use windows_sys::Win32::{
 
 const PROTOCOL_VERSION: u8 = 1;
 const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -1428,12 +1429,56 @@ impl Engine {
         engine
     }
 
+    fn mailbox_operation_lock(
+        &self,
+    ) -> Result<(MutexGuard<'_, ()>, Option<Duration>), EngineError> {
+        let Some(timeout) = self.request_timeout else {
+            return self
+                .mailbox_operation_gate
+                .lock()
+                .map(|guard| (guard, None))
+                .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"));
+        };
+        let started = Instant::now();
+        loop {
+            match self.mailbox_operation_gate.try_lock() {
+                Ok(guard) => {
+                    let remaining = timeout
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| {
+                            EngineError::host(
+                                "engine_timeout",
+                                "Watcher engine did not respond before its timeout",
+                            )
+                        })?;
+                    return Ok((guard, Some(remaining)));
+                }
+                Err(MutexTryLockError::Poisoned(_)) => {
+                    return Err(EngineError::host(
+                        "host_error",
+                        "Email account coordinator stopped",
+                    ));
+                }
+                Err(MutexTryLockError::WouldBlock) => {
+                    let remaining = timeout
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or_else(|| {
+                            EngineError::host(
+                                "engine_timeout",
+                                "Watcher engine did not respond before its timeout",
+                            )
+                        })?;
+                    std::thread::sleep(remaining.min(ENGINE_LOCK_RETRY));
+                }
+            }
+        }
+    }
+
     pub fn check(&self) -> Result<CheckResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request("watcher.check", json!({"dry_run": false}))
+        let (_guard, remaining) = self.mailbox_operation_lock()?;
+        self.request_inner("watcher.check", json!({"dry_run": false}), remaining)
     }
 
     pub(crate) fn run_with_operation_lock<T>(
@@ -2385,6 +2430,26 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.read.status","data"
 
         assert_eq!(error.code, "engine_timeout");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_check_times_out_while_mailbox_coordinator_is_busy() {
+        let engine = Engine::with_command(
+            "unused-engine-command",
+            Vec::new(),
+            PathBuf::from("unused.toml"),
+        );
+        let _active = engine
+            .mailbox_operation_gate
+            .lock()
+            .expect("hold mailbox coordinator");
+
+        let error = engine
+            .with_request_timeout(Duration::from_millis(10))
+            .check()
+            .expect_err("bounded check must not wait indefinitely for the mailbox coordinator");
+
+        assert_eq!(error.code, "engine_timeout");
     }
 
     #[cfg(unix)]

@@ -2,7 +2,7 @@ mod delivery;
 mod engine;
 mod scheduler;
 
-use delivery::NotificationDelivery;
+use delivery::{BoundedOperation, NotificationDelivery};
 use engine::{
     CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
     ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 #[cfg(desktop)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
@@ -532,42 +532,11 @@ fn stage_admitted_workers(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum BoundedOperation<T> {
-    Completed(T),
-    TimedOut,
-    WorkerStopped,
-}
-
-fn run_bounded_operation<T: Send + 'static>(
-    timeout: Duration,
-    operation: impl FnOnce() -> T + Send + 'static,
-) -> BoundedOperation<T> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let worker = thread::Builder::new()
-        .name("email-watcher-startup-delivery-request".into())
-        .spawn(move || {
-            let outcome = operation();
-            let _ = sender.send(outcome);
-        });
-    if worker.is_err() {
-        return BoundedOperation::WorkerStopped;
-    }
-    match receiver.recv_timeout(timeout) {
-        Ok(outcome) => BoundedOperation::Completed(outcome),
-        Err(mpsc::RecvTimeoutError::Timeout) => BoundedOperation::TimedOut,
-        Err(mpsc::RecvTimeoutError::Disconnected) => BoundedOperation::WorkerStopped,
-    }
-}
-
 fn start_startup_delivery(app: AppHandle, engine: Engine, delivery: NotificationDelivery) {
-    let engine = engine.with_request_timeout(STARTUP_DELIVERY_TIMEOUT);
     if thread::Builder::new()
         .name("email-watcher-startup-delivery".into())
-        .spawn(move || {
-            match run_bounded_operation(STARTUP_DELIVERY_TIMEOUT, move || {
-                delivery.deliver(&app, &engine)
-            }) {
+        .spawn(
+            move || match delivery.deliver_bounded(app, engine, STARTUP_DELIVERY_TIMEOUT) {
                 BoundedOperation::Completed(Ok(outcome)) if outcome.failed > 0 => eprintln!(
                     "{} watcher startup notification deliveries failed; {} remain queued",
                     outcome.failed, outcome.remaining
@@ -583,8 +552,8 @@ fn start_startup_delivery(app: AppHandle, engine: Engine, delivery: Notification
                 BoundedOperation::WorkerStopped => {
                     eprintln!("watcher startup notification delivery worker stopped")
                 }
-            }
-        })
+            },
+        )
         .is_err()
     {
         eprintln!("watcher startup notification delivery could not be started");
@@ -807,7 +776,7 @@ async fn inbox_delete(
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        delivery.run_exclusive(|| engine.delete_inbox_item(message_id))
+        delivery.run_engine_exclusive(&engine, |engine| engine.delete_inbox_item(message_id))
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -822,9 +791,11 @@ async fn inbox_clear(
     admission.require_admitted()?;
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || delivery.run_exclusive(|| engine.clear_inbox()))
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        delivery.run_engine_exclusive(&engine, Engine::clear_inbox)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -1238,7 +1209,7 @@ async fn settings_update(
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        delivery.run_exclusive(|| {
+        delivery.run_engine_exclusive(&engine, |engine| {
             engine.update_settings(
                 poll_interval_minutes,
                 retention_days,
@@ -1425,6 +1396,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
 
     #[derive(Clone)]
     struct ProbeStagedWorker {
@@ -1636,11 +1608,12 @@ mod tests {
         assert!(transition.start_startup_delivery);
 
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
-        let (release_sender, release_receiver) = mpsc::sync_channel(1);
         let delivery = thread::spawn(move || {
-            run_bounded_operation(Duration::from_millis(10), move || {
+            delivery::run_bounded_operation(Duration::from_millis(10), move |deadline| {
                 started_sender.send(()).expect("signal delivery start");
-                let _ = release_receiver.recv();
+                while !deadline.is_cancelled() {
+                    thread::yield_now();
+                }
             })
         });
         started_receiver.recv().expect("delivery started");
@@ -1660,7 +1633,6 @@ mod tests {
             delivery.join().expect("delivery waiter joins"),
             BoundedOperation::TimedOut
         );
-        release_sender.send(()).expect("release delivery worker");
     }
 
     #[test]

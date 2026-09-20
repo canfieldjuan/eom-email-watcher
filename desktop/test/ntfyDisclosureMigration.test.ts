@@ -7,6 +7,10 @@ const engineSource = await readFile(
   new URL("../src-tauri/src/engine.rs", import.meta.url),
   "utf8",
 );
+const deliverySource = await readFile(
+  new URL("../src-tauri/src/delivery.rs", import.meta.url),
+  "utf8",
+);
 const schedulerSource = await readFile(
   new URL("../src-tauri/src/scheduler.rs", import.meta.url),
   "utf8",
@@ -34,7 +38,7 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
 
   const stagedWorkers = libSource.slice(
     libSource.indexOf("fn stage_admitted_workers"),
-    libSource.indexOf("enum BoundedOperation"),
+    libSource.indexOf("fn start_startup_delivery"),
   );
   const settings = stagedWorkers.indexOf("settings_with_timeout");
   const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage");
@@ -59,8 +63,13 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     libSource.indexOf("fn start_startup_delivery"),
     libSource.indexOf("fn finish_admission_transition"),
   );
-  assert.match(boundedDelivery, /with_request_timeout\(STARTUP_DELIVERY_TIMEOUT\)/);
-  assert.match(boundedDelivery, /run_bounded_operation\(STARTUP_DELIVERY_TIMEOUT/);
+  assert.match(
+    boundedDelivery,
+    /delivery\.deliver_bounded\(app, engine, STARTUP_DELIVERY_TIMEOUT\)/,
+  );
+  assert.match(deliverySource, /deadline\.cancel\(\);[\s\S]*worker\.join\(\)/);
+  assert.match(deliverySource, /self\.lock\.try_lock\(\)/);
+  assert.match(deliverySource, /deadline\.bounded_engine\(engine\)/);
   assert.match(schedulerSource, /fn wait_for_activation/);
   assert.match(schedulerSource, /pub fn shutdown\(&self\) -> io::Result<\(\)>/);
   assert.match(libSource, /configuration_not_admitted/);

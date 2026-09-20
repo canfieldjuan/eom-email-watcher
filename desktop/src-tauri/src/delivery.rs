@@ -1,12 +1,109 @@
 use crate::engine::{CheckResult, Engine, EngineError, NotificationIntent};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex, MutexGuard, TryLockError,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 
 const DELIVERY_BATCH_LIMIT: u16 = 25;
+const DEFAULT_DELIVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DELIVERY_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+fn delivery_timeout() -> EngineError {
+    EngineError::host("engine_timeout", "Desktop notification delivery timed out")
+}
+
+#[derive(Clone)]
+pub(crate) struct DeliveryDeadline {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DeliveryDeadline {
+    fn new(timeout: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            deadline: now.checked_add(timeout).unwrap_or(now),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn remaining(&self) -> Result<Duration, EngineError> {
+        if self.is_cancelled() {
+            return Err(delivery_timeout());
+        }
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(delivery_timeout)
+    }
+
+    fn check(&self) -> Result<(), EngineError> {
+        self.remaining().map(|_| ())
+    }
+
+    fn bounded_engine(&self, engine: &Engine) -> Result<Engine, EngineError> {
+        Ok(engine.with_request_timeout(self.remaining()?))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BoundedOperation<T> {
+    Completed(T),
+    TimedOut,
+    WorkerStopped,
+}
+
+pub(crate) fn run_bounded_operation<T: Send + 'static>(
+    timeout: Duration,
+    operation: impl FnOnce(DeliveryDeadline) -> T + Send + 'static,
+) -> BoundedOperation<T> {
+    let deadline = DeliveryDeadline::new(timeout);
+    let worker_deadline = deadline.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("email-watcher-bounded-delivery".into())
+        .spawn(move || {
+            let outcome = operation(worker_deadline);
+            let _ = sender.send(outcome);
+        });
+    let Ok(worker) = worker else {
+        return BoundedOperation::WorkerStopped;
+    };
+
+    let remaining = deadline.remaining().unwrap_or(Duration::ZERO);
+    match receiver.recv_timeout(remaining) {
+        Ok(outcome) => match worker.join() {
+            Ok(()) => BoundedOperation::Completed(outcome),
+            Err(_) => BoundedOperation::WorkerStopped,
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            deadline.cancel();
+            match worker.join() {
+                Ok(()) => BoundedOperation::TimedOut,
+                Err(_) => BoundedOperation::WorkerStopped,
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            BoundedOperation::WorkerStopped
+        }
+    }
+}
 
 trait NotificationQueue {
-    #[cfg(test)]
     fn check(&self) -> Result<CheckResult, EngineError>;
     fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError>;
     fn pending_count(&self) -> Result<u64, EngineError>;
@@ -14,7 +111,6 @@ trait NotificationQueue {
 }
 
 impl NotificationQueue for Engine {
-    #[cfg(test)]
     fn check(&self) -> Result<CheckResult, EngineError> {
         self.check()
     }
@@ -29,6 +125,41 @@ impl NotificationQueue for Engine {
 
     fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
         self.acknowledge_notification(intent)
+    }
+}
+
+struct DeadlineQueue<'a> {
+    engine: &'a Engine,
+    deadline: &'a DeliveryDeadline,
+}
+
+impl DeadlineQueue<'_> {
+    fn call<T>(
+        &self,
+        operation: impl FnOnce(&Engine) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let engine = self.deadline.bounded_engine(self.engine)?;
+        let outcome = operation(&engine)?;
+        self.deadline.check()?;
+        Ok(outcome)
+    }
+}
+
+impl NotificationQueue for DeadlineQueue<'_> {
+    fn check(&self) -> Result<CheckResult, EngineError> {
+        self.call(Engine::check)
+    }
+
+    fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError> {
+        self.call(|engine| engine.pending_notifications_under_host_lock(limit))
+    }
+
+    fn pending_count(&self) -> Result<u64, EngineError> {
+        self.call(Engine::pending_notification_count_under_host_lock)
+    }
+
+    fn acknowledge(&self, intent: &NotificationIntent) -> Result<(), EngineError> {
+        self.call(|engine| engine.acknowledge_notification(intent))
     }
 }
 
@@ -70,25 +201,32 @@ pub struct CoordinatedCheck {
     pub delivery: DeliveryOutcome,
 }
 
-fn deliver_batch(
+fn deliver_batch_until(
     queue: &impl NotificationQueue,
     sink: &impl NotificationSink,
+    deadline: &DeliveryDeadline,
 ) -> Result<DeliveryOutcome, EngineError> {
+    deadline.check()?;
     let intents = queue.pending(DELIVERY_BATCH_LIMIT)?;
+    deadline.check()?;
     let mut delivered = 0;
     let mut failed = 0;
     for intent in intents {
+        deadline.check()?;
         if sink.show(&intent).is_err() {
             failed += 1;
             continue;
         }
+        deadline.check()?;
         if queue.acknowledge(&intent).is_err() {
             failed += 1;
             continue;
         }
         delivered += 1;
     }
+    deadline.check()?;
     let remaining = queue.pending_count()?;
+    deadline.check()?;
     Ok(DeliveryOutcome {
         delivered,
         failed,
@@ -97,12 +235,25 @@ fn deliver_batch(
 }
 
 #[cfg(test)]
+fn deliver_batch(
+    queue: &impl NotificationQueue,
+    sink: &impl NotificationSink,
+) -> Result<DeliveryOutcome, EngineError> {
+    deliver_batch_until(
+        queue,
+        sink,
+        &DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT),
+    )
+}
+
+#[cfg(test)]
 fn check_and_deliver(
     queue: &impl NotificationQueue,
     sink: &impl NotificationSink,
 ) -> Result<CoordinatedCheck, EngineError> {
+    let deadline = DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT);
     let check = queue.check();
-    let delivery = deliver_batch(queue, sink);
+    let delivery = deliver_batch_until(queue, sink, &deadline);
     coordinated_result(check, delivery)
 }
 
@@ -133,30 +284,95 @@ pub struct NotificationDelivery {
 }
 
 impl NotificationDelivery {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, EngineError> {
-        self.lock.lock().map_err(|_| {
-            EngineError::host(
-                "host_error",
-                "Desktop notification delivery lock is unavailable",
-            )
-        })
+    fn lock_until(&self, deadline: &DeliveryDeadline) -> Result<MutexGuard<'_, ()>, EngineError> {
+        loop {
+            deadline.check()?;
+            match self.lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(EngineError::host(
+                        "host_error",
+                        "Desktop notification delivery lock is unavailable",
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(deadline.remaining()?.min(DELIVERY_LOCK_RETRY));
+                }
+            }
+        }
     }
 
-    pub fn run_exclusive<T>(
+    fn run_exclusive_until<T>(
+        &self,
+        deadline: &DeliveryDeadline,
+        operation: impl FnOnce(&DeliveryDeadline) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let _guard = self.lock_until(deadline)?;
+        deadline.check()?;
+        let outcome = operation(deadline)?;
+        deadline.check()?;
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
+    fn run_exclusive<T>(
         &self,
         operation: impl FnOnce() -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
-        let _guard = self.lock()?;
-        operation()
+        self.run_exclusive_until(
+            &DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT),
+            |_| operation(),
+        )
     }
 
-    pub fn deliver(
+    #[cfg(test)]
+    fn run_exclusive_with_timeout<T>(
+        &self,
+        timeout: Duration,
+        operation: impl FnOnce(&DeliveryDeadline) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        self.run_exclusive_until(&DeliveryDeadline::new(timeout), operation)
+    }
+
+    pub fn run_engine_exclusive<T>(
+        &self,
+        engine: &Engine,
+        operation: impl FnOnce(&Engine) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        self.run_exclusive_until(
+            &DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT),
+            |deadline| {
+                let engine = deadline.bounded_engine(engine)?;
+                operation(&engine)
+            },
+        )
+    }
+
+    fn deliver_until(
         &self,
         app: &AppHandle,
         engine: &Engine,
+        deadline: &DeliveryDeadline,
     ) -> Result<DeliveryOutcome, EngineError> {
-        self.run_exclusive(|| {
-            engine.run_with_operation_lock(|| deliver_batch(engine, &TauriNotificationSink { app }))
+        let queue = DeadlineQueue { engine, deadline };
+        self.run_exclusive_until(deadline, |_| {
+            deadline
+                .bounded_engine(engine)?
+                .run_with_operation_lock(|| {
+                    deliver_batch_until(&queue, &TauriNotificationSink { app }, deadline)
+                })
+        })
+    }
+
+    pub(crate) fn deliver_bounded(
+        &self,
+        app: AppHandle,
+        engine: Engine,
+        timeout: Duration,
+    ) -> BoundedOperation<Result<DeliveryOutcome, EngineError>> {
+        let delivery = self.clone();
+        run_bounded_operation(timeout, move |deadline| {
+            delivery.deliver_until(&app, &engine, &deadline)
         })
     }
 
@@ -165,10 +381,18 @@ impl NotificationDelivery {
         app: &AppHandle,
         engine: &Engine,
     ) -> Result<CoordinatedCheck, EngineError> {
-        self.run_exclusive(|| {
-            let check = engine.check();
-            let delivery = engine
-                .run_with_operation_lock(|| deliver_batch(engine, &TauriNotificationSink { app }));
+        let deadline = DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT);
+        let queue = DeadlineQueue {
+            engine,
+            deadline: &deadline,
+        };
+        self.run_exclusive_until(&deadline, |_| {
+            let check = queue.check();
+            let delivery = deadline
+                .bounded_engine(engine)?
+                .run_with_operation_lock(|| {
+                    deliver_batch_until(&queue, &TauriNotificationSink { app }, &deadline)
+                });
             coordinated_result(check, delivery)
         })
     }
@@ -177,6 +401,7 @@ impl NotificationDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
@@ -232,6 +457,52 @@ mod tests {
     struct FakeSink {
         events: Arc<Mutex<Vec<&'static str>>>,
         failed_message: Option<String>,
+    }
+
+    struct SlowPendingQueue {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        delay: Duration,
+    }
+
+    impl NotificationQueue for SlowPendingQueue {
+        fn check(&self) -> Result<CheckResult, EngineError> {
+            panic!("check is not part of this delivery probe")
+        }
+
+        fn pending(&self, limit: u16) -> Result<Vec<NotificationIntent>, EngineError> {
+            assert_eq!(limit, DELIVERY_BATCH_LIMIT);
+            self.events.lock().expect("events lock").push("pending");
+            thread::sleep(self.delay);
+            Ok(vec![intent("slow")])
+        }
+
+        fn pending_count(&self) -> Result<u64, EngineError> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push("pending_count");
+            Ok(1)
+        }
+
+        fn acknowledge(&self, _intent: &NotificationIntent) -> Result<(), EngineError> {
+            self.events.lock().expect("events lock").push("acknowledge");
+            Ok(())
+        }
+    }
+
+    struct CancellationSink {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        deadline: DeliveryDeadline,
+    }
+
+    impl NotificationSink for CancellationSink {
+        fn show(&self, _intent: &NotificationIntent) -> Result<(), EngineError> {
+            self.events.lock().expect("events lock").push("show");
+            while !self.deadline.is_cancelled() {
+                thread::yield_now();
+            }
+            Ok(())
+        }
     }
 
     impl NotificationSink for FakeSink {
@@ -425,5 +696,135 @@ mod tests {
             .expect("mutation proceeds after delivery");
         delivery_thread.join().expect("delivery thread joins");
         mutation_thread.join().expect("mutation thread joins");
+    }
+
+    #[test]
+    fn bounded_timeout_cancels_and_joins_worker() {
+        struct ActiveWorker(Arc<AtomicUsize>);
+
+        impl Drop for ActiveWorker {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let result = run_bounded_operation(Duration::from_millis(10), move |deadline| {
+            worker_active.fetch_add(1, Ordering::SeqCst);
+            let _worker = ActiveWorker(Arc::clone(&worker_active));
+            while !deadline.is_cancelled() {
+                thread::yield_now();
+            }
+        });
+
+        assert_eq!(result, BoundedOperation::TimedOut);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn held_delivery_lock_times_out_and_subsequent_manual_operation_works() {
+        let delivery = NotificationDelivery::default();
+        let active_delivery = delivery.clone();
+        let (active_sender, active_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let active = thread::spawn(move || {
+            active_delivery
+                .run_exclusive(|| {
+                    active_sender.send(()).expect("signal active lock");
+                    release_receiver.recv().expect("release active lock");
+                    Ok(())
+                })
+                .expect("active operation finishes");
+        });
+        active_receiver.recv().expect("active lock acquired");
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let timed_ran = Arc::clone(&ran);
+        let error = delivery
+            .run_exclusive_with_timeout(Duration::from_millis(10), |_| {
+                timed_ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect_err("held lock must respect the operation deadline");
+        assert_eq!(error.code, "engine_timeout");
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+        release_sender.send(()).expect("release active lock");
+        active.join().expect("active operation joins");
+        delivery
+            .run_exclusive(|| {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("later manual operation acquires the released lock");
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn slow_first_queue_call_prevents_later_delivery_calls_after_budget() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let queue = SlowPendingQueue {
+            events: Arc::clone(&events),
+            delay: Duration::from_millis(20),
+        };
+        let sink = FakeSink {
+            events: Arc::clone(&events),
+            failed_message: None,
+        };
+
+        let error = deliver_batch_until(
+            &queue,
+            &sink,
+            &DeliveryDeadline::new(Duration::from_millis(5)),
+        )
+        .expect_err("expired batch must stop after the first call");
+
+        assert_eq!(error.code, "engine_timeout");
+        assert_eq!(*events.lock().expect("events lock"), ["pending"]);
+    }
+
+    #[test]
+    fn cancellation_after_platform_acceptance_keeps_intent_for_one_retry() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let worker_events = Arc::clone(&events);
+        let result = run_bounded_operation(Duration::from_millis(10), move |deadline| {
+            let queue = FakeQueue {
+                events: Arc::clone(&worker_events),
+                intents: vec![intent("message-1")],
+                check_error: false,
+                check_pending: 1,
+            };
+            let sink = CancellationSink {
+                events: Arc::clone(&worker_events),
+                deadline: deadline.clone(),
+            };
+            deliver_batch_until(&queue, &sink, &deadline)
+        });
+        assert_eq!(result, BoundedOperation::TimedOut);
+        assert_eq!(*events.lock().expect("events lock"), ["show"]);
+
+        let queue = FakeQueue {
+            events: Arc::clone(&events),
+            intents: vec![intent("message-1")],
+            check_error: false,
+            check_pending: 1,
+        };
+        let sink = FakeSink {
+            events: Arc::clone(&events),
+            failed_message: None,
+        };
+        assert_eq!(
+            deliver_batch(&queue, &sink).expect("queued intent retries"),
+            DeliveryOutcome {
+                delivered: 1,
+                failed: 0,
+                remaining: 0,
+            }
+        );
+        assert_eq!(
+            *events.lock().expect("events lock"),
+            ["show", "show", "acknowledge"]
+        );
     }
 }
