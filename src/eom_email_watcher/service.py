@@ -40,6 +40,8 @@ from .db import (
     Store,
 )
 from .gmail import (
+    GmailAuthorizationRejected,
+    GmailError,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
     GmailRecoveryPageInvalid,
@@ -1363,17 +1365,22 @@ class Watcher:
                     if recovery_state is not None
                     else self._active_gmail_label_selectors(mailbox_identity_key)
                 )
-            except (GmailLabelCatalogInvalid, GmailLabelCatalogUnavailable):
+            except (GmailLabelCatalogInvalid, GmailLabelCatalogUnavailable) as catalog_error:
                 checked_at = datetime.now(UTC)
-                self._process_pending(
-                    dry_run=dry_run,
-                    deliver_notifications=deliver_notifications,
-                    extra=[],
-                    retention_cutoff=checked_at
-                    - timedelta(days=self.config.retention_days),
-                    retention_observed_at=checked_at,
-                    mailbox_identity_key=mailbox_identity_key,
-                )
+                try:
+                    self._process_pending(
+                        dry_run=dry_run,
+                        deliver_notifications=deliver_notifications,
+                        extra=[],
+                        retention_cutoff=checked_at
+                        - timedelta(days=self.config.retention_days),
+                        retention_observed_at=checked_at,
+                        mailbox_identity_key=mailbox_identity_key,
+                    )
+                except GmailAuthorizationRejected:
+                    raise
+                except GmailError:
+                    raise catalog_error from None
                 raise
             if (
                 not self.admission_sender_names

@@ -291,15 +291,30 @@ def decode_gmail_label_catalog(
     return tuple(labels)
 
 
-def _bounded_gmail_label_response_body(response: object) -> bytes | None:
+def _bounded_gmail_label_response_body(
+    response: object,
+    *,
+    require_content_length_match: bool = False,
+) -> bytes | None:
     headers = getattr(response, "headers", {})
     content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
-    if (
-        isinstance(content_length, str)
-        and content_length.strip().isdecimal()
-        and int(content_length.strip()) > MAX_GMAIL_LABEL_CATALOG_BYTES
-    ):
-        return None
+    expected_length: int | None = None
+    if content_length is not None:
+        if isinstance(content_length, str) and content_length.strip().isdecimal():
+            expected_length = int(content_length.strip())
+        elif (
+            isinstance(content_length, int)
+            and not isinstance(content_length, bool)
+            and content_length >= 0
+        ):
+            expected_length = content_length
+        elif require_content_length_match:
+            return None
+        if (
+            expected_length is not None
+            and expected_length > MAX_GMAIL_LABEL_CATALOG_BYTES
+        ):
+            return None
     body = bytearray()
     for chunk in response.iter_content(chunk_size=65_536):
         if not chunk:
@@ -308,6 +323,12 @@ def _bounded_gmail_label_response_body(response: object) -> bytes | None:
         body.extend(chunk[:remaining])
         if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
             return None
+    if (
+        require_content_length_match
+        and expected_length is not None
+        and len(body) != expected_length
+    ):
+        return None
     return bytes(body)
 
 
@@ -676,7 +697,15 @@ class GmailGateway:
                         "Gmail rejected the configured authorization"
                     )
                 if response.status_code == 403:
-                    body = _bounded_gmail_label_response_body(response)
+                    try:
+                        body = _bounded_gmail_label_response_body(
+                            response,
+                            require_content_length_match=True,
+                        )
+                    except Exception as exc:
+                        raise GmailAuthorizationRejected(
+                            "Gmail rejected the configured authorization"
+                        ) from exc
                     reasons = _gmail_error_reasons(body) if body is not None else frozenset()
                     if reasons and reasons <= TRANSIENT_GMAIL_LABEL_403_REASONS:
                         raise GmailLabelCatalogUnavailable(

@@ -12,12 +12,14 @@ import pytest
 from connect_automate import connect
 
 from eom_email_watcher import engine_api
+from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.automation.rules import MAX_AUTOMATION_RULES
 from eom_email_watcher.config import load_config
 from eom_email_watcher.db import AdmissionProvenance, GmailLabelStoreError, Store
 from eom_email_watcher.gmail import (
     GmailAuthorizationRejected,
     GmailError,
+    GmailGateway,
     GmailLabel,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
@@ -61,6 +63,7 @@ from eom_email_watcher.runtime import (
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
 )
+from eom_email_watcher.service import Watcher
 
 IMAP_CURSOR = f"eom-imap-v2:{'a' * 64}:44:7"
 REPLACEMENT_IMAP_CURSOR = f"eom-imap-v2:{'b' * 64}:55:99"
@@ -6116,6 +6119,234 @@ def test_watcher_check_maps_gmail_authorization_rejection_without_provider_detai
     }
     assert "private provider response body" not in json.dumps(response)
     assert "private provider response body" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("catalog_error", "pending_error", "expected_error", "expected_status"),
+    [
+        (
+            GmailLabelCatalogUnavailable("catalog unavailable"),
+            GmailError("temporary mailbox transport failure"),
+            {
+                "code": "gmail_label_catalog_unavailable",
+                "message": "Gmail labels are temporarily unavailable",
+                "retryable": True,
+            },
+            "pending",
+        ),
+        (
+            GmailLabelCatalogInvalid("catalog invalid"),
+            GmailError("temporary mailbox transport failure"),
+            {
+                "code": "gmail_label_catalog_invalid",
+                "message": "Gmail returned an invalid label catalog",
+                "retryable": False,
+            },
+            "pending",
+        ),
+        (
+            GmailLabelCatalogUnavailable("catalog unavailable"),
+            GmailAuthorizationRejected("private authorization response"),
+            {
+                "code": "gmail_authorization_rejected",
+                "message": "Gmail authorization was rejected; reconnect the account",
+                "retryable": False,
+            },
+            "pending",
+        ),
+        (
+            GmailLabelCatalogUnavailable("catalog unavailable"),
+            None,
+            {
+                "code": "gmail_label_catalog_unavailable",
+                "message": "Gmail labels are temporarily unavailable",
+                "retryable": True,
+            },
+            "analyzed",
+        ),
+    ],
+)
+def test_catalog_failure_remains_primary_while_processing_persisted_pending_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog_error: Exception,
+    pending_error: Exception | None,
+    expected_error: dict[str, object],
+    expected_status: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    loaded = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(loaded.store, "gmail", "gmail-default")
+    loaded.store.set_state(
+        "100",
+        datetime.now(UTC),
+        mailbox_identity_key=identity_key,
+    )
+    selector_set = loaded.store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    loaded.store.add_gmail_label_selector(
+        "gmail-default",
+        identity_key,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    assert _add_test_message(
+        loaded.store,
+        message_id="persisted-pending",
+        provider_message_id="provider-pending",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Pending retry",
+        received_at=datetime.now(UTC).isoformat(),
+        mailbox_identity_key=identity_key,
+    )
+
+    class CatalogFailureGateway(FakeGmail):
+        def __init__(self) -> None:
+            self.content_calls = 0
+            self.change_calls = 0
+
+        def mailbox_identity_key(self) -> str:
+            return identity_key
+
+        def label_catalog(self) -> tuple[GmailLabel, ...]:
+            raise catalog_error
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            self.change_calls += 1
+            raise AssertionError("catalog failure must block discovery")
+
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            self.content_calls += 1
+            if pending_error is not None:
+                raise pending_error
+            return MessageContent("body", (), ())
+
+    gateway = CatalogFailureGateway()
+    runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
+    watcher = Watcher(
+        runtime.config,
+        runtime.store,
+        MailboxSession("gmail", "gmail-default", gateway),
+        runtime.model,
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "run_watcher_check",
+        lambda *_args, **kwargs: watcher.check(
+            dry_run=kwargs["dry_run"],
+            deliver_notifications=kwargs["deliver_notifications"],
+        ),
+    )
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+
+    @contextmanager
+    def available_lock(_path: Path, _busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+
+    response = engine_api._response(request(config_path, "watcher.check"))
+
+    assert response["error"] == expected_error
+    assert runtime.store.state()[0] == "100"
+    assert runtime.store.recent(1)[0]["status"] == expected_status
+    assert len(runtime.store.recent(10)) == 1
+    assert gateway.content_calls == 1
+    assert gateway.change_calls == 0
+    assert not _add_test_message(
+        runtime.store,
+        message_id="persisted-pending",
+        provider_message_id="provider-pending",
+        thread_id=None,
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Pending retry",
+        received_at=datetime.now(UTC).isoformat(),
+        mailbox_identity_key=identity_key,
+    )
+
+
+@pytest.mark.parametrize("failure_mode", ["interrupted", "overflow"])
+def test_gmail_catalog_403_incomplete_body_fails_closed_through_engine_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_mode: str,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    transient = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
+
+    class Response:
+        status_code = 403
+        headers: dict[str, str] = {}
+
+        def iter_content(self, chunk_size: int):
+            if failure_mode == "overflow":
+                yield b"x" * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1)
+                return
+            yield transient
+            raise OSError("private provider stream failure")
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, _url: str, **_kwargs: object) -> Response:
+            return Response()
+
+    http_gateway = GmailGateway(
+        None,
+        mailbox_identity_key=identity_key,
+        credentials=SimpleNamespace(),
+    )
+
+    class CatalogGateway:
+        def mailbox_identity_key(self) -> str:
+            return identity_key
+
+        def label_catalog(self) -> tuple[GmailLabel, ...]:
+            return http_gateway.label_catalog()
+
+    mailbox = MailboxSession("gmail", "gmail-default", CatalogGateway())
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda _credentials: Session())
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(engine_api, "mail_account_connected", lambda *_args: True)
+    monkeypatch.setattr(engine_api, "load_mailbox_account", lambda *_args: mailbox)
+    monkeypatch.setattr(engine_api, "operation_lock_supported", lambda _path: True)
+
+    @contextmanager
+    def available_lock(_path: Path, _busy_message: str):
+        yield
+
+    monkeypatch.setattr(engine_api, "operation_lock", available_lock)
+
+    with caplog.at_level(logging.WARNING, logger=engine_api.__name__):
+        response = engine_api._response(
+            request(
+                config_path,
+                "gmail.labels.catalog",
+                {"provider": "gmail", "account_id": "gmail-default"},
+            )
+        )
+
+    assert response["error"] == {
+        "code": "gmail_authorization_rejected",
+        "message": "Gmail authorization was rejected; reconnect the account",
+        "retryable": False,
+    }
+    assert "private provider stream failure" not in json.dumps(response)
+    assert "private provider stream failure" not in caplog.text
 
 
 def test_check_maps_mailbox_identity_change_to_domain_error(

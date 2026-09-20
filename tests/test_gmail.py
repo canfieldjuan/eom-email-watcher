@@ -528,6 +528,12 @@ class FakeCatalogResponse:
             yield self.body[start : start + chunk_size]
 
 
+class InterruptedCatalogResponse(FakeCatalogResponse):
+    def iter_content(self, chunk_size: int):
+        yield from super().iter_content(chunk_size)
+        raise OSError("private provider stream failure")
+
+
 class FakeCatalogSession:
     def __init__(self, response: FakeCatalogResponse):
         self.response = response
@@ -648,6 +654,34 @@ def test_gmail_catalog_classifies_http_auth_and_quota_boundaries(
 
     assert response.read_started is (status_code == 403)
     assert "private provider body" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        InterruptedCatalogResponse(
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
+            status_code=403,
+        ),
+        FakeCatalogResponse(
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
+            content_length="999",
+            status_code=403,
+        ),
+    ],
+)
+def test_gmail_catalog_403_requires_a_complete_error_document(
+    monkeypatch: pytest.MonkeyPatch,
+    response: FakeCatalogResponse,
+) -> None:
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    gateway = GmailGateway(None, credentials=SimpleNamespace())
+
+    with pytest.raises(GmailAuthorizationRejected) as raised:
+        gateway.label_catalog()
+
+    assert "private provider stream failure" not in str(raised.value)
 
 
 def test_gmail_catalog_bounded_reader_accepts_exact_one_mib_and_rejects_plus_one() -> None:
