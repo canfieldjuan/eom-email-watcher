@@ -35,6 +35,7 @@ from .mime import AttachmentDescriptor
 SCHEMA_VERSION = 25
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
 MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 AUTOMATION_CLEANUP_CHUNK_SIZE = 500
@@ -4003,6 +4004,8 @@ class Store:
             for index, row in enumerate(rows):
                 grouped.setdefault(str(row["certificate_id"]), []).append((index, row))
             values: list[dict[str, object] | None] = [None] * len(rows)
+            response_bytes = len(b'{"items":[]}')
+            rendered_count = 0
             for certificate_id, selections in grouped.items():
                 parent = db.execute(
                     "SELECT * FROM certificate_records WHERE certificate_id = ?",
@@ -4062,7 +4065,11 @@ class Store:
                         review_reasons = [
                             reason
                             for reason in review_reasons
-                            if reason != "POLICY_DATE_REVIEW"
+                            if reason
+                            not in {
+                                "POLICY_DATE_REVIEW",
+                                "POLICY_ASSOCIATION_UNCLEAR",
+                            }
                         ]
                         policy_reasons = list(policy["review_reasons"])
                         review_reasons.extend(policy_reasons)
@@ -4077,7 +4084,7 @@ class Store:
                                 expiry_status = "expires_today"
                             else:
                                 expiry_status = "upcoming"
-                    values[index] = {
+                    rendered = {
                         "certificate_id": certificate_id,
                         "certificate_holder": self._certificate_text_value_from_record(
                             record, "certificate_holder"
@@ -4117,6 +4124,19 @@ class Store:
                         "connect_job_id": str(parent["connect_job_id"]),
                         "source_available": bool(selection["source_available"]),
                     }
+                    encoded = json.dumps(
+                        rendered,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    response_bytes += len(encoded) + (1 if rendered_count else 0)
+                    if response_bytes > MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES:
+                        raise RuntimeError(
+                            "Certificate ledger response size exceeds the local API limit"
+                        )
+                    rendered_count += 1
+                    values[index] = rendered
         if any(value is None for value in values):
             raise RuntimeError("Stored certificate ledger row was not rendered")
         return [value for value in values if value is not None]
@@ -7135,27 +7155,39 @@ class Store:
             ):
                 raise RuntimeError("Certificate join job is not a completed certificate job")
 
-            outcome = "valid"
-            try:
-                _certificate_source_for_job(db, job)
-                if job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
-                    raise CertificateResultInvalid("certificate capability version is unsupported")
-                if job.result_json is None:
-                    raise CertificateResultInvalid("certificate result output is unavailable")
-                outputs = _decode_generic_result(job.result_json)
-                if len(outputs) != 1 or outputs[0].media_type != CERTIFICATE_RESULT_MEDIA_TYPE:
-                    raise CertificateResultInvalid("certificate result output is invalid")
-                result = _validate_certificate_record(
-                    outputs[0].payload,
-                    input_sha256=job.input_sha256,
-                    input_byte_size=job.input_byte_size,
-                    input_display_name=job.input_display_name,
-                )
-                _persist_certificate_projection(db, job=job, result=result, stamp=stamp)
-            except CertificateResultConflict:
-                outcome = "CERTIFICATE_RESULT_CONFLICT"
-            except (CertificateResultInvalid, RuntimeError, ValueError):
-                outcome = "CERTIFICATE_RESULT_INVALID"
+            conflict_fence = db.execute(
+                """SELECT 1 FROM automation_fires
+                    WHERE job_id = ? AND reason = 'CERTIFICATE_RESULT_CONFLICT'
+                    LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            outcome = "CERTIFICATE_RESULT_CONFLICT" if conflict_fence is not None else "valid"
+            if outcome == "valid":
+                try:
+                    _certificate_source_for_job(db, job)
+                    if job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
+                        raise CertificateResultInvalid(
+                            "certificate capability version is unsupported"
+                        )
+                    if job.result_json is None:
+                        raise CertificateResultInvalid("certificate result output is unavailable")
+                    outputs = _decode_generic_result(job.result_json)
+                    if (
+                        len(outputs) != 1
+                        or outputs[0].media_type != CERTIFICATE_RESULT_MEDIA_TYPE
+                    ):
+                        raise CertificateResultInvalid("certificate result output is invalid")
+                    result = _validate_certificate_record(
+                        outputs[0].payload,
+                        input_sha256=job.input_sha256,
+                        input_byte_size=job.input_byte_size,
+                        input_display_name=job.input_display_name,
+                    )
+                    _persist_certificate_projection(db, job=job, result=result, stamp=stamp)
+                except CertificateResultConflict:
+                    outcome = "CERTIFICATE_RESULT_CONFLICT"
+                except (CertificateResultInvalid, RuntimeError, ValueError):
+                    outcome = "CERTIFICATE_RESULT_INVALID"
 
             if outcome == "valid":
                 db.execute(

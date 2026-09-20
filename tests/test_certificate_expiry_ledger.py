@@ -553,6 +553,59 @@ def test_conflicting_terminal_replay_fails_completed_and_later_submitted_fires(
     ]
 
 
+def test_conflicting_terminal_replay_fences_a_later_completed_join(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    original = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(original),
+    )
+    conflicting = _record()
+    conflicting["insured"] = _text("Different Insured LLC", "different-insured")
+    engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(conflicting),
+            error=None,
+        ),
+    )
+
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.reconcile_certificate_completed_join(job_id=job_id)
+
+    later = runtime.store.automation_fire(fires[1].fire_id)
+    assert later is not None
+    assert later.state == "failed"
+    assert later.reason == "CERTIFICATE_RESULT_CONFLICT"
+
+
 def test_matching_terminal_replay_preserves_completed_fire(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
@@ -716,6 +769,63 @@ def test_zero_policy_certificate_is_visible_as_review_placeholder(tmp_path: Path
             "source_available": True,
         }
     ]
+
+
+def test_policy_association_review_remains_scoped_to_its_policy_row(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _fire, job_id = _certificate_fire_job(runtime.store)
+    policies = [
+        _policy(
+            0,
+            _date("2027-01-01", "expiration-0"),
+            reasons=["ASSOCIATION_UNCLEAR"],
+        ),
+        _policy(1, _date("2027-02-01", "expiration-1")),
+    ]
+    record = _record(policies=policies)
+    record["withheld"] = [
+        {
+            "field": "policies[0].insurer",
+            "reason": "POLICY_ASSOCIATION_UNCLEAR",
+            "detail": "wrong policy block",
+        }
+    ]
+    record["review"] = {
+        "required": True,
+        "reasons": ["POLICY_ASSOCIATION_UNCLEAR"],
+    }
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+
+    assert [row["review_state"] for row in rows] == ["needs_review", "extracted"]
+    assert rows[0]["review_reasons"] == ["ASSOCIATION_UNCLEAR"]
+    assert rows[1]["review_reasons"] == []
+
+
+def test_certificate_ledger_refuses_an_oversized_serialized_response(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record()
+    record["insured"] = _text("N" * 600_000, "insured-large")
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+
+    with pytest.raises(RuntimeError, match="response size"):
+        runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
 
 
 def test_ledger_query_loads_parent_blob_once_per_certificate(
