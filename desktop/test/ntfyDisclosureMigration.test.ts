@@ -29,6 +29,16 @@ const disclosureCopy =
   "For confidentiality-sensitive mail, close Email Watcher and remove the topic from the private configuration before continuing. " +
   "I understand and allow this email-derived content to be sent to the configured ntfy service";
 
+test("engine child retains cancellation ownership through pipe drainage", () => {
+  assert.doesNotMatch(engineSource, /wait_with_output/);
+  assert.match(engineSource, /struct EnginePipeDrain/);
+  assert.match(engineSource, /fn collect_output/);
+  assert.match(
+    engineSource,
+    /self\.control\.terminate\(\);[\s\S]*self\.join_drains/,
+  );
+});
+
 test("ntfy disclosure native startup gates every config-dependent worker", () => {
   assert.match(engineSource, /"config\.ntfy_disclosure\.status"/);
   assert.match(engineSource, /"config\.ntfy_disclosure\.acknowledge"/);

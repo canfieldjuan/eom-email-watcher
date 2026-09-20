@@ -1517,14 +1517,21 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn stalled_startup_engine(process_id_path: &Path) -> Engine {
+    fn stalled_startup_engine(primary_id_path: &Path, descendant_id_path: &Path) -> Engine {
         Engine::with_command(
             "sh",
             vec![
                 OsString::from("-c"),
-                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from(
+                    r#"cat >/dev/null
+echo $$ > "$1"
+sleep 30 &
+echo $! > "$2"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"host.operation_lock","data":{"path":"/tmp/unused-operation.lock"}}'"#,
+                ),
                 OsString::from("startup-delivery-shutdown-probe"),
-                process_id_path.as_os_str().to_owned(),
+                primary_id_path.as_os_str().to_owned(),
+                descendant_id_path.as_os_str().to_owned(),
             ],
             "unused.toml".into(),
         )
@@ -1741,26 +1748,55 @@ esac"#,
     #[test]
     fn quit_during_startup_delivery_kills_child_releases_lock_and_allows_restart() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let process_id_path = directory.path().join("startup-delivery.pid");
+        let primary_id_path = directory.path().join("startup-delivery-primary.pid");
+        let descendant_id_path = directory.path().join("startup-delivery-descendant.pid");
         let delivery = NotificationDelivery::default();
         let cancellation = CancellationToken::new();
-        let worker = StartupDeliveryWorker::stage(
-            stalled_startup_engine(&process_id_path),
+        let connect_queue =
+            ConnectQueueScheduler::stage_probe_with_cancellation(cancellation.clone(), |token| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+            })
+            .expect("stage Connect queue");
+        let scheduler = PollScheduler::with_cancellation(1, true, cancellation.clone());
+        scheduler
+            .stage_probe(|token| {
+                while !token.is_cancelled() {
+                    thread::yield_now();
+                }
+            })
+            .expect("stage polling");
+        let startup_delivery = StartupDeliveryWorker::stage(
+            stalled_startup_engine(&primary_id_path, &descendant_id_path),
             delivery.clone(),
             cancellation.clone(),
         )
         .expect("stage startup delivery");
-        worker.activate();
-        let process_id = wait_for_process_id(&process_id_path);
+        let queue_probe = connect_queue.clone();
+        let poll_probe = scheduler.clone();
+        let startup_probe = startup_delivery.clone();
+        let workers = AdmissionWorkers {
+            cancellation,
+            connect_queue,
+            scheduler,
+            startup_delivery,
+        };
+        workers.activate();
+        let primary_id = wait_for_process_id(&primary_id_path);
+        let descendant_id = wait_for_process_id(&descendant_id_path);
+        assert_process_stopped(primary_id);
+        // SAFETY: signal 0 only inspects the disposable pipe-holding descendant.
+        assert_eq!(unsafe { libc::kill(descendant_id, 0) }, 0);
 
         let started = Instant::now();
-        cancellation.cancel();
-        worker.signal_stop();
-        worker.join().expect("startup delivery joins");
+        drop(workers);
 
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_process_stopped(process_id);
-        assert!(worker.is_joined());
+        assert_process_stopped(descendant_id);
+        assert!(startup_probe.is_joined());
+        assert!(poll_probe.is_joined());
+        assert!(queue_probe.is_joined());
         delivery
             .run_exclusive_with_timeout(Duration::from_millis(100), |_| Ok(()))
             .expect("delivery lock is released after startup shutdown");

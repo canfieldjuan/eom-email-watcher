@@ -3,13 +3,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{File, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, TryLockError as MutexTryLockError,
     atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, RecvTimeoutError},
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -41,6 +43,9 @@ use windows_sys::Win32::{
 const PROTOCOL_VERSION: u8 = 1;
 const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
+const ENGINE_PIPE_POLL: Duration = Duration::from_millis(10);
+const MAX_ENGINE_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENGINE_STDERR_BYTES: usize = 64 * 1024;
 
 pub(crate) trait CancellationParticipant: Send + Sync {
     fn cancel_and_wait(&self);
@@ -388,24 +393,6 @@ impl EngineChildProcess {
         }
         Ok(())
     }
-
-    fn wait_with_output(self) -> io::Result<Output> {
-        #[cfg(windows)]
-        {
-            let Self { process, job } = self;
-            let output = process.wait_with_output()?;
-            if output.status.success() {
-                job.release_descendants()?;
-            } else {
-                job.terminate();
-            }
-            Ok(output)
-        }
-        #[cfg(not(windows))]
-        {
-            self.process.wait_with_output()
-        }
-    }
 }
 
 struct EngineChildControl {
@@ -434,6 +421,26 @@ impl EngineChildControl {
             process.terminate();
         }
     }
+
+    fn complete(&self, success: bool) -> io::Result<()> {
+        let mut slot = self
+            .process
+            .lock()
+            .map_err(|_| io::Error::other("Engine child process is unavailable"))?;
+        let process = slot
+            .take()
+            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
+        #[cfg(windows)]
+        if success {
+            process.job.release_descendants()?;
+        } else {
+            process.job.terminate();
+        }
+        #[cfg(not(windows))]
+        let _ = success;
+        drop(process);
+        Ok(())
+    }
 }
 
 impl CancellationParticipant for EngineChildControl {
@@ -444,7 +451,118 @@ impl CancellationParticipant for EngineChildControl {
 
 struct EngineChild {
     control: Arc<EngineChildControl>,
+    stdout: Option<EnginePipeDrain>,
+    stderr: Option<EnginePipeDrain>,
     _registration: Option<CancellationRegistration>,
+}
+
+struct DrainedPipe {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+struct EnginePipeDrain {
+    result: mpsc::Receiver<io::Result<DrainedPipe>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum EngineOutputAbort {
+    Cancelled,
+    TimedOut,
+}
+
+enum EngineOutputError {
+    Io,
+    Cancelled,
+    TimedOut,
+    StdoutTooLarge,
+    StderrTooLarge,
+}
+
+struct EngineOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl EnginePipeDrain {
+    fn spawn(
+        name: &'static str,
+        reader: impl Read + Send + 'static,
+        limit: usize,
+    ) -> io::Result<Self> {
+        let (sender, result) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _ = sender.send(drain_engine_pipe(reader, limit));
+            })?;
+        Ok(Self {
+            result,
+            worker: Some(worker),
+        })
+    }
+
+    fn receive(
+        &mut self,
+        control: &EngineChildControl,
+        cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
+        abort: &mut Option<EngineOutputAbort>,
+    ) -> io::Result<DrainedPipe> {
+        let result = loop {
+            if abort.is_none() && cancellation.is_some_and(CancellationToken::is_cancelled) {
+                *abort = Some(EngineOutputAbort::Cancelled);
+                control.terminate();
+            }
+            if abort.is_none() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                *abort = Some(EngineOutputAbort::TimedOut);
+                control.terminate();
+            }
+
+            let wait = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or(ENGINE_PIPE_POLL)
+                .min(ENGINE_PIPE_POLL);
+            match self.result.recv_timeout(wait) {
+                Ok(result) => break result,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(io::Error::other("Engine pipe drain stopped unexpectedly"));
+                }
+            }
+        };
+        self.join()?;
+        result
+    }
+
+    fn join(&mut self) -> io::Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| io::Error::other("Engine pipe drain panicked"))
+    }
+}
+
+fn drain_engine_pipe(mut reader: impl Read, limit: usize) -> io::Result<DrainedPipe> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut overflowed = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..retained]);
+        overflowed |= retained < count;
+    }
+    Ok(DrainedPipe { bytes, overflowed })
 }
 
 impl EngineChild {
@@ -461,8 +579,52 @@ impl EngineChild {
             control.terminate();
             return Err(error);
         }
+        let (stdout, stderr) = match control.with_process(|process| {
+            let stdout = process
+                .process
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("Engine stdout was unavailable"))?;
+            let stderr = process
+                .process
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("Engine stderr was unavailable"))?;
+            Ok((stdout, stderr))
+        }) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                control.terminate();
+                return Err(error);
+            }
+        };
+        let mut stdout = match EnginePipeDrain::spawn(
+            "email-watcher-engine-stdout",
+            stdout,
+            MAX_ENGINE_STDOUT_BYTES,
+        ) {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                control.terminate();
+                return Err(error);
+            }
+        };
+        let stderr = match EnginePipeDrain::spawn(
+            "email-watcher-engine-stderr",
+            stderr,
+            MAX_ENGINE_STDERR_BYTES,
+        ) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                control.terminate();
+                let _ = stdout.join();
+                return Err(error);
+            }
+        };
         Ok(Self {
             control,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
             _registration: registration,
         })
     }
@@ -481,15 +643,72 @@ impl EngineChild {
         self.control.terminate();
     }
 
-    fn wait_with_output(self) -> io::Result<Output> {
-        let process = self
-            .control
-            .process
-            .lock()
-            .map_err(|_| io::Error::other("Engine child process is unavailable"))?
-            .take()
-            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
-        process.wait_with_output()
+    fn collect_output(
+        mut self,
+        status: ExitStatus,
+        cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
+    ) -> Result<EngineOutput, EngineOutputError> {
+        let mut abort = None;
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or(EngineOutputError::Io)?
+            .receive(&self.control, cancellation, deadline, &mut abort)
+            .map_err(|_| EngineOutputError::Io)?;
+        let stderr = self
+            .stderr
+            .as_mut()
+            .ok_or(EngineOutputError::Io)?
+            .receive(&self.control, cancellation, deadline, &mut abort)
+            .map_err(|_| EngineOutputError::Io)?;
+        self.stdout = None;
+        self.stderr = None;
+
+        if abort.is_none() && cancellation.is_some_and(CancellationToken::is_cancelled) {
+            abort = Some(EngineOutputAbort::Cancelled);
+            self.control.terminate();
+        }
+        if abort.is_none() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            abort = Some(EngineOutputAbort::TimedOut);
+            self.control.terminate();
+        }
+        match abort {
+            Some(EngineOutputAbort::Cancelled) => return Err(EngineOutputError::Cancelled),
+            Some(EngineOutputAbort::TimedOut) => return Err(EngineOutputError::TimedOut),
+            None => {}
+        }
+        if stdout.overflowed {
+            return Err(EngineOutputError::StdoutTooLarge);
+        }
+        if stderr.overflowed {
+            return Err(EngineOutputError::StderrTooLarge);
+        }
+        self.control
+            .complete(status.success())
+            .map_err(|_| EngineOutputError::Io)?;
+        Ok(EngineOutput {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        })
+    }
+
+    fn join_drains(&mut self) {
+        if let Some(stdout) = self.stdout.as_mut() {
+            let _ = stdout.join();
+        }
+        if let Some(stderr) = self.stderr.as_mut() {
+            let _ = stderr.join();
+        }
+    }
+}
+
+impl Drop for EngineChild {
+    fn drop(&mut self) {
+        self.control.terminate();
+        self.join_drains();
+        let _ = self.control.complete(false);
     }
 }
 
@@ -1873,48 +2092,56 @@ impl Engine {
             return Err(error);
         }
 
-        if timeout.is_some() || self.cancellation.is_some() {
-            let started = Instant::now();
-            loop {
-                if let Some(cancellation) = self.cancellation.as_ref()
-                    && cancellation.is_cancelled()
-                {
-                    child.terminate();
-                    return Err(engine_cancelled());
-                }
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-                            child.terminate();
-                            return Err(EngineError::host(
-                                "engine_timeout",
-                                "Watcher engine did not respond before its timeout",
-                            ));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => {
+        let started = Instant::now();
+        let deadline = timeout.and_then(|timeout| started.checked_add(timeout));
+        let status = loop {
+            if let Some(cancellation) = self.cancellation.as_ref()
+                && cancellation.is_cancelled()
+            {
+                child.terminate();
+                return Err(engine_cancelled());
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         child.terminate();
                         return Err(EngineError::host(
-                            "engine_unavailable",
-                            "Watcher engine status could not be inspected",
+                            "engine_timeout",
+                            "Watcher engine did not respond before its timeout",
                         ));
                     }
+                    std::thread::sleep(ENGINE_PIPE_POLL);
+                }
+                Err(_) => {
+                    child.terminate();
+                    return Err(EngineError::host(
+                        "engine_unavailable",
+                        "Watcher engine status could not be inspected",
+                    ));
                 }
             }
-        }
+        };
 
-        if self.check_cancellation().is_err() {
-            child.terminate();
-            return Err(engine_cancelled());
-        }
-        let output = child.wait_with_output().map_err(|_| {
-            EngineError::host(
-                "engine_unavailable",
-                "Watcher engine did not return a result",
-            )
-        })?;
+        let output = child
+            .collect_output(status, self.cancellation.as_ref(), deadline)
+            .map_err(|error| match error {
+                EngineOutputError::Cancelled => engine_cancelled(),
+                EngineOutputError::TimedOut => EngineError::host(
+                    "engine_timeout",
+                    "Watcher engine did not respond before its timeout",
+                ),
+                EngineOutputError::StdoutTooLarge | EngineOutputError::StderrTooLarge => {
+                    EngineError::host(
+                        "engine_protocol_error",
+                        "Watcher engine returned an invalid response; inspect desktop logs",
+                    )
+                }
+                EngineOutputError::Io => EngineError::host(
+                    "engine_unavailable",
+                    "Watcher engine did not return a result",
+                ),
+            })?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
             eprintln!("watcher engine {operation} stderr: {}", stderr.trim());
@@ -2030,7 +2257,11 @@ mod tests {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let mut command = Command::new("sh");
-        command.args(["-c", "exec sleep 30"]).process_group(0);
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
 
         let child = EngineChild::spawn(&mut command, Some(&cancellation))
             .expect("spawn child into cancelled registry");
@@ -2045,7 +2276,11 @@ mod tests {
     fn cancellation_synchronously_kills_and_reaps_registered_child() {
         let cancellation = CancellationToken::new();
         let mut command = Command::new("sh");
-        command.args(["-c", "exec sleep 30"]).process_group(0);
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
         let child =
             EngineChild::spawn(&mut command, Some(&cancellation)).expect("spawn registered child");
 
@@ -2054,6 +2289,178 @@ mod tests {
         assert!(child.try_wait().expect("inspect reaped child").is_some());
         drop(child);
         cancellation.wait_for_registrations();
+    }
+
+    #[test]
+    fn engine_pipe_drain_preserves_normal_and_large_bounded_output() {
+        let normal = b"normal engine output".to_vec();
+        let normal_output =
+            drain_engine_pipe(io::Cursor::new(normal.clone()), normal.len()).expect("drain normal");
+        assert_eq!(normal_output.bytes, normal);
+        assert!(!normal_output.overflowed);
+
+        let large = vec![b'x'; 256 * 1024];
+        let large_output =
+            drain_engine_pipe(io::Cursor::new(large.clone()), large.len()).expect("drain large");
+        assert_eq!(large_output.bytes, large);
+        assert!(!large_output.overflowed);
+    }
+
+    #[test]
+    fn engine_pipe_drain_marks_overflow_after_consuming_the_stream() {
+        let input = b"diagnostic stderr beyond its bound".to_vec();
+        let output = drain_engine_pipe(io::Cursor::new(input), 10).expect("drain stderr");
+
+        assert_eq!(output.bytes, b"diagnostic");
+        assert!(output.overflowed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_primary_exit_kills_pipe_holding_descendant_and_releases_gate() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first_run = directory.path().join("first-run");
+        let primary_pid_path = directory.path().join("primary.pid");
+        let descendant_pid_path = directory.path().join("descendant.pid");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+if [ ! -f "$1" ]; then
+  : > "$1"
+  echo $$ > "$2"
+  sleep 30 &
+  echo $! > "$3"
+fi
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+                OsString::from("pipe-holding-descendant-probe"),
+                first_run.as_os_str().to_owned(),
+                primary_pid_path.as_os_str().to_owned(),
+                descendant_pid_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let cancellation = CancellationToken::new();
+        let bounded = engine
+            .with_request_timeout(Duration::from_secs(5))
+            .with_cancellation(cancellation.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(bounded.check()).expect("send engine result");
+        });
+
+        let read_pid = |path: &Path| {
+            for _ in 0..100 {
+                if let Ok(value) = fs::read_to_string(path)
+                    && let Ok(pid) = value.trim().parse::<i32>()
+                {
+                    return pid;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("engine probe did not record {}", path.display());
+        };
+        let primary_pid = read_pid(&primary_pid_path);
+        let descendant_pid = read_pid(&descendant_pid_path);
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable primary PID.
+            if unsafe { libc::kill(primary_pid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 only inspects the disposable primary PID.
+        assert_ne!(unsafe { libc::kill(primary_pid, 0) }, 0);
+        // SAFETY: signal 0 only inspects the disposable descendant PID.
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled engine request finishes")
+            .expect_err("cancelled engine request fails closed");
+        worker.join().expect("engine request worker joins");
+        cancellation.wait_for_registrations();
+        assert_eq!(error.code, "engine_cancelled");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable descendant PID.
+            if unsafe { libc::kill(descendant_pid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 only inspects the disposable descendant PID.
+        assert_ne!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        let restarted = engine.check().expect("fresh request reuses released gate");
+        assert!(restarted.active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_after_primary_exit_kills_pipe_holding_descendant() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let descendant_pid_path = directory.path().join("descendant.pid");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+sleep 30 &
+echo $! > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+                OsString::from("pipe-holding-timeout-probe"),
+                descendant_pid_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let error = engine
+            .check()
+            .expect_err("pipe-holding descendant must not outlive request timeout");
+        assert_eq!(error.code, "engine_timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let descendant_pid: i32 = fs::read_to_string(&descendant_pid_path)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable descendant PID.
+            if unsafe { libc::kill(descendant_pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out pipe-holding descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_drain_does_not_corrupt_a_valid_protocol_response() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' 'bounded diagnostic' >&2
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        assert!(engine.check().expect("valid response with stderr").active);
     }
 
     #[test]
