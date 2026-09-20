@@ -606,6 +606,58 @@ def test_conflicting_terminal_replay_fences_a_later_completed_join(tmp_path: Pat
     assert later.reason == "CERTIFICATE_RESULT_CONFLICT"
 
 
+def test_invalid_terminal_replay_fences_a_later_completed_join(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    invalid = _record()
+    invalid["unexpected"] = True
+    engine_api._apply_connect_update(
+        runtime.store,
+        connect.CapabilityJobUpdate(
+            job_id=job_id,
+            status="completed",
+            provider_app_id="invoice-processor",
+            provider_instance_id=INSTANCE_A,
+            result=_capability_result(invalid),
+            error=None,
+        ),
+    )
+
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.reconcile_certificate_completed_join(job_id=job_id)
+
+    later = runtime.store.automation_fire(fires[1].fire_id)
+    assert later is not None
+    assert later.state == "failed"
+    assert later.reason == "CERTIFICATE_RESULT_INVALID"
+
+
 def test_matching_terminal_replay_preserves_completed_fire(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
@@ -726,6 +778,41 @@ def test_provider_owned_certificate_survives_source_deletion(tmp_path: Path) -> 
     rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
     assert len(rows) == 4
     assert {row["source_available"] for row in rows} == {False}
+    assert runtime.store.connect_job(job_id) is None
+    assert runtime.store.connect_dispatch(job_id) is None
+
+
+def test_invalid_source_less_certificate_discards_its_terminal_job(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="accepted",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+    )
+    assert runtime.store.delete_message("message-1") is True
+    invalid = _record()
+    invalid["unexpected"] = True
+
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="accepted",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(invalid),
+    )
+
+    assert runtime.store.connect_job(job_id) is None
+    assert runtime.store.connect_dispatch(job_id) is None
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled is not None
+    assert settled.state == "failed"
+    assert settled.reason == "CERTIFICATE_RESULT_INVALID"
+    assert settled.job_id == job_id
+    assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100) == []
 
 
 def test_zero_policy_certificate_is_visible_as_review_placeholder(tmp_path: Path) -> None:

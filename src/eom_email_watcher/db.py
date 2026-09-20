@@ -958,6 +958,12 @@ _CERTIFICATE_LEDGER_TABLES_SQL = (
             typeof(review_reasons_json) = 'blob'
             AND length(review_reasons_json) BETWEEN 2 AND 8192
         ),
+        terminal_replay_failure TEXT CHECK (
+            terminal_replay_failure IS NULL
+            OR terminal_replay_failure IN (
+                'CERTIFICATE_RESULT_CONFLICT', 'CERTIFICATE_RESULT_INVALID'
+            )
+        ),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE (
@@ -1051,6 +1057,19 @@ _CERTIFICATE_LEDGER_TABLES_SQL = (
 def _ensure_certificate_ledger_schema(db: sqlite3.Connection) -> None:
     for statement in _CERTIFICATE_LEDGER_TABLES_SQL:
         db.execute(statement)
+    certificate_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(certificate_records)").fetchall()
+    }
+    if "terminal_replay_failure" not in certificate_columns:
+        db.execute(
+            """ALTER TABLE certificate_records ADD COLUMN terminal_replay_failure TEXT
+            CHECK (
+                terminal_replay_failure IS NULL
+                OR terminal_replay_failure IN (
+                    'CERTIFICATE_RESULT_CONFLICT', 'CERTIFICATE_RESULT_INVALID'
+                )
+            )"""
+        )
     db.execute(
         """INSERT OR IGNORE INTO automation_fire_source_identities(
             fire_id, provider, account_id, mailbox_identity_key,
@@ -7029,6 +7048,39 @@ class Store:
                         WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
                         (reason, stamp, job_id),
                     )
+            settled_source_less_certificate = bool(
+                certificate_outcome is not None
+                and terminal_job is not None
+                and dispatch_before is not None
+                and not bool(dispatch_before["source_available"])
+                and db.execute(
+                    """SELECT 1 FROM automation_fires
+                    WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')
+                    LIMIT 1""",
+                    (job_id,),
+                ).fetchone()
+                is None
+            )
+            if settled_source_less_certificate:
+                deleted = db.execute(
+                    "DELETE FROM connect_attachment_jobs WHERE job_id = ? AND status = ?",
+                    (job_id, next_state),
+                )
+                if deleted.rowcount != 1:
+                    raise RuntimeError("Settled source-less certificate job was not discarded")
+                if certificate_outcome != "valid":
+                    reason = (
+                        "CERTIFICATE_RESULT_CONFLICT"
+                        if certificate_outcome == "conflict"
+                        else "CERTIFICATE_RESULT_INVALID"
+                    )
+                    db.execute(
+                        """UPDATE automation_fires SET state = 'failed',
+                            reason = ?, pending_since = NULL, updated_at = ?
+                        WHERE job_id = ?""",
+                        (reason, stamp, job_id),
+                    )
+                discard_terminal = True
             row = None
             if not discard_terminal:
                 row = db.execute(
@@ -7120,6 +7172,14 @@ class Store:
                 outcome = "CERTIFICATE_RESULT_INVALID"
 
             if outcome is not None:
+                fence = db.execute(
+                    """UPDATE certificate_records
+                    SET terminal_replay_failure = ?, updated_at = ?
+                    WHERE connect_job_id = ?""",
+                    (outcome, stamp, job_id),
+                )
+                if fence.rowcount != 1:
+                    raise RuntimeError("Certificate replay failure was not durably fenced")
                 db.execute(
                     """UPDATE automation_fires SET state = 'failed',
                         state_version = state_version + 1, reason = ?,
@@ -7155,13 +7215,17 @@ class Store:
             ):
                 raise RuntimeError("Certificate join job is not a completed certificate job")
 
-            conflict_fence = db.execute(
-                """SELECT 1 FROM automation_fires
-                    WHERE job_id = ? AND reason = 'CERTIFICATE_RESULT_CONFLICT'
-                    LIMIT 1""",
+            replay_fences = db.execute(
+                """SELECT terminal_replay_failure FROM certificate_records
+                WHERE connect_job_id = ?""",
                 (job_id,),
-            ).fetchone()
-            outcome = "CERTIFICATE_RESULT_CONFLICT" if conflict_fence is not None else "valid"
+            ).fetchall()
+            if len(replay_fences) > 1:
+                raise RuntimeError("Completed certificate job has multiple durable projections")
+            replay_failure = (
+                None if not replay_fences else replay_fences[0]["terminal_replay_failure"]
+            )
+            outcome = str(replay_failure) if replay_failure is not None else "valid"
             if outcome == "valid":
                 try:
                     _certificate_source_for_job(db, job)
