@@ -159,7 +159,7 @@ test("Gmail proof evidence spans the section and wraps without changing sender-c
   );
 });
 
-test("local sender observations stay authoritative across stale health responses", () => {
+test("sender observation versions reject crossed health and accept later fresh health", () => {
   assert.match(
     source,
     /const exactSenderCount = gmailLabelSenderCount\.count \?\? health\.watchlist_count/,
@@ -167,34 +167,78 @@ test("local sender observations stay authoritative across stale health responses
   assert.match(source, /watchlist_count: exactSenderCount/);
   assert.match(source, /watchlistCount\.textContent = String\(exactSenderCount\)/);
   assert.doesNotMatch(source, /watchlistCount\.textContent = String\(health\.watchlist_count\)/);
-  const reducerSource = source.match(
-    /function gmailLabelSenderCountAfterObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelPollingStateMessage/,
+  const localReducerSource = source.match(
+    /function gmailLabelSenderCountAfterLocalObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelSenderCountAfterHealth/,
   );
-  assert.ok(reducerSource);
-  const observe = Function(
-    `return function gmailLabelSenderCountAfterObservation(current, incomingCount, source) {${reducerSource[1]}\n}`,
+  assert.ok(localReducerSource);
+  const observeLocal = Function(
+    `return function gmailLabelSenderCountAfterLocalObservation(current, incomingCount) {${localReducerSource[1]}\n}`,
   )() as (
-    current: { count: number | null; local_authoritative: boolean },
+    current: { count: number | null; observation_version: number },
     incomingCount: number,
-    source: "health" | "local",
-  ) => { count: number | null; local_authoritative: boolean };
+  ) => { count: number | null; observation_version: number };
+  const healthReducerSource = source.match(
+    /function gmailLabelSenderCountAfterHealth\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelPollingStateMessage/,
+  );
+  assert.ok(healthReducerSource);
+  const observeHealth = Function(
+    `return function gmailLabelSenderCountAfterHealth(current, incomingCount, requestObservationVersion) {${healthReducerSource[1]}\n}`,
+  )() as (
+    current: { count: number | null; observation_version: number },
+    incomingCount: number,
+    requestObservationVersion: number,
+  ) => { count: number | null; observation_version: number };
 
-  let healthFirst = observe({ count: null, local_authoritative: false }, 0, "health");
-  assert.deepEqual(healthFirst, { count: 0, local_authoritative: false });
-  healthFirst = observe(healthFirst, 0, "local");
-  healthFirst = observe(healthFirst, 1, "local");
-  assert.deepEqual(observe(healthFirst, 0, "health"), {
+  const initial = { count: null, observation_version: 0 };
+  const provisionalHealth = observeHealth(initial, 0, 0);
+  assert.deepEqual(provisionalHealth, { count: 0, observation_version: 0 });
+
+  const afterAdd = observeLocal(provisionalHealth, 1);
+  assert.deepEqual(observeHealth(afterAdd, 0, 0), {
     count: 1,
-    local_authoritative: true,
+    observation_version: 1,
   });
 
-  let listFirst = observe({ count: null, local_authoritative: false }, 1, "local");
-  listFirst = observe(listFirst, 0, "health");
-  assert.deepEqual(listFirst, { count: 1, local_authoritative: true });
+  const afterRemove = observeLocal(afterAdd, 0);
+  assert.deepEqual(observeHealth(afterRemove, 1, 1), {
+    count: 0,
+    observation_version: 2,
+  });
 
-  let removed = observe({ count: 1, local_authoritative: true }, 0, "local");
-  removed = observe(removed, 1, "health");
-  assert.deepEqual(removed, { count: 0, local_authoritative: true });
+  assert.deepEqual(observeHealth(afterRemove, 3, 2), {
+    count: 3,
+    observation_version: 2,
+  });
+
+  assert.deepEqual(observeLocal(provisionalHealth, 2), {
+    count: 2,
+    observation_version: 1,
+  });
+});
+
+test("health captures sender version and preserves health request generation ordering", () => {
+  assert.match(
+    source,
+    /function renderHealth\(health: HealthStatus, senderObservationVersion: number\)/,
+  );
+  const loadHealthSource = source.match(
+    /async function loadHealth\([\s\S]*?\): Promise<boolean> \{([\s\S]*?)\n\}\n\nfunction recoveryStatusMessage/,
+  );
+  assert.ok(loadHealthSource);
+  const capturedVersion = loadHealthSource[1].indexOf(
+    "const senderObservationVersion = gmailLabelSenderCount.observation_version",
+  );
+  const invokeHealth = loadHealthSource[1].indexOf('await invoke<HealthStatus>("health_get")');
+  const generationGuard = loadHealthSource[1].indexOf(
+    "if (requestGeneration !== healthRequestGeneration) return false",
+  );
+  const render = loadHealthSource[1].indexOf(
+    "renderHealth(health, senderObservationVersion)",
+  );
+  assert.ok(capturedVersion >= 0);
+  assert.ok(invokeHealth > capturedVersion);
+  assert.ok(generationGuard > invokeHealth);
+  assert.ok(render > generationGuard);
 });
 
 test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {

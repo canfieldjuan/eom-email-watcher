@@ -342,7 +342,7 @@ interface GmailLabelPollingState {
 
 interface GmailLabelSenderCountState {
   count: number | null;
-  local_authoritative: boolean;
+  observation_version: number;
 }
 
 interface MailAccounts {
@@ -899,7 +899,7 @@ let gmailLabelHealth: GmailLabelPollingHealth | null = null;
 let gmailLabelSelectorRenderSequence = 0;
 let gmailLabelSenderCount: GmailLabelSenderCountState = {
   count: null,
-  local_authoritative: false,
+  observation_version: 0,
 };
 
 function errorMessage(error: unknown): string {
@@ -2301,13 +2301,23 @@ async function gmailLabelIdDigest(labelId: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-function gmailLabelSenderCountAfterObservation(
+function gmailLabelSenderCountAfterLocalObservation(
   current: GmailLabelSenderCountState,
   incomingCount: number,
-  source: "health" | "local",
 ): GmailLabelSenderCountState {
-  if (source === "health" && current.local_authoritative) return current;
-  return { count: incomingCount, local_authoritative: source === "local" };
+  return {
+    count: incomingCount,
+    observation_version: current.observation_version + 1,
+  };
+}
+
+function gmailLabelSenderCountAfterHealth(
+  current: GmailLabelSenderCountState,
+  incomingCount: number,
+  requestObservationVersion: number,
+): GmailLabelSenderCountState {
+  if (requestObservationVersion !== current.observation_version) return current;
+  return { count: incomingCount, observation_version: current.observation_version };
 }
 
 function gmailLabelPollingStateMessage(
@@ -3310,13 +3320,13 @@ function renderHealthUnknown(): void {
   nextCheck.textContent = "Unknown";
 }
 
-function renderHealth(health: HealthStatus): void {
+function renderHealth(health: HealthStatus, senderObservationVersion: number): void {
   const inboxScopeChanged = renderMailAccounts(health.mail);
   if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
-  gmailLabelSenderCount = gmailLabelSenderCountAfterObservation(
+  gmailLabelSenderCount = gmailLabelSenderCountAfterHealth(
     gmailLabelSenderCount,
     health.watchlist_count,
-    "health",
+    senderObservationVersion,
   );
   const exactSenderCount = gmailLabelSenderCount.count ?? health.watchlist_count;
   gmailLabelHealth = {
@@ -3375,8 +3385,7 @@ function renderHealth(health: HealthStatus): void {
     pollingCadence.textContent = "Disabled for current configuration";
     nextCheck.textContent = "Not scheduled";
   }
-  const watcherPrerequisitesReady =
-    health.watchlist_count === 0 || (mailReady && databaseReady);
+  const watcherPrerequisitesReady = exactSenderCount === 0 || (mailReady && databaseReady);
   checkSupported =
     health.production_check_supported &&
     health.notifications.host_delivery_ready &&
@@ -3389,13 +3398,14 @@ async function loadHealth(
   kind: "success" | "error" = "success",
 ): Promise<boolean> {
   const requestGeneration = ++healthRequestGeneration;
+  const senderObservationVersion = gmailLabelSenderCount.observation_version;
   checkSupported = false;
   checkNow.disabled = true;
   healthStatus.textContent = "Refreshing health…";
   try {
     const health = await invoke<HealthStatus>("health_get");
     if (requestGeneration !== healthRequestGeneration) return false;
-    renderHealth(health);
+    renderHealth(health, senderObservationVersion);
     healthStatus.textContent = message;
     healthStatus.dataset.kind = kind;
     return true;
@@ -3742,10 +3752,9 @@ function finishOperation(): void {
 
 function renderSenders(senders: WatchedSender[]): void {
   watchedSenders = senders;
-  gmailLabelSenderCount = gmailLabelSenderCountAfterObservation(
+  gmailLabelSenderCount = gmailLabelSenderCountAfterLocalObservation(
     gmailLabelSenderCount,
     senders.length,
-    "local",
   );
   const exactSenderCount = gmailLabelSenderCount.count ?? senders.length;
   if (gmailLabelHealth !== null) {
