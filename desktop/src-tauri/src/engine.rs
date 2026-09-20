@@ -718,6 +718,7 @@ pub struct Engine {
     args: Vec<OsString>,
     config_path: PathBuf,
     mailbox_operation_gate: Arc<Mutex<()>>,
+    admission_token: Arc<Mutex<Option<AdmissionToken>>>,
     request_timeout: Option<Duration>,
     cancellation: Option<CancellationToken>,
     #[cfg(test)]
@@ -1269,6 +1270,39 @@ pub struct EngineSettings {
     pub retention_days: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdmissionToken {
+    pub version: u8,
+    pub revision: String,
+    pub identity: String,
+}
+
+impl AdmissionToken {
+    fn is_valid(&self) -> bool {
+        fn is_sha256(value: &str) -> bool {
+            value.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }
+
+        self.version == 1 && is_sha256(&self.revision) && is_sha256(&self.identity)
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct AdmissionSnapshot {
+    pub settings: EngineSettings,
+    pub token: AdmissionToken,
+}
+
+#[derive(Deserialize)]
+struct AdmissionComparison {
+    current: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConfigInitialization {
     pub created: bool,
@@ -1301,6 +1335,21 @@ struct EngineRequest<'a> {
     operation: &'a str,
     config_path: String,
     payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_token: Option<AdmissionToken>,
+}
+
+fn operation_requires_admission_token(operation: &str) -> bool {
+    matches!(
+        operation,
+        "host.operation_lock"
+            | "watcher.check"
+            | "connect.queue.pump"
+            | "notifications.pending"
+            | "notifications.pending_under_host_lock"
+            | "notifications.count_under_host_lock"
+            | "notifications.ack"
+    )
 }
 
 #[derive(Deserialize)]
@@ -1378,6 +1427,7 @@ impl Engine {
                 args: Vec::new(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
+                admission_token: Arc::new(Mutex::new(None)),
                 request_timeout: None,
                 cancellation: None,
                 #[cfg(test)]
@@ -1393,6 +1443,7 @@ impl Engine {
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
+                admission_token: Arc::new(Mutex::new(None)),
                 request_timeout: None,
                 cancellation: None,
                 #[cfg(test)]
@@ -1414,6 +1465,7 @@ impl Engine {
             ],
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
+            admission_token: Arc::new(Mutex::new(None)),
             request_timeout: None,
             cancellation: None,
             #[cfg(test)]
@@ -1432,6 +1484,7 @@ impl Engine {
             args,
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
+            admission_token: Arc::new(Mutex::new(None)),
             request_timeout: None,
             cancellation: None,
             test_environment: Vec::new(),
@@ -1778,12 +1831,68 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
         self.request_with_timeout("settings.get", json!({}), timeout)
     }
 
     pub fn settings(&self) -> Result<EngineSettings, EngineError> {
         self.request("settings.get", json!({}))
+    }
+
+    pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
+        let snapshot: AdmissionSnapshot = self.request_with_timeout(
+            "config.admission.snapshot",
+            json!({}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if snapshot.token.is_valid() {
+            Ok(snapshot)
+        } else {
+            Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid configuration admission token",
+            ))
+        }
+    }
+
+    pub fn compare_admission(&self, token: &AdmissionToken) -> Result<(), EngineError> {
+        if !token.is_valid() {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Desktop configuration admission token is invalid",
+            ));
+        }
+        let comparison: AdmissionComparison = self.request_with_timeout(
+            "config.admission.compare",
+            json!({"token": token}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if comparison.current {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "configuration_admission_changed",
+                "Watcher configuration changed during admission",
+            ))
+        }
+    }
+
+    pub(crate) fn install_admission_token(&self, token: AdmissionToken) {
+        *self
+            .admission_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+    }
+
+    pub(crate) fn clear_admission_token(&self, token: &AdmissionToken) {
+        let mut installed = self
+            .admission_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if installed.as_ref() == Some(token) {
+            *installed = None;
+        }
     }
 
     pub fn ntfy_disclosure_status(&self) -> Result<NtfyDisclosureStatus, EngineError> {
@@ -2045,11 +2154,22 @@ impl Engine {
         timeout: Option<Duration>,
     ) -> Result<T, EngineError> {
         self.check_cancellation()?;
+        let admission_token = if operation_requires_admission_token(operation) {
+            self.admission_token
+                .lock()
+                .map_err(|_| {
+                    EngineError::host("host_error", "Configuration admission coordinator stopped")
+                })?
+                .clone()
+        } else {
+            None
+        };
         let request = EngineRequest {
             protocol: PROTOCOL_VERSION,
             operation,
             config_path: self.config_path.to_string_lossy().into_owned(),
             payload,
+            admission_token,
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| {
             EngineError::host(
@@ -3118,6 +3238,114 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.read.status","data"
 
     #[cfg(unix)]
     #[test]
+    fn admission_snapshot_returns_settings_and_exact_safe_token() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *'"operation":"config.admission.snapshot"'*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"config.admission.snapshot","data":{"settings":{"local_model":{"editable":true,"endpoint":"http://127.0.0.1:8080/v1","model":"local-model"},"notifications_enabled":true,"poll_interval_minutes":120,"polling_supported":true,"retention_days":180},"token":{"version":1,"revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}'
+    ;;
+  *) exit 2 ;;
+esac"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let snapshot = engine
+            .admission_snapshot()
+            .expect("atomic admission snapshot must deserialize");
+
+        assert_eq!(snapshot.settings.poll_interval_minutes, 120);
+        assert_eq!(snapshot.token.version, 1);
+        assert_eq!(
+            snapshot.token.revision,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            snapshot.token.identity,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_compare_false_fails_closed() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"config.admission.compare","data":{"current":false}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+
+        let error = engine
+            .compare_admission(&token)
+            .expect_err("a stale comparison must fail closed");
+
+        assert_eq!(error.code, "configuration_admission_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_worker_request_carries_exact_admission_token() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'"#,
+                ),
+                OsString::from("admission-token-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+        engine.install_admission_token(token.clone());
+
+        assert_eq!(
+            engine
+                .pending_notification_count_under_host_lock()
+                .expect("guarded worker request succeeds"),
+            0
+        );
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("parse captured engine request");
+
+        assert_eq!(
+            request["admission_token"],
+            serde_json::to_value(token).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bounded_settings_request_terminates_a_stalled_engine() {
         let engine = Engine::with_command(
             "sh",
@@ -3475,7 +3703,22 @@ notifications_enabled = true
             ),
         )
         .expect("write config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("secure config parent");
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+                .expect("secure config file");
+        }
         let engine = real_engine(config_path);
+        let snapshot = engine
+            .admission_snapshot()
+            .expect("obtain atomic admission snapshot");
+        engine
+            .compare_admission(&snapshot.token)
+            .expect("snapshot remains current before guarded work");
+        engine.install_admission_token(snapshot.token);
 
         let health = engine.health().expect("read engine health");
         let accounts = engine.mail_accounts().expect("read email accounts");
@@ -3595,6 +3838,13 @@ notifications_enabled = true
                 retention_days: 365,
             }
         );
+        let refreshed_admission = engine
+            .admission_snapshot()
+            .expect("refresh admission after settings mutation");
+        engine
+            .compare_admission(&refreshed_admission.token)
+            .expect("refreshed admission remains current");
+        engine.install_admission_token(refreshed_admission.token);
 
         assert_eq!(
             engine.check().expect("inactive check without Gmail"),

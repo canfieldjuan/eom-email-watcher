@@ -4,11 +4,11 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
-    CheckResult, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
-    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
-    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
-    MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
+    AdmissionToken, CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult,
+    CancellationToken, CheckResult, ConnectCapabilities, ConnectCapabilityRef,
+    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
+    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
+    MailAccountResult, MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -22,7 +22,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 
-const STARTUP_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(desktop)]
 const TRAY_OPEN_ID: &str = "open";
@@ -329,6 +328,8 @@ fn run_acknowledgement_attempt<W>(
 }
 
 struct AdmissionWorkers {
+    admission_engine: Engine,
+    admission_token: AdmissionToken,
     cancellation: CancellationToken,
     connect_queue: ConnectQueueScheduler,
     scheduler: PollScheduler,
@@ -469,14 +470,32 @@ where
 }
 
 trait AdmissionWorkerSet {
+    fn revalidate(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     fn activate(&self);
 }
 
 impl AdmissionWorkerSet for AdmissionWorkers {
+    fn revalidate(&self) -> Result<(), EngineError> {
+        self.admission_engine
+            .compare_admission(&self.admission_token)
+    }
+
     fn activate(&self) {
+        self.admission_engine
+            .install_admission_token(self.admission_token.clone());
         self.connect_queue.activate();
         self.scheduler.activate();
         self.startup_delivery.activate();
+    }
+}
+
+impl AdmissionWorkers {
+    fn replace_admission_token(&mut self, token: AdmissionToken) {
+        self.admission_engine.install_admission_token(token.clone());
+        self.admission_token = token;
     }
 }
 
@@ -486,6 +505,8 @@ impl AdmissionWorkerSet for () {
 
 impl Drop for AdmissionWorkers {
     fn drop(&mut self) {
+        self.admission_engine
+            .clear_admission_token(&self.admission_token);
         self.cancellation.cancel();
         self.startup_delivery.signal_stop();
         self.scheduler.signal_stop();
@@ -553,11 +574,20 @@ impl<W> AdmissionCoordinator<W> {
 
     fn install_attempt(
         inner: &mut AdmissionInner<W>,
-        attempt: AdmissionAttempt<W>,
+        mut attempt: AdmissionAttempt<W>,
     ) -> AdmissionTransition
     where
         W: AdmissionWorkerSet,
     {
+        if attempt.state == AdmissionState::Admitted
+            && attempt
+                .workers
+                .as_ref()
+                .is_none_or(|workers| workers.revalidate().is_err())
+        {
+            attempt.state = AdmissionState::ManualRepairRequired;
+            attempt.workers = None;
+        }
         inner.state = attempt.state;
         inner.workers = attempt.workers;
         if inner.state == AdmissionState::Admitted
@@ -581,9 +611,18 @@ impl<W> AdmissionCoordinator<W> {
         let mut inner = self.inner.lock().map_err(|_| {
             EngineError::host("host_error", "Configuration admission coordinator stopped")
         })?;
-        if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
+        if inner.state == AdmissionState::Admitted
+            && let Some(workers) = inner.workers.as_ref()
+        {
+            if workers.revalidate().is_ok() {
+                return Ok(AdmissionTransition {
+                    status: ConfigAdmissionStatus::Admitted,
+                });
+            }
+            inner.state = AdmissionState::ManualRepairRequired;
+            inner.workers = None;
             return Ok(AdmissionTransition {
-                status: ConfigAdmissionStatus::Admitted,
+                status: ConfigAdmissionStatus::ManualRepairRequired,
             });
         }
         inner.state = AdmissionState::Inspecting;
@@ -597,7 +636,8 @@ fn stage_admitted_workers(
     engine: &Engine,
     startup_delivery: &NotificationDelivery,
 ) -> Result<AdmissionWorkers, EngineError> {
-    let settings = engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)?;
+    let snapshot = engine.admission_snapshot()?;
+    let settings = snapshot.settings;
     let cancellation = CancellationToken::new();
     let scheduler = PollScheduler::with_cancellation(
         settings.poll_interval_minutes,
@@ -648,6 +688,8 @@ fn stage_admitted_workers(
         }
     };
     Ok(AdmissionWorkers {
+        admission_engine: engine.clone(),
+        admission_token: snapshot.token,
         cancellation,
         connect_queue,
         scheduler,
@@ -739,6 +781,37 @@ impl AdmissionCoordinator<AdmissionWorkers> {
             Self::install_attempt(&mut inner, attempt)
         };
         Ok(transition.status)
+    }
+
+    fn renew_after_config_mutation(&self, engine: &Engine) -> Result<(), EngineError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            EngineError::host("host_error", "Configuration admission coordinator stopped")
+        })?;
+        if inner.state != AdmissionState::Admitted || inner.workers.is_none() {
+            return Err(EngineError::host(
+                "configuration_not_admitted",
+                "Watcher configuration is not admitted",
+            ));
+        }
+        let renewed = engine.admission_snapshot().and_then(|snapshot| {
+            engine.compare_admission(&snapshot.token)?;
+            Ok(snapshot.token)
+        });
+        match renewed {
+            Ok(token) => {
+                inner
+                    .workers
+                    .as_mut()
+                    .expect("admitted workers checked above")
+                    .replace_admission_token(token);
+                Ok(())
+            }
+            Err(error) => {
+                inner.state = AdmissionState::ManualRepairRequired;
+                inner.workers = None;
+                Err(error)
+            }
+        }
     }
 
     fn wake_connect_queue(&self) -> Result<(), EngineError> {
@@ -1285,10 +1358,11 @@ async fn settings_update(
     model_name: Option<String>,
 ) -> Result<EngineSettings, EngineError> {
     admission.require_admitted()?;
+    let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
     let delivery = delivery.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        delivery.run_engine_exclusive(&engine, |engine| {
+        let settings = delivery.run_engine_exclusive(&engine, |engine| {
             engine.update_settings(
                 poll_interval_minutes,
                 retention_days,
@@ -1296,7 +1370,9 @@ async fn settings_update(
                 model_base_url,
                 model_name,
             )
-        })
+        })?;
+        admission.renew_after_config_mutation(&engine)?;
+        Ok(settings)
     })
     .await
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
@@ -1346,10 +1422,15 @@ async fn watchlist_add(
     name: Option<String>,
 ) -> Result<WatchedSender, EngineError> {
     admission.require_admitted()?;
+    let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.add(email, name))
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let sender = engine.add(email, name)?;
+        admission.renew_after_config_mutation(&engine)?;
+        Ok(sender)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[tauri::command]
@@ -1359,10 +1440,15 @@ async fn watchlist_remove(
     email: String,
 ) -> Result<WatchedSender, EngineError> {
     admission.require_admitted()?;
+    let admission = AdmissionCoordinator::clone(&*admission);
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.remove(email))
-        .await
-        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let sender = engine.remove(email)?;
+        admission.renew_after_config_mutation(&engine)?;
+        Ok(sender)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1597,6 +1683,22 @@ esac"#,
         startup_delivery_activations: Arc<AtomicUsize>,
     }
 
+    #[cfg(unix)]
+    fn inert_admission_engine() -> Engine {
+        Engine::with_command("unused", Vec::new(), "unused.toml".into())
+    }
+
+    #[cfg(unix)]
+    fn inert_admission_token() -> AdmissionToken {
+        AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        }
+    }
+
     impl AdmissionWorkerSet for ProbeAdmissionWorkers {
         fn activate(&self) {
             self.queue_activations.fetch_add(1, Ordering::SeqCst);
@@ -1777,6 +1879,8 @@ esac"#,
         let poll_probe = scheduler.clone();
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
+            admission_engine: inert_admission_engine(),
+            admission_token: inert_admission_token(),
             cancellation,
             connect_queue,
             scheduler,
@@ -1909,6 +2013,8 @@ esac"#,
         let poll_probe = scheduler.clone();
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
+            admission_engine: inert_admission_engine(),
+            admission_token: inert_admission_token(),
             cancellation,
             connect_queue,
             scheduler,
@@ -1978,6 +2084,8 @@ esac"#,
         let poll_probe = scheduler.clone();
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
+            admission_engine: inert_admission_engine(),
+            admission_token: inert_admission_token(),
             cancellation: cancellation.clone(),
             connect_queue,
             scheduler,
@@ -2025,6 +2133,159 @@ esac"#,
         assert_eq!(queue_activations.load(Ordering::SeqCst), 1);
         assert_eq!(poll_activations.load(Ordering::SeqCst), 1);
         assert_eq!(startup_delivery_activations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_snapshot_drops_staged_workers_before_any_activation() {
+        struct StaleWorkers {
+            activations: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for StaleWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                Err(EngineError::host(
+                    "conflict",
+                    "Configuration admission snapshot changed",
+                ))
+            }
+
+            fn activate(&self) {
+                self.activations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl Drop for StaleWorkers {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let activations = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let admission = AdmissionCoordinator::<StaleWorkers>::new();
+
+        let transition = admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(StaleWorkers {
+                        activations: Arc::clone(&activations),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("stale snapshot must reconcile to repair state");
+
+        assert_eq!(
+            transition.status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn normal_admission_compares_snapshot_before_worker_activation() {
+        struct OrderedWorkers {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl AdmissionWorkerSet for OrderedWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                self.events.lock().expect("events").push("compare");
+                Ok(())
+            }
+
+            fn activate(&self) {
+                self.events.lock().expect("events").push("activate");
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let admission = AdmissionCoordinator::<OrderedWorkers>::new();
+        let inspect_events = Arc::clone(&events);
+        let stage_events = Arc::clone(&events);
+
+        let transition = admission
+            .refresh_with(
+                move || {
+                    inspect_events.lock().expect("events").push("status");
+                    Ok(NtfyDisclosureStatus::NormalAdmission)
+                },
+                move || {
+                    stage_events.lock().expect("events").push("snapshot/stage");
+                    Ok(OrderedWorkers {
+                        events: Arc::clone(&stage_events),
+                    })
+                },
+            )
+            .expect("unchanged atomic snapshot admits");
+
+        assert_eq!(transition.status, ConfigAdmissionStatus::Admitted);
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["status", "snapshot/stage", "compare", "activate"]
+        );
+    }
+
+    #[test]
+    fn admitted_refresh_revokes_workers_when_retained_token_is_stale() {
+        struct ExpiringWorkers {
+            comparisons: AtomicUsize,
+            activations: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for ExpiringWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                if self.comparisons.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(EngineError::host(
+                        "conflict",
+                        "Configuration admission snapshot changed",
+                    ))
+                }
+            }
+
+            fn activate(&self) {
+                self.activations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl Drop for ExpiringWorkers {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let activations = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let admission = AdmissionCoordinator::<ExpiringWorkers>::new();
+        let admitted = admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(ExpiringWorkers {
+                        comparisons: AtomicUsize::new(0),
+                        activations: Arc::clone(&activations),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("initial current snapshot admits");
+        let repaired = admission
+            .refresh_with(
+                || panic!("stale admitted refresh must not perform loose inspection"),
+                || panic!("stale admitted refresh must not stage new workers"),
+            )
+            .expect("stale retained token reconciles");
+
+        assert_eq!(admitted.status, ConfigAdmissionStatus::Admitted);
+        assert_eq!(repaired.status, ConfigAdmissionStatus::ManualRepairRequired);
+        assert_eq!(activations.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

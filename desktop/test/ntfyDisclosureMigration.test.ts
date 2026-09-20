@@ -54,11 +54,12 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     libSource.indexOf("fn stage_admitted_workers"),
     libSource.indexOf("impl AdmissionCoordinator<AdmissionWorkers>"),
   );
-  const settings = stagedWorkers.indexOf("settings_with_timeout");
+  const snapshot = stagedWorkers.indexOf("admission_snapshot");
   const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage_with_cancellation");
   const poller = stagedWorkers.indexOf("scheduler\n                .stage");
-  assert.ok(settings >= 0, "worker startup must begin with normal settings admission");
-  assert.ok(settings < queue, "settings admission must precede staged Connect queue startup");
+  assert.ok(snapshot >= 0, "worker startup must begin with one atomic admission snapshot");
+  assert.ok(snapshot < queue, "admission snapshot must precede staged Connect queue startup");
+  assert.doesNotMatch(stagedWorkers, /settings_with_timeout|\.settings\(\)/);
   assert.ok(queue < poller, "Connect queue staging must precede poll staging");
   assert.match(stagedWorkers, /StartupDeliveryWorker::stage/);
   assert.match(libSource, /startup_delivery: StartupDeliveryWorker/);
@@ -67,6 +68,10 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     libSource.indexOf("fn install_attempt"),
     libSource.indexOf("fn refresh_with"),
   );
+  const compare = installAttempt.indexOf("workers.revalidate()");
+  const activate = installAttempt.indexOf("workers.activate()");
+  assert.ok(compare >= 0, "staged workers must revalidate their admission token");
+  assert.ok(compare < activate, "admission token compare must precede worker activation");
   assert.match(installAttempt, /workers\.activate\(\)/);
   assert.doesNotMatch(libSource, /fn start_startup_delivery/);
   assert.match(libSource, /delivery\.deliver_with_cancellation/);
