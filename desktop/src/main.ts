@@ -406,6 +406,7 @@ interface GmailRecoveryStatus {
 
 interface CheckResult extends GmailRecoveryStatus {
   active: boolean;
+  reason?: string;
   discovered: number;
   summarized: number;
   fallback_notified: number;
@@ -418,8 +419,9 @@ interface CheckResult extends GmailRecoveryStatus {
 }
 
 interface ScheduledCheckEvent extends GmailRecoveryStatus {
-  status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending";
+  status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending" | "inactive";
   failed_notifications: number;
+  reason?: string;
 }
 
 interface WatcherSettings {
@@ -3486,6 +3488,14 @@ function recoveryStatusMessage(
   return `Gmail catch-up is still in progress.${progressMessage} Another check will continue it.${recoveryFailureMessage}`;
 }
 
+function inactiveCheckMessage(reason: string | undefined): string | null {
+  if (reason === undefined) return null;
+  if (reason === "gmail_label_selectors_inactive") {
+    return "Saved Gmail labels are inactive. Refresh Gmail labels, then select an active label again.";
+  }
+  return "Email Watcher could not understand the inactive check state. Refresh Gmail labels and try again.";
+}
+
 function checkResultMessage(result: CheckResult): string {
   const delivered = result.delivered_notifications;
   const deliveryMessage = delivered
@@ -3503,6 +3513,13 @@ function checkResultMessage(result: CheckResult): string {
     const progress = `${result.discovered} found, ${result.summarized} analyzed.`;
     const recoveryMessage = recoveryStatusMessage(result, progress);
     return `${recoveryMessage}${deliveryMessage}${failureMessage}${queueMessage}`;
+  }
+  const inactiveMessage =
+    !result.active && result.reason !== undefined
+      ? inactiveCheckMessage(result.reason)
+      : null;
+  if (inactiveMessage !== null) {
+    return `${inactiveMessage}${deliveryMessage}${failureMessage}${queueMessage}`;
   }
   if (!result.active) {
     return `Add a watched sender or Gmail label before running a check.${deliveryMessage}${failureMessage}${queueMessage}`;
@@ -3942,6 +3959,10 @@ void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
       recovery_pending:
         event.payload.recovery_pending || event.payload.status === "recovery_pending",
     });
+    const inactiveMessage =
+      event.payload.status === "inactive"
+        ? inactiveCheckMessage(event.payload.reason)
+        : null;
     if (recoveryMessage !== null) {
       const count = event.payload.failed_notifications;
       const deliveryMessage = count
@@ -3953,6 +3974,8 @@ void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
           ? "error"
           : "success";
       void loadHealth(`Automatic check: ${recoveryMessage}${deliveryMessage}`, kind);
+    } else if (inactiveMessage !== null) {
+      void loadHealth(`Automatic check paused: ${inactiveMessage}`, "error");
     } else if (event.payload.status === "complete") {
       void loadHealth("Automatic check complete.", "success");
     } else if (event.payload.status === "delivery_failed") {

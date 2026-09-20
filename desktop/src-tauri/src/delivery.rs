@@ -196,6 +196,7 @@ mod tests {
             }
             Ok(CheckResult {
                 active: true,
+                reason: None,
                 discovered: 0,
                 summarized: 0,
                 fallback_notified: 0,

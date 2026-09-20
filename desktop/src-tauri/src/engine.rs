@@ -866,6 +866,8 @@ pub struct NotificationHealth {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub discovered: u64,
     pub summarized: u64,
     pub fallback_notified: u64,
@@ -2410,6 +2412,7 @@ mod tests {
         .expect("deserialize Gmail recovery status");
 
         assert_eq!(result.recovery_pending, Some(true));
+        assert_eq!(result.reason, None);
         assert_eq!(result.recovery_state.as_deref(), Some("backoff"));
         assert_eq!(
             result.recovery_failure_code.as_deref(),
@@ -2423,6 +2426,24 @@ mod tests {
         assert_eq!(encoded["recovery_pending"], true);
         assert_eq!(encoded["recovery_state"], "backoff");
 
+        let inactive: CheckResult = serde_json::from_value(json!({
+            "active": false,
+            "reason": "gmail_label_selectors_inactive",
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": false,
+            "pending_notifications": 0
+        }))
+        .expect("deserialize inactive Gmail label reason");
+        assert_eq!(
+            inactive.reason.as_deref(),
+            Some("gmail_label_selectors_inactive")
+        );
+        let encoded = serde_json::to_value(inactive).expect("serialize inactive reason");
+        assert_eq!(encoded["reason"], "gmail_label_selectors_inactive");
+
         let legacy: CheckResult = serde_json::from_value(json!({
             "active": false,
             "discovered": 0,
@@ -2434,6 +2455,7 @@ mod tests {
         }))
         .expect("deserialize check result without recovery status");
         assert_eq!(legacy.recovery_pending, None);
+        assert_eq!(legacy.reason, None);
         let encoded = serde_json::to_value(legacy).expect("serialize legacy check result");
         assert!(encoded.get("recovery_pending").is_none());
         assert!(encoded.get("recovery_state").is_none());
@@ -3173,6 +3195,7 @@ notifications_enabled = true
             engine.check().expect("inactive check without Gmail"),
             CheckResult {
                 active: false,
+                reason: None,
                 discovered: 0,
                 summarized: 0,
                 fallback_notified: 0,

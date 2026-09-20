@@ -24,12 +24,15 @@ enum ScheduledCheckStatus {
     DeliveryFailed,
     CheckFailed,
     RecoveryPending,
+    Inactive,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ScheduledCheckEvent {
     status: ScheduledCheckStatus,
     failed_notifications: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_pending: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,12 +168,15 @@ impl ScheduledCheckEvent {
         Self {
             status: if recovery_pending {
                 ScheduledCheckStatus::RecoveryPending
+            } else if !check.active && check.reason.is_some() {
+                ScheduledCheckStatus::Inactive
             } else if failed_notifications == 0 {
                 ScheduledCheckStatus::Complete
             } else {
                 ScheduledCheckStatus::DeliveryFailed
             },
             failed_notifications,
+            reason: check.reason.clone(),
             recovery_pending: recovery_pending.then_some(true),
             recovery_state: recovery_pending
                 .then(|| check.recovery_state.clone())
@@ -188,6 +194,7 @@ impl ScheduledCheckEvent {
         Self {
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
+            reason: None,
             recovery_pending: None,
             recovery_state: None,
             recovery_failure_code: None,
@@ -327,6 +334,7 @@ mod tests {
     ) -> CheckResult {
         CheckResult {
             active: true,
+            reason: None,
             discovered: 2,
             summarized: 1,
             fallback_notified: 0,
@@ -380,6 +388,7 @@ mod tests {
             ScheduledCheckEvent {
                 status: ScheduledCheckStatus::DeliveryFailed,
                 failed_notifications: 2,
+                reason: None,
                 recovery_pending: None,
                 recovery_state: None,
                 recovery_failure_code: None,
@@ -391,6 +400,7 @@ mod tests {
             ScheduledCheckEvent {
                 status: ScheduledCheckStatus::Complete,
                 failed_notifications: 0,
+                reason: None,
                 recovery_pending: None,
                 recovery_state: None,
                 recovery_failure_code: None,
@@ -405,6 +415,32 @@ mod tests {
                 "failed_notifications": 2,
             })
         );
+    }
+
+    #[test]
+    fn scheduled_inactive_reason_never_emits_completion() {
+        let mut check = check_result_with_recovery(None, None, None);
+        check.active = false;
+        check.reason = Some("gmail_label_selectors_inactive".to_owned());
+
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0))
+            .expect("serialize scheduled inactive event");
+
+        assert_eq!(event["status"], "inactive");
+        assert_eq!(event["reason"], "gmail_label_selectors_inactive");
+        assert_ne!(event["status"], "complete");
+    }
+
+    #[test]
+    fn scheduled_active_result_reason_is_not_misclassified_as_inactive() {
+        let mut check = check_result_with_recovery(None, None, None);
+        check.reason = Some("recovery_truncated".to_owned());
+
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0))
+            .expect("serialize scheduled active result reason");
+
+        assert_eq!(event["status"], "complete");
+        assert_eq!(event["reason"], "recovery_truncated");
     }
 
     #[test]

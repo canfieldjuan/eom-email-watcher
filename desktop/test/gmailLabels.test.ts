@@ -54,15 +54,20 @@ test("check status keeps Gmail recovery visible until catch-up finishes", () => 
   );
 
   const recoveryFunctionSource = source.match(
-    /function recoveryStatusMessage\([\s\S]*?\): string \| null \{([\s\S]*?)\n\}\n\nfunction checkResultMessage/,
+    /function recoveryStatusMessage\([\s\S]*?\): string \| null \{([\s\S]*?)\n\}\n\nfunction inactiveCheckMessage/,
   );
   assert.ok(recoveryFunctionSource);
+  const inactiveFunctionSource = source.match(
+    /function inactiveCheckMessage\([^)]*\): string \| null \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(inactiveFunctionSource);
   const functionSource = source.match(
     /function checkResultMessage\(result: CheckResult\): string \{([\s\S]*?)\n\}\n\nasync function runCheck/,
   );
   assert.ok(functionSource);
   const checkResultMessage = Function(
     `function recoveryStatusMessage(result, progress) {${recoveryFunctionSource[1]}\n}
+     function inactiveCheckMessage(reason) {${inactiveFunctionSource[1]}\n}
      return function checkResultMessage(result) {${functionSource[1]}\n}`,
   )() as (result: Record<string, unknown>) => string;
   const baseline = {
@@ -100,6 +105,37 @@ test("check status keeps Gmail recovery visible until catch-up finishes", () => 
   }
 });
 
+test("manual checks explain inactive saved Gmail labels and fail closed on unknown reasons", () => {
+  const inactiveFunctionSource = source.match(
+    /function inactiveCheckMessage\([^)]*\): string \| null \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(inactiveFunctionSource);
+  const inactiveCheckMessage = Function(
+    `return function inactiveCheckMessage(reason) {${inactiveFunctionSource[1]}\n}`,
+  )() as (reason: string | undefined) => string | null;
+
+  assert.match(
+    inactiveCheckMessage("gmail_label_selectors_inactive") ?? "",
+    /Saved Gmail labels are inactive[\s\S]*refresh[\s\S]*select/i,
+  );
+  assert.match(
+    inactiveCheckMessage("future_inactive_reason") ?? "",
+    /could not understand the inactive check state/i,
+  );
+  assert.equal(inactiveCheckMessage(undefined), null);
+
+  const recoveryBranch = source.indexOf("if (result.recovery_pending)", source.indexOf("function checkResultMessage"));
+  const inactiveBranch = source.indexOf("inactiveCheckMessage(result.reason)", source.indexOf("function checkResultMessage"));
+  const genericInactiveBranch = source.indexOf("if (!result.active)", source.indexOf("function checkResultMessage"));
+  assert.ok(recoveryBranch >= 0);
+  assert.ok(inactiveBranch > recoveryBranch);
+  assert.ok(genericInactiveBranch > inactiveBranch);
+  assert.match(
+    source.slice(recoveryBranch, genericInactiveBranch),
+    /!result\.active && result\.reason !== undefined[\s\S]*inactiveCheckMessage\(result\.reason\)/,
+  );
+});
+
 test("scheduled checks render recovery before any completion status", () => {
   assert.match(
     source,
@@ -114,6 +150,27 @@ test("scheduled checks render recovery before any completion status", () => {
   assert.ok(recoveryBranch >= 0);
   assert.ok(completionBranch >= 0);
   assert.ok(recoveryBranch < completionBranch);
+});
+
+test("scheduled checks render inactive saved Gmail labels before completion", () => {
+  assert.match(
+    source,
+    /status: "complete" \| "delivery_failed" \| "check_failed" \| "recovery_pending" \| "inactive"/,
+  );
+  const listener = source.match(
+    /void listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*)\n\}\);\nvoid listen<\{ attempted: number \}>\("watcher:\/\/connect-queue"/,
+  );
+  assert.ok(listener);
+  const recoveryBranch = listener[1].indexOf("recoveryStatusMessage({");
+  const inactiveBranch = listener[1].indexOf("inactiveCheckMessage(event.payload.reason)");
+  const completionBranch = listener[1].indexOf('event.payload.status === "complete"');
+  assert.ok(recoveryBranch >= 0);
+  assert.ok(inactiveBranch > recoveryBranch);
+  assert.ok(completionBranch > inactiveBranch);
+  assert.match(
+    listener[1],
+    /event\.payload\.status === "inactive"[\s\S]*inactiveCheckMessage\(event\.payload\.reason\)/,
+  );
 });
 
 test("Gmail label proof surface shows safe selector evidence without the opaque label ID", async () => {
