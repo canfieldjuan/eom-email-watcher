@@ -1,4 +1,4 @@
-use crate::engine::{CheckResult, Engine, EngineError, NotificationIntent};
+use crate::engine::{CancellationToken, CheckResult, Engine, EngineError, NotificationIntent};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -27,6 +27,7 @@ fn delivery_timeout() -> EngineError {
 pub(crate) struct DeliveryDeadline {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    shutdown: Option<CancellationToken>,
 }
 
 impl DeliveryDeadline {
@@ -35,7 +36,14 @@ impl DeliveryDeadline {
         Self {
             deadline: now.checked_add(timeout).unwrap_or(now),
             cancelled: Arc::new(AtomicBool::new(false)),
+            shutdown: None,
         }
+    }
+
+    fn with_cancellation(timeout: Duration, shutdown: CancellationToken) -> Self {
+        let mut deadline = Self::new(timeout);
+        deadline.shutdown = Some(shutdown);
+        deadline
     }
 
     fn cancel(&self) {
@@ -44,6 +52,10 @@ impl DeliveryDeadline {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+            || self
+                .shutdown
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 
     pub(crate) fn remaining(&self) -> Result<Duration, EngineError> {
@@ -61,7 +73,11 @@ impl DeliveryDeadline {
     }
 
     fn bounded_engine(&self, engine: &Engine) -> Result<Engine, EngineError> {
-        Ok(engine.with_request_timeout(self.remaining()?))
+        let engine = engine.with_request_timeout(self.remaining()?);
+        Ok(match self.shutdown.as_ref() {
+            Some(shutdown) => engine.with_cancellation(shutdown.clone()),
+            None => engine,
+        })
     }
 }
 
@@ -641,7 +657,7 @@ impl NotificationDelivery {
     }
 
     #[cfg(test)]
-    fn run_exclusive_with_timeout<T>(
+    pub(crate) fn run_exclusive_with_timeout<T>(
         &self,
         timeout: Duration,
         operation: impl FnOnce(&DeliveryDeadline) -> Result<T, EngineError>,
@@ -690,16 +706,31 @@ impl NotificationDelivery {
 
     pub fn check_and_deliver(&self, engine: &Engine) -> Result<CoordinatedCheck, EngineError> {
         let deadline = DeliveryDeadline::new(DEFAULT_DELIVERY_OPERATION_TIMEOUT);
-        let queue = DeadlineQueue {
-            engine,
-            deadline: &deadline,
-        };
+        self.check_and_deliver_until(engine, &deadline)
+    }
+
+    pub(crate) fn check_and_deliver_with_cancellation(
+        &self,
+        engine: &Engine,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<CoordinatedCheck, EngineError> {
+        let deadline = DeliveryDeadline::with_cancellation(timeout, cancellation);
+        self.check_and_deliver_until(engine, &deadline)
+    }
+
+    fn check_and_deliver_until(
+        &self,
+        engine: &Engine,
+        deadline: &DeliveryDeadline,
+    ) -> Result<CoordinatedCheck, EngineError> {
+        let queue = DeadlineQueue { engine, deadline };
         let sink = NotificationProcess::production()?;
-        self.run_exclusive_until(&deadline, |_| {
+        self.run_exclusive_until(deadline, |_| {
             let check = queue.check();
             let delivery = deadline
                 .bounded_engine(engine)?
-                .run_with_operation_lock(|| deliver_batch_until(&queue, &sink, &deadline));
+                .run_with_operation_lock(|| deliver_batch_until(&queue, &sink, deadline));
             coordinated_result(check, delivery)
         })
     }

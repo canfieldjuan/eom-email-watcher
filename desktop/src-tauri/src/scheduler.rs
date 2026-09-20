@@ -1,5 +1,5 @@
 use crate::delivery::NotificationDelivery;
-use crate::engine::Engine;
+use crate::engine::{CancellationToken, Engine};
 use serde::Serialize;
 use std::io;
 use std::sync::{
@@ -49,13 +49,31 @@ struct WorkerGateState {
     stopped: bool,
 }
 
-#[derive(Default)]
 struct WorkerGate {
     state: Mutex<WorkerGateState>,
     changed: Condvar,
+    cancellation: CancellationToken,
+}
+
+impl Default for WorkerGate {
+    fn default() -> Self {
+        Self::with_cancellation(CancellationToken::new())
+    }
 }
 
 impl WorkerGate {
+    fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            state: Mutex::new(WorkerGateState::default()),
+            changed: Condvar::new(),
+            cancellation,
+        }
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
     fn activate(&self) {
         let mut state = self
             .state
@@ -68,6 +86,7 @@ impl WorkerGate {
     }
 
     fn stop(&self) {
+        self.cancellation.cancel();
         let mut state = self
             .state
             .lock()
@@ -77,10 +96,12 @@ impl WorkerGate {
     }
 
     fn is_stopped(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stopped
+        self.cancellation.is_cancelled()
+            || self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stopped
     }
 
     fn wait_for_activation(&self) -> bool {
@@ -88,13 +109,13 @@ impl WorkerGate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !state.activated && !state.stopped {
+        while !state.activated && !state.stopped && !self.cancellation.is_cancelled() {
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        state.activated && !state.stopped
+        state.activated && !state.stopped && !self.cancellation.is_cancelled()
     }
 
     fn wait_for(&self, duration: Duration) -> bool {
@@ -102,14 +123,14 @@ impl WorkerGate {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped {
+        if state.stopped || self.cancellation.is_cancelled() {
             return false;
         }
         let (state, _) = self
             .changed
             .wait_timeout(state, duration)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !state.stopped
+        !state.stopped && !self.cancellation.is_cancelled()
     }
 }
 
@@ -161,16 +182,22 @@ fn queue_refresh_needed(
 }
 
 impl ConnectQueueScheduler {
-    pub fn stage(app: AppHandle, engine: Engine) -> io::Result<Self> {
+    pub(crate) fn stage_with_cancellation(
+        app: AppHandle,
+        engine: Engine,
+        cancellation: CancellationToken,
+    ) -> io::Result<Self> {
         let (wake_sender, receiver) = mpsc::sync_channel(1);
-        let gate = Arc::new(WorkerGate::default());
+        let gate = Arc::new(WorkerGate::with_cancellation(cancellation));
         let handle = Arc::new(Mutex::new(None));
         let scheduler = Self {
             wake_sender,
             gate: Arc::clone(&gate),
             handle: Arc::clone(&handle),
         };
-        let engine = engine.with_request_timeout(SCHEDULED_ENGINE_TIMEOUT);
+        let engine = engine
+            .with_request_timeout(SCHEDULED_ENGINE_TIMEOUT)
+            .with_cancellation(gate.cancellation());
         let worker = thread::Builder::new()
             .name("email-watcher-connect-queue".into())
             .spawn(move || {
@@ -218,6 +245,29 @@ impl ConnectQueueScheduler {
                             );
                         }
                     }
+                }
+            })?;
+        *handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        Ok(scheduler)
+    }
+
+    #[cfg(test)]
+    fn stage_probe(operation: impl FnOnce(CancellationToken) + Send + 'static) -> io::Result<Self> {
+        let (wake_sender, _receiver) = mpsc::sync_channel(1);
+        let gate = Arc::new(WorkerGate::default());
+        let handle = Arc::new(Mutex::new(None));
+        let scheduler = Self {
+            wake_sender,
+            gate: Arc::clone(&gate),
+            handle: Arc::clone(&handle),
+        };
+        let worker = thread::Builder::new()
+            .name("email-watcher-connect-queue-probe".into())
+            .spawn(move || {
+                if gate.wait_for_activation() {
+                    operation(gate.cancellation());
                 }
             })?;
         *handle
@@ -327,7 +377,16 @@ fn wait_until(gate: &WorkerGate, deadline_unix_ms: u64) -> bool {
 }
 
 impl PollScheduler {
+    #[cfg(test)]
     pub fn new(interval_minutes: u64, enabled: bool) -> Self {
+        Self::with_cancellation(interval_minutes, enabled, CancellationToken::new())
+    }
+
+    pub(crate) fn with_cancellation(
+        interval_minutes: u64,
+        enabled: bool,
+        cancellation: CancellationToken,
+    ) -> Self {
         Self {
             enabled,
             interval_minutes,
@@ -336,7 +395,7 @@ impl PollScheduler {
             } else {
                 0
             })),
-            gate: Arc::new(WorkerGate::default()),
+            gate: Arc::new(WorkerGate::with_cancellation(cancellation)),
             handle: Arc::new(Mutex::new(None)),
         }
     }
@@ -361,7 +420,10 @@ impl PollScheduler {
             return Ok(());
         }
         let scheduler = self.clone();
-        let engine = engine.with_request_timeout(SCHEDULED_ENGINE_TIMEOUT);
+        let engine = engine
+            .with_request_timeout(SCHEDULED_ENGINE_TIMEOUT)
+            .with_cancellation(scheduler.gate.cancellation());
+        let cancellation = scheduler.gate.cancellation();
         let worker = thread::Builder::new()
             .name("email-watcher-poll".into())
             .spawn(move || {
@@ -372,7 +434,11 @@ impl PollScheduler {
                     &scheduler.gate,
                     scheduler.next_check_unix_ms.load(Ordering::Relaxed),
                 ) {
-                    let event = match delivery.check_and_deliver(&engine) {
+                    let event = match delivery.check_and_deliver_with_cancellation(
+                        &engine,
+                        SCHEDULED_ENGINE_TIMEOUT,
+                        cancellation.clone(),
+                    ) {
                         Ok(outcome) => {
                             if outcome.delivery.failed > 0 {
                                 eprintln!(
@@ -407,6 +473,29 @@ impl PollScheduler {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn stage_probe(
+        &self,
+        operation: impl FnOnce(CancellationToken) + Send + 'static,
+    ) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let scheduler = self.clone();
+        let worker = thread::Builder::new()
+            .name("email-watcher-poll-probe".into())
+            .spawn(move || {
+                if scheduler.gate.wait_for_activation() {
+                    operation(scheduler.gate.cancellation());
+                }
+            })?;
+        *self
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        Ok(())
+    }
+
     pub fn activate(&self) {
         self.gate.activate();
     }
@@ -431,7 +520,68 @@ impl PollScheduler {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
     use std::sync::atomic::AtomicUsize;
+    #[cfg(unix)]
+    use std::time::Instant;
+
+    #[cfg(unix)]
+    fn wait_for_process_id(path: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Ok(value) = fs::read_to_string(path)
+                && let Ok(process_id) = value.trim().parse()
+            {
+                return process_id;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("engine probe did not record its process id");
+    }
+
+    #[cfg(unix)]
+    fn assert_process_stopped(process_id: i32) {
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable child PID recorded by
+            // this test and does not signal an unrelated process.
+            if unsafe { libc::kill(process_id, 0) } != 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("cancelled engine process {process_id} is still running");
+    }
+
+    #[cfg(unix)]
+    fn stalled_engine(process_id_path: &std::path::Path) -> Engine {
+        Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from("scheduler-shutdown-probe"),
+                process_id_path.as_os_str().to_owned(),
+            ],
+            "unused.toml".into(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn successful_queue_engine() -> Engine {
+        Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"connect.queue.pump","data":{"items":[],"next_wake_unix_ms":null}}'"#,
+                ),
+            ],
+            "unused.toml".into(),
+        )
+    }
 
     #[test]
     fn next_check_uses_configured_interval() {
@@ -562,5 +712,128 @@ mod tests {
         assert!(queue_refresh_needed(false, 1, None));
         assert!(!queue_refresh_needed(false, 0, Some(100)));
         assert!(queue_refresh_needed(true, 0, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_shutdown_cancels_noncooperative_pump_and_allows_restart() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let process_id_path = directory.path().join("connect.pid");
+        let engine = stalled_engine(&process_id_path);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let scheduler = ConnectQueueScheduler::stage_probe(move |cancellation| {
+            let result = engine
+                .with_request_timeout(SCHEDULED_ENGINE_TIMEOUT)
+                .with_cancellation(cancellation)
+                .pump_connect_queue();
+            result_sender.send(result).expect("report queue result");
+        })
+        .expect("stage queue probe");
+        scheduler.activate();
+        let process_id = wait_for_process_id(&process_id_path);
+
+        let started = Instant::now();
+        scheduler.shutdown().expect("queue shutdown joins");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queue result")
+                .expect_err("cancelled queue pump fails")
+                .code,
+            "engine_cancelled"
+        );
+        assert_process_stopped(process_id);
+        assert!(
+            scheduler
+                .handle
+                .lock()
+                .expect("queue handle lock")
+                .is_none()
+        );
+
+        let engine = successful_queue_engine();
+        let (restart_sender, restart_receiver) = mpsc::sync_channel(1);
+        let restarted = ConnectQueueScheduler::stage_probe(move |cancellation| {
+            restart_sender
+                .send(
+                    engine
+                        .with_request_timeout(Duration::from_secs(1))
+                        .with_cancellation(cancellation)
+                        .pump_connect_queue()
+                        .is_ok(),
+                )
+                .expect("report restarted queue");
+        })
+        .expect("stage restarted queue");
+        restarted.activate();
+        assert_eq!(
+            restart_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(true)
+        );
+        restarted.shutdown().expect("restarted queue joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn polling_shutdown_cancels_noncooperative_delivery_and_releases_lock() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let process_id_path = directory.path().join("poll.pid");
+        let engine = stalled_engine(&process_id_path);
+        let delivery = NotificationDelivery::default();
+        let worker_delivery = delivery.clone();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let scheduler = PollScheduler::new(1, true);
+        scheduler
+            .stage_probe(move |cancellation| {
+                let result = worker_delivery.check_and_deliver_with_cancellation(
+                    &engine,
+                    SCHEDULED_ENGINE_TIMEOUT,
+                    cancellation,
+                );
+                result_sender.send(result).expect("report polling result");
+            })
+            .expect("stage polling probe");
+        scheduler.activate();
+        let process_id = wait_for_process_id(&process_id_path);
+
+        let started = Instant::now();
+        scheduler.shutdown().expect("polling shutdown joins");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("polling result")
+                .is_err()
+        );
+        assert_process_stopped(process_id);
+        assert!(
+            scheduler
+                .handle
+                .lock()
+                .expect("polling handle lock")
+                .is_none()
+        );
+        delivery
+            .run_exclusive_with_timeout(Duration::from_millis(100), |_| Ok(()))
+            .expect("delivery lock is released after shutdown");
+
+        let (restart_sender, restart_receiver) = mpsc::sync_channel(1);
+        let restarted = PollScheduler::new(1, true);
+        restarted
+            .stage_probe(move |cancellation| {
+                restart_sender
+                    .send(!cancellation.is_cancelled())
+                    .expect("report restarted poller");
+            })
+            .expect("stage restarted poller");
+        restarted.activate();
+        assert_eq!(
+            restart_receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(true)
+        );
+        restarted.shutdown().expect("restarted poller joins");
     }
 }

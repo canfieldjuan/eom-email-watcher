@@ -6,7 +6,10 @@ use std::fs::{File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError};
+use std::sync::{
+    Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -38,6 +41,32 @@ use windows_sys::Win32::{
 const PROTOCOL_VERSION: u8 = 1;
 const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+#[derive(Clone, Default)]
+pub(crate) struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+fn engine_cancelled() -> EngineError {
+    EngineError::host(
+        "engine_cancelled",
+        "Watcher engine operation was cancelled during shutdown",
+    )
+}
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -284,6 +313,7 @@ pub struct Engine {
     config_path: PathBuf,
     mailbox_operation_gate: Arc<Mutex<()>>,
     request_timeout: Option<Duration>,
+    cancellation: Option<CancellationToken>,
     #[cfg(test)]
     test_environment: Vec<(OsString, OsString)>,
 }
@@ -943,6 +973,7 @@ impl Engine {
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
+                cancellation: None,
                 #[cfg(test)]
                 test_environment: Vec::new(),
             });
@@ -957,6 +988,7 @@ impl Engine {
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 request_timeout: None,
+                cancellation: None,
                 #[cfg(test)]
                 test_environment: Vec::new(),
             });
@@ -977,13 +1009,14 @@ impl Engine {
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
+            cancellation: None,
             #[cfg(test)]
             test_environment: Vec::new(),
         })
     }
 
     #[cfg(test)]
-    fn with_command(
+    pub(crate) fn with_command(
         program: impl Into<OsString>,
         args: Vec<OsString>,
         config_path: PathBuf,
@@ -994,6 +1027,7 @@ impl Engine {
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             request_timeout: None,
+            cancellation: None,
             test_environment: Vec::new(),
         }
     }
@@ -1429,30 +1463,55 @@ impl Engine {
         engine
     }
 
+    pub(crate) fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
+        let mut engine = self.clone();
+        engine.cancellation = Some(cancellation);
+        engine
+    }
+
+    fn check_cancellation(&self) -> Result<(), EngineError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            Err(engine_cancelled())
+        } else {
+            Ok(())
+        }
+    }
+
     fn mailbox_operation_lock(
         &self,
     ) -> Result<(MutexGuard<'_, ()>, Option<Duration>), EngineError> {
-        let Some(timeout) = self.request_timeout else {
+        if self.request_timeout.is_none() && self.cancellation.is_none() {
             return self
                 .mailbox_operation_gate
                 .lock()
                 .map(|guard| (guard, None))
                 .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"));
-        };
+        }
         let started = Instant::now();
         loop {
+            self.check_cancellation()?;
             match self.mailbox_operation_gate.try_lock() {
                 Ok(guard) => {
-                    let remaining = timeout
-                        .checked_sub(started.elapsed())
-                        .filter(|remaining| !remaining.is_zero())
-                        .ok_or_else(|| {
-                            EngineError::host(
-                                "engine_timeout",
-                                "Watcher engine did not respond before its timeout",
-                            )
-                        })?;
-                    return Ok((guard, Some(remaining)));
+                    self.check_cancellation()?;
+                    let remaining = self
+                        .request_timeout
+                        .map(|timeout| {
+                            timeout
+                                .checked_sub(started.elapsed())
+                                .filter(|remaining| !remaining.is_zero())
+                                .ok_or_else(|| {
+                                    EngineError::host(
+                                        "engine_timeout",
+                                        "Watcher engine did not respond before its timeout",
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    return Ok((guard, remaining));
                 }
                 Err(MutexTryLockError::Poisoned(_)) => {
                     return Err(EngineError::host(
@@ -1461,16 +1520,23 @@ impl Engine {
                     ));
                 }
                 Err(MutexTryLockError::WouldBlock) => {
-                    let remaining = timeout
-                        .checked_sub(started.elapsed())
-                        .filter(|remaining| !remaining.is_zero())
-                        .ok_or_else(|| {
-                            EngineError::host(
-                                "engine_timeout",
-                                "Watcher engine did not respond before its timeout",
-                            )
-                        })?;
-                    std::thread::sleep(remaining.min(ENGINE_LOCK_RETRY));
+                    let sleep_for = self
+                        .request_timeout
+                        .map(|timeout| {
+                            timeout
+                                .checked_sub(started.elapsed())
+                                .filter(|remaining| !remaining.is_zero())
+                                .ok_or_else(|| {
+                                    EngineError::host(
+                                        "engine_timeout",
+                                        "Watcher engine did not respond before its timeout",
+                                    )
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(ENGINE_LOCK_RETRY)
+                        .min(ENGINE_LOCK_RETRY);
+                    std::thread::sleep(sleep_for);
                 }
             }
         }
@@ -1572,6 +1638,7 @@ impl Engine {
         payload: Value,
         timeout: Option<Duration>,
     ) -> Result<T, EngineError> {
+        self.check_cancellation()?;
         let request = EngineRequest {
             protocol: PROTOCOL_VERSION,
             operation,
@@ -1620,20 +1687,26 @@ impl Engine {
             return Err(error);
         }
 
-        if let Some(timeout) = timeout {
+        if timeout.is_some() || self.cancellation.is_some() {
             let started = Instant::now();
             loop {
+                if let Some(cancellation) = self.cancellation.as_ref()
+                    && cancellation.is_cancelled()
+                {
+                    child.terminate();
+                    return Err(engine_cancelled());
+                }
                 match child.process.try_wait() {
                     Ok(Some(_)) => break,
-                    Ok(None) if started.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
                     Ok(None) => {
-                        child.terminate();
-                        return Err(EngineError::host(
-                            "engine_timeout",
-                            "Watcher engine did not respond before its timeout",
-                        ));
+                        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                            child.terminate();
+                            return Err(EngineError::host(
+                                "engine_timeout",
+                                "Watcher engine did not respond before its timeout",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => {
                         child.terminate();
@@ -1646,6 +1719,10 @@ impl Engine {
             }
         }
 
+        if self.check_cancellation().is_err() {
+            child.terminate();
+            return Err(engine_cancelled());
+        }
         let output = child.wait_with_output().map_err(|_| {
             EngineError::host(
                 "engine_unavailable",

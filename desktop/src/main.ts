@@ -13,6 +13,7 @@ import {
   classifyCapabilityDiagnostic,
   durableCapabilityStatus,
 } from "./connectAvailability";
+import { configAdmissionView } from "./configAdmissionView";
 import {
   buildMailServerConnection,
   type MailServerConnection,
@@ -2980,7 +2981,7 @@ function renderConfigAdmission(status: ConfigAdmissionStatus): void {
   ntfyDisclosurePanel.hidden = true;
   ntfyDisclosureExpectedRevision = null;
   calendarConsentSettings.hidden = true;
-  showView("settings");
+  showView(configAdmissionView(status));
   if (status.state === "admitted") {
     startConfiguredDesktop();
     return;

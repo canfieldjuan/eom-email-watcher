@@ -4,11 +4,11 @@ mod scheduler;
 
 use delivery::{BoundedOperation, NotificationDelivery};
 use engine::{
-    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CheckResult,
-    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
-    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
-    GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
-    MailServerConnection, NtfyDisclosureStatus, WatchedSender,
+    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
+    CheckResult, ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus,
+    ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity, Engine, EngineError,
+    EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery, MailAccountResult,
+    MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, PollScheduler, PollingStatus};
 use serde::Serialize;
@@ -330,6 +330,7 @@ fn run_acknowledgement_attempt<W>(
 }
 
 struct AdmissionWorkers {
+    cancellation: CancellationToken,
     connect_queue: ConnectQueueScheduler,
     scheduler: PollScheduler,
 }
@@ -388,6 +389,7 @@ impl AdmissionWorkerSet for () {
 
 impl Drop for AdmissionWorkers {
     fn drop(&mut self) {
+        self.cancellation.cancel();
         if let Err(error) = self.scheduler.shutdown() {
             eprintln!("Polling scheduler could not stop cleanly: {error}");
         }
@@ -502,13 +504,23 @@ fn stage_admitted_workers(
     startup_delivery: &NotificationDelivery,
 ) -> Result<AdmissionWorkers, EngineError> {
     let settings = engine.settings_with_timeout(STARTUP_SETTINGS_TIMEOUT)?;
-    let scheduler = PollScheduler::new(settings.poll_interval_minutes, settings.polling_supported);
+    let cancellation = CancellationToken::new();
+    let scheduler = PollScheduler::with_cancellation(
+        settings.poll_interval_minutes,
+        settings.polling_supported,
+        cancellation.clone(),
+    );
     if !settings.polling_supported {
         eprintln!("watcher automatic polling is disabled for the current host configuration");
     }
     let (connect_queue, scheduler) = stage_worker_pair(
         || {
-            ConnectQueueScheduler::stage(app.clone(), engine.clone()).map_err(|_| {
+            ConnectQueueScheduler::stage_with_cancellation(
+                app.clone(),
+                engine.clone(),
+                cancellation.clone(),
+            )
+            .map_err(|_| {
                 EngineError::host("host_error", "Connect queue scheduler could not be started")
             })
         },
@@ -527,6 +539,7 @@ fn stage_admitted_workers(
         },
     )?;
     Ok(AdmissionWorkers {
+        cancellation,
         connect_queue,
         scheduler,
     })

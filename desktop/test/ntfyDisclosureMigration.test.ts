@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { configAdmissionView } from "../src/configAdmissionView.ts";
 
 const libSource = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 const engineSource = await readFile(
@@ -44,7 +45,7 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     libSource.indexOf("fn start_startup_delivery"),
   );
   const settings = stagedWorkers.indexOf("settings_with_timeout");
-  const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage");
+  const queue = stagedWorkers.indexOf("ConnectQueueScheduler::stage_with_cancellation");
   const poller = stagedWorkers.indexOf("scheduler\n                .stage");
   assert.ok(settings >= 0, "worker startup must begin with normal settings admission");
   assert.ok(settings < queue, "settings admission must precede staged Connect queue startup");
@@ -153,4 +154,28 @@ test("ntfy disclosure UI requires one explicit click and reconciles every outcom
   const acknowledgementCalls = uiSource.match(/"config_ntfy_disclosure_acknowledge"/g) ?? [];
   assert.equal(acknowledgementCalls.length, 1, "render, focus, and reconciliation must not acknowledge");
   assert.doesNotMatch(uiSource, /invoke<ConfigStatus>\("config_status"\)/);
+});
+
+test("admitted startup opens the populated application while held states alone force settings", () => {
+  assert.equal(configAdmissionView({ state: "admitted" }), "inbox");
+  assert.equal(configAdmissionView({ state: "missing" }), "settings");
+  assert.equal(configAdmissionView({ state: "acknowledgement_required" }), "settings");
+  assert.equal(configAdmissionView({ state: "manual_repair_required" }), "settings");
+
+  const renderAdmission = uiSource.slice(
+    uiSource.indexOf("function renderConfigAdmission"),
+    uiSource.indexOf("async function refreshConfigAdmission"),
+  );
+  assert.match(renderAdmission, /showView\(configAdmissionView\(status\)\)/);
+  assert.doesNotMatch(renderAdmission, /showView\("settings"\)/);
+});
+
+test("scheduler shutdown cancellation reaches queue, delivery, and engine children", () => {
+  assert.match(engineSource, /struct CancellationToken/);
+  assert.match(engineSource, /with_cancellation/);
+  assert.match(engineSource, /cancellation\.is_cancelled\(\)[\s\S]*child\.terminate\(\)/);
+  assert.match(schedulerSource, /cancellation\.cancel\(\)/);
+  assert.match(schedulerSource, /pump_connect_queue/);
+  assert.match(schedulerSource, /check_and_deliver_with_cancellation/);
+  assert.match(deliverySource, /check_and_deliver_with_cancellation/);
 });
