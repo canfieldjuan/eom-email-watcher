@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import os
@@ -784,16 +785,107 @@ def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
         handle.close()
 
 
+def _rename_exchange_at(parent_fd: int, first: str, second: str) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "atomic rename exchange is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_fd,
+        os.fsencode(first),
+        parent_fd,
+        os.fsencode(second),
+        2,  # RENAME_EXCHANGE
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _reconcile_failed_exchange_rollback(
+    parent_fd: int,
+    name: str,
+    temporary_name: str,
+    candidate_identity: tuple[int, int],
+    candidate_content: bytes,
+) -> bool:
+    destination_fd: int | None = None
+    temporary_fd: int | None = None
+    try:
+        destination_fd, destination_stat, destination_content = _read_safe_file_at(
+            parent_fd, name
+        )
+        temporary_fd, temporary_stat, temporary_content = _read_safe_file_at(
+            parent_fd, temporary_name
+        )
+        destination_is_candidate = (
+            _safe_file_identity(destination_stat) == candidate_identity
+            and destination_content == candidate_content
+        )
+        temporary_is_candidate = (
+            _safe_file_identity(temporary_stat) == candidate_identity
+            and temporary_content == candidate_content
+        )
+        if destination_is_candidate and not temporary_is_candidate:
+            destination_now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            temporary_now = os.stat(
+                temporary_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                _safe_file_version(destination_now)
+                != _safe_file_version(destination_stat)
+                or _safe_file_version(temporary_now)
+                != _safe_file_version(temporary_stat)
+            ):
+                return False
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+            return True
+        if temporary_is_candidate and not destination_is_candidate:
+            temporary_now = os.stat(
+                temporary_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if _safe_file_version(temporary_now) != _safe_file_version(temporary_stat):
+                return False
+            os.unlink(temporary_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return True
+        return False
+    except (OSError, _MissingConfigPath, _UnsafeConfigPath):
+        return False
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+
+
 def _durable_replace_at(
     parent_fd: int,
     name: str,
     content: bytes,
     *,
     before_replace: Callable[[], None] | None = None,
+    validate_displaced: Callable[[int, str], None] | None = None,
 ) -> None:
     temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
     temporary_fd: int | None = None
     replaced = False
+    preserve_temporary = False
+    candidate_identity: tuple[int, int] | None = None
     try:
         temporary_fd = os.open(
             temporary_name,
@@ -813,21 +905,55 @@ def _durable_replace_at(
                 raise OSError("candidate write did not make progress")
             remaining = remaining[written:]
         os.fsync(temporary_fd)
+        candidate_identity = _safe_file_identity(os.fstat(temporary_fd))
         os.close(temporary_fd)
         temporary_fd = None
         if before_replace is not None:
             before_replace()
-        os.replace(
-            temporary_name,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
-        replaced = True
+        if validate_displaced is None:
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            replaced = True
+        else:
+            _rename_exchange_at(parent_fd, temporary_name, name)
+            replaced = True
+            try:
+                validate_displaced(parent_fd, temporary_name)
+            except Exception as validation_error:
+                try:
+                    _rename_exchange_at(parent_fd, temporary_name, name)
+                    replaced = False
+                    os.fsync(parent_fd)
+                except Exception as rollback_error:
+                    if candidate_identity is None or not _reconcile_failed_exchange_rollback(
+                        parent_fd,
+                        name,
+                        temporary_name,
+                        candidate_identity,
+                        content,
+                    ):
+                        preserve_temporary = True
+                    else:
+                        replaced = False
+                    raise _PostReplaceDurabilityError from rollback_error
+                if isinstance(validation_error, NtfyDisclosureConflictError):
+                    raise
+                raise _PostReplaceDurabilityError from validation_error
         try:
             os.fsync(parent_fd)
         except OSError as exc:
             raise _PostReplaceDurabilityError from exc
+        if validate_displaced is not None:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+            replaced = False
+            try:
+                os.fsync(parent_fd)
+            except OSError as exc:
+                raise _PostReplaceDurabilityError from exc
     except Exception as exc:
         if replaced and not isinstance(exc, _PostReplaceDurabilityError):
             raise _PostReplaceDurabilityError from exc
@@ -835,8 +961,9 @@ def _durable_replace_at(
     finally:
         if temporary_fd is not None:
             os.close(temporary_fd)
-        with suppress(FileNotFoundError):
-            os.unlink(temporary_name, dir_fd=parent_fd)
+        if not preserve_temporary:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
 
 
 def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
@@ -897,12 +1024,39 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
                 finally:
                     os.close(verify_fd)
 
+            def validate_displaced(parent_fd: int, displaced_name: str) -> None:
+                try:
+                    displaced_fd, displaced_identity, displaced_content = (
+                        _read_safe_file_at(parent_fd, displaced_name)
+                    )
+                except _UnsafeConfigPath as exc:
+                    raise NtfyDisclosureConflictError(
+                        "Configuration revision changed"
+                    ) from exc
+                except (_MissingConfigPath, OSError) as exc:
+                    raise NtfyDisclosureOutcomeUnknownError(
+                        "Disclosure acknowledgement outcome is unknown"
+                    ) from exc
+                try:
+                    if (
+                        _safe_file_identity(displaced_identity)
+                        != _safe_file_identity(handle.identity)
+                        or displaced_content != current
+                        or _revision(displaced_content) != expected_revision
+                    ):
+                        raise NtfyDisclosureConflictError(
+                            "Configuration revision changed"
+                        )
+                finally:
+                    os.close(displaced_fd)
+
             try:
                 _durable_replace_at(
                     handle.parent_fd,
                     handle.name,
                     candidate,
                     before_replace=verify_precommit,
+                    validate_displaced=validate_displaced,
                 )
                 replacement_completed = True
             except NtfyDisclosureConflictError:

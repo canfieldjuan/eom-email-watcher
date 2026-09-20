@@ -287,34 +287,23 @@ def test_candidate_is_same_directory_regular_owner_private_before_replace(
     _write_legacy_config(path)
     revision = ntfy_disclosure_status(path).expected_revision
     assert revision is not None
-    real_replace = config_module.os.replace
+    real_exchange = config_module._rename_exchange_at
     observed: dict[str, object] = {}
 
-    def inspect_replace(
-        source: str,
-        destination: str,
-        *,
-        src_dir_fd: int,
-        dst_dir_fd: int,
-    ) -> None:
-        candidate_stat = os.stat(source, dir_fd=src_dir_fd, follow_symlinks=False)
+    def inspect_exchange(parent_fd: int, source: str, destination: str) -> None:
+        candidate_stat = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
         observed.update(
             {
                 "destination": destination,
-                "same_directory": src_dir_fd == dst_dir_fd,
+                "same_directory": True,
                 "regular": stat.S_ISREG(candidate_stat.st_mode),
                 "mode": stat.S_IMODE(candidate_stat.st_mode),
                 "owner": candidate_stat.st_uid,
             }
         )
-        real_replace(
-            source,
-            destination,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
+        real_exchange(parent_fd, source, destination)
 
-    monkeypatch.setattr(config_module.os, "replace", inspect_replace)
+    monkeypatch.setattr(config_module, "_rename_exchange_at", inspect_exchange)
 
     response = engine_api._response(
         _request(
@@ -473,10 +462,21 @@ def test_manual_edit_during_precommit_wins_without_lost_update(
     edited = original + b"# edit outside lock\n"
     real_replace = config_module._durable_replace_at
 
-    def edit_then_replace(parent_fd, name, content, *, before_replace=None):
+    def edit_then_replace(
+        parent_fd,
+        name,
+        content,
+        *,
+        before_replace=None,
+        validate_displaced=None,
+    ):
         _write_bytes(path, edited)
         return real_replace(
-            parent_fd, name, content, before_replace=before_replace
+            parent_fd,
+            name,
+            content,
+            before_replace=before_replace,
+            validate_displaced=validate_displaced,
         )
 
     monkeypatch.setattr(config_module, "_durable_replace_at", edit_then_replace)
@@ -492,9 +492,191 @@ def test_manual_edit_during_precommit_wins_without_lost_update(
     assert response["ok"] is False
     assert response["error"]["code"] == "conflict"
     assert path.read_bytes() == edited
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
 
 
-@pytest.mark.parametrize("failure", ["write", "file_fsync", "replace"])
+def test_manual_edit_after_precommit_check_is_atomically_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    edited = original + b"# exact precommit race\n"
+    real_replace = config_module._durable_replace_at
+
+    def edit_after_check(
+        parent_fd,
+        name,
+        content,
+        *,
+        before_replace=None,
+        validate_displaced=None,
+    ):
+        def check_then_edit() -> None:
+            if before_replace is not None:
+                before_replace()
+            _write_bytes(path, edited)
+
+        return real_replace(
+            parent_fd,
+            name,
+            content,
+            before_replace=check_then_edit,
+            validate_displaced=validate_displaced,
+        )
+
+    monkeypatch.setattr(config_module, "_durable_replace_at", edit_after_check)
+
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == edited
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_metadata_change_after_precommit_check_is_atomically_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    real_replace = config_module._durable_replace_at
+
+    def broaden_after_check(
+        parent_fd,
+        name,
+        content,
+        *,
+        before_replace=None,
+        validate_displaced=None,
+    ):
+        def check_then_broaden() -> None:
+            if before_replace is not None:
+                before_replace()
+            path.chmod(0o640)
+
+        return real_replace(
+            parent_fd,
+            name,
+            content,
+            before_replace=check_then_broaden,
+            validate_displaced=validate_displaced,
+        )
+
+    monkeypatch.setattr(config_module, "_durable_replace_at", broaden_after_check)
+
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "conflict"
+    assert path.read_bytes() == original
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_displaced_validation_failure_rolls_back_and_reports_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    real_read = config_module._read_safe_file_at
+
+    def fail_displaced_read(parent_fd: int, name: str):
+        if name.startswith(f".{path.name}."):
+            raise OSError("injected displaced validation failure")
+        return real_read(parent_fd, name)
+
+    monkeypatch.setattr(config_module, "_read_safe_file_at", fail_displaced_read)
+
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "outcome_unknown"
+    assert path.read_bytes() == original
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_exchange_rollback_failure_restores_manual_bytes_without_temp_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "config.toml"
+    original = _write_legacy_config(path)
+    revision = ntfy_disclosure_status(path).expected_revision
+    assert revision is not None
+    edited = original + b"# rollback failure canary\n"
+    real_durable = config_module._durable_replace_at
+    real_exchange = config_module._rename_exchange_at
+    exchange_calls = 0
+
+    def edit_after_check(
+        parent_fd,
+        name,
+        content,
+        *,
+        before_replace=None,
+        validate_displaced=None,
+    ):
+        def check_then_edit() -> None:
+            if before_replace is not None:
+                before_replace()
+            _write_bytes(path, edited)
+
+        return real_durable(
+            parent_fd,
+            name,
+            content,
+            before_replace=check_then_edit,
+            validate_displaced=validate_displaced,
+        )
+
+    def fail_rollback(parent_fd: int, first: str, second: str) -> None:
+        nonlocal exchange_calls
+        exchange_calls += 1
+        if exchange_calls == 2:
+            raise OSError("injected rollback failure")
+        real_exchange(parent_fd, first, second)
+
+    monkeypatch.setattr(config_module, "_durable_replace_at", edit_after_check)
+    monkeypatch.setattr(config_module, "_rename_exchange_at", fail_rollback)
+
+    response = engine_api._response(
+        _request(
+            path,
+            "config.ntfy_disclosure.acknowledge",
+            {"expected_revision": revision},
+        )
+    )
+    assert response["ok"] is False
+    assert response["error"]["code"] == "outcome_unknown"
+    assert path.read_bytes() == edited
+    assert list(path.parent.glob(f".{path.name}.*.tmp")) == []
+    assert TOPIC not in repr(response) + caplog.text
+
+
+@pytest.mark.parametrize("failure", ["write", "file_fsync", "exchange"])
 def test_pre_replace_failures_preserve_exact_old_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -519,9 +701,9 @@ def test_pre_replace_failures_preserve_exact_old_bytes(
         monkeypatch.setattr(config_module.os, "fsync", fail_file_fsync)
     else:
         monkeypatch.setattr(
-            config_module.os,
-            "replace",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected")),
+            config_module,
+            "_rename_exchange_at",
+            lambda *_args: (_ for _ in ()).throw(OSError("injected")),
         )
 
     response = engine_api._response(
