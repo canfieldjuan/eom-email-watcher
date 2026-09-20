@@ -567,7 +567,11 @@ def test_certificate_validator_rejects_duplicate_keys_and_policy_overflow() -> N
 
 @pytest.mark.parametrize(
     ("field", "reason"),
-    [("policies[0].unknown", "SPAN_UNKNOWN"), ("insured", "UNKNOWN_REASON")],
+    [
+        ("policies[0].unknown", "SPAN_UNKNOWN"),
+        ("policies[100].expiration_date", "DATE_UNPARSEABLE"),
+        ("insured", "UNKNOWN_REASON"),
+    ],
 )
 def test_certificate_validator_rejects_unknown_withheld_values(field: str, reason: str) -> None:
     record = _record()
@@ -577,6 +581,24 @@ def test_certificate_validator_rejects_unknown_withheld_values(field: str, reaso
         validate_certificate_result_json(
             json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+def test_certificate_validator_accepts_closed_withheld_values_and_max_policy_index() -> None:
+    record = _record(policies=[_policy(0, _date("2027-01-01", "expiration"))])
+    record["insured"] = None
+    record["withheld"] = [
+        {"field": "insured", "reason": "VALUE_NOT_VERBATIM", "detail": "not exact"},
+        {
+            "field": "policies[99].expiration_date",
+            "reason": "DATE_UNPARSEABLE",
+            "detail": "not a complete date",
+        },
+    ]
+    record["review"] = {"required": True, "reasons": ["INSURED_MISSING"]}
+
+    validate_certificate_result_json(
+        json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
+    )
 
 
 def test_certificate_validator_uses_full_canonical_policy_for_duplicate_identity() -> None:
