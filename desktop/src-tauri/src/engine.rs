@@ -714,6 +714,7 @@ pub struct DatabaseHealth {
 pub struct GmailHealth {
     pub credentials_configured: bool,
     pub connected: bool,
+    pub label_watch_configured: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2301,6 +2302,46 @@ mod tests {
     }
 
     #[test]
+    fn health_contract_requires_label_watch_configuration_state() {
+        let health_json = json!({
+            "database": {"ok": true, "initialized": true},
+            "gmail": {
+                "credentials_configured": true,
+                "connected": false,
+                "label_watch_configured": true
+            },
+            "last_check": null,
+            "local_model": {
+                "authentication_required": false,
+                "detail": "ready",
+                "endpoint": "http://127.0.0.1:1234/v1",
+                "model": "local-model",
+                "ok": true,
+                "token_configured": false
+            },
+            "mail": {"providers": [], "accounts": []},
+            "notifications": {
+                "delivery": "host",
+                "enabled": true,
+                "host_delivery_ready": true,
+                "ntfy_configured": false
+            },
+            "production_check_supported": true,
+            "watchlist_count": 0
+        });
+        let configured: HealthStatus =
+            serde_json::from_value(health_json.clone()).expect("deserialize watcher health");
+        assert!(configured.gmail.label_watch_configured);
+
+        let mut missing = health_json;
+        missing["gmail"]
+            .as_object_mut()
+            .expect("Gmail health object")
+            .remove("label_watch_configured");
+        assert!(serde_json::from_value::<HealthStatus>(missing).is_err());
+    }
+
+    #[test]
     fn gmail_label_contract_is_typed_and_secret_free() {
         let catalog: GmailLabelCatalog = serde_json::from_value(json!({
             "provider": "gmail",
@@ -3028,6 +3069,7 @@ notifications_enabled = true
         );
         assert!(!health.gmail.credentials_configured);
         assert!(!health.gmail.connected);
+        assert!(!health.gmail.label_watch_configured);
         assert_eq!(accounts.accounts.len(), 1);
         assert_eq!(accounts.accounts[0].provider, "gmail");
         assert_eq!(accounts.accounts[0].account_id, "gmail-default");

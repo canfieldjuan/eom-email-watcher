@@ -40,7 +40,7 @@ test("mutations are bound to rendered catalog rows and current revisions", () =>
   );
   assert.match(source, /expectedRevision: revision/);
   assert.match(source, /gmailLabelSelectorItems\.some\([\s\S]*selector\.selector_id/);
-  assert.match(source, /catalog\.revision !== selectors\.revision/);
+  assert.match(source, /gmailLabelRefreshIsCurrent\(selectors, catalog, revalidatedSelectors\)/);
 });
 
 test("check status keeps Gmail recovery visible until catch-up finishes", () => {
@@ -239,6 +239,73 @@ test("health captures sender version and preserves health request generation ord
   assert.ok(invokeHealth > capturedVersion);
   assert.ok(generationGuard > invokeHealth);
   assert.ok(render > generationGuard);
+});
+
+test("check readiness distinguishes unconfigured from label or recovery configured watchers", () => {
+  const readinessSource = source.match(
+    /function watcherPrerequisitesReady\([^)]*\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(readinessSource);
+  const prerequisitesReady = Function(
+    `return function watcherPrerequisitesReady(exactSenderCount, gmailLabelWatchConfigured, mailReady, databaseReady) {${readinessSource[1]}\n}`,
+  )() as (
+    exactSenderCount: number,
+    gmailLabelWatchConfigured: boolean,
+    mailReady: boolean,
+    databaseReady: boolean,
+  ) => boolean;
+
+  assert.equal(prerequisitesReady(0, false, false, false), true);
+  assert.equal(prerequisitesReady(0, true, false, true), false);
+  assert.equal(prerequisitesReady(0, true, true, false), false);
+  assert.equal(prerequisitesReady(0, true, true, true), true);
+  assert.equal(prerequisitesReady(1, false, false, true), false);
+  assert.equal(prerequisitesReady(1, false, true, true), true);
+  assert.match(source, /health\.gmail\.label_watch_configured/);
+});
+
+test("catalog success revalidates selectors before declaring Gmail labels current", () => {
+  const consistencySource = source.match(
+    /function gmailLabelRefreshIsCurrent\([^)]*\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(consistencySource);
+  const refreshIsCurrent = Function(
+    `return function gmailLabelRefreshIsCurrent(initialSelectors, catalog, revalidatedSelectors) {${consistencySource[1]}\n}`,
+  )() as (
+    initialSelectors: { revision: number; catalog_state: string },
+    catalog: { revision: number },
+    revalidatedSelectors: { revision: number; catalog_state: string },
+  ) => boolean;
+
+  const unavailable = { revision: 7, catalog_state: "unavailable" };
+  const current = { revision: 7, catalog_state: "current" };
+  assert.equal(refreshIsCurrent(unavailable, { revision: 7 }, current), true);
+  assert.equal(
+    refreshIsCurrent(unavailable, { revision: 7 }, { revision: 7, catalog_state: "unavailable" }),
+    false,
+  );
+  assert.equal(
+    refreshIsCurrent(current, { revision: 8 }, { revision: 8, catalog_state: "current" }),
+    false,
+  );
+  assert.equal(
+    refreshIsCurrent(current, { revision: 7 }, { revision: 7, catalog_state: "invalid_catalog" }),
+    false,
+  );
+
+  const loadSource = source.match(
+    /async function loadGmailLabelState\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function addGmailLabelSelector/,
+  );
+  assert.ok(loadSource);
+  const selectorReads = [
+    ...loadSource[1].matchAll(/invoke<GmailLabelSelectors>\("gmail_label_selectors_list"/g),
+  ].map((match) => match.index ?? -1);
+  const catalogRead = loadSource[1].indexOf(
+    'invoke<GmailLabelCatalog>("gmail_labels_catalog"',
+  );
+  assert.equal(selectorReads.length, 2);
+  assert.ok(selectorReads[0] < catalogRead && catalogRead < selectorReads[1]);
+  assert.match(loadSource[1], /renderGmailLabelSelectors\(revalidatedSelectors\.items\)/);
 });
 
 test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {

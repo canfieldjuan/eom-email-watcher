@@ -1234,11 +1234,33 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         and active_account.provider == DEFAULT_MAIL_PROVIDER
         and mail_account_connected(config, active_account)
     )
+    gmail_label_watch_configured = False
+    if (
+        active_account is not None
+        and active_account.provider == DEFAULT_MAIL_PROVIDER
+        and active_account.mailbox_identity_key is not None
+    ):
+        selector_set = runtime.store.gmail_label_selector_set(active_account.account_id)
+        if (
+            selector_set is not None
+            and selector_set.current_mailbox_identity_key
+            == active_account.mailbox_identity_key
+        ):
+            selectors = runtime.store.gmail_current_label_selectors(
+                active_account.account_id,
+                active_account.mailbox_identity_key,
+            )
+            recovery = runtime.store.gmail_recovery_state(active_account.account_id)
+            gmail_label_watch_configured = bool(selectors) or bool(
+                recovery is not None
+                and recovery.mailbox_identity_key == active_account.mailbox_identity_key
+            )
     return {
         "database": {"ok": True, "initialized": state is not None},
         "gmail": {
             "credentials_configured": gmail_credentials_configured(config.gmail_credentials_file),
             "connected": gmail_connected,
+            "label_watch_configured": gmail_label_watch_configured,
         },
         "last_check": state[1] if state else None,
         "mail": mail,

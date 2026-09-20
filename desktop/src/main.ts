@@ -370,6 +370,7 @@ interface HealthStatus {
   gmail: {
     credentials_configured: boolean;
     connected: boolean;
+    label_watch_configured: boolean;
   };
   mail: MailAccounts;
   last_check: string | null;
@@ -2284,6 +2285,18 @@ function gmailLabelScopeMatches(
   );
 }
 
+function gmailLabelRefreshIsCurrent(
+  initialSelectors: GmailLabelSelectors,
+  catalog: GmailLabelCatalog,
+  revalidatedSelectors: GmailLabelSelectors,
+): boolean {
+  return (
+    initialSelectors.revision === catalog.revision &&
+    catalog.revision === revalidatedSelectors.revision &&
+    revalidatedSelectors.catalog_state === "current"
+  );
+}
+
 function gmailLabelStatusText(status: GmailLabelSelectorStatus): string {
   const labels: Record<GmailLabelSelectorStatus, string> = {
     active: "Active",
@@ -2359,6 +2372,16 @@ function gmailLabelPollingStateMessage(
     active: true,
     message: `Label-only automatic polling is active: ${labelCount}, zero exact senders, and the desktop scheduler is enabled and running.`,
   };
+}
+
+function watcherPrerequisitesReady(
+  exactSenderCount: number,
+  gmailLabelWatchConfigured: boolean,
+  mailReady: boolean,
+  databaseReady: boolean,
+): boolean {
+  const watcherConfigured = exactSenderCount > 0 || gmailLabelWatchConfigured;
+  return !watcherConfigured || (mailReady && databaseReady);
 }
 
 function renderGmailLabelPollingState(): void {
@@ -2544,18 +2567,33 @@ async function loadGmailLabelState(): Promise<void> {
     ) {
       return;
     }
-    if (catalog.revision !== selectors.revision) {
+    const revalidatedSelectors = await invoke<GmailLabelSelectors>("gmail_label_selectors_list", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+    });
+    if (
+      loadSequence !== gmailLabelLoadSequence ||
+      !gmailLabelScopeMatches(revalidatedSelectors, scope, generation)
+    ) {
+      return;
+    }
+    if (!gmailLabelRefreshIsCurrent(selectors, catalog, revalidatedSelectors)) {
       gmailLabelRevision = null;
       gmailLabelCatalogVerified = false;
       renderGmailLabelCatalog([]);
-      renderGmailLabelSelectors(selectors.items);
-      gmailLabelStatus.textContent = "Gmail label settings changed. Refresh labels before editing.";
+      renderGmailLabelSelectors(revalidatedSelectors.items);
+      gmailLabelStatus.textContent =
+        selectors.revision !== catalog.revision ||
+        catalog.revision !== revalidatedSelectors.revision
+          ? "Gmail label settings changed. Refresh labels before editing."
+          : "Selected labels remain visible, but Gmail validation is currently unavailable.";
       gmailLabelStatus.dataset.kind = "error";
       return;
     }
-    gmailLabelRevision = catalog.revision;
-    gmailLabelCatalogVerified = selectors.catalog_state === "current";
+    gmailLabelRevision = revalidatedSelectors.revision;
+    gmailLabelCatalogVerified = true;
     renderGmailLabelCatalog(catalog.items);
+    renderGmailLabelSelectors(revalidatedSelectors.items);
     renderGmailLabelPollingState();
     gmailLabelStatus.textContent = "Gmail labels are up to date.";
     gmailLabelStatus.dataset.kind = "success";
@@ -3385,11 +3423,16 @@ function renderHealth(health: HealthStatus, senderObservationVersion: number): v
     pollingCadence.textContent = "Disabled for current configuration";
     nextCheck.textContent = "Not scheduled";
   }
-  const watcherPrerequisitesReady = exactSenderCount === 0 || (mailReady && databaseReady);
+  const prerequisitesReady = watcherPrerequisitesReady(
+    exactSenderCount,
+    health.gmail.label_watch_configured,
+    mailReady,
+    databaseReady,
+  );
   checkSupported =
     health.production_check_supported &&
     health.notifications.host_delivery_ready &&
-    watcherPrerequisitesReady;
+    prerequisitesReady;
   checkNow.disabled = checkInFlight || !checkSupported;
 }
 

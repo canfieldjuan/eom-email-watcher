@@ -1051,6 +1051,53 @@ def test_legacy_gmail_health_reports_only_the_active_account_connection(
     ] == [True]
 
 
+def test_health_reports_only_current_identity_gmail_label_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    runtime = load_runtime(config_path)
+    identity = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    runtime.store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_123", "Invoices", 0
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    current = engine_api._response(request(config_path, "health.get"))
+
+    assert current["data"]["gmail"]["label_watch_configured"] is True
+
+    runtime.store.reconcile_mailbox_identity(
+        "gmail", "gmail-default", "f" * 64, preserve_cursor=True
+    )
+    replaced = engine_api._response(request(config_path, "health.get"))
+
+    assert replaced["data"]["gmail"]["label_watch_configured"] is False
+
+
+def test_health_reports_current_identity_gmail_recovery_without_selectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    runtime = load_runtime(config_path)
+    identity = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
+    runtime.store.create_gmail_recovery_state(
+        "gmail-default", identity, 0, [], [], 10, 20, "replacement-history"
+    )
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        "eom_email_watcher.model.LocalModel.health", lambda self: (True, "HTTP 200")
+    )
+
+    health = engine_api._response(request(config_path, "health.get"))
+
+    assert health["data"]["gmail"]["label_watch_configured"] is True
+
+
 def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> None:
     config_path = tmp_path / "new" / "config.toml"
 
