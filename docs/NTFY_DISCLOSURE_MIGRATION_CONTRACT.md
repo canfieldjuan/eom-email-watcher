@@ -346,12 +346,17 @@ an error means the write did not commit, never assumes that success means
 admission passed, and never retries with the old revision. It enters the normal
 desktop only after the coordinator reports `Admitted`.
 
-Closing the window, declining by inaction, navigating away where the host
-allows it, or a failed action mutates nothing. The panel never displays, copies,
-or logs the topic or any other config value. It is a narrow upgrade repair, not
-an ntfy settings editor. The new panel belongs beside the existing first-run and
-normal settings surfaces (`desktop/src/main.ts:587-636`) but is mutually
-exclusive with both.
+Rendering the panel, closing the window, declining by inaction, or navigating
+away where the host allows it sends no acknowledgement request and therefore
+mutates nothing. Once an acknowledgement request is attempted, an error or
+unknown response does not prove that the file stayed old: the native
+coordinator must reconcile, and the exact old document or fully validated new
+document determines the resulting state. It never retries blindly or treats a
+prior click as consent for a currently repairable revision. The panel never
+displays, copies, or logs the topic or any other config value. It is a narrow
+upgrade repair, not an ntfy settings editor. The new panel belongs beside the
+existing first-run and normal settings surfaces
+(`desktop/src/main.ts:587-636`) but is mutually exclusive with both.
 
 ## Scheduler ownership
 
@@ -420,9 +425,10 @@ behavior and then pass without weakening `load_config`:
 11. **Rust bridge:** the engine deserializes only the documented secret-free
    states, passes the expected revision unchanged, maps stable errors, owns the
    serialized admission/worker state, and exposes no config values.
-12. **Desktop flow:** no invocation is sent on render, close, focus, or error;
-   one explicit click sends one revision; every outcome reconciles through the
-   native coordinator; and a new required revision needs another click.
+12. **Desktop flow:** no invocation is sent on render, close, focus, inaction,
+   or navigation; one explicit click sends one revision; an attempted request's
+   success, error, or unknown outcome always reconciles through the native
+   coordinator; and a current required revision needs another click.
 13. **Regression:** normal `load_config` still rejects a topic with missing,
    false, or non-boolean acknowledgement. The existing tests at
    `tests/test_config.py:636-687` remain unchanged in meaning.
