@@ -78,6 +78,7 @@ def test_packaged_smoke_uses_owner_private_config_parent(
     }
     operations: list[str] = []
     watcher_tokens: list[object] = []
+    observed_state_homes: list[Path] = []
 
     def request(*_args: object, **kwargs: object) -> dict[str, object]:
         config_path = kwargs["config_path"]
@@ -86,6 +87,13 @@ def test_packaged_smoke_uses_owner_private_config_parent(
         operation = kwargs["operation"]
         assert isinstance(operation, str)
         operations.append(operation)
+        environment = kwargs["environment"]
+        assert isinstance(environment, dict)
+        assert "STATE_DIRECTORY" not in environment
+        state_home = Path(environment["XDG_STATE_HOME"])
+        assert state_home.is_absolute()
+        assert stat.S_IMODE(state_home.stat().st_mode) == 0o700
+        observed_state_homes.append(state_home)
         if operation == "watcher.check":
             watcher_tokens.append(kwargs.get("admission_token"))
         else:
@@ -104,6 +112,8 @@ def test_packaged_smoke_uses_owner_private_config_parent(
         "watcher.check",
     ]
     assert watcher_tokens == [ADMISSION_TOKEN]
+    assert len(set(observed_state_homes)) == 1
+    assert observed_state_homes[0].parent.name == "private"
 
 
 def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:
@@ -295,6 +305,38 @@ def test_token_bound_smoke_failure_does_not_render_admission_token(
     rendered = str(failure.value)
     assert ADMISSION_TOKEN["revision"] not in rendered
     assert ADMISSION_TOKEN["identity"] not in rendered
+
+
+def test_unbound_smoke_failure_does_not_render_state_lock_or_child_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    private_canary = "/private/STATE_LOCK_CANARY/config-serialization.lock"
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout="",
+            stderr=f"failure at {private_canary}",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    assert private_canary not in str(failure.value)
+    assert "failure at" not in str(failure.value)
 
 
 @pytest.mark.parametrize(

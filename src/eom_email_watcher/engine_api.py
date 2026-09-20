@@ -4963,6 +4963,8 @@ def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "name must be a string or null")
     try:
         sender = add_sender(_config_path(request), email, name)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration changed during update") from exc
     except InvalidSenderError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
     except DuplicateSenderError as exc:
@@ -4977,6 +4979,8 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "email must be a non-empty string")
     try:
         sender = remove_sender(_config_path(request), email)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration changed during update") from exc
     except InvalidSenderError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
     except SenderNotFoundError as exc:
@@ -5112,6 +5116,8 @@ def _settings_update(request: dict[str, object]) -> dict[str, object]:
                 runtime.store.purge(config.retention_days)
     except InvalidSettingsUpdateError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration changed during update") from exc
     return _settings_data(config)
 
 

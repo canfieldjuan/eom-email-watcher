@@ -4536,6 +4536,43 @@ def test_watchlist_mutations_are_normalized_and_return_explicit_errors(
     assert listed["data"]["items"] == []
 
 
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("settings.update", {"poll_interval_minutes": 45}),
+        ("watchlist.add", {"email": "new@example.com"}),
+        ("watchlist.remove", {"email": "a@example.com"}),
+    ],
+)
+def test_config_mutation_preserves_external_replacement_and_returns_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    payload: dict[str, object],
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    manual_content = config_path.read_bytes() + b"\n# operator replacement\n"
+
+    def replace_before_publish(stage: str, path: Path) -> None:
+        assert stage == "before_replace"
+        replacement = path.with_name("manual-replacement.toml")
+        replacement.write_bytes(manual_content)
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+
+    monkeypatch.setattr(config_module, "_config_mutation_probe", replace_before_publish)
+
+    response = engine_api._response(request(config_path, operation, payload))
+
+    assert response["error"] == {
+        "code": "conflict",
+        "message": "Configuration changed during update",
+    }
+    assert config_path.read_bytes() == manual_content
+    assert not list(tmp_path.glob(".config.toml.*.tmp"))
+
+
 def test_attachment_export_uses_inactive_source_account_and_safe_private_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

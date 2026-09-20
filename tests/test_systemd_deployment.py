@@ -62,14 +62,50 @@ def test_systemd_config_lock_resolves_inside_only_writable_state_path(
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
     watcher = WATCHER_SERVICE.read_text()
 
     assert config_module._config_serialization_lock_path() == (
         home / ".local/state/eom-email-watcher/config-serialization.lock"
     )
     assert "ProtectHome=read-only" in watcher
-    assert "ReadWritePaths=%h/.local/state/eom-email-watcher" in watcher
+    assert "StateDirectory=eom-email-watcher" in watcher
+    assert "StateDirectoryMode=0700" in watcher
+    assert "StateDirectory=eom-email-watcher" in MONTHLY_SERVICE.read_text()
+    assert "StateDirectoryMode=0700" in MONTHLY_SERVICE.read_text()
     assert "ReadWritePaths=%h/.config/eom-email-watcher" not in watcher
+
+
+def test_systemd_and_interactive_roles_share_custom_state_lock_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_home = tmp_path / "custom-state"
+    service_state = state_home / "eom-email-watcher"
+    expected = service_state / "config-serialization.lock"
+
+    observed: dict[str, Path] = {}
+    for role in ("watcher", "monthly"):
+        monkeypatch.setenv("STATE_DIRECTORY", str(service_state))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "ignored-state"))
+        observed[role] = config_module._config_serialization_lock_path()
+    for role in ("cli", "desktop"):
+        monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        observed[role] = config_module._config_serialization_lock_path()
+
+    assert observed == {role: expected for role in observed}
+
+
+@pytest.mark.parametrize("value", ["relative/state", "", "relative:other"])
+def test_systemd_state_directory_must_be_one_absolute_path(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("STATE_DIRECTORY", value)
+
+    with pytest.raises(config_module._UnsafeConfigPath):
+        config_module._config_serialization_lock_path()
 
 
 LEGACY_RELEASE_KEYRING = Path(".local/share/eom-email-watcher/connect-entitlement-keyring.json")

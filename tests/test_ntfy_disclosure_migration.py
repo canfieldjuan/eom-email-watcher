@@ -2327,3 +2327,24 @@ def test_custom_config_paths_share_the_state_lock_inode(
 
     assert (initial.st_dev, initial.st_ino) == (completed.st_dev, completed.st_ino)
     assert lock_path.read_bytes() == b""
+
+
+def test_non_posix_lock_fallback_preserves_publication_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NonPosixOs:
+        name = "nt"
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
+    monkeypatch.setattr(config_module, "os", NonPosixOs())
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    with (
+        pytest.raises(OSError, match="publication failed"),
+        config_module._config_serialization_lock(),
+    ):
+        raise OSError("publication failed")

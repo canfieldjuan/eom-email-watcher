@@ -49,13 +49,8 @@ def _request(
         timeout=ENGINE_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
-        detail = (
-            "diagnostic omitted for token-bound request"
-            if admission_token is not None
-            else result.stderr.strip()[-1000:] or "no stderr"
-        )
         raise PackagedEngineSmokeError(
-            f"Packaged engine {operation} exited {result.returncode}: {detail}"
+            f"Packaged engine {operation} exited {result.returncode}: diagnostic omitted"
         )
     try:
         response = json.loads(result.stdout)
@@ -124,11 +119,17 @@ def smoke_packaged_engine(
         if os.name != "nt":
             private_root.chmod(0o700)
         config_path = private_root / "config.toml"
+        state_home = private_root / "state"
+        state_home.mkdir(mode=0o700)
+        if os.name != "nt":
+            state_home.chmod(0o700)
         environment = os.environ.copy()
         environment.pop("PYTHONHOME", None)
         environment.pop("PYTHONPATH", None)
+        environment.pop("STATE_DIRECTORY", None)
         for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
             environment[key] = str(private_root)
+        environment["XDG_STATE_HOME"] = str(state_home.resolve())
 
         initialized = _request(
             isolated_binary,

@@ -13,4 +13,5 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/state/eom-email-watcher
+StateDirectory=eom-email-watcher
+StateDirectoryMode=0700

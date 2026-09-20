@@ -7,6 +7,7 @@ import pytest
 
 import eom_email_watcher.config as config_module
 from eom_email_watcher.config import (
+    ConfigAdmissionStaleError,
     ConfigAlreadyExistsError,
     ConfigError,
     DuplicateSenderError,
@@ -607,24 +608,99 @@ def test_settings_update_atomic_replace_failure_preserves_original(
     assert list(tmp_path.glob(".config.toml.*.tmp")) == []
 
 
-def test_watchlist_mutation_preserves_symlinked_config_target(tmp_path: Path) -> None:
+def test_watchlist_mutation_rejects_symlinked_config_alias(tmp_path: Path) -> None:
     target = tmp_path / "managed" / "config.toml"
     target.parent.mkdir()
     write_config(target)
     link = tmp_path / "config.toml"
     link.symlink_to(target)
 
-    added = add_sender(link, "new@example.com", "New")
+    original = target.read_bytes()
+
+    with pytest.raises(ConfigError, match="unavailable or requires manual repair"):
+        add_sender(link, "new@example.com", "New")
 
     assert link.is_symlink()
-    assert added.email == "new@example.com"
-    assert load_config(target).allowlist == frozenset({"trusted@example.com", "new@example.com"})
+    assert target.read_bytes() == original
 
-    removed = remove_sender(link, "new@example.com")
 
-    assert link.is_symlink()
-    assert removed == added
-    assert load_config(target).allowlist == frozenset({"trusted@example.com"})
+@pytest.mark.skipif(os.name != "posix", reason="safe config publication is POSIX-only")
+@pytest.mark.parametrize("mutation", ["settings", "add", "remove"])
+@pytest.mark.parametrize("same_bytes", [False, True])
+def test_config_mutation_never_overwrites_editor_atomic_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    same_bytes: bool,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    original = path.read_bytes()
+    manual = original if same_bytes else original + b"\n# operator replacement\n"
+    replaced_identity: tuple[int, int] | None = None
+
+    def replace_before_commit(stage: str, observed_path: Path) -> None:
+        nonlocal replaced_identity
+        if stage != "before_replace" or replaced_identity is not None:
+            return
+        assert observed_path == path
+        replacement = path.with_name("operator-config.toml")
+        replacement.write_bytes(manual)
+        replacement.chmod(0o600)
+        os.replace(replacement, path)
+        current = path.stat()
+        replaced_identity = (current.st_dev, current.st_ino)
+
+    monkeypatch.setattr(
+        config_module,
+        "_config_mutation_probe",
+        replace_before_commit,
+        raising=False,
+    )
+
+    with pytest.raises(ConfigAdmissionStaleError, match="snapshot changed"):
+        if mutation == "settings":
+            update_settings(path, {"poll_interval_minutes": 45})
+        elif mutation == "add":
+            add_sender(path, "new@example.com", "New")
+        else:
+            remove_sender(path, "trusted@example.com")
+
+    assert replaced_identity is not None
+    assert (path.stat().st_dev, path.stat().st_ino) == replaced_identity
+    assert path.read_bytes() == manual
+    assert list(path.parent.glob(".config.toml.*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="state lock concurrency is POSIX-only")
+def test_concurrent_app_mutations_serialize_without_lost_updates(tmp_path: Path) -> None:
+    import threading
+
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+    start = threading.Barrier(3)
+    failures: list[BaseException] = []
+
+    def add(address: str) -> None:
+        try:
+            start.wait()
+            add_sender(path, address)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=add, args=("one@example.com",)),
+        threading.Thread(target=add, args=("two@example.com",)),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert load_config(path).allowlist == frozenset({"one@example.com", "two@example.com"})
 
 
 def test_removing_final_sender_leaves_valid_empty_watchlist(tmp_path: Path) -> None:

@@ -182,6 +182,16 @@ class _SafeConfigHandle:
         os.close(self.parent_fd)
 
 
+@dataclass
+class _ConfigMutationSource:
+    path: Path
+    identity: os.stat_result
+    content: bytes
+    parent_fd: int | None = None
+    name: str | None = None
+    parent: _HeldParent | None = None
+
+
 @dataclass(frozen=True)
 class _HeldParent:
     path: Path
@@ -593,6 +603,15 @@ def _open_or_create_safe_parent(path: Path) -> tuple[Path, int, str]:
 
 
 def _config_serialization_lock_path() -> Path:
+    if "STATE_DIRECTORY" in os.environ:
+        configured_state_directory = os.environ["STATE_DIRECTORY"]
+        if (
+            not configured_state_directory
+            or os.pathsep in configured_state_directory
+            or not Path(configured_state_directory).is_absolute()
+        ):
+            raise _UnsafeConfigPath
+        return Path(configured_state_directory) / "config-serialization.lock"
     configured_state_home = os.environ.get("XDG_STATE_HOME")
     if configured_state_home:
         state_home = Path(configured_state_home).expanduser()
@@ -625,10 +644,14 @@ def _config_serialization_lock():
     if os.name != "posix" or not hasattr(os, "geteuid"):
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with FileLock(str(lock_path)):
-                yield
+            lock = FileLock(str(lock_path))
+            lock.acquire()
         except OSError as exc:
             raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+        try:
+            yield
+        finally:
+            lock.release()
         return
 
     parent_fd: int | None = None
@@ -769,6 +792,98 @@ def _read_safe_file_at(parent_fd: int, name: str) -> tuple[int, os.stat_result, 
     except Exception:
         os.close(file_fd)
         raise
+
+
+def _config_mutation_probe(_stage: str, _path: Path) -> None:
+    """Test seam for replacement immediately before config publication."""
+
+
+@contextmanager
+def _config_mutation_source(path: Path):
+    """Hold one safely read config source while its mutation is prepared."""
+
+    absolute = _absolute_lexical_path(path)
+    if os.name != "posix":
+        try:
+            read_path, identity, content = _read_admission_config_under_lock(absolute)
+        except _MissingConfigPath as exc:
+            raise ConfigError(
+                f"Configuration not found: {path}. Copy config.example.toml and edit it."
+            ) from exc
+        except (_UnsafeConfigPath, OSError) as exc:
+            raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+        yield _ConfigMutationSource(read_path, identity, content)
+        return
+
+    parent_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        absolute, parent_fd, name = _open_safe_parent(absolute)
+        recovery = _recover_ntfy_transaction_at(
+            parent_fd,
+            name,
+            parent_path=absolute.parent,
+        )
+        if recovery in {"unsupported", "manual_artifact"}:
+            raise _UnsafeConfigPath
+        parent = _validate_held_parent(parent_fd, parent_path=absolute.parent)
+        file_fd, identity, content = _read_safe_file_at(parent_fd, name)
+        _validate_held_parent(parent_fd, parent)
+        source = _ConfigMutationSource(
+            absolute,
+            identity,
+            content,
+            parent_fd=parent_fd,
+            name=name,
+            parent=parent,
+        )
+    except _MissingConfigPath as exc:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise ConfigError(
+            f"Configuration not found: {path}. Copy config.example.toml and edit it."
+        ) from exc
+    except (_UnsafeConfigPath, OSError) as exc:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise ConfigError("Configuration is unavailable or requires manual repair") from exc
+    try:
+        yield source
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _verify_config_mutation_source(source: _ConfigMutationSource) -> None:
+    _config_mutation_probe("before_replace", source.path)
+    try:
+        if os.name == "posix":
+            assert source.parent_fd is not None
+            assert source.name is not None
+            assert source.parent is not None
+            _validate_held_parent(source.parent_fd, source.parent)
+            current_fd, current_identity, current_content = _read_safe_file_at(
+                source.parent_fd,
+                source.name,
+            )
+            try:
+                _validate_held_parent(source.parent_fd, source.parent)
+            finally:
+                os.close(current_fd)
+        else:
+            current_identity, current_content = _read_safe_windows_file(source.path)
+    except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
+        raise ConfigAdmissionStaleError("Configuration admission snapshot changed") from exc
+    if _safe_file_version(current_identity) != _safe_file_version(source.identity) or _revision(
+        current_content
+    ) != _revision(source.content):
+        raise ConfigAdmissionStaleError("Configuration admission snapshot changed")
 
 
 def _open_safe_config(path: Path) -> _SafeConfigHandle:
@@ -2565,7 +2680,13 @@ def _recover_ntfy_transaction_at(
     raise _UnsafeConfigPath
 
 
-def _durable_replace_at(parent_fd: int, name: str, content: bytes) -> None:
+def _durable_replace_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    before_replace: Callable[[], None] | None = None,
+) -> None:
     temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
     temporary_fd: int | None = None
     replaced = False
@@ -2590,6 +2711,8 @@ def _durable_replace_at(parent_fd: int, name: str, content: bytes) -> None:
         os.fsync(temporary_fd)
         os.close(temporary_fd)
         temporary_fd = None
+        if before_replace is not None:
+            before_replace()
         os.replace(
             temporary_name,
             name,
@@ -3123,14 +3246,18 @@ def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
         os.close(file_fd)
 
 
-def _atomic_write_windows(path: Path, content: bytes) -> None:
+def _atomic_write_windows(
+    path: Path,
+    content: bytes,
+    source: _ConfigMutationSource,
+) -> None:
     parent_stat = os.lstat(path.parent)
     if (
         not stat.S_ISDIR(parent_stat.st_mode)
         or int(getattr(parent_stat, "st_file_attributes", 0)) & 0x400
     ):
         raise _UnsafeConfigPath
-    original_stat, _original_content = _read_safe_windows_file(path)
+    _verify_config_mutation_source(source)
     temporary = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
     temporary_fd: int | None = None
     temporary_identity: tuple[int, int] | None = None
@@ -3159,9 +3286,7 @@ def _atomic_write_windows(path: Path, content: bytes) -> None:
         candidate_stat, candidate_content = _read_safe_windows_file(temporary)
         if candidate_content != content:
             raise _UnsafeConfigPath
-        current_stat, _current_content = _read_safe_windows_file(path)
-        if _windows_stat_version(current_stat) != _windows_stat_version(original_stat):
-            raise ConfigError("Configuration changed during update")
+        _verify_config_mutation_source(source)
         current_parent = os.lstat(path.parent)
         if (
             not stat.S_ISDIR(current_parent.st_mode)
@@ -3186,18 +3311,21 @@ def _atomic_write_windows(path: Path, content: bytes) -> None:
                     os.unlink(temporary)
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def _publish_config_mutation(source: _ConfigMutationSource, content: bytes) -> None:
     if os.name == "nt":
         try:
-            _atomic_write_windows(path, content.encode("utf-8"))
+            _atomic_write_windows(source.path, content, source)
         except _UnsafeConfigPath as exc:
             raise ConfigError("Configuration path is unsafe") from exc
         return
-    parent_fd = os.open(path.parent, _directory_open_flags())
-    try:
-        _durable_replace_at(parent_fd, path.name, content.encode("utf-8"))
-    finally:
-        os.close(parent_fd)
+    assert source.parent_fd is not None
+    assert source.name is not None
+    _durable_replace_at(
+        source.parent_fd,
+        source.name,
+        content,
+        before_replace=lambda: _verify_config_mutation_source(source),
+    )
 
 
 def _atomic_create(path: Path, content: str) -> None:
@@ -3398,14 +3526,11 @@ def _sender_table(sender: Sender, *, inline: bool):
 
 def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
     sender = _sender(email, name, invalid_message="email must be a valid email address")
-    config_path = path.expanduser().resolve()
-    if not config_path.exists():
-        load_config(config_path)
-    with _config_serialization_lock():
-        config = _load_runtime_config(config_path, lock_held=True)
+    with _config_serialization_lock(), _config_mutation_source(path) as source:
+        config = _load_config_bytes(source.content, source.path)
         if sender.email in config.allowlist:
             raise DuplicateSenderError(f"Sender is already watched: {sender.email}")
-        document = parse(config_path.read_text(encoding="utf-8"))
+        document = parse(source.content.decode("utf-8"))
         sender_items = document.get("senders")
         if sender_items is None or isinstance(sender_items, Array) and not sender_items:
             sender_items = aot()
@@ -3416,17 +3541,14 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
             sender_items.append(_sender_table(sender, inline=True))
         else:
             raise ConfigError("senders must be a list of tables")
-        _atomic_write(config_path, dumps(document))
+        _publish_config_mutation(source, dumps(document).encode("utf-8"))
     return sender
 
 
 def remove_sender(path: Path, email: str) -> Sender:
     requested = _sender(email, None, invalid_message="email must be a valid email address")
-    config_path = path.expanduser().resolve()
-    if not config_path.exists():
-        load_config(config_path)
-    with _config_serialization_lock():
-        config = _load_runtime_config(config_path, lock_held=True)
+    with _config_serialization_lock(), _config_mutation_source(path) as source:
+        config = _load_config_bytes(source.content, source.path)
         try:
             index = next(
                 index
@@ -3436,12 +3558,12 @@ def remove_sender(path: Path, email: str) -> Sender:
         except StopIteration as exc:
             raise SenderNotFoundError(f"Sender is not watched: {requested.email}") from exc
         removed = config.senders[index]
-        document = parse(config_path.read_text(encoding="utf-8"))
+        document = parse(source.content.decode("utf-8"))
         sender_items = document.get("senders")
         if not isinstance(sender_items, (AoT, Array)):
             raise ConfigError("senders must be a list of tables")
         del sender_items[index]
-        _atomic_write(config_path, dumps(document))
+        _publish_config_mutation(source, dumps(document).encode("utf-8"))
     return removed
 
 
@@ -3494,27 +3616,22 @@ def update_settings(path: Path, updates: Mapping[str, object]) -> Config:
             raise InvalidSettingsUpdateError("model_name must be a non-empty printable string")
         normalized_updates["model_name"] = normalized_model_name
 
-    config_path = path.expanduser().resolve()
-    if not config_path.exists():
-        load_config(config_path)
-    try:
-        with _config_serialization_lock():
-            config = _load_runtime_config(config_path, lock_held=True)
-            if {
-                "model_base_url",
-                "model_name",
-            } & updates.keys() and config.model_backend != "loopback":
-                raise InvalidSettingsUpdateError(
-                    "Model endpoint and identifier are managed by the inference gateway"
-                )
-            document = parse(config_path.read_text(encoding="utf-8"))
-            for key, value in normalized_updates.items():
-                document[key] = value
-            _atomic_write(config_path, dumps(document))
-            return _load_runtime_config(config_path, lock_held=True)
-    except FileNotFoundError:
-        load_config(config_path)
-        raise
+    with _config_serialization_lock(), _config_mutation_source(path) as source:
+        config = _load_config_bytes(source.content, source.path)
+        if {
+            "model_base_url",
+            "model_name",
+        } & updates.keys() and config.model_backend != "loopback":
+            raise InvalidSettingsUpdateError(
+                "Model endpoint and identifier are managed by the inference gateway"
+            )
+        document = parse(source.content.decode("utf-8"))
+        for key, value in normalized_updates.items():
+            document[key] = value
+        candidate = dumps(document).encode("utf-8")
+        updated = _load_config_bytes(candidate, source.path)
+        _publish_config_mutation(source, candidate)
+        return updated
 
 
 def secure_runtime_paths(
