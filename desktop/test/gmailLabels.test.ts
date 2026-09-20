@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { webcrypto } from "node:crypto";
 import test from "node:test";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -112,4 +113,66 @@ test("scheduled checks render recovery before any completion status", () => {
   assert.ok(recoveryBranch >= 0);
   assert.ok(completionBranch >= 0);
   assert.ok(recoveryBranch < completionBranch);
+});
+
+test("Gmail label proof surface shows safe selector evidence without the opaque label ID", async () => {
+  assert.match(source, /id="gmail-label-polling-state"/);
+  assert.match(source, /Selector UUID:/);
+  assert.match(source, /Label ID SHA-256:/);
+  assert.match(source, /Selector-set revision:/);
+  assert.match(source, /crypto\.subtle\.digest\("SHA-256"/);
+  assert.doesNotMatch(
+    source,
+    /(?:textContent|innerText|innerHTML)\s*=\s*[^;\n]*selector\.label_id/,
+  );
+
+  const digestFunctionSource = source.match(
+    /async function gmailLabelIdDigest\([^)]*\): Promise<string> \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(digestFunctionSource);
+  const digestLabelId = Function(
+    "crypto",
+    "TextEncoder",
+    `return async function gmailLabelIdDigest(labelId) {${digestFunctionSource[1]}\n}`,
+  )(webcrypto, TextEncoder) as (labelId: string) => Promise<string>;
+  const rawLabelId = "Label_private-proof-123";
+  const digest = await digestLabelId(rawLabelId);
+  assert.equal(digest, "cd467470d08281da13ee3acd5fe743544fdf2e92e3de8b125c4dcdab4402dbd9");
+  assert.doesNotMatch(digest, /Label_private-proof-123/);
+});
+
+test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {
+  const stateFunctionSource = source.match(
+    /function gmailLabelPollingStateMessage\([^)]*\): GmailLabelPollingState \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(stateFunctionSource);
+  const pollingState = Function(
+    `return function gmailLabelPollingStateMessage(activeSelectorCount, health) {${stateFunctionSource[1]}\n}`,
+  )() as (
+    activeSelectorCount: number | null,
+    health: Record<string, unknown> | null,
+  ) => { active: boolean; message: string };
+
+  const active = pollingState(1, {
+    watchlist_count: 0,
+    polling: { enabled: true, interval_minutes: 120, next_check_unix_ms: 1_800_000_000_000 },
+  });
+  assert.equal(active.active, true);
+  assert.match(active.message, /Label-only automatic polling is active/);
+  assert.match(active.message, /zero exact senders/);
+  assert.match(active.message, /scheduler is enabled and running/);
+
+  for (const [activeSelectorCount, health, reason] of [
+    [0, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: 1 } }, /no active Gmail label selector/],
+    [1, { watchlist_count: 1, polling: { enabled: true, next_check_unix_ms: 1 } }, /exact sender count is 1/],
+    [1, { watchlist_count: 0, polling: { enabled: false, next_check_unix_ms: null } }, /scheduler is disabled/],
+    [1, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: null } }, /no next check is scheduled/],
+    [null, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: 1 } }, /status is unavailable/],
+    [1, null, /status is unavailable/],
+  ] as const) {
+    const state = pollingState(activeSelectorCount, health);
+    assert.equal(state.active, false);
+    assert.match(state.message, reason);
+    assert.doesNotMatch(state.message, /Label-only automatic polling is active/);
+  }
 });
