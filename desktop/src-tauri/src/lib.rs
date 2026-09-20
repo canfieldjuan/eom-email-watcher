@@ -871,7 +871,7 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         mutate: impl FnOnce() -> Result<T, EngineError>,
         restage: impl FnOnce() -> Result<W, EngineError>,
     ) -> Result<T, EngineError> {
-        let (workers, generation, prior_token) = {
+        let generation = {
             let mut inner = self.inner.lock().map_err(|_| {
                 EngineError::host("host_error", "Configuration admission coordinator stopped")
             })?;
@@ -882,16 +882,9 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
                 ));
             }
             inner.state = AdmissionState::Mutating;
-            let workers = inner
-                .workers
-                .take()
-                .expect("admitted workers checked above");
-            let prior_token = workers.admission_token().cloned();
-            workers.begin_revocation();
-            (workers, inner.generation, prior_token)
+            inner.generation
         };
 
-        drop(workers);
         let mut inner = self.inner.lock().map_err(|_| {
             EngineError::host("host_error", "Configuration admission coordinator stopped")
         })?;
@@ -902,14 +895,21 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         }
         if inner.generation != generation
             || inner.state != AdmissionState::Mutating
-            || inner.workers.is_some()
+            || inner.workers.is_none()
         {
             return Err(EngineError::host(
                 "configuration_not_admitted",
                 "Watcher configuration is not admitted",
             ));
         }
+        let workers = inner
+            .workers
+            .take()
+            .expect("mutating workers checked above");
+        let prior_token = workers.admission_token().cloned();
+        workers.begin_revocation();
         drop(inner);
+        drop(workers);
         let value = match mutate() {
             Ok(value) => value,
             Err(error) => {
@@ -1017,6 +1017,69 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
                 Self::next_generation(&mut inner)?;
                 inner.state = AdmissionState::Inspecting;
                 let attempt = run_admission_attempt(inspect, admit);
+                (Self::install_attempt(&mut inner, attempt), None)
+            }
+        };
+        if let Some(cleanup) = cleanup {
+            Self::enqueue_cleanup(&self.inner, &self.supervisor, cleanup);
+        } else {
+            self.supervisor.emit((&transition).into());
+        }
+        Ok(transition)
+    }
+
+    fn acknowledge_with(
+        &self,
+        expected_revision: &str,
+        acknowledge: impl FnOnce() -> Result<(), EngineError>,
+        inspect: impl FnOnce() -> Result<NtfyDisclosureStatus, EngineError>,
+        admit: impl FnOnce() -> Result<W, EngineError>,
+    ) -> Result<AdmissionTransition, EngineError> {
+        let (transition, cleanup) = {
+            let mut inner = self.inner.lock().map_err(|_| {
+                EngineError::host("host_error", "Configuration admission coordinator stopped")
+            })?;
+            if inner.state == AdmissionState::Mutating {
+                return Ok(AdmissionTransition {
+                    status: ConfigAdmissionStatus::ManualRepairRequired,
+                    generation: inner.generation,
+                });
+            }
+            if inner.state == AdmissionState::Admitted
+                && let Some(workers) = inner.workers.as_ref()
+            {
+                if workers.revalidate().is_ok() {
+                    (
+                        AdmissionTransition {
+                            status: ConfigAdmissionStatus::Admitted,
+                            generation: inner.generation,
+                        },
+                        None,
+                    )
+                } else {
+                    let cleanup = Self::take_for_revocation(&mut inner);
+                    (
+                        AdmissionTransition {
+                            status: ConfigAdmissionStatus::ManualRepairRequired,
+                            generation: inner.generation,
+                        },
+                        cleanup,
+                    )
+                }
+            } else {
+                let revision_matches = match &inner.state {
+                    AdmissionState::AwaitingAcknowledgement {
+                        expected_revision: current,
+                    } => current == expected_revision,
+                    _ => false,
+                };
+                Self::next_generation(&mut inner)?;
+                inner.state = AdmissionState::Inspecting;
+                let attempt = if revision_matches {
+                    run_acknowledgement_attempt(acknowledge, inspect, admit)
+                } else {
+                    run_admission_attempt(inspect, admit)
+                };
                 (Self::install_attempt(&mut inner, attempt), None)
             }
         };
@@ -1157,41 +1220,14 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         expected_revision: String,
     ) -> Result<ConfigAdmissionUpdate, EngineError> {
         let observer = self.engine_error_observer();
-        let transition = {
-            let mut inner = self.inner.lock().map_err(|_| {
-                EngineError::host("host_error", "Configuration admission coordinator stopped")
-            })?;
-            if inner.workers.is_some() && inner.state == AdmissionState::Admitted {
-                return Ok(ConfigAdmissionUpdate {
-                    generation: inner.generation,
-                    status: ConfigAdmissionStatus::Admitted,
-                });
-            }
-            let revision_matches = match &inner.state {
-                AdmissionState::AwaitingAcknowledgement {
-                    expected_revision: current,
-                } => current == &expected_revision,
-                _ => false,
-            };
-            Self::next_generation(&mut inner)?;
-            inner.state = AdmissionState::Inspecting;
-            let attempt = if revision_matches {
-                run_acknowledgement_attempt(
-                    || engine.acknowledge_ntfy_disclosure(expected_revision),
-                    || engine.ntfy_disclosure_status(),
-                    || stage_admitted_workers(app, engine, delivery, Arc::clone(&observer)),
-                )
-            } else {
-                run_admission_attempt(
-                    || engine.ntfy_disclosure_status(),
-                    || stage_admitted_workers(app, engine, delivery, observer),
-                )
-            };
-            Self::install_attempt(&mut inner, attempt)
-        };
-        let update: ConfigAdmissionUpdate = (&transition).into();
-        self.supervisor.emit(update.clone());
-        Ok(update)
+        let acknowledgement_revision = expected_revision.clone();
+        let transition = self.acknowledge_with(
+            &expected_revision,
+            || engine.acknowledge_ntfy_disclosure(acknowledgement_revision),
+            || engine.ntfy_disclosure_status(),
+            || stage_admitted_workers(app, engine, delivery, observer),
+        )?;
+        Ok((&transition).into())
     }
 
     fn mutate_config<T>(
@@ -3498,6 +3534,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
     fn config_mutation_waits_for_active_effect_and_blocks_new_effects() {
         struct EffectGateWorkers {
             token: AdmissionToken,
+            binding: Arc<Mutex<Option<AdmissionToken>>>,
             held: Mutex<Option<mpsc::Sender<()>>>,
             dropped: mpsc::Sender<String>,
         }
@@ -3508,6 +3545,10 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
             }
 
             fn begin_revocation(&self) {
+                self.binding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
                 if let Some(held) = self
                     .held
                     .lock()
@@ -3518,7 +3559,12 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
                 }
             }
 
-            fn activate(&self) {}
+            fn activate(&self) {
+                *self
+                    .binding
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.token.clone());
+            }
         }
 
         impl Drop for EffectGateWorkers {
@@ -3532,6 +3578,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
 
         let old_token = probe_admission_token('b', 'c');
         let new_token = probe_admission_token('d', 'e');
+        let binding = Arc::new(Mutex::new(None));
         let (held_sender, held_receiver) = mpsc::channel();
         let (drop_sender, drop_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
@@ -3546,7 +3593,8 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
                 || Ok(NtfyDisclosureStatus::NormalAdmission),
                 || {
                     Ok(EffectGateWorkers {
-                        token: old_token,
+                        token: old_token.clone(),
+                        binding: Arc::clone(&binding),
                         held: Mutex::new(Some(held_sender)),
                         dropped: initial_drop_sender,
                     })
@@ -3562,6 +3610,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         let (commit_sender, commit_receiver) = mpsc::channel();
         let transaction = AdmissionCoordinator::clone(&admission);
         let replacement_drop_sender = drop_sender;
+        let replacement_binding = Arc::clone(&binding);
         let transaction = thread::Builder::new()
             .name("config-mutation-transaction".into())
             .spawn(move || {
@@ -3574,6 +3623,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
                         let (held, _held_receiver) = mpsc::channel();
                         Ok(EffectGateWorkers {
                             token: new_token,
+                            binding: replacement_binding,
                             held: Mutex::new(Some(held)),
                             dropped: replacement_drop_sender,
                         })
@@ -3582,22 +3632,45 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
             })
             .expect("spawn config mutation transaction");
 
-        held_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("old workers held before mutation");
+        for _ in 0..100 {
+            if admission.inner.lock().expect("admission state").state == AdmissionState::Mutating {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
-            drop_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .expect("old workers dropped off worker thread"),
-            "config-mutation-transaction"
+            admission.inner.lock().expect("admission state").state,
+            AdmissionState::Mutating
         );
         assert!(commit_receiver.try_recv().is_err());
         assert_eq!(
             admission.require_admitted().unwrap_err().code,
             "configuration_not_admitted"
         );
+        assert!(
+            held_receiver.try_recv().is_err(),
+            "old admission binding must remain installed for permitted effects"
+        );
+        assert!(
+            drop_receiver.try_recv().is_err(),
+            "old workers must remain alive for permitted effects"
+        );
+        assert_eq!(
+            binding.lock().expect("engine admission binding").as_ref(),
+            Some(&old_token),
+            "the in-flight command sends the exact token it was admitted under"
+        );
 
         drop(active_effect);
+        held_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old admission binding revoked after permitted effects finish");
+        assert_eq!(
+            drop_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("old workers dropped after permitted effects finish"),
+            "config-mutation-transaction"
+        );
         commit_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("mutation begins only after old admitted effect ends");
@@ -3615,6 +3688,223 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         admission
             .require_admitted()
             .expect("new effects use the replacement generation");
+        assert_eq!(
+            binding.lock().expect("engine admission binding").as_ref(),
+            Some(&probe_admission_token('d', 'e'))
+        );
+    }
+
+    #[test]
+    fn admitted_acknowledgement_revalidates_retained_binding_and_fails_closed_when_stale() {
+        struct ExpiringAcknowledgementWorkers {
+            token: AdmissionToken,
+            comparisons: Arc<AtomicUsize>,
+            revocations: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for ExpiringAcknowledgementWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                if self.comparisons.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(EngineError::host(
+                        "conflict",
+                        "Configuration admission snapshot changed",
+                    ))
+                }
+            }
+
+            fn admission_token(&self) -> Option<&AdmissionToken> {
+                Some(&self.token)
+            }
+
+            fn begin_revocation(&self) {
+                self.revocations.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn activate(&self) {}
+        }
+
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission = AdmissionCoordinator::<ExpiringAcknowledgementWorkers>::with_event_sink(
+            Arc::new(move |event| event_sender.send(event).expect("admission event")),
+        )
+        .expect("start revocation supervisor");
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(ExpiringAcknowledgementWorkers {
+                        token: probe_admission_token('a', 'b'),
+                        comparisons: Arc::clone(&comparisons),
+                        revocations: Arc::clone(&revocations),
+                    })
+                },
+            )
+            .expect("initial snapshot admits");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let transition = admission
+            .acknowledge_with(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                || panic!("delayed acknowledgement must not mutate an admitted config"),
+                || panic!("retained admission must use its atomic snapshot comparator"),
+                || panic!("stale retained admission must fail closed before restaging"),
+            )
+            .expect("delayed acknowledgement reconciles");
+
+        assert_eq!(
+            transition.status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+        assert_eq!(comparisons.load(Ordering::SeqCst), 2);
+        assert_eq!(revocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("manual repair event")
+                .status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+    }
+
+    #[test]
+    fn admitted_acknowledgement_revalidates_current_binding_without_replaying_acknowledgement() {
+        struct CurrentAcknowledgementWorkers {
+            comparisons: Arc<AtomicUsize>,
+        }
+
+        impl AdmissionWorkerSet for CurrentAcknowledgementWorkers {
+            fn revalidate(&self) -> Result<(), EngineError> {
+                self.comparisons.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn activate(&self) {}
+        }
+
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission = AdmissionCoordinator::<CurrentAcknowledgementWorkers>::with_event_sink(
+            Arc::new(move |event| event_sender.send(event).expect("admission event")),
+        )
+        .expect("start revocation supervisor");
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(CurrentAcknowledgementWorkers {
+                        comparisons: Arc::clone(&comparisons),
+                    })
+                },
+            )
+            .expect("initial snapshot admits");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        let transition = admission
+            .acknowledge_with(
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                || panic!("admitted configuration must not replay acknowledgement"),
+                || panic!("retained admission must compare its atomic snapshot"),
+                || panic!("current retained admission must not restage workers"),
+            )
+            .expect("current retained admission reconciles");
+
+        assert_eq!(transition.status, ConfigAdmissionStatus::Admitted);
+        assert_eq!(comparisons.load(Ordering::SeqCst), 2);
+        admission
+            .require_admitted()
+            .expect("current retained admission remains available");
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reconciled admitted event")
+                .status,
+            ConfigAdmissionStatus::Admitted
+        );
+    }
+
+    #[test]
+    fn acknowledgement_racing_config_mutation_observes_fail_closed_state_without_deadlock() {
+        let admission = AdmissionCoordinator::<TokenProbeWorkers>::new();
+        let token = probe_admission_token('e', 'f');
+        let held = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token: token.clone(),
+                        held: Arc::clone(&held),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("initial snapshot admits");
+        let active_effect = admission
+            .require_admitted()
+            .expect("effect starts before config mutation");
+        let transaction = AdmissionCoordinator::clone(&admission);
+        let replacement_token = probe_admission_token('1', '2');
+        let replacement_held = Arc::clone(&held);
+        let replacement_drops = Arc::clone(&drops);
+        let transaction = thread::spawn(move || {
+            transaction.mutate_with(
+                || Ok(()),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token: replacement_token,
+                        held: replacement_held,
+                        drops: replacement_drops,
+                    })
+                },
+            )
+        });
+        for _ in 0..100 {
+            if admission.inner.lock().expect("admission state").state == AdmissionState::Mutating {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let generation = admission.inner.lock().expect("admission state").generation;
+
+        let transition = admission
+            .acknowledge_with(
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                || panic!("mutation race must not acknowledge"),
+                || panic!("mutation race must not inspect outside its transaction"),
+                || panic!("mutation race must not stage competing workers"),
+            )
+            .expect("mutation race reports fail-closed state");
+        assert_eq!(
+            transition.status,
+            ConfigAdmissionStatus::ManualRepairRequired
+        );
+        assert_eq!(transition.generation, generation);
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+
+        drop(active_effect);
+        transaction
+            .join()
+            .expect("mutation thread joins")
+            .expect("mutation completes after effect release");
+        admission
+            .require_admitted()
+            .expect("completed mutation installs replacement admission");
     }
 
     #[test]
