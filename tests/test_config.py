@@ -12,6 +12,7 @@ from eom_email_watcher.config import (
     InvalidSettingsUpdateError,
     SenderNotFoundError,
     add_sender,
+    exact_sender_selector_id,
     initialize_config,
     load_config,
     normalize_address,
@@ -364,6 +365,48 @@ def test_sender_name_is_bounded_by_utf8_bytes_on_load_and_add(tmp_path: Path) ->
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="at most 1024 UTF-8 bytes"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("accepted", "rejected"),
+    [
+        (
+            f"{'A' * 493}@EXAMPLE.COM",
+            f"{'A' * 494}@EXAMPLE.COM",
+        ),
+        (
+            f"{'é' * 246}a@example.com",
+            f"{'é' * 246}ab@example.com",
+        ),
+        (
+            f"{'A' * 483}@XN--BCHER-KVA.EXAMPLE",
+            f"{'A' * 484}@XN--BCHER-KVA.EXAMPLE",
+        ),
+    ],
+)
+def test_exact_sender_selector_utf8_boundary_after_canonicalization(
+    tmp_path: Path,
+    accepted: str,
+    rejected: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+
+    added = add_sender(path, accepted)
+    assert len(exact_sender_selector_id(added.email).encode("utf-8")) == 512
+
+    original = path.read_bytes()
+    with pytest.raises(InvalidSenderError, match="admission selector"):
+        add_sender(path, rejected)
+    assert path.read_bytes() == original
+
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f'\n[[senders]]\nemail = "{rejected}"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="admission selector"):
         load_config(path)
 
 

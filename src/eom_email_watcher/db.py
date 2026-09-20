@@ -28,7 +28,12 @@ from .automation.rules import (
     match_rules,
     parse_rule_definition,
 )
-from .config import MAX_RETENTION_DAYS, normalize_validated_address
+from .config import (
+    EXACT_SENDER_SELECTOR_PREFIX,
+    MAX_RETENTION_DAYS,
+    exact_sender_selector_id,
+    normalize_validated_address,
+)
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from .mime import AttachmentDescriptor
 
@@ -2906,11 +2911,15 @@ def _validate_admission_provenance(
     if admission.kind == "gmail_user_label" and not _valid_uuid_v4(admission.selector_id):
         raise ValueError("gmail label admission selector id is invalid")
     if admission.kind == "exact_sender":
-        prefix = "sender:"
+        prefix = EXACT_SENDER_SELECTOR_PREFIX
         if not admission.selector_id.startswith(prefix):
             raise ValueError("exact sender admission selector id is invalid")
         address = admission.selector_id[len(prefix) :]
-        if normalize_validated_address(address) != address:
+        try:
+            expected_selector_id = exact_sender_selector_id(address)
+        except ValueError as exc:
+            raise ValueError("exact sender admission selector id is invalid") from exc
+        if expected_selector_id != admission.selector_id:
             raise ValueError("exact sender admission selector id is invalid")
     if _require_mailbox_identity_key(admission.mailbox_identity_key) != mailbox_identity_key:
         raise MailboxIdentityChanged("mailbox identity changed")

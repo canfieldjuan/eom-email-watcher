@@ -93,6 +93,32 @@ test("sender name byte limit is enforced before watchlist mutation", () => {
   assert.match(handler[1], /at most 1024 UTF-8 bytes/);
 });
 
+test("sender selector byte limit canonicalizes before watchlist mutation", () => {
+  const helper = source.match(
+    /function senderSelectorWithinByteLimit\(value: string\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const withinLimit = Function(
+    `const MAX_ADMISSION_SELECTOR_BYTES = 512;
+     return function senderSelectorWithinByteLimit(value) {${helper[1]}\n}`,
+  )() as (value: string) => boolean;
+  assert.equal(withinLimit(`${"A".repeat(493)}@EXAMPLE.COM`), true);
+  assert.equal(withinLimit(`${"A".repeat(494)}@EXAMPLE.COM`), false);
+  assert.equal(withinLimit(`${"é".repeat(246)}a@example.com`), true);
+  assert.equal(withinLimit(`${"é".repeat(246)}ab@example.com`), false);
+  assert.equal(withinLimit(`${"A".repeat(483)}@XN--BCHER-KVA.EXAMPLE`), true);
+  assert.equal(withinLimit(`${"A".repeat(484)}@XN--BCHER-KVA.EXAMPLE`), false);
+
+  const handler = source.match(
+    /form\.addEventListener\("submit", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(handler);
+  assert.ok(
+    handler[1].indexOf("senderSelectorWithinByteLimit") < handler[1].indexOf("watchlist_add"),
+  );
+  assert.match(handler[1], /admission selector/);
+});
+
 test("Gmail catalog state gives invalid and transient failures distinct retry guidance", () => {
   const helper = source.match(
     /function gmailLabelCatalogStateMessage\([\s\S]*?\): string \{([\s\S]*?)\n\}/,

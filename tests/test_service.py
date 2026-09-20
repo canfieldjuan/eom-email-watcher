@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1137,6 +1138,104 @@ def test_dry_run_stale_recovery_reads_one_broad_page_and_reports_truncated(
     assert store.state()[0] == "old"
     assert store.gmail_recovery_state("gmail-default") is None
     assert store.recent(1) == []
+
+
+def test_production_stale_recovery_uses_and_freezes_sampled_retention_cutoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_at = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+    history_finished_at = checked_at + timedelta(hours=1)
+    sampled_at = checked_at + timedelta(hours=2)
+    old_cutoff = checked_at - timedelta(days=1)
+    sampled_cutoff = sampled_at - timedelta(days=1)
+    boundary_received_at = old_cutoff + timedelta(minutes=30)
+
+    class AdvancingDatetime(datetime):
+        current = checked_at
+
+        @classmethod
+        def now(cls, tz=None):
+            value = cls.current
+            return value if tz is None else value.astimezone(tz)
+
+    cfg = replace(config(tmp_path), retention_days=1)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        checked_at - timedelta(days=30),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class AdvancingStaleGmail(FreshGmail):
+        def __init__(self):
+            super().__init__(stale=True)
+            self.recovery_calls = 0
+            self.after_epoch: int | None = None
+
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            AdvancingDatetime.current = history_finished_at
+            raise StaleHistoryCursor()
+
+        def initial_cursor(self) -> str:
+            AdvancingDatetime.current = sampled_at
+            return super().initial_cursor()
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            self.recovery_calls += 1
+            self.after_epoch = after_exclusive_epoch
+            if page_token is None:
+                return ("between-cutoffs",), "next-page"
+            raise MailboxError("pause resumed recovery")
+
+        def metadata(
+            self,
+            message_id: str,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> MessageMetadata:
+            return replace(
+                super().metadata(message_id),
+                received_at=boundary_received_at.isoformat(),
+            )
+
+    monkeypatch.setattr(service_module, "datetime", AdvancingDatetime)
+    gateway = AdvancingStaleGmail()
+    result = Watcher(cfg, store, gateway, FakeModel()).check()
+    recovery = store.gmail_recovery_state("gmail-default")
+
+    assert result["discovered"] == 0
+    assert result["recovery_pending"] is True
+    assert recovery is not None
+    assert recovery.retention_cutoff == sampled_cutoff.isoformat()
+    assert recovery.recovery_after_exclusive_epoch == math.ceil(
+        sampled_cutoff.timestamp()
+    ) - 1
+    assert gateway.after_epoch == recovery.recovery_after_exclusive_epoch
+    assert store.recent(1) == []
+
+    frozen = recovery.retention_cutoff
+    AdvancingDatetime.current = sampled_at + timedelta(days=1)
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    resumed = store.gmail_recovery_state("gmail-default")
+    assert resumed is not None
+    assert resumed.retention_cutoff == frozen
 
 
 def test_open_recovery_keeps_capture_retention_after_setting_shrinks(

@@ -16,7 +16,7 @@ from connect_automate.entitlement import (
     feature_entitlements_active,
 )
 
-from .config import Config, normalize_validated_address
+from .config import Config, exact_sender_selector_id, normalize_validated_address
 from .db import (
     AdmissionProvenance,
     AnalyzedMessage,
@@ -157,7 +157,7 @@ def match_mailbox_admission(
     if isinstance(sender, str) and sender in exact_senders:
         return AdmissionDecision(
             kind="exact_sender",
-            selector_id=f"sender:{sender}",
+            selector_id=exact_sender_selector_id(sender),
             display_name=exact_senders[sender],
             mailbox_identity_key=mailbox_identity_key,
             admitted_at=admitted_at_text,
@@ -1916,6 +1916,14 @@ class Watcher:
                         "Gmail returned an invalid replacement history cursor"
                     ) from exc
                 sampled_at = datetime.now(UTC)
+                retention_cutoff = sampled_at - timedelta(
+                    days=self.config.retention_days
+                )
+                since = max(
+                    datetime.fromisoformat(last_success).astimezone(UTC)
+                    - timedelta(minutes=5),
+                    retention_cutoff,
+                )
                 after_epoch = math.ceil(since.timestamp()) - 1
                 before_epoch = math.floor(sampled_at.timestamp()) + 1
                 if after_epoch < 0 or before_epoch <= after_epoch:

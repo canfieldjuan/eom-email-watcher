@@ -773,9 +773,18 @@ const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const watchlistStatus = requiredElement<HTMLParagraphElement>("#watchlist-status");
 const MAX_SENDER_NAME_BYTES = 1024;
+const MAX_ADMISSION_SELECTOR_BYTES = 512;
 
 function senderNameWithinByteLimit(value: string): boolean {
   return new TextEncoder().encode(value.trim()).byteLength <= MAX_SENDER_NAME_BYTES;
+}
+
+function senderSelectorWithinByteLimit(value: string): boolean {
+  const canonicalAddress = value.trim().toLowerCase();
+  return (
+    new TextEncoder().encode(`sender:${canonicalAddress}`).byteLength <=
+    MAX_ADMISSION_SELECTOR_BYTES
+  );
 }
 const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
 const checkNow = requiredElement<HTMLButtonElement>("#check-now");
@@ -3939,6 +3948,12 @@ form.addEventListener("submit", (event) => {
     const name = nameInput.value.trim();
     if (!senderNameWithinByteLimit(name)) {
       watchlistStatus.textContent = "Sender name must be at most 1024 UTF-8 bytes.";
+      watchlistStatus.dataset.kind = "error";
+      return;
+    }
+    if (!senderSelectorWithinByteLimit(emailInput.value)) {
+      watchlistStatus.textContent =
+        "Sender email creates an admission selector over 512 UTF-8 bytes.";
       watchlistStatus.dataset.kind = "error";
       return;
     }

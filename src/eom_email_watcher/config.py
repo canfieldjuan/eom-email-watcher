@@ -25,6 +25,8 @@ DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650
 MAX_SENDER_NAME_BYTES = 1024
+MAX_ADMISSION_SELECTOR_BYTES = 512
+EXACT_SENDER_SELECTOR_PREFIX = "sender:"
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
@@ -139,6 +141,15 @@ def normalize_validated_address(value: str) -> str:
     return email
 
 
+def exact_sender_selector_id(value: str) -> str:
+    selector_id = f"{EXACT_SENDER_SELECTOR_PREFIX}{normalize_validated_address(value)}"
+    if len(selector_id.encode("utf-8")) > MAX_ADMISSION_SELECTOR_BYTES:
+        raise ValueError(
+            "sender email creates an admission selector over 512 UTF-8 bytes"
+        )
+    return selector_id
+
+
 def _valid_domain(domain: str) -> bool:
     try:
         ascii_domain = domain.encode("idna").decode("ascii")
@@ -162,6 +173,10 @@ def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -
         email = normalize_validated_address(email_value)
     except ValueError as exc:
         raise InvalidSenderError(invalid_message) from exc
+    try:
+        exact_sender_selector_id(email)
+    except ValueError as exc:
+        raise InvalidSenderError(str(exc)) from exc
     if name_value is not None and any(
         character in "\r\n" or not character.isprintable() for character in name_value
     ):

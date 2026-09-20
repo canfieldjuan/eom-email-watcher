@@ -902,6 +902,52 @@ def test_watchlist_rejects_sender_name_over_utf8_byte_limit(tmp_path: Path) -> N
     assert config_path.read_bytes() != original
 
 
+def test_watchlist_rejects_sender_selector_over_byte_limit(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    accepted_address = f"{'A' * 493}@EXAMPLE.COM"
+    rejected_address = f"{'A' * 494}@EXAMPLE.COM"
+
+    accepted = engine_api._response(
+        request(config_path, "watchlist.add", {"email": accepted_address})
+    )
+    assert accepted["ok"] is True
+
+    before_rejected = config_path.read_bytes()
+    rejected = engine_api._response(
+        request(config_path, "watchlist.add", {"email": rejected_address})
+    )
+    assert rejected["error"] == {
+        "code": "invalid_request",
+        "message": "sender email creates an admission selector over 512 UTF-8 bytes",
+    }
+    assert config_path.read_bytes() == before_rejected
+
+
+def test_existing_overlong_sender_selector_fails_before_watcher_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path, include_senders=False)
+    rejected_address = f"{'é' * 246}ab@example.com"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + f'\n[[senders]]\nemail = "{rejected_address}"\n',
+        encoding="utf-8",
+    )
+
+    def reject_poll(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Watcher polling started before sender selector validation")
+
+    monkeypatch.setattr(engine_api, "run_watcher_check", reject_poll)
+    response = engine_api._response(request(config_path, "watcher.check", {"dry_run": True}))
+    assert response["error"] == {
+        "code": "configuration_error",
+        "message": "sender email creates an admission selector over 512 UTF-8 bytes",
+    }
+
+
 def test_existing_overlong_sender_name_fails_before_watcher_polling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
