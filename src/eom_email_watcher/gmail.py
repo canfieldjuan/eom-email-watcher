@@ -48,6 +48,7 @@ MAX_HISTORY_CONTINUATION_OFFSET = 50_000
 HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v2:"
 LEGACY_HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v1:"
 MAX_GMAIL_LABEL_CATALOG_BYTES = 1_048_576
+MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES = MAX_GMAIL_LABEL_CATALOG_BYTES + 65_536
 MAX_GMAIL_LABEL_COUNT = 10_000
 MAX_GMAIL_LABEL_ID_BYTES = 512
 MAX_GMAIL_LABEL_NAME_BYTES = 1_024
@@ -115,6 +116,10 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
 
 def _reject_non_json_numeric_constant(value: str) -> object:
     raise ValueError(f"non-JSON numeric constant: {value}")
+
+
+def _classify_refresh_error(error: RefreshError) -> Literal["rejected", "transient"]:
+    return "transient" if error.retryable else "rejected"
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -247,7 +252,7 @@ def decode_gmail_label_catalog(
             object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_non_json_numeric_constant,
         )
-    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as exc:
         raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: malformed JSON") from exc
     if not isinstance(document, dict) or not isinstance(document.get("labels"), list):
         raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: labels are missing")
@@ -318,6 +323,8 @@ def _bounded_gmail_label_response_body(response: object) -> bytes | None:
             expected_length = content_length
         else:
             return None
+        if expected_length > MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES:
+            return None
         if (
             encoding == "identity"
             and expected_length is not None
@@ -325,8 +332,8 @@ def _bounded_gmail_label_response_body(response: object) -> bytes | None:
         ):
             return None
     raw = getattr(response, "raw", None)
-    raw_stream = getattr(raw, "stream", None)
-    if not callable(raw_stream):
+    raw_read = getattr(raw, "read", None)
+    if not callable(raw_read):
         return None
     decompressor = None
     if encoding == "gzip":
@@ -336,12 +343,16 @@ def _bounded_gmail_label_response_body(response: object) -> bytes | None:
     body = bytearray()
     wire_length = 0
     try:
-        for chunk in raw_stream(65_536, decode_content=False):
+        while True:
+            remaining_wire = MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES + 1 - wire_length
+            chunk = raw_read(min(65_536, remaining_wire), decode_content=False)
             if not isinstance(chunk, bytes):
                 return None
             if not chunk:
-                continue
+                break
             wire_length += len(chunk)
+            if wire_length > MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES:
+                return None
             if decompressor is None:
                 body.extend(chunk[: MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)])
             else:
@@ -375,7 +386,7 @@ def _gmail_error_reasons(body: bytes) -> frozenset[str]:
             object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_non_json_numeric_constant,
         )
-    except (UnicodeError, ValueError, json.JSONDecodeError):
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
         return frozenset()
     if not isinstance(payload, dict):
         return frozenset()
@@ -592,7 +603,7 @@ class GmailGateway:
 
                         credentials.refresh(refresh_request)
                     except RefreshError as exc:
-                        if exc.retryable:
+                        if _classify_refresh_error(exc) == "transient":
                             raise GmailError("Gmail authorization refresh failed; retry") from exc
                         raise GmailAuthorizationRejected(
                             "Gmail rejected the configured authorization"
@@ -762,6 +773,14 @@ class GmailGateway:
             raise
         except GmailLabelCatalogUnavailable:
             raise
+        except RefreshError as exc:
+            if _classify_refresh_error(exc) == "rejected":
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
+            raise GmailLabelCatalogUnavailable(
+                "gmail_label_catalog_unavailable: Gmail authorization refresh failed"
+            ) from exc
         except Exception as exc:
             raise GmailLabelCatalogUnavailable(
                 "gmail_label_catalog_unavailable: Gmail labels request failed"

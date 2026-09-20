@@ -517,19 +517,37 @@ class RawWire:
     def __init__(self, body: bytes, response=None):
         self.body = body
         self.response = response
+        self.offset = 0
         self.decode_content_values: list[bool] = []
 
     def stream(self, chunk_size: int, *, decode_content: bool):
         self.decode_content_values.append(decode_content)
         if self.response is not None:
             self.response.read_started = True
-        for start in range(0, len(self.body), chunk_size):
-            yield self.body[start : start + chunk_size]
+        while self.offset < len(self.body):
+            chunk = self.body[self.offset : self.offset + chunk_size]
+            self.offset += len(chunk)
+            yield chunk
+
+    def read(self, amount: int | None = None, *, decode_content: bool):
+        self.decode_content_values.append(decode_content)
+        if self.response is not None:
+            self.response.read_started = True
+        end = len(self.body) if amount is None else self.offset + amount
+        chunk = self.body[self.offset : end]
+        self.offset += len(chunk)
+        return chunk
 
 
 class InterruptedRawWire(RawWire):
     def stream(self, chunk_size: int, *, decode_content: bool):
         yield from super().stream(chunk_size, decode_content=decode_content)
+        raise OSError("private provider stream failure")
+
+    def read(self, amount: int | None = None, *, decode_content: bool):
+        chunk = super().read(amount, decode_content=decode_content)
+        if chunk:
+            return chunk
         raise OSError("private provider stream failure")
 
 
@@ -600,6 +618,18 @@ class CompressedWireCatalogResponse(FakeCatalogResponse):
         self.raw = RawWire(wire_body, self)
 
 
+def gzip_with_filename_overhead(body: bytes, filename_bytes: int) -> bytes:
+    wire = gzip.compress(body)
+    return (
+        wire[:3]
+        + bytes([wire[3] | 0x08])
+        + wire[4:10]
+        + b"x" * filename_bytes
+        + b"\0"
+        + wire[10:]
+    )
+
+
 def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -621,6 +651,67 @@ def test_gmail_catalog_content_length_over_one_mib_rejects_before_body_read(
             {"stream": True, "timeout": 120},
         )
     ]
+
+
+def test_gmail_catalog_rejects_declared_wire_length_over_fixed_cap_before_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire_cap = gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 65_536
+    response = FakeCatalogResponse(
+        gzip.compress(catalog_body([])),
+        content_length=str(wire_cap + 1),
+        content_encoding="gzip",
+    )
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert response.read_started is False
+
+
+def test_gmail_catalog_rejects_headerless_valid_gzip_over_fixed_wire_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire_cap = gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 65_536
+    body = catalog_body([])
+    wire = gzip_with_filename_overhead(body, wire_cap)
+    response = CompressedWireCatalogResponse(
+        body,
+        wire,
+        status_code=200,
+        content_encoding="gzip",
+    )
+    response.headers.pop("Content-Length")
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+
+def test_gmail_catalog_stops_raw_read_at_wire_cap_without_consuming_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire_cap = gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 65_536
+    body = catalog_body([])
+    wire = gzip_with_filename_overhead(body, wire_cap + 65_536)
+    response = CompressedWireCatalogResponse(
+        body,
+        wire,
+        status_code=200,
+        content_encoding="gzip",
+    )
+    response.headers.pop("Content-Length")
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogInvalid):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert response.raw.offset == wire_cap + 1
+    assert response.raw.offset < len(wire)
 
 
 def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
@@ -704,6 +795,42 @@ def test_gmail_catalog_classifies_http_auth_and_quota_boundaries(
 
     assert response.read_started is (status_code == 403)
     assert "private provider body" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("retryable", "error_type"),
+    [
+        (False, GmailAuthorizationRejected),
+        (True, gmail_module.GmailLabelCatalogUnavailable),
+    ],
+)
+def test_gmail_catalog_classifies_authorized_session_refresh_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    retryable: bool,
+    error_type: type[Exception],
+) -> None:
+    private_detail = "private OAuth refresh provider response"
+
+    class RefreshFailingSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def get(self, *args, **kwargs):
+            raise gmail_module.RefreshError(private_detail, retryable=retryable)
+
+    monkeypatch.setattr(
+        gmail_module,
+        "AuthorizedSession",
+        lambda credentials: RefreshFailingSession(),
+    )
+
+    with pytest.raises(error_type) as raised:
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert private_detail not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -829,7 +956,8 @@ def test_gmail_catalog_accepts_complete_compressed_wire_rate_limit(
     with pytest.raises(gmail_module.GmailLabelCatalogUnavailable, match="throttled"):
         GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
 
-    assert response.raw.decode_content_values == [False]
+    assert response.raw.decode_content_values
+    assert all(value is False for value in response.raw.decode_content_values)
 
 
 @pytest.mark.parametrize(
@@ -1005,6 +1133,36 @@ def test_gmail_catalog_rejects_non_json_numeric_constants(constant: bytes) -> No
         gmail_module.decode_gmail_label_catalog(body)
 
     assert error.value.code == "gmail_label_catalog_invalid"
+
+
+def test_gmail_catalog_maps_deep_json_recursion_to_stable_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    nested = b"[" * 2_000 + b"0" + b"]" * 2_000
+    body = (
+        b'{"labels":[{"id":"Label_a","name":"A","type":"user",'
+        b'"ignored":'
+        + nested
+        + b"}]}"
+    )
+    response = FakeCatalogResponse(body)
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+    monkeypatch.setattr(
+        gmail_module.json,
+        "loads",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RecursionError("private recursive parser detail")
+        ),
+    )
+
+    with pytest.raises(
+        gmail_module.GmailLabelCatalogInvalid,
+        match="gmail_label_catalog_invalid: malformed JSON",
+    ) as raised:
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert raised.value.code == "gmail_label_catalog_invalid"
 
 
 def test_gmail_catalog_rejects_normalized_document_over_cap(

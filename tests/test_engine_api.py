@@ -6355,16 +6355,29 @@ def test_gmail_catalog_403_incomplete_body_fails_closed_through_engine_response(
     identity_key = _bind_test_mailbox(runtime.store, "gmail", "gmail-default")
     transient = b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}'
 
+    class RawResponseBody:
+        def __init__(self) -> None:
+            self.body = (
+                b"x" * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1)
+                if failure_mode == "overflow"
+                else transient
+            )
+            self.offset = 0
+
+        def read(self, amount: int, *, decode_content: bool) -> bytes:
+            assert decode_content is False
+            if self.offset == len(self.body) and failure_mode == "interrupted":
+                raise OSError("private provider stream failure")
+            chunk = self.body[self.offset : self.offset + amount]
+            self.offset += len(chunk)
+            return chunk
+
     class Response:
         status_code = 403
         headers: dict[str, str] = {}
 
-        def iter_content(self, chunk_size: int):
-            if failure_mode == "overflow":
-                yield b"x" * (gmail_module.MAX_GMAIL_LABEL_CATALOG_BYTES + 1)
-                return
-            yield transient
-            raise OSError("private provider stream failure")
+        def __init__(self) -> None:
+            self.raw = RawResponseBody()
 
     class Session:
         def __enter__(self):
