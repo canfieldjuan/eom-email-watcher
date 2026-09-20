@@ -111,6 +111,12 @@ an otherwise normal valid config may continue to `normal_admission`, but the
 legacy acknowledgement shape is `manual_repair_required`; the mutation is not
 offered. Windows migration proof remains deferred.
 
+The legacy shape is also `manual_repair_required` when the running platform
+does not expose atomic rename exchange. A filesystem that rejects exchange at
+commit leaves the config unchanged and records a secret-free, owner-private
+unsupported marker. Later status calls remain `manual_repair_required`; they do
+not return to `acknowledgement_required` or invite a retry loop.
+
 After the path checks, the state is `acknowledgement_required` only when all of
 these are true:
 
@@ -204,32 +210,50 @@ The acknowledgement is one config-wide transaction:
 3. Under the lock, read the exact original bytes, compare the revision, recheck
    path identity and the repairable shape, perform the one allowed byte edit,
    and run the full hypothetical document through the shared normal validator.
-4. Create the candidate in the same directory with owner-only mode `0600`.
-   Write and flush all bytes, `fsync` the candidate, and verify immediately
-   before commit that the destination is still the same safe inode with the
-   expected original bytes.
-5. Atomically replace the destination, `fsync` the containing directory, and
-   re-run public `load_config` against the final path. Return success only after
-   all three steps succeed.
-6. Remove unused owner-only temporary files on every normal exit. Never create
-   a second long-lived backup containing configuration secrets.
+4. Before creating any secret-bearing candidate, create and `fsync` a fixed,
+   owner-private, secret-free transaction marker, then `fsync` its directory
+   entry. The marker records the exact original identity and digest plus the
+   derived candidate digest and safe-file shape. Revalidate the held parent
+   identity, owner, and exact `0700` mode immediately before marker creation,
+   marker permission setting, each marker write, file sync, and directory
+   durability.
+5. Only after marker provenance is durable, create the fixed candidate with
+   owner-only mode `0600`. Write and flush all bytes, `fsync` the candidate and
+   its directory entry, and revalidate the held parent before candidate
+   creation, permission setting, each write, file sync, and directory
+   durability.
+6. Recheck the destination identity and exact original bytes, then revalidate
+   the held parent immediately before `RENAME_EXCHANGE`. The exchange makes the
+   candidate the config and places the displaced original at the fixed
+   candidate name. Recovery removes that displaced file only when the marker,
+   inode metadata, safe-file predicate, and digest prove it is the recorded
+   original.
+7. Reconcile and clean exact transaction states before returning: marker-only
+   and marker-plus-candidate are aborted; candidate-at-target plus recorded
+   original-at-candidate is committed; a manual target plus recorded
+   original-at-candidate preserves the manual target while securely removing
+   only the old displaced secret and marker. A fixed candidate without a valid
+   marker is manual state and is never deleted by byte coincidence.
+8. If the exact filesystem rejects exchange with an unsupported-operation
+   result, durably bind a secret-free unsupported marker to the transaction,
+   securely remove only the provenance-owned candidate, leave the config
+   unchanged, and make later status calls stable `manual_repair_required`.
 
-The current `_atomic_write` already uses a same-directory temporary, flushes,
-`fsync`s the file, and atomically replaces the destination, but it does not sync
-the directory, bind operations to a held no-follow directory descriptor, or
-classify a post-replace result as indeterminate
-(`src/eom_email_watcher/config.py:402-420`). The implementation should extend a
-shared durability helper rather than add a second ad hoc write sequence.
+Ordinary settings and watchlist writes keep their platform-specific atomic
+replacement path. Disclosure acknowledgement uses the stronger exchange and
+recovery protocol because it must prove compare-and-swap disposition of both
+the new config and displaced secret-bearing original.
 
 The durability invariant is **exact old bytes or fully prevalidated new bytes**.
-A failure before atomic replace leaves the exact old config at the path. Once
-replace may have succeeded, a directory-sync failure, final-read failure,
-sidecar termination, timeout, or response loss is an indeterminate outcome; do
-not claim rollback and do not overwrite the possible valid new config with an
-automatic restoration. The operation returns the fixed secret-free
-`outcome_unknown` class when it can still respond. Atomic replacement and
-prevalidation ensure that reconciliation sees either the exact old document or
-the complete validated new document, never a partial candidate.
+A failure before exchange leaves the exact old config at the path and removes
+only files whose marker provenance and identities prove they belong to that
+attempt. Once exchange may have succeeded, recovery classifies the exact marker,
+target, and candidate disposition before deleting or restoring anything. A
+directory-sync failure, final-read failure, sidecar termination, timeout, or
+unprovable response loss returns the fixed secret-free `outcome_unknown` class
+when the process can still respond. Ambiguous or tampered states preserve every
+file and surface `manual_repair_required`; recovery never deletes a manual
+concurrent write.
 
 Two concurrent calls for one revision have at most one replacement. A caller
 that acquires the lock after another success observes a stale revision or a
@@ -452,9 +476,15 @@ an unexpected pass stops implementation for diagnosis.
 | Malformed or duplicate-root-key TOML | `manual_repair_required` | unavailable; no mutation |
 | Legacy ntfy shape plus unrelated invalid setting | `manual_repair_required` | unavailable; no mutation |
 | Config/ancestor/parent symlink, hardlink, special file, wrong owner, or broad mode | `manual_repair_required` | unavailable; no read-through or mutation |
+| Rename exchange symbol absent, or persisted unsupported-filesystem marker present | `manual_repair_required` | unavailable; no config mutation |
+| Fixed candidate present without a valid transaction marker | `manual_repair_required` | unavailable; candidate preserved |
 | Quoted/comment/nested acknowledgement decoy; root member absent | `acknowledgement_required` if otherwise valid | insert root member; decoy bytes unchanged |
 | Revision changed after status | previously required | conflict; exact current bytes preserved |
 | Candidate validation or any pre-replace write/sync step fails | required | error; exact old bytes remain |
+| Filesystem rejects exchange as unsupported | `manual_repair_required` after attempt | config unchanged; secret candidate removed; no retry loop |
+| Process exits after durable marker or candidate, before exchange | reconcile | exact old config remains; provenance-owned files cleaned |
+| Process exits immediately after exchange | reconcile | exact candidate retained; displaced original and marker cleaned only after exact proof |
+| Manual target replacement after exchange | reconcile current manual target | manual target preserved; exact displaced original and marker securely removed |
 | Replace may have occurred, then sync/load/response fails | reconcile | old or fully validated new; no blind retry |
 | Two actions race with one revision | required | at most one success; loser conflicts |
 

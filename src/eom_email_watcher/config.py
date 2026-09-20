@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping
@@ -95,6 +96,10 @@ class _UnsafeConfigPath(Exception):
 
 class _PostReplaceDurabilityError(OSError):
     """Atomic replacement returned, but a later durability step failed."""
+
+
+class _RenameExchangeUnsupported(OSError):
+    """The target platform or filesystem cannot perform rename exchange."""
 
 
 @dataclass(frozen=True)
@@ -771,39 +776,67 @@ def ntfy_disclosure_status(path: Path) -> NtfyDisclosureStatus:
             content = config_path.read_bytes()
         except FileNotFoundError:
             return NtfyDisclosureStatus("missing")
-        status, _candidate = _classify_ntfy_disclosure(content, config_path)
+        status, _candidate = _classify_ntfy_disclosure(
+            content, config_path
+        )
         if status.state == "acknowledgement_required":
             return NtfyDisclosureStatus("manual_repair_required")
         return status
+
     try:
-        handle = _open_safe_config(path)
+        absolute, parent_fd, name = _open_safe_parent(path)
     except _MissingConfigPath:
         return NtfyDisclosureStatus("missing")
     except (OSError, _UnsafeConfigPath):
         return NtfyDisclosureStatus("manual_repair_required")
+
+    file_fd: int | None = None
     try:
-        try:
-            with FileLock(f"{handle.path}.lock"):
-                _recover_ntfy_transaction_at(handle.parent_fd, handle.name)
-                os.close(handle.file_fd)
-                handle.file_fd = -1
-                file_fd, identity, content = _read_safe_file_at(handle.parent_fd, handle.name)
-                handle.file_fd = file_fd
-                handle.identity = identity
-                handle.content = content
-                status, _candidate = _classify_ntfy_disclosure(handle.content, handle.path)
-                return status
-        except Exception:
-            return NtfyDisclosureStatus("manual_repair_required")
+        with FileLock(f"{absolute}.lock"):
+            recovery = _recover_ntfy_transaction_at(parent_fd, name)
+            if recovery == "unsupported":
+                return NtfyDisclosureStatus("manual_repair_required")
+            try:
+                file_fd, _identity, content = _read_safe_file_at(
+                    parent_fd, name
+                )
+            except _MissingConfigPath:
+                return NtfyDisclosureStatus("missing")
+            except (OSError, _UnsafeConfigPath):
+                return NtfyDisclosureStatus("manual_repair_required")
+            status, _candidate = _classify_ntfy_disclosure(
+                content, absolute
+            )
+            if (
+                status.state == "acknowledgement_required"
+                and not _rename_exchange_available()
+            ):
+                return NtfyDisclosureStatus("manual_repair_required")
+            return status
+    except Exception:
+        return NtfyDisclosureStatus("manual_repair_required")
     finally:
-        if handle.file_fd >= 0:
-            os.close(handle.file_fd)
-        os.close(handle.parent_fd)
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def _rename_exchange_function():
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    return getattr(library, "renameat2", None)
+
+
+def _rename_exchange_available() -> bool:
+    return _rename_exchange_function() is not None
 
 
 def _rename_exchange_at(parent_fd: int, first: str, second: str) -> None:
-    library = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(library, "renameat2", None)
+    renameat2 = _rename_exchange_function()
     if renameat2 is None:
         raise OSError(errno.ENOSYS, "atomic rename exchange is unavailable")
     renameat2.argtypes = [
@@ -826,9 +859,52 @@ def _rename_exchange_at(parent_fd: int, first: str, second: str) -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
-_NTFY_TRANSACTION_VERSION = 1
+def _transaction_probe(_stage: str) -> None:
+    """Test seam for process-death and filesystem-boundary probes."""
+
+
+def _validate_held_parent(
+    parent_fd: int,
+    expected: os.stat_result | None = None,
+    *,
+    require_private: bool = True,
+) -> os.stat_result:
+    current = os.fstat(parent_fd)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or expected is not None
+        and (
+            _safe_file_identity(current) != _safe_file_identity(expected)
+            or current.st_uid != expected.st_uid
+        )
+        or require_private
+        and stat.S_IMODE(current.st_mode) != 0o700
+    ):
+        raise _UnsafeConfigPath
+    return current
+
+
+def _transaction_boundary(
+    stage: str,
+    parent_fd: int,
+    expected_parent: os.stat_result,
+    *,
+    require_private: bool = True,
+) -> None:
+    _transaction_probe(stage)
+    _validate_held_parent(
+        parent_fd,
+        expected_parent,
+        require_private=require_private,
+    )
+
+
+_NTFY_TRANSACTION_VERSION = 2
+_NTFY_UNSUPPORTED_VERSION = 1
 _NTFY_TRANSACTION_SUFFIX = ".ntfy-disclosure-transaction"
 _NTFY_CANDIDATE_SUFFIX = ".ntfy-disclosure-candidate"
+_NTFY_UNSUPPORTED_SUFFIX = ".ntfy-disclosure-unsupported"
 _FINGERPRINT_KEYS = frozenset(
     {
         "device",
@@ -842,10 +918,17 @@ _FINGERPRINT_KEYS = frozenset(
         "revision",
     }
 )
+_CANDIDATE_DESCRIPTOR_KEYS = frozenset(
+    {"mode", "links", "uid", "size", "revision"}
+)
 
 
-def _transaction_names(name: str) -> tuple[str, str]:
-    return f".{name}{_NTFY_TRANSACTION_SUFFIX}", f".{name}{_NTFY_CANDIDATE_SUFFIX}"
+def _transaction_names(name: str) -> tuple[str, str, str]:
+    return (
+        f".{name}{_NTFY_TRANSACTION_SUFFIX}",
+        f".{name}{_NTFY_CANDIDATE_SUFFIX}",
+        f".{name}{_NTFY_UNSUPPORTED_SUFFIX}",
+    )
 
 
 def _file_fingerprint(file_stat: os.stat_result, content: bytes) -> dict[str, object]:
@@ -862,6 +945,16 @@ def _file_fingerprint(file_stat: os.stat_result, content: bytes) -> dict[str, ob
     }
 
 
+def _candidate_descriptor(content: bytes) -> dict[str, object]:
+    return {
+        "mode": 0o600,
+        "links": 1,
+        "uid": os.geteuid(),
+        "size": len(content),
+        "revision": _revision(content),
+    }
+
+
 def _valid_fingerprint(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != _FINGERPRINT_KEYS:
         return False
@@ -869,14 +962,72 @@ def _valid_fingerprint(value: object) -> bool:
     if any(type(value[key]) is not int or value[key] < 0 for key in integer_keys):
         return False
     revision = value["revision"]
-    return isinstance(revision, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+    return (
+        isinstance(revision, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+    )
 
 
-def _fingerprint_matches(file_stat: os.stat_result, content: bytes, expected: object) -> bool:
-    return _valid_fingerprint(expected) and _file_fingerprint(file_stat, content) == expected
+def _valid_candidate_descriptor(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != _CANDIDATE_DESCRIPTOR_KEYS:
+        return False
+    integer_keys = _CANDIDATE_DESCRIPTOR_KEYS - {"revision"}
+    if any(type(value[key]) is not int or value[key] < 0 for key in integer_keys):
+        return False
+    revision = value["revision"]
+    return (
+        value["mode"] == 0o600
+        and value["links"] == 1
+        and isinstance(revision, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is not None
+    )
 
 
-def _read_optional_safe_file_at(parent_fd: int, name: str) -> tuple[os.stat_result, bytes] | None:
+def _fingerprint_matches(
+    file_stat: os.stat_result, content: bytes, expected: object
+) -> bool:
+    return (
+        _valid_fingerprint(expected)
+        and _file_fingerprint(file_stat, content) == expected
+    )
+
+
+def _candidate_descriptor_matches(
+    file_stat: os.stat_result, content: bytes, expected: object
+) -> bool:
+    if not _valid_candidate_descriptor(expected):
+        return False
+    actual = {
+        "mode": stat.S_IMODE(file_stat.st_mode),
+        "links": file_stat.st_nlink,
+        "uid": file_stat.st_uid,
+        "size": file_stat.st_size,
+        "revision": _revision(content),
+    }
+    return stat.S_ISREG(file_stat.st_mode) and actual == expected
+
+
+def _relaxed_identity_matches_at(
+    parent_fd: int, name: str, expected: object
+) -> bool:
+    if not _valid_fingerprint(expected):
+        return False
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(current.st_mode)
+        and current.st_nlink == 1
+        and current.st_uid == os.geteuid()
+        and current.st_dev == expected["device"]
+        and current.st_ino == expected["inode"]
+    )
+
+
+def _read_optional_safe_file_at(
+    parent_fd: int, name: str
+) -> tuple[os.stat_result, bytes] | None:
     try:
         file_fd, file_stat, content = _read_safe_file_at(parent_fd, name)
     except _MissingConfigPath:
@@ -887,7 +1038,27 @@ def _read_optional_safe_file_at(parent_fd: int, name: str) -> tuple[os.stat_resu
         os.close(file_fd)
 
 
-def _create_private_file_at(parent_fd: int, name: str, content: bytes) -> os.stat_result:
+def _create_private_file_at(
+    parent_fd: int,
+    name: str,
+    content: bytes,
+    *,
+    expected_parent: os.stat_result | None = None,
+    stage: str | None = None,
+) -> os.stat_result:
+    create_stage = stage or "before_private_file_create"
+
+    def mutation_stage(action: str) -> str:
+        if create_stage.endswith("_create"):
+            return f"{create_stage[:-7]}_{action}"
+        return f"{create_stage}_{action}"
+
+    if expected_parent is not None:
+        _transaction_boundary(
+            create_stage,
+            parent_fd,
+            expected_parent,
+        )
     file_fd: int | None = None
     created_identity: tuple[int, int] | None = None
     try:
@@ -902,13 +1073,31 @@ def _create_private_file_at(parent_fd: int, name: str, content: bytes) -> os.sta
             dir_fd=parent_fd,
         )
         created_identity = _safe_file_identity(os.fstat(file_fd))
+        if expected_parent is not None:
+            _transaction_boundary(
+                mutation_stage("fchmod"),
+                parent_fd,
+                expected_parent,
+            )
         os.fchmod(file_fd, 0o600)
         remaining = memoryview(content)
         while remaining:
+            if expected_parent is not None:
+                _transaction_boundary(
+                    mutation_stage("write"),
+                    parent_fd,
+                    expected_parent,
+                )
             written = os.write(file_fd, remaining)
             if written <= 0:
                 raise OSError("private file write did not make progress")
             remaining = remaining[written:]
+        if expected_parent is not None:
+            _transaction_boundary(
+                mutation_stage("fsync"),
+                parent_fd,
+                expected_parent,
+            )
         os.fsync(file_fd)
         file_stat = os.fstat(file_fd)
         if not _is_safe_file_stat(file_stat):
@@ -917,6 +1106,13 @@ def _create_private_file_at(parent_fd: int, name: str, content: bytes) -> os.sta
     except Exception:
         if created_identity is not None:
             with suppress(OSError):
+                if expected_parent is not None:
+                    _transaction_boundary(
+                        "before_failed_private_file_cleanup",
+                        parent_fd,
+                        expected_parent,
+                        require_private=False,
+                    )
                 current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if _safe_file_identity(current) == created_identity:
                     os.unlink(name, dir_fd=parent_fd)
@@ -926,18 +1122,103 @@ def _create_private_file_at(parent_fd: int, name: str, content: bytes) -> os.sta
             os.close(file_fd)
 
 
-def _unlink_verified_file_at(parent_fd: int, name: str, expected: object) -> None:
+def _fsync_transaction_parent_at(
+    parent_fd: int,
+    expected_parent: os.stat_result,
+    stage: str,
+    *,
+    require_private: bool = True,
+) -> None:
+    _transaction_boundary(
+        stage,
+        parent_fd,
+        expected_parent,
+        require_private=require_private,
+    )
+    os.fsync(parent_fd)
+
+
+def _unlink_verified_file_at(
+    parent_fd: int,
+    name: str,
+    expected: object,
+    *,
+    expected_parent: os.stat_result | None = None,
+    stage: str = "before_transaction_unlink",
+    require_private_parent: bool = True,
+) -> None:
     snapshot = _read_optional_safe_file_at(parent_fd, name)
     if snapshot is None:
         raise _UnsafeConfigPath
     file_stat, content = snapshot
     if not _fingerprint_matches(file_stat, content, expected):
         raise _UnsafeConfigPath
+    if expected_parent is not None:
+        _transaction_boundary(
+            stage,
+            parent_fd,
+            expected_parent,
+            require_private=require_private_parent,
+        )
     inspected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if _safe_file_version(inspected) != _safe_file_version(file_stat):
         raise _UnsafeConfigPath
+    if expected_parent is not None:
+        _transaction_boundary(
+            f"{stage}_commit",
+            parent_fd,
+            expected_parent,
+            require_private=require_private_parent,
+        )
     os.unlink(name, dir_fd=parent_fd)
-    os.fsync(parent_fd)
+    if expected_parent is not None:
+        _fsync_transaction_parent_at(
+            parent_fd,
+            expected_parent,
+            f"{stage}_fsync",
+            require_private=require_private_parent,
+        )
+    else:
+        os.fsync(parent_fd)
+
+
+def _unlink_verified_candidate_at(
+    parent_fd: int,
+    name: str,
+    expected: object,
+    *,
+    expected_parent: os.stat_result,
+    stage: str,
+    require_private_parent: bool = True,
+) -> None:
+    snapshot = _read_optional_safe_file_at(parent_fd, name)
+    if snapshot is None:
+        raise _UnsafeConfigPath
+    file_stat, content = snapshot
+    if not _candidate_descriptor_matches(file_stat, content, expected):
+        raise _UnsafeConfigPath
+    _transaction_boundary(
+        stage,
+        parent_fd,
+        expected_parent,
+        require_private=require_private_parent,
+    )
+    inspected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if _safe_file_version(inspected) != _safe_file_version(file_stat):
+        raise _UnsafeConfigPath
+    _transaction_boundary(
+        f"{stage}_commit",
+        parent_fd,
+        expected_parent,
+        require_private=require_private_parent,
+    )
+    os.unlink(name, dir_fd=parent_fd)
+    _fsync_transaction_parent_at(
+        parent_fd,
+        expected_parent,
+        f"{stage}_fsync",
+        require_private=require_private_parent,
+    )
 
 
 def _transaction_marker_bytes(
@@ -954,102 +1235,319 @@ def _transaction_marker_bytes(
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _parse_transaction_marker(content: bytes, expected_temporary_name: str) -> dict[str, object]:
+def _parse_transaction_marker(
+    content: bytes, expected_temporary_name: str
+) -> dict[str, object]:
     try:
         payload = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _UnsafeConfigPath from exc
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"version", "temporary_name", "expected", "candidate"}
+        or set(payload)
+        != {"version", "temporary_name", "expected", "candidate"}
         or payload["version"] != _NTFY_TRANSACTION_VERSION
         or payload["temporary_name"] != expected_temporary_name
         or not _valid_fingerprint(payload["expected"])
-        or not _valid_fingerprint(payload["candidate"])
+        or not _valid_candidate_descriptor(payload["candidate"])
     ):
         raise _UnsafeConfigPath
     return payload
 
 
-def _cleanup_transaction_at(
+def _unsupported_marker_bytes(marker_content: bytes) -> bytes:
+    payload = {
+        "version": _NTFY_UNSUPPORTED_VERSION,
+        "marker_revision": _revision(marker_content),
+    }
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _valid_unsupported_marker(content: bytes, marker_content: bytes) -> bool:
+    try:
+        payload = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return payload == {
+        "version": _NTFY_UNSUPPORTED_VERSION,
+        "marker_revision": _revision(marker_content),
+    }
+
+
+def _cleanup_active_transaction_at(
     parent_fd: int,
+    expected_parent: os.stat_result,
     marker_name: str,
-    marker_fingerprint: dict[str, object],
-    temporary_name: str,
-    temporary_fingerprint: dict[str, object] | None,
+    marker_fingerprint: dict[str, object] | None,
+    candidate_name: str,
+    candidate_fingerprint: dict[str, object] | None,
 ) -> None:
-    if temporary_fingerprint is not None:
-        _unlink_verified_file_at(parent_fd, temporary_name, temporary_fingerprint)
-    _unlink_verified_file_at(parent_fd, marker_name, marker_fingerprint)
+    if candidate_fingerprint is not None:
+        _unlink_verified_file_at(
+            parent_fd,
+            candidate_name,
+            candidate_fingerprint,
+            expected_parent=expected_parent,
+            stage="before_active_candidate_cleanup",
+            require_private_parent=False,
+        )
+    if marker_fingerprint is not None:
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=expected_parent,
+            stage="before_active_marker_cleanup",
+            require_private_parent=False,
+        )
 
 
-def _recover_orphan_candidate_at(parent_fd: int, name: str, candidate_name: str) -> None:
-    candidate_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
-    if candidate_snapshot is None:
-        return
-    target_snapshot = _read_optional_safe_file_at(parent_fd, name)
-    if target_snapshot is None:
-        raise _UnsafeConfigPath
-    target_stat, target_content = target_snapshot
-    status, derived_candidate = _classify_ntfy_disclosure(target_content, Path(name))
-    candidate_stat, candidate_content = candidate_snapshot
-    if (
-        status.state != "acknowledgement_required"
-        or derived_candidate is None
-        or candidate_content != derived_candidate
-    ):
-        raise _UnsafeConfigPath
-    _unlink_verified_file_at(
-        parent_fd,
-        candidate_name,
-        _file_fingerprint(candidate_stat, candidate_content),
-    )
-
-
-def _recover_ntfy_transaction_at(parent_fd: int, name: str) -> str:
-    marker_name, candidate_name = _transaction_names(name)
+def _recover_ntfy_transaction_at(
+    parent_fd: int,
+    name: str,
+    expected_parent: os.stat_result | None = None,
+) -> str:
+    parent = _validate_held_parent(parent_fd, expected_parent)
+    marker_name, candidate_name, unsupported_name = _transaction_names(name)
     marker_snapshot = _read_optional_safe_file_at(parent_fd, marker_name)
+    candidate_read_error = False
+    candidate_unsafe = False
+    try:
+        candidate_snapshot = _read_optional_safe_file_at(
+            parent_fd, candidate_name
+        )
+    except _UnsafeConfigPath:
+        candidate_snapshot = None
+        candidate_unsafe = True
+    except OSError:
+        candidate_snapshot = None
+        candidate_read_error = True
+    unsupported_snapshot = _read_optional_safe_file_at(parent_fd, unsupported_name)
+
     if marker_snapshot is None:
-        _recover_orphan_candidate_at(parent_fd, name, candidate_name)
+        if (
+            candidate_snapshot is not None
+            or candidate_unsafe
+            or candidate_read_error
+            or unsupported_snapshot is not None
+        ):
+            raise _UnsafeConfigPath
         return "none"
+
     marker_stat, marker_content = marker_snapshot
     marker = _parse_transaction_marker(marker_content, candidate_name)
     marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
     expected = marker["expected"]
     candidate = marker["candidate"]
-    target_snapshot = _read_optional_safe_file_at(parent_fd, name)
-    temporary_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
-    target_is_expected = target_snapshot is not None and _fingerprint_matches(
-        *target_snapshot, expected
+    target_unsafe = False
+    try:
+        target_snapshot = _read_optional_safe_file_at(parent_fd, name)
+    except _UnsafeConfigPath:
+        target_snapshot = None
+        target_unsafe = True
+    target_is_expected = (
+        target_snapshot is not None
+        and _fingerprint_matches(*target_snapshot, expected)
     )
-    target_is_candidate = target_snapshot is not None and _fingerprint_matches(
-        *target_snapshot, candidate
+    target_is_candidate = (
+        target_snapshot is not None
+        and _candidate_descriptor_matches(*target_snapshot, candidate)
     )
-    temporary_is_expected = temporary_snapshot is not None and _fingerprint_matches(
-        *temporary_snapshot, expected
+    temporary_is_expected = (
+        candidate_snapshot is not None
+        and _fingerprint_matches(*candidate_snapshot, expected)
     )
-    temporary_is_candidate = temporary_snapshot is not None and _fingerprint_matches(
-        *temporary_snapshot, candidate
+    temporary_is_candidate = (
+        candidate_snapshot is not None
+        and _candidate_descriptor_matches(*candidate_snapshot, candidate)
     )
 
-    if target_is_candidate and (temporary_is_expected or temporary_snapshot is None):
-        _cleanup_transaction_at(
+    if unsupported_snapshot is not None:
+        unsupported_stat, unsupported_content = unsupported_snapshot
+        if (
+            not _valid_unsupported_marker(unsupported_content, marker_content)
+            or not target_is_expected
+            or candidate_snapshot is not None
+            and not temporary_is_candidate
+        ):
+            raise _UnsafeConfigPath
+        if temporary_is_candidate:
+            _unlink_verified_candidate_at(
+                parent_fd,
+                candidate_name,
+                candidate,
+                expected_parent=parent,
+                stage="before_unsupported_candidate_cleanup",
+            )
+        return "unsupported"
+
+    if target_is_expected:
+        if temporary_is_candidate:
+            _unlink_verified_candidate_at(
+                parent_fd,
+                candidate_name,
+                candidate,
+                expected_parent=parent,
+                stage="before_aborted_candidate_cleanup",
+            )
+        elif candidate_snapshot is not None:
+            raise _UnsafeConfigPath
+        _unlink_verified_file_at(
             parent_fd,
             marker_name,
             marker_fingerprint,
-            candidate_name,
-            expected if temporary_is_expected else None,
-        )
-        return "committed"
-    if target_is_expected and (temporary_is_candidate or temporary_snapshot is None):
-        _cleanup_transaction_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            candidate_name,
-            candidate if temporary_is_candidate else None,
+            expected_parent=parent,
+            stage="before_aborted_marker_cleanup",
         )
         return "aborted"
+
+    if temporary_is_expected:
+        if target_snapshot is None and not target_unsafe:
+            raise _UnsafeConfigPath
+        _unlink_verified_file_at(
+            parent_fd,
+            candidate_name,
+            expected,
+            expected_parent=parent,
+            stage="before_displaced_original_cleanup",
+        )
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_committed_marker_cleanup",
+        )
+        return "committed" if target_is_candidate else "manual_target"
+
+    if target_is_candidate and candidate_snapshot is None:
+        if candidate_unsafe or candidate_read_error:
+            if not _relaxed_identity_matches_at(
+                parent_fd, candidate_name, expected
+            ):
+                raise _UnsafeConfigPath
+            _transaction_boundary(
+                "before_recovery_exchange",
+                parent_fd,
+                parent,
+            )
+            _rename_exchange_at(parent_fd, candidate_name, name)
+            _fsync_transaction_parent_at(
+                parent_fd,
+                parent,
+                "before_recovery_exchange_fsync",
+            )
+            restored_candidate = _read_optional_safe_file_at(
+                parent_fd, candidate_name
+            )
+            if (
+                restored_candidate is None
+                or not _candidate_descriptor_matches(
+                    *restored_candidate, candidate
+                )
+            ):
+                raise _UnsafeConfigPath
+            _unlink_verified_candidate_at(
+                parent_fd,
+                candidate_name,
+                candidate,
+                expected_parent=parent,
+                stage="before_rollback_candidate_cleanup",
+            )
+            _unlink_verified_file_at(
+                parent_fd,
+                marker_name,
+                marker_fingerprint,
+                expected_parent=parent,
+                stage="before_rollback_marker_cleanup",
+            )
+            return (
+                "rollback_unknown"
+                if candidate_read_error
+                else "manual_target"
+            )
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_response_loss_marker_cleanup",
+        )
+        return "committed"
+
+    if target_is_candidate and candidate_snapshot is not None:
+        if temporary_is_candidate:
+            raise _UnsafeConfigPath
+        if not _relaxed_identity_matches_at(
+            parent_fd, candidate_name, expected
+        ):
+            raise _UnsafeConfigPath
+        if not _rename_exchange_available():
+            raise _UnsafeConfigPath
+        _transaction_boundary(
+            "before_recovery_exchange",
+            parent_fd,
+            parent,
+        )
+        _rename_exchange_at(parent_fd, candidate_name, name)
+        _fsync_transaction_parent_at(
+            parent_fd,
+            parent,
+            "before_recovery_exchange_fsync",
+        )
+        restored_candidate = _read_optional_safe_file_at(
+            parent_fd, candidate_name
+        )
+        if (
+            restored_candidate is None
+            or not _candidate_descriptor_matches(
+                *restored_candidate, candidate
+            )
+        ):
+            raise _UnsafeConfigPath
+        _unlink_verified_candidate_at(
+            parent_fd,
+            candidate_name,
+            candidate,
+            expected_parent=parent,
+            stage="before_rollback_candidate_cleanup",
+        )
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_rollback_marker_cleanup",
+        )
+        return "manual_target"
+
+    if temporary_is_candidate and target_snapshot is not None:
+        _unlink_verified_candidate_at(
+            parent_fd,
+            candidate_name,
+            candidate,
+            expected_parent=parent,
+            stage="before_completed_rollback_candidate_cleanup",
+        )
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_completed_rollback_marker_cleanup",
+        )
+        return "manual_target"
+
+    if candidate_snapshot is None and target_snapshot is not None:
+        _unlink_verified_file_at(
+            parent_fd,
+            marker_name,
+            marker_fingerprint,
+            expected_parent=parent,
+            stage="before_marker_only_manual_cleanup",
+        )
+        return "manual_target"
+
     raise _UnsafeConfigPath
 
 
@@ -1100,6 +1598,47 @@ def _durable_replace_at(parent_fd: int, name: str, content: bytes) -> None:
             os.unlink(temporary_name, dir_fd=parent_fd)
 
 
+def _unsupported_exchange_error(error: OSError) -> bool:
+    return error.errno in {
+        errno.ENOSYS,
+        errno.EOPNOTSUPP,
+        getattr(errno, "ENOTSUP", errno.EOPNOTSUPP),
+        errno.EINVAL,
+    }
+
+
+def _persist_unsupported_transaction_at(
+    parent_fd: int,
+    expected_parent: os.stat_result,
+    marker_name: str,
+    marker_content: bytes,
+    candidate_name: str,
+    candidate_fingerprint: dict[str, object],
+    unsupported_name: str,
+) -> None:
+    unsupported_content = _unsupported_marker_bytes(marker_content)
+    _create_private_file_at(
+        parent_fd,
+        unsupported_name,
+        unsupported_content,
+        expected_parent=expected_parent,
+        stage="before_unsupported_marker_create",
+    )
+    _fsync_transaction_parent_at(
+        parent_fd,
+        expected_parent,
+        "before_unsupported_marker_directory_fsync",
+    )
+    _transaction_probe("after_unsupported_marker_durable")
+    _unlink_verified_file_at(
+        parent_fd,
+        candidate_name,
+        candidate_fingerprint,
+        expected_parent=expected_parent,
+        stage="before_unsupported_active_candidate_cleanup",
+    )
+
+
 def _durable_exchange_at(
     parent_fd: int,
     name: str,
@@ -1109,133 +1648,201 @@ def _durable_exchange_at(
     *,
     before_replace: Callable[[], None],
 ) -> None:
-    marker_name, candidate_name = _transaction_names(name)
-    candidate_stat = _create_private_file_at(parent_fd, candidate_name, content)
-    candidate = _file_fingerprint(candidate_stat, content)
-    expected = _file_fingerprint(expected_stat, expected_content)
-    marker_stat: os.stat_result | None = None
-    marker_content = _transaction_marker_bytes(candidate_name, expected, candidate)
-    try:
-        marker_stat = _create_private_file_at(parent_fd, marker_name, marker_content)
-        os.fsync(parent_fd)
-    except Exception:
-        with suppress(Exception):
-            _unlink_verified_file_at(parent_fd, candidate_name, candidate)
-        if marker_stat is not None:
-            with suppress(Exception):
-                _unlink_verified_file_at(
-                    parent_fd,
-                    marker_name,
-                    _file_fingerprint(marker_stat, marker_content),
-                )
-        raise
+    if not _rename_exchange_available():
+        raise _RenameExchangeUnsupported(
+            errno.ENOSYS, "atomic rename exchange is unavailable"
+        )
+    parent = _validate_held_parent(parent_fd)
+    marker_name, candidate_name, unsupported_name = _transaction_names(name)
+    if any(
+        _read_optional_safe_file_at(parent_fd, reserved) is not None
+        for reserved in (marker_name, candidate_name, unsupported_name)
+    ):
+        raise _UnsafeConfigPath
 
-    marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
+    expected = _file_fingerprint(expected_stat, expected_content)
+    candidate_descriptor = _candidate_descriptor(content)
+    marker_content = _transaction_marker_bytes(
+        candidate_name,
+        expected,
+        candidate_descriptor,
+    )
+    marker_fingerprint: dict[str, object] | None = None
+    candidate_fingerprint: dict[str, object] | None = None
+
     try:
-        before_replace()
-    except Exception:
-        _cleanup_transaction_at(
+        marker_stat = _create_private_file_at(
             parent_fd,
+            marker_name,
+            marker_content,
+            expected_parent=parent,
+            stage="before_marker_create",
+        )
+        marker_fingerprint = _file_fingerprint(marker_stat, marker_content)
+        _fsync_transaction_parent_at(
+            parent_fd,
+            parent,
+            "before_marker_directory_fsync",
+        )
+        _transaction_probe("after_marker_durable")
+
+        candidate_stat = _create_private_file_at(
+            parent_fd,
+            candidate_name,
+            content,
+            expected_parent=parent,
+            stage="before_candidate_create",
+        )
+        candidate_fingerprint = _file_fingerprint(candidate_stat, content)
+        _fsync_transaction_parent_at(
+            parent_fd,
+            parent,
+            "before_candidate_directory_fsync",
+        )
+        _transaction_probe("after_candidate_durable")
+        before_replace()
+        _transaction_boundary("before_exchange", parent_fd, parent)
+    except Exception:
+        _cleanup_active_transaction_at(
+            parent_fd,
+            parent,
             marker_name,
             marker_fingerprint,
             candidate_name,
-            candidate,
+            candidate_fingerprint,
         )
         raise
 
     try:
         _rename_exchange_at(parent_fd, candidate_name, name)
     except OSError as exchange_error:
+        if (
+            _unsupported_exchange_error(exchange_error)
+            and candidate_fingerprint is not None
+        ):
+            target_snapshot = _read_optional_safe_file_at(parent_fd, name)
+            temporary_snapshot = _read_optional_safe_file_at(
+                parent_fd, candidate_name
+            )
+            if (
+                target_snapshot is not None
+                and _fingerprint_matches(*target_snapshot, expected)
+                and temporary_snapshot is not None
+                and _fingerprint_matches(
+                    *temporary_snapshot, candidate_fingerprint
+                )
+            ):
+                _persist_unsupported_transaction_at(
+                    parent_fd,
+                    parent,
+                    marker_name,
+                    marker_content,
+                    candidate_name,
+                    candidate_fingerprint,
+                    unsupported_name,
+                )
+                raise _RenameExchangeUnsupported(
+                    exchange_error.errno,
+                    "atomic rename exchange is unsupported",
+                ) from exchange_error
         try:
-            disposition = _recover_ntfy_transaction_at(parent_fd, name)
+            disposition = _recover_ntfy_transaction_at(
+                parent_fd, name, parent
+            )
         except (OSError, _MissingConfigPath, _UnsafeConfigPath) as recovery_error:
             raise _PostReplaceDurabilityError from recovery_error
         if disposition == "committed":
             return
         raise exchange_error
 
-    validation_error: Exception | None = None
     try:
-        displaced_snapshot = _read_optional_safe_file_at(parent_fd, candidate_name)
-        if displaced_snapshot is None or not _fingerprint_matches(*displaced_snapshot, expected):
-            validation_error = NtfyDisclosureConflictError("Configuration revision changed")
-    except _UnsafeConfigPath:
-        validation_error = NtfyDisclosureConflictError("Configuration revision changed")
-    except OSError as exc:
-        validation_error = _PostReplaceDurabilityError()
-        validation_error.__cause__ = exc
-
-    if validation_error is None:
+        _transaction_probe("after_exchange")
+    except Exception as probe_error:
         try:
-            if _recover_ntfy_transaction_at(parent_fd, name) != "committed":
-                raise _UnsafeConfigPath
-        except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
-            raise _PostReplaceDurabilityError from exc
-        return
+            disposition = _recover_ntfy_transaction_at(
+                parent_fd, name, parent
+            )
+        except (OSError, _MissingConfigPath, _UnsafeConfigPath) as recovery_error:
+            raise _PostReplaceDurabilityError from recovery_error
+        if disposition == "committed":
+            return
+        raise _PostReplaceDurabilityError from probe_error
 
     try:
-        target_snapshot = _read_optional_safe_file_at(parent_fd, name)
-        if target_snapshot is None or not _fingerprint_matches(*target_snapshot, candidate):
-            raise _UnsafeConfigPath
-        try:
-            _rename_exchange_at(parent_fd, candidate_name, name)
-        except OSError:
-            rolled_back = _read_optional_safe_file_at(parent_fd, candidate_name)
-            if rolled_back is None or not _fingerprint_matches(*rolled_back, candidate):
-                raise
-        os.fsync(parent_fd)
-        _cleanup_transaction_at(
-            parent_fd,
-            marker_name,
-            marker_fingerprint,
-            candidate_name,
-            candidate,
-        )
+        disposition = _recover_ntfy_transaction_at(parent_fd, name, parent)
     except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
         raise _PostReplaceDurabilityError from exc
-    raise validation_error
+    if disposition == "committed":
+        return
+    if disposition == "manual_target":
+        raise NtfyDisclosureConflictError("Configuration revision changed")
+    raise _PostReplaceDurabilityError
 
 
-def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
+
+def acknowledge_ntfy_disclosure(
+    path: Path, expected_revision: str
+) -> None:
     if os.name != "posix":
-        raise NtfyDisclosureConflictError("Disclosure acknowledgement is unavailable")
+        raise NtfyDisclosureConflictError(
+            "Disclosure acknowledgement is unavailable"
+        )
     try:
-        handle = _open_safe_config(path)
+        absolute, parent_fd, name = _open_safe_parent(path)
     except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
         raise NtfyDisclosureConflictError(
             "Configuration is not eligible for acknowledgement"
         ) from exc
+
+    current_fd: int | None = None
     replacement_completed = False
     try:
-        with FileLock(f"{handle.path}.lock"):
+        with FileLock(f"{absolute}.lock"):
             try:
-                _recover_ntfy_transaction_at(handle.parent_fd, handle.name)
-            except (OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
-                raise NtfyDisclosureConflictError(
-                    "Configuration is not eligible for acknowledgement"
-                ) from exc
-            os.close(handle.file_fd)
-            handle.file_fd = -1
-            try:
-                current_fd, current_identity, current = _read_safe_file_at(
-                    handle.parent_fd, handle.name
+                recovery = _recover_ntfy_transaction_at(
+                    parent_fd, name
                 )
-            except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
+                if (
+                    recovery == "unsupported"
+                    or not _rename_exchange_available()
+                ):
+                    raise _UnsafeConfigPath
+            except (
+                OSError,
+                _MissingConfigPath,
+                _UnsafeConfigPath,
+            ) as exc:
                 raise NtfyDisclosureConflictError(
                     "Configuration is not eligible for acknowledgement"
                 ) from exc
-            handle.file_fd = current_fd
-            handle.identity = current_identity
-            handle.content = current
+            try:
+                current_fd, current_identity, current = (
+                    _read_safe_file_at(parent_fd, name)
+                )
+            except (
+                _MissingConfigPath,
+                _UnsafeConfigPath,
+                OSError,
+            ) as exc:
+                raise NtfyDisclosureConflictError(
+                    "Configuration is not eligible for acknowledgement"
+                ) from exc
             if _revision(current) != expected_revision:
-                raise NtfyDisclosureConflictError("Configuration revision changed")
-            status, candidate = _classify_ntfy_disclosure(current, handle.path)
-            if status.state != "acknowledgement_required" or candidate is None:
+                raise NtfyDisclosureConflictError(
+                    "Configuration revision changed"
+                )
+            status, candidate = _classify_ntfy_disclosure(
+                current, absolute
+            )
+            if (
+                status.state != "acknowledgement_required"
+                or candidate is None
+            ):
                 raise NtfyDisclosureConflictError(
                     "Configuration is not eligible for acknowledgement"
                 )
             try:
-                _load_config_bytes(candidate, handle.path)
+                _load_config_bytes(candidate, absolute)
             except ConfigError as exc:
                 raise NtfyDisclosureConflictError(
                     "Configuration is not eligible for acknowledgement"
@@ -1243,26 +1850,35 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
 
             def verify_precommit() -> None:
                 try:
-                    verify_fd, verify_identity, verify_content = _read_safe_file_at(
-                        handle.parent_fd, handle.name
+                    verify_fd, verify_identity, verify_content = (
+                        _read_safe_file_at(parent_fd, name)
                     )
-                except (_MissingConfigPath, _UnsafeConfigPath, OSError) as exc:
-                    raise NtfyDisclosureConflictError("Configuration revision changed") from exc
+                except (
+                    _MissingConfigPath,
+                    _UnsafeConfigPath,
+                    OSError,
+                ) as exc:
+                    raise NtfyDisclosureConflictError(
+                        "Configuration revision changed"
+                    ) from exc
                 try:
                     if (
-                        _safe_file_identity(verify_identity) != _safe_file_identity(handle.identity)
+                        _safe_file_version(verify_identity)
+                        != _safe_file_version(current_identity)
                         or verify_content != current
                     ):
-                        raise NtfyDisclosureConflictError("Configuration revision changed")
+                        raise NtfyDisclosureConflictError(
+                            "Configuration revision changed"
+                        )
                 finally:
                     os.close(verify_fd)
 
             try:
                 _durable_exchange_at(
-                    handle.parent_fd,
-                    handle.name,
+                    parent_fd,
+                    name,
                     candidate,
-                    handle.identity,
+                    current_identity,
                     current,
                     before_replace=verify_precommit,
                 )
@@ -1277,21 +1893,31 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
                 raise NtfyDisclosureWriteError(
                     "Disclosure acknowledgement was not written"
                 ) from exc
+
             try:
-                final_handle = _open_safe_config(handle.path)
+                final_handle = _open_safe_config(absolute)
                 try:
                     if final_handle.content != candidate:
-                        raise ConfigError("final configuration did not match candidate")
+                        raise ConfigError(
+                            "final configuration did not match candidate"
+                        )
                 finally:
                     final_handle.close()
-                load_config(handle.path)
-                confirmed_handle = _open_safe_config(handle.path)
+                load_config(absolute)
+                confirmed_handle = _open_safe_config(absolute)
                 try:
                     if confirmed_handle.content != candidate:
-                        raise ConfigError("final configuration did not match candidate")
+                        raise ConfigError(
+                            "final configuration did not match candidate"
+                        )
                 finally:
                     confirmed_handle.close()
-            except (ConfigError, OSError, _MissingConfigPath, _UnsafeConfigPath) as exc:
+            except (
+                ConfigError,
+                OSError,
+                _MissingConfigPath,
+                _UnsafeConfigPath,
+            ) as exc:
                 raise NtfyDisclosureOutcomeUnknownError(
                     "Disclosure acknowledgement outcome is unknown"
                 ) from exc
@@ -1306,11 +1932,14 @@ def acknowledge_ntfy_disclosure(path: Path, expected_revision: str) -> None:
             raise NtfyDisclosureOutcomeUnknownError(
                 "Disclosure acknowledgement outcome is unknown"
             ) from exc
-        raise NtfyDisclosureWriteError("Disclosure acknowledgement was not written") from exc
+        raise NtfyDisclosureWriteError(
+            "Disclosure acknowledgement was not written"
+        ) from exc
     finally:
-        if handle.file_fd >= 0:
-            os.close(handle.file_fd)
-        os.close(handle.parent_fd)
+        if current_fd is not None:
+            os.close(current_fd)
+        os.close(parent_fd)
+
 
 
 def _windows_stat_version(
