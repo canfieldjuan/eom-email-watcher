@@ -1607,7 +1607,7 @@ def test_certificate_validator_checks_bbox_order_before_float_normalization() ->
     assert isinstance(valid_insured, dict)
     valid_provenance = valid_insured["provenance"]
     assert isinstance(valid_provenance, dict)
-    valid_provenance["bbox"] = [9007199254740992, 0, 9007199254740993, 10]
+    valid_provenance["bbox"] = [9007199254740991, 0, 9007199254740992, 10]
     validate_certificate_result_json(
         json.dumps(valid, separators=(",", ":"), sort_keys=True).encode()
     )
@@ -1617,10 +1617,21 @@ def test_certificate_validator_checks_bbox_order_before_float_normalization() ->
     assert isinstance(reversed_insured, dict)
     reversed_provenance = reversed_insured["provenance"]
     assert isinstance(reversed_provenance, dict)
-    reversed_provenance["bbox"] = [9007199254740993, 0, 9007199254740992, 10]
+    reversed_provenance["bbox"] = [9007199254740992, 0, 9007199254740991, 10]
     with pytest.raises(CertificateResultInvalid, match="coordinates"):
         validate_certificate_result_json(
             json.dumps(reversed_record, separators=(",", ":"), sort_keys=True).encode()
+        )
+
+    inexact_record = _record()
+    inexact_insured = inexact_record["insured"]
+    assert isinstance(inexact_insured, dict)
+    inexact_provenance = inexact_insured["provenance"]
+    assert isinstance(inexact_provenance, dict)
+    inexact_provenance["bbox"] = [0, 0, 9007199254740993, 10]
+    with pytest.raises(CertificateResultInvalid, match="coordinates"):
+        validate_certificate_result_json(
+            json.dumps(inexact_record, separators=(",", ":"), sort_keys=True).encode()
         )
 
 

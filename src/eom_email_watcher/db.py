@@ -2055,12 +2055,18 @@ def _certificate_provenance(
     ordered_bbox = bbox[0] <= bbox[2] and bbox[1] <= bbox[3]
     try:
         normalized_bbox = [float(coordinate) for coordinate in bbox]
+        exact_bbox = all(
+            type(original) is not int or int(normalized) == original
+            for original, normalized in zip(bbox, normalized_bbox, strict=True)
+        )
         finite_bbox = all(math.isfinite(coordinate) for coordinate in normalized_bbox)
     except (OverflowError, ValueError):
         normalized_bbox = []
+        exact_bbox = False
         finite_bbox = False
     if (
         not ordered_bbox
+        or not exact_bbox
         or not finite_bbox
         or normalized_bbox[0] > normalized_bbox[2]
         or normalized_bbox[1] > normalized_bbox[3]
