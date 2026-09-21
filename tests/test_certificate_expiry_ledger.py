@@ -287,6 +287,33 @@ def test_completed_certificate_projects_once_and_lists_all_expiry_states(tmp_pat
         assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
 
+
+def test_valid_certificate_completion_settles_entitlement_paused_fire(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    paused = runtime.store.transition_automation_fire(
+        fire_id=fire.fire_id,
+        expected_state=fire.state,
+        expected_version=fire.state_version,
+        next_state="entitlement_paused",
+        reason="entitlement_inactive",
+        job_id=job_id,
+    )
+
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+
+    settled = runtime.store.automation_fire(paused.fire_id)
+    assert settled is not None
+    assert settled.state == "completed"
+    assert settled.reason == "connect_completed"
+
     with pytest.raises(RuntimeError, match="expected-state race"):
         runtime.store.transition_connect_job(
             job_id=job_id,
@@ -929,6 +956,43 @@ def test_terminal_replay_conflict_fence_is_monotonic(tmp_path: Path) -> None:
     assert later.reason == "CERTIFICATE_RESULT_CONFLICT"
 
 
+def test_terminal_replay_conflict_rewrites_prior_invalid_fire(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    malformed = _record()
+    malformed["unexpected"] = True
+    runtime.store.reconcile_certificate_completed_replay(
+        job_id=job_id,
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(malformed),
+    )
+    invalid = runtime.store.automation_fire(fire.fire_id)
+    assert invalid is not None
+    assert invalid.reason == "CERTIFICATE_RESULT_INVALID"
+
+    conflicting = _record()
+    conflicting["insured"] = _text("Different Insured LLC", "different-insured")
+    runtime.store.reconcile_certificate_completed_replay(
+        job_id=job_id,
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(conflicting),
+    )
+
+    escalated = runtime.store.automation_fire(fire.fire_id)
+    assert escalated is not None
+    assert escalated.reason == "CERTIFICATE_RESULT_CONFLICT"
+
+
 def test_provider_owned_certificate_survives_source_deletion(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
@@ -1535,6 +1599,29 @@ def test_certificate_validator_accepts_closed_withheld_values_and_max_policy_ind
     validate_certificate_result_json(
         json.dumps(record, separators=(",", ":"), sort_keys=True).encode()
     )
+
+
+def test_certificate_validator_checks_bbox_order_before_float_normalization() -> None:
+    valid = _record()
+    valid_insured = valid["insured"]
+    assert isinstance(valid_insured, dict)
+    valid_provenance = valid_insured["provenance"]
+    assert isinstance(valid_provenance, dict)
+    valid_provenance["bbox"] = [9007199254740992, 0, 9007199254740993, 10]
+    validate_certificate_result_json(
+        json.dumps(valid, separators=(",", ":"), sort_keys=True).encode()
+    )
+
+    reversed_record = _record()
+    reversed_insured = reversed_record["insured"]
+    assert isinstance(reversed_insured, dict)
+    reversed_provenance = reversed_insured["provenance"]
+    assert isinstance(reversed_provenance, dict)
+    reversed_provenance["bbox"] = [9007199254740993, 0, 9007199254740992, 10]
+    with pytest.raises(CertificateResultInvalid, match="coordinates"):
+        validate_certificate_result_json(
+            json.dumps(reversed_record, separators=(",", ":"), sort_keys=True).encode()
+        )
 
 
 def test_certificate_validator_uses_full_canonical_policy_for_duplicate_identity() -> None:

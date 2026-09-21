@@ -2052,6 +2052,7 @@ def _certificate_provenance(
         type(coordinate) not in {int, float} for coordinate in bbox
     ):
         raise CertificateResultInvalid(f"certificate {label} coordinates are invalid")
+    ordered_bbox = bbox[0] <= bbox[2] and bbox[1] <= bbox[3]
     try:
         normalized_bbox = [float(coordinate) for coordinate in bbox]
         finite_bbox = all(math.isfinite(coordinate) for coordinate in normalized_bbox)
@@ -2059,7 +2060,8 @@ def _certificate_provenance(
         normalized_bbox = []
         finite_bbox = False
     if (
-        not finite_bbox
+        not ordered_bbox
+        or not finite_bbox
         or normalized_bbox[0] > normalized_bbox[2]
         or normalized_bbox[1] > normalized_bbox[3]
     ):
@@ -7107,7 +7109,7 @@ class Store:
                         """UPDATE automation_fires SET state = 'completed',
                             state_version = state_version + 1, reason = 'connect_completed',
                             pending_since = NULL, updated_at = ?
-                        WHERE job_id = ? AND state = 'submitted'""",
+                        WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
                         (stamp, job_id),
                     )
                 else:
@@ -7324,15 +7326,26 @@ class Store:
                     """UPDATE automation_fires SET state = 'failed',
                         state_version = state_version + 1, reason = ?,
                         pending_since = NULL, updated_at = ?
-                    WHERE job_id = ?
-                        AND state IN ('completed', 'submitted', 'entitlement_paused')""",
-                    (outcome, stamp, job_id),
+                    WHERE job_id = ? AND (
+                        state IN ('completed', 'submitted', 'entitlement_paused')
+                        OR (
+                            ? = 'CERTIFICATE_RESULT_CONFLICT'
+                            AND state = 'failed'
+                            AND reason = 'CERTIFICATE_RESULT_INVALID'
+                        )
+                    )""",
+                    (outcome, stamp, job_id, outcome),
                 )
                 existing = db.execute(
                     "SELECT state, reason FROM automation_fires WHERE job_id = ?", (job_id,)
                 ).fetchall()
                 if any(
                     fire["state"] in {"completed", "submitted", "entitlement_paused"}
+                    or (
+                        outcome == "CERTIFICATE_RESULT_CONFLICT"
+                        and fire["state"] == "failed"
+                        and fire["reason"] == "CERTIFICATE_RESULT_INVALID"
+                    )
                     for fire in existing
                 ):
                     raise RuntimeError("Certificate replay could not settle its automation fires")
