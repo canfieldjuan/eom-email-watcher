@@ -18,6 +18,7 @@ from test_connect_v2_engine_api import (
     seeded_runtime,
 )
 
+from eom_email_watcher import db as db_module
 from eom_email_watcher import engine_api
 from eom_email_watcher.db import CertificateResultInvalid, Store, validate_certificate_result_json
 
@@ -748,6 +749,32 @@ def test_invalid_certificate_result_completes_provider_job_without_partial_ledge
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 0
 
 
+def test_invalid_completion_replay_without_linked_fires_is_idempotent(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _certificate_job(runtime.store, JOB_ID)
+    invalid = _record()
+    invalid["unexpected"] = True
+    result = _result(invalid)
+    runtime.store.transition_connect_job(
+        job_id=JOB_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=result,
+    )
+
+    replayed = runtime.store.reconcile_certificate_completed_replay(
+        job_id=JOB_ID,
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=result,
+    )
+
+    assert replayed.status == "completed"
+    assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
+
+
 def test_provider_owned_certificate_survives_source_deletion(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
@@ -863,6 +890,92 @@ def test_completed_join_discards_source_less_certificate_job_after_settlement(
     assert settled.reason == "connect_completed"
 
 
+def test_failed_terminal_replay_discards_source_less_certificate_job(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    original = _record()
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(original),
+    )
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    assert runtime.store.delete_message("message-1") is True
+    conflicting = _record()
+    conflicting["insured"] = _text("Different Insured LLC", "different-insured")
+
+    runtime.store.reconcile_certificate_completed_replay(
+        job_id=job_id,
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(conflicting),
+    )
+
+    assert runtime.store.connect_job(job_id) is None
+    assert runtime.store.connect_dispatch(job_id) is None
+    assert len(runtime.store.list_certificate_expiry_ledger(today="2026-09-20")) == 4
+    settled = [runtime.store.automation_fire(fire.fire_id) for fire in fires]
+    assert [fire.reason for fire in settled] == [
+        "CERTIFICATE_RESULT_CONFLICT",
+        "CERTIFICATE_RESULT_CONFLICT",
+    ]
+
+
+def test_bulk_completed_join_skips_siblings_settled_by_the_first_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _certificate_job(runtime.store, JOB_ID)
+    runtime.store.transition_connect_job(
+        job_id=JOB_ID,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    for fire in fires:
+        runtime.store.transition_automation_fire(
+            fire_id=fire.fire_id,
+            expected_state=fire.state,
+            expected_version=fire.state_version,
+            next_state="submitted",
+            reason="connect_admitted",
+            job_id=JOB_ID,
+        )
+    assert runtime.store.delete_message("message-1") is True
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
+
+    engine_api._settle_submitted_automation_fires(runtime, limit=2)
+
+    settled = [runtime.store.automation_fire(fire.fire_id) for fire in fires]
+    assert [fire.state for fire in settled] == ["completed", "completed"]
+    assert runtime.store.connect_job(JOB_ID) is None
+
+
 def test_zero_policy_certificate_is_visible_as_review_placeholder(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     _fire, job_id = _certificate_fire_job(runtime.store)
@@ -923,6 +1036,42 @@ def test_policy_association_review_remains_scoped_to_its_policy_row(tmp_path: Pa
             "field": "policies[0].insurer",
             "reason": "POLICY_ASSOCIATION_UNCLEAR",
             "detail": "wrong policy block",
+        }
+    ]
+    record["review"] = {
+        "required": True,
+        "reasons": ["POLICY_ASSOCIATION_UNCLEAR"],
+    }
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+
+    assert [row["review_state"] for row in rows] == ["needs_review", "extracted"]
+    assert rows[0]["review_reasons"] == ["ASSOCIATION_UNCLEAR"]
+    assert rows[1]["review_reasons"] == []
+
+
+def test_withheld_only_association_review_maps_to_the_affected_policy(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record(
+        policies=[
+            _policy(0, _date("2027-01-01", "expiration-0")),
+            _policy(1, _date("2027-02-01", "expiration-1")),
+        ]
+    )
+    record["withheld"] = [
+        {
+            "field": "policies[0].insurer",
+            "reason": "POLICY_ASSOCIATION_UNCLEAR",
+            "detail": "wrong policy field",
         }
     ]
     record["review"] = {
@@ -1072,6 +1221,18 @@ def test_certificate_validator_rejects_duplicate_keys_and_policy_overflow() -> N
         validate_certificate_result_json(
             json.dumps(overflow, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+def test_certificate_validator_classifies_deep_json_as_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def recurse(*args, **kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(db_module.json, "loads", recurse)
+
+    with pytest.raises(CertificateResultInvalid, match="JSON is invalid"):
+        validate_certificate_result_json(b"{}")
 
 
 @pytest.mark.parametrize(

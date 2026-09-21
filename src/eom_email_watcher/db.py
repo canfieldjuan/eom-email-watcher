@@ -2201,7 +2201,7 @@ def _validate_certificate_record(
         )
     except CertificateResultInvalid:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise CertificateResultInvalid("certificate result JSON is invalid") from exc
     record = _certificate_object(
         decoded,
@@ -4094,6 +4094,18 @@ class Store:
                     raise RuntimeError("Stored certificate source identity is invalid")
                 record = validated.record
                 _certificate_assert_projection(db, parent, record)
+                association_review_ordinals = {
+                    int(match.group(1))
+                    for item in record["withheld"]
+                    if item["reason"] == "POLICY_ASSOCIATION_UNCLEAR"
+                    and (
+                        match := re.fullmatch(
+                            r"policies\[(\d+)\]\.[a-z_]+",
+                            str(item["field"]),
+                        )
+                    )
+                    is not None
+                }
 
                 for index, selection in selections:
                     policy: dict[str, object] | None = None
@@ -4128,6 +4140,11 @@ class Store:
                             }
                         ]
                         policy_reasons = list(policy["review_reasons"])
+                        if (
+                            policy_ordinal in association_review_ordinals
+                            and "ASSOCIATION_UNCLEAR" not in policy_reasons
+                        ):
+                            policy_reasons.append("ASSOCIATION_UNCLEAR")
                         review_reasons.extend(policy_reasons)
                         expiration = policy["expiration_date"]
                         if expiration is None or expiration["iso"] is None:
@@ -7157,6 +7174,9 @@ class Store:
             if len(parents) > 1:
                 raise RuntimeError("Completed certificate job has multiple durable projections")
             if not parents:
+                encoded_replay, _metadata = _encode_generic_result(result)
+                if not fires and job.result_json == encoded_replay:
+                    return job
                 if (
                     fires
                     and all(
@@ -7220,6 +7240,12 @@ class Store:
                     for fire in existing
                 ):
                     raise RuntimeError("Certificate replay could not settle its automation fires")
+                _discard_settled_source_less_certificate_job(
+                    db,
+                    job_id=job_id,
+                    failure_reason=outcome,
+                    stamp=stamp,
+                )
             return job
 
     def reconcile_certificate_completed_join(self, *, job_id: str) -> ConnectJob:

@@ -4200,6 +4200,13 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
     for fire in runtime.store.automation_fires_in_states(
         ("submitted", "entitlement_paused"), limit=limit
     ):
+        current_fire = runtime.store.automation_fire(fire.fire_id)
+        if current_fire is None or current_fire.state not in {
+            "submitted",
+            "entitlement_paused",
+        }:
+            continue
+        fire = current_fire
         if fire.job_id is None:
             if fire.state == "entitlement_paused":
                 runtime.store.touch_automation_fire(
