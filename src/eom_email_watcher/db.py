@@ -36,6 +36,7 @@ SCHEMA_VERSION = 25
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
+MAX_CERTIFICATE_LEDGER_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_CONNECT_RESULT_BYTES = 24 * 1024 * 1024
 MAX_CONNECT_RESULT_METADATA_BYTES = 64 * 1024
 AUTOMATION_CLEANUP_CHUNK_SIZE = 500
@@ -4036,6 +4037,7 @@ class Store:
         with self.connection() as db:
             rows = db.execute(
                 """SELECT certificate.certificate_id, policy.policy_id, policy.ordinal,
+                    length(certificate.canonical_result_json) AS canonical_result_bytes,
                     CASE WHEN COALESCE(dispatch.source_available, 1) = 1 AND EXISTS (
                         SELECT 1 FROM messages AS message
                         JOIN message_attachments AS attachment
@@ -4061,8 +4063,17 @@ class Store:
                 grouped.setdefault(str(row["certificate_id"]), []).append((index, row))
             values: list[dict[str, object] | None] = [None] * len(rows)
             response_bytes = len(b'{"items":[]}')
+            evidence_bytes = 0
             rendered_count = 0
             for certificate_id, selections in grouped.items():
+                canonical_result_bytes = selections[0][1]["canonical_result_bytes"]
+                if type(canonical_result_bytes) is not int or canonical_result_bytes < 2:
+                    raise RuntimeError("Stored certificate ledger evidence size is invalid")
+                evidence_bytes += canonical_result_bytes
+                if evidence_bytes > MAX_CERTIFICATE_LEDGER_EVIDENCE_BYTES:
+                    raise RuntimeError(
+                        "Certificate ledger evidence size exceeds the local API limit"
+                    )
                 parent = db.execute(
                     "SELECT * FROM certificate_records WHERE certificate_id = ?",
                     (certificate_id,),
@@ -4094,22 +4105,23 @@ class Store:
                     raise RuntimeError("Stored certificate source identity is invalid")
                 record = validated.record
                 _certificate_assert_projection(db, parent, record)
-                association_review_ordinals = {
-                    int(match.group(1))
-                    for item in record["withheld"]
-                    if item["reason"] == "POLICY_ASSOCIATION_UNCLEAR"
-                    and (
-                        match := re.fullmatch(
-                            r"policies\[(\d+)\]\.[a-z_]+",
-                            str(item["field"]),
-                        )
+                association_review_ordinals: set[int] = set()
+                has_unmapped_association_review = False
+                for item in record["withheld"]:
+                    if item["reason"] != "POLICY_ASSOCIATION_UNCLEAR":
+                        continue
+                    match = re.fullmatch(
+                        r"policies\[(\d+)\]\.[a-z_]+",
+                        str(item["field"]),
                     )
-                    is not None
-                }
+                    if match is None:
+                        has_unmapped_association_review = True
+                    else:
+                        association_review_ordinals.add(int(match.group(1)))
                 stored_policies = record["policies"]
                 if type(stored_policies) is not list:
                     raise RuntimeError("Stored certificate policies are invalid")
-                has_unmapped_association_review = any(
+                has_unmapped_association_review = has_unmapped_association_review or any(
                     ordinal >= len(stored_policies)
                     for ordinal in association_review_ordinals
                 )
@@ -7176,10 +7188,6 @@ class Store:
                 "SELECT * FROM certificate_records WHERE connect_job_id = ?",
                 (job_id,),
             ).fetchall()
-            fires = db.execute(
-                "SELECT fire_id, state, reason FROM automation_fires WHERE job_id = ?",
-                (job_id,),
-            ).fetchall()
             dispatch = db.execute(
                 "SELECT last_error_code FROM connect_job_dispatch WHERE job_id = ?",
                 (job_id,),
@@ -7190,17 +7198,39 @@ class Store:
                 raise RuntimeError("Completed certificate job has multiple durable projections")
             if not parents:
                 encoded_replay, _metadata = _encode_generic_result(result)
-                invalid_fires = bool(fires) and all(
-                    fire["state"] == "failed"
-                    and fire["reason"] == "CERTIFICATE_RESULT_INVALID"
-                    for fire in fires
-                )
-                if job.result_json == encoded_replay and (not fires or invalid_fires):
-                    return job
-                if (
+                replay_conflicts = (
                     dispatch["last_error_code"] == "CERTIFICATE_RESULT_CONFLICT"
                     or job.result_json != encoded_replay
-                ):
+                )
+                if not replay_conflicts:
+                    db.execute(
+                        """UPDATE automation_fires SET state = 'failed',
+                            state_version = state_version + 1,
+                            reason = 'CERTIFICATE_RESULT_INVALID',
+                            pending_since = NULL, updated_at = ?
+                        WHERE job_id = ?
+                            AND state IN ('submitted', 'entitlement_paused')""",
+                        (stamp, job_id),
+                    )
+                    unsettled = db.execute(
+                        """SELECT 1 FROM automation_fires WHERE job_id = ?
+                        AND NOT (
+                            state = 'failed' AND reason = 'CERTIFICATE_RESULT_INVALID'
+                        ) LIMIT 1""",
+                        (job_id,),
+                    ).fetchone()
+                    if unsettled is not None:
+                        raise RuntimeError(
+                            "Certificate invalid replay could not settle its automation fires"
+                        )
+                    _discard_settled_source_less_certificate_job(
+                        db,
+                        job_id=job_id,
+                        failure_reason="CERTIFICATE_RESULT_INVALID",
+                        stamp=stamp,
+                    )
+                    return job
+                if replay_conflicts:
                     fence = db.execute(
                         """UPDATE connect_job_dispatch SET last_error_code = ?,
                             last_error_message = ?, updated_at = ?
@@ -7246,6 +7276,7 @@ class Store:
                 raise RuntimeError("Completed certificate job is missing its durable projection")
 
             outcome: str | None = None
+            parent = parents[0]
             try:
                 if job.capability_version != CERTIFICATE_CAPABILITY_VERSION:
                     raise CertificateResultInvalid("certificate capability version is unsupported")
@@ -7258,7 +7289,6 @@ class Store:
                     input_byte_size=job.input_byte_size,
                     input_display_name=job.input_display_name,
                 )
-                parent = parents[0]
                 if (
                     parent["result_sha256"] != replay.sha256
                     or bytes(parent["canonical_result_json"]) != replay.canonical_json
@@ -7270,6 +7300,15 @@ class Store:
             except CertificateResultConflict:
                 outcome = "CERTIFICATE_RESULT_CONFLICT"
             except (CertificateResultInvalid, ValueError):
+                outcome = "CERTIFICATE_RESULT_INVALID"
+
+            prior_outcome = parent["terminal_replay_failure"]
+            if (
+                prior_outcome == "CERTIFICATE_RESULT_CONFLICT"
+                or outcome == "CERTIFICATE_RESULT_CONFLICT"
+            ):
+                outcome = "CERTIFICATE_RESULT_CONFLICT"
+            elif prior_outcome == "CERTIFICATE_RESULT_INVALID" and outcome is None:
                 outcome = "CERTIFICATE_RESULT_INVALID"
 
             if outcome is not None:
