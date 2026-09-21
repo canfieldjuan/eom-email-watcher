@@ -815,6 +815,54 @@ def test_invalid_source_less_certificate_discards_its_terminal_job(tmp_path: Pat
     assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100) == []
 
 
+def test_completed_join_discards_source_less_certificate_job_after_settlement(
+    tmp_path: Path,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+
+    assert runtime.store.delete_message("message-1") is True
+    assert runtime.store.connect_job(job_id) is not None
+    runtime.store.reconcile_certificate_completed_join(job_id=job_id)
+
+    assert runtime.store.connect_job(job_id) is None
+    assert runtime.store.connect_dispatch(job_id) is None
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+    assert len(rows) == 4
+    assert {row["source_available"] for row in rows} == {False}
+    settled = runtime.store.automation_fire(fires[1].fire_id)
+    assert settled is not None
+    assert settled.state == "completed"
+    assert settled.reason == "connect_completed"
+
+
 def test_zero_policy_certificate_is_visible_as_review_placeholder(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     _fire, job_id = _certificate_fire_job(runtime.store)

@@ -2594,6 +2594,43 @@ def _certificate_source_for_job(
     return source, tuple(fire_ids)
 
 
+def _discard_settled_source_less_certificate_job(
+    db: sqlite3.Connection,
+    *,
+    job_id: str,
+    failure_reason: str | None,
+    stamp: str,
+) -> bool:
+    dispatch = db.execute(
+        "SELECT source_available FROM connect_job_dispatch WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    if dispatch is None or bool(dispatch["source_available"]):
+        return False
+    active_fire = db.execute(
+        """SELECT 1 FROM automation_fires
+        WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')
+        LIMIT 1""",
+        (job_id,),
+    ).fetchone()
+    if active_fire is not None:
+        return False
+    deleted = db.execute(
+        "DELETE FROM connect_attachment_jobs WHERE job_id = ? AND status = 'completed'",
+        (job_id,),
+    )
+    if deleted.rowcount != 1:
+        raise RuntimeError("Settled source-less certificate job was not discarded")
+    if failure_reason is not None:
+        db.execute(
+            """UPDATE automation_fires SET state = 'failed', reason = ?,
+                pending_since = NULL, updated_at = ?
+            WHERE job_id = ?""",
+            (failure_reason, stamp, job_id),
+        )
+    return True
+
+
 def _persist_certificate_projection(
     db: sqlite3.Connection,
     *,
@@ -7048,38 +7085,25 @@ class Store:
                         WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
                         (reason, stamp, job_id),
                     )
-            settled_source_less_certificate = bool(
-                certificate_outcome is not None
-                and terminal_job is not None
-                and dispatch_before is not None
-                and not bool(dispatch_before["source_available"])
-                and db.execute(
-                    """SELECT 1 FROM automation_fires
-                    WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')
-                    LIMIT 1""",
-                    (job_id,),
-                ).fetchone()
-                is None
-            )
-            if settled_source_less_certificate:
-                deleted = db.execute(
-                    "DELETE FROM connect_attachment_jobs WHERE job_id = ? AND status = ?",
-                    (job_id, next_state),
-                )
-                if deleted.rowcount != 1:
-                    raise RuntimeError("Settled source-less certificate job was not discarded")
+            if certificate_outcome is not None and terminal_job is not None:
+                failure_reason = None
                 if certificate_outcome != "valid":
-                    reason = (
+                    failure_reason = (
                         "CERTIFICATE_RESULT_CONFLICT"
                         if certificate_outcome == "conflict"
                         else "CERTIFICATE_RESULT_INVALID"
                     )
-                    db.execute(
-                        """UPDATE automation_fires SET state = 'failed',
-                            reason = ?, pending_since = NULL, updated_at = ?
-                        WHERE job_id = ?""",
-                        (reason, stamp, job_id),
+                settled_source_less_certificate = (
+                    _discard_settled_source_less_certificate_job(
+                        db,
+                        job_id=job_id,
+                        failure_reason=failure_reason,
+                        stamp=stamp,
                     )
+                )
+            else:
+                settled_source_less_certificate = False
+            if settled_source_less_certificate:
                 discard_terminal = True
             row = None
             if not discard_terminal:
@@ -7269,6 +7293,12 @@ class Store:
                     WHERE job_id = ? AND state IN ('submitted', 'entitlement_paused')""",
                     (outcome, stamp, job_id),
                 )
+            _discard_settled_source_less_certificate_job(
+                db,
+                job_id=job_id,
+                failure_reason=None if outcome == "valid" else outcome,
+                stamp=stamp,
+            )
             return job
 
     def reset_connect_job_for_resubmission(
