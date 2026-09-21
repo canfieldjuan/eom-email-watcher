@@ -775,6 +775,57 @@ def test_invalid_completion_replay_without_linked_fires_is_idempotent(tmp_path: 
     assert runtime.store.list_certificate_expiry_ledger(today="2026-09-20") == []
 
 
+def test_different_replay_of_invalid_completion_fences_later_joins(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    invalid = _record()
+    invalid["unexpected"] = True
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(invalid),
+    )
+    different = _record()
+    different["different"] = True
+
+    runtime.store.reconcile_certificate_completed_replay(
+        job_id=job_id,
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(different),
+    )
+
+    first = runtime.store.automation_fire(fires[0].fire_id)
+    assert first is not None
+    assert first.reason == "CERTIFICATE_RESULT_CONFLICT"
+    runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.reconcile_certificate_completed_join(job_id=job_id)
+    later = runtime.store.automation_fire(fires[1].fire_id)
+    assert later is not None
+    assert later.reason == "CERTIFICATE_RESULT_CONFLICT"
+
+
 def test_provider_owned_certificate_survives_source_deletion(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
@@ -1092,6 +1143,38 @@ def test_withheld_only_association_review_maps_to_the_affected_policy(tmp_path: 
     assert [row["review_state"] for row in rows] == ["needs_review", "extracted"]
     assert rows[0]["review_reasons"] == ["ASSOCIATION_UNCLEAR"]
     assert rows[1]["review_reasons"] == []
+
+
+def test_unmapped_association_review_remains_visible_on_ledger_rows(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    _fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record(
+        policies=[_policy(0, _date("2027-01-01", "expiration-0"))]
+    )
+    record["withheld"] = [
+        {
+            "field": "policies[99].insurer",
+            "reason": "POLICY_ASSOCIATION_UNCLEAR",
+            "detail": "dropped policy evidence",
+        }
+    ]
+    record["review"] = {
+        "required": True,
+        "reasons": ["POLICY_ASSOCIATION_UNCLEAR"],
+    }
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(record),
+    )
+
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+
+    assert rows[0]["review_state"] == "needs_review"
+    assert rows[0]["review_reasons"] == ["POLICY_ASSOCIATION_UNCLEAR"]
 
 
 def test_certificate_ledger_refuses_an_oversized_serialized_response(tmp_path: Path) -> None:

@@ -4106,6 +4106,13 @@ class Store:
                     )
                     is not None
                 }
+                stored_policies = record["policies"]
+                if type(stored_policies) is not list:
+                    raise RuntimeError("Stored certificate policies are invalid")
+                has_unmapped_association_review = any(
+                    ordinal >= len(stored_policies)
+                    for ordinal in association_review_ordinals
+                )
 
                 for index, selection in selections:
                     policy: dict[str, object] | None = None
@@ -4114,10 +4121,8 @@ class Store:
                     if selection["policy_id"] is not None:
                         policy_id = str(selection["policy_id"])
                         policy_ordinal = int(selection["ordinal"])
-                        stored_policies = record["policies"]
                         if (
-                            type(stored_policies) is not list
-                            or not 0 <= policy_ordinal < len(stored_policies)
+                            not 0 <= policy_ordinal < len(stored_policies)
                         ):
                             raise RuntimeError("Stored certificate policy ordinal is invalid")
                         policy = stored_policies[policy_ordinal]
@@ -4136,7 +4141,11 @@ class Store:
                             if reason
                             not in {
                                 "POLICY_DATE_REVIEW",
-                                "POLICY_ASSOCIATION_UNCLEAR",
+                                *(
+                                    ()
+                                    if has_unmapped_association_review
+                                    else ("POLICY_ASSOCIATION_UNCLEAR",)
+                                ),
                             }
                         ]
                         policy_reasons = list(policy["review_reasons"])
@@ -7171,20 +7180,68 @@ class Store:
                 "SELECT fire_id, state, reason FROM automation_fires WHERE job_id = ?",
                 (job_id,),
             ).fetchall()
+            dispatch = db.execute(
+                "SELECT last_error_code FROM connect_job_dispatch WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if dispatch is None:
+                raise RuntimeError("Certificate replay job is missing dispatch state")
             if len(parents) > 1:
                 raise RuntimeError("Completed certificate job has multiple durable projections")
             if not parents:
                 encoded_replay, _metadata = _encode_generic_result(result)
-                if not fires and job.result_json == encoded_replay:
+                invalid_fires = bool(fires) and all(
+                    fire["state"] == "failed"
+                    and fire["reason"] == "CERTIFICATE_RESULT_INVALID"
+                    for fire in fires
+                )
+                if job.result_json == encoded_replay and (not fires or invalid_fires):
                     return job
                 if (
-                    fires
-                    and all(
-                        fire["state"] == "failed"
-                        and fire["reason"] == "CERTIFICATE_RESULT_INVALID"
-                        for fire in fires
-                    )
+                    dispatch["last_error_code"] == "CERTIFICATE_RESULT_CONFLICT"
+                    or job.result_json != encoded_replay
                 ):
+                    fence = db.execute(
+                        """UPDATE connect_job_dispatch SET last_error_code = ?,
+                            last_error_message = ?, updated_at = ?
+                        WHERE job_id = ?""",
+                        (
+                            "CERTIFICATE_RESULT_CONFLICT",
+                            "completed certificate replay conflicts with stored evidence",
+                            stamp,
+                            job_id,
+                        ),
+                    )
+                    if fence.rowcount != 1:
+                        raise RuntimeError("Certificate replay conflict was not durably fenced")
+                    db.execute(
+                        """UPDATE automation_fires SET state = 'failed',
+                            state_version = state_version + 1,
+                            reason = 'CERTIFICATE_RESULT_CONFLICT',
+                            pending_since = NULL, updated_at = ?
+                        WHERE job_id = ? AND (
+                            state IN ('completed', 'submitted', 'entitlement_paused')
+                            OR (state = 'failed' AND reason = 'CERTIFICATE_RESULT_INVALID')
+                        )""",
+                        (stamp, job_id),
+                    )
+                    unsettled = db.execute(
+                        """SELECT 1 FROM automation_fires WHERE job_id = ? AND (
+                            state IN ('completed', 'submitted', 'entitlement_paused')
+                            OR (state = 'failed' AND reason = 'CERTIFICATE_RESULT_INVALID')
+                        ) LIMIT 1""",
+                        (job_id,),
+                    ).fetchone()
+                    if unsettled is not None:
+                        raise RuntimeError(
+                            "Certificate replay conflict could not settle its automation fires"
+                        )
+                    _discard_settled_source_less_certificate_job(
+                        db,
+                        job_id=job_id,
+                        failure_reason="CERTIFICATE_RESULT_CONFLICT",
+                        stamp=stamp,
+                    )
                     return job
                 raise RuntimeError("Completed certificate job is missing its durable projection")
 
@@ -7275,7 +7332,18 @@ class Store:
             replay_failure = (
                 None if not replay_fences else replay_fences[0]["terminal_replay_failure"]
             )
-            outcome = str(replay_failure) if replay_failure is not None else "valid"
+            dispatch = db.execute(
+                "SELECT last_error_code FROM connect_job_dispatch WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if dispatch is None:
+                raise RuntimeError("Certificate join job is missing dispatch state")
+            if replay_failure is not None:
+                outcome = str(replay_failure)
+            elif dispatch["last_error_code"] == "CERTIFICATE_RESULT_CONFLICT":
+                outcome = "CERTIFICATE_RESULT_CONFLICT"
+            else:
+                outcome = "valid"
             if outcome == "valid":
                 try:
                     _certificate_source_for_job(db, job)
