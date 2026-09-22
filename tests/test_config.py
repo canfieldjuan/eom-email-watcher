@@ -279,6 +279,65 @@ def test_first_run_initialization_never_replaces_existing_config(tmp_path: Path)
     assert path.read_bytes() == original
 
 
+def test_non_posix_initialization_load_failure_reports_uncertain_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+
+    def fail_load(_path: Path) -> None:
+        raise ConfigError("post-publication read failed")
+
+    monkeypatch.setattr(config_module, "load_config", fail_load)
+    with pytest.raises(config_module.ConfigInitializationOutcomeUnknownError):
+        config_module._initialize_config_non_posix(path, b'timezone = "UTC"\n')
+    assert path.read_bytes() == b'timezone = "UTC"\n'
+
+
+def test_non_posix_initialization_existing_config_remains_conflict(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(b"operator config\n")
+
+    with pytest.raises(ConfigAlreadyExistsError):
+        config_module._initialize_config_non_posix(path, b'timezone = "UTC"\n')
+    assert path.read_bytes() == b"operator config\n"
+
+
+def test_non_posix_initialization_cleanup_failure_reports_uncertain_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    real_unlink = Path.unlink
+
+    def fail_candidate_cleanup(candidate: Path, *args: object, **kwargs: object) -> None:
+        if candidate.name.startswith(".config.toml.") and candidate.name.endswith(".tmp"):
+            raise OSError("simulated cleanup failure")
+        real_unlink(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_candidate_cleanup)
+    with pytest.raises(config_module.ConfigInitializationOutcomeUnknownError):
+        config_module._atomic_create(path, 'timezone = "UTC"\n')
+    assert path.read_bytes() == b'timezone = "UTC"\n'
+
+
+def test_non_posix_initialization_lock_release_failure_reports_uncertain_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    path = tmp_path / "config.toml"
+
+    @contextmanager
+    def fail_release() -> Iterator[None]:
+        yield
+        raise ConfigError("post-publication lock release failed")
+
+    monkeypatch.setattr(config_module, "_config_serialization_lock", fail_release)
+    with pytest.raises(config_module.ConfigInitializationOutcomeUnknownError):
+        config_module._initialize_config_non_posix(path, b'timezone = "UTC"\n')
+    assert path.read_bytes() == b'timezone = "UTC"\n'
+
+
 @pytest.mark.parametrize(
     ("timezone", "model_base_url", "model_name"),
     [
@@ -512,6 +571,43 @@ def test_windows_publication_replays_each_durable_crash_cut(
     assert config_module._recover_windows_publication(path) == "none"
     assert path.read_bytes() == expected_bytes
     assert list(tmp_path.glob(".config.toml.config-publication-*")) == []
+
+
+@pytest.mark.parametrize(
+    "replacement_content", [b"manual candidate\n", b"application mutation\n"]
+)
+def test_windows_publication_replay_preserves_replaced_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement_content: bytes
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    path = tmp_path / "config.toml"
+    original = b"original config\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    source = config_module._ConfigMutationSource(path, path.stat(), original)
+    monkeypatch.setattr(config_module, "_verify_config_mutation_source", lambda _source: None)
+
+    def crash(stage: str, _path: Path) -> None:
+        if stage == "after_windows_candidate_durable":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(config_module, "_config_mutation_probe", crash)
+    with pytest.raises(SimulatedCrash):
+        config_module._atomic_write_windows(path, b"application mutation\n", source)
+
+    candidate_paths = list(tmp_path.glob(".config.toml.config-publication-candidate-*"))
+    assert len(candidate_paths) == 1
+    replacement = tmp_path / "manual-replacement"
+    replacement.write_bytes(replacement_content)
+    replacement.chmod(0o600)
+    os.replace(replacement, candidate_paths[0])
+
+    with pytest.raises(config_module._UnsafeConfigPath):
+        config_module._recover_windows_publication(path)
+    assert path.read_bytes() == original
+    assert candidate_paths[0].read_bytes() == replacement_content
 
 
 @pytest.mark.parametrize("external_kind", ["regular", "hardlink", "symlink"])
@@ -1420,6 +1516,55 @@ def test_root_boolean_scanner_closes_multiline_string_after_even_backslashes() -
 
     expected = content.index(b"false")
     assert spans == [(expected, expected + len(b"false"))]
+
+
+@pytest.mark.parametrize("quote", [b'"', b"'"])
+@pytest.mark.parametrize("closing_width", [4, 5])
+def test_root_boolean_scanner_closes_quote_inclusive_multiline_terminator(
+    quote: bytes, closing_width: int
+) -> None:
+    import tomllib
+
+    content = (
+        b"notes = " + quote * 3 + b"body" + quote * closing_width + b"\n"
+        b"ntfy_content_disclosure_acknowledged = false\n"
+    )
+    assert tomllib.loads(content.decode())["ntfy_content_disclosure_acknowledged"] is False
+
+    spans = config_module._root_boolean_token_spans(content, "ntfy_content_disclosure_acknowledged")
+
+    expected = content.rindex(b"false")
+    assert spans == [(expected, expected + len(b"false"))]
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+@pytest.mark.parametrize("closing_width", [4, 5])
+def test_ntfy_disclosure_classifies_quote_inclusive_multiline_terminator(
+    tmp_path: Path, quote: str, closing_width: int
+) -> None:
+    import tomllib
+
+    path = tmp_path / "config.toml"
+    write_config(
+        path,
+        include_sender=False,
+        extra=(
+            f"notes = {quote * 3}body{quote * closing_width}\n"
+            'ntfy_topic = "private-topic-canary-0123456789"\n'
+            "ntfy_content_disclosure_acknowledged = false"
+        ),
+    )
+    original = path.read_bytes()
+
+    status, candidate = config_module._classify_ntfy_disclosure(original, path)
+
+    assert status.state == "acknowledgement_required"
+    assert candidate is not None
+    assert candidate == original.replace(
+        b"ntfy_content_disclosure_acknowledged = false",
+        b"ntfy_content_disclosure_acknowledged = true",
+    )
+    assert tomllib.loads(candidate.decode())["ntfy_content_disclosure_acknowledged"] is True
 
 
 def test_short_ntfy_topic_is_rejected(tmp_path: Path) -> None:

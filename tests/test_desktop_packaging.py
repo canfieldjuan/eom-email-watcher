@@ -451,6 +451,21 @@ def test_packaged_smoke_failure_code_has_bounded_output(
     ) is None
 
 
+def test_packaged_smoke_reports_public_uncertain_initialization_code() -> None:
+    response = json.dumps(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "ok": False,
+            "error": {"code": "outcome_unknown", "message": "private canary"},
+        }
+    )
+
+    assert smoke_packaged_engine._public_failure_code(response, "config.initialize") == (
+        "outcome_unknown"
+    )
+
+
 @pytest.mark.parametrize(
     ("target_triple", "suffix"),
     [

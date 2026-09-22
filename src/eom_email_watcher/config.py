@@ -80,6 +80,10 @@ class ConfigAlreadyExistsError(ConfigError):
     """First-run initialization cannot replace an existing configuration."""
 
 
+class ConfigInitializationOutcomeUnknownError(ConfigError):
+    """First-run publication may have completed without a usable response."""
+
+
 class NtfyDisclosureConflictError(ConfigError):
     """The disclosure acknowledgement no longer applies to the current file."""
 
@@ -1273,14 +1277,15 @@ def _root_boolean_token_spans(content: bytes, key: str) -> list[tuple[int, int]]
         elif quote is not None:
             marker = bytes([quote]) * 3
             delimiter_is_escaped = quote == ord('"') and escaped
-            if (
-                multiline
-                and not delimiter_is_escaped
-                and content[index : index + 3] == marker
-            ):
+            if multiline and not delimiter_is_escaped and content[index : index + 3] == marker:
+                closing_width = 3
+                while closing_width < 5 and content[
+                    index + closing_width : index + closing_width + 1
+                ] == bytes([quote]):
+                    closing_width += 1
                 quote = None
                 multiline = False
-                index += 3
+                index += closing_width
                 continue
             if not multiline and value == quote and not escaped:
                 quote = None
@@ -3633,7 +3638,7 @@ def _recover_windows_publication(path: Path) -> Literal[
 
     if target_is_expected and not backup_exists:
         if candidate is not None:
-            _unlink_owned_windows_candidate(candidate_path)
+            _unlink_matching_windows_candidate(candidate_path, marker["candidate"])
         _unlink_matching_windows_file(marker_path, marker_descriptor)
         _windows_flush_parent(path.parent)
         return "aborted"
@@ -3821,6 +3826,7 @@ def _publish_config_mutation(source: _ConfigMutationSource, content: bytes) -> N
 
 def _atomic_create(path: Path, content: str) -> None:
     temporary: Path | None = None
+    published = False
     try:
         with tempfile.NamedTemporaryFile(
             "w",
@@ -3837,11 +3843,37 @@ def _atomic_create(path: Path, content: str) -> None:
         temporary.chmod(0o600)
         try:
             os.link(temporary, path)
+            published = True
         except FileExistsError as exc:
             raise ConfigAlreadyExistsError("Configuration already exists") from exc
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                if published:
+                    raise ConfigInitializationOutcomeUnknownError(
+                        "Initialization outcome is unknown"
+                    ) from exc
+                raise
+
+
+def _initialize_config_non_posix(path: Path, content: bytes) -> Config:
+    published = False
+    try:
+        with _config_serialization_lock():
+            _atomic_create(path, content.decode("utf-8"))
+            published = True
+    except Exception as exc:
+        if published:
+            raise ConfigInitializationOutcomeUnknownError(
+                "Initialization outcome is unknown"
+            ) from exc
+        raise
+    try:
+        return load_config(path)
+    except Exception as exc:
+        raise ConfigInitializationOutcomeUnknownError("Initialization outcome is unknown") from exc
 
 
 def _initialization_probe(_stage: str) -> None:
@@ -3949,9 +3981,7 @@ def initialize_config(
     if os.name != "posix":
         config_path = path.expanduser().resolve()
         config_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with _config_serialization_lock():
-            _atomic_create(config_path, content.decode("utf-8"))
-        return load_config(config_path)
+        return _initialize_config_non_posix(config_path, content)
 
     parent_fd: int | None = None
     created_identity: tuple[int, int] | None = None

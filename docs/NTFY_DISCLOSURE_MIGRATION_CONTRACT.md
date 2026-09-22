@@ -687,16 +687,52 @@ Required change surface: `scripts/smoke_packaged_engine.py` may report only a
 bounded, validated engine error code from a failed v1 response. Its adjacent
 tests in `tests/test_desktop_packaging.py` must prove that a valid code is
 visible and malformed output, paths, token values, and stderr remain hidden.
-The next exact-head Windows job must supply the failure class before any
-runtime fix is chosen. If it cannot, record that limitation and keep the job
-red.
+The following exact-head Windows job supplied `configuration_error`. That
+diagnostic result narrows but does not identify the underlying failure.
 
-Explicit non-scope: do not change initialization semantics, the engine API,
+### Current-head repair contract
+
+The next package job reported `configuration_error` from packaged
+`config.initialize`; it did not identify whether publication occurred. Do not
+claim that a post-publication failure caused this job until native evidence
+distinguishes the two cases. Preserve the failing smoke gate.
+
+Problem-derived roots and required changes:
+
+- The root TOML token scanner treats the first three bytes of a four-quote
+  multiline terminator as the closing delimiter. It must consume the complete
+  valid terminator, including the five-quote boundary case, then find a later
+  root-level false boolean;
+  malformed or ambiguous input remains manual repair.
+- Windows replay deletes any safe file at the reserved candidate name when
+  the original target remains. It must delete only a candidate whose recorded
+  provenance still matches and leave a replacement untouched on ambiguity.
+- Native certificate-ledger and Gmail-label commands load configuration or
+  perform effects without holding the configuration admission permit. All five
+  commands must retain that permit across their worker await, without changing
+  the command results or Gmail-label behavior.
+- A non-POSIX first-run create may publish the receipt-bearing file and then
+  fail in cleanup or load. Such a result must be `outcome_unknown`, not an
+  ordinary configuration failure that forces a conflicting retry; an existing
+  pre-publication file remains `conflict`. The host may reconcile only the
+  exact initialization receipt and settings already supplied in the request.
+- The documented v1 engine envelope omits the admission token and its
+  snapshot/compare operations. Document the implemented trusted-host contract
+  and required-operation set without changing the wire version or behavior.
+
+Verification: fail-first scanner, Windows replay, initialization, and native
+command-gate tests; then targeted Python and desktop tests, Rust formatting and
+targeted tests, and exact-head CI. Preserve the consent guard, secret-free
+responses, and all unrelated product behavior. The native Windows package
+check remains the final platform proof.
+
+Diagnostic-only phase non-scope, superseded for the named current-head repair
+classes above: do not change initialization semantics, the engine API,
 configuration storage, Windows publication, ntfy consent, dependencies, or
 the CI admission gate merely to make the smoke pass. The failed operation and
 its exit status remain a failure.
 
-Verification: declare a fail-first test where a packaged engine returns a
+Diagnostic-only phase verification: declare a fail-first test where a packaged engine returns a
 nonzero exit and a valid v1 `configuration_error` envelope. It must currently
 fail because the error code is omitted. After the diagnostic fix, run the
 focused packaging test file and Ruff lint; the exact-head Windows package job

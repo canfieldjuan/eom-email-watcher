@@ -41,11 +41,23 @@ top-level and payload fields are rejected. Responses never contain OAuth tokens,
 contents, token paths, the ntfy topic, or raw email bodies. Detailed mailbox diagnostics are written
 only to stderr.
 
+Trusted hosts may also include an `admission_token` top-level field. It is an object with exactly
+`version: 1`, `revision: "sha256:"` followed by 64 lowercase hexadecimal characters, and
+`identity` in the same digest format. The host obtains it from `config.admission.snapshot`; it is
+not an authorization credential and is not accepted as a substitute for the current config. The
+engine compares the token with the safely reopened config and returns `conflict` if that admission
+snapshot is stale. The token is required for `watcher.check`, `connect.queue.pump`,
+`host.operation_lock`, `notifications.pending`, `notifications.pending_under_host_lock`,
+`notifications.count_under_host_lock`, and `notifications.ack`. This extends the accepted v1
+envelope without changing its protocol number.
+
 ## Operations
 
 | Operation | Payload | Result |
 |---|---|---|
 | `config.initialize` | `timezone`, loopback `model_base_url`, `model_name` | Create a private zero-sender first-run config and return safe settings |
+| `config.admission.snapshot` | `{}` | Return safe settings, the current admission token, and the first-run receipt when present |
+| `config.admission.compare` | `token` from a snapshot | Return `{"current":true}` only when that token still matches the safely reopened config |
 | `health.get` | `{}` | Database, generic mail-account catalog, legacy Gmail status, local-model health, notification mode, watchlist count, last check |
 | `mail.accounts.list` | `{}` | Available mail providers and retained local accounts, without credential values or paths |
 | `mail.accounts.connect` | `provider`; IMAP also requires `connection` | Run that provider's account flow and safely register or reuse the resulting mailbox identity |

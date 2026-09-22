@@ -2167,6 +2167,34 @@ def test_config_initialize_binds_supplied_receipt_to_admission_snapshot(
     assert snapshot["data"]["desktop_initialization_receipt"] == receipt
 
 
+def test_config_initialize_maps_uncertain_publication_to_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_after_publication(*_args: object, **_kwargs: object) -> None:
+        raise engine_api.ConfigInitializationOutcomeUnknownError(
+            "Initialization outcome is unknown"
+        )
+
+    monkeypatch.setattr(engine_api, "initialize_config", fail_after_publication)
+    response = engine_api._response(
+        request(
+            tmp_path / "config.toml",
+            "config.initialize",
+            {
+                "desktop_initialization_receipt": "0123456789abcdef0123456789abcdef",
+                "model_base_url": "http://127.0.0.1:8080/v1",
+                "model_name": "local-model",
+                "timezone": "UTC",
+            },
+        )
+    )
+    assert response["ok"] is False
+    assert response["error"] == {
+        "code": "outcome_unknown",
+        "message": "Initialization outcome is unknown",
+    }
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Unix mode boundary")
 def test_config_initialize_rejects_public_parent_without_writing(tmp_path: Path) -> None:
     parent = tmp_path / "public-config"

@@ -21,6 +21,7 @@ PUBLIC_FAILURE_CODES = frozenset(
         "conflict",
         "internal_error",
         "invalid_request",
+        "outcome_unknown",
         "runtime_error",
         "unsupported_operation",
         "unsupported_protocol",

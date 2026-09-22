@@ -43,6 +43,7 @@ from .config import (
     ConfigAdmissionUnavailableError,
     ConfigAlreadyExistsError,
     ConfigError,
+    ConfigInitializationOutcomeUnknownError,
     DuplicateSenderError,
     InvalidConfigInitializationError,
     InvalidSenderError,
@@ -5561,6 +5562,8 @@ def _config_initialize(request: dict[str, object]) -> dict[str, object]:
         )
     except InvalidConfigInitializationError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
+    except ConfigInitializationOutcomeUnknownError as exc:
+        raise ApiError("outcome_unknown", "Initialization outcome is unknown") from exc
     except ConfigAlreadyExistsError as exc:
         raise ApiError("conflict", str(exc)) from exc
     return {

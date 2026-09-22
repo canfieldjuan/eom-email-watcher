@@ -1581,9 +1581,11 @@ async fn inbox_query(
 #[tauri::command]
 async fn certificate_expiry_ledger_list(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     today: String,
     limit: u32,
 ) -> Result<CertificateExpiryLedger, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.list_certificate_expiry_ledger(today, limit)
@@ -1949,9 +1951,11 @@ async fn mail_accounts_list(
 #[tauri::command]
 async fn gmail_labels_catalog(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
 ) -> Result<GmailLabelCatalog, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.gmail_label_catalog(provider, account_id))
         .await
@@ -1961,9 +1965,11 @@ async fn gmail_labels_catalog(
 #[tauri::command]
 async fn gmail_label_selectors_list(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
 ) -> Result<GmailLabelSelectors, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.gmail_label_selectors(provider, account_id))
         .await
@@ -1973,11 +1979,13 @@ async fn gmail_label_selectors_list(
 #[tauri::command]
 async fn gmail_label_selector_add(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
     label_id: String,
     expected_revision: u64,
 ) -> Result<GmailLabelSelectorAdded, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.add_gmail_label_selector(provider, account_id, label_id, expected_revision)
@@ -1989,11 +1997,13 @@ async fn gmail_label_selector_add(
 #[tauri::command]
 async fn gmail_label_selector_remove(
     engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
     provider: String,
     account_id: String,
     selector_id: String,
     expected_revision: u64,
 ) -> Result<GmailLabelSelectorRemoved, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         engine.remove_gmail_label_selector(provider, account_id, selector_id, expected_revision)
