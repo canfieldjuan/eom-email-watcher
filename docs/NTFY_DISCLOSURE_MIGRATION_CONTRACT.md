@@ -457,6 +457,25 @@ upgrade repair, not an ntfy settings editor. The new panel belongs beside the
 existing first-run and normal settings surfaces
 (`desktop/src/main.ts:587-636`) but is mutually exclusive with both.
 
+## Revisioned mailbox startup integration
+
+When the admitted desktop is combined with revision-stamped mailbox startup,
+normal navigation remains disabled until `loadMailAccounts()` seeds the active
+mailbox revision. The startup attempt captures the admission generation that
+authorized it. After the asynchronous seed returns, it may set
+`configurationReady` and start Inbox, health, autostart, and sender effects only
+if that exact admission generation is still current. A newer held generation
+must keep the desktop fail closed; a newer admitted generation gets its own
+seed attempt. This composes the disclosure admission gate with mailbox event
+ordering without changing disclosure copy, acknowledgement semantics, or any
+buyer-visible output.
+
+The regression proof exercises a superseded startup: an older admitted
+generation begins mailbox seeding, a newer admission generation arrives before
+the seed resolves, and the older attempt cannot enable navigation or launch
+configured effects. The existing successful and failed mailbox-seed cases
+remain required.
+
 ## Scheduler ownership
 
 This migration does not start, stop, enable, disable, install, or edit a systemd
