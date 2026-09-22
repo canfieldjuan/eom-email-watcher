@@ -807,6 +807,32 @@ packaging gates, or dependencies. Verification: the native job must still fail
 at the same first-run load but report the differing stat fields; after repair,
 the first-run and packaged smoke must pass on native Windows.
 
+### Native Windows ctime representation repair after head 20a3517
+
+The exact-head native `windows-package` job failed in the same first-run load
+and reported only `st_ctime_ns` differing between path stat and descriptor
+stat for the newly published config. The admission reader currently requires
+the entire `_windows_stat_version` tuple to match across those two forms, so
+it rejects a safe same-file read. Python 3.13 deprecates Windows `st_ctime_ns`
+as a creation-time signal; the existing `_windows_replacement_identity`
+deliberately excludes it while retaining device, inode, link count, size,
+mtime, and file attributes. The exact reason Windows reports different ctimes
+for these two observations is not independently proven and is not needed to
+make this cross-form comparator correct.
+
+Root fix: compare path stat to descriptor stat with the existing
+`_windows_replacement_identity` in both Windows readers. Keep the full
+`_windows_stat_version` comparison between two descriptor stats, and compare
+the path before and after the admission read in its own representation so a
+real ctime change during the read still fails closed. Keep regular-file,
+single-link, non-reparse, content, and post-read path checks. Add a fail-first
+same-file ctime-drift regression and retain the existing atomic-swap negatives.
+No POSIX read, config format, ntfy consent, public error, dependency, or
+packaging-gate change. The native first-run test also performs one settings
+mutation and reload so the second Windows reader is covered without a mock.
+Local focused tests and Ruff are preliminary; native first-run, settings
+mutation, and packaged smoke at the new exact head are the acceptance proof.
+
 ## Non-goals
 
 - weakening or bypassing the existing literal-`true` startup guard;

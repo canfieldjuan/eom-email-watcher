@@ -1071,7 +1071,8 @@ def _read_admission_config(
         opened = os.fstat(file_fd)
         if (
             not _non_posix_admission_file_is_safe(opened)
-            or _windows_stat_version(opened) != _windows_stat_version(inspected)
+            or _windows_replacement_identity(opened)
+            != _windows_replacement_identity(inspected)
         ):
             raise _UnsafeConfigPath
         content = _read_fd_bytes(file_fd)
@@ -1082,7 +1083,11 @@ def _read_admission_config(
         ):
             raise _UnsafeConfigPath
         current = os.stat(absolute, follow_symlinks=False)
-        if _windows_stat_version(current) != _windows_stat_version(completed):
+        if (
+            _windows_replacement_identity(current)
+            != _windows_replacement_identity(completed)
+            or _windows_stat_version(current) != _windows_stat_version(inspected)
+        ):
             raise _UnsafeConfigPath
         return absolute, completed, content
     except OSError as exc:
@@ -3330,9 +3335,9 @@ def _read_safe_windows_file(path: Path) -> tuple[os.stat_result, bytes]:
         raise _UnsafeConfigPath from exc
     try:
         opened = os.fstat(file_fd)
-        if not _is_safe_windows_file_stat(opened) or _windows_stat_version(
+        if not _is_safe_windows_file_stat(opened) or _windows_replacement_identity(
             opened
-        ) != _windows_stat_version(inspected):
+        ) != _windows_replacement_identity(inspected):
             raise _UnsafeConfigPath
         content = _read_fd_bytes(file_fd)
         completed = os.fstat(file_fd)

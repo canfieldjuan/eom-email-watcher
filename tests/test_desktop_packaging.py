@@ -52,6 +52,7 @@ def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
         ConfigInitializationOutcomeUnknownError,
         initialize_config,
         load_config,
+        update_settings,
     )
 
     private_root = tmp_path / "private"
@@ -95,6 +96,9 @@ def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
     assert config_path.is_file()
     assert initialized.timezone == "America/Chicago"
     assert load_config(config_path).timezone == "America/Chicago"
+    updated = update_settings(config_path, {"poll_interval_minutes": 45})
+    assert updated.poll_interval_minutes == 45
+    assert load_config(config_path).poll_interval_minutes == 45
 
 
 def test_packaged_smoke_uses_owner_private_config_parent(

@@ -97,6 +97,8 @@ def test_non_posix_admission_accepts_same_file_with_stat_representation_drift(
                 return self.original.st_mode | stat.S_IXUSR
             if name == "st_uid":
                 return self.original.st_uid + 1
+            if name == "st_ctime_ns":
+                return self.original.st_ctime_ns + 1
             return getattr(self.original, name)
 
     class NonPosixOsProxy:
@@ -104,6 +106,10 @@ def test_non_posix_admission_accepts_same_file_with_stat_representation_drift(
 
         def stat(self, target: Path, *args: object, **kwargs: object) -> object:
             observed = os.stat(target, *args, **kwargs)
+            return PathStatView(observed) if os.fspath(target) == os.fspath(path) else observed
+
+        def lstat(self, target: Path, *args: object, **kwargs: object) -> object:
+            observed = os.lstat(target, *args, **kwargs)
             return PathStatView(observed) if os.fspath(target) == os.fspath(path) else observed
 
         def __getattr__(self, name: str) -> object:
@@ -115,6 +121,47 @@ def test_non_posix_admission_accepts_same_file_with_stat_representation_drift(
 
     assert read_path == path.resolve()
     assert read_content == content
+    _identity, publication_content = config_module._read_safe_windows_file(path)
+    assert publication_content == content
+
+
+def test_non_posix_admission_rejects_path_ctime_change_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(b'model_name = "local-model"\n')
+    path.chmod(0o600)
+    path_stats = 0
+
+    class PathStatView:
+        def __init__(self, original: os.stat_result, ctime_delta: int) -> None:
+            self.original = original
+            self.ctime_delta = ctime_delta
+
+        def __getattr__(self, name: str) -> object:
+            if name == "st_ctime_ns":
+                return self.original.st_ctime_ns + self.ctime_delta
+            return getattr(self.original, name)
+
+    class NonPosixOsProxy:
+        name = "nt"
+
+        def stat(self, target: Path, *args: object, **kwargs: object) -> object:
+            nonlocal path_stats
+            observed = os.stat(target, *args, **kwargs)
+            if os.fspath(target) != os.fspath(path):
+                return observed
+            path_stats += 1
+            return PathStatView(observed, path_stats)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    monkeypatch.setattr(config_module, "os", NonPosixOsProxy())
+
+    with pytest.raises(config_module._UnsafeConfigPath):
+        config_module._read_admission_config(path)
+    assert path_stats == 2
 
 
 def test_remote_model_url_is_rejected(tmp_path: Path) -> None:
