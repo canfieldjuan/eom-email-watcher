@@ -280,14 +280,20 @@ pub struct Engine {
     program: OsString,
     args: Vec<OsString>,
     config_path: PathBuf,
-    mailbox_operation_gate: Arc<Mutex<()>>,
+    mailbox_operation_gate: Arc<Mutex<MailboxOperationState>>,
     request_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct MailboxOperationState {
+    revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WatchedSender {
     pub email: String,
     pub name: Option<String>,
+    pub admission_active: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -602,6 +608,21 @@ pub struct CalendarDecisionResult {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxAdmissionKind {
+    ExactSender,
+    GmailUserLabel,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct InboxAdmission {
+    pub kind: InboxAdmissionKind,
+    pub selector_id: String,
+    pub display_name: Option<String>,
+    pub admitted_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxItem {
     pub message_id: String,
     #[serde(default = "default_mail_provider")]
@@ -635,6 +656,8 @@ pub struct InboxItem {
     pub attachments: Vec<InboxAttachment>,
     #[serde(default)]
     pub calendar_proposal: Option<CalendarProposalPreview>,
+    #[serde(default)]
+    pub admission: Option<InboxAdmission>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -702,12 +725,15 @@ pub struct DatabaseHealth {
 pub struct GmailHealth {
     pub credentials_configured: bool,
     pub connected: bool,
+    pub label_watch_configured: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GmailAuthorization {
     pub baseline_initialized: bool,
     pub connected: bool,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -740,6 +766,72 @@ pub struct MailAccountStatus {
 pub struct MailAccounts {
     pub providers: Vec<MailProviderStatus>,
     pub accounts: Vec<MailAccountStatus>,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelCatalogItem {
+    pub label_id: String,
+    pub display_name: String,
+    pub selected: bool,
+    pub selector_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelCatalog {
+    pub provider: String,
+    pub account_id: String,
+    pub revision: u64,
+    pub items: Vec<GmailLabelCatalogItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailLabelCatalogState {
+    Current,
+    Unavailable,
+    InvalidCatalog,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailLabelSelectorStatus {
+    Active,
+    Deleted,
+    NotUser,
+    IdentityMismatch,
+    ValidationUnavailable,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelector {
+    pub selector_id: String,
+    pub label_id: String,
+    pub display_name: String,
+    pub status: GmailLabelSelectorStatus,
+    pub admission_active: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectors {
+    pub provider: String,
+    pub account_id: String,
+    pub revision: u64,
+    pub catalog_state: GmailLabelCatalogState,
+    pub items: Vec<GmailLabelSelector>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectorAdded {
+    pub revision: u64,
+    pub item: GmailLabelSelector,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GmailLabelSelectorRemoved {
+    pub revision: u64,
+    pub removed_selector_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -766,6 +858,8 @@ pub struct MailAccountResult {
     pub account: MailAccountStatus,
     #[serde(default)]
     pub baseline_initialized: Option<bool>,
+    #[serde(default)]
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -789,6 +883,8 @@ pub struct NotificationHealth {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CheckResult {
     pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub discovered: u64,
     pub summarized: u64,
     pub fallback_notified: u64,
@@ -799,6 +895,20 @@ pub struct CheckResult {
     pub automation_processed: u64,
     #[serde(default)]
     pub automation_review_required: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_next_retry_at: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MailboxCheckResult {
+    pub check: CheckResult,
+    pub mailbox_operation_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -844,6 +954,10 @@ pub struct ConfigInitialization {
 pub struct EngineError {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mailbox_operation_revision: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -903,15 +1017,18 @@ impl EngineError {
         Self {
             code: code.to_owned(),
             message: message.into(),
+            retryable: None,
+            mailbox_operation_revision: None,
         }
     }
 
     fn for_frontend(self) -> Self {
         if self.code == "configuration_error" {
-            return Self::host(
-                "configuration_error",
-                "Watcher configuration is missing or invalid; inspect desktop logs",
-            );
+            return Self {
+                message: "Watcher configuration is missing or invalid; inspect desktop logs"
+                    .to_owned(),
+                ..self
+            };
         }
         self
     }
@@ -928,7 +1045,7 @@ impl Engine {
                 program,
                 args: Vec::new(),
                 config_path,
-                mailbox_operation_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 request_timeout: None,
             });
         }
@@ -940,7 +1057,7 @@ impl Engine {
                 program: packaged_program,
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
-                mailbox_operation_gate: Arc::new(Mutex::new(())),
+                mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
                 request_timeout: None,
             });
         }
@@ -958,7 +1075,7 @@ impl Engine {
                 OsString::from("eom-mail-engine"),
             ],
             config_path,
-            mailbox_operation_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             request_timeout: None,
         })
     }
@@ -973,7 +1090,7 @@ impl Engine {
             program: program.into(),
             args,
             config_path,
-            mailbox_operation_gate: Arc::new(Mutex::new(())),
+            mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
             request_timeout: None,
         }
     }
@@ -1154,16 +1271,155 @@ impl Engine {
         )
     }
 
+    fn lock_mailbox_operation(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, MailboxOperationState>, EngineError> {
+        self.mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))
+    }
+
+    fn complete_mailbox_mutation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, EngineError>,
+        stamp_revision: impl FnOnce(&mut T, u64),
+    ) -> Result<T, EngineError> {
+        let mut state = self.lock_mailbox_operation()?;
+        let next_revision = state.revision.checked_add(1).ok_or_else(|| {
+            EngineError::host(
+                "host_error",
+                "Email account operation revision is exhausted",
+            )
+        })?;
+        state.revision = next_revision;
+        match operation() {
+            Ok(mut result) => {
+                stamp_revision(&mut result, next_revision);
+                Ok(result)
+            }
+            Err(mut error) => {
+                error.mailbox_operation_revision = Some(next_revision);
+                Err(error)
+            }
+        }
+    }
+
     pub fn authorize_gmail(&self) -> Result<GmailAuthorization, EngineError> {
+        self.complete_mailbox_mutation(
+            || self.request("gmail.authorize", json!({})),
+            |result: &mut GmailAuthorization, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
+    }
+
+    pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
+        let state = self.lock_mailbox_operation()?;
+        let mut result: MailAccounts = self.request("mail.accounts.list", json!({}))?;
+        result.mailbox_operation_revision = state.revision;
+        Ok(result)
+    }
+
+    pub fn gmail_label_catalog(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<GmailLabelCatalog, EngineError> {
         let _guard = self
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request("gmail.authorize", json!({}))
+        let result: GmailLabelCatalog = self.request(
+            "gmail.labels.catalog",
+            json!({"provider": provider, "account_id": account_id}),
+        )?;
+        if result.provider != provider || result.account_id != account_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched Gmail label catalog",
+            ));
+        }
+        Ok(result)
     }
 
-    pub fn mail_accounts(&self) -> Result<MailAccounts, EngineError> {
-        self.request("mail.accounts.list", json!({}))
+    pub fn gmail_label_selectors(
+        &self,
+        provider: String,
+        account_id: String,
+    ) -> Result<GmailLabelSelectors, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectors = self.request(
+            "gmail.label_selectors.list",
+            json!({"provider": provider, "account_id": account_id}),
+        )?;
+        if result.provider != provider || result.account_id != account_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned mismatched Gmail label selectors",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn add_gmail_label_selector(
+        &self,
+        provider: String,
+        account_id: String,
+        label_id: String,
+        expected_revision: u64,
+    ) -> Result<GmailLabelSelectorAdded, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectorAdded = self.request(
+            "gmail.label_selectors.add",
+            json!({
+                "provider": provider,
+                "account_id": account_id,
+                "label_id": label_id,
+                "expected_revision": expected_revision,
+            }),
+        )?;
+        if result.item.label_id != label_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched Gmail label selector",
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn remove_gmail_label_selector(
+        &self,
+        provider: String,
+        account_id: String,
+        selector_id: String,
+        expected_revision: u64,
+    ) -> Result<GmailLabelSelectorRemoved, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: GmailLabelSelectorRemoved = self.request(
+            "gmail.label_selectors.remove",
+            json!({
+                "provider": provider,
+                "account_id": account_id,
+                "selector_id": selector_id,
+                "expected_revision": expected_revision,
+            }),
+        )?;
+        if result.removed_selector_id != selector_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a mismatched removed Gmail label selector",
+            ));
+        }
+        Ok(result)
     }
 
     fn calendar_consent_request(
@@ -1257,15 +1513,16 @@ impl Engine {
         provider: String,
         connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         let payload = match connection {
             Some(connection) => json!({"provider": provider, "connection": connection}),
             None => json!({"provider": provider}),
         };
-        self.request("mail.accounts.connect", payload)
+        self.complete_mailbox_mutation(
+            || self.request("mail.accounts.connect", payload),
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
     }
 
     pub fn reconnect_mail_account(
@@ -1274,10 +1531,6 @@ impl Engine {
         account_id: String,
         connection: Option<MailServerConnection>,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         let payload = match connection {
             Some(connection) => json!({
                 "provider": provider,
@@ -1286,7 +1539,12 @@ impl Engine {
             }),
             None => json!({"provider": provider, "account_id": account_id}),
         };
-        self.request("mail.accounts.reconnect", payload)
+        self.complete_mailbox_mutation(
+            || self.request("mail.accounts.reconnect", payload),
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
+        )
     }
 
     pub fn disconnect_mail_account(
@@ -1294,13 +1552,16 @@ impl Engine {
         provider: String,
         account_id: String,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request(
-            "mail.accounts.disconnect",
-            json!({"provider": provider, "account_id": account_id}),
+        self.complete_mailbox_mutation(
+            || {
+                self.request(
+                    "mail.accounts.disconnect",
+                    json!({"provider": provider, "account_id": account_id}),
+                )
+            },
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
         )
     }
 
@@ -1309,13 +1570,16 @@ impl Engine {
         provider: String,
         account_id: String,
     ) -> Result<MailAccountResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request(
-            "mail.accounts.activate",
-            json!({"provider": provider, "account_id": account_id}),
+        self.complete_mailbox_mutation(
+            || {
+                self.request(
+                    "mail.accounts.activate",
+                    json!({"provider": provider, "account_id": account_id}),
+                )
+            },
+            |result: &mut MailAccountResult, revision| {
+                result.mailbox_operation_revision = revision;
+            },
         )
     }
 
@@ -1382,12 +1646,24 @@ impl Engine {
         engine
     }
 
+    #[cfg(test)]
     pub fn check(&self) -> Result<CheckResult, EngineError> {
-        let _guard = self
-            .mailbox_operation_gate
-            .lock()
-            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.check_with_mailbox_revision()
+            .map(|result| result.check)
+    }
+
+    pub(crate) fn check_with_mailbox_revision(&self) -> Result<MailboxCheckResult, EngineError> {
+        let state = self.lock_mailbox_operation()?;
+        let mailbox_operation_revision = state.revision;
         self.request("watcher.check", json!({"dry_run": false}))
+            .map(|check| MailboxCheckResult {
+                check,
+                mailbox_operation_revision,
+            })
+            .map_err(|mut error| {
+                error.mailbox_operation_revision = Some(mailbox_operation_revision);
+                error
+            })
     }
 
     pub(crate) fn run_with_operation_lock<T>(
@@ -1449,11 +1725,19 @@ impl Engine {
     }
 
     pub fn add(&self, email: String, name: Option<String>) -> Result<WatchedSender, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request::<SenderItem>("watchlist.add", json!({"email": email, "name": name}))
             .map(|data| data.item)
     }
 
     pub fn remove(&self, email: String) -> Result<WatchedSender, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request::<SenderItem>("watchlist.remove", json!({"email": email}))
             .map(|data| data.item)
     }
@@ -1611,6 +1895,7 @@ mod tests {
     use std::fs;
     #[cfg(windows)]
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(windows)]
     use windows_sys::Win32::{
         Foundation::WAIT_TIMEOUT,
@@ -1669,10 +1954,38 @@ mod tests {
     }
 
     #[test]
+    fn watchlist_mutations_fail_closed_when_mailbox_coordinator_stops() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let gate = Arc::clone(&engine.mailbox_operation_gate);
+        let _ = std::thread::spawn(move || {
+            let _guard = gate.lock().expect("acquire mailbox coordinator");
+            panic!("poison mailbox coordinator for the boundary probe");
+        })
+        .join();
+
+        assert_eq!(
+            engine
+                .add("sender@example.com".into(), None)
+                .expect_err("watchlist add must fail closed")
+                .code,
+            "host_error"
+        );
+        assert_eq!(
+            engine
+                .remove("sender@example.com".into())
+                .expect_err("watchlist remove must fail closed")
+                .code,
+            "host_error"
+        );
+    }
+
+    #[test]
     fn configuration_errors_do_not_expose_paths_to_frontend() {
         let error = EngineError {
             code: "configuration_error".into(),
             message: "Configuration not found: /home/private/config.toml".into(),
+            retryable: Some(false),
+            mailbox_operation_revision: None,
         };
 
         assert_eq!(
@@ -1680,8 +1993,27 @@ mod tests {
             EngineError {
                 code: "configuration_error".into(),
                 message: "Watcher configuration is missing or invalid; inspect desktop logs".into(),
+                retryable: Some(false),
+                mailbox_operation_revision: None,
             }
         );
+    }
+
+    #[test]
+    fn engine_error_retryability_round_trips_true_false_and_missing() {
+        for expected in [Some(true), Some(false), None] {
+            let mut value = json!({"code": "failure", "message": "safe message"});
+            if let Some(retryable) = expected {
+                value["retryable"] = json!(retryable);
+            }
+            let error: EngineError =
+                serde_json::from_value(value).expect("deserialize typed engine error");
+            assert_eq!(error.retryable, expected);
+            assert_eq!(
+                serde_json::to_value(error.for_frontend()).expect("serialize frontend error")["retryable"],
+                expected.map_or(serde_json::Value::Null, serde_json::Value::Bool)
+            );
+        }
     }
 
     #[test]
@@ -1922,6 +2254,24 @@ mod tests {
     }
 
     #[test]
+    fn watched_sender_admission_state_is_typed() {
+        let sender: WatchedSender = serde_json::from_value(json!({
+            "email": "legacy@example.com",
+            "name": null,
+            "admission_active": false
+        }))
+        .expect("deserialize watched sender");
+        assert_eq!(
+            sender,
+            WatchedSender {
+                email: "legacy@example.com".into(),
+                name: None,
+                admission_active: false,
+            }
+        );
+    }
+
+    #[test]
     fn protocol_v2_capabilities_and_durable_results_are_typed() {
         let capabilities: ConnectCapabilities = serde_json::from_value(json!({
             "items": [{
@@ -2048,6 +2398,7 @@ mod tests {
             GmailAuthorization {
                 baseline_initialized: true,
                 connected: true,
+                mailbox_operation_revision: 0,
             }
         );
     }
@@ -2089,6 +2440,210 @@ mod tests {
         assert_eq!(result.baseline_initialized, Some(false));
         let encoded = serde_json::to_string(&result).expect("serialize account result");
         assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn health_contract_requires_label_watch_configuration_state() {
+        let health_json = json!({
+            "database": {"ok": true, "initialized": true},
+            "gmail": {
+                "credentials_configured": true,
+                "connected": false,
+                "label_watch_configured": true
+            },
+            "last_check": null,
+            "local_model": {
+                "authentication_required": false,
+                "detail": "ready",
+                "endpoint": "http://127.0.0.1:1234/v1",
+                "model": "local-model",
+                "ok": true,
+                "token_configured": false
+            },
+            "mail": {"providers": [], "accounts": []},
+            "notifications": {
+                "delivery": "host",
+                "enabled": true,
+                "host_delivery_ready": true,
+                "ntfy_configured": false
+            },
+            "production_check_supported": true,
+            "watchlist_count": 0
+        });
+        let configured: HealthStatus =
+            serde_json::from_value(health_json.clone()).expect("deserialize watcher health");
+        assert!(configured.gmail.label_watch_configured);
+
+        let mut missing = health_json;
+        missing["gmail"]
+            .as_object_mut()
+            .expect("Gmail health object")
+            .remove("label_watch_configured");
+        assert!(serde_json::from_value::<HealthStatus>(missing).is_err());
+    }
+
+    #[test]
+    fn gmail_label_contract_is_typed_and_secret_free() {
+        let catalog: GmailLabelCatalog = serde_json::from_value(json!({
+            "provider": "gmail",
+            "account_id": "gmail-default",
+            "revision": 3,
+            "items": [{
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "selected": true,
+                "selector_id": "11111111-1111-4111-8111-111111111111"
+            }]
+        }))
+        .expect("deserialize Gmail label catalog");
+        assert_eq!(catalog.items[0].label_id, "Label_123");
+
+        let selectors: GmailLabelSelectors = serde_json::from_value(json!({
+            "provider": "gmail",
+            "account_id": "gmail-default",
+            "revision": 3,
+            "catalog_state": "unavailable",
+            "items": [{
+                "selector_id": "11111111-1111-4111-8111-111111111111",
+                "label_id": "Label_123",
+                "display_name": "Invoices",
+                "status": "validation_unavailable",
+                "admission_active": false
+            }]
+        }))
+        .expect("deserialize Gmail label selectors");
+        assert_eq!(
+            selectors.items[0].status,
+            GmailLabelSelectorStatus::ValidationUnavailable
+        );
+        let encoded = serde_json::to_string(&selectors).expect("serialize Gmail label selectors");
+        assert!(!encoded.contains("mailbox_identity"));
+        assert!(!encoded.contains("token"));
+
+        let admission: InboxAdmission = serde_json::from_value(json!({
+            "kind": "gmail_user_label",
+            "selector_id": "11111111-1111-4111-8111-111111111111",
+            "display_name": "Invoices",
+            "admitted_at": "2026-09-19T12:00:00+00:00"
+        }))
+        .expect("deserialize Inbox admission provenance");
+        assert_eq!(admission.kind, InboxAdmissionKind::GmailUserLabel);
+        let encoded = serde_json::to_string(&admission).expect("serialize Inbox admission");
+        assert!(encoded.contains("gmail_user_label"));
+        assert!(!encoded.contains("mailbox_identity"));
+    }
+
+    #[test]
+    fn check_result_carries_optional_gmail_recovery_status() {
+        let result: CheckResult = serde_json::from_value(json!({
+            "active": true,
+            "discovered": 2,
+            "summarized": 1,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": true,
+            "pending_notifications": 0,
+            "recovery_pending": true,
+            "recovery_state": "backoff",
+            "recovery_failure_code": "gmail_recovery_page_token_invalid",
+            "recovery_next_retry_at": "2026-09-20T03:00:00+00:00"
+        }))
+        .expect("deserialize Gmail recovery status");
+
+        assert_eq!(result.recovery_pending, Some(true));
+        assert_eq!(result.reason, None);
+        assert_eq!(result.recovery_state.as_deref(), Some("backoff"));
+        assert_eq!(
+            result.recovery_failure_code.as_deref(),
+            Some("gmail_recovery_page_token_invalid")
+        );
+        assert_eq!(
+            result.recovery_next_retry_at.as_deref(),
+            Some("2026-09-20T03:00:00+00:00")
+        );
+        let encoded = serde_json::to_value(result).expect("serialize Gmail recovery status");
+        assert_eq!(encoded["recovery_pending"], true);
+        assert_eq!(encoded["recovery_state"], "backoff");
+
+        let inactive: CheckResult = serde_json::from_value(json!({
+            "active": false,
+            "reason": "gmail_label_selectors_inactive",
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": false,
+            "pending_notifications": 0
+        }))
+        .expect("deserialize inactive Gmail label reason");
+        assert_eq!(
+            inactive.reason.as_deref(),
+            Some("gmail_label_selectors_inactive")
+        );
+        let encoded = serde_json::to_value(inactive).expect("serialize inactive reason");
+        assert_eq!(encoded["reason"], "gmail_label_selectors_inactive");
+
+        let legacy: CheckResult = serde_json::from_value(json!({
+            "active": false,
+            "discovered": 0,
+            "summarized": 0,
+            "fallback_notified": 0,
+            "purged": 0,
+            "stale_cursor_recovered": false,
+            "pending_notifications": 0
+        }))
+        .expect("deserialize check result without recovery status");
+        assert_eq!(legacy.recovery_pending, None);
+        assert_eq!(legacy.reason, None);
+        let encoded = serde_json::to_value(legacy).expect("serialize legacy check result");
+        assert!(encoded.get("recovery_pending").is_none());
+        assert!(encoded.get("recovery_state").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gmail_label_add_forwards_only_scope_label_and_revision() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.label_selectors.add","data":{"revision":4,"item":{"selector_id":"11111111-1111-4111-8111-111111111111","label_id":"Label_123","display_name":"Invoices","status":"active","admission_active":true}}}'"#,
+                ),
+                OsString::from("engine-gmail-label-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let result = engine
+            .add_gmail_label_selector(
+                "gmail".into(),
+                "gmail-default".into(),
+                "Label_123".into(),
+                3,
+            )
+            .expect("add Gmail label through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert_eq!(result.revision, 4);
+        assert_eq!(
+            request["payload"],
+            json!({
+                "provider": "gmail",
+                "account_id": "gmail-default",
+                "label_id": "Label_123",
+                "expected_revision": 3
+            })
+        );
+        assert!(request["payload"].get("display_name").is_none());
+        assert!(request["payload"].get("mailbox_identity_key").is_none());
     }
 
     #[cfg(unix)]
@@ -2556,6 +3111,221 @@ esac"#,
         assert!(check_started.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn mailbox_account_mutations_advance_stamped_check_revision() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *watcher.check*)
+    printf '%s\n' '{"protocol":1,"ok":false,"operation":"watcher.check","error":{"code":"gmail_authorization_rejected","message":"private provider detail","retryable":false}}'
+    ;;
+  *gmail.authorize*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"gmail.authorize","data":{"baseline_initialized":true,"connected":true}}'
+    ;;
+  *mail.accounts.list*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.list","data":{"providers":[],"accounts":[]}}'
+    ;;
+  *mail.accounts.connect*) operation=mail.accounts.connect ;;
+  *mail.accounts.reconnect*account_id*fail*)
+    printf '%s\n' '{"protocol":1,"ok":false,"operation":"mail.accounts.reconnect","error":{"code":"gmail_authorization_rejected","message":"safe reconnect failure","retryable":false}}'
+    ;;
+  *mail.accounts.reconnect*) operation=mail.accounts.reconnect ;;
+  *mail.accounts.disconnect*) operation=mail.accounts.disconnect ;;
+  *mail.accounts.activate*) operation=mail.accounts.activate ;;
+esac
+if [ -n "$operation" ]; then
+  printf '%s\n' "{\"protocol\":1,\"ok\":true,\"operation\":\"$operation\",\"data\":{\"account\":{\"provider\":\"gmail\",\"account_id\":\"gmail-default\",\"display_name\":\"Gmail\",\"address\":\"owner@example.com\",\"connected\":true,\"active\":true,\"last_check\":null},\"baseline_initialized\":false}}"
+fi"#,
+                ),
+                OsString::from("engine-mailbox-revision-probe"),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let initial_failure = engine
+            .check_with_mailbox_revision()
+            .expect_err("initial scheduled failure");
+        assert_eq!(initial_failure.mailbox_operation_revision, Some(0));
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("startup account catalog establishes revision zero")
+                .mailbox_operation_revision,
+            0
+        );
+
+        assert_eq!(
+            engine
+                .connect_mail_provider("gmail".into(), None)
+                .expect("connect account")
+                .mailbox_operation_revision,
+            1
+        );
+        let failed_reconnect = engine
+            .reconnect_mail_account("gmail".into(), "fail".into(), None)
+            .expect_err("failed reconnect");
+        assert_eq!(failed_reconnect.code, "gmail_authorization_rejected");
+        assert_eq!(failed_reconnect.retryable, Some(false));
+        assert_eq!(failed_reconnect.mailbox_operation_revision, Some(2));
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("failed mutation consumes its account revision")
+                .mailbox_operation_revision,
+            2
+        );
+        assert_eq!(
+            engine
+                .reconnect_mail_account("gmail".into(), "gmail-default".into(), None)
+                .expect("reconnect account")
+                .mailbox_operation_revision,
+            3
+        );
+        assert_eq!(
+            engine
+                .disconnect_mail_account("gmail".into(), "gmail-default".into())
+                .expect("disconnect account")
+                .mailbox_operation_revision,
+            4
+        );
+        assert_eq!(
+            engine
+                .activate_mail_account("gmail".into(), "gmail-default".into())
+                .expect("activate account")
+                .mailbox_operation_revision,
+            5
+        );
+        assert_eq!(
+            engine
+                .authorize_gmail()
+                .expect("authorize Gmail")
+                .mailbox_operation_revision,
+            6
+        );
+        assert_eq!(
+            engine
+                .mail_accounts()
+                .expect("read stamped account catalog")
+                .mailbox_operation_revision,
+            6
+        );
+
+        let current_failure = engine
+            .check_with_mailbox_revision()
+            .expect_err("current scheduled failure");
+        assert_eq!(current_failure.mailbox_operation_revision, Some(6));
+        assert_eq!(current_failure.code, "gmail_authorization_rejected");
+        assert_eq!(current_failure.retryable, Some(false));
+    }
+
+    #[test]
+    fn mailbox_mutation_error_after_partial_effect_consumes_and_stamps_revision() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let effect_ran = AtomicBool::new(false);
+
+        let error = engine
+            .complete_mailbox_mutation::<GmailAuthorization>(
+                || {
+                    effect_ran.store(true, Ordering::SeqCst);
+                    Err(EngineError {
+                        code: "gmail_authorization_rejected".into(),
+                        message: "safe reconnect failure".into(),
+                        retryable: Some(false),
+                        mailbox_operation_revision: None,
+                    })
+                },
+                |result, revision| result.mailbox_operation_revision = revision,
+            )
+            .expect_err("partial mutation must return its typed error");
+
+        assert!(effect_ran.load(Ordering::SeqCst));
+        assert_eq!(error.mailbox_operation_revision, Some(1));
+        assert_eq!(
+            serde_json::to_value(&error).expect("serialize typed mutation error"),
+            json!({
+                "code": "gmail_authorization_rejected",
+                "message": "safe reconnect failure",
+                "retryable": false,
+                "mailbox_operation_revision": 1,
+            })
+        );
+        assert_eq!(
+            engine
+                .mailbox_operation_gate
+                .lock()
+                .expect("mailbox state")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_mailbox_mutation_attempts_consume_distinct_revisions() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut attempts = Vec::new();
+        for succeeds in [true, false] {
+            let engine = engine.clone();
+            let start = Arc::clone(&start);
+            attempts.push(std::thread::spawn(move || {
+                start.wait();
+                engine.complete_mailbox_mutation(
+                    || {
+                        if succeeds {
+                            Ok(0_u64)
+                        } else {
+                            Err(EngineError::host("host_error", "mutation failed"))
+                        }
+                    },
+                    |result, revision| *result = revision,
+                )
+            }));
+        }
+        start.wait();
+
+        let mut revisions = attempts
+            .into_iter()
+            .map(|attempt| match attempt.join().expect("mutation thread") {
+                Ok(revision) => revision,
+                Err(error) => error
+                    .mailbox_operation_revision
+                    .expect("failed mutation revision"),
+            })
+            .collect::<Vec<_>>();
+        revisions.sort_unstable();
+        assert_eq!(revisions, [1, 2]);
+    }
+
+    #[test]
+    fn mailbox_mutation_revision_overflow_rejects_before_operation() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+        engine
+            .mailbox_operation_gate
+            .lock()
+            .expect("mailbox state")
+            .revision = u64::MAX;
+        let effect_ran = AtomicBool::new(false);
+
+        let error = engine
+            .complete_mailbox_mutation(
+                || {
+                    effect_ran.store(true, Ordering::SeqCst);
+                    Ok(0_u64)
+                },
+                |result, revision| *result = revision,
+            )
+            .expect_err("revision exhaustion must fail closed");
+
+        assert_eq!(error.code, "host_error");
+        assert_eq!(error.mailbox_operation_revision, None);
+        assert!(!effect_ran.load(Ordering::SeqCst));
+    }
+
     fn real_engine(config_path: PathBuf) -> Engine {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2675,6 +3445,7 @@ notifications_enabled = true
         );
         assert!(!health.gmail.credentials_configured);
         assert!(!health.gmail.connected);
+        assert!(!health.gmail.label_watch_configured);
         assert_eq!(accounts.accounts.len(), 1);
         assert_eq!(accounts.accounts[0].provider, "gmail");
         assert_eq!(accounts.accounts[0].account_id, "gmail-default");
@@ -2778,6 +3549,7 @@ notifications_enabled = true
             engine.check().expect("inactive check without Gmail"),
             CheckResult {
                 active: false,
+                reason: None,
                 discovered: 0,
                 summarized: 0,
                 fallback_notified: 0,
@@ -2786,6 +3558,10 @@ notifications_enabled = true
                 pending_notifications: 0,
                 automation_processed: 0,
                 automation_review_required: 0,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             }
         );
         assert_eq!(engine.list().expect("list empty watchlist"), vec![]);
@@ -2910,6 +3686,7 @@ notifications_enabled = true
             WatchedSender {
                 email: "watched@example.com".into(),
                 name: Some("Watched".into()),
+                admission_active: true,
             }
         );
         assert_eq!(engine.list().expect("list sender"), vec![added]);

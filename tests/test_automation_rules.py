@@ -19,6 +19,7 @@ from eom_email_watcher.automation.rules import (
     parse_rule_definition,
 )
 from eom_email_watcher.db import (
+    AdmissionProvenance,
     AutomationRuleLimitExceeded,
     AutomationRuleNotFound,
     AutomationRuleStale,
@@ -82,6 +83,20 @@ def initialized_store(tmp_path: Path) -> Store:
     return store
 
 
+def exact_sender_admission(
+    sender: str,
+    sender_name: str | None,
+    mailbox_identity_key: str,
+) -> AdmissionProvenance:
+    return AdmissionProvenance(
+        kind="exact_sender",
+        selector_id=f"sender:{sender}",
+        display_name=sender_name,
+        mailbox_identity_key=mailbox_identity_key,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
+
+
 def add_invoice_message(store: Store, message_id: str = "message-1") -> None:
     assert store.add_message(
         message_id=message_id,
@@ -94,6 +109,9 @@ def add_invoice_message(store: Store, message_id: str = "message-1") -> None:
         sender_name="Billing",
         subject="Invoice 42",
         received_at="2026-09-12T12:00:00+00:00",
+        admission=exact_sender_admission(
+            "billing@example.com", "Billing", MAILBOX_IDENTITY_KEY
+        ),
     )
     store.replace_attachments(
         message_id,
@@ -733,6 +751,9 @@ def test_replacement_identity_reuses_provider_message_id_as_a_new_source(
         sender_name="Billing",
         subject="Replacement mailbox invoice",
         received_at="2026-09-12T12:02:00+00:00",
+        admission=exact_sender_admission(
+            "billing@example.com", "Billing", replacement_identity
+        ),
     )
     assert not store.add_message(
         message_id="replacement-replay",
@@ -745,6 +766,9 @@ def test_replacement_identity_reuses_provider_message_id_as_a_new_source(
         sender_name="Billing",
         subject="Replay",
         received_at="2026-09-12T12:03:00+00:00",
+        admission=exact_sender_admission(
+            "billing@example.com", "Billing", replacement_identity
+        ),
     )
     with store.connection() as db:
         identities = db.execute(
@@ -908,6 +932,9 @@ def test_old_mailbox_session_cannot_mutate_after_identity_replacement(tmp_path: 
             sender_name="Billing",
             subject="Stale session",
             received_at="2026-09-12T12:05:00+00:00",
+            admission=exact_sender_admission(
+                "billing@example.com", "Billing", MAILBOX_IDENTITY_KEY
+            ),
         )
     with pytest.raises(MailboxIdentityChanged, match="mailbox identity changed"):
         store.set_state("101", mailbox_identity_key=MAILBOX_IDENTITY_KEY)

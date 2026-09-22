@@ -12,6 +12,7 @@ from eom_email_watcher.config import (
     InvalidSettingsUpdateError,
     SenderNotFoundError,
     add_sender,
+    exact_sender_selector_id,
     initialize_config,
     load_config,
     normalize_address,
@@ -341,6 +342,88 @@ def test_watchlist_round_trip_preserves_config_and_normalizes_addresses(
 
     assert removed == added
     assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+
+
+def test_sender_name_is_bounded_on_new_writes_but_legacy_names_remain_editable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+
+    accepted_name = "é" * 512
+    accepted = add_sender(path, "accepted@example.com", accepted_name)
+    assert accepted.name == accepted_name
+
+    original = path.read_bytes()
+    with pytest.raises(InvalidSenderError, match="at most 1024 UTF-8 bytes"):
+        add_sender(path, "rejected@example.com", ("é" * 512) + "a")
+    assert path.read_bytes() == original
+
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '\n[[senders]]\nemail = "legacy@example.com"\nname = "'
+        + (("é" * 512) + "a")
+        + '"\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+    legacy = next(sender for sender in loaded.senders if sender.email == "legacy@example.com")
+    assert legacy.name == ("é" * 512) + "a"
+
+    removed = remove_sender(path, "legacy@example.com")
+    assert removed == legacy
+    shortened = add_sender(path, "legacy@example.com", "é" * 512)
+    assert shortened.name == "é" * 512
+    assert len(shortened.name.encode("utf-8")) == 1024
+
+
+@pytest.mark.parametrize(
+    ("accepted", "rejected"),
+    [
+        (
+            f"{'A' * 493}@EXAMPLE.COM",
+            f"{'A' * 494}@EXAMPLE.COM",
+        ),
+        (
+            f"{'é' * 246}a@example.com",
+            f"{'é' * 246}ab@example.com",
+        ),
+        (
+            f"{'A' * 483}@XN--BCHER-KVA.EXAMPLE",
+            f"{'A' * 484}@XN--BCHER-KVA.EXAMPLE",
+        ),
+    ],
+)
+def test_exact_sender_selector_utf8_boundary_after_canonicalization(
+    tmp_path: Path,
+    accepted: str,
+    rejected: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path, include_sender=False)
+
+    added = add_sender(path, accepted)
+    assert len(exact_sender_selector_id(added.email).encode("utf-8")) == 512
+
+    original = path.read_bytes()
+    with pytest.raises(InvalidSenderError, match="admission selector"):
+        add_sender(path, rejected)
+    assert path.read_bytes() == original
+
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f'\n[[senders]]\nemail = "{rejected}"\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+    legacy = next(sender for sender in loaded.senders if sender.email == rejected.casefold())
+    assert legacy.name is None
+    assert legacy.email not in loaded.allowlist
+
+    removed = remove_sender(path, rejected)
+    assert removed == legacy
+    replacement = add_sender(path, "replacement@example.com")
+    assert replacement.email == "replacement@example.com"
 
 
 def test_watchlist_duplicate_and_missing_removal_do_not_change_config(tmp_path: Path) -> None:

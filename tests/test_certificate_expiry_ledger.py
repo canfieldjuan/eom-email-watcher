@@ -1560,7 +1560,7 @@ def test_schema_24_migrates_certificate_ledger_tables(tmp_path: Path) -> None:
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert db.execute("PRAGMA user_version").fetchone()[0] == db_module.SCHEMA_VERSION
         tables = {
             row[0]
             for row in db.execute(

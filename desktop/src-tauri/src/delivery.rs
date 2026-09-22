@@ -68,6 +68,7 @@ pub struct DeliveryOutcome {
 pub struct CoordinatedCheck {
     pub check: CheckResult,
     pub delivery: DeliveryOutcome,
+    pub mailbox_operation_revision: u64,
 }
 
 fn deliver_batch(
@@ -103,18 +104,26 @@ fn check_and_deliver(
 ) -> Result<CoordinatedCheck, EngineError> {
     let check = queue.check();
     let delivery = deliver_batch(queue, sink);
-    coordinated_result(check, delivery)
+    coordinated_result(check, delivery, 0)
 }
 
 fn coordinated_result(
     check: Result<CheckResult, EngineError>,
     delivery: Result<DeliveryOutcome, EngineError>,
+    mailbox_operation_revision: u64,
 ) -> Result<CoordinatedCheck, EngineError> {
     match check {
-        Ok(check) => Ok(CoordinatedCheck {
-            check,
-            delivery: delivery?,
-        }),
+        Ok(check) => match delivery {
+            Ok(delivery) => Ok(CoordinatedCheck {
+                check,
+                delivery,
+                mailbox_operation_revision,
+            }),
+            Err(mut error) => {
+                error.mailbox_operation_revision = Some(mailbox_operation_revision);
+                Err(error)
+            }
+        },
         Err(error) => {
             if let Err(delivery_error) = delivery {
                 eprintln!(
@@ -166,10 +175,16 @@ impl NotificationDelivery {
         engine: &Engine,
     ) -> Result<CoordinatedCheck, EngineError> {
         self.run_exclusive(|| {
-            let check = engine.check();
+            let (check, mailbox_operation_revision) = match engine.check_with_mailbox_revision() {
+                Ok(result) => (Ok(result.check), result.mailbox_operation_revision),
+                Err(error) => {
+                    let revision = error.mailbox_operation_revision.unwrap_or_default();
+                    (Err(error), revision)
+                }
+            };
             let delivery = engine
                 .run_with_operation_lock(|| deliver_batch(engine, &TauriNotificationSink { app }));
-            coordinated_result(check, delivery)
+            coordinated_result(check, delivery, mailbox_operation_revision)
         })
     }
 }
@@ -196,6 +211,7 @@ mod tests {
             }
             Ok(CheckResult {
                 active: true,
+                reason: None,
                 discovered: 0,
                 summarized: 0,
                 fallback_notified: 0,
@@ -204,6 +220,10 @@ mod tests {
                 pending_notifications: self.check_pending,
                 automation_processed: 0,
                 automation_review_required: 0,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
             })
         }
 

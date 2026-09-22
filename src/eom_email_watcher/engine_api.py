@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -70,6 +71,8 @@ from .db import (
     ConnectJob,
     ConnectOutput,
     ConnectQueueFull,
+    GmailLabelSelector,
+    GmailLabelStoreError,
     MailAccount,
     MailboxIdentityChanged,
     MessageSource,
@@ -81,6 +84,11 @@ from .gmail import (
     GmailAuthorizationRejected,
     GmailError,
     GmailGateway,
+    GmailLabel,
+    GmailLabelCatalogInvalid,
+    GmailLabelCatalogUnavailable,
+    GmailRecoveryPageInvalid,
+    GmailRecoveryPageTokenInvalid,
     gmail_credentials_configured,
 )
 from .imap import (
@@ -102,7 +110,9 @@ from .mailbox import (
     MailboxError,
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
+    MailboxSession,
     mailbox_polling_session,
+    mailbox_session_identity_key,
 )
 from .microsoft365 import (
     MICROSOFT365_PROVIDER,
@@ -859,6 +869,433 @@ def _with_mail_account_mutation(
         return operation(_runtime(request))
 
 
+def _gmail_label_account_key(payload: dict[str, object]) -> tuple[str, str]:
+    provider = payload.get("provider")
+    if provider != DEFAULT_MAIL_PROVIDER:
+        if not isinstance(provider, str) or not provider:
+            raise ApiError("invalid_request", "provider must equal gmail")
+        raise ApiError("unsupported_provider", "Gmail labels require provider gmail")
+    account_id = payload.get("account_id")
+    if (
+        not isinstance(account_id, str)
+        or not account_id
+        or len(account_id.encode("utf-8")) > 128
+    ):
+        raise ApiError("invalid_request", "account_id must be a non-empty bounded string")
+    return provider, account_id
+
+
+def _gmail_label_revision(payload: dict[str, object]) -> int:
+    revision = payload.get("expected_revision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or revision > 2**63 - 1
+    ):
+        raise ApiError("invalid_request", "expected_revision must be a non-negative integer")
+    return revision
+
+
+def _require_active_gmail_label_account(
+    runtime: Runtime,
+    payload: dict[str, object],
+    *,
+    require_connected: bool = True,
+) -> MailAccount:
+    provider, account_id = _gmail_label_account_key(payload)
+    account = runtime.store.mail_account(provider, account_id)
+    if account is None:
+        raise ApiError("not_found", "The Gmail account was not found")
+    active = runtime.store.active_mail_account()
+    if active is None or (active.provider, active.account_id) != (provider, account_id):
+        raise ApiError("account_not_active", "The Gmail account is not active")
+    if require_connected and not mail_account_connected(runtime.config, account):
+        raise ApiError("account_unavailable", "The active Gmail account is disconnected")
+    return account
+
+
+def _gmail_label_store_error(error: GmailLabelStoreError) -> ApiError:
+    if error.code == "gmail_selector_revision_overflow":
+        return ApiError("conflict", "The Gmail label revision cannot advance")
+    messages = {
+        "conflict": "That Gmail label is already selected",
+        "limit_exceeded": "At most 100 Gmail labels can be selected",
+        "not_found": "The Gmail label selector was not found",
+        "stale_revision": "Gmail label settings changed; refresh and retry",
+    }
+    return ApiError(error.code, messages.get(error.code, "Gmail label settings could not change"))
+
+
+def _gmail_label_catalog_error(error: GmailError) -> ApiError:
+    if isinstance(error, GmailLabelCatalogInvalid):
+        return ApiError(error.code, "Gmail returned an invalid label catalog", retryable=False)
+    if isinstance(error, GmailLabelCatalogUnavailable):
+        return ApiError(error.code, "Gmail labels are temporarily unavailable", retryable=True)
+    if isinstance(error, GmailAuthorizationRejected):
+        return ApiError(
+            error.code,
+            "Gmail authorization was rejected; reconnect the account",
+            retryable=False,
+        )
+    return ApiError("account_unavailable", "The active Gmail account could not be opened")
+
+
+def _gmail_label_operation(
+    request: dict[str, object],
+    operation: Callable[[Runtime], dict[str, object]],
+) -> dict[str, object]:
+    config = load_config(_config_path(request))
+    lock_path = _production_check_lock_path(config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Gmail label settings require native operation locking",
+        )
+    try:
+        with operation_lock(lock_path, "Another mailbox operation is already running"):
+            return operation(_runtime(request))
+    except OperationLockBusy as exc:
+        raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
+
+
+def _gmail_label_session(
+    runtime: Runtime,
+    payload: dict[str, object],
+) -> tuple[MailAccount, MailboxSession, str]:
+    account = _require_active_gmail_label_account(runtime, payload)
+    try:
+        mailbox = load_mailbox_account(
+            runtime.config,
+            runtime.store,
+            account.provider,
+            account.account_id,
+        )
+        with mailbox_polling_session(mailbox.gateway):
+            identity_key = reconcile_mailbox_session_identity(
+                runtime.store,
+                mailbox,
+                dry_run=False,
+            )
+    except MailboxIdentityChanged as exc:
+        raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed") from exc
+    except GmailAuthorizationRejected as exc:
+        raise _gmail_label_catalog_error(exc) from exc
+    except MailboxError as exc:
+        raise ApiError(
+            "account_unavailable",
+            "The active Gmail account could not be opened",
+        ) from exc
+    return account, mailbox, identity_key
+
+
+def _read_gmail_label_catalog(mailbox: MailboxSession) -> tuple[GmailLabel, ...]:
+    gateway = getattr(mailbox, "gateway", None)
+    reader = getattr(gateway, "label_catalog", None)
+    if not callable(reader):
+        raise ApiError("account_unavailable", "The active account is not a Gmail account")
+    try:
+        with mailbox_polling_session(gateway):
+            return reader()
+    except GmailError as exc:
+        raise _gmail_label_catalog_error(exc) from exc
+
+
+def _gmail_selector_public(
+    selector: GmailLabelSelector,
+    *,
+    status: str,
+    display_name: str,
+) -> dict[str, object]:
+    return {
+        "selector_id": selector.selector_id,
+        "label_id": selector.label_id,
+        "display_name": display_name,
+        "status": status,
+        "admission_active": status == "active",
+    }
+
+
+def _gmail_labels_catalog(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id"})
+    _gmail_label_account_key(payload)
+
+    def catalog(runtime: Runtime) -> dict[str, object]:
+        validation_scope: tuple[str, str, int] | None = None
+
+        def record_failure(error: ApiError) -> None:
+            if validation_scope is None:
+                return
+            if error.code == "gmail_label_catalog_invalid":
+                try:
+                    runtime.store.persist_gmail_label_invalid_catalog(*validation_scope)
+                except (GmailLabelStoreError, MailboxIdentityChanged):
+                    # The failure belongs to an older selector revision or identity.
+                    return
+            else:
+                runtime.store.invalidate_gmail_label_validation(*validation_scope)
+
+        try:
+            stored_account = _require_active_gmail_label_account(
+                runtime,
+                payload,
+                require_connected=False,
+            )
+            if stored_account.mailbox_identity_key is not None:
+                stored_set = runtime.store.gmail_label_selector_set(stored_account.account_id)
+                if (
+                    stored_set is not None
+                    and stored_set.current_mailbox_identity_key
+                    == stored_account.mailbox_identity_key
+                ):
+                    validation_scope = (
+                        stored_account.account_id,
+                        stored_account.mailbox_identity_key,
+                        stored_set.revision,
+                    )
+            account, mailbox, identity_key = _gmail_label_session(runtime, payload)
+            selector_set = runtime.store.gmail_label_selector_set(account.account_id)
+            if selector_set is None or selector_set.current_mailbox_identity_key != identity_key:
+                raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed")
+            validation_scope = (account.account_id, identity_key, selector_set.revision)
+            labels = _read_gmail_label_catalog(mailbox)
+        except ApiError as exc:
+            record_failure(exc)
+            raise
+        try:
+            validation = runtime.store.persist_gmail_label_validation(
+                account.account_id,
+                identity_key,
+                selector_set.revision,
+                tuple(
+                    (label.label_id, label.display_name, label.label_type) for label in labels
+                ),
+            )
+        except ValueError as exc:
+            invalid = ApiError(
+                "gmail_label_catalog_invalid",
+                "Gmail returned an invalid label catalog",
+                retryable=False,
+            )
+            record_failure(invalid)
+            raise invalid from exc
+        except GmailLabelStoreError as exc:
+            raise _gmail_label_store_error(exc) from exc
+        except MailboxIdentityChanged as exc:
+            raise ApiError(
+                "mailbox_identity_changed",
+                "The Gmail mailbox identity changed",
+            ) from exc
+        selectors = {item.label_id: item for item in validation.selectors}
+        items = [
+            {
+                "label_id": label.label_id,
+                "display_name": label.display_name,
+                "selected": label.label_id in selectors,
+                "selector_id": (
+                    selectors[label.label_id].selector_id if label.label_id in selectors else None
+                ),
+            }
+            for label in labels
+            if label.label_type == "user"
+        ]
+        items.sort(key=lambda item: (str(item["display_name"]), str(item["label_id"])))
+        return {
+            "provider": DEFAULT_MAIL_PROVIDER,
+            "account_id": account.account_id,
+            "revision": validation.selector_revision,
+            "items": items,
+        }
+
+    return _gmail_label_operation(request, catalog)
+
+
+def _gmail_label_selectors_list(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"provider", "account_id"})
+    _gmail_label_account_key(payload)
+
+    def list_selectors(runtime: Runtime) -> dict[str, object]:
+        account = _require_active_gmail_label_account(
+            runtime,
+            payload,
+            require_connected=False,
+        )
+        identity_key = account.mailbox_identity_key
+        if identity_key is None:
+            raise ApiError(
+                "account_unavailable",
+                "The active Gmail account has no stored mailbox identity",
+            )
+        selector_set = runtime.store.gmail_label_selector_set(account.account_id)
+        if selector_set is None:
+            return {
+                "provider": DEFAULT_MAIL_PROVIDER,
+                "account_id": account.account_id,
+                "revision": 0,
+                "catalog_state": "unavailable",
+                "items": [],
+            }
+        selectors = runtime.store.gmail_label_selectors(account.account_id)
+        selector_set_is_current = selector_set.current_mailbox_identity_key == identity_key
+        validation = (
+            runtime.store.gmail_label_validation_snapshot(
+                account.account_id,
+                identity_key,
+                selector_set.revision,
+            )
+            if selector_set_is_current
+            else None
+        )
+        validated_by_selector = (
+            {item.selector_id: item for item in validation.selectors}
+            if validation is not None and validation.catalog_state == "current"
+            else {}
+        )
+        catalog_state = validation.catalog_state if validation is not None else "unavailable"
+        items: list[dict[str, object]] = []
+        for selector in selectors:
+            if not selector_set_is_current or selector.mailbox_identity_key != identity_key:
+                status = "identity_mismatch"
+                display_name = selector.selected_display_name
+            elif selector.selector_id not in validated_by_selector:
+                status = "validation_unavailable"
+                display_name = selector.selected_display_name
+            else:
+                validated = validated_by_selector[selector.selector_id]
+                status = validated.status
+                display_name = validated.display_name
+            items.append(
+                _gmail_selector_public(
+                    selector,
+                    status=status,
+                    display_name=display_name,
+                )
+            )
+        return {
+            "provider": DEFAULT_MAIL_PROVIDER,
+            "account_id": account.account_id,
+            "revision": selector_set.revision,
+            "catalog_state": catalog_state,
+            "items": items,
+        }
+
+    return _gmail_label_operation(request, list_selectors)
+
+
+def _gmail_label_selector_add(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {"provider", "account_id", "label_id", "expected_revision"},
+    )
+    _gmail_label_account_key(payload)
+    revision = _gmail_label_revision(payload)
+    label_id = payload.get("label_id")
+    if (
+        not isinstance(label_id, str)
+        or not label_id
+        or len(label_id.encode("utf-8")) > 512
+        or any(unicodedata.category(character) == "Cc" for character in label_id)
+    ):
+        raise ApiError("invalid_request", "label_id is invalid")
+
+    def add_selector(runtime: Runtime) -> dict[str, object]:
+        account, mailbox, identity_x = _gmail_label_session(runtime, payload)
+        labels = _read_gmail_label_catalog(mailbox)
+        selected = next((label for label in labels if label.label_id == label_id), None)
+        if selected is None:
+            raise ApiError("label_not_found", "That Gmail label no longer exists")
+        if selected.label_type != "user":
+            raise ApiError("label_not_user", "Only Gmail user labels can be selected")
+        try:
+            reopened = load_mailbox_account(
+                runtime.config,
+                runtime.store,
+                account.provider,
+                account.account_id,
+            )
+            with mailbox_polling_session(reopened.gateway):
+                identity_y = mailbox_session_identity_key(reopened)
+        except GmailAuthorizationRejected as exc:
+            raise _gmail_label_catalog_error(exc) from exc
+        except MailboxError as exc:
+            raise ApiError(
+                "account_unavailable",
+                "The active Gmail account could not be reopened",
+            ) from exc
+        if identity_y != identity_x:
+            raise ApiError("mailbox_identity_changed", "The Gmail mailbox identity changed")
+        try:
+            new_revision, selector = runtime.store.add_gmail_label_selector(
+                account.account_id,
+                identity_y,
+                selected.label_id,
+                selected.display_name,
+                revision,
+            )
+        except GmailLabelStoreError as exc:
+            raise _gmail_label_store_error(exc) from exc
+        except MailboxIdentityChanged as exc:
+            raise ApiError(
+                "mailbox_identity_changed",
+                "The Gmail mailbox identity changed",
+            ) from exc
+        except ValueError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        return {
+            "revision": new_revision,
+            "item": _gmail_selector_public(
+                selector,
+                status="active",
+                display_name=selected.display_name,
+            ),
+        }
+
+    return _gmail_label_operation(request, add_selector)
+
+
+def _gmail_label_selector_remove(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(
+        request,
+        {"provider", "account_id", "selector_id", "expected_revision"},
+    )
+    _gmail_label_account_key(payload)
+    revision = _gmail_label_revision(payload)
+    selector_id = payload.get("selector_id")
+    try:
+        if (
+            not isinstance(selector_id, str)
+            or str(uuid.UUID(selector_id, version=4)) != selector_id
+        ):
+            raise ValueError
+    except (AttributeError, ValueError) as exc:
+        raise ApiError("invalid_request", "selector_id must be a canonical UUIDv4") from exc
+
+    def remove_selector(runtime: Runtime) -> dict[str, object]:
+        account = _require_active_gmail_label_account(runtime, payload)
+        identity_key = account.mailbox_identity_key
+        if identity_key is None:
+            raise ApiError("account_unavailable", "The active Gmail identity is unavailable")
+        try:
+            new_revision = runtime.store.remove_gmail_label_selector(
+                account.account_id,
+                identity_key,
+                selector_id,
+                revision,
+            )
+        except GmailLabelStoreError as exc:
+            raise _gmail_label_store_error(exc) from exc
+        except MailboxIdentityChanged as exc:
+            raise ApiError(
+                "mailbox_identity_changed",
+                "The Gmail mailbox identity changed",
+            ) from exc
+        except ValueError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        return {"revision": new_revision, "removed_selector_id": selector_id}
+
+    return _gmail_label_operation(request, remove_selector)
+
+
 def _health(request: dict[str, object]) -> dict[str, object]:
     _payload(request)
     runtime = _runtime(request)
@@ -880,11 +1317,33 @@ def _health(request: dict[str, object]) -> dict[str, object]:
         and active_account.provider == DEFAULT_MAIL_PROVIDER
         and mail_account_connected(config, active_account)
     )
+    gmail_label_watch_configured = False
+    if (
+        active_account is not None
+        and active_account.provider == DEFAULT_MAIL_PROVIDER
+        and active_account.mailbox_identity_key is not None
+    ):
+        selector_set = runtime.store.gmail_label_selector_set(active_account.account_id)
+        if (
+            selector_set is not None
+            and selector_set.current_mailbox_identity_key
+            == active_account.mailbox_identity_key
+        ):
+            selectors = runtime.store.gmail_current_label_selectors(
+                active_account.account_id,
+                active_account.mailbox_identity_key,
+            )
+            recovery = runtime.store.gmail_recovery_state(active_account.account_id)
+            gmail_label_watch_configured = bool(selectors) or bool(
+                recovery is not None
+                and recovery.mailbox_identity_key == active_account.mailbox_identity_key
+            )
     return {
         "database": {"ok": True, "initialized": state is not None},
         "gmail": {
             "credentials_configured": gmail_credentials_configured(config.gmail_credentials_file),
             "connected": gmail_connected,
+            "label_watch_configured": gmail_label_watch_configured,
         },
         "last_check": state[1] if state else None,
         "mail": mail,
@@ -905,7 +1364,7 @@ def _health(request: dict[str, object]) -> dict[str, object]:
             "ntfy_configured": config.ntfy_topic is not None,
         },
         "production_check_supported": production_check_supported,
-        "watchlist_count": len(config.senders),
+        "watchlist_count": len(config.allowlist),
     }
 
 
@@ -4903,14 +5362,36 @@ def _watchlist(request: dict[str, object]) -> dict[str, object]:
     config = load_config(_config_path(request))
     return {
         "items": [
-            {"email": sender.email, "name": sender.name}
+            _sender_data(sender, admission_active=sender.email in config.allowlist)
             for sender in sorted(config.senders, key=lambda item: item.email)
         ]
     }
 
 
-def _sender_data(sender: Sender) -> dict[str, str | None]:
-    return {"email": sender.email, "name": sender.name}
+def _sender_data(sender: Sender, *, admission_active: bool) -> dict[str, str | bool | None]:
+    return {
+        "email": sender.email,
+        "name": sender.name,
+        "admission_active": admission_active,
+    }
+
+
+def _with_watchlist_mutation(
+    request: dict[str, object],
+    operation: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    config = load_config(_config_path(request))
+    lock_path = _production_check_lock_path(config)
+    if not operation_lock_supported(lock_path):
+        raise ApiError(
+            "unsupported_platform",
+            "Watchlist changes require native operation locking",
+        )
+    try:
+        with operation_lock(lock_path, "Another mailbox operation is already running"):
+            return operation()
+    except OperationLockBusy as exc:
+        raise ApiError("mailbox_busy", str(exc), retryable=True) from exc
 
 
 def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
@@ -4921,13 +5402,16 @@ def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_request", "email must be a non-empty string")
     if name is not None and not isinstance(name, str):
         raise ApiError("invalid_request", "name must be a string or null")
-    try:
-        sender = add_sender(_config_path(request), email, name)
-    except InvalidSenderError as exc:
-        raise ApiError("invalid_request", str(exc)) from exc
-    except DuplicateSenderError as exc:
-        raise ApiError("conflict", str(exc)) from exc
-    return {"item": _sender_data(sender)}
+    def add() -> dict[str, object]:
+        try:
+            sender = add_sender(_config_path(request), email, name)
+        except InvalidSenderError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        except DuplicateSenderError as exc:
+            raise ApiError("conflict", str(exc)) from exc
+        return {"item": _sender_data(sender, admission_active=True)}
+
+    return _with_watchlist_mutation(request, add)
 
 
 def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
@@ -4935,13 +5419,22 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     email = payload.get("email")
     if not isinstance(email, str) or not email.strip():
         raise ApiError("invalid_request", "email must be a non-empty string")
-    try:
-        sender = remove_sender(_config_path(request), email)
-    except InvalidSenderError as exc:
-        raise ApiError("invalid_request", str(exc)) from exc
-    except SenderNotFoundError as exc:
-        raise ApiError("not_found", str(exc)) from exc
-    return {"item": _sender_data(sender)}
+    def remove() -> dict[str, object]:
+        config = load_config(_config_path(request))
+        try:
+            sender = remove_sender(_config_path(request), email)
+        except InvalidSenderError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
+        except SenderNotFoundError as exc:
+            raise ApiError("not_found", str(exc)) from exc
+        return {
+            "item": _sender_data(
+                sender,
+                admission_active=sender.email in config.allowlist,
+            )
+        }
+
+    return _with_watchlist_mutation(request, remove)
 
 
 def _settings_data(config: Config) -> dict[str, object]:
@@ -5198,6 +5691,10 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.output.present": _connect_output_present,
     "connect.queue.pump": _connect_queue_pump,
     "gmail.authorize": _gmail_authorize,
+    "gmail.label_selectors.add": _gmail_label_selector_add,
+    "gmail.label_selectors.list": _gmail_label_selectors_list,
+    "gmail.label_selectors.remove": _gmail_label_selector_remove,
+    "gmail.labels.catalog": _gmail_labels_catalog,
     "health.get": _health,
     "host.operation_lock": _host_operation_lock,
     "inbox.clear": _inbox_clear,
@@ -5273,6 +5770,43 @@ def _response(request: object) -> dict[str, object]:
             "operation": operation,
             "protocol": PROTOCOL_VERSION,
         }
+    except GmailAuthorizationRejected:
+        logger.warning("Gmail authorization was rejected")
+        return {
+            "error": {
+                "code": GmailAuthorizationRejected.code,
+                "message": "Gmail authorization was rejected; reconnect the account",
+                "retryable": False,
+            },
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except (
+        GmailLabelCatalogInvalid,
+        GmailLabelCatalogUnavailable,
+        GmailRecoveryPageInvalid,
+        GmailRecoveryPageTokenInvalid,
+    ) as exc:
+        messages = {
+            "gmail_label_catalog_invalid": "Gmail returned an invalid label catalog",
+            "gmail_label_catalog_unavailable": "Gmail labels are temporarily unavailable",
+            "gmail_recovery_page_invalid": "Gmail returned an invalid recovery page",
+            "gmail_recovery_page_token_invalid": (
+                "Gmail rejected the saved recovery page token"
+            ),
+        }
+        logger.warning("Gmail operation failed with stable code %s", exc.code)
+        return {
+            "error": {
+                "code": exc.code,
+                "message": messages[exc.code],
+                "retryable": not isinstance(exc, GmailLabelCatalogInvalid),
+            },
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
     except GmailError as exc:
         logger.warning("Gmail operation failed: %s", exc)
         return {
@@ -5307,6 +5841,33 @@ def _response(request: object) -> dict[str, object]:
         logger.warning("Connect operation failed (%s): %s", exc.code, exc)
         return {
             "error": {"code": exc.code.casefold(), "message": str(exc)},
+            "ok": False,
+            "operation": operation,
+            "protocol": PROTOCOL_VERSION,
+        }
+    except GmailLabelStoreError as exc:
+        recovery_messages = {
+            "gmail_recovery_snapshot_too_large": (
+                "Gmail recovery settings are too large to snapshot safely"
+            ),
+            "gmail_recovery_counter_overflow": (
+                "Gmail recovery stopped at its storage integrity boundary"
+            ),
+        }
+        if exc.code in recovery_messages:
+            logger.warning("Gmail recovery failed with stable code %s", exc.code)
+            return {
+                "error": {
+                    "code": exc.code,
+                    "message": recovery_messages[exc.code],
+                    "retryable": False,
+                },
+                "ok": False,
+                "operation": operation,
+                "protocol": PROTOCOL_VERSION,
+            }
+        return {
+            "error": {"code": "runtime_error", "message": str(exc)},
             "ok": False,
             "operation": operation,
             "protocol": PROTOCOL_VERSION,

@@ -23,6 +23,7 @@ import "./styles.css";
 interface WatchedSender {
   email: string;
   name: string | null;
+  admission_active: boolean;
 }
 
 interface InboxAttachment {
@@ -179,6 +180,14 @@ interface InboxItem {
   analysis_retry_after_seconds: number | null;
   attachments: InboxAttachment[];
   calendar_proposal: CalendarProposalPreview | null;
+  admission: InboxAdmission | null;
+}
+
+interface InboxAdmission {
+  kind: "exact_sender" | "gmail_user_label";
+  selector_id: string;
+  display_name: string | null;
+  admitted_at: string;
 }
 
 interface CalendarProposalPreview {
@@ -304,14 +313,78 @@ interface MailAccountStatus {
   last_check: string | null;
 }
 
+interface GmailLabelCatalogItem {
+  label_id: string;
+  display_name: string;
+  selected: boolean;
+  selector_id: string | null;
+}
+
+interface GmailLabelCatalog {
+  provider: "gmail";
+  account_id: string;
+  revision: number;
+  items: GmailLabelCatalogItem[];
+}
+
+type GmailLabelSelectorStatus =
+  | "active"
+  | "deleted"
+  | "not_user"
+  | "identity_mismatch"
+  | "validation_unavailable";
+
+interface GmailLabelSelector {
+  selector_id: string;
+  label_id: string;
+  display_name: string;
+  status: GmailLabelSelectorStatus;
+  admission_active: boolean;
+}
+
+interface GmailLabelSelectors {
+  provider: "gmail";
+  account_id: string;
+  revision: number;
+  catalog_state: "current" | "unavailable" | "invalid_catalog";
+  items: GmailLabelSelector[];
+}
+
+interface GmailLabelSelectorAdded {
+  revision: number;
+  item: GmailLabelSelector;
+}
+
+interface GmailLabelSelectorRemoved {
+  revision: number;
+  removed_selector_id: string;
+}
+
+interface GmailLabelPollingHealth {
+  watchlist_count: number;
+  polling: HealthStatus["polling"];
+}
+
+interface GmailLabelPollingState {
+  active: boolean;
+  message: string;
+}
+
+interface GmailLabelSenderCountState {
+  count: number | null;
+  observation_version: number;
+}
+
 interface MailAccounts {
   providers: MailProviderStatus[];
   accounts: MailAccountStatus[];
+  mailbox_operation_revision?: number;
 }
 
 interface MailAccountResult {
   account: MailAccountStatus;
   baseline_initialized?: boolean;
+  mailbox_operation_revision: number;
 }
 
 interface CalendarConsentEntry {
@@ -329,6 +402,7 @@ interface HealthStatus {
   gmail: {
     credentials_configured: boolean;
     connected: boolean;
+    label_watch_configured: boolean;
   };
   mail: MailAccounts;
   last_check: string | null;
@@ -355,8 +429,16 @@ interface HealthStatus {
   };
 }
 
-interface CheckResult {
+interface GmailRecoveryStatus {
+  recovery_pending?: boolean;
+  recovery_state?: string;
+  recovery_failure_code?: string;
+  recovery_next_retry_at?: string;
+}
+
+interface CheckResult extends GmailRecoveryStatus {
   active: boolean;
+  reason?: string;
   discovered: number;
   summarized: number;
   fallback_notified: number;
@@ -366,6 +448,20 @@ interface CheckResult {
   delivered_notifications: number;
   failed_notifications: number;
   remaining_notifications: number;
+}
+
+interface ScheduledCheckEvent extends GmailRecoveryStatus {
+  mailbox_operation_revision?: number;
+  status: "complete" | "delivery_failed" | "check_failed" | "recovery_pending" | "inactive";
+  failed_notifications: number;
+  reason?: string;
+  error_code?: string;
+  error_retryable?: boolean;
+}
+
+interface MailboxEffectScope {
+  mutation_epoch: number;
+  mailbox_operation_revision: number;
 }
 
 interface WatcherSettings {
@@ -407,7 +503,7 @@ app.innerHTML = `
     <header class="intro">
       <p class="eyebrow">Local email watcher</p>
       <h1>Your signal inbox</h1>
-      <p class="lede">Only messages from people on your watchlist appear here.</p>
+      <p class="lede">Only messages from watched senders or Gmail labels appear here.</p>
     </header>
 
     <nav class="view-tabs" aria-label="Watcher views">
@@ -689,6 +785,21 @@ app.innerHTML = `
         <p class="settings-note">Polling cadence changes apply after the app restarts. Retention changes remove expired local history immediately. Source email is never deleted.</p>
         <button type="submit">Save settings</button>
       </form>
+      <section id="gmail-label-settings" class="settings-form" hidden>
+        <h3>Gmail labels</h3>
+        <p id="gmail-label-account" class="settings-note"></p>
+        <div class="settings-actions">
+          <label>Available user label
+            <select id="gmail-label-catalog" aria-label="Available Gmail user labels"></select>
+          </label>
+          <button id="gmail-label-add" type="button" disabled>Add label</button>
+          <button id="gmail-label-refresh" type="button">Refresh labels</button>
+        </div>
+        <p class="settings-note">Applies on the next scheduled check and may include recent matching mail. Adding a label does not start a full mailbox scan.</p>
+        <p id="gmail-label-polling-state" class="status" role="status" aria-live="polite">Label-only automatic polling status is unavailable until Gmail labels and watcher health load.</p>
+        <p id="gmail-label-status" class="status" role="status" aria-live="polite"></p>
+        <ul id="gmail-label-list" class="sender-list" aria-label="Selected Gmail labels"></ul>
+      </section>
       <p id="settings-status" class="status" role="status" aria-live="polite">Loading settings…</p>
       <section id="calendar-consent-settings" class="calendar-consent-settings" hidden>
         <div class="calendar-consent-heading">
@@ -733,6 +844,20 @@ const emailInput = requiredElement<HTMLInputElement>("#sender-email");
 const nameInput = requiredElement<HTMLInputElement>("#sender-name");
 const list = requiredElement<HTMLUListElement>("#sender-list");
 const watchlistStatus = requiredElement<HTMLParagraphElement>("#watchlist-status");
+const MAX_SENDER_NAME_BYTES = 1024;
+const MAX_ADMISSION_SELECTOR_BYTES = 512;
+
+function senderNameWithinByteLimit(value: string): boolean {
+  return new TextEncoder().encode(value.trim()).byteLength <= MAX_SENDER_NAME_BYTES;
+}
+
+function senderSelectorWithinByteLimit(value: string): boolean {
+  const canonicalAddress = value.trim().toLowerCase();
+  return (
+    new TextEncoder().encode(`sender:${canonicalAddress}`).byteLength <=
+    MAX_ADMISSION_SELECTOR_BYTES
+  );
+}
 const healthStatus = requiredElement<HTMLParagraphElement>("#health-status");
 const checkNow = requiredElement<HTMLButtonElement>("#check-now");
 const mailHealth = requiredElement<HTMLElement>("#mail-health");
@@ -786,6 +911,16 @@ const autostartSettingsNote = requiredElement<HTMLParagraphElement>(
   "#autostart-settings-note",
 );
 const settingsStatus = requiredElement<HTMLParagraphElement>("#settings-status");
+const gmailLabelSettings = requiredElement<HTMLElement>("#gmail-label-settings");
+const gmailLabelAccount = requiredElement<HTMLParagraphElement>("#gmail-label-account");
+const gmailLabelCatalogSelect = requiredElement<HTMLSelectElement>("#gmail-label-catalog");
+const gmailLabelAdd = requiredElement<HTMLButtonElement>("#gmail-label-add");
+const gmailLabelRefresh = requiredElement<HTMLButtonElement>("#gmail-label-refresh");
+const gmailLabelPollingState = requiredElement<HTMLParagraphElement>(
+  "#gmail-label-polling-state",
+);
+const gmailLabelStatus = requiredElement<HTMLParagraphElement>("#gmail-label-status");
+const gmailLabelList = requiredElement<HTMLUListElement>("#gmail-label-list");
 const calendarConsentSettings = requiredElement<HTMLElement>("#calendar-consent-settings");
 const calendarConsentStatus = requiredElement<HTMLParagraphElement>("#calendar-consent-status");
 const calendarConsentList = requiredElement<HTMLElement>("#calendar-consent-list");
@@ -793,7 +928,6 @@ let watchedSenders: WatchedSender[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
-let mailOperationInFlight = false;
 let mailProviders: MailProviderStatus[] = [];
 let mailAccounts: MailAccountStatus[] = [];
 let mailServerProvider: MailProviderStatus | null = null;
@@ -841,6 +975,109 @@ let configurationReady = false;
 let configInitializationInFlight = false;
 let calendarConsentOperationInFlight: string | null = null;
 let calendarConsentRequestGeneration = 0;
+let gmailLabelGeneration = 0;
+let gmailLabelLoadSequence = 0;
+let gmailLabelScope: { provider: "gmail"; account_id: string } | null = null;
+let gmailLabelRevision: number | null = null;
+let gmailLabelCatalogItems: GmailLabelCatalogItem[] = [];
+let gmailLabelSelectorItems: GmailLabelSelector[] = [];
+let gmailLabelMutationInFlight = false;
+let gmailLabelCatalogVerified = false;
+let gmailLabelHealth: GmailLabelPollingHealth | null = null;
+let gmailLabelSelectorRenderSequence = 0;
+let gmailLabelSenderCount: GmailLabelSenderCountState = {
+  count: null,
+  observation_version: 0,
+};
+let mailboxOperationRevision = 0;
+let mailboxOperationRevisionReady = false;
+let mailOperationInFlight = false;
+let mailAccountMutationsInFlight = 0;
+let mailAccountMutationEpoch = 0;
+
+function observeMailboxOperationRevision(revision: unknown): boolean {
+  if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 0) {
+    return false;
+  }
+  mailboxOperationRevision = Math.max(mailboxOperationRevision, revision);
+  mailboxOperationRevisionReady = true;
+  return true;
+}
+
+function scheduledCheckEventIsCurrent(event: ScheduledCheckEvent): boolean {
+  if (mailOperationInFlight || !mailboxOperationRevisionReady) return false;
+  const revision = event.mailbox_operation_revision;
+  if (revision === undefined || !Number.isSafeInteger(revision) || revision < 0) return false;
+  if (revision < mailboxOperationRevision) return false;
+  mailboxOperationRevision = revision;
+  return true;
+}
+
+function currentMailboxEffectScope(): MailboxEffectScope | null {
+  if (mailOperationInFlight || !mailboxOperationRevisionReady) return null;
+  return {
+    mutation_epoch: mailAccountMutationEpoch,
+    mailbox_operation_revision: mailboxOperationRevision,
+  };
+}
+
+function mailboxEffectScopeIsCurrent(scope: MailboxEffectScope | null): boolean {
+  if (scope === null) return true;
+  return (
+    !mailOperationInFlight &&
+    mailboxOperationRevisionReady &&
+    scope.mutation_epoch === mailAccountMutationEpoch &&
+    scope.mailbox_operation_revision === mailboxOperationRevision
+  );
+}
+
+function mailboxEffectRequestIsCurrent(
+  requestGeneration: number,
+  currentGeneration: number,
+  scope: MailboxEffectScope | null,
+): boolean {
+  return requestGeneration === currentGeneration && mailboxEffectScopeIsCurrent(scope);
+}
+
+function observeMailboxOperationRevisionFromError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("mailbox_operation_revision" in error)) {
+    return false;
+  }
+  const revision = (error as { mailbox_operation_revision?: unknown })
+    .mailbox_operation_revision;
+  return observeMailboxOperationRevision(revision);
+}
+
+async function runMailAccountMutation<T extends { mailbox_operation_revision: number }>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (mailAccountMutationsInFlight === 0) {
+    mailAccountMutationEpoch += 1;
+    healthRequestGeneration += 1;
+    inboxRequestGeneration += 1;
+    if (!inboxMutationInFlight()) setInboxControlsBusy(false);
+    checkSupported = false;
+    checkNow.disabled = true;
+  }
+  mailAccountMutationsInFlight += 1;
+  mailOperationInFlight = true;
+  try {
+    const result = await operation();
+    if (!observeMailboxOperationRevision(result.mailbox_operation_revision)) {
+      mailboxOperationRevisionReady = false;
+    }
+    return result;
+  } catch (error) {
+    if (!observeMailboxOperationRevisionFromError(error)) {
+      mailboxOperationRevisionReady = false;
+    }
+    throw error;
+  } finally {
+    mailAccountMutationsInFlight -= 1;
+    mailOperationInFlight = mailAccountMutationsInFlight > 0;
+  }
+}
+
 let expiryLedgerLoadInFlight = false;
 
 function errorMessage(error: unknown): string {
@@ -849,6 +1086,56 @@ function errorMessage(error: unknown): string {
     if (typeof message === "string") return message;
   }
   return "The watcher engine could not complete that request.";
+}
+
+function errorCode(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("code" in error)) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function errorRetryable(error: unknown): boolean | null {
+  if (typeof error !== "object" || error === null || !("retryable" in error)) return null;
+  const retryable = (error as { retryable?: unknown }).retryable;
+  return typeof retryable === "boolean" ? retryable : null;
+}
+
+function gmailOperationErrorMessage(error: unknown): string {
+  if (
+    errorCode(error) === "gmail_authorization_rejected" &&
+    errorRetryable(error) === false
+  ) {
+    return "Gmail authorization was rejected. Reconnect the Gmail account, then refresh labels.";
+  }
+  if (
+    errorCode(error) === "gmail_label_catalog_unavailable" &&
+    errorRetryable(error) === true
+  ) {
+    return "Gmail labels are temporarily unavailable. Retry Gmail labels.";
+  }
+  return errorMessage(error);
+}
+
+function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
+  if (
+    event.error_code === "gmail_authorization_rejected" &&
+    event.error_retryable === false
+  ) {
+    return "Automatic check stopped because Gmail authorization was rejected. Reconnect the Gmail account.";
+  }
+  if (
+    event.error_code === "gmail_label_catalog_unavailable" &&
+    event.error_retryable === true
+  ) {
+    return "Automatic check could not load Gmail labels; it will retry on schedule.";
+  }
+  if (event.error_retryable === true) {
+    return "Automatic check failed temporarily; it will retry on schedule.";
+  }
+  if (event.error_retryable === false) {
+    return "Automatic check stopped and needs manual attention. Open Health for details.";
+  }
+  return "Automatic check failed. Open Health for details.";
 }
 
 function showView(view: "inbox" | "watchlist" | "expiry-ledger" | "health" | "settings"): void {
@@ -1371,7 +1658,7 @@ function renderInbox(items: InboxItem[]): void {
     );
     empty.textContent = filtered
       ? "No watched messages match these filters."
-      : "No watched messages yet. Add a sender in Watchlist, then run the watcher.";
+      : "No watched messages yet. Add a sender or Gmail label, then run the watcher.";
     inboxList.append(empty);
     return;
   }
@@ -1411,6 +1698,14 @@ function renderInbox(items: InboxItem[]): void {
         `${provider?.display_name || item.provider} · ${item.account_id}`
       }`;
       senderIdentity.append(sourceAccount);
+    }
+    if (item.admission !== null) {
+      const admission = document.createElement("span");
+      admission.textContent =
+        item.admission.kind === "gmail_user_label"
+          ? `Admitted by Gmail label: ${item.admission.display_name || "selected label"}`
+          : `Admitted by watched sender: ${item.admission.display_name || item.sender}`;
+      senderIdentity.append(admission);
     }
     const received = document.createElement("time");
     received.dateTime = item.received_at;
@@ -2139,7 +2434,11 @@ function inboxStatusLabel(): string {
   return `Showing ${count} matching message${count === 1 ? "" : "s"}.${more}${availability}`;
 }
 
-async function loadInbox(append = false): Promise<void> {
+async function loadInbox(
+  append = false,
+  effectScope: MailboxEffectScope | null = null,
+): Promise<void> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return;
   if (inboxMutationInFlight()) return;
   if (append && !inboxNextCursor) return;
   const generation = ++inboxRequestGeneration;
@@ -2151,7 +2450,7 @@ async function loadInbox(append = false): Promise<void> {
       query: { ...activeInboxQuery, cursor },
     });
   } catch (error) {
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     if (!append) {
       inboxNextCursor = null;
       inboxLoadMore.hidden = true;
@@ -2161,7 +2460,7 @@ async function loadInbox(append = false): Promise<void> {
     setInboxControlsBusy(false);
     return;
   }
-  if (generation !== inboxRequestGeneration) return;
+  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
 
   if (!append) {
     attachmentCapabilities.clear();
@@ -2179,7 +2478,7 @@ async function loadInbox(append = false): Promise<void> {
   delete inboxStatus.dataset.kind;
   try {
     const discovery = await loadAttachmentCapabilities(page.items);
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
     }
@@ -2191,12 +2490,14 @@ async function loadInbox(append = false): Promise<void> {
     inboxStatus.textContent = inboxStatusLabel();
     inboxStatus.dataset.kind = "success";
   } catch (error) {
-    if (generation !== inboxRequestGeneration) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
     renderInbox(inboxItems);
     inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
     inboxStatus.dataset.kind = "warning";
   }
-  if (generation === inboxRequestGeneration) setInboxControlsBusy(false);
+  if (mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
+    setInboxControlsBusy(false);
+  }
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
@@ -2295,6 +2596,468 @@ function currentMailServerConnection(): MailServerConnection {
   });
 }
 
+function gmailLabelScopeMatches(
+  response: { provider: string; account_id: string },
+  scope: { provider: "gmail"; account_id: string },
+  generation: number,
+): boolean {
+  return (
+    generation === gmailLabelGeneration &&
+    gmailLabelScope?.provider === scope.provider &&
+    gmailLabelScope.account_id === scope.account_id &&
+    response.provider === scope.provider &&
+    response.account_id === scope.account_id
+  );
+}
+
+function gmailLabelRefreshIsCurrent(
+  initialSelectors: GmailLabelSelectors,
+  catalog: GmailLabelCatalog,
+  revalidatedSelectors: GmailLabelSelectors,
+): boolean {
+  return (
+    initialSelectors.revision === catalog.revision &&
+    catalog.revision === revalidatedSelectors.revision &&
+    revalidatedSelectors.catalog_state === "current"
+  );
+}
+
+function gmailLabelStatusText(status: GmailLabelSelectorStatus): string {
+  const labels: Record<GmailLabelSelectorStatus, string> = {
+    active: "Active",
+    deleted: "Deleted in Gmail; inactive",
+    not_user: "No longer a user label; inactive",
+    identity_mismatch: "From an earlier Gmail connection; inactive",
+    validation_unavailable: "Could not validate with Gmail; inactive",
+  };
+  return labels[status];
+}
+
+function gmailLabelCatalogStateMessage(
+  catalogState: GmailLabelSelectors["catalog_state"],
+): string {
+  if (catalogState === "invalid_catalog") {
+    return "Gmail returned invalid label data. Correct the Gmail connection, then refresh labels.";
+  }
+  return "Gmail validation is temporarily unavailable. Refresh labels to retry.";
+}
+
+async function gmailLabelIdDigest(labelId: string): Promise<string> {
+  const bytes = new TextEncoder().encode(labelId);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function gmailLabelSenderCountAfterLocalObservation(
+  current: GmailLabelSenderCountState,
+  incomingCount: number,
+): GmailLabelSenderCountState {
+  return {
+    count: incomingCount,
+    observation_version: current.observation_version + 1,
+  };
+}
+
+function activeExactSenderCount(senders: WatchedSender[]): number {
+  return senders.filter((sender) => sender.admission_active).length;
+}
+
+function gmailLabelSenderCountAfterHealth(
+  current: GmailLabelSenderCountState,
+  incomingCount: number,
+  requestObservationVersion: number,
+): GmailLabelSenderCountState {
+  if (requestObservationVersion !== current.observation_version) return current;
+  return { count: incomingCount, observation_version: current.observation_version };
+}
+
+function gmailLabelPollingStateMessage(
+  activeSelectorCount: number | null,
+  health: GmailLabelPollingHealth | null,
+): GmailLabelPollingState {
+  if (activeSelectorCount === null || health === null) {
+    return {
+      active: false,
+      message: "Label-only automatic polling status is unavailable until Gmail labels and watcher health load.",
+    };
+  }
+  if (activeSelectorCount === 0) {
+    return {
+      active: false,
+      message: "Label-only automatic polling is inactive: no active Gmail label selector.",
+    };
+  }
+  if (health.watchlist_count !== 0) {
+    return {
+      active: false,
+      message: `Label-only automatic polling is inactive: exact sender count is ${health.watchlist_count}.`,
+    };
+  }
+  if (!health.polling.enabled) {
+    return {
+      active: false,
+      message: "Label-only automatic polling is inactive: the desktop scheduler is disabled.",
+    };
+  }
+  if (health.polling.next_check_unix_ms === null) {
+    return {
+      active: false,
+      message: "Label-only automatic polling is inactive: the desktop scheduler reports no next check is scheduled.",
+    };
+  }
+  const labelCount = activeSelectorCount === 1 ? "1 active Gmail label" : `${activeSelectorCount} active Gmail labels`;
+  return {
+    active: true,
+    message: `Label-only automatic polling is active: ${labelCount}, zero exact senders, and the desktop scheduler is enabled and running.`,
+  };
+}
+
+function watcherPrerequisitesReady(
+  exactSenderCount: number,
+  gmailLabelWatchConfigured: boolean,
+  mailReady: boolean,
+  databaseReady: boolean,
+): boolean {
+  const watcherConfigured = exactSenderCount > 0 || gmailLabelWatchConfigured;
+  return !watcherConfigured || (mailReady && databaseReady);
+}
+
+function renderGmailLabelPollingState(): void {
+  const activeSelectorCount =
+    gmailLabelCatalogVerified && gmailLabelRevision !== null
+      ? gmailLabelSelectorItems.filter(
+          (selector) => selector.status === "active" && selector.admission_active,
+        ).length
+      : null;
+  const state = gmailLabelPollingStateMessage(activeSelectorCount, gmailLabelHealth);
+  gmailLabelPollingState.textContent = state.message;
+  if (state.active) {
+    gmailLabelPollingState.dataset.kind = "success";
+  } else if (activeSelectorCount !== null && gmailLabelHealth !== null) {
+    gmailLabelPollingState.dataset.kind = "warning";
+  } else {
+    delete gmailLabelPollingState.dataset.kind;
+  }
+}
+
+function refreshGmailLabelControls(): void {
+  const ready = gmailLabelScope !== null && gmailLabelRevision !== null;
+  const selected = gmailLabelCatalogItems.some(
+    (item) => item.label_id === gmailLabelCatalogSelect.value && !item.selected,
+  );
+  gmailLabelCatalogSelect.disabled = gmailLabelMutationInFlight || !ready;
+  gmailLabelAdd.disabled = gmailLabelMutationInFlight || !ready || !selected;
+  gmailLabelRefresh.disabled = gmailLabelMutationInFlight || gmailLabelScope === null;
+  for (const button of gmailLabelList.querySelectorAll<HTMLButtonElement>("button")) {
+    button.disabled = gmailLabelMutationInFlight || !ready;
+  }
+}
+
+function renderGmailLabelCatalog(items: GmailLabelCatalogItem[]): void {
+  gmailLabelCatalogItems = items;
+  const previous = gmailLabelCatalogSelect.value;
+  gmailLabelCatalogSelect.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = items.length > 0 ? "Choose a Gmail label" : "No user labels available";
+  gmailLabelCatalogSelect.append(placeholder);
+  for (const item of items) {
+    const option = document.createElement("option");
+    option.value = item.label_id;
+    option.textContent = item.selected ? `${item.display_name} (selected)` : item.display_name;
+    option.disabled = item.selected;
+    gmailLabelCatalogSelect.append(option);
+  }
+  const previousItem = items.find((item) => item.label_id === previous && !item.selected);
+  gmailLabelCatalogSelect.value = previousItem?.label_id ?? "";
+  refreshGmailLabelControls();
+}
+
+function renderGmailLabelSelectors(items: GmailLabelSelector[]): void {
+  const renderSequence = ++gmailLabelSelectorRenderSequence;
+  gmailLabelSelectorItems = items;
+  gmailLabelList.replaceChildren();
+  if (items.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    empty.textContent = "No Gmail labels are watched for this account.";
+    gmailLabelList.append(empty);
+  }
+  for (const selector of items) {
+    const item = document.createElement("li");
+    item.className = "sender-card gmail-label-selector-card";
+    const identity = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = selector.display_name;
+    const status = document.createElement("span");
+    status.textContent = gmailLabelStatusText(selector.status);
+    const selectorId = document.createElement("span");
+    selectorId.className = "gmail-label-evidence";
+    selectorId.textContent = `Selector UUID: ${selector.selector_id}`;
+    const labelIdDigest = document.createElement("span");
+    labelIdDigest.className = "gmail-label-evidence";
+    labelIdDigest.textContent = "Label ID SHA-256: Calculating…";
+    const revision = document.createElement("span");
+    revision.className = "gmail-label-evidence";
+    revision.textContent = `Selector-set revision: ${gmailLabelRevision ?? "Unavailable"}`;
+    identity.append(title, status, selectorId, labelIdDigest, revision);
+    void gmailLabelIdDigest(selector.label_id).then(
+      (digest) => {
+        if (renderSequence !== gmailLabelSelectorRenderSequence || !labelIdDigest.isConnected) {
+          return;
+        }
+        labelIdDigest.textContent = `Label ID SHA-256: ${digest}`;
+      },
+      () => {
+        if (renderSequence !== gmailLabelSelectorRenderSequence || !labelIdDigest.isConnected) {
+          return;
+        }
+        labelIdDigest.textContent = "Label ID SHA-256: Unavailable";
+      },
+    );
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger-action";
+    remove.textContent = "Remove";
+    remove.setAttribute("aria-label", `Remove Gmail label ${selector.display_name}`);
+    remove.addEventListener("click", () => void removeGmailLabelSelector(selector));
+    item.append(identity, remove);
+    gmailLabelList.append(item);
+  }
+  renderGmailLabelPollingState();
+  refreshGmailLabelControls();
+}
+
+function invalidateGmailLabelState(
+  scope: { provider: "gmail"; account_id: string } | null,
+): void {
+  gmailLabelGeneration += 1;
+  gmailLabelLoadSequence += 1;
+  gmailLabelScope = scope;
+  gmailLabelRevision = null;
+  gmailLabelMutationInFlight = false;
+  gmailLabelCatalogVerified = false;
+  renderGmailLabelCatalog([]);
+  renderGmailLabelSelectors([]);
+  gmailLabelSettings.hidden = scope === null;
+  gmailLabelAccount.textContent = scope
+    ? "Loading the active Gmail account…"
+    : "Connect and activate a Gmail account to choose labels.";
+  gmailLabelStatus.textContent = scope ? "Loading Gmail labels…" : "";
+  delete gmailLabelStatus.dataset.kind;
+  refreshGmailLabelControls();
+}
+
+function reconcileGmailLabelScope(accounts: MailAccountStatus[]): boolean {
+  const active = mailOperationInFlight
+    ? undefined
+    : accounts.find(
+        (account) => account.active && account.connected && account.provider === "gmail",
+      );
+  const next = active ? { provider: "gmail" as const, account_id: active.account_id } : null;
+  const same =
+    gmailLabelScope?.provider === next?.provider &&
+    gmailLabelScope?.account_id === next?.account_id;
+  if (same) return false;
+  invalidateGmailLabelState(next);
+  if (active) {
+    gmailLabelAccount.textContent = active.address || active.display_name;
+  }
+  return true;
+}
+
+async function loadGmailLabelState(): Promise<void> {
+  const scope = gmailLabelScope;
+  if (scope === null) return;
+  const generation = gmailLabelGeneration;
+  const loadSequence = ++gmailLabelLoadSequence;
+  let loadedSelectors: GmailLabelSelectors | null = null;
+  gmailLabelCatalogVerified = false;
+  renderGmailLabelPollingState();
+  gmailLabelStatus.textContent = "Loading Gmail labels…";
+  delete gmailLabelStatus.dataset.kind;
+  try {
+    const selectors = await invoke<GmailLabelSelectors>("gmail_label_selectors_list", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+    });
+    if (
+      loadSequence !== gmailLabelLoadSequence ||
+      !gmailLabelScopeMatches(selectors, scope, generation)
+    ) {
+      return;
+    }
+    loadedSelectors = selectors;
+    gmailLabelRevision = selectors.revision;
+    renderGmailLabelSelectors(selectors.items);
+    gmailLabelStatus.textContent =
+      selectors.catalog_state === "current"
+        ? "Selected Gmail labels are up to date."
+        : gmailLabelCatalogStateMessage(selectors.catalog_state);
+    gmailLabelStatus.dataset.kind =
+      selectors.catalog_state === "current" ? "success" : "error";
+
+    const catalog = await invoke<GmailLabelCatalog>("gmail_labels_catalog", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+    });
+    if (
+      loadSequence !== gmailLabelLoadSequence ||
+      !gmailLabelScopeMatches(catalog, scope, generation)
+    ) {
+      return;
+    }
+    const revalidatedSelectors = await invoke<GmailLabelSelectors>("gmail_label_selectors_list", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+    });
+    if (
+      loadSequence !== gmailLabelLoadSequence ||
+      !gmailLabelScopeMatches(revalidatedSelectors, scope, generation)
+    ) {
+      return;
+    }
+    if (!gmailLabelRefreshIsCurrent(selectors, catalog, revalidatedSelectors)) {
+      gmailLabelRevision = null;
+      gmailLabelCatalogVerified = false;
+      renderGmailLabelCatalog([]);
+      renderGmailLabelSelectors(revalidatedSelectors.items);
+      gmailLabelStatus.textContent =
+        selectors.revision !== catalog.revision ||
+        catalog.revision !== revalidatedSelectors.revision
+          ? "Gmail label settings changed. Refresh labels before editing."
+          : gmailLabelCatalogStateMessage(revalidatedSelectors.catalog_state);
+      gmailLabelStatus.dataset.kind = "error";
+      return;
+    }
+    gmailLabelRevision = revalidatedSelectors.revision;
+    gmailLabelCatalogVerified = true;
+    renderGmailLabelCatalog(catalog.items);
+    renderGmailLabelSelectors(revalidatedSelectors.items);
+    renderGmailLabelPollingState();
+    gmailLabelStatus.textContent = "Gmail labels are up to date.";
+    gmailLabelStatus.dataset.kind = "success";
+  } catch (error) {
+    if (loadSequence !== gmailLabelLoadSequence || generation !== gmailLabelGeneration) return;
+    gmailLabelCatalogVerified = false;
+    renderGmailLabelCatalog([]);
+    try {
+      const unavailableSelectors = await invoke<GmailLabelSelectors>(
+        "gmail_label_selectors_list",
+        {
+          provider: scope.provider,
+          accountId: scope.account_id,
+        },
+      );
+      if (
+        loadSequence !== gmailLabelLoadSequence ||
+        !gmailLabelScopeMatches(unavailableSelectors, scope, generation)
+      ) {
+        return;
+      }
+      gmailLabelRevision = unavailableSelectors.revision;
+      renderGmailLabelSelectors(unavailableSelectors.items);
+      gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
+    } catch (relistError) {
+      if (loadSequence !== gmailLabelLoadSequence || generation !== gmailLabelGeneration) return;
+      gmailLabelRevision = null;
+      const inertSelectors: GmailLabelSelector[] = (loadedSelectors?.items ?? []).map((item) => ({
+        ...item,
+        status: "validation_unavailable",
+        admission_active: false,
+      }));
+      renderGmailLabelSelectors(inertSelectors);
+      gmailLabelStatus.textContent = `Selected Gmail labels are inactive because their current state could not be loaded. ${gmailOperationErrorMessage(relistError)}`;
+    }
+    renderGmailLabelPollingState();
+    gmailLabelStatus.dataset.kind = "error";
+  } finally {
+    if (loadSequence === gmailLabelLoadSequence && generation === gmailLabelGeneration) {
+      refreshGmailLabelControls();
+    }
+  }
+}
+
+async function addGmailLabelSelector(): Promise<void> {
+  const scope = gmailLabelScope;
+  const revision = gmailLabelRevision;
+  const selected = gmailLabelCatalogItems.find(
+    (item) => item.label_id === gmailLabelCatalogSelect.value && !item.selected,
+  );
+  if (scope === null || revision === null || selected === undefined || gmailLabelMutationInFlight) {
+    return;
+  }
+  const generation = gmailLabelGeneration;
+  gmailLabelMutationInFlight = true;
+  refreshGmailLabelControls();
+  gmailLabelStatus.textContent = `Adding ${selected.display_name}…`;
+  delete gmailLabelStatus.dataset.kind;
+  try {
+    await invoke<GmailLabelSelectorAdded>("gmail_label_selector_add", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+      labelId: selected.label_id,
+      expectedRevision: revision,
+    });
+    if (generation !== gmailLabelGeneration) return;
+    gmailLabelStatus.textContent = `${selected.display_name} will apply on the next scheduled check.`;
+    gmailLabelStatus.dataset.kind = "success";
+  } catch (error) {
+    if (generation !== gmailLabelGeneration) return;
+    gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
+    gmailLabelStatus.dataset.kind = "error";
+    if (
+      [
+        "account_not_active",
+        "mailbox_identity_changed",
+        "stale_revision",
+        "gmail_label_catalog_invalid",
+        "gmail_label_catalog_unavailable",
+      ].includes(errorCode(error) ?? "")
+    ) {
+      renderGmailLabelCatalog([]);
+      gmailLabelRevision = null;
+    }
+  } finally {
+    if (generation === gmailLabelGeneration) {
+      gmailLabelMutationInFlight = false;
+      await loadGmailLabelState();
+    }
+  }
+}
+
+async function removeGmailLabelSelector(selector: GmailLabelSelector): Promise<void> {
+  const scope = gmailLabelScope;
+  const revision = gmailLabelRevision;
+  if (scope === null || revision === null || gmailLabelMutationInFlight) return;
+  if (!gmailLabelSelectorItems.some((item) => item.selector_id === selector.selector_id)) return;
+  const generation = gmailLabelGeneration;
+  gmailLabelMutationInFlight = true;
+  refreshGmailLabelControls();
+  gmailLabelStatus.textContent = `Removing ${selector.display_name}…`;
+  delete gmailLabelStatus.dataset.kind;
+  try {
+    await invoke<GmailLabelSelectorRemoved>("gmail_label_selector_remove", {
+      provider: scope.provider,
+      accountId: scope.account_id,
+      selectorId: selector.selector_id,
+      expectedRevision: revision,
+    });
+    if (generation !== gmailLabelGeneration) return;
+    gmailLabelStatus.textContent = `${selector.display_name} is no longer watched.`;
+    gmailLabelStatus.dataset.kind = "success";
+  } catch (error) {
+    if (generation !== gmailLabelGeneration) return;
+    gmailLabelStatus.textContent = gmailOperationErrorMessage(error);
+    gmailLabelStatus.dataset.kind = "error";
+  } finally {
+    if (generation === gmailLabelGeneration) {
+      gmailLabelMutationInFlight = false;
+      await loadGmailLabelState();
+    }
+  }
+}
+
 function renderInboxAccountOptions(): void {
   const previous = inboxAccountSelect.value || "active";
   const active = mailAccounts.find((account) => account.active);
@@ -2342,6 +3105,10 @@ function renderMailAccounts(data: MailAccounts): boolean {
   mailAccountCatalogRevision += 1;
   mailProviders = data.providers;
   mailAccounts = data.accounts;
+  const gmailLabelScopeChanged = reconcileGmailLabelScope(mailAccounts);
+  if (gmailLabelScopeChanged && !settingsView.hidden && gmailLabelScope !== null) {
+    void loadGmailLabelState();
+  }
   renderInboxAccountOptions();
   const inboxScopeChanged = reconcileInboxAccountScope();
   mailAccountList.replaceChildren();
@@ -2444,13 +3211,15 @@ async function refreshAfterMailMutation(message: string): Promise<void> {
 
 async function connectMailProvider(provider: string): Promise<void> {
   if (mailOperationInFlight) return;
+  invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = "Complete email authorization in your browser…";
-  delete healthStatus.dataset.kind;
   try {
-    const result = await invoke<MailAccountResult>("mail_account_connect", { provider });
+    const result = await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = "Complete email authorization in your browser…";
+      delete healthStatus.dataset.kind;
+      return invoke<MailAccountResult>("mail_account_connect", { provider });
+    });
     const message = result.baseline_initialized
       ? "Email account connected. Watching begins from its current mailbox state."
       : "Email account connected. Its saved mailbox position was preserved.";
@@ -2458,7 +3227,6 @@ async function connectMailProvider(provider: string): Promise<void> {
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -2475,24 +3243,26 @@ async function submitMailServerConnection(): Promise<void> {
   }
   const provider = mailServerProvider;
   const account = mailServerAccount;
+  invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = account
-    ? "Verifying the replacement mail server credentials…"
-    : "Verifying the mail server credentials…";
-  delete healthStatus.dataset.kind;
   try {
-    const result = account
-      ? await invoke<MailAccountResult>("mail_account_reconnect", {
-          provider: provider.provider,
-          accountId: account.account_id,
-          connection,
-        })
-      : await invoke<MailAccountResult>("mail_account_connect", {
-          provider: provider.provider,
-          connection,
-        });
+    const result = await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = account
+        ? "Verifying the replacement mail server credentials…"
+        : "Verifying the mail server credentials…";
+      delete healthStatus.dataset.kind;
+      return account
+        ? invoke<MailAccountResult>("mail_account_reconnect", {
+            provider: provider.provider,
+            accountId: account.account_id,
+            connection,
+          })
+        : invoke<MailAccountResult>("mail_account_connect", {
+            provider: provider.provider,
+            connection,
+          });
+    });
     const message = result.baseline_initialized
       ? "Mail server connected. Watching begins from its current mailbox state."
       : "Mail server connected. Its saved mailbox position was preserved.";
@@ -2500,28 +3270,28 @@ async function submitMailServerConnection(): Promise<void> {
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
 
 async function reconnectMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
+  invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
-  healthStatus.textContent = "Complete email authorization in your browser…";
-  delete healthStatus.dataset.kind;
   try {
-    await invoke<MailAccountResult>("mail_account_reconnect", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      healthStatus.textContent = "Complete email authorization in your browser…";
+      delete healthStatus.dataset.kind;
+      return invoke<MailAccountResult>("mail_account_reconnect", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
     await refreshAfterMailMutation("Email account reconnected. Its saved mailbox position was preserved.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -2532,38 +3302,40 @@ async function disconnectMailAccount(account: MailAccountStatus): Promise<void> 
     `Disconnect ${account.address || account.display_name}? Local history remains available and source email is not changed.`,
   );
   if (!confirmed) return;
+  invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    await invoke<MailAccountResult>("mail_account_disconnect", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      return invoke<MailAccountResult>("mail_account_disconnect", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
     await refreshAfterMailMutation("Email account disconnected. Its local history was retained.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
 
 async function activateMailAccount(account: MailAccountStatus): Promise<void> {
   if (mailOperationInFlight) return;
+  invalidateGmailLabelState(null);
   closeMailServerForm();
-  mailOperationInFlight = true;
-  renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   try {
-    await invoke<MailAccountResult>("mail_account_activate", {
-      provider: account.provider,
-      accountId: account.account_id,
+    await runMailAccountMutation(() => {
+      renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
+      return invoke<MailAccountResult>("mail_account_activate", {
+        provider: account.provider,
+        accountId: account.account_id,
+      });
     });
     await refreshAfterMailMutation("Active email account changed.");
   } catch (error) {
     await loadHealth(errorMessage(error), "error");
   } finally {
-    mailOperationInFlight = false;
     renderMailAccounts({ providers: mailProviders, accounts: mailAccounts });
   }
 }
@@ -2579,6 +3351,8 @@ async function loadMailAccounts(): Promise<boolean> {
     ) {
       return false;
     }
+    if (accounts.mailbox_operation_revision === undefined) return false;
+    observeMailboxOperationRevision(accounts.mailbox_operation_revision);
     renderMailAccounts(accounts);
     return true;
   } catch (error) {
@@ -2934,6 +3708,8 @@ async function mutateCalendarConsent(
 }
 
 function renderHealthUnknown(): void {
+  gmailLabelHealth = null;
+  renderGmailLabelPollingState();
   const detail = "Health refresh failed; current status is unknown.";
   for (const [value, description] of [
     [mailHealth, mailDetail],
@@ -2945,14 +3721,26 @@ function renderHealthUnknown(): void {
     description.textContent = detail;
   }
   lastCheck.textContent = "Unknown";
-  watchlistCount.textContent = "Unknown";
+  watchlistCount.textContent =
+    gmailLabelSenderCount.count === null ? "Unknown" : String(gmailLabelSenderCount.count);
   pollingCadence.textContent = "Unknown";
   nextCheck.textContent = "Unknown";
 }
 
-function renderHealth(health: HealthStatus): void {
+function renderHealth(health: HealthStatus, senderObservationVersion: number): void {
   const inboxScopeChanged = renderMailAccounts(health.mail);
   if (inboxScopeChanged && configurationReady && !mailOperationInFlight) void loadInbox();
+  gmailLabelSenderCount = gmailLabelSenderCountAfterHealth(
+    gmailLabelSenderCount,
+    health.watchlist_count,
+    senderObservationVersion,
+  );
+  const exactSenderCount = gmailLabelSenderCount.count ?? health.watchlist_count;
+  gmailLabelHealth = {
+    watchlist_count: exactSenderCount,
+    polling: health.polling,
+  };
+  renderGmailLabelPollingState();
   const activeAccount = health.mail.accounts.find((account) => account.active);
   const activeProvider = activeAccount
     ? health.mail.providers.find((provider) => provider.provider === activeAccount.provider)
@@ -2994,7 +3782,7 @@ function renderHealth(health: HealthStatus): void {
       : "Analysis will still appear in the local inbox.";
 
   lastCheck.textContent = health.last_check ? receivedLabel(health.last_check) : "Not initialized";
-  watchlistCount.textContent = String(health.watchlist_count);
+  watchlistCount.textContent = String(exactSenderCount);
   if (health.polling.enabled && health.polling.next_check_unix_ms !== null) {
     pollingCadence.textContent = intervalLabel(health.polling.interval_minutes);
     nextCheck.textContent = receivedLabel(
@@ -3004,32 +3792,55 @@ function renderHealth(health: HealthStatus): void {
     pollingCadence.textContent = "Disabled for current configuration";
     nextCheck.textContent = "Not scheduled";
   }
-  const watcherPrerequisitesReady =
-    health.watchlist_count === 0 || (mailReady && databaseReady);
+  const prerequisitesReady = watcherPrerequisitesReady(
+    exactSenderCount,
+    health.gmail.label_watch_configured,
+    mailReady,
+    databaseReady,
+  );
   checkSupported =
     health.production_check_supported &&
     health.notifications.host_delivery_ready &&
-    watcherPrerequisitesReady;
+    prerequisitesReady;
   checkNow.disabled = checkInFlight || !checkSupported;
 }
 
 async function loadHealth(
   message = "Health is up to date.",
   kind: "success" | "error" = "success",
+  effectScope: MailboxEffectScope | null = null,
 ): Promise<boolean> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return false;
   const requestGeneration = ++healthRequestGeneration;
+  const senderObservationVersion = gmailLabelSenderCount.observation_version;
   checkSupported = false;
   checkNow.disabled = true;
   healthStatus.textContent = "Refreshing health…";
   try {
     const health = await invoke<HealthStatus>("health_get");
-    if (requestGeneration !== healthRequestGeneration) return false;
-    renderHealth(health);
+    if (
+      !mailboxEffectRequestIsCurrent(
+        requestGeneration,
+        healthRequestGeneration,
+        effectScope,
+      )
+    ) {
+      return false;
+    }
+    renderHealth(health, senderObservationVersion);
     healthStatus.textContent = message;
     healthStatus.dataset.kind = kind;
     return true;
   } catch (error) {
-    if (requestGeneration !== healthRequestGeneration) return false;
+    if (
+      !mailboxEffectRequestIsCurrent(
+        requestGeneration,
+        healthRequestGeneration,
+        effectScope,
+      )
+    ) {
+      return false;
+    }
     checkSupported = false;
     checkNow.disabled = true;
     renderHealthUnknown();
@@ -3037,6 +3848,37 @@ async function loadHealth(
     healthStatus.dataset.kind = "error";
     return false;
   }
+}
+
+function recoveryStatusMessage(
+  result: GmailRecoveryStatus,
+  progress?: string,
+): string | null {
+  if (!result.recovery_pending) return null;
+  const progressMessage = progress ? ` ${progress}` : "";
+  const recoveryState = result.recovery_state ?? "collecting";
+  const recoveryFailureMessage = result.recovery_failure_code
+    ? ` Recovery status: ${result.recovery_failure_code}.`
+    : "";
+  if (recoveryState === "backoff" || recoveryState === "degraded") {
+    const retryMessage = result.recovery_next_retry_at
+      ? ` after ${result.recovery_next_retry_at}`
+      : "";
+    const stateMessage =
+      recoveryState === "degraded"
+        ? "Gmail catch-up is degraded and will retry"
+        : "Gmail catch-up is paused and will retry";
+    return `${stateMessage}${retryMessage}.${progressMessage}${recoveryFailureMessage}`;
+  }
+  return `Gmail catch-up is still in progress.${progressMessage} Another check will continue it.${recoveryFailureMessage}`;
+}
+
+function inactiveCheckMessage(reason: string | undefined): string | null {
+  if (reason === undefined) return null;
+  if (reason === "gmail_label_selectors_inactive") {
+    return "Saved Gmail labels are inactive. Refresh Gmail labels, then select an active label again.";
+  }
+  return "Email Watcher could not understand the inactive check state. Refresh Gmail labels and try again.";
 }
 
 function checkResultMessage(result: CheckResult): string {
@@ -3052,8 +3894,20 @@ function checkResultMessage(result: CheckResult): string {
   const queueMessage = remaining
     ? ` ${remaining} notification${remaining === 1 ? " remains" : "s remain"} queued.`
     : "";
+  if (result.recovery_pending) {
+    const progress = `${result.discovered} found, ${result.summarized} analyzed.`;
+    const recoveryMessage = recoveryStatusMessage(result, progress);
+    return `${recoveryMessage}${deliveryMessage}${failureMessage}${queueMessage}`;
+  }
+  const inactiveMessage =
+    !result.active && result.reason !== undefined
+      ? inactiveCheckMessage(result.reason)
+      : null;
+  if (inactiveMessage !== null) {
+    return `${inactiveMessage}${deliveryMessage}${failureMessage}${queueMessage}`;
+  }
   if (!result.active) {
-    return `Add a watched sender before running a check.${deliveryMessage}${failureMessage}${queueMessage}`;
+    return `Add a watched sender or Gmail label before running a check.${deliveryMessage}${failureMessage}${queueMessage}`;
   }
   const summary = `Check complete: ${result.discovered} found, ${result.summarized} analyzed.`;
   return `${summary}${deliveryMessage}${failureMessage}${queueMessage}`;
@@ -3104,14 +3958,15 @@ function setConfiguredNavigation(enabled: boolean): void {
   healthTab.disabled = !enabled;
 }
 
-function startConfiguredDesktop(): void {
-  configurationReady = true;
-  setConfiguredNavigation(true);
+async function startConfiguredDesktop(): Promise<void> {
+  configurationReady = false;
   configInitializeForm.hidden = true;
   settingsForm.hidden = false;
-  void loadMailAccounts().then((loaded) => {
-    if (loaded) return loadInbox();
-  });
+  const accountsLoaded = await loadMailAccounts();
+  if (!accountsLoaded) return;
+  configurationReady = true;
+  setConfiguredNavigation(true);
+  void loadInbox();
   void loadHealth();
   void loadAutostart();
   void loadSenders().then((loaded) => {
@@ -3126,7 +3981,7 @@ async function initializeDesktop(): Promise<void> {
   try {
     const status = await invoke<ConfigStatus>("config_status");
     if (status.present) {
-      startConfiguredDesktop();
+      await startConfiguredDesktop();
       return;
     }
     initialTimezoneInput.value = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -3157,7 +4012,7 @@ configInitializeForm.addEventListener("submit", (event) => {
       });
       if (!result.created) throw new Error("Watcher configuration was not created.");
       renderSettings(result.settings);
-      startConfiguredDesktop();
+      await startConfiguredDesktop();
       settingsStatus.textContent =
         "Configuration created. Restart the app once to enable automatic polling.";
       settingsStatus.dataset.kind = "success";
@@ -3294,6 +4149,10 @@ settingsForm.addEventListener("submit", (event) => {
   })();
 });
 
+gmailLabelCatalogSelect.addEventListener("change", refreshGmailLabelControls);
+gmailLabelRefresh.addEventListener("click", () => void loadGmailLabelState());
+gmailLabelAdd.addEventListener("click", () => void addGmailLabelSelector());
+
 mailServerForm.addEventListener("submit", (event) => {
   event.preventDefault();
   if (!mailServerForm.reportValidity()) return;
@@ -3340,11 +4199,24 @@ function finishOperation(): void {
 
 function renderSenders(senders: WatchedSender[]): void {
   watchedSenders = senders;
+  const exactSenderCount = activeExactSenderCount(senders);
+  gmailLabelSenderCount = gmailLabelSenderCountAfterLocalObservation(
+    gmailLabelSenderCount,
+    exactSenderCount,
+  );
+  if (gmailLabelHealth !== null) {
+    gmailLabelHealth = {
+      ...gmailLabelHealth,
+      watchlist_count: exactSenderCount,
+    };
+    renderGmailLabelPollingState();
+  }
+  watchlistCount.textContent = String(exactSenderCount);
   list.replaceChildren();
   if (senders.length === 0) {
     const empty = document.createElement("li");
     empty.className = "empty-state";
-    empty.textContent = "No watched senders yet. Add the first exact address above.";
+    empty.textContent = "No watched senders yet. Add an exact address here or choose a Gmail label in Settings.";
     list.append(empty);
     return;
   }
@@ -3408,13 +4280,25 @@ async function removeSender(email: string): Promise<void> {
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   void (async () => {
+    const name = nameInput.value.trim();
+    if (!senderNameWithinByteLimit(name)) {
+      watchlistStatus.textContent = "Sender name must be at most 1024 UTF-8 bytes.";
+      watchlistStatus.dataset.kind = "error";
+      return;
+    }
+    if (!senderSelectorWithinByteLimit(emailInput.value)) {
+      watchlistStatus.textContent =
+        "Sender email creates an admission selector over 512 UTF-8 bytes.";
+      watchlistStatus.dataset.kind = "error";
+      return;
+    }
     if (!beginOperation()) return;
     watchlistStatus.textContent = "Adding sender…";
     let addedSuccessfully = false;
     try {
       const sender = await invoke<WatchedSender>("watchlist_add", {
         email: emailInput.value,
-        name: nameInput.value.trim() || null,
+        name: name || null,
       });
       form.reset();
       renderSenders([...watchedSenders, sender]);
@@ -3445,7 +4329,12 @@ healthTab.addEventListener("click", () => {
 settingsTab.addEventListener("click", () => {
   showView("settings");
   if (configurationReady) {
-    void Promise.all([loadSettings(), loadAutostart(), loadCalendarConsents()]);
+    void Promise.all([
+      loadSettings(),
+      loadAutostart(),
+      loadCalendarConsents(),
+      loadGmailLabelState(),
+    ]);
   }
 });
 autostartEnabledInput.addEventListener("change", () => {
@@ -3465,22 +4354,45 @@ inboxLoadMore.addEventListener("click", () => void loadInbox(true));
 inboxClear.addEventListener("click", () => void clearInboxHistory());
 checkNow.addEventListener("click", () => void runCheck());
 connectActivate.addEventListener("click", () => void selectAndInstallConnectEntitlement());
-void listen<{
-  status: "complete" | "delivery_failed" | "check_failed";
-  failed_notifications: number;
-}>("watcher://scheduled-check", (event) => {
-  void loadInbox();
+void listen<ScheduledCheckEvent>("watcher://scheduled-check", (event) => {
+  if (!configurationReady || !scheduledCheckEventIsCurrent(event.payload)) return;
+  const effectScope = currentMailboxEffectScope();
+  if (effectScope === null) return;
+  void loadInbox(false, effectScope);
   if (!healthView.hidden) {
-    if (event.payload.status === "complete") {
-      void loadHealth("Automatic check complete.", "success");
+    const recoveryMessage = recoveryStatusMessage({
+      ...event.payload,
+      recovery_pending:
+        event.payload.recovery_pending || event.payload.status === "recovery_pending",
+    });
+    const inactiveMessage =
+      event.payload.status === "inactive"
+        ? inactiveCheckMessage(event.payload.reason)
+        : null;
+    if (recoveryMessage !== null) {
+      const count = event.payload.failed_notifications;
+      const deliveryMessage = count
+        ? ` ${count} notification${count === 1 ? " remains" : "s remain"} queued.`
+        : "";
+      const kind =
+        event.payload.recovery_state === "backoff" ||
+        event.payload.recovery_state === "degraded"
+          ? "error"
+          : "success";
+      void loadHealth(`Automatic check: ${recoveryMessage}${deliveryMessage}`, kind, effectScope);
+    } else if (inactiveMessage !== null) {
+      void loadHealth(`Automatic check paused: ${inactiveMessage}`, "error", effectScope);
+    } else if (event.payload.status === "complete") {
+      void loadHealth("Automatic check complete.", "success", effectScope);
     } else if (event.payload.status === "delivery_failed") {
       const count = event.payload.failed_notifications;
       void loadHealth(
         `Automatic check complete, but ${count} notification${count === 1 ? "" : "s"} remain queued.`,
         "error",
+        effectScope,
       );
     } else {
-      void loadHealth("Automatic check failed; it will retry on schedule.", "error");
+      void loadHealth(scheduledCheckFailureMessage(event.payload), "error", effectScope);
     }
   }
 });
@@ -3494,7 +4406,7 @@ window.addEventListener("focus", () => {
     });
   }
   if (!settingsView.hidden && configurationReady) {
-    void loadCalendarConsents();
+    void Promise.all([loadCalendarConsents(), loadGmailLabelState()]);
   } else {
     void refreshConnectStatus();
   }
@@ -3502,7 +4414,7 @@ window.addEventListener("focus", () => {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") return;
   if (!settingsView.hidden && configurationReady) {
-    void loadCalendarConsents();
+    void Promise.all([loadCalendarConsents(), loadGmailLabelState()]);
   } else {
     void refreshConnectStatus();
   }

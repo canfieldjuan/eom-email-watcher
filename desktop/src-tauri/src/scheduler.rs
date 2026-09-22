@@ -1,5 +1,5 @@
 use crate::delivery::NotificationDelivery;
-use crate::engine::Engine;
+use crate::engine::{CheckResult, Engine, EngineError};
 use serde::Serialize;
 use std::io;
 use std::sync::{
@@ -23,12 +23,30 @@ enum ScheduledCheckStatus {
     Complete,
     DeliveryFailed,
     CheckFailed,
+    RecoveryPending,
+    Inactive,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct ScheduledCheckEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox_operation_revision: Option<u64>,
     status: ScheduledCheckStatus,
     failed_notifications: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_pending: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_failure_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_next_retry_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_retryable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -151,21 +169,52 @@ impl ConnectQueueScheduler {
 }
 
 impl ScheduledCheckEvent {
-    fn completed(failed_notifications: u64) -> Self {
+    fn from_check(
+        check: &CheckResult,
+        failed_notifications: u64,
+        mailbox_operation_revision: u64,
+    ) -> Self {
+        let recovery_pending = check.recovery_pending == Some(true);
         Self {
-            status: if failed_notifications == 0 {
+            mailbox_operation_revision: Some(mailbox_operation_revision),
+            status: if recovery_pending {
+                ScheduledCheckStatus::RecoveryPending
+            } else if !check.active && check.reason.is_some() {
+                ScheduledCheckStatus::Inactive
+            } else if failed_notifications == 0 {
                 ScheduledCheckStatus::Complete
             } else {
                 ScheduledCheckStatus::DeliveryFailed
             },
             failed_notifications,
+            reason: check.reason.clone(),
+            recovery_pending: recovery_pending.then_some(true),
+            recovery_state: recovery_pending
+                .then(|| check.recovery_state.clone())
+                .flatten(),
+            recovery_failure_code: recovery_pending
+                .then(|| check.recovery_failure_code.clone())
+                .flatten(),
+            recovery_next_retry_at: recovery_pending
+                .then(|| check.recovery_next_retry_at.clone())
+                .flatten(),
+            error_code: None,
+            error_retryable: None,
         }
     }
 
-    fn check_failed() -> Self {
+    fn check_failed(error: &EngineError) -> Self {
         Self {
+            mailbox_operation_revision: error.mailbox_operation_revision,
             status: ScheduledCheckStatus::CheckFailed,
             failed_notifications: 0,
+            reason: None,
+            recovery_pending: None,
+            recovery_state: None,
+            recovery_failure_code: None,
+            recovery_next_retry_at: None,
+            error_code: Some(error.code.clone()),
+            error_retryable: error.retryable,
         }
     }
 }
@@ -262,14 +311,18 @@ impl PollScheduler {
                                 outcome.delivery.failed
                             );
                         }
-                        ScheduledCheckEvent::completed(outcome.delivery.failed)
+                        ScheduledCheckEvent::from_check(
+                            &outcome.check,
+                            outcome.delivery.failed,
+                            outcome.mailbox_operation_revision,
+                        )
                     }
                     Err(error) => {
                         eprintln!(
                             "scheduled watcher check failed ({}): {}",
                             error.code, error.message
                         );
-                        ScheduledCheckEvent::check_failed()
+                        ScheduledCheckEvent::check_failed(&error)
                     }
                 };
                 connect_queue.wake();
@@ -288,7 +341,31 @@ impl PollScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::CheckResult;
     use std::cell::Cell;
+
+    fn check_result_with_recovery(
+        recovery_state: Option<&str>,
+        recovery_failure_code: Option<&str>,
+        recovery_next_retry_at: Option<&str>,
+    ) -> CheckResult {
+        CheckResult {
+            active: true,
+            reason: None,
+            discovered: 2,
+            summarized: 1,
+            fallback_notified: 0,
+            purged: 0,
+            stale_cursor_recovered: recovery_state.is_some(),
+            pending_notifications: 0,
+            automation_processed: 0,
+            automation_review_required: 0,
+            recovery_pending: recovery_state.map(|_| true),
+            recovery_state: recovery_state.map(str::to_owned),
+            recovery_failure_code: recovery_failure_code.map(str::to_owned),
+            recovery_next_retry_at: recovery_next_retry_at.map(str::to_owned),
+        }
+    }
 
     #[test]
     fn next_check_uses_configured_interval() {
@@ -322,27 +399,129 @@ mod tests {
 
     #[test]
     fn scheduled_event_distinguishes_delivery_failure_from_complete_check() {
+        let check = check_result_with_recovery(None, None, None);
         assert_eq!(
-            ScheduledCheckEvent::completed(2),
+            ScheduledCheckEvent::from_check(&check, 2, 7),
             ScheduledCheckEvent {
+                mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::DeliveryFailed,
                 failed_notifications: 2,
+                reason: None,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
+                error_code: None,
+                error_retryable: None,
             }
         );
         assert_eq!(
-            ScheduledCheckEvent::completed(0),
+            ScheduledCheckEvent::from_check(&check, 0, 7),
             ScheduledCheckEvent {
+                mailbox_operation_revision: Some(7),
                 status: ScheduledCheckStatus::Complete,
                 failed_notifications: 0,
+                reason: None,
+                recovery_pending: None,
+                recovery_state: None,
+                recovery_failure_code: None,
+                recovery_next_retry_at: None,
+                error_code: None,
+                error_retryable: None,
             }
         );
         assert_eq!(
-            serde_json::to_value(ScheduledCheckEvent::completed(2)).expect("serialize event"),
+            serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2, 7))
+                .expect("serialize event"),
             serde_json::json!({
+                "mailbox_operation_revision": 7,
                 "status": "delivery_failed",
                 "failed_notifications": 2,
             })
         );
+    }
+
+    #[test]
+    fn scheduled_failure_preserves_code_and_retryability_boundaries() {
+        for retryable in [Some(true), Some(false), None] {
+            let error = crate::engine::EngineError {
+                code: "gmail_authorization_rejected".to_owned(),
+                message: "provider detail must stay private".to_owned(),
+                retryable,
+                mailbox_operation_revision: Some(11),
+            };
+            let event = serde_json::to_value(ScheduledCheckEvent::check_failed(&error))
+                .expect("serialize scheduled error");
+            assert_eq!(event["status"], "check_failed");
+            assert_eq!(event["error_code"], "gmail_authorization_rejected");
+            assert_eq!(event["mailbox_operation_revision"], 11);
+            assert_eq!(
+                event["error_retryable"],
+                retryable.map_or(serde_json::Value::Null, serde_json::Value::Bool)
+            );
+            assert!(!event.to_string().contains("provider detail"));
+        }
+    }
+
+    #[test]
+    fn scheduled_inactive_reason_never_emits_completion() {
+        let mut check = check_result_with_recovery(None, None, None);
+        check.active = false;
+        check.reason = Some("gmail_label_selectors_inactive".to_owned());
+
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0, 0))
+            .expect("serialize scheduled inactive event");
+
+        assert_eq!(event["status"], "inactive");
+        assert_eq!(event["reason"], "gmail_label_selectors_inactive");
+        assert_ne!(event["status"], "complete");
+    }
+
+    #[test]
+    fn scheduled_active_result_reason_is_not_misclassified_as_inactive() {
+        let mut check = check_result_with_recovery(None, None, None);
+        check.reason = Some("recovery_truncated".to_owned());
+
+        let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 0, 0))
+            .expect("serialize scheduled active result reason");
+
+        assert_eq!(event["status"], "complete");
+        assert_eq!(event["reason"], "recovery_truncated");
+    }
+
+    #[test]
+    fn scheduled_recovery_states_never_emit_completion() {
+        for (state, failure_code, next_retry_at) in [
+            ("collecting", None, None),
+            (
+                "backoff",
+                Some("gmail_recovery_page_token_invalid"),
+                Some("2026-09-20T03:00:00+00:00"),
+            ),
+            (
+                "degraded",
+                Some("gmail_recovery_page_token_invalid"),
+                Some("2026-09-20T04:00:00+00:00"),
+            ),
+        ] {
+            let check = check_result_with_recovery(Some(state), failure_code, next_retry_at);
+            let event = serde_json::to_value(ScheduledCheckEvent::from_check(&check, 2, 0))
+                .expect("serialize scheduled recovery event");
+
+            assert_eq!(event["status"], "recovery_pending");
+            assert_eq!(event["failed_notifications"], 2);
+            assert_eq!(event["recovery_pending"], true);
+            assert_eq!(event["recovery_state"], state);
+            assert_eq!(
+                event["recovery_failure_code"],
+                failure_code.map_or(serde_json::Value::Null, serde_json::Value::from)
+            );
+            assert_eq!(
+                event["recovery_next_retry_at"],
+                next_retry_at.map_or(serde_json::Value::Null, serde_json::Value::from)
+            );
+            assert_ne!(event["status"], "complete");
+        }
     }
 
     #[test]

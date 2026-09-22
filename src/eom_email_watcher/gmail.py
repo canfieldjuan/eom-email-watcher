@@ -4,19 +4,24 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import sys
+import unicodedata
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
+import httplib2
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow, WSGITimeoutError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -25,6 +30,7 @@ from .config import normalize_address
 from .mailbox import (
     MailboxChanges,
     MailboxError,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -38,8 +44,22 @@ TOKEN_LOCK_TIMEOUT_SECONDS = 30
 GMAIL_AUTHORIZATION_TIMEOUT_SECONDS = 300
 # Each unique history ID requires a metadata request before exact sender gating.
 MAX_INCREMENTAL_MESSAGE_IDS = 200
-HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v1:"
+MAX_HISTORY_CONTINUATION_BYTES = 4096
+MAX_HISTORY_CONTINUATION_OFFSET = 50_000
+HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v2:"
+LEGACY_HISTORY_CONTINUATION_PREFIX = "eom-gmail-history-v1:"
+MAX_GMAIL_LABEL_CATALOG_BYTES = 1_048_576
+MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES = MAX_GMAIL_LABEL_CATALOG_BYTES + 65_536
+MAX_GMAIL_LABEL_COUNT = 10_000
+MAX_GMAIL_LABEL_ID_BYTES = 512
+MAX_GMAIL_LABEL_NAME_BYTES = 1_024
+MAX_GMAIL_RECOVERY_PAGE_IDS = 200
+MAX_GMAIL_PAGE_TOKEN_BYTES = 8_192
+GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels"
 BUNDLED_GOOGLE_OAUTH_CLIENT = Path("eom_email_watcher_data/google-oauth-client.json")
+TRANSIENT_GMAIL_LABEL_403_REASONS = frozenset(
+    {"rateLimitExceeded", "userRateLimitExceeded"}
+)
 
 
 class GmailError(MailboxError):
@@ -49,9 +69,39 @@ class GmailError(MailboxError):
 class GmailAuthorizationRejected(GmailError):
     """Gmail rejected credentials that appeared usable locally."""
 
+    code = "gmail_authorization_rejected"
+
+
+class GmailLabelCatalogInvalid(GmailError):
+    """Gmail returned a label catalog that cannot safely be used."""
+
+    code = "gmail_label_catalog_invalid"
+
+
+class GmailLabelCatalogUnavailable(GmailError):
+    """The complete Gmail label catalog could not be fetched."""
+
+    code = "gmail_label_catalog_unavailable"
+
+
+class GmailRecoveryPageInvalid(GmailError):
+    """Gmail returned a recovery page that cannot safely be persisted."""
+
+    code = "gmail_recovery_page_invalid"
+
+
+class GmailRecoveryPageTokenInvalid(GmailError):
+    """Gmail rejected the stored recovery page token."""
+
+    code = "gmail_recovery_page_token_invalid"
+
+
+class _GmailLabelCatalogReadUnavailable(Exception):
+    """A successful response body could not be read to completion."""
+
 
 class StaleHistoryCursor(GmailError, StaleMailboxCursor):
-    """The saved Gmail history cursor requires sender-filtered recovery."""
+    """The saved Gmail history cursor requires bounded durable recovery."""
 
 
 class MessageUnavailable(GmailError, MailboxMessageUnavailable):
@@ -60,27 +110,308 @@ class MessageUnavailable(GmailError, MailboxMessageUnavailable):
     caller should skip this one message, not fail the whole run."""
 
 
-def _decode_history_cursor(cursor: str) -> tuple[str, int]:
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_non_json_numeric_constant(value: str) -> object:
+    raise ValueError(f"non-JSON numeric constant: {value}")
+
+
+def _classify_refresh_error(error: RefreshError) -> Literal["rejected", "transient"]:
+    return "transient" if error.retryable else "rejected"
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _contains_control(value: str) -> bool:
+    return any(unicodedata.category(character) == "Cc" for character in value)
+
+
+def _bounded_text(
+    value: object,
+    *,
+    maximum_bytes: int,
+    field: str,
+    error_type: type[GmailError],
+) -> str:
+    if not isinstance(value, str) or not value or _contains_control(value):
+        raise error_type(f"{field} is invalid")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise error_type(f"{field} is invalid") from exc
+    if len(encoded) > maximum_bytes:
+        raise error_type(f"{field} is invalid")
+    return value
+
+
+def _history_prefix_digest(message_ids: list[str]) -> str:
+    return hashlib.sha256(_canonical_json_bytes(message_ids)).hexdigest()
+
+
+def _decode_history_cursor(cursor: str) -> tuple[str, int, str | None]:
+    if not isinstance(cursor, str) or not cursor:
+        raise StaleHistoryCursor("Saved Gmail history cursor is invalid")
+    if cursor.startswith(LEGACY_HISTORY_CONTINUATION_PREFIX):
+        raise StaleHistoryCursor("Saved Gmail history continuation uses the retired stream")
     if not cursor.startswith(HISTORY_CONTINUATION_PREFIX):
-        return cursor, 0
-    value = cursor.removeprefix(HISTORY_CONTINUATION_PREFIX)
-    start_history_id, separator, offset_text = value.rpartition(":")
-    if not separator or not start_history_id or not offset_text.isdecimal():
-        raise GmailError("Saved Gmail history continuation cursor is invalid")
-    offset = int(offset_text)
-    if offset <= 0:
-        raise GmailError("Saved Gmail history continuation cursor is invalid")
-    return start_history_id, offset
+        if not cursor.isdecimal() or len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+            raise StaleHistoryCursor("Saved Gmail history cursor is invalid")
+        return cursor, 0, None
+    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+        raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid")
+    encoded = cursor.removeprefix(HISTORY_CONTINUATION_PREFIX)
+    try:
+        payload = json.loads(encoded, object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "prefix_sha256",
+        "returned",
+        "start_history_id",
+    }:
+        raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid")
+    start_history_id = payload["start_history_id"]
+    offset = payload["returned"]
+    digest = payload["prefix_sha256"]
+    if (
+        not isinstance(start_history_id, str)
+        or not start_history_id.isdecimal()
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or not 0 <= offset <= MAX_HISTORY_CONTINUATION_OFFSET
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid")
+    if offset == 0 and digest != _history_prefix_digest([]):
+        raise StaleHistoryCursor("Saved Gmail history continuation prefix changed")
+    return start_history_id, offset, digest
 
 
-def _history_continuation_cursor(start_history_id: str, offset: int) -> str:
-    return f"{HISTORY_CONTINUATION_PREFIX}{start_history_id}:{offset}"
+def _history_continuation_cursor(start_history_id: str, message_ids: list[str]) -> str:
+    offset = len(message_ids)
+    if offset > MAX_HISTORY_CONTINUATION_OFFSET:
+        raise StaleHistoryCursor("Saved Gmail history continuation exceeded replay bounds")
+    payload = {
+        "prefix_sha256": _history_prefix_digest(message_ids),
+        "returned": offset,
+        "start_history_id": start_history_id,
+    }
+    cursor = HISTORY_CONTINUATION_PREFIX + _canonical_json_bytes(payload).decode("utf-8")
+    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+        raise StaleHistoryCursor("Saved Gmail history continuation exceeded transport bounds")
+    return cursor
 
 
 @dataclass(frozen=True)
 class GmailProfile:
     email_address: str
     history_id: str
+
+
+@dataclass(frozen=True)
+class GmailLabel:
+    label_id: str
+    display_name: str
+    label_type: Literal["user", "system"]
+
+
+def decode_gmail_label_catalog(
+    body: bytes,
+    *,
+    content_length: object = None,
+) -> tuple[GmailLabel, ...]:
+    """Decode one complete bounded Gmail labels response without partial results."""
+    string_length_over_cap = (
+        isinstance(content_length, str)
+        and content_length.strip().isdecimal()
+        and int(content_length.strip()) > MAX_GMAIL_LABEL_CATALOG_BYTES
+    )
+    integer_length_over_cap = (
+        isinstance(content_length, int)
+        and not isinstance(content_length, bool)
+        and content_length > MAX_GMAIL_LABEL_CATALOG_BYTES
+    )
+    if string_length_over_cap or integer_length_over_cap:
+        raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: response is too large")
+    if not isinstance(body, bytes) or len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+        raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: response is too large")
+    try:
+        document = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_json_numeric_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as exc:
+        raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: malformed JSON") from exc
+    if not isinstance(document, dict) or not isinstance(document.get("labels"), list):
+        raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: labels are missing")
+    raw_labels = document["labels"]
+    if len(raw_labels) > MAX_GMAIL_LABEL_COUNT:
+        raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: too many labels")
+    labels: list[GmailLabel] = []
+    seen_ids: set[str] = set()
+    for item in raw_labels:
+        if not isinstance(item, dict):
+            raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: malformed label")
+        label_id = _bounded_text(
+            item.get("id"),
+            maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+            field="Gmail label ID",
+            error_type=GmailLabelCatalogInvalid,
+        )
+        display_name = _bounded_text(
+            item.get("name"),
+            maximum_bytes=MAX_GMAIL_LABEL_NAME_BYTES,
+            field="Gmail label name",
+            error_type=GmailLabelCatalogInvalid,
+        )
+        label_type = item.get("type")
+        if label_type not in ("user", "system"):
+            raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: unknown label type")
+        if label_id in seen_ids:
+            raise GmailLabelCatalogInvalid("gmail_label_catalog_invalid: duplicate label ID")
+        seen_ids.add(label_id)
+        labels.append(GmailLabel(label_id, display_name, label_type))
+    labels.sort(key=lambda label: label.label_id)
+    normalized = {
+        "labels": [
+            {"id": label.label_id, "name": label.display_name, "type": label.label_type}
+            for label in labels
+        ]
+    }
+    if len(_canonical_json_bytes(normalized)) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+        raise GmailLabelCatalogInvalid(
+            "gmail_label_catalog_invalid: normalized response is too large"
+        )
+    return tuple(labels)
+
+
+def _bounded_gmail_label_response_body(response: object) -> bytes | None:
+    headers = getattr(response, "headers", {})
+    if not hasattr(headers, "get"):
+        return None
+    content_encoding = headers.get("Content-Encoding")
+    if content_encoding is None:
+        encoding = "identity"
+    elif not isinstance(content_encoding, str):
+        return None
+    else:
+        encoding = content_encoding.strip().casefold() or "identity"
+    if encoding not in {"identity", "gzip", "deflate"}:
+        return None
+    content_length = headers.get("Content-Length")
+    expected_length: int | None = None
+    if content_length is not None:
+        if isinstance(content_length, str) and content_length.strip().isdecimal():
+            expected_length = int(content_length.strip())
+        elif (
+            isinstance(content_length, int)
+            and not isinstance(content_length, bool)
+            and content_length >= 0
+        ):
+            expected_length = content_length
+        else:
+            return None
+        if expected_length > MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES:
+            return None
+        if (
+            encoding == "identity"
+            and expected_length is not None
+            and expected_length > MAX_GMAIL_LABEL_CATALOG_BYTES
+        ):
+            return None
+    raw = getattr(response, "raw", None)
+    raw_read = getattr(raw, "read", None)
+    if not callable(raw_read):
+        return None
+    decompressor = None
+    if encoding == "gzip":
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+    elif encoding == "deflate":
+        decompressor = zlib.decompressobj(zlib.MAX_WBITS)
+    body = bytearray()
+    wire_length = 0
+    try:
+        while True:
+            remaining_wire = MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES + 1 - wire_length
+            chunk = raw_read(min(65_536, remaining_wire), decode_content=False)
+            if not isinstance(chunk, bytes):
+                return None
+            if not chunk:
+                break
+            wire_length += len(chunk)
+            if wire_length > MAX_GMAIL_LABEL_CATALOG_WIRE_BYTES:
+                return None
+            if decompressor is None:
+                body.extend(chunk[: MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)])
+            else:
+                remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
+                body.extend(decompressor.decompress(chunk, remaining))
+                if decompressor.unused_data or decompressor.unconsumed_tail:
+                    return None
+            if len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES:
+                return None
+        if expected_length is not None and wire_length != expected_length:
+            return None
+        if decompressor is not None:
+            remaining = MAX_GMAIL_LABEL_CATALOG_BYTES + 1 - len(body)
+            body.extend(decompressor.flush(remaining))
+            if (
+                len(body) > MAX_GMAIL_LABEL_CATALOG_BYTES
+                or not decompressor.eof
+                or decompressor.unused_data
+                or decompressor.unconsumed_tail
+            ):
+                return None
+    except (OSError, RuntimeError) as exc:
+        raise _GmailLabelCatalogReadUnavailable from exc
+    except (TypeError, ValueError, zlib.error):
+        return None
+    return bytes(body)
+
+
+def _gmail_error_reasons(body: bytes) -> frozenset[str]:
+    try:
+        payload = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_non_json_numeric_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
+        return frozenset()
+    if not isinstance(payload, dict):
+        return frozenset()
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return frozenset()
+    errors = error.get("errors")
+    if not isinstance(errors, list) or not errors:
+        return frozenset()
+    reasons: set[str] = set()
+    for item in errors:
+        if not isinstance(item, dict):
+            return frozenset()
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason:
+            return frozenset()
+        reasons.add(reason)
+    return frozenset(reasons)
 
 
 def resolve_gmail_credentials_file(configured_file: Path) -> Path:
@@ -131,6 +462,29 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
     from email.utils import parseaddr
 
     sender_name, _address = parseaddr(raw_from)
+    raw_labels = message.get("labelIds")
+    if raw_labels is None:
+        raw_labels = []
+    if not isinstance(raw_labels, list) or len(raw_labels) > MAX_GMAIL_LABEL_COUNT:
+        raise MailboxMessageInvalid(
+            "gmail_message_invalid",
+            "Gmail message metadata contained invalid label IDs",
+        )
+    try:
+        labels = frozenset(
+            _bounded_text(
+                label,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="Gmail metadata label ID",
+                error_type=GmailError,
+            )
+            for label in raw_labels
+        )
+    except GmailError as exc:
+        raise MailboxMessageInvalid(
+            "gmail_message_invalid",
+            "Gmail message metadata contained invalid label IDs",
+        ) from exc
     return MessageMetadata(
         message_id=str(message["id"]),
         thread_id=str(message["threadId"]) if message.get("threadId") else None,
@@ -138,7 +492,7 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
         sender_name=sender_name.strip() or None,
         subject=headers.get("subject", "(no subject)").strip() or "(no subject)",
         received_at=_received_at(message, headers),
-        labels=frozenset(str(label) for label in message.get("labelIds") or []),
+        labels=labels,
     )
 
 
@@ -164,9 +518,45 @@ def _find_part(payload: dict[str, Any], part_id: str) -> dict[str, Any] | None:
 
 
 class GmailGateway:
-    def __init__(self, service: Any, mailbox_identity_key: str | None = None):
+    def __init__(
+        self,
+        service: Any,
+        mailbox_identity_key: str | None = None,
+        credentials: Credentials | None = None,
+    ):
         self.service = service
         self._mailbox_identity_key = mailbox_identity_key
+        self._credentials = credentials
+
+    def _execute_request(
+        self,
+        request: Any,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        try:
+            if timeout_seconds is None:
+                return request.execute()
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                raise ValueError("Gmail request timeout must be a positive finite number")
+            if self._credentials is None:
+                return request.execute()
+            transport = AuthorizedHttp(
+                self._credentials,
+                http=httplib2.Http(timeout=float(timeout_seconds)),
+            )
+            return request.execute(http=transport)
+        except RefreshError as exc:
+            if _classify_refresh_error(exc) == "rejected":
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
+            raise GmailError("Gmail authorization refresh failed; retry") from exc
 
     @staticmethod
     def _credential_identity(credentials: Credentials) -> str:
@@ -250,7 +640,7 @@ class GmailGateway:
 
                         credentials.refresh(refresh_request)
                     except RefreshError as exc:
-                        if exc.retryable:
+                        if _classify_refresh_error(exc) == "transient":
                             raise GmailError("Gmail authorization refresh failed; retry") from exc
                         raise GmailAuthorizationRejected(
                             "Gmail rejected the configured authorization"
@@ -268,6 +658,7 @@ class GmailGateway:
         gateway = cls(
             build("gmail", "v1", credentials=credentials, cache_discovery=False),
             identity_key,
+            credentials,
         )
         if remaining_timeout is not None:
             gateway.set_operation_timeout(
@@ -337,6 +728,7 @@ class GmailGateway:
             cls(
                 build("gmail", "v1", credentials=credentials, cache_discovery=False),
                 identity_key,
+                credentials,
             ),
             authorization_changed,
         )
@@ -363,7 +755,10 @@ class GmailGateway:
         ):
             raise GmailError("Gmail profile response did not contain an email address")
         history_id = str(result.get("historyId", "")).strip()
-        if not history_id:
+        if (
+            not history_id.isdecimal()
+            or len(history_id.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES
+        ):
             raise GmailError("Gmail profile response did not contain a history cursor")
         return GmailProfile(email_address=email_address, history_id=history_id)
 
@@ -373,13 +768,71 @@ class GmailGateway:
     def initial_cursor(self) -> str:
         return self.profile_history_id()
 
+    def label_catalog(self) -> tuple[GmailLabel, ...]:
+        if self._credentials is None:
+            raise GmailLabelCatalogUnavailable(
+                "gmail_label_catalog_unavailable: authenticated transport is unavailable"
+            )
+        try:
+            with AuthorizedSession(self._credentials) as session:
+                response = session.get(GMAIL_LABELS_URL, stream=True, timeout=120)
+                if response.status_code == 401:
+                    raise GmailAuthorizationRejected(
+                        "Gmail rejected the configured authorization"
+                    )
+                if response.status_code == 403:
+                    try:
+                        body = _bounded_gmail_label_response_body(response)
+                    except Exception as exc:
+                        raise GmailAuthorizationRejected(
+                            "Gmail rejected the configured authorization"
+                        ) from exc
+                    reasons = _gmail_error_reasons(body) if body is not None else frozenset()
+                    if reasons and reasons <= TRANSIENT_GMAIL_LABEL_403_REASONS:
+                        raise GmailLabelCatalogUnavailable(
+                            "gmail_label_catalog_unavailable: Gmail labels request was throttled"
+                        )
+                    raise GmailAuthorizationRejected(
+                        "Gmail rejected the configured authorization"
+                    )
+                if response.status_code >= 300:
+                    raise GmailLabelCatalogUnavailable(
+                        "gmail_label_catalog_unavailable: "
+                        f"Gmail labels request failed (HTTP {response.status_code})"
+                    )
+                body = _bounded_gmail_label_response_body(response)
+                if body is None:
+                    raise GmailLabelCatalogInvalid(
+                        "gmail_label_catalog_invalid: response is too large"
+                    )
+                return decode_gmail_label_catalog(body)
+        except (GmailAuthorizationRejected, GmailLabelCatalogInvalid):
+            raise
+        except GmailLabelCatalogUnavailable:
+            raise
+        except RefreshError as exc:
+            if _classify_refresh_error(exc) == "rejected":
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
+            raise GmailLabelCatalogUnavailable(
+                "gmail_label_catalog_unavailable: Gmail authorization refresh failed"
+            ) from exc
+        except Exception as exc:
+            raise GmailLabelCatalogUnavailable(
+                "gmail_label_catalog_unavailable: Gmail labels request failed"
+            ) from exc
+
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
-        request_start_history_id, skip_unique_ids = _decode_history_cursor(start_history_id)
+        request_start_history_id, skip_unique_ids, expected_prefix_digest = (
+            _decode_history_cursor(start_history_id)
+        )
         ids: list[str] = []
         seen_ids: set[str] = set()
+        ordered_unique_ids: list[str] = []
         page_token: str | None = None
         newest = request_start_history_id
-        unique_ids_seen = 0
+        prefix_verified = skip_unique_ids == 0
         try:
             while True:
                 request = (
@@ -388,30 +841,70 @@ class GmailGateway:
                     .list(
                         userId="me",
                         startHistoryId=request_start_history_id,
-                        historyTypes=["messageAdded"],
-                        labelId="INBOX",
+                        historyTypes=["messageAdded", "labelAdded"],
                         pageToken=page_token,
                         maxResults=500,
                     )
                 )
                 response = request.execute()
-                newest = str(response.get("historyId", newest))
-                for event in response.get("history") or []:
-                    for added in event.get("messagesAdded") or []:
-                        message = added.get("message") or {}
-                        message_id = str(message.get("id", ""))
-                        if message_id and message_id not in seen_ids:
+                if not isinstance(response, dict):
+                    raise GmailError("Gmail history response is invalid")
+                candidate_newest = response.get("historyId", newest)
+                if not isinstance(candidate_newest, str) or not candidate_newest.isdecimal():
+                    raise GmailError("Gmail history response contained an invalid cursor")
+                newest = candidate_newest
+                events = response.get("history", [])
+                if not isinstance(events, list):
+                    raise GmailError("Gmail history response is invalid")
+                for event in events:
+                    if not isinstance(event, dict):
+                        raise GmailError("Gmail history response is invalid")
+                    for event_field in ("messagesAdded", "labelsAdded"):
+                        additions = event.get(event_field, [])
+                        if not isinstance(additions, list):
+                            raise GmailError("Gmail history response is invalid")
+                        for added in additions:
+                            message = added.get("message") if isinstance(added, dict) else None
+                            message_id = _bounded_text(
+                                message.get("id") if isinstance(message, dict) else None,
+                                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                                field="Gmail history message ID",
+                                error_type=GmailError,
+                            )
+                            if message_id in seen_ids:
+                                continue
                             seen_ids.add(message_id)
-                            unique_ids_seen += 1
-                            if unique_ids_seen <= skip_unique_ids:
+                            ordered_unique_ids.append(message_id)
+                            unique_ids_seen = len(ordered_unique_ids)
+                            if unique_ids_seen > MAX_HISTORY_CONTINUATION_OFFSET:
+                                raise StaleHistoryCursor(
+                                    "Saved Gmail history continuation exceeded replay bounds"
+                                )
+                            if unique_ids_seen == skip_unique_ids:
+                                actual_prefix_digest = _history_prefix_digest(ordered_unique_ids)
+                                if actual_prefix_digest != expected_prefix_digest:
+                                    raise StaleHistoryCursor(
+                                        "Saved Gmail history continuation prefix changed"
+                                    )
+                                prefix_verified = True
+                                continue
+                            if unique_ids_seen < skip_unique_ids:
                                 continue
                             if len(ids) == MAX_INCREMENTAL_MESSAGE_IDS:
+                                prefix = ordered_unique_ids[: skip_unique_ids + len(ids)]
                                 return ids, _history_continuation_cursor(
                                     request_start_history_id,
-                                    skip_unique_ids + len(ids),
+                                    prefix,
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
+                if page_token is not None:
+                    page_token = _bounded_text(
+                        page_token,
+                        maximum_bytes=MAX_GMAIL_PAGE_TOKEN_BYTES,
+                        field="Gmail history page token",
+                        error_type=GmailError,
+                    )
                 if not page_token:
                     break
         except HttpError as exc:
@@ -420,17 +913,22 @@ class GmailGateway:
                     "Saved Gmail history cursor is no longer available"
                 ) from exc
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
-        if unique_ids_seen < skip_unique_ids:
-            raise GmailError("Saved Gmail history continuation cursor cannot be resumed")
+        if not prefix_verified:
+            raise StaleHistoryCursor("Saved Gmail history continuation cursor cannot be resumed")
         return ids, newest
 
     def changes_since(self, cursor: str) -> MailboxChanges:
         message_ids, newest = self.history_message_ids(cursor)
         return MailboxChanges(tuple(message_ids), newest)
 
-    def metadata(self, message_id: str) -> MessageMetadata:
+    def metadata(
+        self,
+        message_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> MessageMetadata:
         try:
-            message = (
+            request = (
                 self.service.users()
                 .messages()
                 .get(
@@ -439,14 +937,16 @@ class GmailGateway:
                     format="metadata",
                     metadataHeaders=["From", "Subject", "Date"],
                 )
-                .execute()
             )
+            message = self._execute_request(request, timeout_seconds=timeout_seconds)
         except HttpError as exc:
             if getattr(exc.resp, "status", None) == 404:
                 raise MessageUnavailable(
                     f"Gmail message {message_id} unavailable (HTTP 404)"
                 ) from exc
             raise GmailError(f"Gmail metadata fetch failed (HTTP {exc.resp.status})") from exc
+        except (TimeoutError, OSError, httplib2.HttpLib2Error) as exc:
+            raise GmailError("Gmail metadata fetch timed out or failed") from exc
         return parse_metadata(message)
 
     def full_payload(self, message_id: str) -> dict[str, Any]:
@@ -522,6 +1022,89 @@ class GmailGateway:
             page_token = response.get("nextPageToken")
             if not page_token:
                 return list(dict.fromkeys(ids))
+
+    def recovery_page(
+        self,
+        page_token: str | None,
+        after_exclusive_epoch: int,
+        before_exclusive_epoch: int,
+        max_results: int = MAX_GMAIL_RECOVERY_PAGE_IDS,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[tuple[str, ...], str | None]:
+        if (
+            isinstance(after_exclusive_epoch, bool)
+            or not isinstance(after_exclusive_epoch, int)
+            or after_exclusive_epoch < 0
+            or isinstance(before_exclusive_epoch, bool)
+            or not isinstance(before_exclusive_epoch, int)
+            or before_exclusive_epoch <= after_exclusive_epoch
+            or isinstance(max_results, bool)
+            or max_results != MAX_GMAIL_RECOVERY_PAGE_IDS
+        ):
+            raise GmailRecoveryPageInvalid("gmail_recovery_page_invalid: invalid request bounds")
+        if page_token is not None:
+            _bounded_text(
+                page_token,
+                maximum_bytes=MAX_GMAIL_PAGE_TOKEN_BYTES,
+                field="Gmail recovery page token",
+                error_type=GmailRecoveryPageInvalid,
+            )
+        query = (
+            f"in:inbox after:{after_exclusive_epoch} "
+            f"before:{before_exclusive_epoch}"
+        )
+        try:
+            request = (
+                self.service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    q=query,
+                    pageToken=page_token,
+                    maxResults=MAX_GMAIL_RECOVERY_PAGE_IDS,
+                )
+            )
+            response = self._execute_request(request, timeout_seconds=timeout_seconds)
+        except HttpError as exc:
+            if page_token is not None and getattr(exc.resp, "status", None) == 400:
+                raise GmailRecoveryPageTokenInvalid(
+                    "gmail_recovery_page_token_invalid: Gmail rejected the page token"
+                ) from exc
+            raise GmailError(
+                f"Gmail recovery search failed (HTTP {exc.resp.status})"
+            ) from exc
+        except (TimeoutError, OSError, httplib2.HttpLib2Error) as exc:
+            raise GmailError("Gmail recovery search timed out or failed") from exc
+        if not isinstance(response, dict):
+            raise GmailRecoveryPageInvalid("gmail_recovery_page_invalid: malformed response")
+        messages = response.get("messages", [])
+        if not isinstance(messages, list) or len(messages) > MAX_GMAIL_RECOVERY_PAGE_IDS:
+            raise GmailRecoveryPageInvalid("gmail_recovery_page_invalid: malformed response")
+        ids: list[str] = []
+        seen_ids: set[str] = set()
+        for item in messages:
+            message_id = _bounded_text(
+                item.get("id") if isinstance(item, dict) else None,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="Gmail recovery message ID",
+                error_type=GmailRecoveryPageInvalid,
+            )
+            if message_id in seen_ids:
+                raise GmailRecoveryPageInvalid(
+                    "gmail_recovery_page_invalid: duplicate message ID"
+                )
+            seen_ids.add(message_id)
+            ids.append(message_id)
+        next_page_token = response.get("nextPageToken")
+        if next_page_token is not None:
+            next_page_token = _bounded_text(
+                next_page_token,
+                maximum_bytes=MAX_GMAIL_PAGE_TOKEN_BYTES,
+                field="Gmail recovery next page token",
+                error_type=GmailRecoveryPageInvalid,
+            )
+        return tuple(ids), next_page_token
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
         recovery_cursor = self.initial_cursor()

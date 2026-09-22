@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from eom_email_watcher import cli, engine_api
-from eom_email_watcher.db import Store
+from eom_email_watcher.db import AdmissionProvenance, Store
 from eom_email_watcher.engine_api import ApiError
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.notifications import ChannelResult, DeliveryResult
@@ -376,6 +376,13 @@ def test_requeue_analysis_command_releases_only_permanent_failure(
         subject="Subject",
         received_at="2026-08-29T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:trusted@example.com",
+            display_name=None,
+            mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
     )
     store.reserve_analysis_request("message-1", 20_000)
     store.record_analysis_failure(
