@@ -1718,6 +1718,8 @@ class Watcher:
                         now=checked_at,
                     )
                     return added, False
+                except GmailAuthorizationRejected:
+                    raise
                 except MailboxError:
                     self._record_recovery_backoff(
                         state,
@@ -1780,6 +1782,8 @@ class Watcher:
                 )
                 terminal += 1
                 continue
+            except GmailAuthorizationRejected:
+                raise
             except MailboxError:
                 self._record_recovery_backoff(
                     state,

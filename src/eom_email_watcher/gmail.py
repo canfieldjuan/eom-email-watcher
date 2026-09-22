@@ -30,6 +30,7 @@ from .config import normalize_address
 from .mailbox import (
     MailboxChanges,
     MailboxError,
+    MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
@@ -93,6 +94,10 @@ class GmailRecoveryPageTokenInvalid(GmailError):
     """Gmail rejected the stored recovery page token."""
 
     code = "gmail_recovery_page_token_invalid"
+
+
+class _GmailLabelCatalogReadUnavailable(Exception):
+    """A successful response body could not be read to completion."""
 
 
 class StaleHistoryCursor(GmailError, StaleMailboxCursor):
@@ -374,7 +379,9 @@ def _bounded_gmail_label_response_body(response: object) -> bytes | None:
                 or decompressor.unconsumed_tail
             ):
                 return None
-    except (OSError, RuntimeError, TypeError, ValueError, zlib.error):
+    except (OSError, RuntimeError) as exc:
+        raise _GmailLabelCatalogReadUnavailable from exc
+    except (TypeError, ValueError, zlib.error):
         return None
     return bytes(body)
 
@@ -455,6 +462,29 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
     from email.utils import parseaddr
 
     sender_name, _address = parseaddr(raw_from)
+    raw_labels = message.get("labelIds")
+    if raw_labels is None:
+        raw_labels = []
+    if not isinstance(raw_labels, list) or len(raw_labels) > MAX_GMAIL_LABEL_COUNT:
+        raise MailboxMessageInvalid(
+            "gmail_message_invalid",
+            "Gmail message metadata contained invalid label IDs",
+        )
+    try:
+        labels = frozenset(
+            _bounded_text(
+                label,
+                maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
+                field="Gmail metadata label ID",
+                error_type=GmailError,
+            )
+            for label in raw_labels
+        )
+    except GmailError as exc:
+        raise MailboxMessageInvalid(
+            "gmail_message_invalid",
+            "Gmail message metadata contained invalid label IDs",
+        ) from exc
     return MessageMetadata(
         message_id=str(message["id"]),
         thread_id=str(message["threadId"]) if message.get("threadId") else None,
@@ -462,7 +492,7 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
         sender_name=sender_name.strip() or None,
         subject=headers.get("subject", "(no subject)").strip() or "(no subject)",
         received_at=_received_at(message, headers),
-        labels=frozenset(str(label) for label in message.get("labelIds") or []),
+        labels=labels,
     )
 
 
@@ -504,22 +534,29 @@ class GmailGateway:
         *,
         timeout_seconds: float | None = None,
     ) -> Any:
-        if timeout_seconds is None:
-            return request.execute()
-        if (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or not math.isfinite(timeout_seconds)
-            or timeout_seconds <= 0
-        ):
-            raise ValueError("Gmail request timeout must be a positive finite number")
-        if self._credentials is None:
-            return request.execute()
-        transport = AuthorizedHttp(
-            self._credentials,
-            http=httplib2.Http(timeout=float(timeout_seconds)),
-        )
-        return request.execute(http=transport)
+        try:
+            if timeout_seconds is None:
+                return request.execute()
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+            ):
+                raise ValueError("Gmail request timeout must be a positive finite number")
+            if self._credentials is None:
+                return request.execute()
+            transport = AuthorizedHttp(
+                self._credentials,
+                http=httplib2.Http(timeout=float(timeout_seconds)),
+            )
+            return request.execute(http=transport)
+        except RefreshError as exc:
+            if _classify_refresh_error(exc) == "rejected":
+                raise GmailAuthorizationRejected(
+                    "Gmail rejected the configured authorization"
+                ) from exc
+            raise GmailError("Gmail authorization refresh failed; retry") from exc
 
     @staticmethod
     def _credential_identity(credentials: Credentials) -> str:
@@ -839,6 +876,10 @@ class GmailGateway:
                             seen_ids.add(message_id)
                             ordered_unique_ids.append(message_id)
                             unique_ids_seen = len(ordered_unique_ids)
+                            if unique_ids_seen > MAX_HISTORY_CONTINUATION_OFFSET:
+                                raise StaleHistoryCursor(
+                                    "Saved Gmail history continuation exceeded replay bounds"
+                                )
                             if unique_ids_seen == skip_unique_ids:
                                 actual_prefix_digest = _history_prefix_digest(ordered_unique_ids)
                                 if actual_prefix_digest != expected_prefix_digest:

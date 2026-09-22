@@ -40,7 +40,9 @@ values would therefore widen trust to spoofable input.
 ## Code-grounded root cause
 
 The code already exposes the necessary Gmail metadata: `MessageMetadata`
-contains a label-ID set, and Gmail fills it from `labelIds`
+contains a label-ID set, and Gmail fills it only from a JSON array of bounded,
+non-control strings in `labelIds`; malformed provider shapes are rejected before
+sender or label admission
 (`src/eom_email_watcher/mailbox.py:54-62`;
 `src/eom_email_watcher/gmail.py:125-140`). The blocker is the discovery and
 admission path around that metadata:
@@ -500,13 +502,15 @@ nonretryable `gmail_authorization_rejected`. The manual catalog refresh and
 scheduled discovery paths expose the same public code and retryability, and
 neither exposes the provider response body.
 
-A transport byte overflow, malformed or partial successful JSON document,
+A transport byte overflow, cleanly completed malformed or truncated successful JSON document,
 decoded item-count overflow, unknown label type, malformed item, duplicate ID,
 or canonical byte overflow rejects the whole snapshot with stable
 `gmail_label_catalog_invalid`; it never becomes a partial result. Locally
 disconnected or absent credentials return `account_unavailable`;
 account/provider mismatch returns `account_not_active`, `not_found`, or
-`unsupported_provider`. No selector or mailbox cursor changes, except that an
+`unsupported_provider`. A transport exception while reading a successful
+response is retryable `gmail_label_catalog_unavailable`, not stable invalid
+provider data. No selector or mailbox cursor changes, except that an
 identity replacement already detected by established reconciliation performs
 the single required selector-set revision change and recovery-state removal.
 
@@ -888,6 +892,12 @@ retained), `gmail_recovery_page_token_invalid` (provider paging restarted after
 backoff), `gmail_recovery_provider_unavailable` (transient progress-preserving
 backoff), and `gmail_recovery_counter_overflow` (integrity failure, fail closed).
 None authorizes a cursor advance.
+
+Timed recovery page and metadata requests classify OAuth refresh failures at
+the gateway boundary. Retryable refresh failures enter the existing
+progress-preserving provider-unavailable backoff. Nonretryable refresh rejection
+remains `gmail_authorization_rejected` and is never relabelled as transient
+backoff. Provider details are not exposed.
 
 Resume does not re-enumerate labels or let new local grants into the frozen
 snapshot. Current local grants are nevertheless re-read for every candidate so

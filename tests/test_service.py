@@ -14,6 +14,7 @@ from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
+    GmailAuthorizationRejected,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
     GmailRecoveryPageTokenInvalid,
@@ -1753,6 +1754,62 @@ def test_recovery_backoff_is_visible_in_check_result(tmp_path: Path) -> None:
     assert result["recovery_state"] == "backoff"
     assert result["recovery_failure_code"] == "gmail_recovery_provider_unavailable"
     assert result["recovery_next_retry_at"] == recovery.next_retry_at
+    assert store.state()[0] == "100"
+
+
+@pytest.mark.parametrize("failure_stage", ["page", "metadata"])
+def test_recovery_authorization_rejection_is_not_relabelled_as_transient_backoff(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime.now(UTC) - timedelta(minutes=10),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class RejectedRecoveryGmail(FreshGmail):
+        def __init__(self) -> None:
+            super().__init__(stale=True)
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            if failure_stage == "page":
+                raise GmailAuthorizationRejected("authorization rejected")
+            return ("allowed",), None
+
+        def metadata(
+            self,
+            message_id: str,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> MessageMetadata:
+            raise GmailAuthorizationRejected("authorization rejected")
+
+    with pytest.raises(GmailAuthorizationRejected):
+        Watcher(cfg, store, RejectedRecoveryGmail(), FakeModel()).check()
+
+    recovery = store.gmail_recovery_state("gmail-default")
+    assert recovery is not None
+    assert recovery.failure_code is None
+    assert recovery.next_retry_at is None
     assert store.state()[0] == "100"
 
 

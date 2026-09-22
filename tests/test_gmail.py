@@ -18,6 +18,7 @@ from eom_email_watcher.gmail import (
     parse_metadata,
     resolve_gmail_credentials_file,
 )
+from eom_email_watcher.mailbox import MailboxMessageInvalid
 
 
 def test_gmail_operation_timeout_reaches_authorized_transport() -> None:
@@ -138,6 +139,26 @@ def test_parse_metadata_keeps_missing_source_time_invalid() -> None:
     )
 
     assert parsed.received_at == ""
+
+
+@pytest.mark.parametrize(
+    "label_ids",
+    [
+        {"INBOX": True, "Label_123": True},
+        ["INBOX", 1],
+        ["INBOX", "x" * (gmail_module.MAX_GMAIL_LABEL_ID_BYTES + 1)],
+    ],
+)
+def test_parse_metadata_rejects_malformed_label_ids(label_ids: object) -> None:
+    with pytest.raises(MailboxMessageInvalid):
+        parse_metadata(
+            {
+                "id": "m1",
+                "internalDate": "1784383200000",
+                "labelIds": label_ids,
+                "payload": {"headers": []},
+            }
+        )
 
 
 def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
@@ -281,6 +302,16 @@ def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
     message_ids, _ = gateway.history_message_ids("12345")
 
     assert len(message_ids) == gmail_module.MAX_INCREMENTAL_MESSAGE_IDS
+
+
+def test_gmail_history_rejects_final_batch_past_replay_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gmail_module, "MAX_HISTORY_CONTINUATION_OFFSET", 2)
+    gateway = GmailGateway(FakeHistoryService(history_response(3)))
+
+    with pytest.raises(gmail_module.StaleHistoryCursor, match="replay bounds"):
+        gateway.history_message_ids("12345")
 
 
 @pytest.mark.parametrize(
@@ -730,6 +761,17 @@ def test_gmail_catalog_stream_reader_rejects_decoded_cap_plus_one(
     assert response.read_started is True
 
 
+def test_gmail_catalog_interrupted_success_is_retryable_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = InterruptedCatalogResponse(catalog_body([]), status_code=200)
+    session = FakeCatalogSession(response)
+    monkeypatch.setattr(gmail_module, "AuthorizedSession", lambda credentials: session)
+
+    with pytest.raises(gmail_module.GmailLabelCatalogUnavailable):
+        GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+
 @pytest.mark.parametrize(
     ("status_code", "body", "error_type"),
     [
@@ -829,6 +871,41 @@ def test_gmail_catalog_classifies_authorized_session_refresh_failures(
 
     with pytest.raises(error_type) as raised:
         GmailGateway(None, credentials=SimpleNamespace()).label_catalog()
+
+    assert private_detail not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("retryable", "error_type"),
+    [
+        (False, GmailAuthorizationRejected),
+        (True, GmailError),
+    ],
+)
+def test_timed_metadata_classifies_authorized_transport_refresh_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    retryable: bool,
+    error_type: type[Exception],
+) -> None:
+    private_detail = "private timed refresh response"
+
+    class RefreshFailingRequest:
+        def execute(self, *, http=None):
+            raise gmail_module.RefreshError(private_detail, retryable=retryable)
+
+    messages = SimpleNamespace(get=lambda **_kwargs: RefreshFailingRequest())
+    service = SimpleNamespace(users=lambda: SimpleNamespace(messages=lambda: messages))
+    monkeypatch.setattr(
+        gmail_module,
+        "AuthorizedHttp",
+        lambda credentials, *, http: SimpleNamespace(http=http),
+    )
+
+    with pytest.raises(error_type) as raised:
+        GmailGateway(
+            service,
+            credentials=SimpleNamespace(),
+        ).metadata("message-1", timeout_seconds=1.0)
 
     assert private_detail not in str(raised.value)
 
