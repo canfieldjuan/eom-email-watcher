@@ -84,3 +84,15 @@ test("queue progress refreshes the full loaded inbox span", async () => {
     /listen<\{ attempted: number \}>\("watcher:\/\/connect-queue", \(\) => \{\s+if \(configurationReady\) scheduleConnectQueueRefresh\(\);/,
   );
 });
+
+test("configured navigation gates every engine-backed tab", async () => {
+  const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const navigation = source.match(
+    /function setConfiguredNavigation\(enabled: boolean\): void \{([\s\S]*?)\n\}/,
+  );
+
+  assert.ok(navigation, "expected the configured navigation owner");
+  for (const tab of ["inboxTab", "watchlistTab", "expiryLedgerTab", "healthTab"]) {
+    assert.match(navigation[1], new RegExp(`${tab}\\.disabled = !enabled;`));
+  }
+});

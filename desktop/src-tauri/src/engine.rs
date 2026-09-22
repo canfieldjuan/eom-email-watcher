@@ -664,6 +664,11 @@ pub struct InboxPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct CertificateExpiryLedger {
+    pub items: Vec<Value>,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct InboxDeletion {
     deleted: bool,
@@ -992,6 +997,17 @@ impl Engine {
                 "status": query.status,
                 "keyword": query.keyword,
             }),
+        )
+    }
+
+    pub fn list_certificate_expiry_ledger(
+        &self,
+        today: String,
+        limit: u32,
+    ) -> Result<CertificateExpiryLedger, EngineError> {
+        self.request(
+            "certificate.expiry_ledger.list",
+            json!({"today": today, "limit": limit}),
         )
     }
 
