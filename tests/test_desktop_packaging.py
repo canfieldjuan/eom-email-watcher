@@ -44,6 +44,35 @@ ADMISSION_TOKEN = {
 }
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows stat and lock semantics")
+def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eom_email_watcher.config import initialize_config, load_config
+
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    state_home = private_root / "state"
+    state_home.mkdir()
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(key, str(private_root))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home.resolve()))
+    monkeypatch.chdir(tmp_path)
+    config_path = private_root / "config.toml"
+
+    initialized = initialize_config(
+        config_path,
+        model_base_url="http://127.0.0.1:9/v1",
+        model_name="sidecar-build-smoke",
+        timezone="America/Chicago",
+    )
+
+    assert config_path.is_file()
+    assert initialized.timezone == "America/Chicago"
+    assert load_config(config_path).timezone == "America/Chicago"
+
+
 def test_packaged_smoke_uses_owner_private_config_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

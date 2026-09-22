@@ -753,6 +753,30 @@ the packaged Windows smoke. Do not change POSIX reads, admission tokens,
 consent semantics, the public error envelope, or the package gate. The native
 jobs, not the Linux simulation, decide whether this actually fixes Windows.
 
+### Native Windows first-run isolation after head 272c45e
+
+At head `272c45ec93fcfe1d46b87af4f74414e4766a8483`, the required
+`windows-operation-lock` job passes, but `windows-package` still exits at
+packaged `config.initialize` with public code `outcome_unknown`. The
+`_initialize_config_non_posix` boundary intentionally translates failures
+after publication into that code, so the smoke result alone does not identify
+whether cleanup, lock release, or the follow-up load raised. The previous
+admission stat repair therefore has native read coverage but not packaged
+first-run proof.
+
+Problem-derived contract for this diagnostic phase: exercise real non-POSIX
+first-run initialization in the Windows package job's existing Python test
+step, with the same isolated state-home inputs as the packaged smoke. The
+native test must assert the created config loads and retains its timezone;
+an unexpected exception should preserve its native pytest traceback so the
+root cause can be identified before changing production behavior. Limit this
+phase to this contract and `tests/test_desktop_packaging.py`, already in the
+fix-mode allowlist. Do not change the public error envelope, smoke failure
+gate, Windows publication, config storage, consent behavior, dependencies,
+or CI workflow. A passing direct test would narrow the defect to the packaged
+environment; a failing test would supply the underlying exception. In either
+case, repair and native packaged proof remain required before merge.
+
 Diagnostic-only phase non-scope, superseded for the named current-head repair
 classes above: do not change initialization semantics, the engine API,
 configuration storage, Windows publication, ntfy consent, dependencies, or
