@@ -2,23 +2,22 @@ timezone = "America/Chicago"
 body_char_limit = 20000
 retention_days = 180
 poll_interval_minutes = 120
-gmail_credentials_file = "~/.local/state/eom-email-watcher/credentials.json"
-microsoft_credentials_file = "~/.local/state/eom-email-watcher/microsoft-oauth-client.json"
-gmail_token_file = "~/.local/state/eom-email-watcher/token.json"
-gmail_send_token_file = "~/.local/state/eom-email-watcher/send-token.json"
+# Database and credential/token paths default to Email Watcher's runtime state
+# directory: $STATE_DIRECTORY for systemd, otherwise
+# $XDG_STATE_HOME/eom-email-watcher, otherwise ~/.local/state/eom-email-watcher.
+# Absolute paths may be set explicitly when an operator manages another private location.
 monthly_hours_recipient = "billing-contact@example.com"
-database_file = "~/.local/state/eom-email-watcher/watcher.sqlite3"
 model_backend = "loopback"
 model_base_url = "http://127.0.0.1:1234/v1"
 model_name = "your-local-model-identifier"
-model_api_token_file = "~/.local/state/eom-email-watcher/lmstudio-api-token"
+# model_api_token_file defaults to <runtime-state-directory>/lmstudio-api-token.
 model_require_auth = true
 model_timeout_seconds = 60
 # To use an administrator-managed on-prem inference gateway instead, set:
 # model_backend = "gateway"
 # model_base_url = "https://inference.example.internal"
-# model_api_token_file = "~/.local/state/eom-email-watcher/gateway-credential"
-# model_ca_file = "~/.local/state/eom-email-watcher/gateway-ca.pem"
+# model_api_token_file = "/absolute/private/path/gateway-credential"
+# model_ca_file = "/absolute/private/path/gateway-ca.pem"
 # model_name is ignored in gateway mode; worker/model selection stays on the appliance.
 notifications_enabled = true
 # Optional content-bearing phone push via ntfy (https://ntfy.sh).

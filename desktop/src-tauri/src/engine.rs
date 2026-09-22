@@ -3,10 +3,15 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{File, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, TryLockError as MutexTryLockError,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, RecvTimeoutError},
+};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::ShellExt;
@@ -36,6 +41,152 @@ use windows_sys::Win32::{
 };
 
 const PROTOCOL_VERSION: u8 = 1;
+const CONFIG_INITIALIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
+const ENGINE_PIPE_POLL: Duration = Duration::from_millis(10);
+const MAX_ENGINE_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENGINE_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct AdmissionLease(Arc<()>);
+
+impl AdmissionLease {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+pub(crate) trait CancellationParticipant: Send + Sync {
+    fn cancel_and_wait(&self);
+}
+
+#[derive(Default)]
+struct CancellationRegistry {
+    next_id: AtomicU64,
+    participants: Mutex<BTreeMap<u64, Arc<dyn CancellationParticipant>>>,
+    empty: Condvar,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    registry: CancellationRegistry,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CancellationToken {
+    state: Arc<CancellationState>,
+}
+
+pub(crate) struct CancellationRegistration {
+    state: Arc<CancellationState>,
+    id: Option<u64>,
+}
+
+impl Drop for CancellationRegistration {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        participants.remove(&id);
+        if participants.is_empty() {
+            self.state.registry.empty.notify_all();
+        }
+    }
+}
+
+impl CancellationToken {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        let participants: Vec<_> = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for participant in participants {
+            participant.cancel_and_wait();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn register(
+        &self,
+        participant: Arc<dyn CancellationParticipant>,
+    ) -> CancellationRegistration {
+        let id = self.state.registry.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancelled = self.is_cancelled();
+        let id = if cancelled {
+            None
+        } else {
+            participants.insert(id, Arc::clone(&participant));
+            Some(id)
+        };
+        drop(participants);
+        if cancelled {
+            participant.cancel_and_wait();
+        }
+        CancellationRegistration {
+            state: Arc::clone(&self.state),
+            id,
+        }
+    }
+
+    pub(crate) fn wait_for_registrations(&self) {
+        let mut participants = self
+            .state
+            .registry
+            .participants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !participants.is_empty() {
+            participants = self
+                .state
+                .registry
+                .empty
+                .wait(participants)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+fn cancellation_requested(cancellations: &[CancellationToken]) -> bool {
+    cancellations.iter().any(CancellationToken::is_cancelled)
+}
+
+fn engine_cancelled() -> EngineError {
+    EngineError::host(
+        "engine_cancelled",
+        "Watcher engine operation was cancelled during shutdown",
+    )
+}
 
 fn default_config_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/eom-email-watcher/config.toml")
@@ -201,13 +352,13 @@ fn resume_suspended_process(process_id: u32) -> io::Result<()> {
     }
 }
 
-struct EngineChild {
+struct EngineChildProcess {
     process: Child,
     #[cfg(windows)]
     job: WindowsJob,
 }
 
-impl EngineChild {
+impl EngineChildProcess {
     fn spawn(command: &mut Command) -> io::Result<Self> {
         #[cfg(windows)]
         let job = WindowsJob::new()?;
@@ -219,10 +370,7 @@ impl EngineChild {
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let process = command.spawn()?;
         #[cfg(windows)]
-        let process = match job
-            .assign(&process)
-            .and_then(|()| resume_suspended_process(process.id()))
-        {
+        let process = match job.assign(&process) {
             Ok(()) => process,
             Err(error) => {
                 let mut process = process;
@@ -256,22 +404,332 @@ impl EngineChild {
         let _ = self.process.wait();
     }
 
-    fn wait_with_output(self) -> io::Result<Output> {
-        #[cfg(windows)]
+    #[cfg(windows)]
+    fn resume(&mut self) -> io::Result<()> {
+        if self.process.try_wait()?.is_none() {
+            resume_suspended_process(self.process.id())?;
+        }
+        Ok(())
+    }
+}
+
+struct EngineChildControl {
+    process: Mutex<Option<EngineChildProcess>>,
+}
+
+impl EngineChildControl {
+    fn with_process<T>(
+        &self,
+        operation: impl FnOnce(&mut EngineChildProcess) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_| io::Error::other("Engine child process is unavailable"))?;
+        let process = process
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
+        operation(process)
+    }
+
+    fn terminate(&self) {
+        if let Ok(mut process) = self.process.lock()
+            && let Some(process) = process.as_mut()
         {
-            let Self { process, job } = self;
-            let output = process.wait_with_output()?;
-            if output.status.success() {
-                job.release_descendants()?;
-            } else {
-                job.terminate();
-            }
-            Ok(output)
+            process.terminate();
+        }
+    }
+
+    fn complete(&self, success: bool) -> io::Result<()> {
+        let mut slot = self
+            .process
+            .lock()
+            .map_err(|_| io::Error::other("Engine child process is unavailable"))?;
+        let process = slot
+            .take()
+            .ok_or_else(|| io::Error::other("Engine child process is unavailable"))?;
+        #[cfg(windows)]
+        if success {
+            process.job.release_descendants()?;
+        } else {
+            process.job.terminate();
         }
         #[cfg(not(windows))]
-        {
-            self.process.wait_with_output()
+        let _ = success;
+        drop(process);
+        Ok(())
+    }
+}
+
+impl CancellationParticipant for EngineChildControl {
+    fn cancel_and_wait(&self) {
+        self.terminate();
+    }
+}
+
+struct EngineChild {
+    control: Arc<EngineChildControl>,
+    stdout: Option<EnginePipeDrain>,
+    stderr: Option<EnginePipeDrain>,
+    _registrations: Vec<CancellationRegistration>,
+}
+
+struct DrainedPipe {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+struct EnginePipeDrain {
+    result: mpsc::Receiver<io::Result<DrainedPipe>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum EngineOutputAbort {
+    Cancelled,
+    TimedOut,
+}
+
+enum EngineOutputError {
+    Io,
+    Cancelled,
+    TimedOut,
+    StdoutTooLarge,
+    StderrTooLarge,
+}
+
+struct EngineOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl EnginePipeDrain {
+    fn spawn(
+        name: &'static str,
+        reader: impl Read + Send + 'static,
+        limit: usize,
+    ) -> io::Result<Self> {
+        let (sender, result) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _ = sender.send(drain_engine_pipe(reader, limit));
+            })?;
+        Ok(Self {
+            result,
+            worker: Some(worker),
+        })
+    }
+
+    fn receive(
+        &mut self,
+        control: &EngineChildControl,
+        cancellations: &[CancellationToken],
+        deadline: Option<Instant>,
+        abort: &mut Option<EngineOutputAbort>,
+    ) -> io::Result<DrainedPipe> {
+        let result = loop {
+            if abort.is_none() && cancellation_requested(cancellations) {
+                *abort = Some(EngineOutputAbort::Cancelled);
+                control.terminate();
+            }
+            if abort.is_none() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                *abort = Some(EngineOutputAbort::TimedOut);
+                control.terminate();
+            }
+
+            let wait = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or(ENGINE_PIPE_POLL)
+                .min(ENGINE_PIPE_POLL);
+            match self.result.recv_timeout(wait) {
+                Ok(result) => break result,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(io::Error::other("Engine pipe drain stopped unexpectedly"));
+                }
+            }
+        };
+        self.join()?;
+        result
+    }
+
+    fn join(&mut self) -> io::Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| io::Error::other("Engine pipe drain panicked"))
+    }
+}
+
+fn drain_engine_pipe(mut reader: impl Read, limit: usize) -> io::Result<DrainedPipe> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut overflowed = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
+        let remaining = limit.saturating_sub(bytes.len());
+        let retained = remaining.min(count);
+        bytes.extend_from_slice(&buffer[..retained]);
+        overflowed |= retained < count;
+    }
+    Ok(DrainedPipe { bytes, overflowed })
+}
+
+impl EngineChild {
+    fn spawn(command: &mut Command, cancellations: &[CancellationToken]) -> io::Result<Self> {
+        let process = EngineChildProcess::spawn(command)?;
+        let control = Arc::new(EngineChildControl {
+            process: Mutex::new(Some(process)),
+        });
+        let registrations = cancellations
+            .iter()
+            .map(|cancellation| {
+                cancellation.register(Arc::clone(&control) as Arc<dyn CancellationParticipant>)
+            })
+            .collect();
+        #[cfg(windows)]
+        if let Err(error) = control.with_process(EngineChildProcess::resume) {
+            control.terminate();
+            return Err(error);
+        }
+        let (stdout, stderr) = match control.with_process(|process| {
+            let stdout = process
+                .process
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("Engine stdout was unavailable"))?;
+            let stderr = process
+                .process
+                .stderr
+                .take()
+                .ok_or_else(|| io::Error::other("Engine stderr was unavailable"))?;
+            Ok((stdout, stderr))
+        }) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                control.terminate();
+                return Err(error);
+            }
+        };
+        let mut stdout = match EnginePipeDrain::spawn(
+            "email-watcher-engine-stdout",
+            stdout,
+            MAX_ENGINE_STDOUT_BYTES,
+        ) {
+            Ok(stdout) => stdout,
+            Err(error) => {
+                control.terminate();
+                return Err(error);
+            }
+        };
+        let stderr = match EnginePipeDrain::spawn(
+            "email-watcher-engine-stderr",
+            stderr,
+            MAX_ENGINE_STDERR_BYTES,
+        ) {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                control.terminate();
+                let _ = stdout.join();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            control,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            _registrations: registrations,
+        })
+    }
+
+    fn take_stdin(&self) -> io::Result<Option<std::process::ChildStdin>> {
+        self.control
+            .with_process(|process| Ok(process.process.stdin.take()))
+    }
+
+    fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.control
+            .with_process(|process| process.process.try_wait())
+    }
+
+    fn terminate(&self) {
+        self.control.terminate();
+    }
+
+    fn collect_output(
+        mut self,
+        status: ExitStatus,
+        cancellations: &[CancellationToken],
+        deadline: Option<Instant>,
+    ) -> Result<EngineOutput, EngineOutputError> {
+        let mut abort = None;
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or(EngineOutputError::Io)?
+            .receive(&self.control, cancellations, deadline, &mut abort)
+            .map_err(|_| EngineOutputError::Io)?;
+        let stderr = self
+            .stderr
+            .as_mut()
+            .ok_or(EngineOutputError::Io)?
+            .receive(&self.control, cancellations, deadline, &mut abort)
+            .map_err(|_| EngineOutputError::Io)?;
+        self.stdout = None;
+        self.stderr = None;
+
+        if abort.is_none() && cancellation_requested(cancellations) {
+            abort = Some(EngineOutputAbort::Cancelled);
+            self.control.terminate();
+        }
+        if abort.is_none() && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            abort = Some(EngineOutputAbort::TimedOut);
+            self.control.terminate();
+        }
+        match abort {
+            Some(EngineOutputAbort::Cancelled) => return Err(EngineOutputError::Cancelled),
+            Some(EngineOutputAbort::TimedOut) => return Err(EngineOutputError::TimedOut),
+            None => {}
+        }
+        if stdout.overflowed {
+            return Err(EngineOutputError::StdoutTooLarge);
+        }
+        if stderr.overflowed {
+            return Err(EngineOutputError::StderrTooLarge);
+        }
+        self.control
+            .complete(status.success())
+            .map_err(|_| EngineOutputError::Io)?;
+        Ok(EngineOutput {
+            status,
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+        })
+    }
+
+    fn join_drains(&mut self) {
+        if let Some(stdout) = self.stdout.as_mut() {
+            let _ = stdout.join();
+        }
+        if let Some(stderr) = self.stderr.as_mut() {
+            let _ = stderr.join();
+        }
+    }
+}
+
+impl Drop for EngineChild {
+    fn drop(&mut self) {
+        self.control.terminate();
+        self.join_drains();
+        let _ = self.control.complete(false);
     }
 }
 
@@ -281,7 +739,11 @@ pub struct Engine {
     args: Vec<OsString>,
     config_path: PathBuf,
     mailbox_operation_gate: Arc<Mutex<MailboxOperationState>>,
+    admission_binding: Arc<Mutex<Option<AdmissionBinding>>>,
     request_timeout: Option<Duration>,
+    cancellations: Vec<CancellationToken>,
+    #[cfg(test)]
+    test_environment: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Default)]
@@ -927,7 +1389,7 @@ pub struct NotificationIntent {
     pub title: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LocalModelSettings {
     #[serde(default)]
     pub editable: bool,
@@ -935,19 +1397,81 @@ pub struct LocalModelSettings {
     pub model: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EngineSettings {
     pub local_model: LocalModelSettings,
     pub notifications_enabled: bool,
     pub poll_interval_minutes: u64,
     pub polling_supported: bool,
     pub retention_days: u64,
+    #[serde(default)]
+    pub timezone: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdmissionToken {
+    pub version: u8,
+    pub revision: String,
+    pub identity: String,
+}
+
+pub(crate) type AdmissionErrorObserver =
+    Arc<dyn Fn(&AdmissionToken, &EngineError) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct AdmissionBinding {
+    lease: AdmissionLease,
+    token: AdmissionToken,
+    observer: AdmissionErrorObserver,
+}
+
+impl AdmissionToken {
+    fn is_valid(&self) -> bool {
+        fn is_sha256(value: &str) -> bool {
+            value.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }
+
+        self.version == 1 && is_sha256(&self.revision) && is_sha256(&self.identity)
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct AdmissionSnapshot {
+    #[serde(default)]
+    pub desktop_initialization_receipt: Option<String>,
+    pub settings: EngineSettings,
+    pub token: AdmissionToken,
+}
+
+#[derive(Deserialize)]
+struct AdmissionComparison {
+    current: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConfigInitialization {
     pub created: bool,
+    pub desktop_initialization_receipt: String,
     pub settings: EngineSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NtfyDisclosureStatus {
+    Missing,
+    NormalAdmission,
+    AcknowledgementRequired { expected_revision: String },
+    ManualRepairRequired,
+}
+
+#[derive(Deserialize)]
+struct NtfyDisclosureAcknowledgement {
+    acknowledged: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -960,12 +1484,39 @@ pub struct EngineError {
     pub mailbox_operation_revision: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigInitializationFailureClass {
+    Definitive,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy)]
+enum EngineRequestCommitRisk {
+    None,
+    ConfigInitialization,
+}
+
 #[derive(Serialize)]
 struct EngineRequest<'a> {
     protocol: u8,
     operation: &'a str,
     config_path: String,
     payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_token: Option<AdmissionToken>,
+}
+
+fn operation_requires_admission_token(operation: &str) -> bool {
+    matches!(
+        operation,
+        "host.operation_lock"
+            | "watcher.check"
+            | "connect.queue.pump"
+            | "notifications.pending"
+            | "notifications.pending_under_host_lock"
+            | "notifications.count_under_host_lock"
+            | "notifications.ack"
+    )
 }
 
 #[derive(Deserialize)]
@@ -1022,6 +1573,10 @@ impl EngineError {
         }
     }
 
+    fn requires_admission_revocation(&self) -> bool {
+        matches!(self.code.as_str(), "conflict" | "configuration_error")
+    }
+
     fn for_frontend(self) -> Self {
         if self.code == "configuration_error" {
             return Self {
@@ -1031,6 +1586,26 @@ impl EngineError {
             };
         }
         self
+    }
+
+    pub(crate) fn config_initialization_failure_class(&self) -> ConfigInitializationFailureClass {
+        if self.code == "outcome_unknown" {
+            ConfigInitializationFailureClass::OutcomeUnknown
+        } else {
+            ConfigInitializationFailureClass::Definitive
+        }
+    }
+}
+
+impl EngineRequestCommitRisk {
+    fn map_post_dispatch(self, error: EngineError) -> EngineError {
+        match self {
+            Self::None => error,
+            Self::ConfigInitialization => EngineError::host(
+                "outcome_unknown",
+                "Watcher configuration initialization may have completed; refresh admission before retrying",
+            ),
+        }
     }
 }
 
@@ -1046,7 +1621,11 @@ impl Engine {
                 args: Vec::new(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
+                admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
+                cancellations: Vec::new(),
+                #[cfg(test)]
+                test_environment: Vec::new(),
             });
         }
 
@@ -1058,7 +1637,11 @@ impl Engine {
                 args: sidecar.get_args().map(OsString::from).collect(),
                 config_path,
                 mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
+                admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
+                cancellations: Vec::new(),
+                #[cfg(test)]
+                test_environment: Vec::new(),
             });
         }
 
@@ -1076,12 +1659,16 @@ impl Engine {
             ],
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
+            admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
+            cancellations: Vec::new(),
+            #[cfg(test)]
+            test_environment: Vec::new(),
         })
     }
 
     #[cfg(test)]
-    fn with_command(
+    pub(crate) fn with_command(
         program: impl Into<OsString>,
         args: Vec<OsString>,
         config_path: PathBuf,
@@ -1091,8 +1678,21 @@ impl Engine {
             args,
             config_path,
             mailbox_operation_gate: Arc::new(Mutex::new(MailboxOperationState::default())),
+            admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
+            cancellations: Vec::new(),
+            test_environment: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_environment(
+        mut self,
+        key: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.test_environment.push((key.into(), value.into()));
+        self
     }
 
     pub fn list(&self) -> Result<Vec<WatchedSender>, EngineError> {
@@ -1583,6 +2183,7 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
     pub fn settings_with_timeout(&self, timeout: Duration) -> Result<EngineSettings, EngineError> {
         self.request_with_timeout("settings.get", json!({}), timeout)
     }
@@ -1591,6 +2192,101 @@ impl Engine {
         self.request("settings.get", json!({}))
     }
 
+    pub fn admission_snapshot(&self) -> Result<AdmissionSnapshot, EngineError> {
+        let snapshot: AdmissionSnapshot = self.request_with_timeout(
+            "config.admission.snapshot",
+            json!({}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if snapshot.token.is_valid() {
+            Ok(snapshot)
+        } else {
+            Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid configuration admission token",
+            ))
+        }
+    }
+
+    pub fn compare_admission(&self, token: &AdmissionToken) -> Result<(), EngineError> {
+        if !token.is_valid() {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Desktop configuration admission token is invalid",
+            ));
+        }
+        let comparison: AdmissionComparison = self.request_with_timeout(
+            "config.admission.compare",
+            json!({"token": token}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if comparison.current {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "configuration_admission_changed",
+                "Watcher configuration changed during admission",
+            ))
+        }
+    }
+
+    pub(crate) fn install_admission_binding(
+        &self,
+        lease: AdmissionLease,
+        token: AdmissionToken,
+        observer: AdmissionErrorObserver,
+    ) {
+        *self
+            .admission_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AdmissionBinding {
+            lease,
+            token,
+            observer,
+        });
+    }
+
+    pub(crate) fn clear_admission_binding(&self, lease: &AdmissionLease) {
+        let mut installed = self
+            .admission_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if installed
+            .as_ref()
+            .is_some_and(|binding| binding.lease.is_same(lease))
+        {
+            *installed = None;
+        }
+    }
+
+    pub fn ntfy_disclosure_status(&self) -> Result<NtfyDisclosureStatus, EngineError> {
+        self.request_with_timeout(
+            "config.ntfy_disclosure.status",
+            json!({}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn acknowledge_ntfy_disclosure(
+        &self,
+        expected_revision: String,
+    ) -> Result<(), EngineError> {
+        let response: NtfyDisclosureAcknowledgement = self.request_with_timeout(
+            "config.ntfy_disclosure.acknowledge",
+            json!({"expected_revision": expected_revision}),
+            DISCLOSURE_REQUEST_TIMEOUT,
+        )?;
+        if response.acknowledged {
+            Ok(())
+        } else {
+            Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid disclosure acknowledgement",
+            ))
+        }
+    }
+
+    #[cfg(test)]
     pub fn config_present(&self) -> Result<bool, EngineError> {
         match std::fs::symlink_metadata(&self.config_path) {
             Ok(_) => Ok(true),
@@ -1607,15 +2303,24 @@ impl Engine {
         timezone: String,
         model_base_url: String,
         model_name: String,
+        desktop_initialization_receipt: String,
     ) -> Result<ConfigInitialization, EngineError> {
-        self.request(
+        self.request_inner(
             "config.initialize",
             json!({
+                "desktop_initialization_receipt": desktop_initialization_receipt,
                 "model_base_url": model_base_url,
                 "model_name": model_name,
                 "timezone": timezone,
             }),
+            Some(self.config_initialization_timeout()),
+            EngineRequestCommitRisk::ConfigInitialization,
         )
+    }
+
+    fn config_initialization_timeout(&self) -> Duration {
+        self.request_timeout
+            .unwrap_or(CONFIG_INITIALIZATION_REQUEST_TIMEOUT)
     }
 
     pub fn update_settings(
@@ -1646,6 +2351,81 @@ impl Engine {
         engine
     }
 
+    pub(crate) fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
+        let mut engine = self.clone();
+        engine.cancellations.push(cancellation);
+        engine
+    }
+
+    fn check_cancellation(&self) -> Result<(), EngineError> {
+        if cancellation_requested(&self.cancellations) {
+            Err(engine_cancelled())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mailbox_operation_lock(
+        &self,
+    ) -> Result<(MutexGuard<'_, MailboxOperationState>, Option<Duration>), EngineError> {
+        if self.request_timeout.is_none() && self.cancellations.is_empty() {
+            return self
+                .mailbox_operation_gate
+                .lock()
+                .map(|guard| (guard, None))
+                .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"));
+        }
+        let started = Instant::now();
+        loop {
+            self.check_cancellation()?;
+            match self.mailbox_operation_gate.try_lock() {
+                Ok(guard) => {
+                    self.check_cancellation()?;
+                    let remaining = self
+                        .request_timeout
+                        .map(|timeout| {
+                            timeout
+                                .checked_sub(started.elapsed())
+                                .filter(|remaining| !remaining.is_zero())
+                                .ok_or_else(|| {
+                                    EngineError::host(
+                                        "engine_timeout",
+                                        "Watcher engine did not respond before its timeout",
+                                    )
+                                })
+                        })
+                        .transpose()?;
+                    return Ok((guard, remaining));
+                }
+                Err(MutexTryLockError::Poisoned(_)) => {
+                    return Err(EngineError::host(
+                        "host_error",
+                        "Email account coordinator stopped",
+                    ));
+                }
+                Err(MutexTryLockError::WouldBlock) => {
+                    let sleep_for = self
+                        .request_timeout
+                        .map(|timeout| {
+                            timeout
+                                .checked_sub(started.elapsed())
+                                .filter(|remaining| !remaining.is_zero())
+                                .ok_or_else(|| {
+                                    EngineError::host(
+                                        "engine_timeout",
+                                        "Watcher engine did not respond before its timeout",
+                                    )
+                                })
+                        })
+                        .transpose()?
+                        .unwrap_or(ENGINE_LOCK_RETRY)
+                        .min(ENGINE_LOCK_RETRY);
+                    std::thread::sleep(sleep_for);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn check(&self) -> Result<CheckResult, EngineError> {
         self.check_with_mailbox_revision()
@@ -1653,17 +2433,22 @@ impl Engine {
     }
 
     pub(crate) fn check_with_mailbox_revision(&self) -> Result<MailboxCheckResult, EngineError> {
-        let state = self.lock_mailbox_operation()?;
+        let (state, remaining) = self.mailbox_operation_lock()?;
         let mailbox_operation_revision = state.revision;
-        self.request("watcher.check", json!({"dry_run": false}))
-            .map(|check| MailboxCheckResult {
-                check,
-                mailbox_operation_revision,
-            })
-            .map_err(|mut error| {
-                error.mailbox_operation_revision = Some(mailbox_operation_revision);
-                error
-            })
+        self.request_inner(
+            "watcher.check",
+            json!({"dry_run": false}),
+            remaining,
+            EngineRequestCommitRisk::None,
+        )
+        .map(|check| MailboxCheckResult {
+            check,
+            mailbox_operation_revision,
+        })
+        .map_err(|mut error| {
+            error.mailbox_operation_revision = Some(mailbox_operation_revision);
+            error
+        })
     }
 
     pub(crate) fn run_with_operation_lock<T>(
@@ -1747,7 +2532,12 @@ impl Engine {
         operation: &str,
         payload: Value,
     ) -> Result<T, EngineError> {
-        self.request_inner(operation, payload, self.request_timeout)
+        self.request_inner(
+            operation,
+            payload,
+            self.request_timeout,
+            EngineRequestCommitRisk::None,
+        )
     }
 
     fn request_with_timeout<T: DeserializeOwned>(
@@ -1756,7 +2546,12 @@ impl Engine {
         payload: Value,
         timeout: Duration,
     ) -> Result<T, EngineError> {
-        self.request_inner(operation, payload, Some(timeout))
+        self.request_inner(
+            operation,
+            payload,
+            Some(timeout),
+            EngineRequestCommitRisk::None,
+        )
     }
 
     fn request_inner<T: DeserializeOwned>(
@@ -1764,12 +2559,27 @@ impl Engine {
         operation: &str,
         payload: Value,
         timeout: Option<Duration>,
+        commit_risk: EngineRequestCommitRisk,
     ) -> Result<T, EngineError> {
+        self.check_cancellation()?;
+        let admission_binding = if operation_requires_admission_token(operation) {
+            self.admission_binding
+                .lock()
+                .map_err(|_| {
+                    EngineError::host("host_error", "Configuration admission coordinator stopped")
+                })?
+                .clone()
+        } else {
+            None
+        };
         let request = EngineRequest {
             protocol: PROTOCOL_VERSION,
             operation,
             config_path: self.config_path.to_string_lossy().into_owned(),
             payload,
+            admission_token: admission_binding
+                .as_ref()
+                .map(|binding| binding.token.clone()),
         };
         let encoded = serde_json::to_vec(&request).map_err(|_| {
             EngineError::host(
@@ -1784,9 +2594,11 @@ impl Engine {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(test)]
+        command.envs(self.test_environment.iter().cloned());
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = EngineChild::spawn(&mut command).map_err(|_| {
+        let child = EngineChild::spawn(&mut command, &self.cancellations).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
                 "Watcher engine is unavailable; reinstall it or inspect desktop logs",
@@ -1794,9 +2606,8 @@ impl Engine {
         })?;
 
         let write_result = child
-            .process
-            .stdin
-            .take()
+            .take_stdin()
+            .map_err(|_| EngineError::host("host_error", "Engine stdin was unavailable"))?
             .ok_or_else(|| EngineError::host("host_error", "Engine stdin was unavailable"))
             .and_then(|mut stdin| {
                 stdin.write_all(&encoded).map_err(|_| {
@@ -1811,55 +2622,74 @@ impl Engine {
             return Err(error);
         }
 
-        if let Some(timeout) = timeout {
-            let started = Instant::now();
-            loop {
-                match child.process.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if started.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
+        let started = Instant::now();
+        let deadline = timeout.and_then(|timeout| started.checked_add(timeout));
+        let status = loop {
+            if cancellation_requested(&self.cancellations) {
+                child.terminate();
+                return Err(commit_risk.map_post_dispatch(engine_cancelled()));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         child.terminate();
-                        return Err(EngineError::host(
+                        return Err(commit_risk.map_post_dispatch(EngineError::host(
                             "engine_timeout",
                             "Watcher engine did not respond before its timeout",
-                        ));
+                        )));
                     }
-                    Err(_) => {
-                        child.terminate();
-                        return Err(EngineError::host(
-                            "engine_unavailable",
-                            "Watcher engine status could not be inspected",
-                        ));
-                    }
+                    std::thread::sleep(ENGINE_PIPE_POLL);
+                }
+                Err(_) => {
+                    child.terminate();
+                    return Err(commit_risk.map_post_dispatch(EngineError::host(
+                        "engine_unavailable",
+                        "Watcher engine status could not be inspected",
+                    )));
                 }
             }
-        }
+        };
 
-        let output = child.wait_with_output().map_err(|_| {
-            EngineError::host(
-                "engine_unavailable",
-                "Watcher engine did not return a result",
-            )
-        })?;
+        let output = child
+            .collect_output(status, &self.cancellations, deadline)
+            .map_err(|error| {
+                let error = match error {
+                    EngineOutputError::Cancelled => engine_cancelled(),
+                    EngineOutputError::TimedOut => EngineError::host(
+                        "engine_timeout",
+                        "Watcher engine did not respond before its timeout",
+                    ),
+                    EngineOutputError::StdoutTooLarge | EngineOutputError::StderrTooLarge => {
+                        EngineError::host(
+                            "engine_protocol_error",
+                            "Watcher engine returned an invalid response; inspect desktop logs",
+                        )
+                    }
+                    EngineOutputError::Io => EngineError::host(
+                        "engine_unavailable",
+                        "Watcher engine did not return a result",
+                    ),
+                };
+                commit_risk.map_post_dispatch(error)
+            })?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
             eprintln!("watcher engine {operation} stderr: {}", stderr.trim());
         }
         let envelope: EngineEnvelope<T> = serde_json::from_slice(&output.stdout).map_err(|_| {
-            EngineError::host(
+            commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned an invalid response; inspect desktop logs",
-            )
+            ))
         })?;
 
         if envelope.protocol != PROTOCOL_VERSION || envelope.operation.as_deref() != Some(operation)
         {
-            return Err(EngineError::host(
+            return Err(commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine returned a mismatched response",
-            ));
+            )));
         }
         if !envelope.ok {
             let error = envelope.error.unwrap_or_else(|| {
@@ -1872,19 +2702,24 @@ impl Engine {
                 "watcher engine {operation} failed ({}): {}",
                 error.code, error.message
             );
+            if error.requires_admission_revocation()
+                && let Some(binding) = admission_binding.as_ref()
+            {
+                (binding.observer)(&binding.token, &error);
+            }
             return Err(error.for_frontend());
         }
         if !output.status.success() {
-            return Err(EngineError::host(
+            return Err(commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine reported success with a failing exit status",
-            ));
+            )));
         }
         envelope.data.ok_or_else(|| {
-            EngineError::host(
+            commit_risk.map_post_dispatch(EngineError::host(
                 "engine_protocol_error",
                 "Watcher engine omitted response data",
-            )
+            ))
         })
     }
 }
@@ -1951,6 +2786,218 @@ mod tests {
 
         drop(active);
         HostOperationLock::acquire(&path).expect("released lock is reusable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_wins_spawn_registration_race_and_reaps_child() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+
+        let child = EngineChild::spawn(&mut command, std::slice::from_ref(&cancellation))
+            .expect("spawn child into cancelled registry");
+
+        assert!(child.try_wait().expect("inspect cancelled child").is_some());
+        drop(child);
+        cancellation.wait_for_registrations();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_synchronously_kills_and_reaps_registered_child() {
+        let cancellation = CancellationToken::new();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = EngineChild::spawn(&mut command, std::slice::from_ref(&cancellation))
+            .expect("spawn registered child");
+
+        cancellation.cancel();
+
+        assert!(child.try_wait().expect("inspect reaped child").is_some());
+        drop(child);
+        cancellation.wait_for_registrations();
+    }
+
+    #[test]
+    fn engine_pipe_drain_preserves_normal_and_large_bounded_output() {
+        let normal = b"normal engine output".to_vec();
+        let normal_output =
+            drain_engine_pipe(io::Cursor::new(normal.clone()), normal.len()).expect("drain normal");
+        assert_eq!(normal_output.bytes, normal);
+        assert!(!normal_output.overflowed);
+
+        let large = vec![b'x'; 256 * 1024];
+        let large_output =
+            drain_engine_pipe(io::Cursor::new(large.clone()), large.len()).expect("drain large");
+        assert_eq!(large_output.bytes, large);
+        assert!(!large_output.overflowed);
+    }
+
+    #[test]
+    fn engine_pipe_drain_marks_overflow_after_consuming_the_stream() {
+        let input = b"diagnostic stderr beyond its bound".to_vec();
+        let output = drain_engine_pipe(io::Cursor::new(input), 10).expect("drain stderr");
+
+        assert_eq!(output.bytes, b"diagnostic");
+        assert!(output.overflowed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_after_primary_exit_kills_pipe_holding_descendant_and_releases_gate() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first_run = directory.path().join("first-run");
+        let primary_pid_path = directory.path().join("primary.pid");
+        let descendant_pid_path = directory.path().join("descendant.pid");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+if [ ! -f "$1" ]; then
+  : > "$1"
+  echo $$ > "$2"
+  sleep 30 &
+  echo $! > "$3"
+fi
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+                OsString::from("pipe-holding-descendant-probe"),
+                first_run.as_os_str().to_owned(),
+                primary_pid_path.as_os_str().to_owned(),
+                descendant_pid_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let cancellation = CancellationToken::new();
+        let bounded = engine
+            .with_request_timeout(Duration::from_secs(5))
+            .with_cancellation(cancellation.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(bounded.check()).expect("send engine result");
+        });
+
+        let read_pid = |path: &Path| {
+            for _ in 0..100 {
+                if let Ok(value) = fs::read_to_string(path)
+                    && let Ok(pid) = value.trim().parse::<i32>()
+                {
+                    return pid;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("engine probe did not record {}", path.display());
+        };
+        let primary_pid = read_pid(&primary_pid_path);
+        let descendant_pid = read_pid(&descendant_pid_path);
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable primary PID.
+            if unsafe { libc::kill(primary_pid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 only inspects the disposable primary PID.
+        assert_ne!(unsafe { libc::kill(primary_pid, 0) }, 0);
+        // SAFETY: signal 0 only inspects the disposable descendant PID.
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled engine request finishes")
+            .expect_err("cancelled engine request fails closed");
+        worker.join().expect("engine request worker joins");
+        cancellation.wait_for_registrations();
+        assert_eq!(error.code, "engine_cancelled");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable descendant PID.
+            if unsafe { libc::kill(descendant_pid, 0) } != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 only inspects the disposable descendant PID.
+        assert_ne!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+
+        let restarted = engine.check().expect("fresh request reuses released gate");
+        assert!(restarted.active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_after_primary_exit_kills_pipe_holding_descendant() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let descendant_pid_path = directory.path().join("descendant.pid");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+sleep 30 &
+echo $! > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+                OsString::from("pipe-holding-timeout-probe"),
+                descendant_pid_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let error = engine
+            .check()
+            .expect_err("pipe-holding descendant must not outlive request timeout");
+        assert_eq!(error.code, "engine_timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let descendant_pid: i32 = fs::read_to_string(&descendant_pid_path)
+            .expect("read descendant pid")
+            .trim()
+            .parse()
+            .expect("parse descendant pid");
+        for _ in 0..100 {
+            // SAFETY: signal 0 only inspects the disposable descendant PID.
+            if unsafe { libc::kill(descendant_pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed-out pipe-holding descendant {descendant_pid} is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_drain_does_not_corrupt_a_valid_protocol_response() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' 'bounded diagnostic' >&2
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"active":true,"discovered":0,"summarized":0,"fallback_notified":0,"purged":0,"stale_cursor_recovered":false,"pending_notifications":0}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        assert!(engine.check().expect("valid response with stderr").active);
     }
 
     #[test]
@@ -2878,6 +3925,304 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.read.status","data"
 
     #[cfg(unix)]
     #[test]
+    fn admission_snapshot_returns_settings_and_exact_safe_token() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+case "$request" in
+  *'"operation":"config.admission.snapshot"'*)
+    printf '%s\n' '{"protocol":1,"ok":true,"operation":"config.admission.snapshot","data":{"settings":{"local_model":{"editable":true,"endpoint":"http://127.0.0.1:8080/v1","model":"local-model"},"notifications_enabled":true,"poll_interval_minutes":120,"polling_supported":true,"retention_days":180},"token":{"version":1,"revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}'
+    ;;
+  *) exit 2 ;;
+esac"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let snapshot = engine
+            .admission_snapshot()
+            .expect("atomic admission snapshot must deserialize");
+
+        assert_eq!(snapshot.settings.poll_interval_minutes, 120);
+        assert_eq!(snapshot.token.version, 1);
+        assert_eq!(
+            snapshot.token.revision,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            snapshot.token.identity,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_lost_reply_is_structured_as_outcome_unknown() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![OsString::from("-c"), OsString::from("cat >/dev/null")],
+            PathBuf::from("unused.toml"),
+        );
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .expect_err("missing post-dispatch reply has an unknown outcome");
+
+        assert_eq!(error.code, "outcome_unknown");
+        assert_eq!(
+            error.config_initialization_failure_class(),
+            ConfigInitializationFailureClass::OutcomeUnknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_preserves_structured_conflict_response() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":false,"operation":"config.initialize","error":{"code":"conflict","message":"Configuration already exists"}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .expect_err("engine conflict is definitive");
+
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            error.config_initialization_failure_class(),
+            ConfigInitializationFailureClass::Definitive
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admission_compare_false_fails_closed() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"config.admission.compare","data":{"current":false}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+
+        let error = engine
+            .compare_admission(&token)
+            .expect_err("a stale comparison must fail closed");
+
+        assert_eq!(error.code, "configuration_admission_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_worker_request_carries_exact_admission_token() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'"#,
+                ),
+                OsString::from("admission-token-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+        engine.install_admission_binding(AdmissionLease::new(), token.clone(), Arc::new(|_, _| {}));
+
+        assert_eq!(
+            engine
+                .pending_notification_count_under_host_lock()
+                .expect("guarded worker request succeeds"),
+            0
+        );
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("parse captured engine request");
+
+        assert_eq!(
+            request["admission_token"],
+            serde_json::to_value(token).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_same_token_cleanup_does_not_clear_new_binding() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'"#,
+                ),
+                OsString::from("admission-binding-aba-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+        let old_lease = AdmissionLease::new();
+        let replacement_lease = AdmissionLease::new();
+        engine.install_admission_binding(old_lease.clone(), token.clone(), Arc::new(|_, _| {}));
+        engine.install_admission_binding(replacement_lease, token.clone(), Arc::new(|_, _| {}));
+
+        engine.clear_admission_binding(&old_lease);
+        assert_eq!(
+            engine
+                .pending_notification_count_under_host_lock()
+                .expect("replacement generation remains bound"),
+            0
+        );
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured request"))
+                .expect("parse captured request");
+        assert_eq!(
+            request["admission_token"],
+            serde_json::to_value(token).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_has_a_bounded_default_deadline() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+
+        assert_eq!(
+            engine.config_initialization_timeout(),
+            CONFIG_INITIALIZATION_REQUEST_TIMEOUT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_timeout_is_outcome_unknown() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+sleep 2"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_millis(100));
+        let started = Instant::now();
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .expect_err("stalled initialization must time out");
+
+        assert_eq!(error.code, "outcome_unknown");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_request_reports_admission_error_with_its_exact_token() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error":{"code":"conflict","message":"Configuration admission snapshot changed"}}'"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
+            identity: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
+        };
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            token.clone(),
+            Arc::new(move |observed_token, error| {
+                observed_sender
+                    .send((observed_token.clone(), error.code.clone()))
+                    .expect("record admission error");
+            }),
+        );
+
+        assert_eq!(
+            engine
+                .pump_connect_queue()
+                .expect_err("stale guarded request must fail")
+                .code,
+            "conflict"
+        );
+        assert_eq!(
+            observed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("admission observer called"),
+            (token, "conflict".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bounded_settings_request_terminates_a_stalled_engine() {
         let engine = Engine::with_command(
             "sh",
@@ -2892,6 +4237,26 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.read.status","data"
 
         assert_eq!(error.code, "engine_timeout");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_check_times_out_while_mailbox_coordinator_is_busy() {
+        let engine = Engine::with_command(
+            "unused-engine-command",
+            Vec::new(),
+            PathBuf::from("unused.toml"),
+        );
+        let _active = engine
+            .mailbox_operation_gate
+            .lock()
+            .expect("hold mailbox coordinator");
+
+        let error = engine
+            .with_request_timeout(Duration::from_millis(10))
+            .check()
+            .expect_err("bounded check must not wait indefinitely for the mailbox coordinator");
+
+        assert_eq!(error.code, "engine_timeout");
     }
 
     #[cfg(unix)]
@@ -3331,6 +4696,12 @@ fi"#,
             .parent()
             .and_then(Path::parent)
             .expect("repository root");
+        let process_root = config_path
+            .ancestors()
+            .skip(1)
+            .find(|candidate| candidate.exists())
+            .expect("test configuration has an existing ancestor")
+            .join("isolated-process-environment");
         Engine::with_command(
             "uv",
             vec![
@@ -3341,6 +4712,9 @@ fi"#,
             ],
             config_path,
         )
+        .with_test_environment("HOME", process_root.join("home"))
+        .with_test_environment("XDG_CONFIG_HOME", process_root.join("xdg-config"))
+        .with_test_environment("LOCALAPPDATA", process_root.join("local-app-data"))
     }
 
     fn toml_path_literal(path: &Path) -> String {
@@ -3368,10 +4742,12 @@ fi"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 )
                 .expect("initialize first-run config"),
             ConfigInitialization {
                 created: true,
+                desktop_initialization_receipt: "0123456789abcdef0123456789abcdef".into(),
                 settings: EngineSettings {
                     local_model: LocalModelSettings {
                         editable: true,
@@ -3382,6 +4758,7 @@ fi"#,
                     poll_interval_minutes: 120,
                     polling_supported: true,
                     retention_days: 180,
+                    timezone: "UTC".into(),
                 },
             }
         );
@@ -3392,6 +4769,7 @@ fi"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 )
                 .expect_err("existing config must not be replaced")
                 .code,
@@ -3416,6 +4794,7 @@ model_base_url = "http://127.0.0.1:9/v1"
 model_name = "local-model"
 model_require_auth = false
 notifications_enabled = true
+timezone = "UTC"
 "#,
                 toml_path_literal(&database_path),
                 toml_path_literal(&gmail_credentials_path),
@@ -3423,7 +4802,26 @@ notifications_enabled = true
             ),
         )
         .expect("write config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("secure config parent");
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+                .expect("secure config file");
+        }
         let engine = real_engine(config_path);
+        let snapshot = engine
+            .admission_snapshot()
+            .expect("obtain atomic admission snapshot");
+        engine
+            .compare_admission(&snapshot.token)
+            .expect("snapshot remains current before guarded work");
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            snapshot.token,
+            Arc::new(|_, _| {}),
+        );
 
         let health = engine.health().expect("read engine health");
         let accounts = engine.mail_accounts().expect("read email accounts");
@@ -3499,6 +4897,7 @@ notifications_enabled = true
                 poll_interval_minutes: 120,
                 polling_supported: true,
                 retention_days: 180,
+                timezone: "UTC".into(),
             }
         );
         assert_eq!(
@@ -3528,6 +4927,7 @@ notifications_enabled = true
                 poll_interval_minutes: 45,
                 polling_supported: true,
                 retention_days: 365,
+                timezone: "UTC".into(),
             }
         );
         assert_eq!(
@@ -3542,7 +4942,19 @@ notifications_enabled = true
                 poll_interval_minutes: 45,
                 polling_supported: true,
                 retention_days: 365,
+                timezone: "UTC".into(),
             }
+        );
+        let refreshed_admission = engine
+            .admission_snapshot()
+            .expect("refresh admission after settings mutation");
+        engine
+            .compare_admission(&refreshed_admission.token)
+            .expect("refreshed admission remains current");
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            refreshed_admission.token,
+            Arc::new(|_, _| {}),
         );
 
         assert_eq!(

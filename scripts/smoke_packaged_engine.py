@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,10 +15,42 @@ PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
 EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
 EXPECTED_MAIL_PROVIDERS = ("gmail", "microsoft365")
+PUBLIC_FAILURE_CODES = frozenset(
+    {
+        "configuration_error",
+        "conflict",
+        "internal_error",
+        "invalid_request",
+        "outcome_unknown",
+        "runtime_error",
+        "unsupported_operation",
+        "unsupported_protocol",
+    }
+)
 
 
 class PackagedEngineSmokeError(RuntimeError):
     pass
+
+
+def _public_failure_code(output: str, operation: str) -> str | None:
+    if len(output) > 4096:
+        return None
+    try:
+        response = json.loads(output)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        return None
+    if (
+        not isinstance(response, dict)
+        or type(response.get("protocol")) is not int
+        or response["protocol"] != PROTOCOL_VERSION
+        or response.get("operation") != operation
+        or response.get("ok") is not False
+        or not isinstance(response.get("error"), dict)
+    ):
+        return None
+    code = response["error"].get("code")
+    return code if isinstance(code, str) and code in PUBLIC_FAILURE_CODES else None
 
 
 def _request(
@@ -28,6 +61,7 @@ def _request(
     payload: dict[str, object] | None,
     working_directory: Path,
     environment: dict[str, str],
+    admission_token: dict[str, object] | None = None,
 ) -> dict[str, object]:
     request = {
         "config_path": str(config_path),
@@ -35,6 +69,8 @@ def _request(
         "payload": payload or {},
         "protocol": PROTOCOL_VERSION,
     }
+    if admission_token is not None:
+        request["admission_token"] = admission_token
     result = subprocess.run(
         [str(binary)],
         input=json.dumps(request, separators=(",", ":")),
@@ -45,7 +81,8 @@ def _request(
         timeout=ENGINE_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
-        detail = result.stderr.strip()[-1000:] or "no stderr"
+        failure_code = _public_failure_code(result.stdout, operation)
+        detail = f"engine code {failure_code}" if failure_code else "diagnostic omitted"
         raise PackagedEngineSmokeError(
             f"Packaged engine {operation} exited {result.returncode}: {detail}"
         )
@@ -71,6 +108,27 @@ def _request(
     return response
 
 
+def _snapshot_admission_token(response: dict[str, object]) -> dict[str, object]:
+    data = response.get("data")
+    token = data.get("token") if isinstance(data, dict) else None
+    settings = data.get("settings") if isinstance(data, dict) else None
+    digest_pattern = re.compile(r"sha256:[0-9a-f]{64}")
+    if (
+        not isinstance(settings, dict)
+        or not isinstance(token, dict)
+        or set(token) != {"version", "revision", "identity"}
+        or token.get("version") != 1
+        or not isinstance(token.get("revision"), str)
+        or digest_pattern.fullmatch(token["revision"]) is None
+        or not isinstance(token.get("identity"), str)
+        or digest_pattern.fullmatch(token["identity"]) is None
+    ):
+        raise PackagedEngineSmokeError(
+            "Packaged engine admission snapshot returned an invalid public shape"
+        )
+    return dict(token)
+
+
 def smoke_packaged_engine(
     binary: Path,
     expected_entitlement_state: str,
@@ -91,13 +149,21 @@ def smoke_packaged_engine(
             isolated_binary.chmod(0o755)
 
         private_root = temporary / "private"
-        private_root.mkdir()
+        private_root.mkdir(mode=0o700)
+        if os.name != "nt":
+            private_root.chmod(0o700)
         config_path = private_root / "config.toml"
+        state_home = private_root / "state"
+        state_home.mkdir(mode=0o700)
+        if os.name != "nt":
+            state_home.chmod(0o700)
         environment = os.environ.copy()
         environment.pop("PYTHONHOME", None)
         environment.pop("PYTHONPATH", None)
+        environment.pop("STATE_DIRECTORY", None)
         for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
             environment[key] = str(private_root)
+        environment["XDG_STATE_HOME"] = str(state_home.resolve())
 
         initialized = _request(
             isolated_binary,
@@ -116,6 +182,16 @@ def smoke_packaged_engine(
             raise PackagedEngineSmokeError(
                 "Packaged engine did not preserve the initialized timezone"
             )
+
+        admission = _request(
+            isolated_binary,
+            config_path=config_path,
+            operation="config.admission.snapshot",
+            payload=None,
+            working_directory=temporary,
+            environment=environment,
+        )
+        admission_token = _snapshot_admission_token(admission)
 
         watchlist = _request(
             isolated_binary,
@@ -182,6 +258,7 @@ def smoke_packaged_engine(
             payload={"dry_run": False},
             working_directory=temporary,
             environment=environment,
+            admission_token=admission_token,
         )
         if inactive_check["data"].get("active") is not False:
             raise PackagedEngineSmokeError(

@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
+import stat
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -33,6 +36,146 @@ def _load_smoke() -> ModuleType:
 
 
 smoke_packaged_engine = _load_smoke()
+
+ADMISSION_TOKEN = {
+    "version": 1,
+    "revision": f"sha256:{'a' * 64}",
+    "identity": f"sha256:{'b' * 64}",
+}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows stat and lock semantics")
+def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eom_email_watcher.config import (
+        ConfigInitializationOutcomeUnknownError,
+        initialize_config,
+        load_config,
+        update_settings,
+    )
+
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    state_home = private_root / "state"
+    state_home.mkdir()
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    for key in ("APPDATA", "HOME", "LOCALAPPDATA", "USERPROFILE", "XDG_CONFIG_HOME"):
+        monkeypatch.setenv(key, str(private_root))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_home.resolve()))
+    monkeypatch.chdir(tmp_path)
+    config_path = private_root / "config.toml"
+
+    try:
+        initialized = initialize_config(
+            config_path,
+            model_base_url="http://127.0.0.1:9/v1",
+            model_name="sidecar-build-smoke",
+            timezone="America/Chicago",
+        )
+    except ConfigInitializationOutcomeUnknownError:
+        if config_path.is_file():
+            inspected = os.stat(config_path, follow_symlinks=False)
+            file_fd = os.open(config_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                opened = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            fields = (
+                "st_mode", "st_dev", "st_ino", "st_nlink", "st_size",
+                "st_mtime_ns", "st_ctime_ns", "st_file_attributes",
+            )
+            mismatches = {
+                name: (getattr(inspected, name, None), getattr(opened, name, None))
+                for name in fields
+                if getattr(inspected, name, None) != getattr(opened, name, None)
+            }
+            print(f"Windows admission path/descriptor stat mismatches: {mismatches}")
+        raise
+
+    assert config_path.is_file()
+    assert initialized.timezone == "America/Chicago"
+    assert load_config(config_path).timezone == "America/Chicago"
+    updated = update_settings(config_path, {"poll_interval_minutes": 45})
+    assert updated.poll_interval_minutes == 45
+    assert load_config(config_path).poll_interval_minutes == 45
+
+
+def test_packaged_smoke_uses_owner_private_config_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = {
+        "config.initialize": {"data": {"settings": {"timezone": "America/Chicago"}}},
+        "config.admission.snapshot": {
+            "data": {
+                "settings": {"timezone": "America/Chicago"},
+                "token": ADMISSION_TOKEN,
+            },
+        },
+        "watchlist.list": {"data": {"items": []}},
+        "health.get": {
+            "data": {
+                "watchlist_count": 0,
+                "mail": {
+                    "providers": [
+                        {
+                            "provider": "microsoft365",
+                            "connection_available": False,
+                        }
+                    ]
+                },
+            }
+        },
+        "connect.entitlement.status": {
+            "data": {"state": "authority_unavailable", "active": False}
+        },
+        "watcher.check": {"data": {"active": False}},
+    }
+    operations: list[str] = []
+    watcher_tokens: list[object] = []
+    observed_state_homes: list[Path] = []
+
+    def request(*_args: object, **kwargs: object) -> dict[str, object]:
+        config_path = kwargs["config_path"]
+        assert isinstance(config_path, Path)
+        assert config_path.parent.is_dir()
+        if os.name == "posix":
+            assert stat.S_IMODE(config_path.parent.stat().st_mode) == 0o700
+        operation = kwargs["operation"]
+        assert isinstance(operation, str)
+        operations.append(operation)
+        environment = kwargs["environment"]
+        assert isinstance(environment, dict)
+        assert "STATE_DIRECTORY" not in environment
+        state_home = Path(environment["XDG_STATE_HOME"])
+        assert state_home.is_absolute()
+        assert state_home.is_dir()
+        if os.name == "posix":
+            assert stat.S_IMODE(state_home.stat().st_mode) == 0o700
+        observed_state_homes.append(state_home)
+        if operation == "watcher.check":
+            watcher_tokens.append(kwargs.get("admission_token"))
+        else:
+            assert kwargs.get("admission_token") is None
+        return responses[operation]
+
+    monkeypatch.setattr(smoke_packaged_engine, "_request", request)
+
+    smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
+    assert operations == [
+        "config.initialize",
+        "config.admission.snapshot",
+        "watchlist.list",
+        "health.get",
+        "connect.entitlement.status",
+        "watcher.check",
+    ]
+    assert watcher_tokens == [ADMISSION_TOKEN]
+    assert len(set(observed_state_homes)) == 1
+    assert observed_state_homes[0].parent.name == "private"
 
 
 def test_packaged_smoke_rejects_unknown_expected_authority_state(tmp_path: Path) -> None:
@@ -72,6 +215,12 @@ def test_packaged_smoke_rejects_unavailable_expected_mail_provider(
     responses = iter(
         [
             {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": ADMISSION_TOKEN,
+                }
+            },
             {"data": {"items": []}},
             {
                 "data": {
@@ -118,6 +267,12 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
     responses = iter(
         [
             {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": ADMISSION_TOKEN,
+                }
+            },
             {"data": {"items": []}},
             {
                 "data": {
@@ -147,6 +302,224 @@ def test_packaged_smoke_accepts_all_expected_mail_providers(
         binary,
         "missing",
         ("gmail", "microsoft365"),
+    )
+
+
+def test_packaged_smoke_rejects_malformed_admission_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    responses = iter(
+        [
+            {"data": {"settings": {"timezone": "America/Chicago"}}},
+            {
+                "data": {
+                    "settings": {"timezone": "America/Chicago"},
+                    "token": {"version": 1, "revision": f"sha256:{'a' * 64}"},
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        smoke_packaged_engine,
+        "_request",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    with pytest.raises(
+        smoke_packaged_engine.PackagedEngineSmokeError,
+        match="invalid public shape",
+    ):
+        smoke_packaged_engine.smoke_packaged_engine(binary, "authority_unavailable")
+
+
+def test_token_bound_smoke_failure_does_not_render_admission_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    token_text = json.dumps(ADMISSION_TOKEN, sort_keys=True)
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout="",
+            stderr=token_text,
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="watcher.check",
+            payload={"dry_run": False},
+            working_directory=tmp_path,
+            environment={},
+            admission_token=ADMISSION_TOKEN,
+        )
+
+    rendered = str(failure.value)
+    assert ADMISSION_TOKEN["revision"] not in rendered
+    assert ADMISSION_TOKEN["identity"] not in rendered
+
+
+def test_unbound_smoke_failure_does_not_render_state_lock_or_child_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    private_canary = "/private/STATE_LOCK_CANARY/config-serialization.lock"
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout="",
+            stderr=f"failure at {private_canary}",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    assert private_canary not in str(failure.value)
+    assert "failure at" not in str(failure.value)
+
+
+def test_packaged_smoke_reports_validated_failure_code_without_private_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    private_canary = "/private/CONFIG_PATH_CANARY/config.toml"
+    response = {
+        "protocol": 1,
+        "operation": "config.initialize",
+        "ok": False,
+        "error": {
+            "code": "configuration_error",
+            "message": private_canary,
+        },
+    }
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout=json.dumps(response),
+            stderr=f"failure at {private_canary}",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    rendered = str(failure.value)
+    assert "configuration_error" in rendered
+    assert private_canary not in rendered
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"protocol": 1, "operation": "config.initialize", "ok": False,
+         "error": {"code": "private_token_canary", "message": "secret"}},
+        {"protocol": 1, "operation": "watcher.check", "ok": False,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": 1, "operation": "config.initialize", "ok": True,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": True, "operation": "config.initialize", "ok": False,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": 1, "operation": "config.initialize", "ok": False},
+    ],
+)
+def test_packaged_smoke_rejects_untrusted_failure_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout=json.dumps(response),
+            stderr="private_token_canary secret",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    assert str(failure.value).endswith("diagnostic omitted")
+    assert "private_token_canary" not in str(failure.value)
+
+
+def test_packaged_smoke_failure_code_has_bounded_output(
+) -> None:
+    response = json.dumps(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "ok": False,
+            "error": {"code": "configuration_error"},
+        }
+    )
+
+    assert smoke_packaged_engine._public_failure_code(
+        response.ljust(4096), "config.initialize"
+    ) == "configuration_error"
+    assert smoke_packaged_engine._public_failure_code(
+        response.ljust(4097), "config.initialize"
+    ) is None
+
+
+def test_packaged_smoke_reports_public_uncertain_initialization_code() -> None:
+    response = json.dumps(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "ok": False,
+            "error": {"code": "outcome_unknown", "message": "private canary"},
+        }
+    )
+
+    assert smoke_packaged_engine._public_failure_code(response, "config.initialize") == (
+        "outcome_unknown"
     )
 
 

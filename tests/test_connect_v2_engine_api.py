@@ -11,6 +11,7 @@ import pytest
 from connect_automate import connect
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.config import config_admission_snapshot
 from eom_email_watcher.db import AdmissionProvenance, ConnectQueueFull, MessageSource
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import (
@@ -92,6 +93,7 @@ notifications_enabled = false
 ''',
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def api_request(
@@ -99,12 +101,24 @@ def api_request(
     operation: str,
     payload: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    request = {
         "protocol": 1,
         "operation": operation,
         "config_path": str(config_path),
         "payload": payload or {},
     }
+    if operation in engine_api.ADMISSION_REQUIRED_OPERATIONS:
+        request["admission_token"] = config_admission_snapshot(config_path).token
+    return request
+
+
+def patch_runtime(monkeypatch: pytest.MonkeyPatch, runtime: Runtime) -> None:
+    monkeypatch.setattr(engine_api, "load_runtime", lambda _path: runtime)
+    monkeypatch.setattr(
+        engine_api,
+        "runtime_from_config",
+        lambda _config, **_kwargs: runtime,
+    )
 
 
 def make_connect_job_due(runtime: Runtime, job_id: str) -> None:
@@ -204,7 +218,7 @@ def test_connect_queue_pump_rejects_invalid_limits(
     limit: object,
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     response = engine_api._response(
         api_request(config_path, "connect.queue.pump", {"limit": limit})
@@ -220,7 +234,7 @@ def test_connect_queue_pump_accepts_boundary_limits(
     limit: int,
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     response = engine_api._response(
         api_request(config_path, "connect.queue.pump", {"limit": limit})
@@ -295,7 +309,7 @@ def test_connect_queue_pump_materializes_matching_automation_fire_once(
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     monkeypatch.setattr(
         engine_api.connect,
@@ -1992,7 +2006,7 @@ def test_automation_source_failure_distinguishes_transient_from_definitive(
         def attachment_bytes(self, *args: object) -> bytes:
             raise failure
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     monkeypatch.setattr(
         engine_api.connect,
@@ -2906,7 +2920,7 @@ def test_active_pending_dispatch_ceiling_stops_before_provider_discovery(
             WHERE fire_id = ?""",
             (datetime.now(UTC).isoformat(), fire.fire_id),
         )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: True)
     monkeypatch.setattr(
         engine_api.connect,
@@ -3328,7 +3342,7 @@ def test_connect_queue_pump_reports_admission_deadline_expiry(
         "invoice.pdf",
         job_id=REQUEST_ID,
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     runtime.store.create_connect_job(
         job_id=job.job_id,
         message_id="message-1",
@@ -3692,7 +3706,7 @@ def install_automation_dispatch_fakes(
         def attachment_bytes(self, *args: object) -> bytes:
             return PDF
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
     monkeypatch.setattr(engine_api.GmailGateway, "from_token", lambda *args: FakeGmail())
     if stub_lane:
@@ -3806,7 +3820,7 @@ def test_attachment_capabilities_are_contextual_and_do_not_expose_transport_secr
         instance_id=INSTANCE_B,
         media_type="text/plain",
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -3842,7 +3856,7 @@ def test_imap_capability_discovery_respects_the_local_fetch_ceiling(
         tmp_path, descriptor_size=descriptor_size
     )
     accepted = capability()
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -3916,7 +3930,7 @@ def test_imap_generic_invoke_uses_actual_download_size_for_job(
             on_update(completed)
             return completed
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -3947,7 +3961,7 @@ def test_imap_generic_invoke_rejects_descriptor_over_local_fetch_ceiling(
     payload = invocation_payload(selected)
     payload["part_id"] = "mime-0"
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -3998,7 +4012,7 @@ def test_imap_generic_invoke_rechecks_local_fetch_ceiling_under_source_lock(
         def __exit__(self, *_args: object) -> None:
             return None
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4039,7 +4053,7 @@ def test_imap_generic_invoke_rejects_actual_bytes_over_capability_limit(
         def attachment_bytes(self, *args: object) -> bytes:
             return b"X" * 1025
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4070,7 +4084,7 @@ def test_invoke_rejects_stale_capability_version_before_handoff(
     payload = invocation_payload(selected)
     payload["capability"] = {"id": selected.capability_id, "version": "9.0"}
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4099,7 +4113,7 @@ def test_unentitled_invoke_stops_before_discovery_gmail_or_persistence(
 ) -> None:
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         connect.entitlement,
         "connect_entitlement_decision",
@@ -4152,7 +4166,7 @@ def test_completed_connect_result_remains_readable_after_entitlement_expires(
         payload=b"saved",
     )
     persist_completed_outputs(runtime, job, (output,))
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         connect.entitlement,
         "connect_entitlement_decision",
@@ -4314,7 +4328,7 @@ def test_completed_outputs_use_trusted_presentations_and_safe_binary_export(
         job,
         (summary_output, text_output, opaque_output, invalid_text_output),
     )
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
 
     def present(artifact_id: str) -> dict[str, object]:
         return engine_api._response(
@@ -4435,7 +4449,7 @@ def test_generic_invoke_requires_explicit_provider_and_confirmation_then_persist
         discovered_instances.append(kwargs.get("provider_instance_id"))
         return connect.CapabilityCatalog((first, selected))
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
 
     class LaneLockProbe:
@@ -4633,7 +4647,7 @@ def test_lost_acknowledgement_reconciles_and_resubmits_the_same_durable_request(
         def wait_for_terminal(self, job, initial, on_update):
             return initial
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4763,7 +4777,7 @@ def test_post_submit_poll_timeout_schedules_durable_reconciliation_backoff(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4817,7 +4831,7 @@ def test_queue_pump_respects_cross_process_lane_owner_then_recovers(
         def wait_for_terminal(self, job, initial, on_update):
             return initial
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -4924,7 +4938,7 @@ def test_queue_pump_advances_other_provider_lane_without_waiting_for_terminal(
             waits += 1
             raise AssertionError("a scheduled queue pass must not wait for terminal state")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities_for_reconciliation",
@@ -4997,7 +5011,7 @@ def test_queue_pump_completes_provider_owned_head_then_drains_waiting_invoice(
                 )
             return initial
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5094,7 +5108,7 @@ def test_queue_pump_reconciles_after_entitlement_revocation_without_resubmitting
         discovery_modes.append("reconciliation")
         return registered_capability(selected), None
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(engine_api.connect, "discover_capabilities", discover)
     monkeypatch.setattr(
         engine_api.connect,
@@ -5158,7 +5172,7 @@ def test_queue_pump_never_resubmits_job_not_found_after_authoritative_acceptance
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5212,7 +5226,7 @@ def test_queue_pump_blocks_a_new_post_after_entitlement_revocation(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5262,7 +5276,7 @@ def test_nonretryable_provider_refusal_remains_immediately_terminal(
                 retryable=False,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5308,7 +5322,7 @@ def test_queue_pump_rejects_changed_source_before_a_retry_post(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5356,7 +5370,7 @@ def test_queue_pump_rejects_retention_expired_source_before_a_retry_post(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5417,7 +5431,7 @@ def test_queue_pump_retries_transient_source_fetch_under_original_deadline(
                 )
             return update(job, "completed", payload=b"Recovered output")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5490,7 +5504,7 @@ def test_queue_pump_treats_invalid_or_missing_mailbox_source_as_definitive(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5541,7 +5555,7 @@ def test_source_cleanup_wins_before_retry_and_prevents_another_post(
                 retryable=True,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5606,7 +5620,7 @@ def test_handoff_releases_source_lock_after_durable_acceptance(
             on_update(completed)
             return completed
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5637,7 +5651,7 @@ def test_generic_invoke_maps_provider_lane_capacity_without_submitting(
     def reject_full_lane(**values):
         raise ConnectQueueFull("Connect provider queue is full")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5671,7 +5685,7 @@ def test_generic_invoke_rejects_unsupported_lock_before_enqueue(
     config_path, runtime = seeded_runtime(tmp_path)
     selected = capability()
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5714,7 +5728,7 @@ def test_generic_invoke_rejects_retention_expired_source_before_enqueue(
             (expired_at.isoformat(), "message-1"),
         )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5777,7 +5791,7 @@ def test_nonterminal_get_error_preserves_reconciliation_lane(
                 retryable=False,
             )
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5835,7 +5849,7 @@ def test_distinct_request_ids_reuse_the_same_active_logical_invocation(
             queries.append(job.job_id)
             return update(job, "completed", payload=b"Recovered")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5918,7 +5932,7 @@ def test_active_request_reconciles_without_gmail_and_tolerates_transition_race(
             raise RuntimeError("simulated competing poller won the transition")
         return real_transition(**values)
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -5979,7 +5993,7 @@ def test_reconciliation_returns_a_terminal_row_won_by_another_poller(
             wait_calls += 1
             raise AssertionError("a durable terminal row must stop provider polling")
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",
@@ -6054,7 +6068,7 @@ def test_concurrent_same_request_id_reuses_the_persisted_winner(
         real_create(**values)
         real_create(**values)
 
-    monkeypatch.setattr(engine_api, "load_runtime", lambda path: runtime)
+    patch_runtime(monkeypatch, runtime)
     monkeypatch.setattr(
         engine_api.connect,
         "discover_capabilities",

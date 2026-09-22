@@ -39,17 +39,27 @@ from .automation.rules import (
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
     Config,
+    ConfigAdmissionStaleError,
+    ConfigAdmissionUnavailableError,
     ConfigAlreadyExistsError,
     ConfigError,
+    ConfigInitializationOutcomeUnknownError,
     DuplicateSenderError,
     InvalidConfigInitializationError,
     InvalidSenderError,
     InvalidSettingsUpdateError,
+    NtfyDisclosureConflictError,
+    NtfyDisclosureOutcomeUnknownError,
+    NtfyDisclosureWriteError,
     Sender,
     SenderNotFoundError,
+    acknowledge_ntfy_disclosure,
     add_sender,
+    admitted_config,
+    config_admission_snapshot,
     initialize_config,
     load_config,
+    ntfy_disclosure_status,
     remove_sender,
     update_settings,
 )
@@ -147,6 +157,7 @@ from .runtime import (
     mail_provider_connection_available,
     microsoft_calendar_read_token_file,
     microsoft_calendar_token_file,
+    runtime_from_config,
 )
 from .service import (
     LegacyMailboxIdentityUnverified,
@@ -174,7 +185,20 @@ INBOX_CATEGORIES = frozenset(
     }
 )
 INBOX_STATUSES = frozenset({"pending", "analyzed", "summarized", "skipped"})
-REQUEST_FIELDS = frozenset({"protocol", "operation", "config_path", "payload"})
+REQUEST_FIELDS = frozenset(
+    {"protocol", "operation", "config_path", "payload", "admission_token"}
+)
+ADMISSION_REQUIRED_OPERATIONS = frozenset(
+    {
+        "connect.queue.pump",
+        "host.operation_lock",
+        "notifications.ack",
+        "notifications.count_under_host_lock",
+        "notifications.pending",
+        "notifications.pending_under_host_lock",
+        "watcher.check",
+    }
+)
 
 logger = logging.getLogger(__name__)
 SAFE_ATTACHMENT_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,12}\Z")
@@ -299,7 +323,47 @@ def _decode_inbox_cursor(value: object) -> tuple[str, str] | None:
     return received_at, message_id
 
 
+def _admission_token(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "revision",
+        "identity",
+    }:
+        raise ApiError("invalid_request", "admission_token is invalid")
+    revision = value.get("revision")
+    identity = value.get("identity")
+    if (
+        type(value.get("version")) is not int
+        or value["version"] != 1
+        or not isinstance(revision, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is None
+        or not isinstance(identity, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", identity) is None
+    ):
+        raise ApiError("invalid_request", "admission_token is invalid")
+    return dict(value)
+
+
+def _admitted_config(request: dict[str, object]) -> Config:
+    token = _admission_token(request.get("admission_token"))
+    try:
+        return admitted_config(_config_path(request), token)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration admission snapshot changed") from exc
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+
+
 def _runtime(request: dict[str, object]) -> Runtime:
+    operation = request.get("operation")
+    if operation in ADMISSION_REQUIRED_OPERATIONS:
+        return runtime_from_config(
+            _admitted_config(request),
+            config_path_already_safe=True,
+        )
     return load_runtime(_config_path(request))
 
 
@@ -2121,7 +2185,7 @@ def _check(request: dict[str, object]) -> dict[str, object]:
             "pending_notifications": _host_notification_intent_count(active_runtime),
         }
 
-    config = load_config(_config_path(request))
+    config = _admitted_config(request)
     lock_path = _production_check_lock_path(config)
     if not operation_lock_supported(lock_path):
         raise ApiError(
@@ -5405,6 +5469,8 @@ def _watchlist_add(request: dict[str, object]) -> dict[str, object]:
     def add() -> dict[str, object]:
         try:
             sender = add_sender(_config_path(request), email, name)
+        except ConfigAdmissionStaleError as exc:
+            raise ApiError("conflict", "Configuration changed during update") from exc
         except InvalidSenderError as exc:
             raise ApiError("invalid_request", str(exc)) from exc
         except DuplicateSenderError as exc:
@@ -5423,6 +5489,8 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
         config = load_config(_config_path(request))
         try:
             sender = remove_sender(_config_path(request), email)
+        except ConfigAdmissionStaleError as exc:
+            raise ApiError("conflict", "Configuration changed during update") from exc
         except InvalidSenderError as exc:
             raise ApiError("invalid_request", str(exc)) from exc
         except SenderNotFoundError as exc:
@@ -5462,20 +5530,113 @@ def _settings_data(config: Config) -> dict[str, object]:
 
 
 def _config_initialize(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"model_base_url", "model_name", "timezone"})
+    payload = _payload(
+        request,
+        {
+            "desktop_initialization_receipt",
+            "model_base_url",
+            "model_name",
+            "timezone",
+        },
+    )
     values: dict[str, str] = {}
     for field in ("model_base_url", "model_name", "timezone"):
         value = payload.get(field)
         if not isinstance(value, str):
             raise ApiError("invalid_request", f"{field} must be a string")
         values[field] = value
+    initialization_receipt = payload.get("desktop_initialization_receipt")
+    if initialization_receipt is not None and (
+        not isinstance(initialization_receipt, str)
+        or re.fullmatch(r"[0-9a-f]{32}", initialization_receipt) is None
+    ):
+        raise ApiError(
+            "invalid_request",
+            "desktop_initialization_receipt must be 32 lowercase hexadecimal characters",
+        )
     try:
-        config = initialize_config(_config_path(request), **values)
+        config = initialize_config(
+            _config_path(request),
+            desktop_initialization_receipt=initialization_receipt,
+            **values,
+        )
     except InvalidConfigInitializationError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
+    except ConfigInitializationOutcomeUnknownError as exc:
+        raise ApiError("outcome_unknown", "Initialization outcome is unknown") from exc
     except ConfigAlreadyExistsError as exc:
         raise ApiError("conflict", str(exc)) from exc
-    return {"created": True, "settings": _settings_data(config)}
+    return {
+        "created": True,
+        "desktop_initialization_receipt": config.desktop_initialization_receipt,
+        "settings": _settings_data(config),
+    }
+
+
+def _config_admission_snapshot(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    try:
+        snapshot = config_admission_snapshot(_config_path(request))
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+    response = {
+        "settings": _settings_data(snapshot.config),
+        "token": snapshot.token,
+    }
+    if snapshot.config.desktop_initialization_receipt is not None:
+        response["desktop_initialization_receipt"] = (
+            snapshot.config.desktop_initialization_receipt
+        )
+    return response
+
+
+def _config_admission_compare(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"token"})
+    token = _admission_token(payload.get("token"))
+    try:
+        admitted_config(_config_path(request), token)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration admission snapshot changed") from exc
+    except ConfigAdmissionUnavailableError as exc:
+        raise ApiError(
+            "configuration_error",
+            "Configuration admission snapshot is unavailable",
+        ) from exc
+    return {"current": True}
+
+
+def _config_ntfy_disclosure_status(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    status = ntfy_disclosure_status(_config_path(request))
+    result: dict[str, object] = {"state": status.state}
+    if status.expected_revision is not None:
+        result["expected_revision"] = status.expected_revision
+    return result
+
+
+def _config_ntfy_disclosure_acknowledge(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"expected_revision"})
+    expected_revision = payload.get("expected_revision")
+    if not isinstance(expected_revision, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", expected_revision
+    ) is None:
+        raise ApiError("invalid_request", "expected_revision must be a SHA-256 revision")
+    try:
+        acknowledge_ntfy_disclosure(_config_path(request), expected_revision)
+    except NtfyDisclosureConflictError as exc:
+        raise ApiError("conflict", "Configuration disclosure state changed") from exc
+    except NtfyDisclosureOutcomeUnknownError as exc:
+        raise ApiError(
+            "outcome_unknown", "Disclosure acknowledgement outcome is unknown"
+        ) from exc
+    except NtfyDisclosureWriteError as exc:
+        raise ApiError(
+            "configuration_error", "Disclosure acknowledgement was not written"
+        ) from exc
+    return {"acknowledged": True}
 
 
 def _settings(request: dict[str, object]) -> dict[str, object]:
@@ -5504,6 +5665,8 @@ def _settings_update(request: dict[str, object]) -> dict[str, object]:
                 runtime.store.purge(config.retention_days)
     except InvalidSettingsUpdateError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration changed during update") from exc
     return _settings_data(config)
 
 
@@ -5680,7 +5843,11 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.status": _calendar_write_status,
     "calendar.automation.decide": _calendar_automation_decide,
     "certificate.expiry_ledger.list": _certificate_expiry_ledger_list,
+    "config.admission.compare": _config_admission_compare,
+    "config.admission.snapshot": _config_admission_snapshot,
     "config.initialize": _config_initialize,
+    "config.ntfy_disclosure.acknowledge": _config_ntfy_disclosure_acknowledge,
+    "config.ntfy_disclosure.status": _config_ntfy_disclosure_status,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,
     "connect.attachment.summarize": _connect_attachment_summarize,

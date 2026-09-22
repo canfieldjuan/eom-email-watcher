@@ -109,6 +109,8 @@ priority, action, deadline, adversarial, and human-summary contract.
 Example baseline run:
 
 ```bash
+state_dir="${STATE_DIRECTORY:-${XDG_STATE_HOME:-$HOME/.local/state}/eom-email-watcher}"
+
 lms load qwen3.5-4b \
   --gpu off \
   --context-length 8192 \
@@ -126,7 +128,7 @@ uv run eom-model-benchmark run \
   --cold-start-seconds 5.34 \
   --repetitions 3 \
   --require-auth \
-  --api-token-file ~/.local/state/eom-email-watcher/lmstudio-api-token \
+  --api-token-file "$state_dir/lmstudio-api-token" \
   --output benchmarks/results/lmstudio-qwen35-4b-q4km.json \
   --private-review-output benchmarks/local/lmstudio-qwen35-4b-q4km.local.json
 

@@ -602,35 +602,48 @@ test("startup rejects scheduled events until even an empty account catalog seeds
 
 function configuredDesktopStartupHarness() {
   const match = source.match(
-    /async function startConfiguredDesktop\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function initializeDesktop/,
+    /async function startConfiguredDesktop\([\s\S]*?\): Promise<void> \{([\s\S]*?)\n\}\n\nfunction renderConfigAdmissionState/,
   );
   assert.ok(match);
-  let resolveAccounts!: (loaded: boolean) => void;
-  const accounts = new Promise<boolean>((resolve) => {
-    resolveAccounts = resolve;
-  });
+  const pending: Array<(loaded: boolean) => void> = [];
+  const loadMailAccounts = () => new Promise<boolean>((resolve) => pending.push(resolve));
   return {
     ...Function(
       "loadMailAccounts",
       `let configurationReady = false;
+       let configAdmissionGeneration = 1;
+       let configuredStartupEpoch = 1;
        const calls = [];
        const configInitializeForm = { hidden: false };
        const settingsForm = { hidden: true };
+       const ntfyDisclosurePanel = { hidden: false };
+       let ntfyDisclosureExpectedRevision = "revision";
        function setConfiguredNavigation(enabled) { calls.push(["navigation", enabled]); }
        function loadInbox() { calls.push(["inbox"]); }
        function loadHealth() { calls.push(["health"]); }
        function loadAutostart() { calls.push(["autostart"]); }
        function loadSenders() { calls.push(["senders"]); return Promise.resolve(true); }
        function finishOperation() { calls.push(["finish"]); }
-       async function startConfiguredDesktop() {${match[1]}\n}
+       async function startConfiguredDesktop(expectedGeneration, expectedEpoch) {${match[1]}\n}
        return {
-         start: startConfiguredDesktop,
+         start: () => startConfiguredDesktop(configAdmissionGeneration, configuredStartupEpoch),
+         supersede: () => {
+           configAdmissionGeneration += 1;
+           configuredStartupEpoch += 1;
+           configurationReady = false;
+           setConfiguredNavigation(false);
+         },
          snapshot: () => ({ calls: structuredClone(calls), ready: configurationReady }),
        };`,
-    )(() => accounts),
-    resolveAccounts,
+    )(loadMailAccounts),
+    resolveAccounts: (loaded: boolean) => {
+      const resolve = pending.shift();
+      assert.ok(resolve, "a mailbox seed request must be pending");
+      resolve(loaded);
+    },
   } as {
     start: () => Promise<void>;
+    supersede: () => void;
     snapshot: () => { calls: unknown[][]; ready: boolean };
     resolveAccounts: (loaded: boolean) => void;
   };
@@ -680,6 +693,29 @@ test("startup failure stays fail closed and a restarted no-account desktop resee
     source,
     /observeMailboxOperationRevision\(accounts\.mailbox_operation_revision\);[\s\S]*renderMailAccounts\(accounts\)/,
   );
+});
+
+test("superseded admission cannot enable the desktop after mailbox seeding", async () => {
+  const startup = configuredDesktopStartupHarness();
+  const older = startup.start();
+  startup.supersede();
+  const newer = startup.start();
+
+  startup.resolveAccounts(true);
+  await older;
+  assert.deepEqual(startup.snapshot(), {
+    calls: [["navigation", false]],
+    ready: false,
+  });
+
+  startup.resolveAccounts(true);
+  await newer;
+  assert.equal(startup.snapshot().ready, true);
+  assert.deepEqual(startup.snapshot().calls.slice(1, 4), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+  ]);
 });
 
 test("label admission contract publishes exact Gmail authorization retry semantics", () => {
