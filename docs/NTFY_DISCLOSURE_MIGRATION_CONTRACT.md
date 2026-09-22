@@ -789,6 +789,24 @@ fail because the error code is omitted. After the diagnostic fix, run the
 focused packaging test file and Ruff lint; the exact-head Windows package job
 is the platform proof.
 
+### Native Windows admission stat mismatch after head 4d546d8
+
+Root cause under investigation: the native first-run test creates the config,
+then `_read_admission_config` rejects its path-inspection versus open-descriptor
+comparison at `config.py:1073-1076`. The CI traceback does not show which stat
+field differs, so changing the comparator now would guess at a security boundary.
+
+Required diagnostic surface: in the existing native Windows first-run test,
+capture the safe file's path and descriptor stat fields on the same failure,
+without changing the production admission decision or public error. Publish
+that fail-first diagnostic to the Windows package job, then name the mismatching
+field and revise this contract before the production repair. Preserve the
+regular-file, single-link, non-reparse, same-descriptor, and post-read path
+checks. Do not touch POSIX admission, config formats, disclosure consent,
+packaging gates, or dependencies. Verification: the native job must still fail
+at the same first-run load but report the differing stat fields; after repair,
+the first-run and packaged smoke must pass on native Windows.
+
 ## Non-goals
 
 - weakening or bypassing the existing literal-`true` startup guard;

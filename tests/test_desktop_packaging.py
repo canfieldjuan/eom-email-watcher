@@ -48,7 +48,11 @@ ADMISSION_TOKEN = {
 def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from eom_email_watcher.config import initialize_config, load_config
+    from eom_email_watcher.config import (
+        ConfigInitializationOutcomeUnknownError,
+        initialize_config,
+        load_config,
+    )
 
     private_root = tmp_path / "private"
     private_root.mkdir()
@@ -61,12 +65,32 @@ def test_windows_first_run_initialization_loads_in_packaged_smoke_environment(
     monkeypatch.chdir(tmp_path)
     config_path = private_root / "config.toml"
 
-    initialized = initialize_config(
-        config_path,
-        model_base_url="http://127.0.0.1:9/v1",
-        model_name="sidecar-build-smoke",
-        timezone="America/Chicago",
-    )
+    try:
+        initialized = initialize_config(
+            config_path,
+            model_base_url="http://127.0.0.1:9/v1",
+            model_name="sidecar-build-smoke",
+            timezone="America/Chicago",
+        )
+    except ConfigInitializationOutcomeUnknownError:
+        if config_path.is_file():
+            inspected = os.stat(config_path, follow_symlinks=False)
+            file_fd = os.open(config_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                opened = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            fields = (
+                "st_mode", "st_dev", "st_ino", "st_nlink", "st_size",
+                "st_mtime_ns", "st_ctime_ns", "st_file_attributes",
+            )
+            mismatches = {
+                name: (getattr(inspected, name, None), getattr(opened, name, None))
+                for name in fields
+                if getattr(inspected, name, None) != getattr(opened, name, None)
+            }
+            print(f"Windows admission path/descriptor stat mismatches: {mismatches}")
+        raise
 
     assert config_path.is_file()
     assert initialized.timezone == "America/Chicago"
