@@ -183,7 +183,9 @@ test("ntfy disclosure UI requires one explicit click and reconciles every outcom
   assert.match(uiSource, /await refreshConfigAdmission\(\)/);
   assert.match(uiSource, /listen<ConfigAdmissionStatus>\("watcher:\/\/config-admission"/);
   assert.match(uiSource, /status\.generation <= configAdmissionGeneration/);
-  assert.match(uiSource, /status\.state === "admitted" && configurationReady/);
+  assert.match(uiSource, /const startupEpoch = \+\+configuredStartupEpoch/);
+  assert.match(uiSource, /startConfiguredDesktop\(configAdmissionGeneration, startupEpoch\)/);
+  assert.doesNotMatch(uiSource, /status\.state === "admitted" && configurationReady/);
   assert.match(uiSource, /renderConfigAdmission\(event\.payload\)/);
   assert.match(
     uiSource,

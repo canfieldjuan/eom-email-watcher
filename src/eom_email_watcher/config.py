@@ -32,6 +32,9 @@ DEFAULT_POLL_INTERVAL_MINUTES = 120
 DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650
+MAX_SENDER_NAME_BYTES = 1024
+MAX_ADMISSION_SELECTOR_BYTES = 512
+EXACT_SENDER_SELECTOR_PREFIX = "sender:"
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
 INITIALIZATION_RECEIPT_RE = re.compile(r"^[0-9a-f]{32}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -148,7 +151,11 @@ class Config:
 
     @property
     def allowlist(self) -> frozenset[str]:
-        return frozenset(sender.email for sender in self.senders)
+        return frozenset(
+            sender.email
+            for sender in self.senders
+            if _exact_sender_selector_id_or_none(sender.email) is not None
+        )
 
     @property
     def zone(self) -> ZoneInfo:
@@ -249,6 +256,22 @@ def normalize_validated_address(value: str) -> str:
     return email
 
 
+def exact_sender_selector_id(value: str) -> str:
+    selector_id = f"{EXACT_SENDER_SELECTOR_PREFIX}{normalize_validated_address(value)}"
+    if len(selector_id.encode("utf-8")) > MAX_ADMISSION_SELECTOR_BYTES:
+        raise ValueError(
+            "sender email creates an admission selector over 512 UTF-8 bytes"
+        )
+    return selector_id
+
+
+def _exact_sender_selector_id_or_none(value: str) -> str | None:
+    try:
+        return exact_sender_selector_id(value)
+    except ValueError:
+        return None
+
+
 def _valid_domain(domain: str) -> bool:
     try:
         ascii_domain = domain.encode("idna").decode("ascii")
@@ -267,16 +290,45 @@ def _valid_network_host(host: str) -> bool:
     return True
 
 
-def _sender(email_value: str, name_value: str | None, *, invalid_message: str) -> Sender:
+def admission_sender_display_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    encoded = value.encode("utf-8")
+    if len(encoded) <= MAX_SENDER_NAME_BYTES:
+        return value
+    return encoded[:MAX_SENDER_NAME_BYTES].decode("utf-8", errors="ignore")
+
+
+def _sender(
+    email_value: str,
+    name_value: str | None,
+    *,
+    invalid_message: str,
+    enforce_name_limit: bool = True,
+    enforce_selector_limit: bool = True,
+) -> Sender:
     try:
         email = normalize_validated_address(email_value)
     except ValueError as exc:
         raise InvalidSenderError(invalid_message) from exc
+    if enforce_selector_limit:
+        try:
+            exact_sender_selector_id(email)
+        except ValueError as exc:
+            raise InvalidSenderError(str(exc)) from exc
     if name_value is not None and any(
         character in "\r\n" or not character.isprintable() for character in name_value
     ):
         raise InvalidSenderError("sender name must not contain control characters")
     name = name_value.strip() if name_value and name_value.strip() else None
+    if (
+        enforce_name_limit
+        and name is not None
+        and len(name.encode("utf-8")) > MAX_SENDER_NAME_BYTES
+    ):
+        raise InvalidSenderError(
+            f"sender name must be at most {MAX_SENDER_NAME_BYTES} UTF-8 bytes"
+        )
     return Sender(email=email, name=name)
 
 
@@ -388,6 +440,8 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
                 raw_email,
                 name,
                 invalid_message=f"senders entry {index} has an invalid email",
+                enforce_name_limit=False,
+                enforce_selector_limit=False,
             )
         except InvalidSenderError as exc:
             raise ConfigError(str(exc)) from exc
@@ -3968,7 +4022,12 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
 
 
 def remove_sender(path: Path, email: str) -> Sender:
-    requested = _sender(email, None, invalid_message="email must be a valid email address")
+    requested = _sender(
+        email,
+        None,
+        invalid_message="email must be a valid email address",
+        enforce_selector_limit=False,
+    )
     with _config_serialization_lock(), _config_mutation_source(path) as source:
         config = _load_config_bytes(source.content, source.path)
         try:

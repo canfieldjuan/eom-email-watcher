@@ -29,7 +29,7 @@ from connect_reference_provider import (
 )
 
 from eom_email_watcher import engine_api
-from eom_email_watcher.db import SCHEMA_VERSION, MailAccount
+from eom_email_watcher.db import SCHEMA_VERSION, AdmissionProvenance, MailAccount
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import Runtime, load_runtime, mail_account_token_file
@@ -664,6 +664,13 @@ def main() -> None:
                 provider=fixture_account.provider,
                 account_id=fixture_account.account_id,
                 mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+                admission=AdmissionProvenance(
+                    kind="exact_sender",
+                    selector_id="sender:fixture@example.invalid",
+                    display_name="Fixture Sender",
+                    mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+                    admitted_at="2026-09-19T12:00:00+00:00",
+                ),
             )
             runtime.store.replace_attachments(
                 "fixture-message",

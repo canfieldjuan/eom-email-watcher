@@ -1,0 +1,1288 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { webcrypto } from "node:crypto";
+import test from "node:test";
+
+const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+const contract = await readFile(
+  new URL("../../docs/GMAIL_LABEL_ADMISSION_CONTRACT.md", import.meta.url),
+  "utf8",
+);
+
+type MailboxMutationHarness = {
+  run: <T extends { mailbox_operation_revision: number }>(operation: () => Promise<T>) => Promise<T>;
+  observe: (revision: unknown) => boolean;
+  observeError: (error: unknown) => boolean;
+  accepts: (event: { mailbox_operation_revision?: number }) => boolean;
+  scope: () => { mutation_epoch: number; mailbox_operation_revision: number } | null;
+  requestIsCurrent: (
+    requestGeneration: number,
+    currentGeneration: number,
+    scope: { mutation_epoch: number; mailbox_operation_revision: number } | null,
+  ) => boolean;
+  snapshot: () => {
+    inFlight: boolean;
+    ready: boolean;
+    revision: number;
+    active: number;
+    mutationEpoch: number;
+    healthGeneration: number;
+    inboxGeneration: number;
+  };
+};
+
+function mailboxMutationHarness(): MailboxMutationHarness {
+  const match = source.match(
+    /let mailboxOperationRevision = 0;([\s\S]*?)\n\nfunction errorMessage/,
+  );
+  assert.ok(match);
+  const executable = match[1]
+    .replace(
+      /function observeMailboxOperationRevision\(revision: unknown\): boolean/,
+      "function observeMailboxOperationRevision(revision)",
+    )
+    .replace(
+      /function scheduledCheckEventIsCurrent\(event: ScheduledCheckEvent\): boolean/,
+      "function scheduledCheckEventIsCurrent(event)",
+    )
+    .replace(
+      /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/,
+      "function observeMailboxOperationRevisionFromError(error)",
+    )
+    .replace(
+      /function currentMailboxEffectScope\(\): MailboxEffectScope \| null/,
+      "function currentMailboxEffectScope()",
+    )
+    .replace(
+      /function mailboxEffectScopeIsCurrent\(scope: MailboxEffectScope \| null\): boolean/,
+      "function mailboxEffectScopeIsCurrent(scope)",
+    )
+    .replace(
+      /function mailboxEffectRequestIsCurrent\(\s*requestGeneration: number,\s*currentGeneration: number,\s*scope: MailboxEffectScope \| null,\s*\): boolean/,
+      "function mailboxEffectRequestIsCurrent(requestGeneration, currentGeneration, scope)",
+    )
+    .replace(/\(error as \{ mailbox_operation_revision\?: unknown \}\)/g, "error")
+    .replace(
+      /async function runMailAccountMutation<T extends \{ mailbox_operation_revision: number \}>\(\s*operation: \(\) => Promise<T>,\s*\): Promise<T>/,
+      "async function runMailAccountMutation(operation)",
+    );
+  return Function(
+    `let healthRequestGeneration = 0;
+     let inboxRequestGeneration = 0;
+     let checkSupported = true;
+     const checkNow = { disabled: false };
+     function inboxMutationInFlight() { return false; }
+     function setInboxControlsBusy(_busy) {}
+     let mailboxOperationRevision = 0;${executable}
+     return {
+       run: runMailAccountMutation,
+       observe: observeMailboxOperationRevision,
+       observeError: observeMailboxOperationRevisionFromError,
+       accepts: scheduledCheckEventIsCurrent,
+       scope: currentMailboxEffectScope,
+       requestIsCurrent: mailboxEffectRequestIsCurrent,
+       snapshot: () => ({
+         inFlight: mailOperationInFlight,
+         ready: mailboxOperationRevisionReady,
+         revision: mailboxOperationRevision,
+         active: mailAccountMutationsInFlight,
+         mutationEpoch: mailAccountMutationEpoch,
+         healthGeneration: healthRequestGeneration,
+         inboxGeneration: inboxRequestGeneration,
+       }),
+     };`,
+  )() as MailboxMutationHarness;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function gmailLabelLoadHarness(
+  invoke: (operation: string) => Promise<Record<string, unknown>>,
+) {
+  const match = source.match(
+    /async function loadGmailLabelState\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function addGmailLabelSelector/,
+  );
+  assert.ok(match);
+  const body = match[1]
+    .replace(/invoke<[^>]+>/g, "invoke")
+    .replace(/: GmailLabelSelectors \| null/g, "")
+    .replace(/: GmailLabelSelector\[\]/g, "");
+  return Function(
+    "invoke",
+    `let gmailLabelScope = { provider: "gmail", account_id: "gmail-default" };
+     let gmailLabelGeneration = 1;
+     let gmailLabelLoadSequence = 0;
+     let gmailLabelCatalogVerified = false;
+     let gmailLabelRevision = null;
+     const gmailLabelStatus = { textContent: "", dataset: {} };
+     const selectorRenders = [];
+     function renderGmailLabelSelectors(items) { selectorRenders.push(items); }
+     function renderGmailLabelCatalog(_items) {}
+     function renderGmailLabelPollingState() {}
+     function refreshGmailLabelControls() {}
+     function errorMessage(error) { return String(error); }
+     function gmailOperationErrorMessage(error) { return errorMessage(error); }
+     function gmailLabelScopeMatches(response, scope, generation) {
+       return generation === gmailLabelGeneration &&
+         gmailLabelScope?.provider === scope.provider &&
+         gmailLabelScope.account_id === scope.account_id &&
+         response.provider === scope.provider &&
+         response.account_id === scope.account_id;
+     }
+     function gmailLabelRefreshIsCurrent(initial, catalog, revalidated) {
+       return initial.revision === catalog.revision &&
+         catalog.revision === revalidated.revision &&
+         revalidated.catalog_state === "current";
+     }
+     async function loadGmailLabelState() {${body}\n}
+     return {
+       load: loadGmailLabelState,
+       bumpGeneration: () => { gmailLabelGeneration += 1; },
+       snapshot: () => ({
+         selectorRenders: selectorRenders.map((items) => structuredClone(items)),
+         revision: gmailLabelRevision,
+         catalogVerified: gmailLabelCatalogVerified,
+       }),
+     };`,
+  )(invoke) as {
+    load: () => Promise<void>;
+    bumpGeneration: () => void;
+    snapshot: () => {
+      selectorRenders: Array<Array<Record<string, unknown>>>;
+      revision: number | null;
+      catalogVerified: boolean;
+    };
+  };
+}
+
+test("Gmail label settings use typed backend operations and no free-form label input", () => {
+  assert.match(source, /invoke<GmailLabelSelectors>\("gmail_label_selectors_list"/);
+  assert.match(source, /invoke<GmailLabelCatalog>\("gmail_labels_catalog"/);
+  assert.match(source, /invoke<GmailLabelSelectorAdded>\("gmail_label_selector_add"/);
+  assert.match(source, /invoke<GmailLabelSelectorRemoved>\("gmail_label_selector_remove"/);
+  assert.match(source, /<select id="gmail-label-catalog"/);
+  assert.doesNotMatch(source, /<input[^>]+id="gmail-label-(?:id|name|provider)"/);
+});
+
+test("sender name byte limit is enforced before watchlist mutation", () => {
+  const helper = source.match(
+    /function senderNameWithinByteLimit\(value: string\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const withinLimit = Function(
+    `const MAX_SENDER_NAME_BYTES = 1024;
+     return function senderNameWithinByteLimit(value) {${helper[1]}\n}`,
+  )() as (value: string) => boolean;
+  assert.equal(withinLimit("é".repeat(512)), true);
+  assert.equal(withinLimit(`${"é".repeat(512)}a`), false);
+
+  const handler = source.match(
+    /form\.addEventListener\("submit", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(handler);
+  assert.ok(handler[1].indexOf("senderNameWithinByteLimit") < handler[1].indexOf("watchlist_add"));
+  assert.match(handler[1], /at most 1024 UTF-8 bytes/);
+});
+
+test("sender selector byte limit canonicalizes before watchlist mutation", () => {
+  const helper = source.match(
+    /function senderSelectorWithinByteLimit\(value: string\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const withinLimit = Function(
+    `const MAX_ADMISSION_SELECTOR_BYTES = 512;
+     return function senderSelectorWithinByteLimit(value) {${helper[1]}\n}`,
+  )() as (value: string) => boolean;
+  assert.equal(withinLimit(`${"A".repeat(493)}@EXAMPLE.COM`), true);
+  assert.equal(withinLimit(`${"A".repeat(494)}@EXAMPLE.COM`), false);
+  assert.equal(withinLimit(`${"é".repeat(246)}a@example.com`), true);
+  assert.equal(withinLimit(`${"é".repeat(246)}ab@example.com`), false);
+  assert.equal(withinLimit(`${"A".repeat(483)}@XN--BCHER-KVA.EXAMPLE`), true);
+  assert.equal(withinLimit(`${"A".repeat(484)}@XN--BCHER-KVA.EXAMPLE`), false);
+
+  const handler = source.match(
+    /form\.addEventListener\("submit", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(handler);
+  assert.ok(
+    handler[1].indexOf("senderSelectorWithinByteLimit") < handler[1].indexOf("watchlist_add"),
+  );
+  assert.match(handler[1], /admission selector/);
+});
+
+test("Gmail catalog state gives invalid and transient failures distinct retry guidance", () => {
+  const helper = source.match(
+    /function gmailLabelCatalogStateMessage\([\s\S]*?\): string \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const message = Function(
+    `return function gmailLabelCatalogStateMessage(catalogState) {${helper[1]}\n}`,
+  )() as (catalogState: string) => string;
+
+  assert.match(message("invalid_catalog"), /invalid label data/);
+  assert.match(message("invalid_catalog"), /Correct the Gmail connection/);
+  assert.match(message("unavailable"), /temporarily unavailable/);
+  assert.match(message("unavailable"), /retry/);
+});
+
+test("Gmail authorization and throttling keep distinct operator guidance", () => {
+  assert.match(source, /function gmailOperationErrorMessage\(error: unknown\): string/);
+  assert.match(source, /errorCode\(error\) === "gmail_authorization_rejected"/);
+  assert.match(source, /errorRetryable\(error\) === false/);
+  assert.match(source, /Reconnect the Gmail account/);
+  assert.match(source, /errorCode\(error\) === "gmail_label_catalog_unavailable"/);
+  assert.match(source, /errorRetryable\(error\) === true/);
+  assert.match(source, /Retry Gmail labels/);
+  assert.match(source, /gmailLabelStatus\.textContent = gmailOperationErrorMessage\(error\)/);
+  assert.match(source, /function scheduledCheckFailureMessage\(event: ScheduledCheckEvent\): string/);
+  assert.match(source, /error_code\?: string/);
+  assert.match(source, /error_retryable\?: boolean/);
+  assert.match(source, /scheduledCheckFailureMessage\(event\.payload\)/);
+
+  const gmailHelper = source.match(
+    /function gmailOperationErrorMessage\(error: unknown\): string \{([\s\S]*?)\n\}\n\nfunction scheduledCheckFailureMessage/,
+  );
+  assert.ok(gmailHelper);
+  const gmailMessage = Function(
+    `function errorCode(error) { return typeof error?.code === "string" ? error.code : null; }
+     function errorRetryable(error) { return typeof error?.retryable === "boolean" ? error.retryable : null; }
+     function errorMessage(error) { return typeof error?.message === "string" ? error.message : "fallback"; }
+     return function gmailOperationErrorMessage(error) {${gmailHelper[1]}\n}`,
+  )() as (error: Record<string, unknown>) => string;
+  assert.match(
+    gmailMessage({ code: "gmail_authorization_rejected", retryable: false }),
+    /Reconnect the Gmail account/,
+  );
+  assert.match(
+    gmailMessage({ code: "gmail_label_catalog_unavailable", retryable: true }),
+    /Retry Gmail labels/,
+  );
+  assert.equal(
+    gmailMessage({ code: "gmail_authorization_rejected", retryable: true, message: "safe" }),
+    "safe",
+  );
+  assert.equal(gmailMessage({ code: "unknown", message: "safe" }), "safe");
+
+  const scheduledHelper = source.match(
+    /function scheduledCheckFailureMessage\(event: ScheduledCheckEvent\): string \{([\s\S]*?)\n\}\n\nfunction showView/,
+  );
+  assert.ok(scheduledHelper);
+  const scheduledMessage = Function(
+    `return function scheduledCheckFailureMessage(event) {${scheduledHelper[1]}\n}`,
+  )() as (event: Record<string, unknown>) => string;
+  assert.match(
+    scheduledMessage({
+      error_code: "gmail_authorization_rejected",
+      error_retryable: false,
+    }),
+    /Reconnect the Gmail account/,
+  );
+  assert.match(scheduledMessage({ error_retryable: true }), /retry on schedule/);
+  assert.match(scheduledMessage({ error_retryable: false }), /manual attention/);
+  assert.match(scheduledMessage({}), /Open Health/);
+  assert.doesNotMatch(scheduledMessage({}), /retry on schedule/);
+});
+
+test("scheduled check events cannot overwrite a newer mailbox account operation", () => {
+  const harness = mailboxMutationHarness();
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+  harness.observe(1);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+  assert.equal(harness.snapshot().revision, 2);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+  assert.equal(harness.accepts({}), false);
+
+  const failedReconnect = {
+    code: "gmail_authorization_rejected",
+    retryable: false,
+    mailbox_operation_revision: 3,
+  };
+  harness.observeError({ code: "legacy_error" });
+  assert.equal(harness.snapshot().revision, 2);
+  harness.observeError(failedReconnect);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 3 }), true);
+
+  const listener = source.match(
+    /listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(listener);
+  assert.ok(
+    listener[1].indexOf("scheduledCheckEventIsCurrent(event.payload)") <
+      listener[1].indexOf("loadInbox(false, effectScope)"),
+  );
+  assert.match(listener[1], /if \(!configurationReady/);
+  assert.match(
+    source,
+    /observeMailboxOperationRevision\(accounts\.mailbox_operation_revision\);[\s\S]*renderMailAccounts\(accounts\)/,
+  );
+
+  for (const operation of [
+    "connectMailProvider",
+    "submitMailServerConnection",
+    "reconnectMailAccount",
+    "disconnectMailAccount",
+    "activateMailAccount",
+  ]) {
+    const start = source.indexOf(`async function ${operation}`);
+    assert.notEqual(start, -1);
+    const next = source.indexOf("\nasync function ", start + 1);
+    const body = source.slice(start, next === -1 ? source.length : next);
+    assert.match(body, /runMailAccountMutation\(\(\) => \{/);
+  }
+
+  assert.match(source, /function observeMailboxOperationRevisionFromError\(error: unknown\): boolean/);
+  assert.match(source, /const result = await operation\(\);/);
+  assert.match(source, /observeMailboxOperationRevision\(result\.mailbox_operation_revision\)/);
+  assert.match(source, /observeMailboxOperationRevisionFromError\(error\)/);
+});
+
+test("scheduled success and error stay inert until a stamped failed mutation settles", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const failed = deferred<{ mailbox_operation_revision: number }>();
+  const attempt = harness.run(() => failed.promise);
+  let guidance = "Complete email authorization in your browser";
+
+  assert.equal(harness.snapshot().inFlight, true);
+  for (const staleGuidance of ["Automatic check complete", "Automatic check failed"]) {
+    if (harness.accepts({ mailbox_operation_revision: 0 })) guidance = staleGuidance;
+  }
+  assert.equal(guidance, "Complete email authorization in your browser");
+
+  failed.reject({
+    code: "gmail_authorization_rejected",
+    mailbox_operation_revision: 1,
+    retryable: false,
+  });
+  await assert.rejects(attempt);
+  guidance = "Gmail authorization was rejected";
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: false,
+    ready: true,
+    revision: 1,
+    active: 0,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(guidance, "Gmail authorization was rejected");
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+});
+
+test("scheduled events resume at the successful mutation revision", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const succeeded = deferred<{ mailbox_operation_revision: number }>();
+  const attempt = harness.run(() => succeeded.promise);
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  succeeded.resolve({ mailbox_operation_revision: 1 });
+  await attempt;
+
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), true);
+});
+
+test("accepted scheduled inbox and health effects are invalidated across overlapping mutations", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const acceptedScope = harness.scope();
+  assert.deepEqual(acceptedScope, {
+    mutation_epoch: 0,
+    mailbox_operation_revision: 0,
+  });
+  const requestGeneration = harness.snapshot();
+  const staleSuccess = deferred<{ mailbox_operation_revision: number }>();
+  const staleFailure = deferred<{ mailbox_operation_revision: number }>();
+  const firstMutation = harness.run(() => staleSuccess.promise);
+  const overlappingMutation = harness.run(() => staleFailure.promise);
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: true,
+    ready: true,
+    revision: 0,
+    active: 2,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
+  });
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+
+  let healthMessage = "Authorizing account";
+  let inboxState = "mutation owns loading state";
+  let inboxBusy = true;
+  if (
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    )
+  ) {
+    healthMessage = "stale scheduled success";
+  }
+  if (
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    )
+  ) {
+    inboxState = "stale scheduled failure";
+    inboxBusy = false;
+  }
+  assert.equal(healthMessage, "Authorizing account");
+  assert.equal(inboxState, "mutation owns loading state");
+  assert.equal(inboxBusy, true);
+
+  staleSuccess.resolve({ mailbox_operation_revision: 1 });
+  await firstMutation;
+  assert.equal(harness.snapshot().inFlight, true);
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.healthGeneration,
+      harness.snapshot().healthGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+
+  staleFailure.reject({
+    code: "gmail_authorization_rejected",
+    mailbox_operation_revision: 2,
+  });
+  await assert.rejects(overlappingMutation);
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.snapshot().revision, 2);
+  assert.equal(
+    harness.requestIsCurrent(
+      requestGeneration.inboxGeneration,
+      harness.snapshot().inboxGeneration,
+      acceptedScope,
+    ),
+    false,
+  );
+});
+
+test("scheduled inbox and health consumers retain their effect scope through cleanup", () => {
+  const inbox = source.match(
+    /async function loadInbox\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function refreshLoadedInboxSpan/,
+  );
+  assert.ok(inbox);
+  assert.match(inbox[1], /mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)/);
+  assert.ok(
+    inbox[1].lastIndexOf(
+      "mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)",
+    ) > inbox[1].lastIndexOf("await loadAttachmentCapabilities"),
+  );
+  assert.match(
+    inbox[1],
+    /if \(mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) \{\s*setInboxControlsBusy\(false\);\s*\}/,
+  );
+
+  const health = source.match(
+    /async function loadHealth\([\s\S]*?effectScope: MailboxEffectScope \| null = null,[\s\S]*?\): Promise<boolean> \{([\s\S]*?)\n\}\n\nfunction recoveryStatusMessage/,
+  );
+  assert.ok(health);
+  assert.ok(
+    health[1].match(
+      /mailboxEffectRequestIsCurrent\(\s*requestGeneration,\s*healthRequestGeneration,\s*effectScope,?\s*\)/g,
+    )?.length === 2,
+  );
+
+  const listener = source.match(
+    /listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*?)\n\}\);/,
+  );
+  assert.ok(listener);
+  assert.match(listener[1], /const effectScope = currentMailboxEffectScope\(\)/);
+  assert.match(listener[1], /loadInbox\(false, effectScope\)/);
+  assert.match(listener[1], /loadHealth\([\s\S]*?effectScope\)/);
+});
+
+test("overlapping account mutations keep the scheduled-event gate closed", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const older = deferred<{ mailbox_operation_revision: number }>();
+  const newer = deferred<{ mailbox_operation_revision: number }>();
+  const olderAttempt = harness.run(() => older.promise);
+  const newerAttempt = harness.run(() => newer.promise);
+
+  assert.equal(harness.snapshot().active, 2);
+  newer.resolve({ mailbox_operation_revision: 2 });
+  await newerAttempt;
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: true,
+    ready: true,
+    revision: 2,
+    active: 1,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), false);
+
+  older.resolve({ mailbox_operation_revision: 1 });
+  await olderAttempt;
+  assert.equal(harness.snapshot().inFlight, false);
+  assert.equal(harness.snapshot().revision, 2);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 1 }), false);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 2 }), true);
+});
+
+test("synchronous and legacy mutation errors fail closed without stranding the gate", async () => {
+  const harness = mailboxMutationHarness();
+  harness.observe(0);
+  const legacyError = { code: "legacy_error" };
+
+  await assert.rejects(
+    harness.run(() => {
+      throw legacyError;
+    }),
+    (error) => error === legacyError,
+  );
+
+  assert.deepEqual(harness.snapshot(), {
+    inFlight: false,
+    ready: false,
+    revision: 0,
+    active: 0,
+    mutationEpoch: 1,
+    healthGeneration: 1,
+    inboxGeneration: 1,
+  });
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+});
+
+test("startup rejects scheduled events until even an empty account catalog seeds revision zero", () => {
+  const harness = mailboxMutationHarness();
+
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), false);
+  harness.observe(0);
+  assert.equal(harness.accepts({ mailbox_operation_revision: 0 }), true);
+});
+
+function configuredDesktopStartupHarness() {
+  const match = source.match(
+    /async function startConfiguredDesktop\([\s\S]*?\): Promise<void> \{([\s\S]*?)\n\}\n\nfunction renderConfigAdmissionState/,
+  );
+  assert.ok(match);
+  const pending: Array<(loaded: boolean) => void> = [];
+  const loadMailAccounts = () => new Promise<boolean>((resolve) => pending.push(resolve));
+  return {
+    ...Function(
+      "loadMailAccounts",
+      `let configurationReady = false;
+       let configAdmissionGeneration = 1;
+       let configuredStartupEpoch = 1;
+       const calls = [];
+       const configInitializeForm = { hidden: false };
+       const settingsForm = { hidden: true };
+       const ntfyDisclosurePanel = { hidden: false };
+       let ntfyDisclosureExpectedRevision = "revision";
+       function setConfiguredNavigation(enabled) { calls.push(["navigation", enabled]); }
+       function loadInbox() { calls.push(["inbox"]); }
+       function loadHealth() { calls.push(["health"]); }
+       function loadAutostart() { calls.push(["autostart"]); }
+       function loadSenders() { calls.push(["senders"]); return Promise.resolve(true); }
+       function finishOperation() { calls.push(["finish"]); }
+       async function startConfiguredDesktop(expectedGeneration, expectedEpoch) {${match[1]}\n}
+       return {
+         start: () => startConfiguredDesktop(configAdmissionGeneration, configuredStartupEpoch),
+         supersede: () => {
+           configAdmissionGeneration += 1;
+           configuredStartupEpoch += 1;
+           configurationReady = false;
+           setConfiguredNavigation(false);
+         },
+         snapshot: () => ({ calls: structuredClone(calls), ready: configurationReady }),
+       };`,
+    )(loadMailAccounts),
+    resolveAccounts: (loaded: boolean) => {
+      const resolve = pending.shift();
+      assert.ok(resolve, "a mailbox seed request must be pending");
+      resolve(loaded);
+    },
+  } as {
+    start: () => Promise<void>;
+    supersede: () => void;
+    snapshot: () => { calls: unknown[][]; ready: boolean };
+    resolveAccounts: (loaded: boolean) => void;
+  };
+}
+
+test("startup seeds stamped accounts before health and inbox work", async () => {
+  const startup = configuredDesktopStartupHarness();
+  const started = startup.start();
+  assert.deepEqual(startup.snapshot(), {
+    calls: [],
+    ready: false,
+  });
+
+  startup.resolveAccounts(true);
+  await started;
+  assert.equal(startup.snapshot().ready, true);
+  assert.deepEqual(startup.snapshot().calls.slice(0, 5), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+    ["autostart"],
+    ["senders"],
+  ]);
+});
+
+test("startup failure stays fail closed and a restarted no-account desktop reseeds", async () => {
+  const failed = configuredDesktopStartupHarness();
+  const failedStart = failed.start();
+  failed.resolveAccounts(false);
+  await failedStart;
+  assert.equal(failed.snapshot().ready, false);
+  assert.deepEqual(failed.snapshot().calls, []);
+
+  const restartedNoAccount = configuredDesktopStartupHarness();
+  const restarted = restartedNoAccount.start();
+  assert.equal(restartedNoAccount.snapshot().ready, false);
+  restartedNoAccount.resolveAccounts(true);
+  await restarted;
+  assert.equal(restartedNoAccount.snapshot().ready, true);
+  assert.deepEqual(restartedNoAccount.snapshot().calls.slice(0, 3), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+  ]);
+  assert.ok(restartedNoAccount.snapshot().calls.some(([operation]) => operation === "inbox"));
+  assert.match(
+    source,
+    /observeMailboxOperationRevision\(accounts\.mailbox_operation_revision\);[\s\S]*renderMailAccounts\(accounts\)/,
+  );
+});
+
+test("superseded admission cannot enable the desktop after mailbox seeding", async () => {
+  const startup = configuredDesktopStartupHarness();
+  const older = startup.start();
+  startup.supersede();
+  const newer = startup.start();
+
+  startup.resolveAccounts(true);
+  await older;
+  assert.deepEqual(startup.snapshot(), {
+    calls: [["navigation", false]],
+    ready: false,
+  });
+
+  startup.resolveAccounts(true);
+  await newer;
+  assert.equal(startup.snapshot().ready, true);
+  assert.deepEqual(startup.snapshot().calls.slice(1, 4), [
+    ["navigation", true],
+    ["inbox"],
+    ["health"],
+  ]);
+});
+
+test("label admission contract publishes exact Gmail authorization retry semantics", () => {
+  assert.match(
+    contract,
+    /only `rateLimitExceeded` and `userRateLimitExceeded`[\s\S]*retryable `gmail_label_catalog_unavailable`/,
+  );
+  assert.match(
+    contract,
+    /missing, malformed, permission, unknown,\s+`quotaExceeded`, or mixed[\s\S]*nonretryable `gmail_authorization_rejected`/,
+  );
+  assert.match(
+    contract,
+    /manual catalog refresh and\s+scheduled discovery[\s\S]*same public code and retryability/,
+  );
+});
+
+test("active account generation invalidates late Gmail label responses", () => {
+  assert.match(source, /gmailLabelGeneration \+= 1/);
+  assert.match(source, /generation === gmailLabelGeneration/);
+  assert.match(source, /response\.provider === scope\.provider/);
+  assert.match(source, /response\.account_id === scope\.account_id/);
+  assert.match(source, /invalidateGmailLabelState\(null\);[\s\S]*reconnectMailAccount/);
+});
+
+test("Gmail label UI explains bounded catch-up and renders admission provenance", () => {
+  assert.match(
+    source,
+    /Applies on the next scheduled check and may include recent matching mail\. Adding a label does not start a full mailbox scan\./,
+  );
+  assert.match(source, /Admitted by Gmail label:/);
+  assert.match(source, /Admitted by watched sender:/);
+  assert.match(source, /item\.admission !== null/);
+});
+
+test("mutations are bound to rendered catalog rows and current revisions", () => {
+  assert.match(
+    source,
+    /gmailLabelCatalogItems\.find\([\s\S]*item\.label_id === gmailLabelCatalogSelect\.value/,
+  );
+  assert.match(source, /expectedRevision: revision/);
+  assert.match(source, /gmailLabelSelectorItems\.some\([\s\S]*selector\.selector_id/);
+  assert.match(source, /gmailLabelRefreshIsCurrent\(selectors, catalog, revalidatedSelectors\)/);
+});
+
+test("check status keeps Gmail recovery visible until catch-up finishes", () => {
+  assert.match(source, /recovery_pending\?: boolean/);
+  assert.match(source, /recovery_state\?: string/);
+  assert.match(source, /recovery_failure_code\?: string/);
+  assert.match(source, /recovery_next_retry_at\?: string/);
+  assert.match(
+    source,
+    /function recoveryStatusMessage[\s\S]*Gmail catch-up[\s\S]*will retry/,
+  );
+
+  const recoveryFunctionSource = source.match(
+    /function recoveryStatusMessage\([\s\S]*?\): string \| null \{([\s\S]*?)\n\}\n\nfunction inactiveCheckMessage/,
+  );
+  assert.ok(recoveryFunctionSource);
+  const inactiveFunctionSource = source.match(
+    /function inactiveCheckMessage\([^)]*\): string \| null \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(inactiveFunctionSource);
+  const functionSource = source.match(
+    /function checkResultMessage\(result: CheckResult\): string \{([\s\S]*?)\n\}\n\nasync function runCheck/,
+  );
+  assert.ok(functionSource);
+  const checkResultMessage = Function(
+    `function recoveryStatusMessage(result, progress) {${recoveryFunctionSource[1]}\n}
+     function inactiveCheckMessage(reason) {${inactiveFunctionSource[1]}\n}
+     return function checkResultMessage(result) {${functionSource[1]}\n}`,
+  )() as (result: Record<string, unknown>) => string;
+  const baseline = {
+    active: true,
+    discovered: 2,
+    summarized: 1,
+    fallback_notified: 0,
+    purged: 0,
+    stale_cursor_recovered: true,
+    pending_notifications: 0,
+    delivered_notifications: 0,
+    failed_notifications: 0,
+    remaining_notifications: 0,
+  };
+
+  const collecting = checkResultMessage({
+    ...baseline,
+    recovery_pending: true,
+    recovery_state: "collecting",
+  });
+  assert.match(collecting, /Gmail catch-up is still in progress/);
+  assert.doesNotMatch(collecting, /Check complete/);
+
+  for (const recovery_state of ["backoff", "degraded"]) {
+    const retrying = checkResultMessage({
+      ...baseline,
+      recovery_pending: true,
+      recovery_state,
+      recovery_failure_code: "gmail_recovery_page_token_invalid",
+      recovery_next_retry_at: "2026-09-20T03:00:00+00:00",
+    });
+    assert.match(retrying, /will retry after 2026-09-20T03:00:00\+00:00/);
+    assert.match(retrying, /gmail_recovery_page_token_invalid/);
+    assert.doesNotMatch(retrying, /Check complete/);
+  }
+});
+
+test("manual checks explain inactive saved Gmail labels and fail closed on unknown reasons", () => {
+  const inactiveFunctionSource = source.match(
+    /function inactiveCheckMessage\([^)]*\): string \| null \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(inactiveFunctionSource);
+  const inactiveCheckMessage = Function(
+    `return function inactiveCheckMessage(reason) {${inactiveFunctionSource[1]}\n}`,
+  )() as (reason: string | undefined) => string | null;
+
+  assert.match(
+    inactiveCheckMessage("gmail_label_selectors_inactive") ?? "",
+    /Saved Gmail labels are inactive[\s\S]*refresh[\s\S]*select/i,
+  );
+  assert.match(
+    inactiveCheckMessage("future_inactive_reason") ?? "",
+    /could not understand the inactive check state/i,
+  );
+  assert.equal(inactiveCheckMessage(undefined), null);
+
+  const recoveryBranch = source.indexOf("if (result.recovery_pending)", source.indexOf("function checkResultMessage"));
+  const inactiveBranch = source.indexOf("inactiveCheckMessage(result.reason)", source.indexOf("function checkResultMessage"));
+  const genericInactiveBranch = source.indexOf("if (!result.active)", source.indexOf("function checkResultMessage"));
+  assert.ok(recoveryBranch >= 0);
+  assert.ok(inactiveBranch > recoveryBranch);
+  assert.ok(genericInactiveBranch > inactiveBranch);
+  assert.match(
+    source.slice(recoveryBranch, genericInactiveBranch),
+    /!result\.active && result\.reason !== undefined[\s\S]*inactiveCheckMessage\(result\.reason\)/,
+  );
+});
+
+test("scheduled checks render recovery before any completion status", () => {
+  assert.match(
+    source,
+    /status: "complete" \| "delivery_failed" \| "check_failed" \| "recovery_pending"/,
+  );
+  const listener = source.match(
+    /void listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*)\n\}\);\nvoid listen<\{ attempted: number \}>\("watcher:\/\/connect-queue"/,
+  );
+  assert.ok(listener);
+  const recoveryBranch = listener[1].indexOf("recoveryStatusMessage({");
+  const completionBranch = listener[1].indexOf('event.payload.status === "complete"');
+  assert.ok(recoveryBranch >= 0);
+  assert.ok(completionBranch >= 0);
+  assert.ok(recoveryBranch < completionBranch);
+});
+
+test("scheduled checks render inactive saved Gmail labels before completion", () => {
+  assert.match(
+    source,
+    /status: "complete" \| "delivery_failed" \| "check_failed" \| "recovery_pending" \| "inactive"/,
+  );
+  const listener = source.match(
+    /void listen<ScheduledCheckEvent>\("watcher:\/\/scheduled-check", \(event\) => \{([\s\S]*)\n\}\);\nvoid listen<\{ attempted: number \}>\("watcher:\/\/connect-queue"/,
+  );
+  assert.ok(listener);
+  const recoveryBranch = listener[1].indexOf("recoveryStatusMessage({");
+  const inactiveBranch = listener[1].indexOf("inactiveCheckMessage(event.payload.reason)");
+  const completionBranch = listener[1].indexOf('event.payload.status === "complete"');
+  assert.ok(recoveryBranch >= 0);
+  assert.ok(inactiveBranch > recoveryBranch);
+  assert.ok(completionBranch > inactiveBranch);
+  assert.match(
+    listener[1],
+    /event\.payload\.status === "inactive"[\s\S]*inactiveCheckMessage\(event\.payload\.reason\)/,
+  );
+});
+
+test("Gmail label proof surface shows safe selector evidence without the opaque label ID", async () => {
+  assert.match(source, /id="gmail-label-polling-state"/);
+  assert.match(source, /Selector UUID:/);
+  assert.match(source, /Label ID SHA-256:/);
+  assert.match(source, /Selector-set revision:/);
+  assert.match(source, /crypto\.subtle\.digest\("SHA-256"/);
+  assert.doesNotMatch(
+    source,
+    /(?:textContent|innerText|innerHTML)\s*=\s*[^;\n]*selector\.label_id/,
+  );
+
+  const digestFunctionSource = source.match(
+    /async function gmailLabelIdDigest\([^)]*\): Promise<string> \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(digestFunctionSource);
+  const digestLabelId = Function(
+    "crypto",
+    "TextEncoder",
+    `return async function gmailLabelIdDigest(labelId) {${digestFunctionSource[1]}\n}`,
+  )(webcrypto, TextEncoder) as (labelId: string) => Promise<string>;
+  const rawLabelId = "Label_private-proof-123";
+  const digest = await digestLabelId(rawLabelId);
+  assert.equal(digest, "cd467470d08281da13ee3acd5fe743544fdf2e92e3de8b125c4dcdab4402dbd9");
+  assert.doesNotMatch(digest, /Label_private-proof-123/);
+});
+
+test("Gmail proof evidence spans the section and wraps without changing sender-card truncation", () => {
+  assert.match(source, /item\.className = "sender-card gmail-label-selector-card"/);
+  assert.match(source, /className = "gmail-label-evidence"/);
+  assert.match(
+    styles,
+    /#gmail-label-settings\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/s,
+  );
+  assert.match(
+    styles,
+    /\.gmail-label-selector-card \.gmail-label-evidence\s*\{[^}]*overflow:\s*visible[^}]*text-overflow:\s*clip[^}]*white-space:\s*normal[^}]*overflow-wrap:\s*anywhere/s,
+  );
+  assert.match(
+    styles,
+    /\.sender-card strong,\s*\.sender-card span\s*\{[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
+  );
+});
+
+test("sender observation versions reject crossed health and accept later fresh health", () => {
+  assert.match(
+    source,
+    /const exactSenderCount = gmailLabelSenderCount\.count \?\? health\.watchlist_count/,
+  );
+  assert.match(source, /watchlist_count: exactSenderCount/);
+  assert.match(source, /watchlistCount\.textContent = String\(exactSenderCount\)/);
+  assert.doesNotMatch(source, /watchlistCount\.textContent = String\(health\.watchlist_count\)/);
+  const localReducerSource = source.match(
+    /function gmailLabelSenderCountAfterLocalObservation\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction activeExactSenderCount/,
+  );
+  assert.ok(localReducerSource);
+  const observeLocal = Function(
+    `return function gmailLabelSenderCountAfterLocalObservation(current, incomingCount) {${localReducerSource[1]}\n}`,
+  )() as (
+    current: { count: number | null; observation_version: number },
+    incomingCount: number,
+  ) => { count: number | null; observation_version: number };
+  const healthReducerSource = source.match(
+    /function gmailLabelSenderCountAfterHealth\([^)]*\): GmailLabelSenderCountState \{([\s\S]*?)\n\}\n\nfunction gmailLabelPollingStateMessage/,
+  );
+  assert.ok(healthReducerSource);
+  const observeHealth = Function(
+    `return function gmailLabelSenderCountAfterHealth(current, incomingCount, requestObservationVersion) {${healthReducerSource[1]}\n}`,
+  )() as (
+    current: { count: number | null; observation_version: number },
+    incomingCount: number,
+    requestObservationVersion: number,
+  ) => { count: number | null; observation_version: number };
+
+  const initial = { count: null, observation_version: 0 };
+  const provisionalHealth = observeHealth(initial, 0, 0);
+  assert.deepEqual(provisionalHealth, { count: 0, observation_version: 0 });
+
+  const afterAdd = observeLocal(provisionalHealth, 1);
+  assert.deepEqual(observeHealth(afterAdd, 0, 0), {
+    count: 1,
+    observation_version: 1,
+  });
+
+  const afterRemove = observeLocal(afterAdd, 0);
+  assert.deepEqual(observeHealth(afterRemove, 1, 1), {
+    count: 0,
+    observation_version: 2,
+  });
+
+  assert.deepEqual(observeHealth(afterRemove, 3, 2), {
+    count: 3,
+    observation_version: 2,
+  });
+
+  assert.deepEqual(observeLocal(provisionalHealth, 2), {
+    count: 2,
+    observation_version: 1,
+  });
+});
+
+test("legacy-only sender rows remain manageable without defeating label-only state", () => {
+  assert.match(source, /function activeExactSenderCount\(senders: WatchedSender\[\]\): number/);
+  assert.match(source, /senders\.filter\(\(sender\) => sender\.admission_active\)\.length/);
+  assert.match(source, /const exactSenderCount = activeExactSenderCount\(senders\)/);
+  const renderSenders = source.match(
+    /function renderSenders\(senders: WatchedSender\[\]\): void \{([\s\S]*?)\n\}\n\nasync function loadSenders/,
+  );
+  assert.ok(renderSenders);
+  assert.doesNotMatch(
+    renderSenders[1],
+    /gmailLabelSenderCountAfterLocalObservation\(\s*gmailLabelSenderCount,\s*senders\.length,/s,
+  );
+  const helper = source.match(
+    /function activeExactSenderCount\(senders: WatchedSender\[\]\): number \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(helper);
+  const activeCount = Function(
+    `return function activeExactSenderCount(senders) {${helper[1]}\n}`,
+  )() as (senders: Array<{ admission_active: boolean }>) => number;
+  assert.equal(activeCount([{ admission_active: false }]), 0);
+  assert.equal(
+    activeCount([{ admission_active: false }, { admission_active: true }]),
+    1,
+  );
+});
+
+test("health captures sender version and preserves health request generation ordering", () => {
+  assert.match(
+    source,
+    /function renderHealth\(health: HealthStatus, senderObservationVersion: number\)/,
+  );
+  const loadHealthSource = source.match(
+    /async function loadHealth\([\s\S]*?\): Promise<boolean> \{([\s\S]*?)\n\}\n\nfunction recoveryStatusMessage/,
+  );
+  assert.ok(loadHealthSource);
+  const capturedVersion = loadHealthSource[1].indexOf(
+    "const senderObservationVersion = gmailLabelSenderCount.observation_version",
+  );
+  const invokeHealth = loadHealthSource[1].indexOf('await invoke<HealthStatus>("health_get")');
+  const generationGuard = loadHealthSource[1].indexOf(
+    "!mailboxEffectRequestIsCurrent(",
+  );
+  const render = loadHealthSource[1].indexOf(
+    "renderHealth(health, senderObservationVersion)",
+  );
+  assert.ok(capturedVersion >= 0);
+  assert.ok(invokeHealth > capturedVersion);
+  assert.ok(generationGuard > invokeHealth);
+  assert.ok(render > generationGuard);
+});
+
+test("check readiness distinguishes unconfigured from label or recovery configured watchers", () => {
+  const readinessSource = source.match(
+    /function watcherPrerequisitesReady\([^)]*\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(readinessSource);
+  const prerequisitesReady = Function(
+    `return function watcherPrerequisitesReady(exactSenderCount, gmailLabelWatchConfigured, mailReady, databaseReady) {${readinessSource[1]}\n}`,
+  )() as (
+    exactSenderCount: number,
+    gmailLabelWatchConfigured: boolean,
+    mailReady: boolean,
+    databaseReady: boolean,
+  ) => boolean;
+
+  assert.equal(prerequisitesReady(0, false, false, false), true);
+  assert.equal(prerequisitesReady(0, true, false, true), false);
+  assert.equal(prerequisitesReady(0, true, true, false), false);
+  assert.equal(prerequisitesReady(0, true, true, true), true);
+  assert.equal(prerequisitesReady(1, false, false, true), false);
+  assert.equal(prerequisitesReady(1, false, true, true), true);
+  assert.match(source, /health\.gmail\.label_watch_configured/);
+});
+
+test("catalog success revalidates selectors before declaring Gmail labels current", () => {
+  const consistencySource = source.match(
+    /function gmailLabelRefreshIsCurrent\([^)]*\): boolean \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(consistencySource);
+  const refreshIsCurrent = Function(
+    `return function gmailLabelRefreshIsCurrent(initialSelectors, catalog, revalidatedSelectors) {${consistencySource[1]}\n}`,
+  )() as (
+    initialSelectors: { revision: number; catalog_state: string },
+    catalog: { revision: number },
+    revalidatedSelectors: { revision: number; catalog_state: string },
+  ) => boolean;
+
+  const unavailable = { revision: 7, catalog_state: "unavailable" };
+  const current = { revision: 7, catalog_state: "current" };
+  assert.equal(refreshIsCurrent(unavailable, { revision: 7 }, current), true);
+  assert.equal(
+    refreshIsCurrent(unavailable, { revision: 7 }, { revision: 7, catalog_state: "unavailable" }),
+    false,
+  );
+  assert.equal(
+    refreshIsCurrent(current, { revision: 8 }, { revision: 8, catalog_state: "current" }),
+    false,
+  );
+  assert.equal(
+    refreshIsCurrent(current, { revision: 7 }, { revision: 7, catalog_state: "invalid_catalog" }),
+    false,
+  );
+
+  const loadSource = source.match(
+    /async function loadGmailLabelState\(\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function addGmailLabelSelector/,
+  );
+  assert.ok(loadSource);
+  const selectorReads = [
+    ...loadSource[1].matchAll(
+      /invoke<GmailLabelSelectors>\(\s*"gmail_label_selectors_list"/g,
+    ),
+  ].map((match) => match.index ?? -1);
+  const catalogRead = loadSource[1].indexOf(
+    'invoke<GmailLabelCatalog>("gmail_labels_catalog"',
+  );
+  assert.equal(selectorReads.length, 3);
+  assert.ok(selectorReads[0] < catalogRead && catalogRead < selectorReads[1]);
+  assert.ok(selectorReads[2] > selectorReads[1]);
+  assert.match(loadSource[1], /renderGmailLabelSelectors\(revalidatedSelectors\.items\)/);
+});
+
+test("catalog failure re-lists durable selectors and renders them inert", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  const unavailable = {
+    ...active,
+    catalog_state: "unavailable",
+    items: [
+      {
+        ...active.items[0],
+        status: "validation_unavailable",
+        admission_active: false,
+      },
+    ],
+  };
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      return selectorReads === 1 ? active : unavailable;
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  await harness.load();
+
+  const snapshot = harness.snapshot();
+  assert.equal(selectorReads, 2);
+  assert.equal(snapshot.catalogVerified, false);
+  assert.equal(snapshot.revision, 7);
+  assert.deepEqual(snapshot.selectorRenders.at(-1), unavailable.items);
+});
+
+test("late catalog-failure re-list cannot overwrite a newer account generation", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  let resolveRelist: ((value: Record<string, unknown>) => void) | undefined;
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      if (selectorReads === 1) return active;
+      return new Promise<Record<string, unknown>>((resolve) => {
+        resolveRelist = resolve;
+      });
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  const loading = harness.load();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(selectorReads, 2);
+  assert.ok(resolveRelist);
+  const rendersBeforeNewGeneration = harness.snapshot().selectorRenders.length;
+  harness.bumpGeneration();
+  resolveRelist({
+    ...active,
+    catalog_state: "unavailable",
+    items: [
+      {
+        ...active.items[0],
+        status: "validation_unavailable",
+        admission_active: false,
+      },
+    ],
+  });
+  await loading;
+
+  assert.equal(harness.snapshot().selectorRenders.length, rendersBeforeNewGeneration);
+});
+
+test("failed catalog recovery renders cached selectors explicitly inert", async () => {
+  const active = {
+    provider: "gmail",
+    account_id: "gmail-default",
+    revision: 7,
+    catalog_state: "current",
+    items: [
+      {
+        selector_id: "selector-1",
+        label_id: "Label_1",
+        display_name: "Invoices",
+        status: "active",
+        admission_active: true,
+      },
+    ],
+  };
+  let selectorReads = 0;
+  const harness = gmailLabelLoadHarness(async (operation) => {
+    if (operation === "gmail_label_selectors_list") {
+      selectorReads += 1;
+      if (selectorReads === 1) return active;
+      throw new Error("Selector state unavailable");
+    }
+    assert.equal(operation, "gmail_labels_catalog");
+    throw new Error("Gmail labels are temporarily unavailable");
+  });
+
+  await harness.load();
+
+  const snapshot = harness.snapshot();
+  assert.equal(selectorReads, 2);
+  assert.equal(snapshot.revision, null);
+  assert.deepEqual(snapshot.selectorRenders.at(-1), [
+    {
+      ...active.items[0],
+      status: "validation_unavailable",
+      admission_active: false,
+    },
+  ]);
+});
+
+test("label-only polling claim requires active selector, zero senders, and running scheduler", () => {
+  const stateFunctionSource = source.match(
+    /function gmailLabelPollingStateMessage\([^)]*\): GmailLabelPollingState \{([\s\S]*?)\n\}/,
+  );
+  assert.ok(stateFunctionSource);
+  const pollingState = Function(
+    `return function gmailLabelPollingStateMessage(activeSelectorCount, health) {${stateFunctionSource[1]}\n}`,
+  )() as (
+    activeSelectorCount: number | null,
+    health: Record<string, unknown> | null,
+  ) => { active: boolean; message: string };
+
+  const active = pollingState(1, {
+    watchlist_count: 0,
+    polling: { enabled: true, interval_minutes: 120, next_check_unix_ms: 1_800_000_000_000 },
+  });
+  assert.equal(active.active, true);
+  assert.match(active.message, /Label-only automatic polling is active/);
+  assert.match(active.message, /zero exact senders/);
+  assert.match(active.message, /scheduler is enabled and running/);
+
+  for (const [activeSelectorCount, health, reason] of [
+    [0, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: 1 } }, /no active Gmail label selector/],
+    [1, { watchlist_count: 1, polling: { enabled: true, next_check_unix_ms: 1 } }, /exact sender count is 1/],
+    [1, { watchlist_count: 0, polling: { enabled: false, next_check_unix_ms: null } }, /scheduler is disabled/],
+    [1, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: null } }, /no next check is scheduled/],
+    [null, { watchlist_count: 0, polling: { enabled: true, next_check_unix_ms: 1 } }, /status is unavailable/],
+    [1, null, /status is unavailable/],
+  ] as const) {
+    const state = pollingState(activeSelectorCount, health);
+    assert.equal(state.active, false);
+    assert.match(state.message, reason);
+    assert.doesNotMatch(state.message, /Label-only automatic polling is active/);
+  }
+});

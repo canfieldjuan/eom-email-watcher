@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.db import AdmissionProvenance
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
@@ -125,6 +126,13 @@ def test_fixture_mailbox_satisfies_real_account_boundary(
         provider=DEFAULT_MAIL_PROVIDER,
         account_id=DEFAULT_MAIL_ACCOUNT_ID,
         mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+        admission=AdmissionProvenance(
+            kind="exact_sender",
+            selector_id="sender:fixture@example.invalid",
+            display_name="Fixture Sender",
+            mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+            admitted_at="2026-09-19T12:00:00+00:00",
+        ),
     )
     runtime.store.replace_attachments(
         "fixture-message",

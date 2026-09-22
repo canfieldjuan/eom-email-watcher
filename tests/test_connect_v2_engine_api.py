@@ -12,7 +12,7 @@ from connect_automate import connect
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
-from eom_email_watcher.db import ConnectQueueFull, MessageSource
+from eom_email_watcher.db import AdmissionProvenance, ConnectQueueFull, MessageSource
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
@@ -53,6 +53,16 @@ from eom_email_watcher.db import Store
 deleted = Store(Path(sys.argv[1])).delete_message(sys.argv[2])
 print("deleted" if deleted else "missing", flush=True)
 """
+
+
+def exact_sender_admission(sender: str, display_name: str | None) -> AdmissionProvenance:
+    return AdmissionProvenance(
+        kind="exact_sender",
+        selector_id=f"sender:{sender}",
+        display_name=display_name,
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
 
 
 class SeededMailboxGateway:
@@ -2039,10 +2049,19 @@ def test_automation_source_rejects_unbound_or_replaced_mailbox_identity(
         )
     else:
         with runtime.store.connection() as db:
+            db.execute("DROP TRIGGER messages_admission_provenance_immutable")
             db.execute(
-                "UPDATE messages SET mailbox_identity_key = NULL WHERE message_id = ?",
+                """UPDATE messages
+                SET mailbox_identity_key = NULL,
+                    admission_kind = NULL,
+                    admission_selector_id = NULL,
+                    admission_display_name = NULL,
+                    admission_mailbox_identity_key = NULL,
+                    admitted_at = NULL
+                WHERE message_id = ?""",
                 (fire.message_id,),
             )
+        runtime.store.initialize()
 
     response = engine_api._response(api_request(config_path, "connect.queue.pump"))
 
@@ -3453,6 +3472,7 @@ def seeded_runtime(tmp_path: Path):
         subject="Private subject",
         received_at="2026-08-30T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("private@example.com", "Private Sender"),
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -3501,6 +3521,7 @@ def seeded_imap_runtime(tmp_path: Path, *, descriptor_size: int):
         subject="Private subject",
         received_at="2026-09-12T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("private@example.com", "Private Sender"),
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -3527,6 +3548,7 @@ def seed_second_attachment(runtime: Runtime) -> None:
         subject="Second private subject",
         received_at="2026-08-30T12:01:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("second@example.com", "Second Sender"),
     )
     runtime.store.replace_attachments(
         "message-2",

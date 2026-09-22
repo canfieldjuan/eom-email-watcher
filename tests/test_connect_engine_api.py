@@ -7,6 +7,7 @@ import pytest
 from connect_automate import connect, entitlement
 
 from eom_email_watcher import engine_api
+from eom_email_watcher.db import AdmissionProvenance
 from eom_email_watcher.imap import MAX_MESSAGE_BYTES as MAX_IMAP_MESSAGE_BYTES
 from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
 from eom_email_watcher.mime import AttachmentDescriptor
@@ -54,6 +55,20 @@ def api_request(config_path: Path, operation: str, payload: dict[str, object] | 
         "config_path": str(config_path),
         "payload": payload or {},
     }
+
+
+def exact_sender_admission(
+    sender: str,
+    sender_name: str | None,
+    mailbox_identity_key: str = TEST_MAILBOX_IDENTITY_KEY,
+) -> AdmissionProvenance:
+    return AdmissionProvenance(
+        kind="exact_sender",
+        selector_id=f"sender:{sender}",
+        display_name=sender_name,
+        mailbox_identity_key=mailbox_identity_key,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
 
 
 def test_entitlement_status_is_claim_free_and_does_not_load_watcher_config(
@@ -167,6 +182,7 @@ def seeded_runtime(tmp_path: Path):
         subject="Private subject",
         received_at="2026-08-29T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("private@example.com", "Private Sender"),
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -351,6 +367,7 @@ def test_imap_attachment_summary_uses_actual_download_size(
         subject="Private subject",
         received_at="2026-09-12T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("private@example.com", "Private Sender"),
     )
     runtime.store.replace_attachments(
         "message-1",
@@ -499,6 +516,7 @@ def test_imap_attachment_summary_rejects_descriptor_over_local_fetch_ceiling(
         subject="Private subject",
         received_at="2026-09-12T12:00:00+00:00",
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        admission=exact_sender_admission("private@example.com", "Private Sender"),
     )
     runtime.store.replace_attachments(
         "message-1",

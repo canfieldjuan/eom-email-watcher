@@ -5,11 +5,12 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     AdmissionErrorObserver, AdmissionLease, AdmissionToken, CalendarConsentProfile,
-    CalendarConsentStatus, CalendarDecisionResult, CancellationToken, CheckResult,
-    ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
+    CalendarConsentStatus, CalendarDecisionResult, CancellationToken, CertificateExpiryLedger,
+    CheckResult, ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
     ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
-    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus,
-    InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
+    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
+    GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
+    HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
     NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
@@ -1578,6 +1579,20 @@ async fn inbox_query(
 }
 
 #[tauri::command]
+async fn certificate_expiry_ledger_list(
+    engine: State<'_, Engine>,
+    today: String,
+    limit: u32,
+) -> Result<CertificateExpiryLedger, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.list_certificate_expiry_ledger(today, limit)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn inbox_delete(
     engine: State<'_, Engine>,
     delivery: State<'_, NotificationDelivery>,
@@ -1932,6 +1947,62 @@ async fn mail_accounts_list(
 }
 
 #[tauri::command]
+async fn gmail_labels_catalog(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<GmailLabelCatalog, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.gmail_label_catalog(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selectors_list(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+) -> Result<GmailLabelSelectors, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.gmail_label_selectors(provider, account_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selector_add(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+    label_id: String,
+    expected_revision: u64,
+) -> Result<GmailLabelSelectorAdded, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.add_gmail_label_selector(provider, account_id, label_id, expected_revision)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn gmail_label_selector_remove(
+    engine: State<'_, Engine>,
+    provider: String,
+    account_id: String,
+    selector_id: String,
+    expected_revision: u64,
+) -> Result<GmailLabelSelectorRemoved, EngineError> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.remove_gmail_label_selector(provider, account_id, selector_id, expected_revision)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn mail_account_connect(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2204,6 +2275,7 @@ pub fn run() {
             calendar_consent_disconnect,
             calendar_consent_status,
             calendar_proposal_decide,
+            certificate_expiry_ledger_list,
             capability_output_export,
             capability_output_present,
             connect_entitlement_install,
@@ -2212,6 +2284,10 @@ pub fn run() {
             config_initialize,
             config_ntfy_disclosure_acknowledge,
             gmail_authorize,
+            gmail_label_selector_add,
+            gmail_label_selector_remove,
+            gmail_label_selectors_list,
+            gmail_labels_catalog,
             health_get,
             inbox_clear,
             inbox_delete,
