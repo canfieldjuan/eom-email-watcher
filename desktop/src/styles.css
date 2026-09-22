@@ -1128,6 +1128,72 @@ select:focus {
   text-align: right;
 }
 
+.expiry-ledger-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid #d7ded8;
+  border-radius: 12px;
+  background: rgb(255 255 255 / 82%);
+}
+
+.expiry-ledger-table {
+  width: 100%;
+  min-width: 1160px;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.expiry-ledger-table th,
+.expiry-ledger-table td {
+  max-width: 220px;
+  padding: 11px 12px;
+  border-bottom: 1px solid #e2e7e3;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.expiry-ledger-table th {
+  color: #526057;
+  background: #f5f7f5;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.expiry-ledger-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.expiry-ledger-table .expiry-ledger-status[data-status="expired"] {
+  color: #812d2d;
+  background: #f9e8e6;
+  font-weight: 800;
+}
+
+.expiry-ledger-table .expiry-ledger-status[data-status="expires_today"] {
+  color: #704900;
+  background: #fff2d3;
+  font-weight: 800;
+}
+
+.expiry-ledger-table .expiry-ledger-status[data-status="upcoming"] {
+  color: #245c40;
+  background: #e7f1e8;
+  font-weight: 800;
+}
+
+.expiry-ledger-table .expiry-ledger-status[data-status="review"],
+.expiry-ledger-table .expiry-ledger-review[data-state="needs_review"] {
+  color: #704900;
+  background: #fff2d3;
+  font-weight: 800;
+}
+
+.expiry-ledger-placeholder {
+  background: #fafbf9;
+}
+
 @media (max-width: 680px) {
   .shell {
     width: min(100% - 28px, 760px);

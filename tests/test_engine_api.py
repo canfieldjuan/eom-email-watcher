@@ -1370,6 +1370,64 @@ def test_read_operations_are_versioned_and_do_not_expose_token_paths(
     assert "mailbox_identity" not in json.dumps(inbox)
 
 
+def test_certificate_expiry_ledger_list_validates_bounds_and_calls_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int]] = []
+
+    def list_ledger(*, today: str, limit: int) -> list[dict[str, object]]:
+        calls.append((today, limit))
+        return []
+
+    monkeypatch.setattr(
+        engine_api,
+        "_runtime",
+        lambda _request: SimpleNamespace(
+            store=SimpleNamespace(list_certificate_expiry_ledger=list_ledger)
+        ),
+    )
+
+    for payload, expected_limit in (
+        ({"today": "2026-09-20"}, 100),
+        ({"today": "2026-09-20", "limit": 1}, 1),
+        ({"today": "2026-09-20", "limit": 500}, 500),
+    ):
+        response = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "certificate.expiry_ledger.list",
+                "config_path": "unused",
+                "payload": payload,
+            }
+        )
+        assert response["ok"] is True
+        assert response["data"] == {"items": []}
+        assert calls[-1] == ("2026-09-20", expected_limit)
+
+    for payload in (
+        {"today": "2026-9-20"},
+        {"today": "2026-02-30"},
+        {"today": "20260920"},
+        {},
+        {"today": "2026-09-20", "limit": True},
+        {"today": "2026-09-20", "limit": 0},
+        {"today": "2026-09-20", "limit": -1},
+        {"today": "2026-09-20", "limit": 501},
+    ):
+        calls_before = len(calls)
+        response = engine_api._response(
+            {
+                "protocol": 1,
+                "operation": "certificate.expiry_ledger.list",
+                "config_path": "unused",
+                "payload": payload,
+            }
+        )
+        assert response["ok"] is False
+        assert response["error"]["code"] == "invalid_request"
+        assert len(calls) == calls_before
+
+
 def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

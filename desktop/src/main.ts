@@ -248,6 +248,35 @@ interface InboxPage {
   next_cursor: string | null;
 }
 
+interface CertificateExpiryLedgerRow {
+  certificate_id: string;
+  certificate_holder: string | null;
+  insured: string | null;
+  producer: string | null;
+  policy_id: string | null;
+  policy_ordinal: number | null;
+  coverage: string | null;
+  insurer: string | null;
+  policy_number: string | null;
+  effective_date_iso: string | null;
+  effective_date_ambiguous: boolean | null;
+  effective_date_candidates: string[];
+  expiration_date_iso: string | null;
+  expiration_date_ambiguous: boolean | null;
+  expiration_date_candidates: string[];
+  expiry_status: "expired" | "expires_today" | "upcoming" | "review";
+  review_state: "extracted" | "needs_review";
+  review_reasons: string[];
+  source_message_id: string;
+  source_part_id: string;
+  connect_job_id: string;
+  source_available: boolean;
+}
+
+interface CertificateExpiryLedger {
+  items: CertificateExpiryLedgerRow[];
+}
+
 interface OpenedAttachment {
   filename: string;
 }
@@ -480,6 +509,7 @@ app.innerHTML = `
     <nav class="view-tabs" aria-label="Watcher views">
       <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
       <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
+      <button id="expiry-ledger-tab" type="button" aria-controls="expiry-ledger-view" aria-pressed="false">Expiry Ledger</button>
       <button id="health-tab" type="button" aria-controls="health-view" aria-pressed="false">Health</button>
       <button id="settings-tab" type="button" aria-controls="settings-view" aria-pressed="false">Settings</button>
     </nav>
@@ -580,6 +610,32 @@ app.innerHTML = `
 
       <p id="watchlist-status" class="status" role="status" aria-live="polite">Loading watchlist…</p>
       <ul id="sender-list" class="sender-list" aria-label="Watched senders"></ul>
+    </section>
+
+    <section id="expiry-ledger-view" class="view" aria-labelledby="expiry-ledger-tab" hidden>
+      <h2>Expiry Ledger</h2>
+      <p class="view-lede">Policy dates extracted from retained certificates, with uncertain details marked for review.</p>
+      <p id="expiry-ledger-status" class="status" role="status" aria-live="polite">Open this view to load policy expirations.</p>
+      <div id="expiry-ledger-table-wrap" class="expiry-ledger-table-wrap" hidden>
+        <table class="expiry-ledger-table" aria-label="Certificate expiry ledger">
+          <thead>
+            <tr>
+              <th scope="col">Holder</th>
+              <th scope="col">Insured</th>
+              <th scope="col">Producer</th>
+              <th scope="col">Coverage</th>
+              <th scope="col">Insurer</th>
+              <th scope="col">Policy number</th>
+              <th scope="col">Effective date</th>
+              <th scope="col">Expiration date</th>
+              <th scope="col">Expiry status</th>
+              <th scope="col">Review state</th>
+              <th scope="col">Source availability</th>
+            </tr>
+          </thead>
+          <tbody id="expiry-ledger-rows"></tbody>
+        </table>
+      </div>
     </section>
 
     <section id="health-view" class="view" aria-labelledby="health-tab" hidden>
@@ -759,12 +815,17 @@ app.innerHTML = `
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
 const watchlistTab = requiredElement<HTMLButtonElement>("#watchlist-tab");
+const expiryLedgerTab = requiredElement<HTMLButtonElement>("#expiry-ledger-tab");
 const healthTab = requiredElement<HTMLButtonElement>("#health-tab");
 const settingsTab = requiredElement<HTMLButtonElement>("#settings-tab");
 const inboxView = requiredElement<HTMLElement>("#inbox-view");
 const watchlistView = requiredElement<HTMLElement>("#watchlist-view");
+const expiryLedgerView = requiredElement<HTMLElement>("#expiry-ledger-view");
 const healthView = requiredElement<HTMLElement>("#health-view");
 const settingsView = requiredElement<HTMLElement>("#settings-view");
+const expiryLedgerStatus = requiredElement<HTMLParagraphElement>("#expiry-ledger-status");
+const expiryLedgerTableWrap = requiredElement<HTMLDivElement>("#expiry-ledger-table-wrap");
+const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledger-rows");
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
@@ -1017,6 +1078,8 @@ async function runMailAccountMutation<T extends { mailbox_operation_revision: nu
   }
 }
 
+let expiryLedgerLoadInFlight = false;
+
 function errorMessage(error: unknown): string {
   if (typeof error === "object" && error !== null && "message" in error) {
     const message = (error as { message?: unknown }).message;
@@ -1075,19 +1138,117 @@ function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
   return "Automatic check failed. Open Health for details.";
 }
 
-function showView(view: "inbox" | "watchlist" | "health" | "settings"): void {
+function showView(view: "inbox" | "watchlist" | "expiry-ledger" | "health" | "settings"): void {
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
+  const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
   inboxView.hidden = !inboxSelected;
   watchlistView.hidden = !watchlistSelected;
+  expiryLedgerView.hidden = !expiryLedgerSelected;
   healthView.hidden = !healthSelected;
   settingsView.hidden = !settingsSelected;
   inboxTab.setAttribute("aria-pressed", String(inboxSelected));
   watchlistTab.setAttribute("aria-pressed", String(watchlistSelected));
+  expiryLedgerTab.setAttribute("aria-pressed", String(expiryLedgerSelected));
   healthTab.setAttribute("aria-pressed", String(healthSelected));
   settingsTab.setAttribute("aria-pressed", String(settingsSelected));
+}
+
+function localCalendarDate(): string {
+  const now = new Date();
+  const year = String(now.getFullYear()).padStart(4, "0");
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function expiryStatusLabel(status: CertificateExpiryLedgerRow["expiry_status"]): string {
+  switch (status) {
+    case "expired":
+      return "Expired";
+    case "expires_today":
+      return "Expires today";
+    case "upcoming":
+      return "Upcoming";
+    case "review":
+      return "Needs review";
+  }
+}
+
+function ledgerCell(value: string): HTMLTableCellElement {
+  const cell = document.createElement("td");
+  cell.textContent = value;
+  return cell;
+}
+
+function renderExpiryLedger(items: CertificateExpiryLedgerRow[]): void {
+  expiryLedgerRows.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement("tr");
+    const placeholder = item.policy_id === null && item.policy_ordinal === null;
+    if (placeholder) row.className = "expiry-ledger-placeholder";
+
+    row.append(
+      ledgerCell(item.certificate_holder ?? "Not available"),
+      ledgerCell(item.insured ?? "Not available"),
+      ledgerCell(item.producer ?? "Not available"),
+      ledgerCell(placeholder ? "No policy rows" : item.coverage ?? "Not available"),
+      ledgerCell(item.insurer ?? "Not available"),
+      ledgerCell(item.policy_number ?? "Not available"),
+      ledgerCell(
+        item.effective_date_iso && !item.effective_date_ambiguous
+          ? item.effective_date_iso
+          : "Needs review",
+      ),
+      ledgerCell(
+        item.expiration_date_iso && !item.expiration_date_ambiguous
+          ? item.expiration_date_iso
+          : "Needs review",
+      ),
+    );
+
+    const expiryCell = ledgerCell(expiryStatusLabel(item.expiry_status));
+    expiryCell.className = "expiry-ledger-status";
+    expiryCell.dataset.status = item.expiry_status;
+    const reviewCell = ledgerCell(
+      item.review_state === "needs_review" ? "Needs review" : "Extracted",
+    );
+    reviewCell.className = "expiry-ledger-review";
+    reviewCell.dataset.state = item.review_state;
+    row.append(
+      expiryCell,
+      reviewCell,
+      ledgerCell(item.source_available ? "Available" : "Unavailable"),
+    );
+    expiryLedgerRows.append(row);
+  }
+  expiryLedgerTableWrap.hidden = items.length === 0;
+  expiryLedgerStatus.textContent =
+    items.length === 0 ? "No certificate policy records yet." : `Loaded ${items.length} rows.`;
+  expiryLedgerStatus.dataset.kind = items.length === 0 ? "" : "success";
+}
+
+async function loadExpiryLedger(): Promise<void> {
+  if (expiryLedgerLoadInFlight) return;
+  expiryLedgerLoadInFlight = true;
+  expiryLedgerRows.replaceChildren();
+  expiryLedgerTableWrap.hidden = true;
+  expiryLedgerStatus.textContent = "Loading policy expirations...";
+  delete expiryLedgerStatus.dataset.kind;
+  try {
+    const ledger = await invoke<CertificateExpiryLedger>("certificate_expiry_ledger_list", {
+      today: localCalendarDate(),
+      limit: 100,
+    });
+    renderExpiryLedger(ledger.items);
+  } catch (error) {
+    expiryLedgerStatus.textContent = errorMessage(error);
+    expiryLedgerStatus.dataset.kind = "error";
+  } finally {
+    expiryLedgerLoadInFlight = false;
+  }
 }
 
 function receivedLabel(value: string): string {
@@ -3793,6 +3954,7 @@ function setConfigInitializationBusy(busy: boolean): void {
 function setConfiguredNavigation(enabled: boolean): void {
   inboxTab.disabled = !enabled;
   watchlistTab.disabled = !enabled;
+  expiryLedgerTab.disabled = !enabled;
   healthTab.disabled = !enabled;
 }
 
@@ -4156,6 +4318,10 @@ form.addEventListener("submit", (event) => {
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));
+expiryLedgerTab.addEventListener("click", () => {
+  showView("expiry-ledger");
+  void loadExpiryLedger();
+});
 healthTab.addEventListener("click", () => {
   showView("health");
   void Promise.all([loadHealth(), refreshConnectStatus()]);

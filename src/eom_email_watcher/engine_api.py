@@ -14,7 +14,7 @@ import time
 import unicodedata
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from connect_automate import connect, entitlement
@@ -55,6 +55,7 @@ from .config import (
 )
 from .db import (
     AUTOMATION_FIRE_PENDING_WINDOW,
+    CERTIFICATE_CAPABILITY_ID,
     CONNECT_PROVIDER_ABSENCE_DELAY_SECONDS,
     CONNECT_RETRY_DELAYS_SECONDS,
     AutomationRuleDetail,
@@ -3172,6 +3173,18 @@ def _apply_connect_update(
         if current is None:
             raise RuntimeError("Connect job disappeared before its status could persist")
         if current.status == update.status:
+            if (
+                current.status == "completed"
+                and current.capability_id == "certificate.extract"
+                and isinstance(update, connect.CapabilityJobUpdate)
+                and update.result is not None
+            ):
+                return store.reconcile_certificate_completed_replay(
+                    job_id=update.job_id,
+                    provider_app_id=update.provider_app_id,
+                    provider_instance_id=update.provider_instance_id,
+                    result=update.result.store_dict(),
+                )
             return current
         if update.status in active_rank and (
             current.status in {"completed", "failed"}
@@ -4646,6 +4659,13 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
     for fire in runtime.store.automation_fires_in_states(
         ("submitted", "entitlement_paused"), limit=limit
     ):
+        current_fire = runtime.store.automation_fire(fire.fire_id)
+        if current_fire is None or current_fire.state not in {
+            "submitted",
+            "entitlement_paused",
+        }:
+            continue
+        fire = current_fire
         if fire.job_id is None:
             if fire.state == "entitlement_paused":
                 runtime.store.touch_automation_fire(
@@ -4684,6 +4704,9 @@ def _settle_submitted_automation_fires(runtime: Runtime, *, limit: int) -> None:
                 )
             continue
         if job.status == "completed":
+            if job.capability_id == CERTIFICATE_CAPABILITY_ID:
+                runtime.store.reconcile_certificate_completed_join(job_id=job.job_id)
+                continue
             runtime.store.transition_automation_fire(
                 fire_id=fire.fire_id,
                 expected_state=fire.state,
@@ -5614,6 +5637,27 @@ def _notifications_ack(request: dict[str, object]) -> dict[str, object]:
     return {"status": status}
 
 
+def _certificate_expiry_ledger_list(
+    request: dict[str, object],
+) -> dict[str, object]:
+    payload = _payload(request, {"today", "limit"})
+    today = payload.get("today")
+    if not isinstance(today, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", today) is None:
+        raise ApiError("invalid_request", "today must be a valid YYYY-MM-DD date")
+    try:
+        date.fromisoformat(today)
+    except ValueError as exc:
+        raise ApiError("invalid_request", "today must be a valid YYYY-MM-DD date") from exc
+    limit = _bounded_limit(payload, default=100)
+    runtime = _runtime(request)
+    return {
+        "items": runtime.store.list_certificate_expiry_ledger(
+            today=today,
+            limit=limit,
+        )
+    }
+
+
 OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "analysis.requeue": _analysis_requeue,
     "automation.fire.decide": _automation_fire_decide,
@@ -5635,6 +5679,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "calendar.write.disconnect": _calendar_write_disconnect,
     "calendar.write.status": _calendar_write_status,
     "calendar.automation.decide": _calendar_automation_decide,
+    "certificate.expiry_ledger.list": _certificate_expiry_ledger_list,
     "config.initialize": _config_initialize,
     "connect.attachment.capabilities": _connect_attachment_capabilities,
     "connect.attachment.invoke": _connect_attachment_invoke,
