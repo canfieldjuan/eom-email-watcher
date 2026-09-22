@@ -344,6 +344,113 @@ def test_unbound_smoke_failure_does_not_render_state_lock_or_child_stderr(
     assert "failure at" not in str(failure.value)
 
 
+def test_packaged_smoke_reports_validated_failure_code_without_private_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    private_canary = "/private/CONFIG_PATH_CANARY/config.toml"
+    response = {
+        "protocol": 1,
+        "operation": "config.initialize",
+        "ok": False,
+        "error": {
+            "code": "configuration_error",
+            "message": private_canary,
+        },
+    }
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout=json.dumps(response),
+            stderr=f"failure at {private_canary}",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    rendered = str(failure.value)
+    assert "configuration_error" in rendered
+    assert private_canary not in rendered
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"protocol": 1, "operation": "config.initialize", "ok": False,
+         "error": {"code": "private_token_canary", "message": "secret"}},
+        {"protocol": 1, "operation": "watcher.check", "ok": False,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": 1, "operation": "config.initialize", "ok": True,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": True, "operation": "config.initialize", "ok": False,
+         "error": {"code": "configuration_error", "message": "secret"}},
+        {"protocol": 1, "operation": "config.initialize", "ok": False},
+    ],
+)
+def test_packaged_smoke_rejects_untrusted_failure_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+) -> None:
+    binary = tmp_path / "engine"
+    binary.write_bytes(b"engine")
+    monkeypatch.setattr(
+        smoke_packaged_engine.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[str(binary)],
+            returncode=2,
+            stdout=json.dumps(response),
+            stderr="private_token_canary secret",
+        ),
+    )
+
+    with pytest.raises(smoke_packaged_engine.PackagedEngineSmokeError) as failure:
+        smoke_packaged_engine._request(
+            binary,
+            config_path=tmp_path / "config.toml",
+            operation="config.initialize",
+            payload={},
+            working_directory=tmp_path,
+            environment={},
+        )
+
+    assert str(failure.value).endswith("diagnostic omitted")
+    assert "private_token_canary" not in str(failure.value)
+
+
+def test_packaged_smoke_failure_code_has_bounded_output(
+) -> None:
+    response = json.dumps(
+        {
+            "protocol": 1,
+            "operation": "config.initialize",
+            "ok": False,
+            "error": {"code": "configuration_error"},
+        }
+    )
+
+    assert smoke_packaged_engine._public_failure_code(
+        response.ljust(4096), "config.initialize"
+    ) == "configuration_error"
+    assert smoke_packaged_engine._public_failure_code(
+        response.ljust(4097), "config.initialize"
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("target_triple", "suffix"),
     [

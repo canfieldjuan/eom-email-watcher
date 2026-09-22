@@ -674,6 +674,34 @@ An extracted sidecar test is useful deterministic evidence, but it does not
 replace the installed UI click, restart, shared-config systemd recovery, file
 mode, and journal checks above.
 
+## Exact-head Windows package failure investigation
+
+Root cause presently proven: the Windows package job at head
+`423756727a723620cb32d3db59788e062914d398` reaches the packaged
+`config.initialize` request and exits 2, but the smoke probe discards the
+structured response and child diagnostic. The underlying initialization
+failure is not yet determined. This is an observability defect in the release
+gate, not permission to bypass or weaken it.
+
+Required change surface: `scripts/smoke_packaged_engine.py` may report only a
+bounded, validated engine error code from a failed v1 response. Its adjacent
+tests in `tests/test_desktop_packaging.py` must prove that a valid code is
+visible and malformed output, paths, token values, and stderr remain hidden.
+The next exact-head Windows job must supply the failure class before any
+runtime fix is chosen. If it cannot, record that limitation and keep the job
+red.
+
+Explicit non-scope: do not change initialization semantics, the engine API,
+configuration storage, Windows publication, ntfy consent, dependencies, or
+the CI admission gate merely to make the smoke pass. The failed operation and
+its exit status remain a failure.
+
+Verification: declare a fail-first test where a packaged engine returns a
+nonzero exit and a valid v1 `configuration_error` envelope. It must currently
+fail because the error code is omitted. After the diagnostic fix, run the
+focused packaging test file and Ruff lint; the exact-head Windows package job
+is the platform proof.
+
 ## Non-goals
 
 - weakening or bypassing the existing literal-`true` startup guard;

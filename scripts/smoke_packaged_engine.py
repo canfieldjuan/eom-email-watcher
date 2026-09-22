@@ -15,10 +15,41 @@ PROTOCOL_VERSION = 1
 ENGINE_TIMEOUT_SECONDS = 90
 EXPECTED_ENTITLEMENT_STATES = ("authority_unavailable", "missing")
 EXPECTED_MAIL_PROVIDERS = ("gmail", "microsoft365")
+PUBLIC_FAILURE_CODES = frozenset(
+    {
+        "configuration_error",
+        "conflict",
+        "internal_error",
+        "invalid_request",
+        "runtime_error",
+        "unsupported_operation",
+        "unsupported_protocol",
+    }
+)
 
 
 class PackagedEngineSmokeError(RuntimeError):
     pass
+
+
+def _public_failure_code(output: str, operation: str) -> str | None:
+    if len(output) > 4096:
+        return None
+    try:
+        response = json.loads(output)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        return None
+    if (
+        not isinstance(response, dict)
+        or type(response.get("protocol")) is not int
+        or response["protocol"] != PROTOCOL_VERSION
+        or response.get("operation") != operation
+        or response.get("ok") is not False
+        or not isinstance(response.get("error"), dict)
+    ):
+        return None
+    code = response["error"].get("code")
+    return code if isinstance(code, str) and code in PUBLIC_FAILURE_CODES else None
 
 
 def _request(
@@ -49,8 +80,10 @@ def _request(
         timeout=ENGINE_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
+        failure_code = _public_failure_code(result.stdout, operation)
+        detail = f"engine code {failure_code}" if failure_code else "diagnostic omitted"
         raise PackagedEngineSmokeError(
-            f"Packaged engine {operation} exited {result.returncode}: diagnostic omitted"
+            f"Packaged engine {operation} exited {result.returncode}: {detail}"
         )
     try:
         response = json.loads(result.stdout)
