@@ -7426,7 +7426,7 @@ class Store:
                     _persist_certificate_projection(db, job=job, result=result, stamp=stamp)
                 except CertificateResultConflict:
                     outcome = "CERTIFICATE_RESULT_CONFLICT"
-                except (CertificateResultInvalid, RuntimeError, ValueError):
+                except (CertificateResultInvalid, ValueError):
                     outcome = "CERTIFICATE_RESULT_INVALID"
 
             if outcome == "valid":

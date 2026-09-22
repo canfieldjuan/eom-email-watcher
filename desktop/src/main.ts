@@ -3100,6 +3100,7 @@ function setConfigInitializationBusy(busy: boolean): void {
 function setConfiguredNavigation(enabled: boolean): void {
   inboxTab.disabled = !enabled;
   watchlistTab.disabled = !enabled;
+  expiryLedgerTab.disabled = !enabled;
   healthTab.disabled = !enabled;
 }
 

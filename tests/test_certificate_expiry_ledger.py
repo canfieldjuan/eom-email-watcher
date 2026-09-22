@@ -489,6 +489,54 @@ def test_valid_completed_certificate_completes_a_later_joined_fire(
         assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
 
 
+def test_incomplete_existing_projection_keeps_a_later_join_retryable(tmp_path: Path) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fires = _certificate_pending_fires(runtime.store, count=2)
+    first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
+    job_id = first_attempt.dispatch_request_id
+    _certificate_job(runtime.store, job_id)
+    runtime.store.transition_automation_fire(
+        fire_id=fires[0].fire_id,
+        expected_state=fires[0].state,
+        expected_version=fires[0].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id="invoice-processor",
+        provider_instance_id=INSTANCE_A,
+        result=_result(_record()),
+    )
+    with runtime.store.connection() as db:
+        db.execute(
+            """DELETE FROM certificate_policy_rows
+            WHERE certificate_id = (
+                SELECT certificate_id FROM certificate_records WHERE connect_job_id = ?
+            ) AND ordinal = 0""",
+            (job_id,),
+        )
+    submitted = runtime.store.transition_automation_fire(
+        fire_id=fires[1].fire_id,
+        expected_state=fires[1].state,
+        expected_version=fires[1].state_version,
+        next_state="submitted",
+        reason="connect_admitted",
+        job_id=job_id,
+    )
+
+    with pytest.raises(RuntimeError, match="projection is incomplete"):
+        runtime.store.reconcile_certificate_completed_join(job_id=job_id)
+
+    retryable = runtime.store.automation_fire(submitted.fire_id)
+    assert retryable is not None
+    assert retryable.state == "submitted"
+    assert retryable.reason == "connect_admitted"
+
+
 def test_conflicting_terminal_replay_fails_fire_without_replacing_evidence(tmp_path: Path) -> None:
     _, runtime = seeded_runtime(tmp_path)
     fire, job_id = _certificate_fire_job(runtime.store)
