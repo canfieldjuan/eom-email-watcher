@@ -4,12 +4,13 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    AdmissionErrorObserver, AdmissionToken, CalendarConsentProfile, CalendarConsentStatus,
-    CalendarDecisionResult, CancellationToken, CheckResult, ConfigInitialization,
-    ConfigInitializationFailureClass, ConnectCapabilities, ConnectCapabilityRef,
-    ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView, ConnectProviderIdentity,
-    Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus, InboxPage, InboxQuery,
-    MailAccountResult, MailAccounts, MailServerConnection, NtfyDisclosureStatus, WatchedSender,
+    AdmissionErrorObserver, AdmissionLease, AdmissionToken, CalendarConsentProfile,
+    CalendarConsentStatus, CalendarDecisionResult, CancellationToken, CheckResult,
+    ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
+    ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
+    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization, HealthStatus,
+    InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
+    NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -282,28 +283,40 @@ impl ConfigAdmissionUpdate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigInitializationIntent {
+    desktop_initialization_receipt: String,
     timezone: String,
     model_base_url: String,
     model_name: String,
 }
 
 impl ConfigInitializationIntent {
-    fn new(timezone: String, model_base_url: String, model_name: String) -> Self {
+    fn new(
+        timezone: String,
+        model_base_url: String,
+        model_name: String,
+        desktop_initialization_receipt: String,
+    ) -> Self {
         Self {
+            desktop_initialization_receipt,
             timezone,
             model_base_url,
             model_name,
         }
     }
 
-    fn verify(&self, settings: &EngineSettings) -> Result<(), EngineError> {
+    fn verify(
+        &self,
+        settings: &EngineSettings,
+        desktop_initialization_receipt: Option<&str>,
+    ) -> Result<(), EngineError> {
         let matches = settings.timezone == self.timezone.trim()
             && settings.local_model.endpoint == self.model_base_url.trim_end_matches('/')
             && settings.local_model.model == self.model_name.trim()
             && settings.local_model.editable
             && settings.notifications_enabled
             && settings.poll_interval_minutes == 120
-            && settings.retention_days == 180;
+            && settings.retention_days == 180
+            && desktop_initialization_receipt == Some(self.desktop_initialization_receipt.as_str());
         if matches {
             Ok(())
         } else {
@@ -316,21 +329,52 @@ impl ConfigInitializationIntent {
 }
 
 enum InitializationAdmissionExpectation {
-    Created(EngineSettings),
+    Created {
+        settings: EngineSettings,
+        desktop_initialization_receipt: String,
+    },
     OutcomeUnknown(ConfigInitializationIntent),
 }
 
 impl InitializationAdmissionExpectation {
-    fn verify(&self, settings: &EngineSettings) -> Result<(), EngineError> {
+    fn verify(
+        &self,
+        settings: &EngineSettings,
+        desktop_initialization_receipt: Option<&str>,
+    ) -> Result<(), EngineError> {
         match self {
-            Self::Created(created) if created == settings => Ok(()),
-            Self::Created(_) => Err(EngineError::host(
+            Self::Created {
+                settings: created,
+                desktop_initialization_receipt: created_receipt,
+            } if created == settings
+                && desktop_initialization_receipt == Some(created_receipt.as_str()) =>
+            {
+                Ok(())
+            }
+            Self::Created { .. } => Err(EngineError::host(
                 "conflict",
                 "Watcher configuration changed after initialization",
             )),
-            Self::OutcomeUnknown(intent) => intent.verify(settings),
+            Self::OutcomeUnknown(intent) => intent.verify(settings, desktop_initialization_receipt),
         }
     }
+}
+
+fn new_desktop_initialization_receipt() -> Result<String, EngineError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| {
+        EngineError::host(
+            "host_error",
+            "Desktop could not create a configuration initialization receipt",
+        )
+    })?;
+    let mut receipt = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        receipt.push(HEX[(byte >> 4) as usize] as char);
+        receipt.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(receipt)
 }
 
 type AdmissionEventSink = Arc<dyn Fn(ConfigAdmissionUpdate) + Send + Sync + 'static>;
@@ -453,6 +497,7 @@ fn run_initialization_admission_attempt<W>(
 
 struct AdmissionWorkers {
     admission_engine: Engine,
+    admission_lease: AdmissionLease,
     admission_token: AdmissionToken,
     observer: AdmissionErrorObserver,
     cancellation: CancellationToken,
@@ -620,7 +665,7 @@ impl AdmissionWorkerSet for AdmissionWorkers {
 
     fn begin_revocation(&self) {
         self.admission_engine
-            .clear_admission_binding(&self.admission_token);
+            .clear_admission_binding(&self.admission_lease);
         self.cancellation.cancel();
         self.startup_delivery.signal_stop();
         self.scheduler.signal_stop();
@@ -628,8 +673,11 @@ impl AdmissionWorkerSet for AdmissionWorkers {
     }
 
     fn activate(&self) {
-        self.admission_engine
-            .install_admission_binding(self.admission_token.clone(), Arc::clone(&self.observer));
+        self.admission_engine.install_admission_binding(
+            self.admission_lease.clone(),
+            self.admission_token.clone(),
+            Arc::clone(&self.observer),
+        );
         self.connect_queue.activate();
         self.scheduler.activate();
         self.startup_delivery.activate();
@@ -1161,9 +1209,16 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
                             "Watcher engine did not confirm configuration creation",
                         ));
                     }
-                    intent.verify(&initialization.settings)?;
+                    intent.verify(
+                        &initialization.settings,
+                        Some(&initialization.desktop_initialization_receipt),
+                    )?;
                     (
-                        InitializationAdmissionExpectation::Created(initialization.settings),
+                        InitializationAdmissionExpectation::Created {
+                            settings: initialization.settings,
+                            desktop_initialization_receipt: initialization
+                                .desktop_initialization_receipt,
+                        },
                         None,
                     )
                 }
@@ -1270,7 +1325,10 @@ fn stage_admitted_workers(
 ) -> Result<AdmissionWorkers, EngineError> {
     let snapshot = engine.admission_snapshot()?;
     if let Some(expectation) = expectation {
-        expectation.verify(&snapshot.settings)?;
+        expectation.verify(
+            &snapshot.settings,
+            snapshot.desktop_initialization_receipt.as_deref(),
+        )?;
     }
     let settings = snapshot.settings;
     let cancellation = CancellationToken::new();
@@ -1324,6 +1382,7 @@ fn stage_admitted_workers(
     };
     Ok(AdmissionWorkers {
         admission_engine: engine.clone(),
+        admission_lease: AdmissionLease::new(),
         admission_token: snapshot.token,
         observer,
         cancellation,
@@ -1358,14 +1417,23 @@ impl AdmissionCoordinator<AdmissionWorkers> {
         model_name: String,
     ) -> Result<ConfigAdmissionUpdate, EngineError> {
         let observer = self.engine_error_observer();
+        let desktop_initialization_receipt = new_desktop_initialization_receipt()?;
         let intent = ConfigInitializationIntent::new(
             timezone.clone(),
             model_base_url.clone(),
             model_name.clone(),
+            desktop_initialization_receipt.clone(),
         );
         let transition = self.initialize_with(
             intent,
-            || engine.initialize_config(timezone, model_base_url, model_name),
+            || {
+                engine.initialize_config(
+                    timezone,
+                    model_base_url,
+                    model_name,
+                    desktop_initialization_receipt,
+                )
+            },
             || engine.ntfy_disclosure_status(),
             |expectation| {
                 stage_admitted_workers(app, engine, delivery, observer, Some(expectation))
@@ -2482,6 +2550,7 @@ esac"#,
             " UTC ".into(),
             "http://127.0.0.1:8080/v1/".into(),
             " local-model ".into(),
+            "0123456789abcdef0123456789abcdef".into(),
         );
         let observed = initialization_settings("UTC", "http://127.0.0.1:8080/v1", "local-model");
 
@@ -2499,7 +2568,7 @@ esac"#,
                 },
                 || Ok(NtfyDisclosureStatus::NormalAdmission),
                 |expectation| {
-                    expectation.verify(&observed)?;
+                    expectation.verify(&observed, Some("0123456789abcdef0123456789abcdef"))?;
                     Ok(ProbeAdmissionWorkers {
                         queue_activations,
                         poll_activations,
@@ -2514,6 +2583,36 @@ esac"#,
     }
 
     #[test]
+    fn outcome_unknown_initialization_never_relabels_matching_preexisting_config() {
+        let admission = AdmissionCoordinator::<()>::new();
+        set_missing(&admission);
+        let observed = initialization_settings("UTC", "http://127.0.0.1:8080/v1", "local-model");
+
+        let error = admission
+            .initialize_with(
+                ConfigInitializationIntent::new(
+                    "UTC".into(),
+                    "http://127.0.0.1:8080/v1".into(),
+                    "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
+                ),
+                || Err(EngineError::host("outcome_unknown", "reply lost")),
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                |expectation| {
+                    expectation.verify(&observed, Some("fedcba9876543210fedcba9876543210"))?;
+                    Ok(())
+                },
+            )
+            .expect_err("matching settings do not prove this request created the config");
+
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            admission.require_admitted().unwrap_err().code,
+            "configuration_not_admitted"
+        );
+    }
+
+    #[test]
     fn definitive_initialization_conflict_never_relabels_preexisting_config() {
         let admission = AdmissionCoordinator::<()>::new();
         set_missing(&admission);
@@ -2523,6 +2622,7 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 ),
                 || {
                     Err(EngineError::host(
@@ -2555,11 +2655,12 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 ),
                 || Err(EngineError::host("outcome_unknown", "reply lost")),
                 || Ok(NtfyDisclosureStatus::NormalAdmission),
                 |expectation| {
-                    expectation.verify(&observed)?;
+                    expectation.verify(&observed, Some("0123456789abcdef0123456789abcdef"))?;
                     Ok(())
                 },
             )
@@ -2587,6 +2688,7 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 ),
                 || panic!("mutation generation must not invoke initialization"),
                 || panic!("mutation generation must not inspect"),
@@ -2639,16 +2741,18 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 ),
                 || {
                     Ok(ConfigInitialization {
                         created: true,
+                        desktop_initialization_receipt: "0123456789abcdef0123456789abcdef".into(),
                         settings: settings.clone(),
                     })
                 },
                 || Ok(NtfyDisclosureStatus::NormalAdmission),
                 |expectation| {
-                    expectation.verify(&settings)?;
+                    expectation.verify(&settings, Some("0123456789abcdef0123456789abcdef"))?;
                     Ok(StaleInitializationWorkers {
                         activations: Arc::clone(&activations),
                         drops: Arc::clone(&drops),
@@ -2736,6 +2840,7 @@ esac"#,
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
             admission_engine: inert_admission_engine(),
+            admission_lease: AdmissionLease::new(),
             admission_token: inert_admission_token(),
             observer: inert_admission_observer(),
             cancellation,
@@ -2871,6 +2976,7 @@ esac"#,
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
             admission_engine: inert_admission_engine(),
+            admission_lease: AdmissionLease::new(),
             admission_token: inert_admission_token(),
             observer: inert_admission_observer(),
             cancellation,
@@ -2943,6 +3049,7 @@ esac"#,
         let startup_probe = startup_delivery.clone();
         let workers = AdmissionWorkers {
             admission_engine: inert_admission_engine(),
+            admission_lease: AdmissionLease::new(),
             admission_token: inert_admission_token(),
             observer: inert_admission_observer(),
             cancellation: cancellation.clone(),
@@ -3304,7 +3411,11 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
             ],
             "unused.toml".into(),
         );
-        engine.install_admission_binding(token, admission.engine_error_observer());
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            token,
+            admission.engine_error_observer(),
+        );
 
         assert_eq!(
             engine

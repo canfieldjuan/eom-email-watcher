@@ -33,6 +33,7 @@ DEFAULT_RETENTION_DAYS = 180
 MIN_RETENTION_DAYS = 1
 MAX_RETENTION_DAYS = 3650
 NTFY_TOPIC_RE = re.compile(r"^[-_A-Za-z0-9]{20,64}$")
+INITIALIZATION_RECEIPT_RE = re.compile(r"^[0-9a-f]{32}$")
 DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 GATEWAY_MODEL_LABEL = "Managed by inference gateway"
 MUTABLE_DESKTOP_SETTINGS = frozenset(
@@ -143,6 +144,7 @@ class Config:
     ntfy_url: str
     ntfy_content_disclosure_acknowledged: bool
     senders: tuple[Sender, ...]
+    desktop_initialization_receipt: str | None = None
 
     @property
     def allowlist(self) -> frozenset[str]:
@@ -459,6 +461,12 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
             "ntfy_topic requires ntfy_content_disclosure_acknowledged = true "
             "because ntfy receives email-derived content"
         )
+    raw_initialization_receipt = data.get("desktop_initialization_receipt")
+    if raw_initialization_receipt is not None and (
+        not isinstance(raw_initialization_receipt, str)
+        or INITIALIZATION_RECEIPT_RE.fullmatch(raw_initialization_receipt) is None
+    ):
+        raise ConfigError("desktop_initialization_receipt is invalid")
 
     return Config(
         path=config_path,
@@ -506,6 +514,7 @@ def _load_config_bytes(content: bytes, config_path: Path) -> Config:
         ntfy_url=ntfy_url,
         ntfy_content_disclosure_acknowledged=raw_ntfy_disclosure,
         senders=tuple(senders),
+        desktop_initialization_receipt=raw_initialization_receipt,
     )
 
 
@@ -3842,6 +3851,7 @@ def initialize_config(
     timezone: str,
     model_base_url: str,
     model_name: str,
+    desktop_initialization_receipt: str | None = None,
 ) -> Config:
     normalized_timezone = timezone.strip()
     if not normalized_timezone:
@@ -3860,6 +3870,15 @@ def initialize_config(
         not character.isprintable() for character in normalized_model_name
     ):
         raise InvalidConfigInitializationError("model_name must be a non-empty printable string")
+    initialization_receipt = (
+        secrets.token_hex(16)
+        if desktop_initialization_receipt is None
+        else desktop_initialization_receipt
+    )
+    if INITIALIZATION_RECEIPT_RE.fullmatch(initialization_receipt) is None:
+        raise InvalidConfigInitializationError(
+            "desktop_initialization_receipt must be 32 lowercase hexadecimal characters"
+        )
 
     initial = document()
     initial["timezone"] = normalized_timezone
@@ -3870,6 +3889,7 @@ def initialize_config(
     initial["model_name"] = normalized_model_name
     initial["model_require_auth"] = False
     initial["notifications_enabled"] = True
+    initial["desktop_initialization_receipt"] = initialization_receipt
     content = dumps(initial).encode("utf-8")
 
     if os.name != "posix":

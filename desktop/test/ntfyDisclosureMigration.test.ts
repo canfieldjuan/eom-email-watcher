@@ -270,7 +270,14 @@ test("scheduler shutdown cancellation reaches queue, delivery, and engine childr
   assert.match(engineSource, /struct CancellationRegistration/);
   assert.match(engineSource, /wait_for_registrations/);
   assert.match(engineSource, /with_cancellation/);
-  assert.match(engineSource, /cancellation\.is_cancelled\(\)[\s\S]*child\.terminate\(\)/);
+  assert.match(
+    engineSource,
+    /fn cancellation_requested[\s\S]*iter\(\)\.any\(CancellationToken::is_cancelled\)/,
+  );
+  assert.match(
+    engineSource,
+    /cancellation_requested\(&self\.cancellations\)[\s\S]*child\.terminate\(\)/,
+  );
   assert.match(libSource, /self\.cancellation\.cancel\(\)/);
   assert.match(schedulerSource, /pump_connect_queue/);
   assert.match(schedulerSource, /check_and_deliver_with_cancellation/);

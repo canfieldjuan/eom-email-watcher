@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -869,6 +870,8 @@ def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> No
 
     assert response["ok"] is True
     assert response["data"]["created"] is True
+    receipt = response["data"]["desktop_initialization_receipt"]
+    assert re.fullmatch(r"[0-9a-f]{32}", receipt)
     assert response["data"]["settings"]["timezone"] == "UTC"
     assert response["data"]["settings"]["local_model"] == {
         "authentication_required": False,
@@ -878,10 +881,38 @@ def test_config_initialize_creates_safe_first_run_contract(tmp_path: Path) -> No
         "timeout_seconds": 60.0,
         "token_configured": False,
     }
-    assert load_config(config_path).senders == ()
+    config = load_config(config_path)
+    assert config.senders == ()
+    assert config.desktop_initialization_receipt == receipt
     encoded = json.dumps(response)
     assert "token.json" not in encoded
     assert "send-token.json" not in encoded
+
+
+def test_config_initialize_binds_supplied_receipt_to_admission_snapshot(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    receipt = "0123456789abcdef0123456789abcdef"
+
+    initialized = engine_api._response(
+        request(
+            config_path,
+            "config.initialize",
+            {
+                "desktop_initialization_receipt": receipt,
+                "model_base_url": "http://127.0.0.1:8080/v1",
+                "model_name": "local-model",
+                "timezone": "UTC",
+            },
+        )
+    )
+    snapshot = engine_api._response(
+        request(config_path, "config.admission.snapshot")
+    )
+
+    assert initialized["data"]["desktop_initialization_receipt"] == receipt
+    assert snapshot["data"]["desktop_initialization_receipt"] == receipt
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix mode boundary")
@@ -1029,6 +1060,18 @@ def test_config_initialize_accepts_existing_private_parent(tmp_path: Path) -> No
         },
         {
             "model_base_url": "https://models.example.com/v1",
+            "model_name": "model",
+            "timezone": "UTC",
+        },
+        {
+            "desktop_initialization_receipt": "",
+            "model_base_url": "http://127.0.0.1:8080/v1",
+            "model_name": "model",
+            "timezone": "UTC",
+        },
+        {
+            "desktop_initialization_receipt": "A" * 32,
+            "model_base_url": "http://127.0.0.1:8080/v1",
             "model_name": "model",
             "timezone": "UTC",
         },

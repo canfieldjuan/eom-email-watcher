@@ -5013,20 +5013,45 @@ def _settings_data(config: Config) -> dict[str, object]:
 
 
 def _config_initialize(request: dict[str, object]) -> dict[str, object]:
-    payload = _payload(request, {"model_base_url", "model_name", "timezone"})
+    payload = _payload(
+        request,
+        {
+            "desktop_initialization_receipt",
+            "model_base_url",
+            "model_name",
+            "timezone",
+        },
+    )
     values: dict[str, str] = {}
     for field in ("model_base_url", "model_name", "timezone"):
         value = payload.get(field)
         if not isinstance(value, str):
             raise ApiError("invalid_request", f"{field} must be a string")
         values[field] = value
+    initialization_receipt = payload.get("desktop_initialization_receipt")
+    if initialization_receipt is not None and (
+        not isinstance(initialization_receipt, str)
+        or re.fullmatch(r"[0-9a-f]{32}", initialization_receipt) is None
+    ):
+        raise ApiError(
+            "invalid_request",
+            "desktop_initialization_receipt must be 32 lowercase hexadecimal characters",
+        )
     try:
-        config = initialize_config(_config_path(request), **values)
+        config = initialize_config(
+            _config_path(request),
+            desktop_initialization_receipt=initialization_receipt,
+            **values,
+        )
     except InvalidConfigInitializationError as exc:
         raise ApiError("invalid_request", str(exc)) from exc
     except ConfigAlreadyExistsError as exc:
         raise ApiError("conflict", str(exc)) from exc
-    return {"created": True, "settings": _settings_data(config)}
+    return {
+        "created": True,
+        "desktop_initialization_receipt": config.desktop_initialization_receipt,
+        "settings": _settings_data(config),
+    }
 
 
 def _config_admission_snapshot(request: dict[str, object]) -> dict[str, object]:
@@ -5038,10 +5063,15 @@ def _config_admission_snapshot(request: dict[str, object]) -> dict[str, object]:
             "configuration_error",
             "Configuration admission snapshot is unavailable",
         ) from exc
-    return {
+    response = {
         "settings": _settings_data(snapshot.config),
         "token": snapshot.token,
     }
+    if snapshot.config.desktop_initialization_receipt is not None:
+        response["desktop_initialization_receipt"] = (
+            snapshot.config.desktop_initialization_receipt
+        )
+    return response
 
 
 def _config_admission_compare(request: dict[str, object]) -> dict[str, object]:

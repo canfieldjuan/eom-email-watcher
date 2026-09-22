@@ -41,11 +41,25 @@ use windows_sys::Win32::{
 };
 
 const PROTOCOL_VERSION: u8 = 1;
+const CONFIG_INITIALIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DISCLOSURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const ENGINE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const ENGINE_PIPE_POLL: Duration = Duration::from_millis(10);
 const MAX_ENGINE_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENGINE_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct AdmissionLease(Arc<()>);
+
+impl AdmissionLease {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 pub(crate) trait CancellationParticipant: Send + Sync {
     fn cancel_and_wait(&self);
@@ -161,6 +175,10 @@ impl CancellationToken {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
+}
+
+fn cancellation_requested(cancellations: &[CancellationToken]) -> bool {
+    cancellations.iter().any(CancellationToken::is_cancelled)
 }
 
 fn engine_cancelled() -> EngineError {
@@ -453,7 +471,7 @@ struct EngineChild {
     control: Arc<EngineChildControl>,
     stdout: Option<EnginePipeDrain>,
     stderr: Option<EnginePipeDrain>,
-    _registration: Option<CancellationRegistration>,
+    _registrations: Vec<CancellationRegistration>,
 }
 
 struct DrainedPipe {
@@ -507,12 +525,12 @@ impl EnginePipeDrain {
     fn receive(
         &mut self,
         control: &EngineChildControl,
-        cancellation: Option<&CancellationToken>,
+        cancellations: &[CancellationToken],
         deadline: Option<Instant>,
         abort: &mut Option<EngineOutputAbort>,
     ) -> io::Result<DrainedPipe> {
         let result = loop {
-            if abort.is_none() && cancellation.is_some_and(CancellationToken::is_cancelled) {
+            if abort.is_none() && cancellation_requested(cancellations) {
                 *abort = Some(EngineOutputAbort::Cancelled);
                 control.terminate();
             }
@@ -566,14 +584,17 @@ fn drain_engine_pipe(mut reader: impl Read, limit: usize) -> io::Result<DrainedP
 }
 
 impl EngineChild {
-    fn spawn(command: &mut Command, cancellation: Option<&CancellationToken>) -> io::Result<Self> {
+    fn spawn(command: &mut Command, cancellations: &[CancellationToken]) -> io::Result<Self> {
         let process = EngineChildProcess::spawn(command)?;
         let control = Arc::new(EngineChildControl {
             process: Mutex::new(Some(process)),
         });
-        let registration = cancellation.map(|cancellation| {
-            cancellation.register(Arc::clone(&control) as Arc<dyn CancellationParticipant>)
-        });
+        let registrations = cancellations
+            .iter()
+            .map(|cancellation| {
+                cancellation.register(Arc::clone(&control) as Arc<dyn CancellationParticipant>)
+            })
+            .collect();
         #[cfg(windows)]
         if let Err(error) = control.with_process(EngineChildProcess::resume) {
             control.terminate();
@@ -625,7 +646,7 @@ impl EngineChild {
             control,
             stdout: Some(stdout),
             stderr: Some(stderr),
-            _registration: registration,
+            _registrations: registrations,
         })
     }
 
@@ -646,7 +667,7 @@ impl EngineChild {
     fn collect_output(
         mut self,
         status: ExitStatus,
-        cancellation: Option<&CancellationToken>,
+        cancellations: &[CancellationToken],
         deadline: Option<Instant>,
     ) -> Result<EngineOutput, EngineOutputError> {
         let mut abort = None;
@@ -654,18 +675,18 @@ impl EngineChild {
             .stdout
             .as_mut()
             .ok_or(EngineOutputError::Io)?
-            .receive(&self.control, cancellation, deadline, &mut abort)
+            .receive(&self.control, cancellations, deadline, &mut abort)
             .map_err(|_| EngineOutputError::Io)?;
         let stderr = self
             .stderr
             .as_mut()
             .ok_or(EngineOutputError::Io)?
-            .receive(&self.control, cancellation, deadline, &mut abort)
+            .receive(&self.control, cancellations, deadline, &mut abort)
             .map_err(|_| EngineOutputError::Io)?;
         self.stdout = None;
         self.stderr = None;
 
-        if abort.is_none() && cancellation.is_some_and(CancellationToken::is_cancelled) {
+        if abort.is_none() && cancellation_requested(cancellations) {
             abort = Some(EngineOutputAbort::Cancelled);
             self.control.terminate();
         }
@@ -720,7 +741,7 @@ pub struct Engine {
     mailbox_operation_gate: Arc<Mutex<()>>,
     admission_binding: Arc<Mutex<Option<AdmissionBinding>>>,
     request_timeout: Option<Duration>,
-    cancellation: Option<CancellationToken>,
+    cancellations: Vec<CancellationToken>,
     #[cfg(test)]
     test_environment: Vec<(OsString, OsString)>,
 }
@@ -1284,6 +1305,7 @@ pub(crate) type AdmissionErrorObserver =
 
 #[derive(Clone)]
 struct AdmissionBinding {
+    lease: AdmissionLease,
     token: AdmissionToken,
     observer: AdmissionErrorObserver,
 }
@@ -1305,6 +1327,8 @@ impl AdmissionToken {
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct AdmissionSnapshot {
+    #[serde(default)]
+    pub desktop_initialization_receipt: Option<String>,
     pub settings: EngineSettings,
     pub token: AdmissionToken,
 }
@@ -1317,6 +1341,7 @@ struct AdmissionComparison {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ConfigInitialization {
     pub created: bool,
+    pub desktop_initialization_receipt: String,
     pub settings: EngineSettings,
 }
 
@@ -1476,7 +1501,7 @@ impl Engine {
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
-                cancellation: None,
+                cancellations: Vec::new(),
                 #[cfg(test)]
                 test_environment: Vec::new(),
             });
@@ -1492,7 +1517,7 @@ impl Engine {
                 mailbox_operation_gate: Arc::new(Mutex::new(())),
                 admission_binding: Arc::new(Mutex::new(None)),
                 request_timeout: None,
-                cancellation: None,
+                cancellations: Vec::new(),
                 #[cfg(test)]
                 test_environment: Vec::new(),
             });
@@ -1514,7 +1539,7 @@ impl Engine {
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
-            cancellation: None,
+            cancellations: Vec::new(),
             #[cfg(test)]
             test_environment: Vec::new(),
         })
@@ -1533,7 +1558,7 @@ impl Engine {
             mailbox_operation_gate: Arc::new(Mutex::new(())),
             admission_binding: Arc::new(Mutex::new(None)),
             request_timeout: None,
-            cancellation: None,
+            cancellations: Vec::new(),
             test_environment: Vec::new(),
         }
     }
@@ -1927,22 +1952,29 @@ impl Engine {
 
     pub(crate) fn install_admission_binding(
         &self,
+        lease: AdmissionLease,
         token: AdmissionToken,
         observer: AdmissionErrorObserver,
     ) {
         *self
             .admission_binding
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(AdmissionBinding { token, observer });
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(AdmissionBinding {
+            lease,
+            token,
+            observer,
+        });
     }
 
-    pub(crate) fn clear_admission_binding(&self, token: &AdmissionToken) {
+    pub(crate) fn clear_admission_binding(&self, lease: &AdmissionLease) {
         let mut installed = self
             .admission_binding
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed.as_ref().map(|binding| &binding.token) == Some(token) {
+        if installed
+            .as_ref()
+            .is_some_and(|binding| binding.lease.is_same(lease))
+        {
             *installed = None;
         }
     }
@@ -1991,17 +2023,24 @@ impl Engine {
         timezone: String,
         model_base_url: String,
         model_name: String,
+        desktop_initialization_receipt: String,
     ) -> Result<ConfigInitialization, EngineError> {
         self.request_inner(
             "config.initialize",
             json!({
+                "desktop_initialization_receipt": desktop_initialization_receipt,
                 "model_base_url": model_base_url,
                 "model_name": model_name,
                 "timezone": timezone,
             }),
-            self.request_timeout,
+            Some(self.config_initialization_timeout()),
             EngineRequestCommitRisk::ConfigInitialization,
         )
+    }
+
+    fn config_initialization_timeout(&self) -> Duration {
+        self.request_timeout
+            .unwrap_or(CONFIG_INITIALIZATION_REQUEST_TIMEOUT)
     }
 
     pub fn update_settings(
@@ -2034,16 +2073,12 @@ impl Engine {
 
     pub(crate) fn with_cancellation(&self, cancellation: CancellationToken) -> Self {
         let mut engine = self.clone();
-        engine.cancellation = Some(cancellation);
+        engine.cancellations.push(cancellation);
         engine
     }
 
     fn check_cancellation(&self) -> Result<(), EngineError> {
-        if self
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        if cancellation_requested(&self.cancellations) {
             Err(engine_cancelled())
         } else {
             Ok(())
@@ -2053,7 +2088,7 @@ impl Engine {
     fn mailbox_operation_lock(
         &self,
     ) -> Result<(MutexGuard<'_, ()>, Option<Duration>), EngineError> {
-        if self.request_timeout.is_none() && self.cancellation.is_none() {
+        if self.request_timeout.is_none() && self.cancellations.is_empty() {
             return self
                 .mailbox_operation_gate
                 .lock()
@@ -2260,7 +2295,7 @@ impl Engine {
         command.envs(self.test_environment.iter().cloned());
         #[cfg(unix)]
         command.process_group(0);
-        let child = EngineChild::spawn(&mut command, self.cancellation.as_ref()).map_err(|_| {
+        let child = EngineChild::spawn(&mut command, &self.cancellations).map_err(|_| {
             EngineError::host(
                 "engine_unavailable",
                 "Watcher engine is unavailable; reinstall it or inspect desktop logs",
@@ -2287,9 +2322,7 @@ impl Engine {
         let started = Instant::now();
         let deadline = timeout.and_then(|timeout| started.checked_add(timeout));
         let status = loop {
-            if let Some(cancellation) = self.cancellation.as_ref()
-                && cancellation.is_cancelled()
-            {
+            if cancellation_requested(&self.cancellations) {
                 child.terminate();
                 return Err(commit_risk.map_post_dispatch(engine_cancelled()));
             }
@@ -2316,7 +2349,7 @@ impl Engine {
         };
 
         let output = child
-            .collect_output(status, self.cancellation.as_ref(), deadline)
+            .collect_output(status, &self.cancellations, deadline)
             .map_err(|error| {
                 let error = match error {
                     EngineOutputError::Cancelled => engine_cancelled(),
@@ -2463,7 +2496,7 @@ mod tests {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let child = EngineChild::spawn(&mut command, Some(&cancellation))
+        let child = EngineChild::spawn(&mut command, std::slice::from_ref(&cancellation))
             .expect("spawn child into cancelled registry");
 
         assert!(child.try_wait().expect("inspect cancelled child").is_some());
@@ -2481,8 +2514,8 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        let child =
-            EngineChild::spawn(&mut command, Some(&cancellation)).expect("spawn registered child");
+        let child = EngineChild::spawn(&mut command, std::slice::from_ref(&cancellation))
+            .expect("spawn registered child");
 
         cancellation.cancel();
 
@@ -3366,6 +3399,7 @@ esac"#,
                 "UTC".into(),
                 "http://127.0.0.1:8080/v1".into(),
                 "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
             )
             .expect_err("missing post-dispatch reply has an unknown outcome");
 
@@ -3396,6 +3430,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"config.initialize","error":
                 "UTC".into(),
                 "http://127.0.0.1:8080/v1".into(),
                 "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
             )
             .expect_err("engine conflict is definitive");
 
@@ -3460,7 +3495,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_ho
             identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .into(),
         };
-        engine.install_admission_binding(token.clone(), Arc::new(|_, _| {}));
+        engine.install_admission_binding(AdmissionLease::new(), token.clone(), Arc::new(|_, _| {}));
 
         assert_eq!(
             engine
@@ -3476,6 +3511,93 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_ho
             request["admission_token"],
             serde_json::to_value(token).unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_same_token_cleanup_does_not_clear_new_binding() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"notifications.count_under_host_lock","data":{"count":0}}'"#,
+                ),
+                OsString::from("admission-binding-aba-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let token = AdmissionToken {
+            version: 1,
+            revision: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
+            identity: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+        };
+        let old_lease = AdmissionLease::new();
+        let replacement_lease = AdmissionLease::new();
+        engine.install_admission_binding(old_lease.clone(), token.clone(), Arc::new(|_, _| {}));
+        engine.install_admission_binding(replacement_lease, token.clone(), Arc::new(|_, _| {}));
+
+        engine.clear_admission_binding(&old_lease);
+        assert_eq!(
+            engine
+                .pending_notification_count_under_host_lock()
+                .expect("replacement generation remains bound"),
+            0
+        );
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured request"))
+                .expect("parse captured request");
+        assert_eq!(
+            request["admission_token"],
+            serde_json::to_value(token).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_has_a_bounded_default_deadline() {
+        let engine = Engine::with_command("unused", Vec::new(), PathBuf::from("unused.toml"));
+
+        assert_eq!(
+            engine.config_initialization_timeout(),
+            CONFIG_INITIALIZATION_REQUEST_TIMEOUT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_initialize_timeout_is_outcome_unknown() {
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat >/dev/null
+sleep 2"#,
+                ),
+            ],
+            PathBuf::from("unused.toml"),
+        )
+        .with_request_timeout(Duration::from_millis(100));
+        let started = Instant::now();
+
+        let error = engine
+            .initialize_config(
+                "UTC".into(),
+                "http://127.0.0.1:8080/v1".into(),
+                "local-model".into(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .expect_err("stalled initialization must time out");
+
+        assert_eq!(error.code, "outcome_unknown");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
@@ -3501,6 +3623,7 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         };
         let (observed_sender, observed_receiver) = mpsc::channel();
         engine.install_admission_binding(
+            AdmissionLease::new(),
             token.clone(),
             Arc::new(move |observed_token, error| {
                 observed_sender
@@ -3830,10 +3953,12 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 )
                 .expect("initialize first-run config"),
             ConfigInitialization {
                 created: true,
+                desktop_initialization_receipt: "0123456789abcdef0123456789abcdef".into(),
                 settings: EngineSettings {
                     local_model: LocalModelSettings {
                         editable: true,
@@ -3855,6 +3980,7 @@ esac"#,
                     "UTC".into(),
                     "http://127.0.0.1:8080/v1".into(),
                     "local-model".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
                 )
                 .expect_err("existing config must not be replaced")
                 .code,
@@ -3879,6 +4005,7 @@ model_base_url = "http://127.0.0.1:9/v1"
 model_name = "local-model"
 model_require_auth = false
 notifications_enabled = true
+timezone = "UTC"
 "#,
                 toml_path_literal(&database_path),
                 toml_path_literal(&gmail_credentials_path),
@@ -3901,7 +4028,11 @@ notifications_enabled = true
         engine
             .compare_admission(&snapshot.token)
             .expect("snapshot remains current before guarded work");
-        engine.install_admission_binding(snapshot.token, Arc::new(|_, _| {}));
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            snapshot.token,
+            Arc::new(|_, _| {}),
+        );
 
         let health = engine.health().expect("read engine health");
         let accounts = engine.mail_accounts().expect("read email accounts");
@@ -4030,7 +4161,11 @@ notifications_enabled = true
         engine
             .compare_admission(&refreshed_admission.token)
             .expect("refreshed admission remains current");
-        engine.install_admission_binding(refreshed_admission.token, Arc::new(|_, _| {}));
+        engine.install_admission_binding(
+            AdmissionLease::new(),
+            refreshed_admission.token,
+            Arc::new(|_, _| {}),
+        );
 
         assert_eq!(
             engine.check().expect("inactive check without Gmail"),
