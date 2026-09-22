@@ -80,6 +80,43 @@ def test_packaged_tzdata_supports_default_zone_without_system_database(
         ZoneInfo.clear_cache()
 
 
+def test_non_posix_admission_accepts_same_file_with_stat_representation_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    content = b'model_name = "local-model"\n'
+    path.write_bytes(content)
+    path.chmod(0o600)
+
+    class PathStatView:
+        def __init__(self, original: os.stat_result) -> None:
+            self.original = original
+
+        def __getattr__(self, name: str) -> object:
+            if name == "st_mode":
+                return self.original.st_mode | stat.S_IXUSR
+            if name == "st_uid":
+                return self.original.st_uid + 1
+            return getattr(self.original, name)
+
+    class NonPosixOsProxy:
+        name = "nt"
+
+        def stat(self, target: Path, *args: object, **kwargs: object) -> object:
+            observed = os.stat(target, *args, **kwargs)
+            return PathStatView(observed) if os.fspath(target) == os.fspath(path) else observed
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(os, name)
+
+    monkeypatch.setattr(config_module, "os", NonPosixOsProxy())
+
+    read_path, _identity, read_content = config_module._read_admission_config(path)
+
+    assert read_path == path.resolve()
+    assert read_content == content
+
+
 def test_remote_model_url_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     write_config(path, base_url="https://api.example.com/v1")

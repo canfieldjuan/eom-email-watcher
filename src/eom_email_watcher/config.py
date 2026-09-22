@@ -1071,18 +1071,18 @@ def _read_admission_config(
         opened = os.fstat(file_fd)
         if (
             not _non_posix_admission_file_is_safe(opened)
-            or _safe_file_version(opened) != _safe_file_version(inspected)
+            or _windows_stat_version(opened) != _windows_stat_version(inspected)
         ):
             raise _UnsafeConfigPath
         content = _read_fd_bytes(file_fd)
         completed = os.fstat(file_fd)
         if (
             not _non_posix_admission_file_is_safe(completed)
-            or _safe_file_version(completed) != _safe_file_version(opened)
+            or _windows_stat_version(completed) != _windows_stat_version(opened)
         ):
             raise _UnsafeConfigPath
         current = os.stat(absolute, follow_symlinks=False)
-        if _safe_file_version(current) != _safe_file_version(completed):
+        if _windows_stat_version(current) != _windows_stat_version(completed):
             raise _UnsafeConfigPath
         return absolute, completed, content
     except OSError as exc:

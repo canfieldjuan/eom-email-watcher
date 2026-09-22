@@ -726,6 +726,33 @@ targeted tests, and exact-head CI. Preserve the consent guard, secret-free
 responses, and all unrelated product behavior. The native Windows package
 check remains the final platform proof.
 
+### Exact-head Windows admission-read repair
+
+At head `2d606a1e34c603557f19f6f2a3dd2e5722db59c4`, the
+`windows-operation-lock` job fails while `_read_admission_config` compares
+the opened descriptor with the path inspection. The packaged first-run smoke
+now reports `outcome_unknown` after publication, consistent with its following
+runtime load hitting the same reader. The job does not expose the individual
+stat fields, so the exact mismatching field is not yet proven.
+
+Root cause: the non-POSIX admission reader uses `_safe_file_version`, a
+POSIX-oriented tuple containing mode, uid, and gid, for path-versus-descriptor
+comparisons. The Windows publication reader already has `_windows_stat_version`
+for the platform's stable file identity, link count, size, timestamps, and file
+attributes. A representation difference in POSIX-only stat fields therefore
+rejects an otherwise unchanged Windows file before its bytes can be admitted.
+
+Required change surface: use the existing Windows version comparator for all
+three non-POSIX admission-read comparisons in `config.py`. Keep each regular
+file, single-link, and non-reparse check, the same-descriptor read, and the
+post-read path recheck. Add a fail-first regression in `tests/test_config.py`
+for one safe file whose path and descriptor differ only in POSIX-style mode or
+ownership representation. Re-run the existing same-byte atomic-swap rejection
+tests in `tests/test_ntfy_disclosure_migration.py`, the focused Windows job, and
+the packaged Windows smoke. Do not change POSIX reads, admission tokens,
+consent semantics, the public error envelope, or the package gate. The native
+jobs, not the Linux simulation, decide whether this actually fixes Windows.
+
 Diagnostic-only phase non-scope, superseded for the named current-head repair
 classes above: do not change initialization semantics, the engine API,
 configuration storage, Windows publication, ntfy consent, dependencies, or
