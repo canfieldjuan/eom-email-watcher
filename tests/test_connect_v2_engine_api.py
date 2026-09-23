@@ -1770,6 +1770,9 @@ def test_automation_confirmation_binds_stable_preparation_and_admits_after_decis
     assert projected["state"] == "awaiting_confirmation"
     assert projected["state_version"] == prepared.state_version
     assert projected["prepared_identity_sha256"] == prepared.prepared_identity_sha256
+    inbox_response = engine_api._response(api_request(config_path, "inbox.query", {"limit": 25}))
+    inbox_fire = inbox_response["data"]["items"][0]["attachments"][0]["automation_fires"][0]
+    assert inbox_fire == projected
     identity = json.loads(prepared.prepared_identity_json)
     expected_artifact_id = engine_api._automation_artifact_id(attempt.dispatch_request_id)
     assert identity["input"]["artifact_id"] == expected_artifact_id
@@ -1791,6 +1794,10 @@ def test_automation_confirmation_binds_stable_preparation_and_admits_after_decis
         "state": "pending_dispatch",
         "state_version": prepared.state_version + 1,
     }
+    refreshed_inbox = engine_api._response(api_request(config_path, "inbox.query", {"limit": 25}))
+    refreshed_fire = refreshed_inbox["data"]["items"][0]["attachments"][0]["automation_fires"][0]
+    assert refreshed_fire["state"] == "pending_dispatch"
+    assert refreshed_fire["state_version"] == prepared.state_version + 1
 
     admitted_response = engine_api._response(api_request(config_path, "connect.queue.pump"))
 

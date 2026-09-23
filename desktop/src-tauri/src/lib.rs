@@ -4,14 +4,14 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    AdmissionErrorObserver, AdmissionLease, AdmissionToken, CalendarConsentProfile,
-    CalendarConsentStatus, CalendarDecisionResult, CancellationToken, CertificateExpiryLedger,
-    CheckResult, ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
-    ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
-    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
-    GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
-    HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, WatchedSender,
+    AdmissionErrorObserver, AdmissionLease, AdmissionToken, AutomationDecisionResult,
+    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
+    CertificateExpiryLedger, CheckResult, ConfigInitialization, ConfigInitializationFailureClass,
+    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
+    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
+    GmailAuthorization, GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved,
+    GmailLabelSelectors, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
+    MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -1925,6 +1925,29 @@ async fn calendar_proposal_decide(
 }
 
 #[tauri::command]
+async fn automation_fire_decide(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    fire_id: String,
+    expected_version: i64,
+    prepared_identity_sha256: String,
+    decision: String,
+) -> Result<AutomationDecisionResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.decide_automation_fire(
+            fire_id,
+            expected_version,
+            prepared_identity_sha256,
+            decision,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn gmail_authorize(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2279,6 +2302,7 @@ pub fn run() {
             attachment_capabilities,
             attachment_capability_invoke,
             attachment_open,
+            automation_fire_decide,
             autostart_get,
             autostart_set,
             calendar_consent_connect,

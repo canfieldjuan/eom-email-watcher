@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  canDecideAutomationFire,
+  runAutomationDecision,
+  type AutomationDecisionResult,
+} from "./automationDecision";
+import {
   CALENDAR_CONSENT_PROFILES,
   calendarConsentControls,
   calendarConsentStateLabel,
@@ -971,6 +976,7 @@ let inboxProposalExpiryTimer: number | null = null;
 let connectQueueRefresh: Promise<void> | null = null;
 let connectQueueRefreshAgain = false;
 const inboxDeletionsInFlight = new Set<string>();
+const automationDecisionsInFlight = new Set<string>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
@@ -2167,6 +2173,75 @@ function renderInbox(items: InboxItem[]): void {
       row.append(attachmentDetails, actions);
       for (const result of attachment.capability_results ?? []) {
         renderCapabilityResult(row, result, item.message_id, attachment.part_id);
+      }
+      for (const fire of attachment.automation_fires ?? []) {
+        if (!canDecideAutomationFire(fire)) continue;
+        const panel = document.createElement("div");
+        panel.className = "automation-confirmation";
+        const description = document.createElement("p");
+        description.textContent = `Automation rule ${fire.rule_id} (version ${fire.rule_version}) is waiting for confirmation for ${attachment.filename}. Confirming may run an action in another app.`;
+        const decisions = document.createElement("div");
+        decisions.className = "automation-confirmation-actions";
+        const decline = document.createElement("button");
+        decline.type = "button";
+        decline.className = "secondary";
+        decline.textContent = "Decline automation";
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.textContent = "Confirm automation";
+        const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
+          if (automationDecisionsInFlight.has(fire.fire_id)) return;
+          if (
+            decision === "confirmed" &&
+            !window.confirm(
+              `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
+            )
+          ) return;
+          confirm.disabled = true;
+          decline.disabled = true;
+          const outcome = await runAutomationDecision(
+            fire,
+            decision,
+            automationDecisionsInFlight,
+            (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
+            async () => {
+              const before = inboxRequestGeneration;
+              await loadInbox();
+              if (inboxRequestGeneration === before || inboxStatus.dataset.kind === "error") {
+                throw new Error("Inbox could not refresh");
+              }
+            },
+          );
+          confirm.disabled = false;
+          decline.disabled = false;
+          if (outcome.status === "ignored") return;
+          if (outcome.status === "rejected") {
+            inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
+              ? outcome.refreshed
+                ? "Automation changed before your decision. Review the refreshed inbox before trying again."
+                : "Automation changed before your decision. Refresh Inbox before trying again."
+              : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
+            inboxStatus.dataset.kind = "error";
+          } else if (outcome.result.state === "declined") {
+            inboxStatus.textContent = "Automation declined. No action was submitted.";
+            inboxStatus.dataset.kind = "success";
+          } else if (outcome.result.state === "pending_dispatch") {
+            inboxStatus.textContent = "Automation confirmed and queued for dispatch. The provider action has not completed yet.";
+            inboxStatus.dataset.kind = "success";
+          } else {
+            inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
+            inboxStatus.dataset.kind = "warning";
+          }
+          if (!outcome.refreshed) {
+            inboxStatus.textContent += " Inbox could not refresh; reopen Inbox before another decision.";
+            inboxStatus.dataset.kind = "error";
+          }
+        };
+        decline.addEventListener("click", () => void decide("declined"));
+        confirm.addEventListener("click", () => void decide("confirmed"));
+        decisions.append(decline, confirm);
+        panel.append(description, decisions);
+        row.append(panel);
       }
       attachments.append(row);
     }
