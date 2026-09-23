@@ -2189,6 +2189,13 @@ function renderInbox(items: InboxItem[]): void {
         const confirm = document.createElement("button");
         confirm.type = "button";
         confirm.textContent = "Confirm automation";
+        const refreshDecisionInbox = async (): Promise<void> => {
+          const before = inboxRequestGeneration;
+          await loadInbox();
+          if (inboxRequestGeneration === before || inboxStatus.dataset.kind === "error") {
+            throw new Error("Inbox could not refresh");
+          }
+        };
         const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
           if (automationDecisionsInFlight.has(fire.fire_id)) return;
           if (
@@ -2204,17 +2211,37 @@ function renderInbox(items: InboxItem[]): void {
             decision,
             automationDecisionsInFlight,
             (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
-            async () => {
-              const before = inboxRequestGeneration;
-              await loadInbox();
-              if (inboxRequestGeneration === before || inboxStatus.dataset.kind === "error") {
-                throw new Error("Inbox could not refresh");
-              }
-            },
+            refreshDecisionInbox,
           );
-          confirm.disabled = false;
-          decline.disabled = false;
-          if (outcome.status === "ignored") return;
+          if (outcome.status === "ignored") {
+            confirm.disabled = false;
+            decline.disabled = false;
+            return;
+          }
+          if (!outcome.refreshed) {
+            confirm.disabled = true;
+            decline.disabled = true;
+            const retryRefresh = document.createElement("button");
+            retryRefresh.type = "button";
+            retryRefresh.className = "secondary";
+            retryRefresh.textContent = "Refresh inbox";
+            retryRefresh.addEventListener("click", async () => {
+              retryRefresh.disabled = true;
+              try {
+                await refreshDecisionInbox();
+                inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
+                inboxStatus.dataset.kind = "success";
+              } catch {
+                retryRefresh.disabled = false;
+                inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
+                inboxStatus.dataset.kind = "error";
+              }
+            });
+            decisions.replaceChildren(retryRefresh);
+          } else {
+            confirm.disabled = false;
+            decline.disabled = false;
+          }
           if (outcome.status === "rejected") {
             inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
               ? outcome.refreshed
@@ -2233,7 +2260,7 @@ function renderInbox(items: InboxItem[]): void {
             inboxStatus.dataset.kind = "warning";
           }
           if (!outcome.refreshed) {
-            inboxStatus.textContent += " Inbox could not refresh; reopen Inbox before another decision.";
+            inboxStatus.textContent += " Inbox could not refresh; use Refresh inbox before another decision.";
             inboxStatus.dataset.kind = "error";
           }
         };

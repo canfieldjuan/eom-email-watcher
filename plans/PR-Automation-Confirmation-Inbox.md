@@ -13,6 +13,14 @@ The diff exceeds the 400-line soft cap because this end-to-end UI-to-engine brid
 - Both success and stale/error outcomes refresh the inbox. A stale decision must be shown as a recoverable refresh, not reported as a successful provider action.
 - The engine's atomic decision, dispatch, entitlement, and prepared-identity semantics must not change. The desktop must not directly submit provider work.
 
+### Review-fix contract (PR #179, exact head 0f06179)
+
+- Root cause 1: the native decision bridge persists `pending_dispatch` but never wakes the Connect queue. When the scheduler has no next wake, it blocks on its channel until an unrelated signal. A successful confirmation must signal the queue after the decision returns; decline or failure must not signal it.
+- Root cause 2: after a failed inbox refresh, the old card remains mounted but the decision handler unconditionally re-enables its stale controls. A failed refresh must leave both decisions disabled and offer a retry of the inbox refresh; only a successful refresh may replace that card with current state.
+- Required change surface: `desktop/src-tauri/src/lib.rs`, `desktop/src/main.ts`, focused Rust and desktop tests in those files and `desktop/test/automationDecision.test.ts`. No engine decision, scheduler, database, schema, public API, dependency, or unrelated inbox behavior changes.
+- Assumption: the engine's expected-version and prepared-hash transaction remains the authority for races across windows; the desktop prevents only same-card retries of known-stale state.
+- Verification: fail-first focused desktop source/runner test and Rust wake-routing test; then targeted test reruns, TypeScript build, Rust format, and exact-head CI after push. No broad local suite duplicated from CI.
+
 ## Scope (this PR)
 
 Ownership lane: automation-confirmation-inbox
@@ -22,6 +30,7 @@ Slice phase: operator-visible vertical proof
 1. Add one admission-guarded Tauri bridge for the existing automation decision operation.
 2. Render attachment-scoped confirm/decline controls only for a prepared, awaiting fire, and refresh the inbox after any decision outcome.
 3. Add focused bridge and desktop decision tests for exact identity, confirm, decline, stale error, and double-click suppression.
+4. Wake the Connect queue on successful confirmation, and retain disabled stale controls with a refresh retry when the inbox cannot reload.
 
 ### Files touched
 
@@ -44,6 +53,8 @@ Acceptance criteria:
 3. A second click while the first decision is in flight cannot submit a second request; the async double-click test settles this.
 4. Success and stale/error responses refresh through `loadInbox`; stale/error remains visible and never claims provider work was submitted. The desktop decision tests cover refresh and `main.ts` uses the result only for status.
 5. The existing engine expected-state and prepared-identity checks remain unchanged; `tests/test_connect_v2_engine_api.py` already covers stale hash and replay, and this PR does not touch that engine path.
+6. `desktop/src-tauri/src/lib.rs` wakes the Connect queue only after a decision returns `pending_dispatch`; its focused Rust test covers confirmed, declined, and failed results, while `scheduler.rs`'s `None => receiver.recv()` branch shows why the signal is required.
+7. When `loadInbox` fails after a decision, the old card's Confirm and Decline controls remain disabled and a refresh retry is available; the focused desktop test covers that result and source wiring.
 
 Affected surfaces: desktop inbox attachment card, Tauri engine bridge, existing engine operation.
 
@@ -56,6 +67,8 @@ Reachability proof: `inbox_query` renders an attachment fire in the desktop inbo
 ## Mechanism
 
 The desktop decision runner checks the projected state and hash, reserves the fire ID synchronously, forwards the exact identity to an injected submit function, refreshes after either outcome, and releases its reservation. The Tauri command requires configuration admission and calls the existing engine operation under the mailbox operation gate. The UI never constructs a prepared identity or calls provider dispatch directly.
+
+On successful confirmation, the native command signals the existing Connect queue scheduler after the engine returns `pending_dispatch`; no signal is sent for decline or an error. If inbox refresh fails, the existing card becomes decision-inert and presents only a refresh retry until a fresh projection replaces it.
 
 ## Intentional
 
@@ -73,6 +86,8 @@ Parking predicate: adjacent automation-management UI, presentation polish, and r
 
 Local: `node --test --experimental-strip-types test/automationDecision.test.ts test/ntfyDisclosureMigration.test.ts` (13 passed); `pnpm build` (built); `pnpm build:sidecar` (`packaged-engine-smoke: ok`); `cargo test automation_decision_bridge_forwards_exact_prepared_identity --lib` (1 passed); `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` (passed); `uv run pytest -q tests/test_connect_v2_engine_api.py::test_automation_confirmation_binds_stable_preparation_and_admits_after_decision` (`. [100%]` after the new inbox assertions); `uv run ruff check tests/test_connect_v2_engine_api.py` (`All checks passed!`); `git diff --check` (passed). Browser fixture check could not run because Chrome lacked a usable sandbox and in-app browser control was unavailable; no bypass flag was used. Exact-head CI remains for PR publication.
 
+Review-fix loop: fail-first desktop test returned 6 pass / 1 expected source-branch failure, and fail-first Rust compilation returned E0425 for the missing wake helper. After the fix, the focused desktop pair returned 14 passed; `pnpm build` passed; `cargo test automation_decision_wakes_queue_only_after_confirmation --lib` and `cargo test repeated_queue_wakes_are_coalesced --lib` each returned 1 passed; `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` passed. The four CI jobs were green on the original PR head only; the updated head must be checked separately.
+
 ## Estimated diff size
 
-Final target: 9 files, about +465 / -8. Over the 400-line soft cap for the indivisible bridge and its regression evidence; exact staged count is checked before PR publication.
+Updated PR diff: 9 files, +583 / -8. Over the 400-line soft cap for the indivisible bridge, wake/refresh correction, and regression evidence; exact count is checked before push.

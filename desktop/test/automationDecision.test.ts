@@ -71,6 +71,23 @@ test("stale identity error refreshes and never reports submission", async () => 
   assert.deepEqual(outcome, { status: "rejected", error: stale, refreshed: true });
 });
 
+test("refresh failure preserves the decision result and requires a fresh inbox", async () => {
+  const refreshError = new Error("inbox unavailable");
+  const outcome = await runAutomationDecision(
+    fire,
+    "confirmed",
+    new Set(),
+    async () => ({ fire_id: fire.fire_id, state: "pending_dispatch", state_version: 5 }),
+    async () => { throw refreshError; },
+  );
+  assert.deepEqual(outcome, {
+    status: "submitted",
+    result: { fire_id: fire.fire_id, state: "pending_dispatch", state_version: 5 },
+    refreshed: false,
+    refreshError,
+  });
+});
+
 test("a second click while the first is pending cannot submit twice", async () => {
   let release!: (value: { fire_id: string; state: string; state_version: number }) => void;
   const pending = new Promise<{ fire_id: string; state: string; state_version: number }>((resolve) => {
@@ -96,6 +113,9 @@ test("inbox renders attachment-scoped decisions through the admitted Tauri comma
   assert.match(ui, /runAutomationDecision\(\s*fire,/);
   assert.match(ui, /invoke<AutomationDecisionResult>\("automation_fire_decide", \{ \.\.\.request \}\)/);
   assert.match(ui, /await loadInbox\(\)/);
+  assert.match(ui, /if \(!outcome\.refreshed\) \{[\s\S]*?confirm\.disabled = true;[\s\S]*?decline\.disabled = true;/);
+  assert.match(ui, /retryRefresh\.textContent = "Refresh inbox"/);
+  assert.match(ui, /decisions\.replaceChildren\(retryRefresh\)/);
   assert.match(lib, /async fn automation_fire_decide\([\s\S]*?admission\.require_admitted\(\)\?/);
   assert.match(lib, /\.invoke_handler\(tauri::generate_handler!\[[\s\S]*?automation_fire_decide,/);
 });
