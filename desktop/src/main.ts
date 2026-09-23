@@ -7,7 +7,7 @@ import {
   runAutomationDecision,
   type AutomationDecisionResult,
 } from "./automationDecision";
-import { automationOutcomeStatus } from "./automationOutcome";
+import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
 import {
   CALENDAR_CONSENT_PROFILES,
   calendarConsentControls,
@@ -2180,7 +2180,7 @@ function renderInbox(items: InboxItem[]): void {
       for (const fire of attachment.automation_fires ?? []) {
         const status = document.createElement("p");
         status.className = "automation-outcome";
-        status.textContent = automationOutcomeStatus(fire?.state);
+        status.textContent = `${automationOutcomeIdentity(fire?.rule_id, fire?.rule_version)}: ${automationOutcomeStatus(fire?.state)}`;
         row.append(status);
         if (!fire || !canDecideAutomationFire(fire)) continue;
         const panel = document.createElement("div");

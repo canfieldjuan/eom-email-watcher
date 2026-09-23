@@ -182,7 +182,7 @@ test("inbox renders attachment-scoped decisions through the admitted Tauri comma
   const lib = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   assert.match(ui, /for \(const fire of attachment\.automation_fires \?\? \[\]\)/);
   const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
-  assert.match(panel, /status\.textContent = automationOutcomeStatus\(fire\?\.state\);[\s\S]*row\.append\(status\);[\s\S]*if \(!fire \|\| !canDecideAutomationFire\(fire\)\) continue;/);
+  assert.match(panel, /status\.textContent = `\$\{automationOutcomeIdentity\(fire\?\.rule_id, fire\?\.rule_version\)\}: \$\{automationOutcomeStatus\(fire\?\.state\)\}`;[\s\S]*row\.append\(status\);[\s\S]*if \(!fire \|\| !canDecideAutomationFire\(fire\)\) continue;/);
   assert.doesNotMatch(panel, /fire\.(?:reason|job_id)/);
   assert.match(ui, /runAutomationDecision\(\s*fire,/);
   assert.match(ui, /invoke<AutomationDecisionResult>\("automation_fire_decide", \{ \.\.\.request \}\)/);
