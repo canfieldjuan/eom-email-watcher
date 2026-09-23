@@ -1427,7 +1427,7 @@ def test_automation_entitlement_is_rechecked_after_missing_reconciliation(
 def test_capability_effect_authority_drift_fails_before_provider_post(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, runtime = seeded_runtime(tmp_path)
+    config_path, runtime = seeded_runtime(tmp_path)
     selected, fire, attempt = seed_contract_fire(runtime)
     install_automation_dispatch_fakes(
         monkeypatch,
@@ -1464,6 +1464,12 @@ def test_capability_effect_authority_drift_fails_before_provider_post(
     assert failed_job.error_code == "capability_authority_changed"
     assert failed_fire is not None
     assert failed_fire.state == "failed"
+    inbox_response = engine_api._response(api_request(config_path, "inbox.query", {"limit": 25}))
+    assert inbox_response["ok"] is True
+    inbox_fire = inbox_response["data"]["items"][0]["attachments"][0]["automation_fires"][0]
+    assert inbox_fire["fire_id"] == fire.fire_id
+    assert inbox_fire["state"] == "failed"
+    assert inbox_fire["job_id"] == job.job_id
 
 
 def test_shared_job_deadline_is_extended_once_for_one_entitlement_pause(
@@ -1809,6 +1815,29 @@ def test_automation_confirmation_binds_stable_preparation_and_admits_after_decis
     assert job is not None
     assert job.input_artifact_id == expected_artifact_id
     assert runtime.store.automation_confirmation_matches(admitted)
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type="application/vnd.local-connect.cited-summary+json",
+        display_name="contract-summary.json",
+        byte_size=2,
+        sha256=hashlib.sha256(b"{}").hexdigest(),
+        payload=b"{}",
+    )
+    runtime.store.transition_connect_job(
+        job_id=job.job_id,
+        expected_state="requested",
+        next_state="completed",
+        provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    engine_api._settle_submitted_automation_fires(runtime, limit=25)
+    terminal_response = engine_api._response(api_request(config_path, "inbox.query", {"limit": 25}))
+    assert terminal_response["ok"] is True
+    terminal_fire = terminal_response["data"]["items"][0]["attachments"][0]["automation_fires"][0]
+    assert terminal_fire["fire_id"] == fire.fire_id
+    assert terminal_fire["state"] == "completed"
+    assert terminal_fire["job_id"] == job.job_id
 
 
 def test_automation_confirmation_rejects_live_effect_drift_without_creating_job(
@@ -2626,6 +2655,12 @@ def test_inbox_keeps_completed_automation_result_when_newer_retry_fails(
     completed_fire = runtime.store.automation_fire(fire.fire_id)
     assert completed_fire is not None
     assert completed_fire.state == "completed"
+    inbox_response = engine_api._response(api_request(config_path, "inbox.query", {"limit": 25}))
+    assert inbox_response["ok"] is True
+    inbox_fire = inbox_response["data"]["items"][0]["attachments"][0]["automation_fires"][0]
+    assert inbox_fire["fire_id"] == fire.fire_id
+    assert inbox_fire["state"] == "completed"
+    assert inbox_fire["job_id"] == attempt.dispatch_request_id
 
     _candidate, retry, collision, _content = (
         engine_api._prepare_or_create_generic_connect_job(

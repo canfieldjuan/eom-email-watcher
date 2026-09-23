@@ -727,6 +727,16 @@ select:focus {
   font-size: 0.82rem;
 }
 
+.automation-outcome {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #dce3dd;
+  border-radius: 8px;
+  background: #f8faf7;
+  overflow-wrap: anywhere;
+}
+
 .automation-confirmation {
   grid-column: 1 / -1;
   display: grid;
