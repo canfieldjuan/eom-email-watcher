@@ -4,14 +4,14 @@ mod scheduler;
 
 use delivery::NotificationDelivery;
 use engine::{
-    AdmissionErrorObserver, AdmissionLease, AdmissionToken, CalendarConsentProfile,
-    CalendarConsentStatus, CalendarDecisionResult, CancellationToken, CertificateExpiryLedger,
-    CheckResult, ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
-    ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
-    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
-    GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
-    HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, WatchedSender,
+    AdmissionErrorObserver, AdmissionLease, AdmissionToken, AutomationDecisionResult,
+    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
+    CertificateExpiryLedger, CheckResult, ConfigInitialization, ConfigInitializationFailureClass,
+    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
+    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
+    GmailAuthorization, GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved,
+    GmailLabelSelectors, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
+    MailServerConnection, NtfyDisclosureStatus, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -1924,6 +1924,47 @@ async fn calendar_proposal_decide(
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+fn wake_connect_queue_after_automation_decision(
+    result: Result<AutomationDecisionResult, EngineError>,
+    wake: impl FnOnce(),
+) -> Result<AutomationDecisionResult, EngineError> {
+    if matches!(&result, Ok(decision) if decision.state == "pending_dispatch") {
+        wake();
+    }
+    result
+}
+
+#[tauri::command]
+async fn automation_fire_decide(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    fire_id: String,
+    expected_version: i64,
+    prepared_identity_sha256: String,
+    decision: String,
+) -> Result<AutomationDecisionResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        engine.decide_automation_fire(
+            fire_id,
+            expected_version,
+            prepared_identity_sha256,
+            decision,
+        )
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?;
+    wake_connect_queue_after_automation_decision(result, || {
+        if let Err(error) = admission.wake_connect_queue() {
+            eprintln!(
+                "Connect queue wake after automation confirmation failed ({}): {}",
+                error.code, error.message
+            );
+        }
+    })
+}
+
 #[tauri::command]
 async fn gmail_authorize(
     engine: State<'_, Engine>,
@@ -2279,6 +2320,7 @@ pub fn run() {
             attachment_capabilities,
             attachment_capability_invoke,
             attachment_open,
+            automation_fire_decide,
             autostart_get,
             autostart_set,
             calendar_consent_connect,
@@ -4626,6 +4668,44 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
         assert_eq!(success, Ok("active"));
         assert_eq!(success_wakes, 1);
         assert_eq!(failure, Err("invalid"));
+        assert_eq!(failure_wakes, 0);
+    }
+
+    #[test]
+    fn automation_decision_wakes_queue_only_after_confirmation() {
+        let confirmed = AutomationDecisionResult {
+            fire_id: "fire-1".into(),
+            state: "pending_dispatch".into(),
+            state_version: 5,
+        };
+        let mut confirmed_wakes = 0;
+        let result = wake_connect_queue_after_automation_decision(Ok(confirmed), || {
+            confirmed_wakes += 1;
+        });
+        assert_eq!(
+            result.expect("confirmed decision").state,
+            "pending_dispatch"
+        );
+        assert_eq!(confirmed_wakes, 1);
+
+        let declined = AutomationDecisionResult {
+            fire_id: "fire-2".into(),
+            state: "declined".into(),
+            state_version: 5,
+        };
+        let mut declined_wakes = 0;
+        let result = wake_connect_queue_after_automation_decision(Ok(declined), || {
+            declined_wakes += 1;
+        });
+        assert_eq!(result.expect("declined decision").state, "declined");
+        assert_eq!(declined_wakes, 0);
+
+        let mut failure_wakes = 0;
+        let result = wake_connect_queue_after_automation_decision(
+            Err(EngineError::host("host_error", "decision failed")),
+            || failure_wakes += 1,
+        );
+        assert!(result.is_err());
         assert_eq!(failure_wakes, 0);
     }
 

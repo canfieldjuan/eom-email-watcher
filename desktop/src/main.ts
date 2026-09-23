@@ -2,6 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  canDecideAutomationFire,
+  releaseAutomationRefreshFences,
+  runAutomationDecision,
+  type AutomationDecisionResult,
+} from "./automationDecision";
+import {
   CALENDAR_CONSENT_PROFILES,
   calendarConsentControls,
   calendarConsentStateLabel,
@@ -971,6 +977,8 @@ let inboxProposalExpiryTimer: number | null = null;
 let connectQueueRefresh: Promise<void> | null = null;
 let connectQueueRefreshAgain = false;
 const inboxDeletionsInFlight = new Set<string>();
+const automationDecisionsInFlight = new Set<string>();
+const automationDecisionRefreshRequired = new Map<string, number>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
@@ -2168,6 +2176,117 @@ function renderInbox(items: InboxItem[]): void {
       for (const result of attachment.capability_results ?? []) {
         renderCapabilityResult(row, result, item.message_id, attachment.part_id);
       }
+      for (const fire of attachment.automation_fires ?? []) {
+        if (!canDecideAutomationFire(fire)) continue;
+        const panel = document.createElement("div");
+        panel.className = "automation-confirmation";
+        const description = document.createElement("p");
+        description.textContent = `Automation rule ${fire.rule_id} (version ${fire.rule_version}) is waiting for confirmation for ${attachment.filename}. Confirming may run an action in another app.`;
+        const decisions = document.createElement("div");
+        decisions.className = "automation-confirmation-actions";
+        const decline = document.createElement("button");
+        decline.type = "button";
+        decline.className = "secondary";
+        decline.textContent = "Decline automation";
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.textContent = "Confirm automation";
+        const refreshDecisionInbox = async (): Promise<void> => {
+          const committed = await loadInbox();
+          if (!committed) {
+            throw new Error("Inbox could not refresh");
+          }
+        };
+        const showRefreshRetry = (): void => {
+          const retryRefresh = document.createElement("button");
+          retryRefresh.type = "button";
+          retryRefresh.className = "secondary";
+          retryRefresh.textContent = "Refresh inbox";
+          retryRefresh.addEventListener("click", async () => {
+            retryRefresh.disabled = true;
+            try {
+              await refreshDecisionInbox();
+              inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
+              inboxStatus.dataset.kind = "success";
+            } catch {
+              retryRefresh.disabled = false;
+              inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
+              inboxStatus.dataset.kind = "error";
+            }
+          });
+          decisions.replaceChildren(retryRefresh);
+        };
+        if (automationDecisionRefreshRequired.has(fire.fire_id)) {
+          showRefreshRetry();
+          panel.append(description, decisions);
+          row.append(panel);
+          continue;
+        }
+        if (automationDecisionsInFlight.has(fire.fire_id)) {
+          confirm.disabled = true;
+          decline.disabled = true;
+        }
+        const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
+          if (automationDecisionsInFlight.has(fire.fire_id)) return;
+          if (
+            decision === "confirmed" &&
+            !window.confirm(
+              `Confirm automation rule ${fire.rule_id} for "${attachment.filename}"? This authorizes its prepared action and may change data in another app.`,
+            )
+          ) return;
+          confirm.disabled = true;
+          decline.disabled = true;
+          const outcome = await runAutomationDecision(
+            fire,
+            decision,
+            automationDecisionsInFlight,
+            (request) => invoke<AutomationDecisionResult>("automation_fire_decide", { ...request }),
+            refreshDecisionInbox,
+          );
+          if (outcome.status === "ignored") {
+            confirm.disabled = false;
+            decline.disabled = false;
+            return;
+          }
+          if (!outcome.refreshed) {
+            automationDecisionRefreshRequired.set(fire.fire_id, inboxRequestGeneration);
+            confirm.disabled = true;
+            decline.disabled = true;
+            showRefreshRetry();
+            renderInbox(inboxItems);
+          } else {
+            renderInbox(inboxItems);
+          }
+          if (outcome.status === "rejected") {
+            inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"
+              ? outcome.refreshed
+                ? "Automation changed before your decision. Review the refreshed inbox before trying again."
+                : "Automation changed before your decision. Refresh Inbox before trying again."
+              : `Automation decision was not saved: ${errorMessage(outcome.error)}`;
+            inboxStatus.dataset.kind = "error";
+          } else if (outcome.result.state === "declined") {
+            inboxStatus.textContent = "Automation declined. No action was submitted.";
+            inboxStatus.dataset.kind = "success";
+          } else if (outcome.result.state === "pending_dispatch") {
+            if (!outcome.refreshed) {
+              inboxStatus.textContent = "Automation confirmation saved. The prepared action was queued for dispatch.";
+              inboxStatus.dataset.kind = "success";
+            }
+          } else {
+            inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
+            inboxStatus.dataset.kind = "warning";
+          }
+          if (!outcome.refreshed) {
+            inboxStatus.textContent += " Inbox could not refresh; use Refresh inbox before another decision.";
+            inboxStatus.dataset.kind = "error";
+          }
+        };
+        decline.addEventListener("click", () => void decide("declined"));
+        confirm.addEventListener("click", () => void decide("confirmed"));
+        decisions.append(decline, confirm);
+        panel.append(description, decisions);
+        row.append(panel);
+      }
       attachments.append(row);
     }
 
@@ -2457,10 +2576,10 @@ function inboxStatusLabel(): string {
 async function loadInbox(
   append = false,
   effectScope: MailboxEffectScope | null = null,
-): Promise<void> {
-  if (!mailboxEffectScopeIsCurrent(effectScope)) return;
-  if (inboxMutationInFlight()) return;
-  if (append && !inboxNextCursor) return;
+): Promise<boolean> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return false;
+  if (inboxMutationInFlight()) return false;
+  if (append && !inboxNextCursor) return false;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
   setInboxControlsBusy(true);
@@ -2470,7 +2589,7 @@ async function loadInbox(
       query: { ...activeInboxQuery, cursor },
     });
   } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
     if (!append) {
       inboxNextCursor = null;
       inboxLoadMore.hidden = true;
@@ -2478,9 +2597,9 @@ async function loadInbox(
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
     setInboxControlsBusy(false);
-    return;
+    return false;
   }
-  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
 
   if (!append) {
     attachmentCapabilities.clear();
@@ -2494,11 +2613,14 @@ async function loadInbox(
   inboxNextCursor = page.next_cursor;
   inboxLoadMore.hidden = inboxNextCursor === null;
   renderInbox(inboxItems);
+  if (releaseAutomationRefreshFences(automationDecisionRefreshRequired, generation, append)) {
+    renderInbox(inboxItems);
+  }
   inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities are refreshing.`;
   delete inboxStatus.dataset.kind;
   try {
     const discovery = await loadAttachmentCapabilities(page.items);
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
     }
@@ -2510,7 +2632,7 @@ async function loadInbox(
     inboxStatus.textContent = inboxStatusLabel();
     inboxStatus.dataset.kind = "success";
   } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
     renderInbox(inboxItems);
     inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
     inboxStatus.dataset.kind = "warning";
@@ -2518,6 +2640,7 @@ async function loadInbox(
   if (mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
     setInboxControlsBusy(false);
   }
+  return true;
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {

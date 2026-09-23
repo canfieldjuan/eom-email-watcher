@@ -116,6 +116,7 @@ test("ntfy disclosure native startup gates every config-dependent worker", () =>
     "attachment_capabilities",
     "attachment_capability_invoke",
     "attachment_open",
+    "automation_fire_decide",
     "calendar_consent_connect",
     "calendar_consent_disconnect",
     "calendar_consent_status",

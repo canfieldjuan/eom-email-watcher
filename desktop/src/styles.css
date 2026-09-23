@@ -727,6 +727,31 @@ select:focus {
   font-size: 0.82rem;
 }
 
+.automation-confirmation {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d5aa54;
+  border-radius: 8px;
+  background: #fff4d6;
+}
+
+.automation-confirmation p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.automation-confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.automation-confirmation-actions button {
+  width: auto;
+}
+
 .attachment-details {
   display: grid;
   gap: 2px;

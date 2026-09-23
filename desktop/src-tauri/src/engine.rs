@@ -1069,6 +1069,13 @@ pub struct CalendarDecisionResult {
     pub graph_event_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomationDecisionResult {
+    pub fire_id: String,
+    pub state: String,
+    pub state_version: i64,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxAdmissionKind {
@@ -2104,6 +2111,28 @@ impl Engine {
                 "proposal_version": proposal_version,
                 "run_id": run_id,
                 "state_version": state_version,
+            }),
+        )
+    }
+
+    pub fn decide_automation_fire(
+        &self,
+        fire_id: String,
+        expected_version: i64,
+        prepared_identity_sha256: String,
+        decision: String,
+    ) -> Result<AutomationDecisionResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "automation.fire.decide",
+            json!({
+                "fire_id": fire_id,
+                "expected_version": expected_version,
+                "prepared_identity_sha256": prepared_identity_sha256,
+                "decision": decision,
             }),
         )
     }
@@ -3876,6 +3905,52 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                 "proposal_version": 2,
                 "run_id": "77d9c691-1c91-4e23-8f03-92973e12c385",
                 "state_version": 7
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automation_decision_bridge_forwards_exact_prepared_identity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"request=$(cat)
+printf '%s' "$request" > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"automation.fire.decide","data":{"fire_id":"11111111-1111-4111-8111-111111111111","state":"pending_dispatch","state_version":5}}'"#,
+                ),
+                OsString::from("engine-automation-decision-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+
+        let result = engine
+            .decide_automation_fire(
+                "11111111-1111-4111-8111-111111111111".into(),
+                4,
+                "a".repeat(64),
+                "confirmed".into(),
+            )
+            .expect("decide automation fire through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(&request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+
+        assert_eq!(result.state, "pending_dispatch");
+        assert_eq!(result.state_version, 5);
+        assert_eq!(request["operation"], "automation.fire.decide");
+        assert_eq!(
+            request["payload"],
+            json!({
+                "fire_id": "11111111-1111-4111-8111-111111111111",
+                "expected_version": 4,
+                "prepared_identity_sha256": "a".repeat(64),
+                "decision": "confirmed",
             })
         );
     }
