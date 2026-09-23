@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   canDecideAutomationFire,
+  releaseAutomationRefreshFences,
   runAutomationDecision,
   type AutomationDecisionProjection,
 } from "../src/automationDecision.ts";
@@ -104,6 +105,38 @@ test("decision refresh requires its own committed inbox projection", async () =>
   assert.doesNotMatch(loadInbox.slice(renderPoint), /\breturn(?:;| false;)/);
   assert.match(decisionRefresh, /const committed = await loadInbox\(\);[\s\S]*if \(!committed\) \{/);
   assert.doesNotMatch(decisionRefresh, /inboxRequestGeneration/);
+});
+
+test("refresh fences require a later full committed query", () => {
+  const required = new Map([[fire.fire_id, 5], ["later-fire", 7]]);
+  assert.equal(releaseAutomationRefreshFences(required, 4, false), false);
+  assert.equal(releaseAutomationRefreshFences(required, 5, false), false);
+  assert.equal(releaseAutomationRefreshFences(required, 6, true), false);
+  assert.equal(required.size, 2);
+  assert.equal(releaseAutomationRefreshFences(required, 6, false), true);
+  assert.equal(required.has(fire.fire_id), false);
+  assert.equal(required.has("later-fire"), true);
+  assert.equal(releaseAutomationRefreshFences(required, 7, false), false);
+  assert.equal(releaseAutomationRefreshFences(required, 8, false), true);
+  assert.equal(required.size, 0);
+});
+
+test("rerendered decision controls stay blocked until a later query commits", async () => {
+  const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
+  const loadInbox = ui.slice(ui.indexOf("async function loadInbox("), ui.indexOf("async function refreshLoadedInboxSpan("));
+  assert.match(ui, /const automationDecisionRefreshRequired = new Map<string, number>\(\)/);
+  assert.match(panel, /automationDecisionsInFlight\.has\(fire\.fire_id\)[\s\S]*?confirm\.disabled = true;[\s\S]*?decline\.disabled = true;/);
+  assert.match(panel, /automationDecisionRefreshRequired\.has\(fire\.fire_id\)[\s\S]*?showRefreshRetry\(\)/);
+  assert.match(panel, /automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?renderInbox\(inboxItems\)/);
+  assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*?releaseAutomationRefreshFences\(automationDecisionRefreshRequired, generation, append\)/);
+});
+
+test("a refreshed confirmation does not overwrite current provider status", async () => {
+  const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
+  assert.doesNotMatch(panel, /The provider action has not completed yet/);
+  assert.match(panel, /else if \(outcome\.result\.state === "pending_dispatch"\) \{\s*if \(!outcome\.refreshed\) \{/);
 });
 
 test("a second click while the first is pending cannot submit twice", async () => {

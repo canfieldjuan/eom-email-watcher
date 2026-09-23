@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   canDecideAutomationFire,
+  releaseAutomationRefreshFences,
   runAutomationDecision,
   type AutomationDecisionResult,
 } from "./automationDecision";
@@ -977,6 +978,7 @@ let connectQueueRefresh: Promise<void> | null = null;
 let connectQueueRefreshAgain = false;
 const inboxDeletionsInFlight = new Set<string>();
 const automationDecisionsInFlight = new Set<string>();
+const automationDecisionRefreshRequired = new Map<string, number>();
 let inboxClearInFlight = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
@@ -2195,6 +2197,35 @@ function renderInbox(items: InboxItem[]): void {
             throw new Error("Inbox could not refresh");
           }
         };
+        const showRefreshRetry = (): void => {
+          const retryRefresh = document.createElement("button");
+          retryRefresh.type = "button";
+          retryRefresh.className = "secondary";
+          retryRefresh.textContent = "Refresh inbox";
+          retryRefresh.addEventListener("click", async () => {
+            retryRefresh.disabled = true;
+            try {
+              await refreshDecisionInbox();
+              inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
+              inboxStatus.dataset.kind = "success";
+            } catch {
+              retryRefresh.disabled = false;
+              inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
+              inboxStatus.dataset.kind = "error";
+            }
+          });
+          decisions.replaceChildren(retryRefresh);
+        };
+        if (automationDecisionRefreshRequired.has(fire.fire_id)) {
+          showRefreshRetry();
+          panel.append(description, decisions);
+          row.append(panel);
+          continue;
+        }
+        if (automationDecisionsInFlight.has(fire.fire_id)) {
+          confirm.disabled = true;
+          decline.disabled = true;
+        }
         const decide = async (decision: "confirmed" | "declined"): Promise<void> => {
           if (automationDecisionsInFlight.has(fire.fire_id)) return;
           if (
@@ -2218,25 +2249,11 @@ function renderInbox(items: InboxItem[]): void {
             return;
           }
           if (!outcome.refreshed) {
+            automationDecisionRefreshRequired.set(fire.fire_id, inboxRequestGeneration);
             confirm.disabled = true;
             decline.disabled = true;
-            const retryRefresh = document.createElement("button");
-            retryRefresh.type = "button";
-            retryRefresh.className = "secondary";
-            retryRefresh.textContent = "Refresh inbox";
-            retryRefresh.addEventListener("click", async () => {
-              retryRefresh.disabled = true;
-              try {
-                await refreshDecisionInbox();
-                inboxStatus.textContent = "Inbox refreshed. Review the current automation state.";
-                inboxStatus.dataset.kind = "success";
-              } catch {
-                retryRefresh.disabled = false;
-                inboxStatus.textContent = "Inbox could not refresh. Try again before making another decision.";
-                inboxStatus.dataset.kind = "error";
-              }
-            });
-            decisions.replaceChildren(retryRefresh);
+            showRefreshRetry();
+            renderInbox(inboxItems);
           } else {
             confirm.disabled = false;
             decline.disabled = false;
@@ -2252,8 +2269,10 @@ function renderInbox(items: InboxItem[]): void {
             inboxStatus.textContent = "Automation declined. No action was submitted.";
             inboxStatus.dataset.kind = "success";
           } else if (outcome.result.state === "pending_dispatch") {
-            inboxStatus.textContent = "Automation confirmed and queued for dispatch. The provider action has not completed yet.";
-            inboxStatus.dataset.kind = "success";
+            if (!outcome.refreshed) {
+              inboxStatus.textContent = "Automation confirmation saved. The prepared action was queued for dispatch.";
+              inboxStatus.dataset.kind = "success";
+            }
           } else {
             inboxStatus.textContent = `Automation decision saved with state ${outcome.result.state}.`;
             inboxStatus.dataset.kind = "warning";
@@ -2595,6 +2614,9 @@ async function loadInbox(
   inboxNextCursor = page.next_cursor;
   inboxLoadMore.hidden = inboxNextCursor === null;
   renderInbox(inboxItems);
+  if (releaseAutomationRefreshFences(automationDecisionRefreshRequired, generation, append)) {
+    renderInbox(inboxItems);
+  }
   inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities are refreshing.`;
   delete inboxStatus.dataset.kind;
   try {

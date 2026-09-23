@@ -503,7 +503,7 @@ test("accepted scheduled inbox and health effects are invalidated across overlap
 
 test("scheduled inbox and health consumers retain their effect scope through cleanup", () => {
   const inbox = source.match(
-    /async function loadInbox\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<void> \{([\s\S]*?)\n\}\n\nasync function refreshLoadedInboxSpan/,
+    /async function loadInbox\(\s*append = false,\s*effectScope: MailboxEffectScope \| null = null,\s*\): Promise<boolean> \{([\s\S]*?)\n\}\n\nasync function refreshLoadedInboxSpan/,
   );
   assert.ok(inbox);
   assert.match(inbox[1], /mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)/);

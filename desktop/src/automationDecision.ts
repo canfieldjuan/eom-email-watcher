@@ -26,6 +26,22 @@ export type AutomationDecisionOutcome =
   | { status: "ignored" }
   | (Submission & ({ refreshed: true } | { refreshed: false; refreshError: unknown }));
 
+export function releaseAutomationRefreshFences(
+  required: Map<string, number>,
+  committedGeneration: number,
+  append: boolean,
+): boolean {
+  if (append) return false;
+  let released = false;
+  for (const [fireId, blockedThroughGeneration] of required) {
+    if (committedGeneration > blockedThroughGeneration) {
+      required.delete(fireId);
+      released = true;
+    }
+  }
+  return released;
+}
+
 export function canDecideAutomationFire(fire: AutomationDecisionProjection): boolean {
   return (
     fire.state === "awaiting_confirmation" &&
