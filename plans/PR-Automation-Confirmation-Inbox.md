@@ -17,9 +17,12 @@ The diff exceeds the 400-line soft cap because this end-to-end UI-to-engine brid
 
 - Root cause 1: the native decision bridge persists `pending_dispatch` but never wakes the Connect queue. When the scheduler has no next wake, it blocks on its channel until an unrelated signal. A successful confirmation must signal the queue after the decision returns; decline or failure must not signal it.
 - Root cause 2: after a failed inbox refresh, the old card remains mounted but the decision handler unconditionally re-enables its stale controls. A failed refresh must leave both decisions disabled and offer a retry of the inbox refresh; only a successful refresh may replace that card with current state.
+- Concurrent extension of root cause 2 (exact head `92f47e1`): the decision refresh checks only whether the global request generation changed. A queue-event refresh can supersede this request, cause its `loadInbox` to return without rendering, and then fail itself. Generation change is not proof that this decision's inbox projection committed. `loadInbox` must report whether its own query result was rendered; the decision refresh must require that result before enabling decisions.
 - Required change surface: `desktop/src-tauri/src/lib.rs`, `desktop/src/main.ts`, focused Rust and desktop tests in those files and `desktop/test/automationDecision.test.ts`. No engine decision, scheduler, database, schema, public API, dependency, or unrelated inbox behavior changes.
+- For the concurrent extension, change only `desktop/src/main.ts`, `desktop/test/automationDecision.test.ts`, and this plan. Keep `loadInbox`'s call arguments, caller fire-and-forget behavior, inbox error reporting, queue event scheduling, native wake, and provider behavior unchanged.
 - Assumption: the engine's expected-version and prepared-hash transaction remains the authority for races across windows; the desktop prevents only same-card retries of known-stale state.
 - Verification: fail-first focused desktop source/runner test and Rust wake-routing test; then targeted test reruns, TypeScript build, Rust format, and exact-head CI after push. No broad local suite duplicated from CI.
+- Concurrent-extension verification: fail-first desktop regression for a superseded decision load, then the focused desktop test and build. CI on the updated head owns the cross-platform suites. A successful inbox query with optional capability discovery warning still counts as a committed projection.
 
 ## Scope (this PR)
 
@@ -55,6 +58,7 @@ Acceptance criteria:
 5. The existing engine expected-state and prepared-identity checks remain unchanged; `tests/test_connect_v2_engine_api.py` already covers stale hash and replay, and this PR does not touch that engine path.
 6. `desktop/src-tauri/src/lib.rs` wakes the Connect queue only after a decision returns `pending_dispatch`; its focused Rust test covers confirmed, declined, and failed results, while `scheduler.rs`'s `None => receiver.recv()` branch shows why the signal is required.
 7. When `loadInbox` fails after a decision, the old card's Confirm and Decline controls remain disabled and a refresh retry is available; the focused desktop test covers that result and source wiring.
+8. The decision refresh accepts only its own `loadInbox()` result when that call rendered a current query page. Early skip, query failure, or superseded-generation returns are false; a rendered page remains true even if optional capability discovery warns. The focused desktop test checks both sides of this return contract and the decision caller's use of it.
 
 Affected surfaces: desktop inbox attachment card, Tauri engine bridge, existing engine operation.
 
@@ -69,6 +73,8 @@ Reachability proof: `inbox_query` renders an attachment fire in the desktop inbo
 The desktop decision runner checks the projected state and hash, reserves the fire ID synchronously, forwards the exact identity to an injected submit function, refreshes after either outcome, and releases its reservation. The Tauri command requires configuration admission and calls the existing engine operation under the mailbox operation gate. The UI never constructs a prepared identity or calls provider dispatch directly.
 
 On successful confirmation, the native command signals the existing Connect queue scheduler after the engine returns `pending_dispatch`; no signal is sent for decline or an error. If inbox refresh fails, the existing card becomes decision-inert and presents only a refresh retry until a fresh projection replaces it.
+
+For concurrent inbox loads, `loadInbox` returns whether this call committed a current query page to `renderInbox`. The decision refresh consumes that specific result; a later request merely incrementing the global generation cannot falsely re-enable stale controls.
 
 ## Intentional
 
@@ -88,6 +94,8 @@ Local: `node --test --experimental-strip-types test/automationDecision.test.ts t
 
 Review-fix loop: fail-first desktop test returned 6 pass / 1 expected source-branch failure, and fail-first Rust compilation returned E0425 for the missing wake helper. After the fix, the focused desktop pair returned 14 passed; `pnpm build` passed; `cargo test automation_decision_wakes_queue_only_after_confirmation --lib` and `cargo test repeated_queue_wakes_are_coalesced --lib` each returned 1 passed; `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` passed. The four CI jobs were green on the original PR head only; the updated head must be checked separately.
 
+Concurrent-extension loop: fail-first desktop test failed as expected on `Promise<void>` rather than a committed-result return. After the fix, the focused desktop pair returned 15 passed and `pnpm build` passed. All four CI jobs were green on head `92f47e1`; the next head must be checked separately.
+
 ## Estimated diff size
 
-Updated PR diff: 9 files, +583 / -8. Over the 400-line soft cap for the indivisible bridge, wake/refresh correction, and regression evidence; exact count is checked before push.
+Updated PR diff: 9 files, +618 / -17. Over the 400-line soft cap for the indivisible bridge, wake/refresh correction, and regression evidence; exact count is checked before push.

@@ -2190,9 +2190,8 @@ function renderInbox(items: InboxItem[]): void {
         confirm.type = "button";
         confirm.textContent = "Confirm automation";
         const refreshDecisionInbox = async (): Promise<void> => {
-          const before = inboxRequestGeneration;
-          await loadInbox();
-          if (inboxRequestGeneration === before || inboxStatus.dataset.kind === "error") {
+          const committed = await loadInbox();
+          if (!committed) {
             throw new Error("Inbox could not refresh");
           }
         };
@@ -2559,10 +2558,10 @@ function inboxStatusLabel(): string {
 async function loadInbox(
   append = false,
   effectScope: MailboxEffectScope | null = null,
-): Promise<void> {
-  if (!mailboxEffectScopeIsCurrent(effectScope)) return;
-  if (inboxMutationInFlight()) return;
-  if (append && !inboxNextCursor) return;
+): Promise<boolean> {
+  if (!mailboxEffectScopeIsCurrent(effectScope)) return false;
+  if (inboxMutationInFlight()) return false;
+  if (append && !inboxNextCursor) return false;
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
   setInboxControlsBusy(true);
@@ -2572,7 +2571,7 @@ async function loadInbox(
       query: { ...activeInboxQuery, cursor },
     });
   } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
     if (!append) {
       inboxNextCursor = null;
       inboxLoadMore.hidden = true;
@@ -2580,9 +2579,9 @@ async function loadInbox(
     inboxStatus.textContent = errorMessage(error);
     inboxStatus.dataset.kind = "error";
     setInboxControlsBusy(false);
-    return;
+    return false;
   }
-  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
 
   if (!append) {
     attachmentCapabilities.clear();
@@ -2600,7 +2599,7 @@ async function loadInbox(
   delete inboxStatus.dataset.kind;
   try {
     const discovery = await loadAttachmentCapabilities(page.items);
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
     for (const [key, capabilities] of discovery.capabilities) {
       attachmentCapabilities.set(key, capabilities);
     }
@@ -2612,7 +2611,7 @@ async function loadInbox(
     inboxStatus.textContent = inboxStatusLabel();
     inboxStatus.dataset.kind = "success";
   } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return true;
     renderInbox(inboxItems);
     inboxStatus.textContent = `${inboxStatusLabel()} Local capabilities could not refresh: ${errorMessage(error)}`;
     inboxStatus.dataset.kind = "warning";
@@ -2620,6 +2619,7 @@ async function loadInbox(
   if (mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
     setInboxControlsBusy(false);
   }
+  return true;
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {

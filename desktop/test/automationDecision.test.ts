@@ -88,6 +88,24 @@ test("refresh failure preserves the decision result and requires a fresh inbox",
   });
 });
 
+test("decision refresh requires its own committed inbox projection", async () => {
+  const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const decisionRefresh = ui.slice(
+    ui.indexOf("const refreshDecisionInbox = async"),
+    ui.indexOf("const decide = async (decision: \"confirmed\""),
+  );
+  const loadInbox = ui.slice(ui.indexOf("async function loadInbox("), ui.indexOf("async function refreshLoadedInboxSpan("));
+  const renderPoint = loadInbox.indexOf("renderInbox(inboxItems);");
+  assert.notEqual(renderPoint, -1);
+  assert.match(loadInbox, /\): Promise<boolean> \{/);
+  assert.match(loadInbox, /if \(!mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) return false;/);
+  assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*return true;/);
+  assert.doesNotMatch(loadInbox.slice(0, renderPoint), /\breturn(?:;| true;)/);
+  assert.doesNotMatch(loadInbox.slice(renderPoint), /\breturn(?:;| false;)/);
+  assert.match(decisionRefresh, /const committed = await loadInbox\(\);[\s\S]*if \(!committed\) \{/);
+  assert.doesNotMatch(decisionRefresh, /inboxRequestGeneration/);
+});
+
 test("a second click while the first is pending cannot submit twice", async () => {
   let release!: (value: { fire_id: string; state: string; state_version: number }) => void;
   const pending = new Promise<{ fire_id: string; state: string; state_version: number }>((resolve) => {
