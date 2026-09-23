@@ -74,6 +74,7 @@ def _install_bundle_keyring(root: Path, key: Ed25519PrivateKey) -> None:
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX entitlement and runtime fixture")
 def test_signed_install_controls_discovery_without_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
