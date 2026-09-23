@@ -153,6 +153,7 @@ def test_signed_install_controls_discovery_without_restart(
         provider.stop()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX entitlement file fixture")
 def test_signed_verifier_enforces_exact_time_boundaries(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
     path = tmp_path / entitlement.ENTITLEMENT_FILE_NAME
