@@ -132,6 +132,27 @@ test("rerendered decision controls stay blocked until a later query commits", as
   assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*?releaseAutomationRefreshFences\(automationDecisionRefreshRequired, generation, append\)/);
 });
 
+test("a committed decision refresh reconciles the mounted panel after reservation release", async () => {
+  const inFlight = new Set<string>();
+  const stale = { code: "stale_automation_fire", message: "Prepared identity changed" };
+  let reservedDuringRefresh = false;
+  const outcome = await runAutomationDecision(
+    fire,
+    "confirmed",
+    inFlight,
+    async () => { throw stale; },
+    async () => { reservedDuringRefresh = inFlight.has(fire.fire_id); },
+  );
+  assert.equal(reservedDuringRefresh, true);
+  assert.equal(inFlight.has(fire.fire_id), false);
+  assert.deepEqual(outcome, { status: "rejected", error: stale, refreshed: true });
+
+  const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+  const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));
+  assert.match(panel, /if \(!outcome\.refreshed\) \{[\s\S]*?automationDecisionRefreshRequired\.set\(fire\.fire_id, inboxRequestGeneration\);[\s\S]*?\} else \{\s*renderInbox\(inboxItems\);\s*\}/);
+  assert.doesNotMatch(panel, /\} else \{\s*confirm\.disabled = false;\s*decline\.disabled = false;\s*\}/);
+});
+
 test("a refreshed confirmation does not overwrite current provider status", async () => {
   const ui = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
   const panel = ui.slice(ui.indexOf("for (const fire of attachment.automation_fires ?? [])"), ui.indexOf("attachments.append(row);"));

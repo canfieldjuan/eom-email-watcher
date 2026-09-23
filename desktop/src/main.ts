@@ -2255,8 +2255,7 @@ function renderInbox(items: InboxItem[]): void {
             showRefreshRetry();
             renderInbox(inboxItems);
           } else {
-            confirm.disabled = false;
-            decline.disabled = false;
+            renderInbox(inboxItems);
           }
           if (outcome.status === "rejected") {
             inboxStatus.textContent = errorCode(outcome.error) === "stale_automation_fire"

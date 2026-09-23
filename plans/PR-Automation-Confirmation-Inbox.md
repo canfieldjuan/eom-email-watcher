@@ -32,6 +32,14 @@ The diff exceeds the 400-line soft cap because this end-to-end UI-to-engine brid
 - Required change surface: `desktop/src/main.ts`, a testable fence transition in `desktop/src/automationDecision.ts`, `desktop/test/automationDecision.test.ts`, `desktop/test/gmailLabels.test.ts`, and this plan. Do not change the engine, queue scheduler, provider dispatch, schema, dependencies, CSS, or unrelated inbox controls. The status correction removes a false claim; it does not add a new product promise.
 - Verification: reproduce the focused CI failure; add fail-first assertions for the mounted-panel fence and accurate post-refresh status; test the fence transition at older/equal/newer generations and append-only loads; then run the affected desktop test files and build. CI on the new head owns the broad and platform suites.
 
+### Mounted-panel reconciliation contract (PR #179, exact head `a7d08f5`)
+
+- Root cause: a committed decision refresh renders replacement controls while the fire ID is still reserved. The runner releases that reservation only after the refresh returns, but the handler enables only its captured, potentially detached buttons. If the refreshed projection still awaits confirmation after a rejected submission, the mounted controls remain disabled.
+- Required change surface: reconcile the mounted inbox after the runner releases its reservation on a committed refresh; retain the failed-refresh fence and retry behavior. Change only `desktop/src/main.ts`, `desktop/test/automationDecision.test.ts`, and this plan.
+- Explicit non-scope: no engine, bridge, queue, schema, dependency, copy, or other inbox behavior changes.
+- Assumption: `runAutomationDecision` releases the fire-ID reservation in `finally` before its outcome reaches the handler; `renderInbox(inboxItems)` derives current controls from that reservation and the existing refresh fence.
+- Verification: fail-first focused test for release ordering and current-panel reconciliation, then the focused desktop test, desktop build, and diff check. CI on the updated head owns the broad suites.
+
 ## Scope (this PR)
 
 Ownership lane: automation-confirmation-inbox
@@ -45,16 +53,16 @@ Slice phase: operator-visible vertical proof
 
 ### Files touched
 
-- `desktop/src-tauri/src/engine.rs` - typed result, exact payload bridge, focused bridge test.
-- `desktop/src-tauri/src/lib.rs` - admitted Tauri command and registration.
-- `desktop/src/automationDecision.ts` - guarded desktop decision runner.
-- `desktop/src/main.ts` - attachment controls and inbox refresh/status.
-- `desktop/src/styles.css` - attachment-scoped decision layout.
-- `desktop/test/automationDecision.test.ts` - decision and source-wiring regression tests.
-- `desktop/test/gmailLabels.test.ts` - direct inbox scope test updated for the committed-result loader return.
-- `desktop/test/ntfyDisclosureMigration.test.ts` - retain the admission-gate assertion for the new command.
-- `tests/test_connect_v2_engine_api.py` - prove the real inbox query projects the prepared and refreshed fire.
-- `plans/PR-Automation-Confirmation-Inbox.md` - this contract.
+- `desktop/src-tauri/src/engine.rs`
+- `desktop/src-tauri/src/lib.rs`
+- `desktop/src/automationDecision.ts`
+- `desktop/src/main.ts`
+- `desktop/src/styles.css`
+- `desktop/test/automationDecision.test.ts`
+- `desktop/test/gmailLabels.test.ts`
+- `desktop/test/ntfyDisclosureMigration.test.ts`
+- `plans/PR-Automation-Confirmation-Inbox.md`
+- `tests/test_connect_v2_engine_api.py`
 
 ### Review Contract
 
@@ -71,6 +79,7 @@ Acceptance criteria:
 9. If a panel rerenders while a decision is in flight, its controls are disabled; if the later decision refresh fails, the mounted panel shows only a refresh retry. A full query started before or during that failure cannot release its fire-ID fence; a full query started afterward can release it only after its page commits. The desktop source test checks the render path, and the runtime fence test checks older/equal/newer and append-only boundaries.
 10. When a confirmed decision refresh succeeds, `main.ts` preserves the refreshed inbox status rather than asserting the provider remains unfinished. When refresh fails, the decision status is historical and requests a fresh inbox; the desktop source test checks both branches.
 11. The scoped `gmailLabels.test.ts` assertion recognizes `loadInbox(): Promise<boolean>` and still verifies effect-scope checks after capability discovery. The focused test settles the red desktop CI failure.
+12. Once a committed decision refresh returns, `main.ts` rerenders the current inbox after `runAutomationDecision` has released the fire-ID reservation, so a still-awaiting fire has usable mounted controls. The focused desktop test checks runner ordering and the handler's current-panel reconciliation; failed refresh still uses the fence in criterion 9.
 
 Affected surfaces: desktop inbox attachment card, Tauri engine bridge, existing engine operation.
 
@@ -89,6 +98,8 @@ On successful confirmation, the native command signals the existing Connect queu
 For concurrent inbox loads, `loadInbox` returns whether this call committed a current query page to `renderInbox`. The decision refresh consumes that specific result; a later request merely incrementing the global generation cannot falsely re-enable stale controls.
 
 The current-head repair adds a fire-ID refresh-required fence. New panels consult it and the in-flight reservation; failure cleanup rerenders the mounted inbox from that state. A full query only releases a fence when its generation began after the failed decision and its page committed. Successful decision refresh leaves the status from that fresh query intact; an unrefreshed result reports only the saved decision and need to retry.
+
+The mounted-panel repair rerenders the current inbox after a committed decision refresh returns and the runner's `finally` releases the fire-ID reservation. This replaces the obsolete captured-button enablement; the failed-refresh branch still fences and rerenders the panel with a retry.
 
 ## Intentional
 
@@ -112,6 +123,20 @@ Concurrent-extension loop: fail-first desktop test failed as expected on `Promis
 
 Current-head repair loop: the red desktop CI job reported 68 passed / 1 failed at `gmailLabels.test.ts:508`; the focused local reproduction failed at the same assertion. The two new fail-first desktop tests failed on the missing fire-ID fence and false provider-completion claim; the runtime fence test failed on the missing helper export. After the repair, the affected desktop files returned 45 passed before the helper extraction, the final `pnpm test` returned 72 passed, `pnpm build` passed, and `git diff --check` passed. Head `5fd2a82` still has red desktop CI; the next head requires its own CI and review.
 
+Mounted-panel loop: the focused regression failed first on the committed-refresh branch still enabling captured buttons (1 failed). After replacing that branch with a current-inbox render, `node --test --experimental-strip-types test/automationDecision.test.ts` returned 12 passed, `pnpm build` passed, and `git diff --check` passed. The updated head requires its own CI and review.
+
 ## Estimated diff size
 
-Updated PR diff: 10 files, +706 / -18. Over the 400-line soft cap for the indivisible bridge, wake/refresh correction, and regression evidence; exact count is checked before push.
+| File | LOC |
+|---|---:|
+| `desktop/src-tauri/src/engine.rs` | 75 |
+| `desktop/src-tauri/src/lib.rs` | 96 |
+| `desktop/src/automationDecision.ts` | 87 |
+| `desktop/src/main.ts` | 141 |
+| `desktop/src/styles.css` | 25 |
+| `desktop/test/automationDecision.test.ts` | 193 |
+| `desktop/test/gmailLabels.test.ts` | 2 |
+| `desktop/test/ntfyDisclosureMigration.test.ts` | 1 |
+| `plans/PR-Automation-Confirmation-Inbox.md` | 142 |
+| `tests/test_connect_v2_engine_api.py` | 7 |
+| **Total** | **769** |
