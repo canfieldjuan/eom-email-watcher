@@ -1,6 +1,7 @@
 # COI Watcher workflow plan
 
-Status: proposed working plan, 2026-09-24. Owner: COI workflow lane.
+Status: proposed working plan, 2026-09-24; updated 2026-10-02. Owner: COI
+workflow lane.
 
 This is the navigation and state log for the Certificate of Insurance (COI)
 workflow. It does not replace the accepted
@@ -65,7 +66,7 @@ policy validity without separate verification outside this contract.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Pending. Parser-only checks admitted the text-bearing encrypted PDF and rejected the image-only scan with `NO_NATIVE_TEXT`. An extraction-only local-model attempt on the former ended `MODEL_RUNTIME_UNAVAILABLE`; neither input has completed a Connect job or reached the ledger. |
+| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Pending. Parser-only checks admitted the text-bearing encrypted PDF and rejected the image-only scan with `NO_NATIVE_TEXT`. An extraction-only local-model attempt on the former ended `MODEL_RUNTIME_UNAVAILABLE`; neither input has completed a Connect job or reached the ledger. Re-checked 2026-10-02: all three blockers remain open, and under the accepted contract both supplied COIs are failure cases, so M3 also needs one ordinary text-bearing real COI (see state log). |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
@@ -74,9 +75,12 @@ policy validity without separate verification outside this contract.
 **Accepted technical slice finished** means M3's real-entrypoint proof passes
 against the accepted contract, including replay/concurrency, malformed-result
 fail-closed behavior, missing/ambiguous dates, and visible desktop states.
-Both real COIs must have an observed outcome checked against the accepted
+Every real COI input must have an observed outcome checked against the accepted
 contract: field/provenance comparison for a completed record, or the expected
-typed error for an unreadable document. An image-only scan may satisfy the
+typed error for an unreadable document. At least one real COI must complete a
+ledger record whose fields and provenance match a private human-checked
+reference; expected failures add coverage but cannot close M3 on their own.
+An image-only scan may satisfy the
 accepted failure contract while scanned-COI extraction remains an open product
 coverage gap; do not call that gap a successful extraction. Any unexercised
 acceptance item remains explicitly open. M1 and M2 are merged-code milestones,
@@ -84,9 +88,10 @@ not substitutes for M3.
 
 **Installed COI workflow finished** means M4 passes for each platform we claim.
 The operator can select the intended mailbox/rule/provider, run a real retained
-COI attachment through the supported installed path, and inspect the resulting
-ledger or a truthful review/failure outcome. This is a separate gate from
-source-level integration.
+COI attachment through the supported installed path, and inspect at least one
+successfully persisted ledger result with its desktop review state. Truthful
+review or failure outcomes for other inputs are additional coverage, not a
+substitute. This is a separate gate from source-level integration.
 
 **COI product/release finished** requires M5's explicit operator decisions and
 release evidence. Reminders, renewal actions, coverage verification, and
@@ -114,6 +119,29 @@ contract and update these finish conditions.
   Neither input has completed the real Connect or Email Watcher path. Resolve
   the contract/code mismatch and runtime capacity before claiming a real COI
   success; keep the scanned case open as a separate OCR/admission boundary.
+- 2026-10-02: Re-checked the M3 blockers against Invoice Processor `main`.
+  Certificate code changed only in Invoice Processor #85 (2026-09-27, value
+  parsing).
+  - Encrypted input: `extract/pdf.py::build_catalog` still has no encryption
+    check, so the provider still admits the encrypted COI that its contract
+    rejects as `DOCUMENT_UNREADABLE`. No issue tracks this; it needs a provider
+    fix with a regression test.
+  - Scanned input: Invoice Processor now accepts OCR input for invoices
+    (`application/vnd.local-connect.ocr-pdf`), but `certificate.extract` still
+    builds its catalog from native text only, so the scan still ends
+    `NO_NATIVE_TEXT`. OCR admission for certificates would be a provider
+    contract change; it stays an open coverage gap here.
+  - Model runtime: the CPU-placement failure predates the shared per-user model
+    runtime in connect-contracts ADR-0011 (Linux, on `main`). Its Windows
+    amendment is proposed in connect-contracts #58, and the host itself is not
+    built yet. Until Invoice Processor attaches to it, an M3 run must record
+    the runtime it actually used and its device placement.
+  - Inputs: under the accepted contract the encrypted COI should fail
+    `DOCUMENT_UNREADABLE` and the scan `NO_NATIVE_TEXT`. Neither can show a
+    completed ledger record, so M3 also needs one ordinary, unencrypted,
+    text-bearing real COI, chosen by the operator and kept outside Git.
+  - Finish conditions tightened: M3 and M4 now require at least one real,
+    successfully persisted ledger result; expected failures add coverage only.
 
 ## Update and resume rule
 
