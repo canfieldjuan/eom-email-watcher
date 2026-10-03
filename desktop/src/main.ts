@@ -8,6 +8,8 @@ import {
   type AutomationDecisionResult,
 } from "./automationDecision";
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
+import { inboxActionState } from "./inboxActionState";
+import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import {
   CALENDAR_CONSENT_PROFILES,
   calendarConsentControls,
@@ -248,6 +250,7 @@ interface InboxQuery {
   cursor: string | null;
   provider: string | null;
   account_id: string | null;
+  sender: string | null;
   sender_query: string | null;
   priority: string | null;
   category: string | null;
@@ -526,6 +529,13 @@ app.innerHTML = `
     </nav>
 
     <section id="inbox-view" class="view" aria-labelledby="inbox-tab">
+      <div class="inbox-columns">
+      <aside class="inbox-senders">
+        <nav id="inbox-sender-nav" aria-label="Inbox senders"></nav>
+        <p id="inbox-sender-error" class="status" role="status" hidden></p>
+      </aside>
+      <div class="inbox-messages">
+      <h2 id="inbox-heading">All messages</h2>
       <details class="inbox-filter-panel" open>
         <summary>
           <span>Inbox filters</span>
@@ -601,6 +611,8 @@ app.innerHTML = `
       <div class="inbox-page-actions">
         <button id="inbox-load-more" type="button" hidden>Load more</button>
         <button id="inbox-clear" class="danger-action" type="button">Clear local history</button>
+      </div>
+      </div>
       </div>
     </section>
 
@@ -847,6 +859,9 @@ const expiryLedgerTableWrap = requiredElement<HTMLDivElement>("#expiry-ledger-ta
 const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledger-rows");
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
+const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
+const inboxSenderError = requiredElement<HTMLParagraphElement>("#inbox-sender-error");
+const inboxHeading = requiredElement<HTMLElement>("#inbox-heading");
 const inboxFilterForm = requiredElement<HTMLFormElement>("#inbox-filter-form");
 const inboxKeywordInput = requiredElement<HTMLInputElement>("#inbox-keyword");
 const inboxSenderInput = requiredElement<HTMLInputElement>("#inbox-sender");
@@ -971,6 +986,9 @@ const capabilityOutputPresentationsInFlight = new Set<string>();
 const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
+let inboxQueryEpoch = 0;
+let inboxSenderNavigationError: string | null = null;
+const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
 let inboxNextCursor: string | null = null;
 let inboxCapabilityUnavailableCount = 0;
@@ -981,11 +999,13 @@ const inboxDeletionsInFlight = new Set<string>();
 const automationDecisionsInFlight = new Set<string>();
 const automationDecisionRefreshRequired = new Map<string, number>();
 let inboxClearInFlight = false;
+let inboxReloadAfterMutation = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
   provider: "__no_active_account__",
   account_id: "__no_active_account__",
+  sender: null,
   sender_query: null,
   priority: null,
   category: null,
@@ -1685,7 +1705,9 @@ function renderInbox(items: InboxItem[]): void {
     const filtered = Object.entries(activeInboxQuery).some(
       ([key, value]) => key !== "limit" && value !== null,
     );
-    empty.textContent = filtered
+    empty.textContent = activeInboxQuery.sender !== null
+      ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
+      : filtered
       ? "No watched messages match these filters."
       : "No watched messages yet. Add a sender or Gmail label, then run the watcher.";
     inboxList.append(empty);
@@ -2350,6 +2372,61 @@ function renderInbox(items: InboxItem[]): void {
     if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
     card.append(footer);
+    const content = document.createElement("div");
+    content.id = `inbox-message-${inboxList.childElementCount}`;
+    content.className = "inbox-message-content";
+    content.hidden = !expandedInboxMessages.has(item.message_id);
+    content.append(...Array.from(card.childNodes));
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "inbox-row-toggle";
+    toggle.setAttribute("aria-expanded", String(!content.hidden));
+    toggle.setAttribute("aria-controls", content.id);
+    const identity = document.createElement("span");
+    identity.className = "inbox-row-sender";
+    const name = document.createElement("strong");
+    name.textContent = item.sender_name || item.sender;
+    identity.append(name);
+    if (item.sender_name) {
+      const address = document.createElement("span");
+      address.textContent = item.sender;
+      identity.append(address);
+    }
+    const rowSubject = document.createElement("span");
+    rowSubject.className = "inbox-row-subject";
+    rowSubject.textContent = item.subject;
+    const rowBadges = document.createElement("span");
+    rowBadges.className = "message-badges";
+    rowBadges.append(category.cloneNode(true), state.cloneNode(true));
+    if (item.attachments.length) {
+      const attachmentCount = document.createElement("span");
+      attachmentCount.textContent = `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
+      rowBadges.append(attachmentCount);
+    }
+    const actionState = inboxActionState(
+      item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state)),
+      item.attachments.flatMap((attachment) => (attachment.capability_results ?? []).map((result) => result?.status)),
+      item.calendar_proposal ? {
+        state: item.calendar_proposal.state,
+        status: item.calendar_proposal.status,
+        expires_at: item.calendar_proposal.expires_at,
+      } : null,
+      renderStartedAt,
+    );
+    if (actionState !== null) {
+      const chip = document.createElement("span");
+      chip.className = "inbox-action-state";
+      chip.textContent = actionState;
+      rowBadges.append(chip);
+    }
+    toggle.append(identity, received.cloneNode(true), rowSubject, rowBadges);
+    toggle.addEventListener("click", () => {
+      content.hidden = !content.hidden;
+      if (content.hidden) expandedInboxMessages.delete(item.message_id);
+      else expandedInboxMessages.add(item.message_id);
+      toggle.setAttribute("aria-expanded", String(!content.hidden));
+    });
+    card.append(toggle, content);
     inboxList.append(card);
   }
   for (const key of capabilityOutputPresentations.keys()) {
@@ -2453,12 +2530,50 @@ function inboxAccountForSelection(
     : unavailableAccountFilter;
 }
 
+function renderInboxSenderNavigation(error: string | null = null): void {
+  inboxSenderNavigationError = error;
+  const model = inboxSenderNav(watchedSenders, activeInboxQuery.sender, error);
+  inboxHeading.textContent = model.heading;
+  inboxSenderError.textContent = model.error ?? "";
+  inboxSenderError.hidden = model.error === null;
+  inboxSenderError.dataset.kind = "error";
+  inboxSenderNavigation.replaceChildren();
+  for (const item of model.items) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("aria-pressed", String(item.selected));
+    button.textContent = item.label;
+    if (item.sender !== null && item.label !== item.sender) {
+      const address = document.createElement("span");
+      address.textContent = item.sender;
+      button.append(address);
+    }
+    button.disabled = inboxMutationInFlight();
+    button.addEventListener("click", () => selectInboxSender(item.sender));
+    inboxSenderNavigation.append(button);
+  }
+  if (model.sender !== activeInboxQuery.sender) selectInboxSender(model.sender);
+}
+
+function selectInboxSender(sender: string | null): void {
+  if (sender === activeInboxQuery.sender) return;
+  activeInboxQuery = { ...activeInboxQuery, sender };
+  clearInboxPageForAccountChange("Sender filter changed. Refreshing local history...");
+  renderInboxSenderNavigation(inboxSenderNavigationError);
+  if (inboxMutationInFlight()) {
+    inboxReloadAfterMutation = true;
+  } else {
+    void loadInbox();
+  }
+}
+
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
   const account = inboxAccountForSelection(inboxAccountSelect.value);
   return {
     limit: Number(inboxPageSizeSelect.value),
     provider: account.provider,
     account_id: account.account_id,
+    sender: activeInboxQuery.sender,
     sender_query: optionalFilterValue(inboxSenderInput.value),
     priority: optionalFilterValue(inboxPrioritySelect.value),
     category: optionalFilterValue(inboxCategorySelect.value),
@@ -2469,6 +2584,8 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
 
 function clearInboxPageForAccountChange(message: string): void {
   inboxRequestGeneration += 1;
+  inboxQueryEpoch += 1;
+  expandedInboxMessages.clear();
   inboxItems = [];
   inboxNextCursor = null;
   inboxCapabilityUnavailableCount = 0;
@@ -2483,16 +2600,27 @@ function commitInboxQueryFromControls(): void {
   const nextQuery = queryFromInboxControls();
   const accountScopeChanged =
     activeInboxQuery.provider !== nextQuery.provider ||
-    activeInboxQuery.account_id !== nextQuery.account_id;
+    activeInboxQuery.account_id !== nextQuery.account_id ||
+    activeInboxQuery.sender !== nextQuery.sender;
   activeInboxAccountSelection = inboxAccountSelect.value;
   activeInboxQuery = nextQuery;
   if (accountScopeChanged) {
     clearInboxPageForAccountChange("Email account filter changed. Refreshing local history…");
+  } else {
+    inboxQueryEpoch += 1;
+    expandedInboxMessages.clear();
+    renderInbox(inboxItems);
   }
 }
 
 function inboxMutationInFlight(): boolean {
   return inboxClearInFlight || inboxDeletionsInFlight.size > 0;
+}
+
+function resumeInboxReloadAfterMutation(): void {
+  if (inboxMutationInFlight() || !inboxReloadAfterMutation) return;
+  inboxReloadAfterMutation = false;
+  void loadInbox();
 }
 
 function setInboxControlsBusy(busy: boolean): void {
@@ -2507,6 +2635,9 @@ function setInboxControlsBusy(busy: boolean): void {
   }
   inboxLoadMore.disabled = busy;
   inboxClear.disabled = busy || inboxMutationInFlight();
+  for (const button of inboxSenderNavigation.querySelectorAll<HTMLButtonElement>("button")) {
+    button.disabled = inboxMutationInFlight();
+  }
 }
 
 async function deleteInboxItem(item: InboxItem): Promise<void> {
@@ -2523,6 +2654,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
   renderInbox(inboxItems);
   try {
     await invoke<void>("inbox_delete", { messageId: item.message_id });
+    expandedInboxMessages.delete(item.message_id);
     clearMessageOwnedUiState(item.message_id);
     inboxItems = inboxItems.filter((candidate) => candidate.message_id !== item.message_id);
     renderInbox(inboxItems);
@@ -2535,6 +2667,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxDeletionsInFlight.delete(item.message_id);
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
+    resumeInboxReloadAfterMutation();
   }
 }
 
@@ -2551,6 +2684,7 @@ async function clearInboxHistory(): Promise<void> {
   renderInbox(inboxItems);
   try {
     const deleted = await invoke<number>("inbox_clear");
+    expandedInboxMessages.clear();
     inboxItems = [];
     inboxNextCursor = null;
     inboxCapabilityUnavailableCount = 0;
@@ -2566,6 +2700,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxClearInFlight = false;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
+    resumeInboxReloadAfterMutation();
   }
 }
 
@@ -2649,10 +2784,11 @@ async function loadInbox(
 }
 
 async function refreshLoadedInboxSpan(): Promise<void> {
+  const epoch = inboxQueryEpoch;
   const loadedCount = inboxItems.length;
-  await loadInbox();
+  if (!await loadInbox() || epoch !== inboxQueryEpoch) return;
   while (inboxItems.length < loadedCount && inboxNextCursor) {
-    await loadInbox(true);
+    if (!await loadInbox(true) || epoch !== inboxQueryEpoch) return;
   }
 }
 
@@ -4419,6 +4555,7 @@ function finishOperation(): void {
 
 function renderSenders(senders: WatchedSender[]): void {
   watchedSenders = senders;
+  renderInboxSenderNavigation();
   const exactSenderCount = activeExactSenderCount(senders);
   gmailLabelSenderCount = gmailLabelSenderCountAfterLocalObservation(
     gmailLabelSenderCount,
@@ -4475,6 +4612,7 @@ async function loadSenders(message = "Watchlist is up to date."): Promise<boolea
     watchlistStatus.dataset.kind = "success";
     return true;
   } catch (error) {
+    renderInboxSenderNavigation(errorMessage(error));
     watchlistStatus.textContent = errorMessage(error);
     watchlistStatus.dataset.kind = "error";
     return false;
@@ -4535,6 +4673,7 @@ form.addEventListener("submit", (event) => {
   })();
 });
 
+renderInboxSenderNavigation();
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));

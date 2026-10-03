@@ -142,6 +142,7 @@ Desktop:
 - `desktop/test/inboxActionState.test.ts` (new)
 - `desktop/test/inboxSenderNav.test.ts` (new)
 - `desktop/test/inboxFilters.test.ts`
+- `desktop/test/connectAvailability.test.ts`
 - `tests/test_db.py`
 - `tests/test_engine_api.py`
 
@@ -206,6 +207,7 @@ Fail-first: each new behavior test must fail on `ac4829f` before the change. On 
   - `node --test --experimental-strip-types desktop/test/*.test.ts`
   - `pnpm --dir desktop build`
   - `cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib inbox_query`
+- Reviewer-run before the PR, because the release-candidate workflow enforces them: `cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --check` and `cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings`.
 - Not claimed: rendered interaction in the packaged app. The operator's check on a dev build (`pnpm --dir desktop tauri dev`) is a separate acceptance step.
 
 ## Estimated diff size
@@ -246,6 +248,7 @@ The implementing session runs from a worktree of this branch, with `.codex/` lis
     "desktop/test/inboxActionState.test.ts",
     "desktop/test/inboxSenderNav.test.ts",
     "desktop/test/inboxFilters.test.ts",
+    "desktop/test/connectAvailability.test.ts",
     "tests/test_db.py",
     "tests/test_engine_api.py"
   ],
@@ -282,3 +285,7 @@ Second review (Codex review of `a9543d1`): four more P2 findings were verified a
 6. Rebuilding the query from the filter controls dropped `sender`. The rebuild now carries the selection, and a `sender` change counts as a scope change.
 7. Treating every non-`accepted` proposal `status` as "no suggestion" contradicted "unknown contributes nothing". `status` is now the closed set `accepted | no_suggestions`.
 8. `refreshLoadedInboxSpan` ignored a superseded load and could append into the new view. This is an existing defect that sender selection makes reachable. The span refresh is now bound to a query epoch.
+
+Implementation finding (Codex session `01a1006d`):
+
+9. `desktop/test/connectAvailability.test.ts:80` asserts the exact text of the unguarded `refreshLoadedInboxSpan` loop that behavior 8's epoch guard must change. That file was missing from "Files touched". It is added, and its assertion must keep its intent (queue progress refreshes the full loaded span) against the guarded loop.

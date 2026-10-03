@@ -247,10 +247,14 @@ JavaScript.
 
 `inbox.query` is the desktop Inbox read contract. It returns at most 100 rows ordered by
 `received_at DESC, message_id DESC`; its opaque cursor preserves that ordering when timestamps are
-equal. Optional filters are combined with `AND`: sender matches literal case-insensitive text in
+equal. Optional filters are combined with `AND`: `sender_query` matches literal case-insensitive text in
 the address or display name, keyword matches literal case-insensitive text in subject or summary,
 and priority, category, and status use fixed values. Mail provider and account filters select exact
-source attribution. `untriaged` and `unclassified` select missing priority and category values.
+source attribution. Optional `sender` matches the exact address after `normalize_validated_address`
+normalization, with the same address validation and 512 UTF-8 byte selector bound as `watchlist.add`.
+Absent or `null` means no exact sender filter; an empty, non-string, invalid, or over-bound address
+returns `invalid_request`, never an unfiltered page. It also combines with `sender_query` by `AND`.
+`untriaged` and `unclassified` select missing priority and category values.
 Filtering and pagination read only local SQLite state and never call a mail provider, inference, or
 a Connect provider. Rows include their mail source, existing category, and ordered
 attachment and durable capability-result metadata. `inbox.recent` remains available for existing

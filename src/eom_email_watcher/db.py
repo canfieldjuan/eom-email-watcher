@@ -11459,6 +11459,7 @@ class Store:
         *,
         limit: int,
         cursor: tuple[str, str] | None = None,
+        sender: str | None = None,
         sender_query: str | None = None,
         priority: str | None = None,
         category: str | None = None,
@@ -11472,6 +11473,9 @@ class Store:
         if cursor is not None:
             clauses.append("(received_at < ? OR (received_at = ? AND message_id < ?))")
             parameters.extend((cursor[0], cursor[0], cursor[1]))
+        if sender is not None:
+            clauses.append("sender = ?")
+            parameters.append(sender)
         if sender_query is not None:
             folded_sender = sender_query.casefold()
             clauses.append(

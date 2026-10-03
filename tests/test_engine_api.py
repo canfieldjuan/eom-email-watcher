@@ -1619,6 +1619,72 @@ def test_certificate_expiry_ledger_list_validates_bounds_and_calls_store(
         assert len(calls) == calls_before
 
 
+def test_inbox_query_exact_sender_pages_and_normalizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    patch_runtime(monkeypatch, runtime)
+    expected = []
+    for index in range(150):
+        sender = (
+            "bob@acme.com" if index < 130
+            else "jimbob@acme.com" if index < 145 else "other@acme.com"
+        )
+        stamp = (
+            datetime(2026, 8, 31, tzinfo=UTC) + timedelta(seconds=max(0, index - 19))
+        ).isoformat()
+        _add_test_message(
+            runtime.store, message_id=f"exact-{index:03}", thread_id=None,
+            sender=sender, sender_name="bob@acme.com" if index >= 145 else "Billing",
+            subject="Update", received_at=stamp,
+        )
+        if index < 130:
+            expected.append((stamp, f"exact-{index:03}"))
+    cursor, actual = None, []
+    while True:
+        response = engine_api._response(request(config_path, "inbox.query", {
+            "sender": "BOB@Acme.com", "sender_query": "BILL", "limit": 7, "cursor": cursor,
+        }))
+        assert response["ok"] is True, response
+        actual.extend(
+            (item["received_at"], item["message_id"]) for item in response["data"]["items"]
+        )
+        cursor = response["data"]["next_cursor"]
+        if cursor is None:
+            break
+    assert actual == sorted(expected, reverse=True)
+    assert len(actual) == len(set(actual)) == 130
+    response = engine_api._response(request(config_path, "inbox.query", {
+        "sender": "bob@acme.com", "sender_query": "jimbob",
+    }))
+    assert response["data"]["items"] == []
+
+
+def test_inbox_query_exact_sender_admission_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    patch_runtime(monkeypatch, runtime)
+    address = f"{'A' * 493}@EXAMPLE.COM"
+    _add_test_message(runtime.store, message_id="long", thread_id=None,
+                      sender=address.lower(), sender_name=None, subject="Long sender",
+                      received_at="2026-08-31T12:00:00+00:00")
+    accepted = engine_api._response(request(config_path, "inbox.query", {"sender": address}))
+    assert accepted["ok"] is True, accepted
+    assert [item["message_id"] for item in accepted["data"]["items"]] == ["long"]
+    absent = engine_api._response(request(config_path, "inbox.query"))
+    assert engine_api._response(request(config_path, "inbox.query", {"sender": None})) == absent
+    for sender in ["", " ", 0, False, [], {}, "not-an-address", f"{'A' * 494}@EXAMPLE.COM"]:
+        rejected = engine_api._response(request(config_path, "inbox.query", {"sender": sender}))
+        assert rejected["ok"] is False, sender
+        assert rejected["error"]["code"] == "invalid_request", sender
+        assert "data" not in rejected
+
+
 def test_inbox_query_returns_opaque_cursor_and_uses_only_local_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

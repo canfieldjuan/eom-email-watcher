@@ -3532,6 +3532,48 @@ def test_inbox_query_keyset_paginates_equal_timestamps_without_gaps(
     assert len(message_ids) == len(set(message_ids))
 
 
+def test_inbox_query_exact_sender_pages_and_combines_filters(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    expected = []
+    for index in range(150):
+        sender = (
+            "bob@acme.com" if index < 130
+            else "jimbob@acme.com" if index < 145 else "other@acme.com"
+        )
+        stamp = (
+            datetime(2026, 8, 31, tzinfo=UTC) + timedelta(seconds=max(0, index - 19))
+        ).isoformat()
+        store.add_message(
+            message_id=f"exact-{index:03}", thread_id=None, sender=sender,
+            sender_name="bob@acme.com" if index >= 145 else "Billing",
+            subject="Update", received_at=stamp,
+        )
+        if index < 130:
+            expected.append((stamp, f"exact-{index:03}"))
+    cursor = None
+    actual = []
+    while True:
+        items, cursor = store.query_inbox(limit=7, cursor=cursor, sender="bob@acme.com")
+        assert all(item["sender"] == "bob@acme.com" for item in items)
+        actual.extend((item["received_at"], item["message_id"]) for item in items)
+        if cursor is None:
+            break
+    assert actual == sorted(expected, reverse=True)
+    assert len(actual) == len(set(actual)) == 130
+    items, _ = store.query_inbox(
+        limit=100, sender="bob@acme.com", sender_query="BILL", keyword="UPDATE",
+        priority="untriaged", category="unclassified", status="pending",
+        provider="gmail", account_id="gmail-default",
+    )
+    assert len(items) == 100
+    for field, value in {"sender_query": "jimbob", "keyword": "missing",
+                         "priority": "high", "category": "invoice", "status": "analyzed",
+                         "provider": "imap", "account_id": "other"}.items():
+        items, _ = store.query_inbox(limit=7, sender="bob@acme.com", **{field: value})
+        assert items == [], field
+
+
 def test_inbox_query_combines_filters_before_limiting_and_matches_literals(
     tmp_path: Path,
 ) -> None:
