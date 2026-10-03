@@ -36,6 +36,23 @@ test("sender selection clears the scope before requesting its first page", () =>
   assert.doesNotMatch(failure, /inboxItems =/);
 });
 
+test("sender selection defers reload until the final inbox mutation finishes", () => {
+  const selection = source.match(/function selectInboxSender\([\s\S]*?\n\}/)![0];
+  assert.match(
+    selection,
+    /if \(inboxMutationInFlight\(\)\) \{\s+inboxReloadAfterMutation = true;\s+\} else \{\s+void loadInbox\(\);\s+\}/,
+    "sender selection must defer its reload while a mutation is in flight",
+  );
+  assert.match(source, /let inboxReloadAfterMutation = false;/);
+  const resume = source.match(/function resumeInboxReloadAfterMutation\([\s\S]*?\n\}/)![0];
+  assert.match(resume, /if \(inboxMutationInFlight\(\) \|\| !inboxReloadAfterMutation\) return;/);
+  assert.match(resume, /inboxReloadAfterMutation = false;\s+void loadInbox\(\);/);
+  const deletion = source.match(/async function deleteInboxItem\([\s\S]*?\n\}/)![0];
+  const clearing = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
+  assert.match(deletion, /finally \{\s+inboxDeletionsInFlight.delete\(item.message_id\);\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
+  assert.match(clearing, /finally \{\s+inboxClearInFlight = false;\s+setInboxControlsBusy\(false\);\s+renderInbox\(inboxItems\);\s+resumeInboxReloadAfterMutation\(\);/);
+});
+
 test("Apply and Reset carry the sender and clear query expansion", () => {
   const query = source.match(/function queryFromInboxControls[\s\S]*?\n\}/)![0];
   assert.ok(query.includes("sender: activeInboxQuery.sender"), "control query retains selected sender");

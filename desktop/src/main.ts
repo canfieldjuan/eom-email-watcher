@@ -999,6 +999,7 @@ const inboxDeletionsInFlight = new Set<string>();
 const automationDecisionsInFlight = new Set<string>();
 const automationDecisionRefreshRequired = new Map<string, number>();
 let inboxClearInFlight = false;
+let inboxReloadAfterMutation = false;
 let activeInboxAccountSelection = "active";
 let activeInboxQuery: Omit<InboxQuery, "cursor"> = {
   limit: 25,
@@ -2559,7 +2560,11 @@ function selectInboxSender(sender: string | null): void {
   activeInboxQuery = { ...activeInboxQuery, sender };
   clearInboxPageForAccountChange("Sender filter changed. Refreshing local history...");
   renderInboxSenderNavigation(inboxSenderNavigationError);
-  void loadInbox();
+  if (inboxMutationInFlight()) {
+    inboxReloadAfterMutation = true;
+  } else {
+    void loadInbox();
+  }
 }
 
 function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
@@ -2612,6 +2617,12 @@ function inboxMutationInFlight(): boolean {
   return inboxClearInFlight || inboxDeletionsInFlight.size > 0;
 }
 
+function resumeInboxReloadAfterMutation(): void {
+  if (inboxMutationInFlight() || !inboxReloadAfterMutation) return;
+  inboxReloadAfterMutation = false;
+  void loadInbox();
+}
+
 function setInboxControlsBusy(busy: boolean): void {
   for (const control of inboxFilterForm.elements) {
     if (
@@ -2656,6 +2667,7 @@ async function deleteInboxItem(item: InboxItem): Promise<void> {
     inboxDeletionsInFlight.delete(item.message_id);
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
+    resumeInboxReloadAfterMutation();
   }
 }
 
@@ -2688,6 +2700,7 @@ async function clearInboxHistory(): Promise<void> {
     inboxClearInFlight = false;
     setInboxControlsBusy(false);
     renderInbox(inboxItems);
+    resumeInboxReloadAfterMutation();
   }
 }
 
