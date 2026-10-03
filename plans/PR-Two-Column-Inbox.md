@@ -42,7 +42,7 @@ Engine:
 
 1. `inbox.query` accepts optional `sender`. The engine normalizes it with `normalize_validated_address` (`src/eom_email_watcher/config.py:245`), the same normalization every mail adapter applies to stored `messages.sender`. It returns only rows whose `sender` equals the normalized value. `BOB@Acme.com` matches stored `bob@acme.com`; `jimbob@acme.com` and display-name matches do not.
 2. `sender` combines with every other filter by `AND`, including `sender_query`. Paging, ordering, the 100-row limit, and the cursor are unchanged.
-3. A `sender` that is not a string, is empty, exceeds 320 characters, or is not a valid address returns `invalid_request`. It never falls back to a substring match or to an unfiltered page. `null` or an absent field means no sender filter.
+3. A `sender` that is not a non-empty string, or that `exact_sender_selector_id` (`src/eom_email_watcher/config.py:263`) rejects, returns `invalid_request`. That is the same check `watchlist.add` applies: an invalid address, or an admission selector over 512 UTF-8 bytes. Every sender the watchlist accepts is therefore queryable, including the 505-character address `tests/test_engine_api.py:1191` accepts. A rejected `sender` never falls back to a substring match or to an unfiltered page. `null` or an absent field means no sender filter.
 
 Desktop:
 
@@ -60,25 +60,32 @@ Desktop:
    - at most one action-state chip.
 
    A toggle `button` with `aria-expanded` and `aria-controls` shows or hides the full card. The expanded region holds exactly what the card renders today, with unchanged controls and behavior.
-8. Expansion is held in a module-level set keyed by `message_id`. Re-renders (filter change, "Load more", scheduled check, `watcher://connect-queue`, decision refresh) never collapse an expanded row. Ids no longer loaded are pruned. Rows default to collapsed.
+8. Expansion is held in a module-level set keyed by `message_id`. Rows default to collapsed. Refreshes ("Load more", scheduled check, `watcher://connect-queue`, decision refresh) never collapse an expanded row. The set is not pruned on refresh: the scheduled check reloads only the first page (`desktop/src/main.ts:4584`), so a row reached through "Load more" must come back expanded when it is loaded again. The set is cleared when the query changes (sender selection, filter submit or reset, account change). It loses one id on `inbox.delete` of that message, and is cleared on `inbox.clear`.
 9. The action-state chip is a pure function of projected states only:
    - fire `state` (closed set `AUTOMATION_FIRE_STATES`);
    - Connect result `status` (`requested | accepted | processing | completed | failed`);
-   - calendar proposal `state`.
+   - calendar proposal `state`, `status`, and `expires_at`, evaluated against a `now` argument. The renderer passes its `renderStartedAt`, and tests inject a fixed clock.
+
+   A proposal counts as expired by the renderer's own rule (`desktop/src/main.ts:1781-1784`): `status` is `accepted` and `expires_at` is at or before `now`. A proposal whose `status` is not `accepted` has no suggestion, and the renderer labels it "Needs review", so it contributes "Needs review". An expired `awaiting_confirmation` proposal contributes nothing, because it can no longer be confirmed. The renderer's existing expiry timer (`nextProposalExpiry`) re-renders at expiry, so the chip changes then.
 
    Precedence, highest first:
 
    | Chip | Triggered by |
    |---|---|
-   | "Needs your confirmation" | a fire in `awaiting_confirmation`, or an unexpired proposal in `awaiting_confirmation` |
+   | "Needs your confirmation" | a fire in `awaiting_confirmation`, or an unexpired proposal with an accepted suggestion in `awaiting_confirmation` |
    | "Action failed" | a fire `failed`, a result `failed`, or a proposal `failed` |
-   | "Needs review" | a fire `manual_review` or `source_unavailable`, or a proposal `manual_review` or `unresolved` |
+   | "Needs review" | a fire `manual_review` or `source_unavailable`; a proposal `manual_review` or `unresolved`; or a proposal without an accepted suggestion |
    | "Action paused" | a fire `entitlement_paused` |
    | "Action running" | a fire `pending_dispatch` or `submitted`; a result `requested`, `accepted`, or `processing`; or a proposal `write_authorized`, `writing`, or `reconciling` |
    | "Completed" | a fire, result, or proposal `completed` |
 
    Unknown or malformed values contribute nothing, and `declined` contributes nothing. The chip never reads `reason`, `job_id`, `last_error`, or any provider text.
-10. An empty sender view reads "No retained messages from this sender." A failed `watchlist_list` shows its error in the left column; "All messages" and the list keep working.
+10. An empty sender view names what actually filtered it. The default query always carries an account scope (`desktop/src/main.ts:985-988`).
+    - Any of keyword, free-text sender, priority, topic, or status is set: "No retained messages from this sender match these filters."
+    - Otherwise, the account selection is not "All retained accounts": "No retained messages from this sender in this account."
+    - Otherwise: "No retained messages from this sender."
+
+    `inboxSenderNav.ts` chooses the text as a pure function. A failed `watchlist_list` shows its error in the left column; "All messages" and the list keep working.
 
 ### Invariants
 
@@ -93,7 +100,7 @@ Desktop:
 - A refresh event while a sender is selected: `refreshLoadedInboxSpan` and the scheduled-check reload use `activeInboxQuery`, which now carries `sender`, so refreshes stay in the selected view.
 - The selected sender is removed while its page is loading: the fallback to "All messages" bumps the generation, so the stale page is discarded.
 - A row is collapsed while its attachment invocation or automation decision is in flight: the in-flight sets stay keyed by fire id or attachment key, so collapsing hides the controls and does not cancel or duplicate the request.
-- Expansion state changes only on user toggle and on pruning. No async path writes it.
+- Expansion state changes only on user toggle, query change, delete, and clear. No refresh or other async path writes it.
 
 ### Failure cases
 
@@ -104,7 +111,7 @@ Desktop:
 
 - Fire states: CLOSED by `AUTOMATION_FIRE_STATES` (`db.py:61`). Unknown values produce no chip.
 - Connect result statuses: CLOSED by the `AttachmentCapabilityResult.status` union (`desktop/src/main.ts:81`). Unknown values produce no chip.
-- Calendar proposal states: CLOSED by the `proposalStateLabels` keys (`desktop/src/main.ts:1792`). Unknown values produce no chip.
+- Calendar proposal states: CLOSED by the `proposalStateLabels` keys (`desktop/src/main.ts:1792`). Unknown values produce no chip. Expiry follows the renderer's rule (`status` `accepted` and `expires_at` at or before `now`). An unparseable `expires_at` is treated as not expiring, as the renderer does, and its unknown `status` values mean no suggestion.
 - Reason vocabulary: OPEN, as in #181. Not read or rendered.
 
 ### Boundary-change enumeration
@@ -112,7 +119,8 @@ Desktop:
 - New input: `sender` on `inbox.query`. Callers are the desktop through Rust `InboxQuery` and any CLI or host that calls the engine directly.
 - Input shapes:
   - absent, `null`, or valid mixed-case → accepted, normalized;
-  - empty, whitespace, over 320 characters, not a string, or not an address → `invalid_request`.
+  - the longest address `watchlist.add` accepts (`tests/test_engine_api.py:1191`) → accepted;
+  - empty, whitespace, not a string, not an address, or a selector over 512 UTF-8 bytes → `invalid_request`.
 - Guard-relevant field: only the normalized `sender` reaches SQL, as a bound parameter.
 
 ### Files touched
@@ -134,7 +142,7 @@ Desktop:
 ## Mechanism
 
 - Store: `query_inbox` gains `sender: str | None`. When set, it adds the clause `sender = ?`. There is no index change; retained volume is bounded by retention, and ordering still uses `idx_messages_inbox_order`.
-- Engine: `_query_inbox` admits `sender` in its payload set and normalizes it with `normalize_validated_address`, raising `invalid_request` on failure.
+- Engine: `_query_inbox` admits `sender` in its payload set. It validates the value with `exact_sender_selector_id` and filters on `normalize_validated_address(sender)`, raising `invalid_request` when validation fails.
 - Rust: `InboxQuery.sender: Option<String>`, forwarded as `"sender"`. The typed contract test (`inbox_query_and_page_contract_are_typed`) includes it.
 - Desktop:
   - `inboxSenderNav.ts` is a pure selection model: it derives the selection from the watchlist plus the current selection, and handles removal fallback.
@@ -171,15 +179,16 @@ Fail-first: each new behavior test must fail on `ac4829f` before the change. On 
   - mixed-case input matches;
   - `sender` AND `sender_query`;
   - each invalid shape rejected;
+  - the 505-character address from `tests/test_engine_api.py:1191` accepted, and the 506-character one rejected;
   - `null` equals absent.
 - Rust: the typed contract test serializes `sender`, and a `query_inbox` forwarding assertion shows `"sender"` in the engine payload.
 - Desktop unit tests:
-  - `inboxActionState`: every fire, result, and proposal state, the precedence order, an expired proposal, and unknown and malformed values;
-  - `inboxSenderNav`: select, All, removal fallback, watchlist failure.
+  - `inboxActionState`: every fire, result, and proposal state; the precedence order; a proposal one millisecond before, exactly at, and after `expires_at` under a fixed `now`; a proposal without an accepted suggestion; an unparseable `expires_at`; and unknown and malformed values;
+  - `inboxSenderNav`: select, All, removal fallback, watchlist failure, and each of the three empty-state texts.
 - Desktop source wiring:
   - selection sends `sender`, not `sender_query`;
   - selection resets the cursor;
-  - the expansion set survives `renderInbox`;
+  - the expansion set survives `renderInbox`, including a first-page reload that drops a row loaded by "Load more", and is cleared on a query change;
   - the toggle carries `aria-expanded` and `aria-controls`;
   - the chip mapper receives only state fields.
 - Commands, each a narrowing of a prefix declared in the Codex scope file:
@@ -202,12 +211,12 @@ Fail-first: each new behavior test must fail on `ac4829f` before the change. On 
 | `desktop/src/inboxSenderNav.ts` | 50 |
 | `desktop/src/main.ts` | 140 |
 | `desktop/src/styles.css` | 90 |
-| `desktop/test/inboxActionState.test.ts` | 90 |
-| `desktop/test/inboxSenderNav.test.ts` | 60 |
+| `desktop/test/inboxActionState.test.ts` | 110 |
+| `desktop/test/inboxSenderNav.test.ts` | 80 |
 | `desktop/test/inboxFilters.test.ts` | 30 |
 | `tests/test_db.py` | 60 |
-| `tests/test_engine_api.py` | 40 |
-| **Total** | **664** |
+| `tests/test_engine_api.py` | 50 |
+| **Total** | **714** |
 
 ## Codex scope file
 
@@ -243,8 +252,17 @@ The implementing session runs from a worktree of this branch, with `.codex/` lis
     ],
     "max_runs": 14
   },
-  "churn": { "max_lines": 750, "max_new_tests": 30 }
+  "churn": { "max_lines": 800, "max_new_tests": 34 }
 }
 ```
 
 `roots`, `allow`, and `goal` are enforced today by the scope guard (guard 6). `verify` and `churn` take effect only once canfieldjuan/sol-5-6-cicd-lab#28 (step 6) is accepted and implemented. Until then they are inert, and the limits they express are instructions in this plan. Declared commands are prefixes, so narrowing (`-k inbox`, one test file, `inbox_query`) is allowed.
+
+## Review amendments (Codex review of `fbd41e5`)
+
+Four P2 findings were verified against the code and adopted:
+
+1. The 320-character `sender` cap was narrower than the watchlist's 512-byte selector bound. `sender` now uses `watchlist.add`'s own validator.
+2. Pruning expansion on refresh would collapse rows loaded through "Load more", because the scheduled check reloads only page one. Expansion is now cleared only by query change, delete, or clear.
+3. A state-only mapper could not see calendar proposal expiry. The mapper now takes `status`, `expires_at`, and an injected `now`, using the renderer's own expiry rule.
+4. The sender empty-state text ignored active filters and the default account scope. It now has three filter-aware forms.
