@@ -57,8 +57,10 @@ from .config import (
     add_sender,
     admitted_config,
     config_admission_snapshot,
+    exact_sender_selector_id,
     initialize_config,
     load_config,
+    normalize_validated_address,
     ntfy_disclosure_status,
     remove_sender,
     update_settings,
@@ -2486,12 +2488,22 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
             "limit",
             "priority",
             "provider",
+            "sender",
             "sender_query",
             "status",
         },
     )
     limit = _bounded_limit(payload, default=25, maximum=100)
     cursor = _decode_inbox_cursor(payload.get("cursor"))
+    sender = payload.get("sender")
+    if sender is not None:
+        if not isinstance(sender, str) or not sender.strip():
+            raise ApiError("invalid_request", "sender must be a non-empty string")
+        try:
+            exact_sender_selector_id(sender)
+            sender = normalize_validated_address(sender)
+        except ValueError as exc:
+            raise ApiError("invalid_request", str(exc)) from exc
     sender_query = _optional_inbox_text(payload, "sender_query", maximum=320)
     keyword = _optional_inbox_text(payload, "keyword", maximum=200)
     provider = _optional_inbox_text(payload, "provider", maximum=64)
@@ -2502,6 +2514,7 @@ def _query_inbox(request: dict[str, object]) -> dict[str, object]:
     rows, next_cursor = _runtime(request).store.query_inbox(
         limit=limit,
         cursor=cursor,
+        sender=sender,
         sender_query=sender_query,
         priority=priority,
         category=category,

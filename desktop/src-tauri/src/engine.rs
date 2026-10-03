@@ -1135,6 +1135,7 @@ pub struct InboxQuery {
     pub cursor: Option<String>,
     pub provider: Option<String>,
     pub account_id: Option<String>,
+    pub sender: Option<String>,
     pub sender_query: Option<String>,
     pub priority: Option<String>,
     pub category: Option<String>,
@@ -1715,6 +1716,7 @@ impl Engine {
                 "cursor": query.cursor,
                 "provider": query.provider,
                 "account_id": query.account_id,
+                "sender": query.sender,
                 "sender_query": query.sender_query,
                 "priority": query.priority,
                 "category": query.category,
@@ -3282,17 +3284,13 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
 
     #[test]
     fn inbox_query_and_page_contract_are_typed() {
-        let query = InboxQuery {
-            limit: 25,
-            cursor: Some("opaque-cursor".into()),
-            provider: Some("gmail".into()),
-            account_id: Some("gmail-default".into()),
-            sender_query: Some("billing".into()),
-            priority: Some("high".into()),
-            category: Some("invoice".into()),
-            status: Some("analyzed".into()),
-            keyword: Some("overdue".into()),
-        };
+        let query: InboxQuery = serde_json::from_value(json!({
+            "limit": 25, "cursor": "opaque-cursor", "provider": "gmail",
+            "account_id": "gmail-default", "sender": "billing@example.com",
+            "sender_query": "billing", "priority": "high", "category": "invoice",
+            "status": "analyzed", "keyword": "overdue"
+        }))
+        .expect("deserialize inbox query");
         assert_eq!(
             serde_json::to_value(query).expect("serialize inbox query"),
             json!({
@@ -3300,6 +3298,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
                 "cursor": "opaque-cursor",
                 "provider": "gmail",
                 "account_id": "gmail-default",
+                "sender": "billing@example.com",
                 "sender_query": "billing",
                 "priority": "high",
                 "category": "invoice",
@@ -3327,6 +3326,37 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
         let cleared: InboxClear =
             serde_json::from_value(json!({"deleted": 3})).expect("deserialize inbox clear result");
         assert_eq!(cleared.deleted, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbox_query_forwards_sender_to_engine() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let engine = Engine::with_command(
+            "sh",
+            vec![
+                OsString::from("-c"),
+                OsString::from(
+                    r#"cat > "$1"
+printf '%s\n' '{"protocol":1,"ok":true,"operation":"inbox.query","data":{"items":[],"next_cursor":null}}'"#,
+                ),
+                OsString::from("engine-inbox-probe"),
+                request_path.as_os_str().to_owned(),
+            ],
+            PathBuf::from("unused.toml"),
+        );
+        let query: InboxQuery = serde_json::from_value(json!({
+            "limit": 25, "sender": "bob@acme.com"
+        }))
+        .expect("deserialize exact sender query");
+        engine
+            .query_inbox(query)
+            .expect("query inbox through engine request");
+        let request: Value =
+            serde_json::from_slice(&fs::read(request_path).expect("read captured engine request"))
+                .expect("decode captured engine request");
+        assert_eq!(request["payload"]["sender"], "bob@acme.com");
     }
 
     #[test]
@@ -5059,6 +5089,7 @@ timezone = "UTC"
                     cursor: None,
                     provider: None,
                     account_id: None,
+                    sender: None,
                     sender_query: None,
                     priority: None,
                     category: None,

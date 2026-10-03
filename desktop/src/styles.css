@@ -197,6 +197,98 @@ select:focus {
   box-shadow: 0 0 0 3px rgb(46 107 76 / 14%);
 }
 
+.inbox-columns {
+  display: grid;
+  grid-template-columns: minmax(140px, 190px) minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+
+.inbox-senders,
+.inbox-messages {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.inbox-messages > h2 {
+  margin-top: 0;
+}
+
+#inbox-sender-nav {
+  display: grid;
+  gap: 8px;
+}
+
+#inbox-sender-nav button {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #d7ded8;
+  border-radius: 10px;
+  color: #354239;
+  background: rgb(255 255 255 / 82%);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+#inbox-sender-nav button[aria-pressed="true"] {
+  border-color: #2e6b4c;
+  background: #e8ede8;
+  font-weight: 800;
+}
+
+#inbox-sender-nav span,
+.inbox-row-sender span {
+  display: block;
+  color: #536158;
+  font-size: 0.78rem;
+}
+
+.inbox-row-toggle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px 12px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  color: #17211b;
+  background: transparent;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.inbox-row-toggle time {
+  color: #536158;
+  font-size: 0.78rem;
+}
+
+.inbox-row-subject,
+.inbox-row-toggle .message-badges {
+  grid-column: 1 / -1;
+}
+
+.inbox-row-subject {
+  font-weight: 800;
+}
+
+.inbox-action-state {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #245c40;
+  background: #e8ede8;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.inbox-message-content {
+  margin-top: 18px;
+}
+
+@media (max-width: 760px) {
+  .inbox-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .inbox-filter-panel {
   border: 1px solid #d7ded8;
   border-radius: 18px;
