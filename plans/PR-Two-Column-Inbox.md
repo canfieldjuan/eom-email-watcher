@@ -47,7 +47,10 @@ Engine:
 Desktop:
 
 4. The Inbox view has two columns. The left column lists "All messages" followed by every watched sender from `watchlist_list`, showing each sender's name when present and always its address. The right column holds the existing filter form (all current controls), status line, message list, "Load more", and "Clear local history". Below about 760px the left column stacks above the right; nothing scrolls horizontally.
-5. "All messages" is selected on launch and sends no `sender`. Selecting a watched sender sends that sender's address as `sender` and reloads from the first page. The selected item exposes `aria-pressed="true"`, and the list heading shows the selection.
+5. "All messages" is selected on launch and sends no `sender`. Selecting a watched sender sends that sender's address as `sender`. The selected item exposes `aria-pressed="true"`, and the list heading shows the selection.
+
+   A selection change is a scope change, handled like an account change (`clearInboxPageForAccountChange`, `desktop/src/main.ts:2470-2480`). It bumps the request generation; clears the loaded rows, the cursor, and "Load more"; renders the empty pending list with a status message; and only then loads page one. If that load fails, the list stays empty and shows the error. Rows from the previous scope are never displayed under the new heading, whether the load is pending or failed.
+5a. Query reconstruction carries the selection. `queryFromInboxControls` (`desktop/src/main.ts:2456-2468`) includes the navigation's `sender`. Apply and Reset change only the secondary controls; the selected sender stays. `commitInboxQueryFromControls` (`desktop/src/main.ts:2482-2491`) treats a `sender` change as a scope change, exactly as it treats an account change.
 6. A watchlist change (add or remove on the Watchlist tab) refreshes the left column. If the selected sender is removed, the selection returns to "All messages" and the list reloads.
 7. Each message renders collapsed with:
    - sender name and address;
@@ -66,7 +69,7 @@ Desktop:
    - Connect result `status` (`requested | accepted | processing | completed | failed`);
    - calendar proposal `state`, `status`, and `expires_at`, evaluated against a `now` argument. The renderer passes its `renderStartedAt`, and tests inject a fixed clock.
 
-   A proposal counts as expired by the renderer's own rule (`desktop/src/main.ts:1781-1784`): `status` is `accepted` and `expires_at` is at or before `now`. A proposal whose `status` is not `accepted` has no suggestion, and the renderer labels it "Needs review", so it contributes "Needs review". An expired `awaiting_confirmation` proposal contributes nothing, because it can no longer be confirmed. The renderer's existing expiry timer (`nextProposalExpiry`) re-renders at expiry, so the chip changes then.
+   A proposal counts as expired by the renderer's own rule (`desktop/src/main.ts:1781-1784`): `status` is `accepted` and `expires_at` is at or before `now`. `status` is the closed set `accepted | no_suggestions` (`desktop/src/main.ts:220`). A `no_suggestions` proposal, which the renderer labels "Needs review", contributes "Needs review". An `accepted` proposal follows the state rules below, with expiry. Any other `status` contributes nothing. An expired `awaiting_confirmation` proposal contributes nothing, because it can no longer be confirmed. The renderer's existing expiry timer (`nextProposalExpiry`) re-renders at expiry, so the chip changes then.
 
    Precedence, highest first:
 
@@ -74,7 +77,7 @@ Desktop:
    |---|---|
    | "Needs your confirmation" | a fire in `awaiting_confirmation`, or an unexpired proposal with an accepted suggestion in `awaiting_confirmation` |
    | "Action failed" | a fire `failed`, a result `failed`, or a proposal `failed` |
-   | "Needs review" | a fire `manual_review` or `source_unavailable`; a proposal `manual_review` or `unresolved`; or a proposal without an accepted suggestion |
+   | "Needs review" | a fire `manual_review` or `source_unavailable`; a proposal `manual_review` or `unresolved`; or a proposal with `status` `no_suggestions` |
    | "Action paused" | a fire `entitlement_paused` |
    | "Action running" | a fire `pending_dispatch` or `submitted`; a result `requested`, `accepted`, or `processing`; or a proposal `write_authorized`, `writing`, or `reconciling` |
    | "Completed" | a fire, result, or proposal `completed` |
@@ -92,6 +95,8 @@ Desktop:
 - A sender view never shows a message whose `sender` differs from the selected address.
 - A response for a superseded query never renders. The existing `inboxRequestGeneration` / `mailboxEffectRequestIsCurrent` guard applies to sender selection exactly as it does to filter changes.
 - Changing the sender selection discards the cursor. A cursor from one query is never sent with another.
+- A sender view never shows rows from another scope, while its load is pending or after it fails.
+- Applying or resetting filters never drops the selected sender.
 - Raw `reason`, `job_id`, and provider error text never reach the new chip or row markup. This holds the #181 position: the reason vocabulary is OPEN.
 
 ### Concurrency
@@ -101,6 +106,7 @@ Desktop:
 - The selected sender is removed while its page is loading: the fallback to "All messages" bumps the generation, so the stale page is discarded.
 - A row is collapsed while its attachment invocation or automation decision is in flight: the in-flight sets stay keyed by fire id or attachment key, so collapsing hides the controls and does not cancel or duplicate the request.
 - Expansion state changes only on user toggle, query change, delete, and clear. No refresh or other async path writes it.
+- A span refresh never outlives its query. Today `refreshLoadedInboxSpan` (`desktop/src/main.ts:2651-2657`) ignores the `false` a superseded `loadInbox` returns, so after a sender change it can keep appending pages to the new view until it reaches the old view's row count. The refresh must capture a query epoch at start (bumped on every scope or filter change) and stop as soon as any of its loads returns `false` or the epoch has changed, including inside the append loop.
 
 ### Failure cases
 
@@ -111,7 +117,7 @@ Desktop:
 
 - Fire states: CLOSED by `AUTOMATION_FIRE_STATES` (`db.py:61`). Unknown values produce no chip.
 - Connect result statuses: CLOSED by the `AttachmentCapabilityResult.status` union (`desktop/src/main.ts:81`). Unknown values produce no chip.
-- Calendar proposal states: CLOSED by the `proposalStateLabels` keys (`desktop/src/main.ts:1792`). Unknown values produce no chip. Expiry follows the renderer's rule (`status` `accepted` and `expires_at` at or before `now`). An unparseable `expires_at` is treated as not expiring, as the renderer does, and its unknown `status` values mean no suggestion.
+- Calendar proposal states: CLOSED by the `proposalStateLabels` keys (`desktop/src/main.ts:1792`). Unknown values produce no chip. Expiry follows the renderer's rule (`status` `accepted` and `expires_at` at or before `now`). An unparseable `expires_at` is treated as not expiring, as the renderer does. `status` is CLOSED by `accepted | no_suggestions` (`desktop/src/main.ts:220`); an unknown `status` contributes nothing.
 - Reason vocabulary: OPEN, as in #181. Not read or rendered.
 
 ### Boundary-change enumeration
@@ -183,11 +189,14 @@ Fail-first: each new behavior test must fail on `ac4829f` before the change. On 
   - `null` equals absent.
 - Rust: the typed contract test serializes `sender`, and a `query_inbox` forwarding assertion shows `"sender"` in the engine payload.
 - Desktop unit tests:
-  - `inboxActionState`: every fire, result, and proposal state; the precedence order; a proposal one millisecond before, exactly at, and after `expires_at` under a fixed `now`; a proposal without an accepted suggestion; an unparseable `expires_at`; and unknown and malformed values;
+  - `inboxActionState`: every fire, result, and proposal state; the precedence order; a proposal one millisecond before, exactly at, and after `expires_at` under a fixed `now`; a `no_suggestions` proposal; an unknown `status`; an unparseable `expires_at`; and unknown and malformed values;
   - `inboxSenderNav`: select, All, removal fallback, watchlist failure, and each of the three empty-state texts.
 - Desktop source wiring:
   - selection sends `sender`, not `sender_query`;
   - selection resets the cursor;
+  - selection clears the rendered rows before its request starts, and a failed sender load leaves the list empty with the error shown;
+  - Apply and Reset from a selected-sender view keep `sender` in the query;
+  - a span refresh stops when a sender change supersedes it, both before and during its append loop;
   - the expansion set survives `renderInbox`, including a first-page reload that drops a row loaded by "Load more", and is cleared on a query change;
   - the toggle carries `aria-expanded` and `aria-controls`;
   - the chip mapper receives only state fields.
@@ -209,14 +218,14 @@ Fail-first: each new behavior test must fail on `ac4829f` before the change. On 
 | `desktop/src-tauri/src/engine.rs` | 10 |
 | `desktop/src/inboxActionState.ts` | 70 |
 | `desktop/src/inboxSenderNav.ts` | 50 |
-| `desktop/src/main.ts` | 140 |
+| `desktop/src/main.ts` | 165 |
 | `desktop/src/styles.css` | 90 |
 | `desktop/test/inboxActionState.test.ts` | 110 |
 | `desktop/test/inboxSenderNav.test.ts` | 80 |
-| `desktop/test/inboxFilters.test.ts` | 30 |
+| `desktop/test/inboxFilters.test.ts` | 55 |
 | `tests/test_db.py` | 60 |
 | `tests/test_engine_api.py` | 50 |
-| **Total** | **714** |
+| **Total** | **764** |
 
 ## Codex scope file
 
@@ -252,7 +261,7 @@ The implementing session runs from a worktree of this branch, with `.codex/` lis
     ],
     "max_runs": 14
   },
-  "churn": { "max_lines": 800, "max_new_tests": 34 }
+  "churn": { "max_lines": 850, "max_new_tests": 38 }
 }
 ```
 
@@ -266,3 +275,10 @@ Four P2 findings were verified against the code and adopted:
 2. Pruning expansion on refresh would collapse rows loaded through "Load more", because the scheduled check reloads only page one. Expansion is now cleared only by query change, delete, or clear.
 3. A state-only mapper could not see calendar proposal expiry. The mapper now takes `status`, `expires_at`, and an injected `now`, using the renderer's own expiry rule.
 4. The sender empty-state text ignored active filters and the default account scope. It now has three filter-aware forms.
+
+Second review (Codex review of `a9543d1`): four more P2 findings were verified and adopted:
+
+5. A failed or pending sender load left the previous scope's rows visible. A selection change is now a scope change that clears the page first, like an account change.
+6. Rebuilding the query from the filter controls dropped `sender`. The rebuild now carries the selection, and a `sender` change counts as a scope change.
+7. Treating every non-`accepted` proposal `status` as "no suggestion" contradicted "unknown contributes nothing". `status` is now the closed set `accepted | no_suggestions`.
+8. `refreshLoadedInboxSpan` ignored a superseded load and could append into the new view. This is an existing defect that sender selection makes reachable. The span refresh is now bound to a query epoch.
