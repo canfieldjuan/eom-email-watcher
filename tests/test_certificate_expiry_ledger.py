@@ -1813,3 +1813,77 @@ def test_concurrent_certificate_settlement_and_restart_preserve_complete_project
     response_path = tmp_path / "rendering-engine-response.json"
     response_path.write_text(json.dumps(before), encoding="utf-8")
     response_path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["malformed", "duplicate_keys", "extra_field", "wrong_type", "invalid_iso",
+     "date_relationship", "duplicate_policy", "policy_overflow"],
+)
+def test_m3_invalid_result_classes_leave_no_partial_ledger(tmp_path: Path, case: str) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record(policies=[_policy(0, _date("2027-01-01", "expiration"))])
+    if case == "extra_field":
+        record["unexpected"] = True
+    elif case == "wrong_type":
+        record["policies"][0]["expiration_date"]["ambiguous"] = "false"
+    elif case == "invalid_iso":
+        record["policies"][0]["expiration_date"].update(
+            iso="2026-02-30", candidates=["2026-02-30"]
+        )
+    elif case == "date_relationship":
+        record["policies"][0]["expiration_date"]["candidates"] = ["2027-01-02"]
+    elif case == "duplicate_policy":
+        record["policies"].append(record["policies"][0])
+    elif case == "policy_overflow":
+        record["policies"] = [_policy(i, _date("2027-01-01", f"e-{i}")) for i in range(101)]
+    payload = json.dumps(record).encode()
+    if case == "malformed":
+        payload = payload[:-1]
+    elif case == "duplicate_keys":
+        payload = b'{"record_version":"1.0",' + payload[1:]
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type=CERTIFICATE_MEDIA_TYPE,
+        display_name="certificate.json",
+        byte_size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        payload=payload,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id, expected_state="requested", next_state="completed",
+        provider_app_id="invoice-processor", provider_instance_id=INSTANCE_A,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled.state == "failed" and settled.reason == "CERTIFICATE_RESULT_INVALID"
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("field", ["effective_date", "expiration_date"])
+@pytest.mark.parametrize("uncertainty", ["missing", "ambiguous"])
+def test_m3_date_uncertainty_preserves_certain_expiration_status(
+    tmp_path: Path, field: str, uncertainty: str,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    policy = _policy(0, _date("2027-01-01", "expiration"))
+    policy[field] = None if uncertainty == "missing" else {
+        "iso": None, "ambiguous": True, "candidates": ["2026-01-02", "2026-02-01"],
+        "provenance": _provenance("01/02/2026", "uncertain"),
+    }
+    policy["review_reasons"] = [f"{field.upper()}_{uncertainty.upper()}"]
+    runtime.store.transition_connect_job(
+        job_id=job_id, expected_state="requested", next_state="completed",
+        provider_app_id="invoice-processor", provider_instance_id=INSTANCE_A,
+        result=_result(_record(policies=[policy])),
+    )
+    assert runtime.store.automation_fire(fire.fire_id).state == "completed"
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+    assert len(rows) == 1
+    assert rows[0]["review_state"] == "needs_review"
+    assert rows[0]["expiry_status"] == ("upcoming" if field == "effective_date" else "review")
+    assert rows[0][f"{field}_iso"] is None
