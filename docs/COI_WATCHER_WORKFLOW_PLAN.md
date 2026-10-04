@@ -1,6 +1,6 @@
 # COI Watcher workflow plan
 
-Status: proposed working plan, 2026-09-24; updated 2026-10-02. Owner: COI
+Status: proposed working plan, 2026-09-24; updated 2026-10-04. Owner: COI
 workflow lane.
 
 This is the navigation and state log for the Certificate of Insurance (COI)
@@ -66,7 +66,7 @@ policy validity without separate verification outside this contract.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Pending. Parser-only checks admitted the text-bearing encrypted PDF and rejected the image-only scan with `NO_NATIVE_TEXT`. An extraction-only local-model attempt on the former ended `MODEL_RUNTIME_UNAVAILABLE`; neither input has completed a Connect job or reached the ledger. Re-checked 2026-10-02: all three blockers remain open, and under the accepted contract both supplied COIs are failure cases, so M3 also needs one ordinary text-bearing real COI (see state log). |
+| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | In progress, not complete. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) records current-source public integration, replay/restart, concurrent settlement, all eight acceptance items and browser source rendering. Generated encrypted and scanned inputs both reach the provider and return `DOCUMENT_UNREADABLE` with no ledger rows; the ordinary generated COI persists two policy rows with a declared fixture model. Current-head approved real-COI extraction and private reference comparison remain pending GPU availability. See the 2026-10-04 state log. |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
@@ -100,6 +100,23 @@ If the operator wants any of them in v1, first accept a separate product
 contract and update these finish conditions.
 
 ## Current state log
+
+- 2026-10-04: M3 proof in [PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187),
+  consumer head `144cadaf8c0e7aed10fbb4af6604d4211e510104`, provider merged head
+  `85ae9de619d545fbf5f09fb82188666c7cbc8273`. Real discovery, HTTP dispatch,
+  provider parsing/validation, consumer settlement and engine listing passed for a generated
+  ordinary COI (two policy rows, explicitly substituted model), an encrypted empty-password
+  PDF and a scanned PDF (both `DOCUMENT_UNREADABLE`, zero ledger rows). Replay and a new
+  consumer process preserved every result. Concurrent settlement, malformed-result classes,
+  and date-uncertainty regressions passed; the current source renderer displayed all four
+  expiry/review states from a real saved engine response. This does not establish installed
+  Tauri behavior. The eight-item evidence map is alias `coi-m3/acceptance-evidence.json`,
+  SHA256 `57c8f5ea3b77447fc43842c6b20b7cc7a3da6fb2fadda732b3c71e755c54f8ad`.
+  Current-head approved real-document replay remains unverified: CPU fallback was interrupted
+  and a subsequent GPU launch could not allocate memory while an unrelated Ollama workload
+  occupied the device. That workload was left running. M3 remains open until the actual local
+  model produces a persisted record that passes private field/provenance comparison. The
+  model profile is unchanged; M4/M5 and deferred attribution/recall work remain separate.
 
 - 2026-09-20: Consumer contract revision 2 accepted. Scope is extraction,
   durable expiry ledger, and review visibility, with no automatic reminders.
