@@ -1756,3 +1756,60 @@ def test_certificate_validator_retains_reversed_range_only_with_review_reason() 
         validate_certificate_result_json(
             json.dumps(contradicted, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+def test_concurrent_certificate_settlement_and_restart_preserve_complete_projection(
+    tmp_path: Path,
+) -> None:
+    """Separate connections racing the real commit path settle one complete record."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from test_connect_v2_engine_api import api_request
+
+    config_path, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    ready = Barrier(4)
+
+    def settle() -> str:
+        store = Store(runtime.store.path)
+        ready.wait(timeout=10)
+        job = engine_api._apply_connect_update(
+            store,
+            connect.CapabilityJobUpdate(
+                job_id=job_id,
+                status="completed",
+                provider_app_id="invoice-processor",
+                provider_instance_id=INSTANCE_A,
+                result=_capability_result(_record()),
+                error=None,
+            ),
+        )
+        return job.status
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        outcomes = list(workers.map(lambda _: settle(), range(4)))
+    assert outcomes == ["completed"] * 4
+    assert runtime.store.automation_fire(fire.fire_id).state == "completed"
+    before = engine_api._response(
+        api_request(config_path, "certificate.expiry_ledger.list", {"today": "2026-09-20"})
+    )
+    assert before["ok"] is True
+    assert [row["expiry_status"] for row in before["data"]["items"]] == [
+        "expired",
+        "expires_today",
+        "upcoming",
+        "review",
+    ]
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
+    restarted = Store(runtime.store.path)
+    restarted.initialize()
+    assert (
+        restarted.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+        == before["data"]["items"]
+    )
+    response_path = tmp_path / "rendering-engine-response.json"
+    response_path.write_text(json.dumps(before), encoding="utf-8")
+    response_path.chmod(0o600)
