@@ -250,6 +250,30 @@ This proof establishes local behavior only. It does not establish that a
 provider's model output is factually correct, that an insurer recognizes a
 policy, that coverage is active, or that any reminder or renewal occurred.
 
+### M3 executable proof (2026-10-04)
+
+The current merged provider and consumer are exercised together. Reuse the existing
+settlement and dispatcher regressions as evidence for their exact boundaries; supplement
+them with a retained certificate proof through real discovery, HTTP submission/polling,
+provider parsing/validation, consumer settlement and engine listing. A generated public PDF
+and deterministic model boundary are permitted for repeatable fault and concurrency cases.
+Record every substituted boundary; neither direct database insertion nor a fixture model is
+proof of real-document extraction. The approved real COI must also use the actual local
+model profile, with private field/provenance comparison and no published document content.
+
+Replay and a new consumer process must preserve the certificate identity and complete child
+set. Concurrent settlement and malformed-result cases must exercise the production commit
+boundary, with no partial records or replacement of committed evidence. Use the same real
+engine list response to exercise the current desktop rendering of all expiry/review states;
+a browser transport adapter establishes source-rendering proof only, not installed Tauri
+or platform release proof. Keep installed proof in M4.
+
+Public logs and receipts are retained outside worktrees, with private COI material in a
+separate restricted evidence directory. Each of the eight acceptance items names its actual
+entrypoint, tested heads, result and any remaining gap. The proof must fail on a missing or
+false check. It does not repair the deferred attribution harness or change extraction,
+prompts, model choice, schema, generic dispatcher policy or product behavior.
+
 ## Explicit non-scope
 
 - No changes to generic rule definition, evaluator, Connect v2 dispatcher,
@@ -284,3 +308,5 @@ policy, that coverage is active, or that any reminder or renewal occurred.
 - 2026-09-20: Revision 2 accepted after synchronization with provider contract
   revision 3, including provider-owned date parsing, transaction-coupled local
   settlement, zero-policy visibility, and the 100-policy cap.
+
+- 2026-10-04: M3 executable-proof boundary accepted under the operator's instruction to start the next slice. Evidence-only amendment; existing behavior and eight acceptance items unchanged.
