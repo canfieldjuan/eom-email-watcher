@@ -296,6 +296,13 @@ public catalog for setup without requiring a pre-existing attachment; it accepts
 an empty payload and returns the same `items`/`diagnostic` shape as attachment
 capability discovery. Existing attachment-specific admission is unchanged.
 
+A read-only `automation.rules.prepare` operation accepts `{definition}` and
+normalizes subject condition text with the rule owner's Python Unicode case-folding,
+then parses and returns the canonical definition through the existing strict schema.
+Other fields retain strict validation. The desktop uses this preparation before
+`put`; direct `put` semantics remain unchanged. This avoids a second text-normalization
+implementation in the desktop.
+
 Only representable COI rules may be edited by this bounded form. Existing rules
 with additional predicates, parameters or unsupported scope remain unchanged;
 show that they cannot be edited here rather than dropping hidden conditions.
