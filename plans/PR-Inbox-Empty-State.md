@@ -41,7 +41,7 @@ Slice phase: correctness fix on an existing operator-visible state
   - `loadInbox` with `append === false` and a current generation: `"loaded"` on success, before it renders; `"failed"` on failure, always, plus a re-render when `inboxItems` is empty;
   - a successful `inbox_clear`: `"loaded"`.
 - This slice does not schedule or re-issue loads. Whether a skipped load is retried is #203. `loadInbox`'s guards and `inboxReloadAfterMutation` are unchanged.
-- A response for a superseded generation never changes the state. The existing generation check returns before any state write.
+- A response for a superseded generation never sets `"loaded"` or `"failed"`. Its only state write is releasing its own `"loading"` to `"pending"`, and only while its generation still owns the state (above).
 - The empty-state branch is the only reader.
 
 ### Failure cases
@@ -57,7 +57,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 ## Mechanism
 
-Add the state variable next to `inboxQueryEpoch`. Set it at the points above; the `"loading"` set and its re-render go after `loadInbox`'s guards, before its `await`. In `renderInbox`'s empty branch, return the `pending`, `loading`, or `failed` text first; otherwise fall through to today's chain unchanged. In `renderInbox`'s empty branch, return "Loading messages…" or "Messages could not be loaded." first, and otherwise fall through to today's chain unchanged.
+Add the state variable next to `inboxQueryEpoch`. Set it at the points above; the `"loading"` set and its re-render go after `loadInbox`'s guards, before its `await`. In `renderInbox`'s empty branch, return the `pending`, `loading`, or `failed` text first; otherwise fall through to today's chain unchanged.
 
 ## Intentional
 
