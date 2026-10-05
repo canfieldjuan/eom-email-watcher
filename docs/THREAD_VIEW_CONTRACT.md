@@ -101,21 +101,31 @@ Today the product cannot do this, by construction. A read-only investigation of 
      - IMAP Sent keeps its own `UIDVALIDITY` and UID cursor.
      - Gmail's history id is mailbox-wide, so one cursor covers both.
      - Expiry and recovery of one folder's cursor never move or reset the other's.
-7. **Thread sync has one owner: a bounded, resumable sync pass per followed thread.** Each followed thread keeps a durable `synced_through` watermark. Every completeness gap is closed by this one mechanism, never by a separate path. A thread is queued for a sync pass when:
-   - it becomes followed (a full sync, from the retention cutoff);
-   - a vendor address or domain is added. Retained messages already stored from that address or domain, including messages admitted before this arc, make their threads followed, which queues them. This is how pre-arc retained mail enters threads;
-   - the Connect entitlement becomes active again after a lapse. Every followed thread resyncs from its watermark, so mail that arrived during the lapse and is still within retention is recovered. Mail that aged out of retention during the lapse is not recovered, and the thread shows "history partial";
-   - a provider cursor expires or recovers, for every followed thread on that account.
-
-   A sync pass fetches the thread's messages from INBOX and Sent, within retention, and admits each one as `thread_follow`. For messages that are stored but have no body, it fetches the body if the source still exists. The provider strategies are:
-   - **Gmail:** discovery calls `threads.get` with `format=minimal`, which returns ids, `labelIds`, and `internalDate` only, never bodies.
-     - Each message id is fetched individually, only if it carries `INBOX` or `SENT` and its `internalDate` is within retention.
-     - The discovery response is byte-bounded. If a thread exceeds the bound, only the newest in-retention ids are kept, and the thread is marked "history partial".
-     - The per-message fetches are what get split across checks.
-   - **Microsoft 365:** two folder-scoped queries, `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, each filtered by `conversationId` and `receivedDateTime` at or after the retention cutoff. They select metadata only and are paged with bounded `@odata.nextLink`. Messages in any other folder, such as Deleted Items, Drafts, Archive, or Clutter, are never fetched.
-   - **IMAP:** searching INBOX and the resolved Sent folder by the thread's `Message-ID` set, with `SINCE` the retention cutoff.
-   - Every sync pass is bounded per thread and per check, and resumes from its watermark on the next check when a budget is exhausted. A full sync from the retention cutoff is called **backfill** elsewhere in this contract.
-   - A sync pass never fetches messages outside retention.
+7. **Completeness has one owner: the reconcile pass.** Each account keeps a durable **coverage record**: the scope it has reconciled, and a `synced_through` watermark for every followed thread. The scope is the vendor addresses and domains, the retention cutoff, the entitlement state, and the claims extractor version.
+   - **Any scope change marks coverage stale:**
+     - a vendor address or domain is added;
+     - `retention_days` is increased, which moves the cutoff earlier;
+     - the Connect entitlement becomes active again;
+     - a provider cursor expires or recovers;
+     - a new claims extractor version is deployed (M4).
+   - A bounded, resumable reconcile pass then brings retained data up to the current scope. No other path fills completeness gaps, so a new trigger is added here and nowhere else.
+   - **The reconcile pass has three stages, run in order:**
+     - **(a) Discovery.** Find messages within retention in INBOX that come from a current vendor address or domain, and messages in Sent addressed (`To`/`Cc`) to one, that are not yet in a followed thread. Their threads become followed.
+       - This is how pre-arc retained mail, conversations started while Connect was lapsed, and mail newly in scope after a vendor or retention change all enter threads.
+     - **(b) Thread sync.** For every followed thread, fetch its messages in INBOX and Sent within retention, from its watermark. When the cutoff moved earlier, the sync is full again, from the new cutoff. Each message is admitted as `thread_follow`.
+     - **(c) Derived work.** Fetch bodies for stored messages that lack one, if the source still exists. Extract claims for inbound vendor messages that lack the current extractor version (M4).
+   - Normal polling keeps coverage current between scope changes. The reconcile pass runs only when coverage is stale or a thread's sync is incomplete.
+   - **Every stage is bounded per check and resumable from its durable progress,** and never fetches outside retention or outside INBOX and Sent.
+     - Mail that aged out of retention before it could be reconciled is not recovered, and the affected thread shows "history partial".
+     - A full sync from the retention cutoff is called **backfill** elsewhere in this contract.
+   - **Provider rules the M2 plan must satisfy (its plan specifies and tests the exact calls):**
+     - **Content is fetched only after the folder or label check and the retention check pass, on per-message metadata.**
+       - Gmail: discovery by `threads.get` with `format=minimal` yields only ids and `labelIds`. It is followed by a bounded per-message `format=metadata` fetch for `internalDate` and headers, before any body fetch.
+       - Microsoft 365: folder-scoped queries on `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, filtered by `conversationId` (sync) or by sender and recipients (discovery), and by `receivedDateTime` at or after the cutoff. Only metadata is selected, and paging uses bounded `@odata.nextLink`.
+     - **Other folders are never fetched,** including Deleted Items, Drafts, Archive, and Clutter.
+     - **IMAP thread sync searches `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References`** for every known id of the component, in INBOX and the resolved Sent folder, with `SINCE` the cutoff.
+       - It repeats with newly found ids until the component stops growing or the per-check budget runs out.
+       - A reply whose own id was unknown is therefore still found through its reply headers.
 
 ### Thread identity
 
@@ -150,7 +160,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - The pre-cut length is stored as well, so a stored body that was cut is labeled as cut.
     - Bodies obey the same retention as their message and are deleted with it.
     - The connection that deletes body rows uses `PRAGMA secure_delete = ON`, so purged text does not survive in free pages.
-11. **Messages admitted before this arc get their bodies through the thread sync pass (item 7)** when their thread becomes followed. If the source no longer exists, the UI shows "Body not stored (source no longer available)." There is no separate manual re-fetch path.
+11. **Messages admitted before this arc get their bodies through the reconcile pass (item 7, stages a and c)** when their vendor comes into scope. If the source no longer exists, the UI shows "Body not stored (source no longer available)." There is no separate manual re-fetch path.
 
 ### Thread view (desktop)
 
@@ -192,18 +202,22 @@ Today the product cannot do this, by construction. A read-only investigation of 
        - `unit_price` needs no anchor. A changed price for the same normalized item from the same vendor is shown as "price changed since <date>".
     - **`reference`, `term`, `role = other`, and `what = other` are never compared.**
     - A discrepancy is flagged only between comparable claims whose re-derived values differ, and it is shown with both quotes and dates. For `date_commitment` the flag is "later than promised" when the later claim's date is after the earlier one.
-    - **Matching fails closed.** If more than one earlier claim has the same key, for example two different totals, no discrepancy is flagged, and the thread shows "Several values for <key>; compare manually". Ambiguity never produces a flag.
+    - **Matching fails closed, after every comparability condition above has been applied.** If more than one earlier claim is *comparable*, meaning it has the same thread, vendor, type, key, and shared anchor, no discrepancy is flagged, and the thread shows "Several values for <key>; compare manually".
+      - Earlier claims that are not comparable, such as a total for a different PO, are ignored for this test and never cause ambiguity.
+      - Ambiguity never produces a flag.
     - The model only extracts; it never decides whether something is a discrepancy.
 18. **The model input is bounded.** Claims are extracted per message, not per thread, so input stays within `body_char_limit`. Truncation is recorded as in #146.
     - Thread-level summarization is out of scope for this arc.
 
 ### Gating
 
-19. **Every capability in this arc requires the paid Connect entitlement**, `connect.capability_exchange`, the same feature that gates Connect today (`engine_api.py` `require_connect_entitlement`). This covers vendors, following, Sent capture, backfill, body storage, the thread view, and claims.
+19. **Every operation that captures, syncs, reconciles, extracts, or changes vendor data requires the paid Connect entitlement**, `connect.capability_exchange`, the same feature that gates Connect today (`engine_api.py` `require_connect_entitlement`).
+    - **Reading stored data is read-only and is not gated:** listing vendors, threads, messages, bodies, claims, and discrepancies.
+    - The read operations never call a provider or model.
     - When the entitlement is inactive, capture stops. Today's inbox behavior continues, and provider cursors keep advancing.
-    - On reactivation, the thread sync pass (item 7) resyncs every followed thread from its watermark.
-    - Already-stored data stays readable until retention removes it.
-    - The view shows "Connect required".
+    - Reactivation marks coverage stale, so the reconcile pass (item 7) discovers conversations started during the lapse and resyncs every followed thread from its watermark.
+    - Already-stored data stays readable until retention removes it, through the ungated read operations.
+    - The view shows "Connect required to update" and hides the controls that change data. It never denies reading.
 
 ## Invariants
 
@@ -223,7 +237,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 - **Admission stays idempotent** on the existing unique source identity (`db.py:3333-3337`). Backfill and polling can meet the same message without duplicates.
 - **A thread becomes followed once.** That is a unique row per thread key. Concurrent checks race on it under the existing operation lock (`engine_api.py:2192-2199`).
-- **Sync progress (`synced_through` plus the page state) is durable and per thread,** so a crash, a budget stop, or an entitlement lapse resumes without refetching completed pages. Only the thread sync pass (item 7) writes it.
+- **Sync progress (`synced_through` plus the page state) is durable and per thread,** so a crash, a budget stop, or an entitlement lapse resumes without refetching completed pages. Only the reconcile pass (item 7) writes it, along with the coverage record.
 - **Claims are keyed per message and extractor version.** Re-extraction only happens on an explicit version bump.
 
 ## Failure cases
@@ -249,7 +263,9 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
   - `To`/`Cc` are fetched for Sent matching.
   - Local body storage with `secure_delete` for every message M2 captures. Nothing renders bodies yet.
 - **M3, the thread view.** The CSP, the Vendors → threads → thread UI, and the updated inbox copy.
-- **M4, vendor claims and discrepancies.** The extraction task and code validation, then deterministic discrepancy rules and their UI.
+- **M4, vendor claims and discrepancies.**
+  - The extraction task and code validation, then deterministic discrepancy rules and their UI.
+  - Deploying the extractor version marks coverage stale, so the reconcile pass (item 7, stage c) extracts claims for every retained eligible message. This is bounded and resumable.
 - **M5, domain opt-in and address suggestions.** The public-provider refusal list and suggestion accept/dismiss.
 
 ## Operator decisions (accepted 2026-10-05, as recommended)
@@ -295,7 +311,12 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
 - an inbound reply quoting an earlier $400 total producing no new claim from the quoted text;
 - an outbound message to vendor A (`To`) and vendor B (`Cc`) attributed to A, with B shown as "also involves";
 - IMAP Inbox and Sent UIDs that collide numerically producing two distinct messages, and a moved IMAP message with a `Message-ID` admitted once;
-- a Connect lapse of N days, then reactivation, recovering the followed-thread mail from the lapse that is still within retention;
+- a Connect lapse of N days, then reactivation, recovering the followed-thread mail from the lapse that is still within retention, plus a vendor conversation started during the lapse;
+- raising `retention_days` resyncing followed threads from the earlier cutoff;
+- an IMAP reply whose own `Message-ID` was unknown, found by reconcile through its `In-Reply-To`;
+- after totals for PO-1 and PO-2, an invoice for PO-2 compared only with PO-2's total;
+- an expired entitlement still listing stored threads and bodies, while refusing sync and edits;
+- deploying the M4 extractor producing claims for messages captured in M2 and M3;
 - a vendor address added over retained pre-arc messages pulling those messages into followed threads, with bodies fetched where the source still exists;
 - `watchlist.remove` of a vendor address returning `conflict`;
 - `Mail.Read` / `gmail.readonly` remaining the only scopes.
@@ -320,3 +341,8 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
   - the identity rule (9a): folder-qualified IMAP source identity plus a `Message-ID` logical identity;
   - the thread sync pass (7): pre-arc retained mail and entitlement-lapse catch-up go through the one resumable sync;
   - the comparability rule (15, 17): authored text only, transaction anchors, and references used as anchors and never compared.
+- 2026-10-05: the third Codex round on #200 (seven findings) is resolved.
+  - Completeness moves to one owner, the reconcile pass (item 7). It works from a coverage record, and any scope change marks coverage stale: a vendor added, retention raised, Connect reactivated, cursor recovery, or a new extractor version. One discovery, sync, and derived-work pass then runs, replacing the per-trigger list.
+  - Exact provider calls move to the M2 plan, under stated rules: Gmail metadata before the retention check, and IMAP reply-header search.
+  - Ambiguity is counted only among comparable claims.
+  - Reading stored data is ungated.
