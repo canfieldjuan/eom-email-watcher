@@ -36,7 +36,8 @@ Slice phase: correctness fix on an existing operator-visible state
 
 - One module-level page state, `"pending" | "loading" | "loaded" | "failed"`, starts as `"loading"`, because the configured startup issues the first request. Each value reflects what happened to requests for the current query. Only these change it:
   - `clearInboxPageForAccountChange`: `"pending"`, before it renders;
-  - `loadInbox` with `append === false`, once its early-return guards have passed and the request is about to be sent: `"loading"`, plus a re-render when `inboxItems` is empty;
+  - `loadInbox` with `append === false`, once its early-return guards have passed and the request is about to be sent: `"loading"`, recording that request's generation as the owner of the state, plus a re-render when `inboxItems` is empty;
+  - `loadInbox` with `append === false` whose result is discarded as stale (the two `mailboxEffectRequestIsCurrent` returns, `desktop/src/main.ts:2700,2710`): if the state is still `"loading"` and still owned by this request's generation, it becomes `"pending"`, plus a re-render when `inboxItems` is empty. A request that was superseded, for example by a delete's generation bump (`desktop/src/main.ts:2620`), never leaves "Loading…" behind with nothing in flight;
   - `loadInbox` with `append === false` and a current generation: `"loaded"` on success, before it renders; `"failed"` on failure, always, plus a re-render when `inboxItems` is empty;
   - a successful `inbox_clear`: `"loaded"`.
 - This slice does not schedule or re-issue loads. Whether a skipped load is retried is #203. `loadInbox`'s guards and `inboxReloadAfterMutation` are unchanged.
@@ -47,6 +48,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 - A first-page failure while rows are shown (background refresh): the state becomes `"failed"` and the rows stay, as today. Only the empty-list text reads the state.
 - A first-page load skipped by a guard (an in-flight mutation, an in-flight mail-account operation, or a stale effect scope): the state stays `"pending"` and the list reads "Messages not loaded yet." until a later request runs. The missing retry is #203.
+- An in-flight first-page request superseded before it returns (a delete, a clear, or a newer load bumping the generation): when it returns, it releases its `"loading"` to `"pending"`, unless a newer request already owns the state.
 
 ### Files touched
 
@@ -71,6 +73,7 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the points above; th
   - `clearInboxPageForAccountChange` sets `"pending"` before `renderInbox`;
   - `loadInbox` with `append === false` sets `"loading"` after its guards and before its request, and re-renders when there are no rows (covers an empty-list Apply or Reset);
   - a current non-append failure sets `"failed"` whether or not rows are shown, and re-renders only with no rows;
+  - a stale non-append return releases `"loading"` to `"pending"` only when its own generation owns the state, so it never overwrites a newer request's state;
   - `loadInbox`'s early returns and `inboxReloadAfterMutation` are untouched;
   - success sets `"loaded"` before rendering;
   - `inbox_clear` success sets `"loaded"`;
@@ -85,9 +88,9 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the points above; th
 
 | File | LOC |
 |---|---:|
-| `desktop/src/main.ts` | 20 |
+| `desktop/src/main.ts` | 28 |
 | `desktop/test/inboxFilters.test.ts` | 40 |
-| **Total** | **60** |
+| **Total** | **68** |
 
 ## Codex scope file
 
@@ -117,3 +120,7 @@ Round 2's second fix made `loadInbox` queue deferred reloads. That stretched thi
 1. The deferral change is withdrawn; `loadInbox`'s guards are unchanged. The missing retry is #203, which also records that a correct fix must preserve span refreshes.
 2. The state now follows only what happened to requests, adding `"pending"` (cleared, nothing requested yet): "Messages not loaded yet." No path can claim "Loading…" without a request in flight.
 3. A current failure is always recorded as `"failed"`, even while rows remain, so a later delete that empties the list shows the failure, not absence.
+
+## Review amendments, round 4 (Codex review of `33b4e7b`)
+
+1. A background refresh superseded by a delete's generation bump returned stale and left `"loading"`. If the delete emptied the list, it showed "Loading…" with nothing in flight. The request that sets `"loading"` now owns it by generation, and its stale return releases it to `"pending"` unless a newer request has taken ownership. This stays inside `loadInbox`, the single owner of request-derived state.
