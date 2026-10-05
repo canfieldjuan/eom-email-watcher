@@ -69,7 +69,9 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - **A thread can involve other vendors.** A message attributed to another vendor stays in the thread, shows its own vendor label ("also involves <vendor>"), and appears under that vendor's view as a linked thread. Ownership does not change.
     - Claims belong to the vendor of the message that carries them, not to the thread owner. Suggestions go to the thread owner.
     - **Deleting a vendor is one atomic step.**
-      - It removes the vendor, its addresses, domains, and dismissals, its claims and discrepancies, and the follow rows for every thread it owns. Those threads stop capturing new mail at once.
+      - It removes the vendor, its addresses, domains, and dismissals, its claims and discrepancies, and the follow rows for every thread it owns. Those threads stop all vendor-driven capture at once: `thread_follow`, `sent_to_vendor`, and `vendor_domain`.
+      - The deletion dialog offers "Also stop watching these addresses", off by default, and applies it in the same step. Item 1's `watchlist.remove` guard no longer applies, because the vendor is gone.
+      - Addresses that stay watched keep today's `exact_sender` admission, as the user chose. Mail they admit is stored like any watched mail, and it starts no follow because the address now has no vendor.
       - Their stored messages and bodies stay until today's per-message retention removes them, because D1's whole-thread retention applies only to followed threads.
       - A thread that another vendor's message also involves is not re-owned. It is followed again only if that vendor's mail starts a new follow.
 3. **New addresses are suggested, never auto-added.** When a followed thread contains an **inbound** message whose sender has no vendor under item 2a, the thread's owning vendor shows a suggestion: "Add <address> to <vendor>?"
@@ -89,12 +91,16 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - `vendor_domain`: an opt-in domain match.
    - Today's `exact_sender` and `gmail_user_label` are unchanged.
    - `messages.admission_kind` stays a closed set (`db.py:3606`) and is widened by migration.
-5. **A thread becomes followed** when any message in it is admitted by `exact_sender` for a vendor address, by `vendor_domain`, or by `sent_to_vendor`.
+5. **A thread becomes followed** when any message in it *currently matches* a vendor under the attribution rule (item 2a): an inbound sender, or an outbound `To`/`Cc` recipient, that is a vendor address or in a vendor domain.
+   - That is evaluated against the current vendor scope, by polling or by the reconcile pass. The message's stored admission kind is not consulted.
+   - A retained message first admitted by `gmail_user_label` starts a follow once its sender becomes a vendor address. Its stored provenance stays `gmail_user_label`.
    - Gmail-label-only admission does not follow threads.
    - Following is recorded durably with the triggering message.
 5a. **Admission kind and direction come from message metadata, never from the discovery path.** A message can be reachable by several paths (Inbox poll, Sent poll, backfill) and match several rules, so the result is computed only from its labels or folder and its headers.
     - The admission kind is chosen in a fixed precedence: `exact_sender` > `vendor_domain` > `sent_to_vendor` > `thread_follow` > `gmail_user_label`.
-    - Whichever path discovers the message first records the same kind and selector. Provenance stays immutable.
+    - **Provenance records how a message was first admitted, and is immutable.**
+      - Under one configuration, whichever path discovers the message first records the same kind and selector.
+      - A later configuration change never rewrites stored provenance. Following (item 5) and attribution (item 2a) are judged on the current scope instead, so the two never need to agree.
 6. **Sent mail is read** with the same read-only grants:
    - Gmail: the `SENT` label in history;
    - Microsoft 365: `mailFolders/sentitems` delta;
@@ -118,7 +124,9 @@ Today the product cannot do this, by construction. A read-only investigation of 
      - **(a) Discovery.** Find messages within retention in INBOX that come from a current vendor address or domain, and messages in Sent addressed (`To`/`Cc`) to one, that are not yet in a followed thread. Their threads become followed.
        - This is how pre-arc retained mail, conversations started while Connect was lapsed, and mail newly in scope after a vendor or retention change all enter threads.
      - **(b) Thread sync.** For every followed thread, fetch its messages in INBOX and Sent within retention, from its watermark. When the cutoff moved earlier, the sync is full again, from the new cutoff. Each message is admitted under the admission rule (item 5a), which is the only owner of admission kind and direction. A message that also matches `exact_sender` or `vendor_domain` records that stronger kind, whichever path finds it.
-     - **(c) Derived work.** Fetch bodies for stored messages that lack one, if the source still exists. Extract claims for inbound vendor messages that lack the current extractor version (M4).
+     - **(c) Derived work.** Fetch bodies for stored messages that lack one, if the source still exists *and is currently in INBOX or Sent*.
+       - A stored message found only elsewhere, such as a Gmail-label-admitted message that was archived, keeps no body. It shows "Body not stored (outside Inbox and Sent)", and it yields no claims.
+       - This is an explicit state, never a fetch outside the two folders. Extract claims for inbound vendor messages that lack the current extractor version (M4).
    - Normal polling keeps coverage current between scope changes. The reconcile pass runs only when coverage is stale or a thread's sync is incomplete.
    - **Every stage is bounded per check and resumable from its durable progress,** and never fetches outside retention or outside INBOX and Sent.
      - Mail that aged out of retention before it could be reconciled is not recovered, and the affected thread shows "history partial".
@@ -172,7 +180,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - The pre-cut length is stored as well, so a stored body that was cut is labeled as cut.
     - Bodies obey the same retention as their message and are deleted with it.
     - The connection that deletes body rows uses `PRAGMA secure_delete = ON`, so purged text does not survive in free pages.
-11. **Messages admitted before this arc get their bodies through the reconcile pass (item 7, stages a and c)** when their vendor comes into scope. If the source no longer exists, the UI shows "Body not stored (source no longer available)." There is no separate manual re-fetch path.
+11. **Messages admitted before this arc get their bodies through the reconcile pass (item 7, stages a and c)** when their vendor comes into scope. If the source no longer exists, the UI shows "Body not stored (source no longer available)". If the source is outside Inbox and Sent, it shows "Body not stored (outside Inbox and Sent)". There is no separate manual re-fetch path.
 
 ### Thread view (desktop)
 
@@ -212,7 +220,9 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - **Per-claim binding.** A claim is comparable only if its anchor and its item key are bound to *that claim* deterministically and uniquely from its own evidence. An example is an anchor that appears in the same evidence quote. A claim whose anchor or item binding is not unique is shown but never compared. One message stating "PO-1 total $100; PO-2 total $200" therefore yields two totals, each bound to its own PO.
     - **Canonical item keys.** Item keys are canonicalized in code from the evidence, never taken from the model's choice of substring. If two different canonical keys are possible, the claim is not compared.
     - **One extractor version.** Comparisons read only claims of the current extractor version. When a message's new-version extraction completes, it supersedes that message's older claims atomically. Old and new versions never coexist in a comparison.
-    - **Pinned date context.** Relative and yearless dates ("next Friday", "May 3") are resolved against the message's own received time in the configured time zone, pinned when the message is stored. Re-extraction months later therefore gives the same date. If that context is unavailable, the claim is rejected.
+    - **Pinned date context.** Relative and yearless dates ("next Friday", "May 3") are resolved against the message's own received time in the configured time zone, pinned when the message is stored.
+      - M2 records the zone with every message it stores, before M4 exists. M4 only interprets it.
+      - Re-extraction months later therefore gives the same date. If that context is unavailable, as for rows stored before M2, a claim that needs it is rejected.
 17. **Discrepancies are computed in code, never by the model. Comparability has one owner: the comparability rule.** Two validated claims are comparable only if every one of these holds, and only under item 16a:
     1. They are in the same thread.
     2. They belong to the same vendor (item 2a).
@@ -222,7 +232,8 @@ Today the product cannot do this, by construction. A read-only investigation of 
        - `unit_price` needs no anchor. A changed price for the same normalized item from the same vendor is shown as "price changed since <date>".
     - **`reference`, `term`, `role = other`, and `what = other` are never compared.**
     - A discrepancy is flagged only between comparable claims whose re-derived values differ, and it is shown with both quotes and dates. For `date_commitment` the flag is "later than promised" when the later claim's date is after the earlier one.
-    - **Matching fails closed, after every comparability condition above has been applied.** If more than one earlier claim is *comparable*, meaning it has the same thread, vendor, type, key, and shared anchor, no discrepancy is flagged, and the thread shows "Several values for <key>; compare manually".
+    - **Matching fails closed, after every comparability condition above has been applied.** A comparison is ambiguous when either side has more than one comparable value: the later message carries two or more comparable claims for the key, or more than one earlier claim is comparable. Comparable means the same thread, vendor, type, key, and shared anchor. An ambiguous comparison flags no discrepancy, and the thread shows "Several values for <key>; compare manually".
+      - Claims inside one message are never compared with each other. A quote with two `total` values for the same PO is one ambiguous source.
       - Earlier claims that are not comparable, such as a total for a different PO, are ignored for this test and never cause ambiguity.
       - Ambiguity never produces a flag.
     - The model only extracts; it never decides whether something is a discrepancy.
@@ -238,7 +249,9 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - When the entitlement is inactive, capture stops. Today's inbox behavior continues, and provider cursors keep advancing.
     - Reactivation marks coverage stale, so the reconcile pass (item 7) discovers conversations started during the lapse and resyncs every followed thread from its watermark.
     - Already-stored data stays readable until retention removes it, through the ungated read operations.
-    - The view shows "Connect required to update" and hides the controls that change data. It never denies reading.
+    - The view shows "Connect required to update" and hides only the controls for gated operations (capture, sync, reconcile, extract, add).
+    - The removal controls (remove an address, delete a vendor) stay visible and working, because item 19 leaves them ungated.
+    - It never denies reading.
 
 ## Invariants
 
@@ -279,6 +292,7 @@ This contract owns the arc's rules and invariants. Each milestone plan owns its 
 Each item below must appear in the named plan's behavior and fail-first tests. That plan cannot be accepted without it.
 
 - **M2:**
+  - Store the configured time zone with every message it stores. This is the date context for item 16a; it needs a schema field and a test that changes the zone after storage.
   - Gmail stage-(a) discovery through `messages.list` with durable page tokens.
   - Microsoft discovery paged by date with local matching.
   - IMAP reply-header search expanding the component until it is stable.
@@ -403,3 +417,10 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
     - `sent_to_vendor` covers recipients matched by domain;
     - deleting a vendor that owns threads is one atomic unfollow.
   - The four claims findings are consolidated into item 16a's invariants (per-claim binding, canonical item keys, one extractor version, pinned date context). Their algorithms are carried to the M4 plan as required items.
+- 2026-10-05: sixth Codex round on #200. All six findings were contradictions between this contract's own statements, each fixed at its owner:
+  - provenance stays immutable while following is judged on the current scope (5, 5a);
+  - removal controls stay visible when Connect is inactive (19);
+  - stored messages outside Inbox and Sent get an explicit no-body state (7c, 11);
+  - ambiguity counts multiple values on either side, and comparisons within one message are excluded (17);
+  - M2 pins the date-context zone at storage (16a);
+  - vendor deletion offers to stop watching and narrows its capture guarantee to vendor-driven capture (2a).
