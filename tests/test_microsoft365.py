@@ -63,6 +63,7 @@ model_require_auth = false
 ''',
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
 
 def graph_client(handler) -> httpx.Client:

@@ -133,6 +133,7 @@ gmail_token_file = "{tmp_path / "token.json"}"
 ''',
         encoding="utf-8",
     )
+    config_path.chmod(0o600)
     return config_path
 
 
