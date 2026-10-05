@@ -1,6 +1,6 @@
 # COI Watcher workflow plan
 
-Status: proposed working plan, 2026-09-24; updated 2026-10-04. Owner: COI
+Status: working plan, 2026-09-24; updated 2026-10-05. Owner: COI
 workflow lane.
 
 This is the navigation and state log for the Certificate of Insurance (COI)
@@ -77,7 +77,7 @@ comparison, repeatable acceptance items, or separate M4 installed proof.
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
 | M3: integrated local proof | Begin with both private real COIs from the accepted input baseline above through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Complete under the accepted baseline. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) merged at `8d832259583b5e59f507fe5cc706e9f8d86f0a59` after exact-head review, four green checks and thread reconciliation. The approved ordinary real-model comparison and repeatable evidence remain retained; corrected terminal replay and rendering receipts are identified in the 2026-10-05 entry below. Historical byte continuity remains unproven. |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Linux proof passed on 2026-10-05: actual installed apps processed the approved COI from a real Gmail message, persisted one policy row matching the approved reference, and displayed Expired / Extracted / Available before and after desktop restart. Isolated application state; no Windows/macOS, reboot or unattended-operation claim. Receipt and exact package sources are in the dated entry below. |
-| M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
+| M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Desktop COI setup for a Linux operator pilot accepted on 2026-10-05 in issue #192. Implementation and installed setup proof pending; public release and broader product behavior remain undecided. |
 
 ## Definition of finished
 
@@ -107,6 +107,30 @@ release evidence. Reminders, renewal actions, coverage verification, and
 compliance claims are **not** implicitly required or approved by this plan.
 If the operator wants any of them in v1, first accept a separate product
 contract and update these finish conditions.
+
+## Accepted M5 setup slice (2026-10-05)
+
+The operator approved [issue #192](https://github.com/canfieldjuan/eom-email-watcher/issues/192)
+with "I approve". The next slice puts COI rule setup in the existing Expiry Ledger
+view for a Linux operator pilot:
+
+- Select one connected mailbox, one already watched exact sender, an optional
+  subject filter and one discovered compatible `certificate.extract` provider.
+  Rules match PDF attachments; mailbox/sender scope is never silently broadened.
+- Explain that saving creates an enabled rule. Confirmation for each matching
+  attachment is on by default; the operator may explicitly choose automatic
+  extraction. Existing inbox confirmation and provider effect gates still apply.
+- Inspect, edit, pause and resume saved COI rules through the existing versioned
+  generic operations. Stale edits require refresh. A missing/changed pinned provider
+  is visible and is never replaced automatically.
+- Keep certificate rows read-only. The operator checks values against the source
+  and handles uncertainty/unreadable files manually. Extraction and expiry labels
+  do not establish human approval, active coverage or compliance.
+
+The consumer contract's **M5 desktop setup** section owns implementation and proof
+requirements. This acceptance does not authorize public release, Windows/macOS
+claims, reminders, renewal/broker contact, ledger correction, OCR or model changes.
+Another outbound proof email requires separate explicit approval.
 
 ## Current state log
 
