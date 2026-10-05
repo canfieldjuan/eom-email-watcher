@@ -26,27 +26,27 @@ Slice phase: correctness fix on an existing operator-visible state
 
 ### Observable behavior
 
-1. While a first-page request is pending and no rows are shown, the empty list reads "Loading messages…". This covers every first-page load: a sender or account change, Apply or Reset of the secondary filters, a scheduled check, and the initial load.
-2. When the current first-page load fails and no rows are shown, the empty list reads "Messages could not be loaded." The status line keeps showing the error, as today.
+1. While a first-page request is actually in flight and no rows are shown, the empty list reads "Loading messages…". This covers every first-page request: a sender or account change, Apply or Reset of the secondary filters, a scheduled check, and the initial load.
+1a. After a scope change has cleared the list and before any first-page request for it has been issued, the empty list reads "Messages not loaded yet." That includes a load skipped by a guard (#203).
+2. When the current first-page request fails, the empty list reads "Messages could not be loaded." whenever no rows are shown, including after a later delete empties a list that was showing stale rows. The status line keeps showing the error, as today.
 3. After a successful first-page load, or a successful "Clear local history", an empty list shows exactly today's texts: the sender texts from `inboxSenderEmptyText`, "No watched messages match these filters.", or "No watched messages yet. …".
 4. A failed "Load more" or background refresh while rows are shown changes nothing in the list.
 
 ### State and invariants
 
-- One module-level page state, `"loading" | "loaded" | "failed"`, starts as `"loading"`. Only these change it:
-  - `clearInboxPageForAccountChange`: `"loading"`, before it renders;
-  - `loadInbox` with `append === false`, once its early-return guards have passed and a request will be sent: `"loading"` plus a re-render, but only when `inboxItems` is empty. Rows already shown stay as they are;
-  - `loadInbox` with `append === false` and a current generation: `"loaded"` on success, before it renders; on failure, `"failed"` plus a re-render, but only when `inboxItems` is empty;
+- One module-level page state, `"pending" | "loading" | "loaded" | "failed"`, starts as `"loading"`, because the configured startup issues the first request. Each value reflects what happened to requests for the current query. Only these change it:
+  - `clearInboxPageForAccountChange`: `"pending"`, before it renders;
+  - `loadInbox` with `append === false`, once its early-return guards have passed and the request is about to be sent: `"loading"`, plus a re-render when `inboxItems` is empty;
+  - `loadInbox` with `append === false` and a current generation: `"loaded"` on success, before it renders; `"failed"` on failure, always, plus a re-render when `inboxItems` is empty;
   - a successful `inbox_clear`: `"loaded"`.
-- `loadInbox` is the single owner of deferral. When it skips a first-page load because a mutation is in flight (`inboxMutationInFlight()`), it sets `inboxReloadAfterMutation = true`, so the existing `resumeInboxReloadAfterMutation` (run when the last delete or clear finishes) re-issues it. This covers account-scope reconciliation and filter commits, not only sender selection, so the list never stays on "Loading messages…" with no request in flight.
+- This slice does not schedule or re-issue loads. Whether a skipped load is retried is #203. `loadInbox`'s guards and `inboxReloadAfterMutation` are unchanged.
 - A response for a superseded generation never changes the state. The existing generation check returns before any state write.
 - The empty-state branch is the only reader.
 
 ### Failure cases
 
-- A first-page failure while rows are shown (background refresh): the state is unchanged and rows stay, as today.
-- `loadInbox` skipped while a mutation is in flight: the reload is queued and runs when the mutation finishes (above).
-- `loadInbox` returning early for a stale effect scope: the newer scope's own load sets the state.
+- A first-page failure while rows are shown (background refresh): the state becomes `"failed"` and the rows stay, as today. Only the empty-list text reads the state.
+- A first-page load skipped by a guard (an in-flight mutation, an in-flight mail-account operation, or a stale effect scope): the state stays `"pending"` and the list reads "Messages not loaded yet." until a later request runs. The missing retry is #203.
 
 ### Files touched
 
@@ -55,7 +55,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 ## Mechanism
 
-Add the state variable next to `inboxQueryEpoch`. Set it at the points above. In `loadInbox`, the mutation early return queues the deferred reload when `append` is false. The "loading" set and its re-render go after the guards, before the `await`. In `renderInbox`'s empty branch, return "Loading messages…" or "Messages could not be loaded." first, and otherwise fall through to today's chain unchanged.
+Add the state variable next to `inboxQueryEpoch`. Set it at the points above; the `"loading"` set and its re-render go after `loadInbox`'s guards, before its `await`. In `renderInbox`'s empty branch, return the `pending`, `loading`, or `failed` text first; otherwise fall through to today's chain unchanged. In `renderInbox`'s empty branch, return "Loading messages…" or "Messages could not be loaded." first, and otherwise fall through to today's chain unchanged.
 
 ## Intentional
 
@@ -68,26 +68,26 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the points above. In
 ## Verification
 
 - Fail-first source-wiring tests in `desktop/test/inboxFilters.test.ts`:
-  - `clearInboxPageForAccountChange` sets the state to `"loading"` before `renderInbox`;
-  - `loadInbox` with `append === false` and no rows sets `"loading"` and re-renders after its guards and before its request (covers an empty-list Apply or Reset);
-  - `loadInbox` with `append === false`, skipped for an in-flight mutation, sets `inboxReloadAfterMutation`;
-  - a non-append failure with no rows sets `"failed"` and re-renders;
+  - `clearInboxPageForAccountChange` sets `"pending"` before `renderInbox`;
+  - `loadInbox` with `append === false` sets `"loading"` after its guards and before its request, and re-renders when there are no rows (covers an empty-list Apply or Reset);
+  - a current non-append failure sets `"failed"` whether or not rows are shown, and re-renders only with no rows;
+  - `loadInbox`'s early returns and `inboxReloadAfterMutation` are untouched;
   - success sets `"loaded"` before rendering;
   - `inbox_clear` success sets `"loaded"`;
   - the empty branch checks the state before the query-derived texts;
-  - the two new strings are present.
+  - the three new strings are present.
 - Commands, each a narrowing of a prefix declared in the Codex scope file:
   - `node --test --experimental-strip-types --test-isolation=none desktop/test/*.test.ts`
   - `pnpm --dir desktop build`
-- Effect check, reviewer-run: the stubbed-backend preview, with `inbox_query` made slow, then failing, for one sender. The empty list must read "Loading messages…" during the load and "Messages could not be loaded." after the failure, and today's sender text when the sender truly has no messages.
+- Effect check, reviewer-run: the stubbed-backend preview, with `inbox_query` made slow, then failing, for one sender. The empty list must read "Loading messages…" during the load, "Messages could not be loaded." after the failure, and today's sender text when the sender truly has no messages.
 
 ## Estimated diff size
 
 | File | LOC |
 |---|---:|
-| `desktop/src/main.ts` | 22 |
+| `desktop/src/main.ts` | 20 |
 | `desktop/test/inboxFilters.test.ts` | 40 |
-| **Total** | **62** |
+| **Total** | **60** |
 
 ## Codex scope file
 
@@ -109,3 +109,11 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the points above. In
 
 1. An Apply or Reset of only secondary filters with an empty list never entered `"loading"`, so it showed a false "no messages" during the request. `loadInbox` now sets `"loading"` for any first-page request while no rows are shown.
 2. A scope clear during an in-flight delete or clear left `"loading"` with no request, because only sender selection queued a reload. `loadInbox` now owns that deferral for every first-page load.
+
+## Review amendments, round 3 (Codex review of `1c2e0c0`): the cut
+
+Round 2's second fix made `loadInbox` queue deferred reloads. That stretched this slice from empty-state text into reload scheduling, and round 3 found three more cases of that one class: a skip during a mail-account operation that queues nothing; a deferred span refresh collapsing to page one; and a failure not recorded while rows remain. The class is a pre-existing scheduling defect with more than one owner, so:
+
+1. The deferral change is withdrawn; `loadInbox`'s guards are unchanged. The missing retry is #203, which also records that a correct fix must preserve span refreshes.
+2. The state now follows only what happened to requests, adding `"pending"` (cleared, nothing requested yet): "Messages not loaded yet." No path can claim "Loading…" without a request in flight.
+3. A current failure is always recorded as `"failed"`, even while rows remain, so a later delete that empties the list shows the failure, not absence.
