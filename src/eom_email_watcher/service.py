@@ -2309,9 +2309,11 @@ class Watcher:
                     body_char_limit = self.config.body_char_limit
                     current_local_time = datetime.now(self.config.zone)
                 else:
+                    # Pin the local offset with the request so retries reuse identical content.
                     request = self.store.reserve_analysis_request(
                         message.message_id,
                         self.config.body_char_limit,
+                        datetime.now(self.config.zone),
                     )
                     request_id = request.request_id
                     body_char_limit = request.body_char_limit
