@@ -87,6 +87,7 @@ envelope without changing its protocol number.
 | `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
 | `connect.catalog` | `{}` | Shared Connect v2 public catalog for rule setup; retains entitlement/discovery diagnostics |
 | `automation.rules.prepare` | `definition` | Case-fold human subject text at the Python rule owner, validate and return the canonical definition without writing |
+| `automation.rules.put_watched` | `definition`, optional paired `rule_id` / `expected_version` | Desktop save with current exact-sender admission under the shared mutation lock; see [M5 desktop setup](CERTIFICATE_EXPIRY_LEDGER_AUTOMATION_CONTRACT.md#m5-desktop-setup-accepted-2026-10-05) |
 | `connect.attachment.summarize` | `message_id`, `part_id` | Legacy v1 document-summary invocation |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |

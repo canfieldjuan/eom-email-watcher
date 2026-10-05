@@ -287,9 +287,18 @@ live `certificate.extract` v1.0 provider for PDF inputs. Saving creates an enabl
 rule. Confirmation defaults on; automatic extraction requires an explicit user
 choice. Provider-mandated confirmation cannot be disabled by that choice.
 
-Use typed admitted Tauri bridges to `automation.rules.list/get/put/set_enabled`.
+Use typed admitted Tauri bridges to `automation.rules.list/get/set_enabled` and
+`automation.rules.put_watched` for desktop creates and definition edits.
 These preserve engine-owned identities, immutable versions, compare-and-set edits,
-mailbox operation locking and domain errors. Do not add a second rule schema,
+mailbox operation locking and domain errors. The watched-save entrypoint has the
+same payload/result and shared write implementation as generic `automation.rules.put`,
+but requires one exact sender condition admitted by the current config allowlist.
+Read that config and check membership under the existing production operation lock,
+which also covers watchlist mutations, and hold it through the rule commit. Reject
+a missing/inactive sender as `invalid_rule` without creating a rule or successor;
+return an actionable refresh message. Cached desktop membership is only a form
+preview, never save admission. Generic `put` retains its existing semantics.
+Do not add a second rule schema,
 queue, provider client, policy parser or database write path. A read-only
 `connect.catalog` operation exposes the existing Connect v2 discovery owner's
 public catalog for setup without requiring a pre-existing attachment; it accepts
