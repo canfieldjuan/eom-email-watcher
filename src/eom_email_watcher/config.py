@@ -598,38 +598,28 @@ def _file_open_flags() -> int:
 
 
 def _open_directory_nofollow(path: Path) -> int:
-    absolute = _absolute_lexical_path(path)
-    if not absolute.is_absolute():
-        raise _UnsafeConfigPath
-    current_fd = os.open("/", _directory_open_flags())
-    try:
-        for component in absolute.parts[1:]:
-            try:
-                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
-            except FileNotFoundError as exc:
-                raise _MissingConfigPath from exc
-            except OSError as exc:
-                if exc.errno in {errno.ELOOP, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
-                    raise _UnsafeConfigPath from exc
-                raise
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except Exception:
-        os.close(current_fd)
-        raise
+    return _walk_directory_nofollow(path, create=False)
 
 
 def _open_or_create_directory_nofollow(path: Path) -> int:
+    return _walk_directory_nofollow(path, create=True)
+
+
+def _walk_directory_nofollow(path: Path, *, create: bool) -> int:
+    """Traverse without listing ancestors; return a readable leaf for fsync."""
+
     absolute = _absolute_lexical_path(path)
     if not absolute.is_absolute():
         raise _UnsafeConfigPath
-    current_fd = os.open("/", _directory_open_flags())
+    traversal_flags = _directory_open_flags() | getattr(os, "O_PATH", 0)
+    current_fd = os.open("/", traversal_flags)
     try:
         for component in absolute.parts[1:]:
             try:
-                next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
-            except FileNotFoundError:
+                next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
+            except FileNotFoundError as exc:
+                if not create:
+                    raise _MissingConfigPath from exc
                 try:
                     os.mkdir(component, mode=0o700, dir_fd=current_fd)
                 except FileExistsError:
@@ -637,7 +627,7 @@ def _open_or_create_directory_nofollow(path: Path) -> int:
                 except OSError as exc:
                     raise _UnsafeConfigPath from exc
                 try:
-                    next_fd = os.open(component, _directory_open_flags(), dir_fd=current_fd)
+                    next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
                 except OSError as exc:
                     raise _UnsafeConfigPath from exc
             except OSError as exc:
@@ -646,10 +636,9 @@ def _open_or_create_directory_nofollow(path: Path) -> int:
                 raise
             os.close(current_fd)
             current_fd = next_fd
-        return current_fd
-    except Exception:
+        return os.open(".", _directory_open_flags(), dir_fd=current_fd)
+    finally:
         os.close(current_fd)
-        raise
 
 
 def _open_safe_parent(path: Path) -> tuple[Path, int, str]:

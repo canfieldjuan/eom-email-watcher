@@ -66,6 +66,81 @@ def test_config_normalizes_exact_sender(tmp_path: Path) -> None:
     assert normalize_address("Person <TRUSTED@example.com>") == "trusted@example.com"
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="Requires Linux path handles and enforced directory permissions",
+)
+@pytest.mark.parametrize("state_exists", [False, True])
+def test_config_load_and_mutation_through_searchable_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state_exists: bool
+) -> None:
+    ancestor = tmp_path / "searchable"
+    config_dir = ancestor / "config"
+    config_dir.mkdir(parents=True, mode=0o700)
+    path = config_dir / "config.toml"
+    write_config(path)
+    state_parent = ancestor / "runtime"
+    state_parent.mkdir(mode=0o700)
+    state_dir = state_parent / "state"
+    if state_exists:
+        state_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_dir))
+    ancestor.chmod(0o111)
+    try:
+        assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+        updated = update_settings(path, {"poll_interval_minutes": 7})
+        assert updated.poll_interval_minutes == 7
+        assert load_config(path).poll_interval_minutes == 7
+        assert state_dir.stat().st_mode & 0o777 == 0o700
+        assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        ancestor.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX nofollow directory traversal")
+@pytest.mark.parametrize("aliased_path", ["config", "state"])
+def test_config_rejects_symlinked_traversal_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aliased_path: str
+) -> None:
+    target = tmp_path / "target"
+    config_dir = target / "config"
+    config_dir.mkdir(parents=True, mode=0o700)
+    path = config_dir / "config.toml"
+    write_config(path)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    state_dir = (alias if aliased_path == "state" else target) / "state"
+    monkeypatch.setenv("STATE_DIRECTORY", str(state_dir))
+    candidate = alias / "config" / path.name if aliased_path == "config" else path
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigError, match="unavailable"):
+        load_config(candidate)
+    assert path.read_bytes() == before
+    assert not (target / "state").exists()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="Requires Linux path handles and enforced directory permissions",
+)
+def test_config_rejects_ancestor_without_search_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ancestor = tmp_path / "inaccessible"
+    config_dir = ancestor / "config"
+    config_dir.mkdir(parents=True, mode=0o700)
+    path = config_dir / "config.toml"
+    write_config(path)
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path / "state"))
+    ancestor.chmod(0o000)
+    try:
+        with pytest.raises(ConfigError, match="unavailable"):
+            load_config(path)
+    finally:
+        ancestor.chmod(0o700)
+
+
 def test_packaged_tzdata_supports_default_zone_without_system_database(
     tmp_path: Path,
 ) -> None:
