@@ -68,6 +68,10 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - **A thread's owning vendor** is the vendor of the message that started following it. It is recorded with the follow and never changes afterwards. The one exception is a component merge, which keeps the owner of the surviving (earliest-created) component.
     - **A thread can involve other vendors.** A message attributed to another vendor stays in the thread, shows its own vendor label ("also involves <vendor>"), and appears under that vendor's view as a linked thread. Ownership does not change.
     - Claims belong to the vendor of the message that carries them, not to the thread owner. Suggestions go to the thread owner.
+    - **Deleting a vendor is one atomic step.**
+      - It removes the vendor, its addresses, domains, and dismissals, its claims and discrepancies, and the follow rows for every thread it owns. Those threads stop capturing new mail at once.
+      - Their stored messages and bodies stay until today's per-message retention removes them, because D1's whole-thread retention applies only to followed threads.
+      - A thread that another vendor's message also involves is not re-owned. It is followed again only if that vendor's mail starts a new follow.
 3. **New addresses are suggested, never auto-added.** When a followed thread contains an **inbound** message whose sender has no vendor under item 2a, the thread's owning vendor shows a suggestion: "Add <address> to <vendor>?"
    - Outbound messages never produce suggestions.
    - Every verified identity of the active mailbox is excluded: `mail_accounts.address`, plus the authenticated address the provider reports for the session.
@@ -81,7 +85,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 4. **Admission gains three kinds:**
    - `thread_follow`: the message belongs to a followed thread;
-   - `sent_to_vendor`: a Sent message with a vendor address in `To` or `Cc`;
+   - `sent_to_vendor`: a Sent message with a recipient in `To` or `Cc` that has a vendor under the attribution rule (item 2a). That means an exact vendor address, or else an address in a vendor's opted-in domain.
    - `vendor_domain`: an opt-in domain match.
    - Today's `exact_sender` and `gmail_user_label` are unchanged.
    - `messages.admission_kind` stays a closed set (`db.py:3606`) and is widened by migration.
@@ -121,7 +125,8 @@ Today the product cannot do this, by construction. A read-only investigation of 
      - A full sync from the retention cutoff is called **backfill** elsewhere in this contract.
    - **Provider rules the M2 plan must satisfy (its plan specifies and tests the exact calls):**
      - **Content is fetched only after the folder or label check and the retention check pass, on per-message metadata.**
-       - Gmail: discovery by `threads.get` with `format=minimal` yields only ids and `labelIds`. It is followed by a bounded per-message `format=metadata` fetch for `internalDate` and headers, before any body fetch.
+       - **Gmail discovery (stage a)** pages `messages.list` over INBOX and SENT within the cutoff, with durable page tokens. Each listed message gets a bounded `format=metadata` fetch, and its sender and recipients are matched locally. `threads.get` needs a thread id, so it can never discover an unknown conversation.
+       - **Gmail thread sync (stage b)** uses `threads.get` with `format=minimal` for a known thread id. That yields only ids and `labelIds`, so the same per-message `format=metadata` fetch supplies `internalDate` and headers before any body fetch.
        - Microsoft 365: folder-scoped queries on `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, filtered by `conversationId` for sync and by `receivedDateTime` at or after the cutoff.
          - Discovery pages each folder by the `receivedDateTime` filter alone, selects sender and recipient metadata, and matches normalized addresses locally.
          - It never relies on `$search`, which is capped and not complete.
@@ -203,7 +208,12 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - **Validation has two levels, and both are deterministic for the same input:**
       - **The response:** a response that is not valid JSON for the claims schema is rejected whole. The message shows "Claims unavailable" and no claims are stored.
       - **Each claim, in a schema-valid response:** each claim is validated independently. Claims that fail are discarded and counted, and are never shown. Claims that pass are stored. If any were discarded, the message shows a "Some claims could not be verified" note.
-17. **Discrepancies are computed in code, never by the model. Comparability has one owner: the comparability rule.** Two validated claims are comparable only if every one of these holds:
+16a. **Claims invariants that the M4 plan must satisfy.** The M4 plan owns the exact algorithm and its tests.
+    - **Per-claim binding.** A claim is comparable only if its anchor and its item key are bound to *that claim* deterministically and uniquely from its own evidence. An example is an anchor that appears in the same evidence quote. A claim whose anchor or item binding is not unique is shown but never compared. One message stating "PO-1 total $100; PO-2 total $200" therefore yields two totals, each bound to its own PO.
+    - **Canonical item keys.** Item keys are canonicalized in code from the evidence, never taken from the model's choice of substring. If two different canonical keys are possible, the claim is not compared.
+    - **One extractor version.** Comparisons read only claims of the current extractor version. When a message's new-version extraction completes, it supersedes that message's older claims atomically. Old and new versions never coexist in a comparison.
+    - **Pinned date context.** Relative and yearless dates ("next Friday", "May 3") are resolved against the message's own received time in the configured time zone, pinned when the message is stored. Re-extraction months later therefore gives the same date. If that context is unavailable, the claim is rejected.
+17. **Discrepancies are computed in code, never by the model. Comparability has one owner: the comparability rule.** Two validated claims are comparable only if every one of these holds, and only under item 16a:
     1. They are in the same thread.
     2. They belong to the same vendor (item 2a).
     3. They have the same type and the same validated comparison key.
@@ -263,6 +273,20 @@ Today the product cannot do this, by construction. A read-only investigation of 
 Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No milestone ships UI that depends on a later one.
 
 This contract owns the arc's rules and invariants. Each milestone plan owns its exact provider calls, schema, and tests, and must satisfy every rule here. Review findings about one milestone's mechanics are raised on that milestone's plan PR, where they can be checked against code. A finding is fixed here only if it contradicts a rule.
+
+### Carried to milestone plans (required items)
+
+Each item below must appear in the named plan's behavior and fail-first tests. That plan cannot be accepted without it.
+
+- **M2:**
+  - Gmail stage-(a) discovery through `messages.list` with durable page tokens.
+  - Microsoft discovery paged by date with local matching.
+  - IMAP reply-header search expanding the component until it is stable.
+- **M4:**
+  - The per-claim anchor binding algorithm, with the two-PO message test.
+  - Canonical item-key derivation, with the "premium red widget" test.
+  - Atomic supersession by extractor version.
+  - The pinned received-time date context, with a re-extraction months later giving the same date.
 
 - **M1, vendor records and thread identity.**
   - Vendor tables and the engine API, with addresses unique across vendors and `watchlist.remove` guarded.
@@ -373,3 +397,9 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
   - Microsoft discovery pages by date and matches locally, never with `$search`;
   - D1 thread retention is assigned to M2.
 - A governance note now sends milestone-mechanics findings to their milestone plan PR.
+- 2026-10-05: fifth Codex round on #200 (seven findings).
+  - Three rule bugs are fixed:
+    - Gmail discovery lists messages rather than using `threads.get`;
+    - `sent_to_vendor` covers recipients matched by domain;
+    - deleting a vendor that owns threads is one atomic unfollow.
+  - The four claims findings are consolidated into item 16a's invariants (per-claim binding, canonical item keys, one extractor version, pinned date context). Their algorithms are carried to the M4 plan as required items.
