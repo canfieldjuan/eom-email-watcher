@@ -74,7 +74,15 @@ Desktop:
 6. A row whose `body_truncated` is true shows a "Partial summary" badge in its collapsed row.
 7. The expanded card shows: `Summary based on the first 20,000 of 54,321 characters. Read the full email in your mail app.` The numbers come from the item, with locale digit grouping.
 8. A row with `false` or `null` shows neither.
-9. The ntfy disclosure (`desktop/src/main.ts:727` and `README.md` "ntfy" section) adds "and, when the summary covers only part of a long email, a fixed note saying so." (See decision D1.)
+9. The ntfy disclosure copy changes in its canonical source, `docs/NTFY_DISCLOSURE_MIGRATION_CONTRACT.md` (the exact-copy block). Every restatement moves with it: the panel in `desktop/src/main.ts:727`, the exact-copy assertion in `desktop/test/ntfyDisclosureMigration.test.ts`, and the field list in the `README.md` ntfy section. The clause
+
+   > and either the local-model summary with any suggested action and deadline, fixed fallback text, or scheduling review text that may contain an email-derived summary.
+
+   becomes
+
+   > and either the local-model summary with any suggested action and deadline and, when the summary covers only part of a long email, a fixed note saying so; fixed fallback text; or scheduling review text that may contain an email-derived summary.
+
+   The acknowledgement stays a boolean, and the canonical contract sets no re-acknowledgement rule for copy changes. (See decision D1.)
 
 ### Invariants
 
@@ -96,7 +104,7 @@ Desktop:
 
 ### Failure cases
 
-- **An adapter returns content without `body_source_chars`:** construction fails, so the message takes the existing analysis-failure path. Tests prove every adapter sets it.
+- **An adapter returns content without `body_source_chars`:** this is a programmer error that fails fast, not a runtime failure path. `MessageContent(...)` raises `TypeError`, and `_process_pending` does not catch it, so the whole check fails loudly rather than storing an analysis with unknown truncation. The required field exists so this cannot ship: the four adapters are the only production constructors, and each one's construction is exercised by the adapter tests below, so an omission fails CI.
 - **The store guard rejects inconsistent counts:** `mark_analyzed` raises, the transaction rolls back, and the message stays pending for retry. It is never stored with a summary and no counts.
 - **The Rust host drops unknown fields:** `InboxItem` has no `deny_unknown_fields` (`desktop/src-tauri/src/engine.rs:1131`). The three fields must be declared there, and the typed contract test must carry them.
 
@@ -123,7 +131,8 @@ Desktop:
 - `desktop/src-tauri/src/engine.rs`
 - `desktop/src/main.ts`, `desktop/src/inboxBodyTruncation.ts` (new), `desktop/src/styles.css`
 - `desktop/test/inboxBodyTruncation.test.ts` (new)
-- `README.md`, `docs/ENGINE_API.md` (the `inbox.query` contract section)
+- `README.md`, `docs/ENGINE_API.md` (the `inbox.query` contract section), `docs/NTFY_DISCLOSURE_MIGRATION_CONTRACT.md` (the canonical disclosure copy)
+- `desktop/test/ntfyDisclosureMigration.test.ts` (the exact-copy assertion)
 - `tests/test_mime.py`, `test_imap.py`, `test_microsoft365.py`, `test_service.py`, `test_db.py`, `test_engine_api.py`, `test_notifications.py`, and every test fake that constructs `MessageContent`
 
 ## Mechanism
@@ -175,6 +184,7 @@ Fail-first: each behavior test must fail on `b65d34a`.
   - a v28 database is refused by version-27 code, matching the existing newer-version test pattern.
 - **Engine:** `inbox.query` returns the three fields for truncated, untruncated, unanalyzed, and legacy rows.
 - **Notifications:** both paths append the fixed line exactly when truncated, and never on fallback or review notifications.
+- **Disclosure copy:** `ntfyDisclosureMigration.test.ts` asserts the new panel text exactly. The panel, the canonical contract block, and the README field list all name the partial-summary note.
 - **Rust:** the typed contract test round-trips the three fields.
 - **Desktop:** `inboxBodyTruncation` covers true, false, null, missing fields, and digit grouping. Source wiring renders the badge and note.
 - **Gateway identity:** for the same message, the prompt and request body are byte-identical before and after the change.
