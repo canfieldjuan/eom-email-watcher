@@ -8134,3 +8134,136 @@ def test_main_rejects_duplicate_json_members_at_every_rule_depth(
 
     assert exit_info.value.code == 2
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "invalid_json"
+
+
+def _desktop_rule_put_operation() -> str:
+    # Bind this regression to the production native save route, not an assumed API.
+    source = (Path(__file__).parents[1] / "desktop/src-tauri/src/engine.rs").read_text()
+    method = source.split("pub fn put_automation_rule(", 1)[1].split(
+        "pub fn set_automation_rule_enabled(", 1
+    )[0]
+    calls = re.findall(r'self\.request\("([^"]+)", payload\)', method)
+    assert len(calls) == 1, "desktop rule save must have one engine write owner"
+    return calls[0]
+
+
+@pytest.mark.parametrize("editing", [False, True], ids=["create", "edit"])
+@pytest.mark.parametrize("remove_sender", [True, False], ids=["removed", "active"])
+def test_desktop_watched_save_uses_current_sender_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, editing: bool, remove_sender: bool
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    identity = _bind_test_mailbox(runtime.store, DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID)
+    monkeypatch.setattr(engine_api, "_automation_rule_scope_identity", lambda *_: identity)
+    definition = _automation_definition()
+    definition["scope"] = {"provider": DEFAULT_MAIL_PROVIDER, "account_id": DEFAULT_MAIL_ACCOUNT_ID}
+    definition["action"]["capability"]["id"] = "certificate.extract"
+    definition["conditions"].insert(
+        0, {"field": "sender", "op": "equals", "value": "a@example.com"}
+    )
+    cached = engine_api._response(request(config_path, "watchlist.list"))
+    assert any(
+        s["email"] == "a@example.com" and s["admission_active"] for s in cached["data"]["items"]
+    )
+    payload = {"definition": definition}
+    if editing:
+        created = engine_api._response(request(config_path, _desktop_rule_put_operation(), payload))
+        assert created["ok"], created
+        payload.update(rule_id=created["data"]["rule"]["summary"]["rule_id"], expected_version=1)
+    if remove_sender:
+        removed = engine_api._response(
+            request(config_path, "watchlist.remove", {"email": "a@example.com"})
+        )
+        assert removed["ok"], removed
+    before = runtime.store.automation_rules_snapshot()
+    result = engine_api._response(request(config_path, _desktop_rule_put_operation(), payload))
+    assert result["ok"] is (not remove_sender), result
+    if remove_sender:
+        assert result["error"]["code"] == "invalid_rule"
+        assert runtime.store.automation_rules_snapshot() == before
+    else:
+        assert result["data"]["rule"]["summary"]["version"] == (2 if editing else 1)
+
+
+@pytest.mark.parametrize(
+    "sender_conditions",
+    [
+        [],
+        [{"field": "sender", "op": "domain_equals", "value": "example.com"}],
+        [
+            {"field": "sender", "op": "equals", "value": "a@example.com"},
+            {"field": "sender", "op": "equals", "value": "z@example.com"},
+        ],
+        [{"field": "sender", "op": "equals", "value": "absent@example.com"}],
+    ],
+)
+def test_watched_save_rejects_missing_mixed_or_inactive_sender_without_changing_generic_put(
+    tmp_path: Path, sender_conditions: list[dict[str, str]]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    definition = _automation_definition()
+    definition["conditions"] = sender_conditions + definition["conditions"]
+    result = engine_api._response(
+        request(config_path, _desktop_rule_put_operation(), {"definition": definition})
+    )
+    assert result["error"]["code"] == "invalid_rule"
+    assert load_runtime(config_path).store.automation_rules_snapshot() == (0, [])
+    generic = engine_api._response(
+        request(config_path, "automation.rules.put", {"definition": definition})
+    )
+    assert generic["ok"], generic
+
+
+def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    held = False
+    observations = []
+    original_lock = engine_api.operation_lock
+    original_allowlist = config_module.Config.allowlist.fget
+    original_put = Store.put_automation_rule
+
+    @contextmanager
+    def tracked_lock(path: Path, message: str):
+        nonlocal held
+        with original_lock(path, message):
+            assert not held
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+
+    def allowlist(config):
+        assert held, "live sender admission escaped the shared mutation lock"
+        observations.append("membership")
+        return original_allowlist(config)
+
+    def put(store, *args, **kwargs):
+        assert held
+        assert "membership" in observations
+        removal = engine_api._response(
+            request(config_path, "watchlist.remove", {"email": "a@example.com"})
+        )
+        assert removal["error"]["code"] == "mailbox_busy"
+        observations.append("commit")
+        return original_put(store, *args, **kwargs)
+
+    monkeypatch.setattr(engine_api, "operation_lock", tracked_lock)
+    monkeypatch.setattr(config_module.Config, "allowlist", property(allowlist))
+    monkeypatch.setattr(Store, "put_automation_rule", put)
+    definition = _automation_definition()
+    definition["conditions"].insert(
+        0, {"field": "sender", "op": "equals", "value": "a@example.com"}
+    )
+    result = engine_api._response(
+        request(config_path, _desktop_rule_put_operation(), {"definition": definition})
+    )
+    assert result["ok"], result
+    assert observations == ["membership", "commit"]
+    assert held is False

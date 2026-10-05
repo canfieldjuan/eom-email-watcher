@@ -1809,7 +1809,7 @@ impl Engine {
             .mailbox_operation_gate
             .lock()
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
-        self.request("automation.rules.put", payload)
+        self.request("automation.rules.put_watched", payload)
     }
 
     pub fn set_automation_rule_enabled(
@@ -4057,7 +4057,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
             "automation.rules.list",
             "automation.rules.get",
             "automation.rules.prepare",
-            "automation.rules.put",
+            "automation.rules.put_watched",
             "automation.rules.set_enabled",
         ] {
             let data = match operation {
@@ -4116,7 +4116,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                     );
                     json!({"definition":definition})
                 }
-                "automation.rules.put" => {
+                "automation.rules.put_watched" => {
                     assert_eq!(
                         engine
                             .put_automation_rule(definition.clone(), Some("rule-a".into()), Some(7))
@@ -4143,7 +4143,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
             let request: Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
             assert_eq!(request["operation"], operation);
             assert_eq!(request["payload"], expected);
-            if operation == "automation.rules.put" {
+            if operation == "automation.rules.put_watched" {
                 engine
                     .put_automation_rule(definition.clone(), None, None)
                     .unwrap();

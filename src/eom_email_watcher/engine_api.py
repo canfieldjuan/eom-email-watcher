@@ -2365,7 +2365,13 @@ def _automation_rules_prepare(request: dict[str, object]) -> dict[str, object]:
         raise ApiError("invalid_rule", exc.reason) from exc
 
 
-def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
+def _automation_rules_put_watched(request: dict[str, object]) -> dict[str, object]:
+    return _automation_rules_put(request, require_watched_sender=True)
+
+
+def _automation_rules_put(
+    request: dict[str, object], *, require_watched_sender: bool = False
+) -> dict[str, object]:
     payload = _payload(request, {"rule_id", "expected_version", "definition"})
     fields = set(payload)
     create = fields == {"definition"}
@@ -2381,6 +2387,17 @@ def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
 
     def put(runtime: Runtime) -> dict[str, object]:
         try:
+            if require_watched_sender:
+                senders = [item for item in definition.conditions if item.field == "sender"]
+                if (
+                    len(senders) != 1
+                    or senders[0].op != "equals"
+                    or senders[0].value not in runtime.config.allowlist
+                ):
+                    raise RuleValidationError(
+                        "Select one currently watched exact sender; "
+                        "refresh saved rules before saving"
+                    )
             if rule_id is None:
                 runtime.store.require_automation_rule_create_capacity()
             else:
@@ -5857,6 +5874,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "automation.rules.list": _automation_rules_list,
     "automation.rules.prepare": _automation_rules_prepare,
     "automation.rules.put": _automation_rules_put,
+    "automation.rules.put_watched": _automation_rules_put_watched,
     "automation.rules.set_enabled": _automation_rules_set_enabled,
     "attachment.export": _attachment_export,
     "calendar.read.connect": _calendar_read_connect,
