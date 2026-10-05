@@ -154,7 +154,7 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
                 "byte_size": len(PDF),
                 "sha256": hashlib.sha256(PDF).hexdigest(),
                 "display_name": "invoice.pdf",
-                "source_app_id": "eom-email-watcher",
+                "source_app_id": connect.SOURCE_APP_ID,
             }
         ],
         "parameters": {},
@@ -174,7 +174,7 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
         input_byte_size=len(PDF),
         input_sha256=hashlib.sha256(PDF).hexdigest(),
         input_display_name="invoice.pdf",
-        source_app_id="eom-email-watcher",
+        source_app_id=connect.SOURCE_APP_ID,
         request_json=json.dumps(request, separators=(",", ":")).encode(),
         capability_produces=(CERTIFICATE_MEDIA_TYPE,),
     )

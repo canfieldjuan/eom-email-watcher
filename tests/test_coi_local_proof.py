@@ -2,12 +2,14 @@
 
 import copy
 import importlib.util
+import json
 import os
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -108,6 +110,8 @@ def identity_checkout(tmp_path, monkeypatch):
             __file__=str(checkout / "src/eom_email_watcher/__init__.py")
         ),
         "eom_email_watcher.engine_api": proof.engine_api,
+        **{name: module for name, module in sys.modules.items()
+           if name == "connect_automate" or name.startswith("connect_automate.")},
     }))
     return checkout
 
@@ -148,6 +152,44 @@ def test_identity_accepts_clean_checkout_with_ignored_output(identity_checkout):
     output.mkdir()
     (output / "scratch.txt").write_text("build artifact")
     assert proof.watcher_identity()["watcher_head"] == expected
+
+
+def test_identity_records_executed_connect_sources(identity_checkout):
+    identity = proof.watcher_identity()
+    dependency = identity["connect_dependency"]
+    assert dependency["version"]
+    source = Path(proof.connect.__file__)
+    assert dependency["sources"]["connect.py"] == proof.hashlib.sha256(
+        source.read_bytes()
+    ).hexdigest()
+    assert "entitlement.py" in dependency["sources"]
+
+
+@pytest.mark.parametrize("filename", ["connect.py", "entitlement.py", "lazy_module.py"])
+def test_package_identity_changes_with_executable_code(tmp_path, monkeypatch, filename):
+    (tmp_path / "__init__.py").write_text("")
+    module = tmp_path / filename
+    module.write_text("original = True\n")
+    monkeypatch.setattr(proof, "sys", SimpleNamespace(modules={}))
+    before = proof.package_sources("dependency", tmp_path)
+    module.write_text("original = False\n")
+    after = proof.package_sources("dependency", tmp_path)
+    assert before[filename] != after[filename]
+
+
+def test_package_identity_rejects_foreign_loaded_module(tmp_path, monkeypatch):
+    package = tmp_path / "dependency"
+    package.mkdir()
+    source = package / "__init__.py"
+    source.write_text("")
+    module = SimpleNamespace(__file__=str(source))
+    monkeypatch.setattr(proof, "sys", SimpleNamespace(modules={"dependency": module}))
+    assert proof.package_sources("dependency", package)
+    foreign = tmp_path / "foreign.py"
+    foreign.write_text("foreign = True\n")
+    module.__file__ = str(foreign)
+    with pytest.raises(RuntimeError, match="outside the recorded"):
+        proof.package_sources("dependency", package)
 
 
 def test_checkout_status_has_one_owner_and_no_path_filter():
@@ -216,6 +258,101 @@ def test_explicit_model_declarations_reach_runtime(cli, model_kind):
     cli(model_kind=model_kind)
     with pytest.raises(ReachedRuntime):
         proof.main()
+
+
+def test_admitted_input_is_retained_with_its_oracles(cli, tmp_path):
+    output = cli()
+    original = tmp_path / "input.pdf"
+    content = original.read_bytes()
+    with pytest.raises(ReachedRuntime):
+        proof.main()
+    original.unlink()
+    retained = output / "input.pdf"
+    assert retained.is_file(), "Proof must retain the admitted PDF bytes"
+    assert retained.read_bytes() == content
+    assert retained.stat().st_mode & 0o777 == 0o600
+    inputs = json.loads((output / "run-inputs.json").read_text())
+    assert inputs["input_sha256"] == proof.hashlib.sha256(content).hexdigest()
+    assert inputs["expected_policy_count"] == 0
+    assert inputs["today"] == "2026-09-20"
+
+
+@pytest.fixture
+def completed_main_run(cli, tmp_path, monkeypatch):
+    from test_certificate_expiry_ledger import (
+        _capability_result,
+        _certificate_fire_job,
+        _record,
+    )
+    from test_connect_v2_engine_api import PDF, capability, seeded_runtime
+
+    output = cli()
+    Path(sys.argv[sys.argv.index("--pdf") + 1]).write_bytes(PDF)
+    sys.argv[sys.argv.index("--expect-policy-count") + 1] = "4"
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _, runtime = seeded_runtime(seed)
+    _, job_id = _certificate_fire_job(runtime.store)
+    selected = capability(app_id="invoice-processor", app_version="0.1.0",
+                          capability_id="certificate.extract",
+                          produces=("application/vnd.local-connect.certificate+json",),
+                          parameters=())
+    update = proof.connect.CapabilityJobUpdate(
+        job_id=job_id, status="completed", provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id, result=_capability_result(_record()), error=None,
+    )
+    get = Mock(return_value=update)
+    reconcile = Mock(wraps=runtime.store.reconcile_certificate_completed_replay)
+    monkeypatch.setattr(runtime.store, "reconcile_certificate_completed_replay", reconcile)
+    monkeypatch.setattr(proof, "MESSAGE_ID", "message-1")
+    monkeypatch.setattr(proof, "load_runtime", lambda _: runtime)
+    monkeypatch.setattr(proof.StagedMailbox, "seed_message", lambda *_: None)
+    monkeypatch.setattr(proof.StagedMailbox, "seed_analysis", lambda *_: None)
+    monkeypatch.setattr(proof.connect, "discover_capabilities",
+                        lambda: SimpleNamespace(items=[selected]))
+    monkeypatch.setattr(proof, "select_provider", lambda *_: selected)
+    monkeypatch.setattr(proof.connect, "ConnectV2Client", lambda *_: SimpleNamespace(get=get))
+
+    def ledger_response():
+        return {"ok": True, "data": {"items": runtime.store.list_certificate_expiry_ledger(
+            today="2026-09-20", limit=100
+        )}}
+
+    def response(request):
+        if request["operation"] == "certificate.expiry_ledger.list":
+            return ledger_response()
+        if request["operation"] == "connect.queue.pump":
+            if runtime.store.connect_job(job_id).status == "requested":
+                proof.engine_api._apply_connect_update(runtime.store, update)
+            else:
+                assert runtime.store.due_connect_lane_heads() == ()
+        else:
+            assert request["operation"] == "automation.rules.put"
+        return {"ok": True}
+
+    monkeypatch.setattr(proof.engine_api, "_response", response)
+    monkeypatch.setattr(proof.sys, "executable", sys.executable, raising=False)
+    monkeypatch.setattr(proof, "subprocess", SimpleNamespace(
+        check_output=subprocess.check_output,
+        run=lambda *_, **__: SimpleNamespace(stdout=json.dumps(ledger_response())),
+    ))
+    proof.main()
+    return output, get, reconcile
+
+
+def test_main_replays_completed_terminal_update(completed_main_run):
+    output, get, reconcile = completed_main_run
+    summary = json.loads((output / "watcher-result-summary.json").read_text())
+    assert summary["checks"]["replay_unchanged"] is True
+    get.assert_called_once()
+    reconcile.assert_called_once()
+
+
+def test_summary_records_input_oracles(completed_main_run):
+    output, _, _ = completed_main_run
+    summary = json.loads((output / "watcher-result-summary.json").read_text())
+    assert summary["expected_policy_count"] == 4
+    assert summary["today"] == "2026-09-20"
 
 
 def test_foreign_loaded_package_is_rejected_before_io(cli, monkeypatch, tmp_path):
