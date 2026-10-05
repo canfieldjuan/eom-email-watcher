@@ -115,7 +115,6 @@ Each definition is the only place its rule is stated.
 
 - **A thread becomes followed** when one of its in-scope messages has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
   - It is evaluated when a message is captured, and again by [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass). Stored provenance is never consulted.
-  - Following belongs to the gated class ([D-ops](#d-ops-operation-classes-and-gating)).
   - A thread is followed at most once (a unique row per thread key), under the operation lock (`engine_api.py:2192-2199`).
 - **Owner.** The owner is the vendor of the message that started the follow, recorded with it.
   - It never changes, except through a merge ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
@@ -171,7 +170,7 @@ Each definition is the only place its rule is stated.
 
 ### D-body: stored bodies
 
-- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Body storage belongs to the gated class ([D-ops](#d-ops-operation-classes-and-gating)). Messages outside followed threads keep today's summary-only storage.
+- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage.
 - **What is stored:**
   - the normalized text, from `bounded_body_text` with a named storage cap larger than `body_char_limit`;
   - the pre-cut length;
