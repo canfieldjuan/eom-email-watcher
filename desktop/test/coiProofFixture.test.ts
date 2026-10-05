@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runInNewContext } from "node:vm";
+import { renderSavedHtml } from "../../scripts/coi_render_probe.mjs";
 import test from "node:test";
 
 const script = fileURLToPath(new URL("../../scripts/coi_rendering_fixture.mjs", import.meta.url));
@@ -54,31 +55,60 @@ test("complete fixture renders and reloads from inline data without HTTP or modu
   const { result, output } = generate(items);
   assert.equal(result.status, 0, result.stderr);
   const html = readFileSync(join(output, "index.html"), "utf8");
-  const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
-  assert.equal(inline.length, 1, "disk-loadable artifact must contain its executable script");
-  const element = () => ({
-    children: [] as any[], dataset: {} as Record<string, string>, textContent: "", hidden: false,
-    append(...values: any[]) { this.children.push(...values); },
-    replaceChildren() { this.children = []; },
-    addEventListener(_name: string, callback: () => void) { this.reload = callback; },
-    reload: () => {},
-  });
-  const elements = Object.fromEntries([
-    "expiry-ledger-rows", "expiry-ledger-table-wrap", "expiry-ledger-status", "reload",
-  ].map(id => [id, element()]));
-  runInNewContext(inline[0][1], { document: {
-    getElementById: (id: string) => elements[id], createElement: element,
-  } });
-  const observed = () => elements["expiry-ledger-rows"].children.map(row => ({
-    expiry: row.children[8].textContent, review: row.children[9].textContent,
-  }));
-  assert.deepEqual(observed(), [
+  const rendered = renderSavedHtml(html);
+  assert.deepEqual(rendered.initial.map(row => ({ expiry: row[8], review: row[9] })), [
     { expiry: "Expired", review: "Extracted" },
     { expiry: "Expires today", review: "Extracted" },
     { expiry: "Upcoming", review: "Extracted" },
     { expiry: "Needs review", review: "Needs review" },
   ]);
-  assert.equal(elements["expiry-ledger-rows"].children[0].children[1].textContent, items[0].insured);
-  elements.reload.reload();
-  assert.equal(elements["expiry-ledger-rows"].children.length, items.length);
+  assert.equal(rendered.initial[0][1], items[0].insured);
+  assert.deepEqual(rendered.after_reload, rendered.initial);
+});
+
+
+for (const marker of ["primary", "linked"]) {
+  for (const alias of [false, true]) {
+    test(`rendering rejects ${marker} worktree output, symlink=${alias}`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "coi-private-output-"));
+      const repo = join(dir, "repo");
+      mkdirSync(repo);
+      if (marker === "primary") mkdirSync(join(repo, ".git"));
+      else writeFileSync(join(repo, ".git"), "gitdir: /private/metadata");
+      const input = join(dir, "response.json");
+      writeFileSync(input, JSON.stringify({ ok: true, data: { items: rows() } }));
+      const link = join(dir, "alias");
+      if (alias) symlinkSync(repo, link, "dir");
+      const output = join(alias ? link : repo, "output");
+      const result = spawnSync(process.execPath, [script, input, output], { encoding: "utf8" });
+      assert.notEqual(result.status, 0, "Git-contained output must be rejected");
+      assert.equal(existsSync(output), false);
+    });
+  }
+}
+
+test("receipt binds embedded production stylesheet bytes", () => {
+  const { result, output } = generate(rows());
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(readFileSync(join(output, "source-receipt.json"), "utf8"));
+  const stylesheet = readFileSync(new URL("../src/styles.css", import.meta.url));
+  assert.equal(receipt.styles_sha256, createHash("sha256").update(stylesheet).digest("hex"));
+});
+
+
+test("generator delegates directory admission and creation to the shared owner", () => {
+  const source = readFileSync(script, "utf8");
+  assert.ok(source.includes("scripts/coi_evidence.py"));
+  assert.doesNotMatch(source, /\bmkdir(?:Sync)?\s*\(/);
+});
+
+
+test("shared directory result preserves escaped and trailing-newline paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "coi-output-encoding-"));
+  const input = join(dir, "response.json");
+  writeFileSync(input, JSON.stringify({ ok: true, data: { items: rows() } }));
+  const output = join(dir, 'quote"back\\slash\n');
+  const result = spawnSync(process.execPath, [script, input, output], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(existsSync(join(output, "index.html")));
 });

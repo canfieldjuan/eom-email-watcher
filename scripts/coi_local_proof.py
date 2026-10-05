@@ -2,7 +2,8 @@
 
 Run with an isolated XDG_RUNTIME_DIR containing a running invoice-connect provider.
 Uses the installed entitlement through the published keyring; never reads it directly.
-Only mailbox retrieval is staged from --pdf. Provider results are never mocked.
+Message ingestion, attachment discovery, analysis and attachment retrieval are staged.
+Provider results are never mocked; --model-kind records any model substitution.
 Supply the expected provider instance and versions from its retained launch receipt;
 that receipt must record the tested source revision. Manifest versions alone are not
 source revision attestation. The selected identity is retained with the result.
@@ -26,6 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from build_desktop_sidecar import validate_entitlement_keyring
+from coi_evidence import create_evidence_directory
 from connect_automate import connect, entitlement
 from tomlkit import dumps as toml_dumps
 
@@ -36,8 +38,8 @@ from eom_email_watcher.mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROV
 from eom_email_watcher.mime import AttachmentDescriptor
 from eom_email_watcher.runtime import load_runtime
 
-# The only replaced boundary is mailbox attachment retrieval. All Connect discovery,
-# dispatch, provider processing, validation and persistence run unchanged.
+# Mailbox state and analysis are seeded; attachment bytes come from the staged adapter.
+# Connect discovery, dispatch, provider processing, validation and persistence run unchanged.
 ROOT: Path
 INPUT: Path
 STATE: Path
@@ -110,6 +112,66 @@ def request(operation: str, payload: dict[str, object] | None = None) -> dict[st
 class StagedMailbox:
     def __init__(self, content: bytes) -> None:
         self.content = content
+        self.substitutions = {
+            "attachment_retrieval": "StagedMailbox returns --pdf bytes; no live mailbox retrieval",
+        }
+
+    def seed_message(self, runtime) -> None:
+        runtime.store.reconcile_mailbox_identity(
+            DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID, IDENTITY, legacy_status="replacement"
+        )
+        now = datetime.now(UTC).isoformat()
+        runtime.store.add_message(
+            message_id=MESSAGE_ID,
+            thread_id=None,
+            sender="fixture@example.invalid",
+            sender_name="Isolated fixture",
+            subject="Approved COI proof",
+            received_at=now,
+            provider=DEFAULT_MAIL_PROVIDER,
+            account_id=DEFAULT_MAIL_ACCOUNT_ID,
+            provider_message_id=MESSAGE_ID,
+            mailbox_identity_key=IDENTITY,
+            admission=AdmissionProvenance(
+                kind="exact_sender",
+                selector_id="sender:fixture@example.invalid",
+                display_name="Isolated fixture",
+                mailbox_identity_key=IDENTITY,
+                admitted_at=now,
+            ),
+        )
+        runtime.store.replace_attachments(
+            MESSAGE_ID,
+            (
+                AttachmentDescriptor(
+                    PART_ID, ATTACHMENT_ID, "certificate.pdf", "application/pdf",
+                    len(self.content), 0
+                ),
+            ),
+        )
+        self.substitutions.update({
+            "message_ingestion": "Store.add_message seeds a retained message; no mailbox ingestion",
+            "attachment_discovery": "Store.replace_attachments seeds one attachment descriptor",
+        })
+
+    def seed_analysis(self, runtime) -> None:
+        runtime.store.mark_analyzed(
+            MESSAGE_ID,
+            {
+                "category": "informational",
+                "priority": "normal",
+                "summary": "Certificate arrived.",
+                "action_required": True,
+                "suggested_action": "Review certificate expiry.",
+                "deadline_text": None,
+                "deadline_iso": None,
+                "confidence": 0.9,
+            },
+            mailbox_identity_key=IDENTITY,
+        )
+        self.substitutions["message_analysis"] = (
+            "Store.mark_analyzed seeds a completed analysis; no analyzer call"
+        )
 
     def mailbox_identity_key(self) -> str:
         return IDENTITY
@@ -133,13 +195,6 @@ def select_provider(items, expected):
     if len(candidates) != 1:
         raise RuntimeError(f"expected one pinned certificate provider, found {len(candidates)}")
     return candidates[0]
-
-
-def evidence_directory(path: Path) -> Path:
-    resolved = path.resolve()
-    if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
-        raise RuntimeError("Private evidence must be outside every Git worktree")
-    return resolved
 
 
 def projection_matches(ledger, parents, children, count, expect_error):
@@ -212,8 +267,7 @@ def main() -> None:
     identity = watcher_identity()
     os.umask(0o077)
     INPUT = args.pdf.resolve(strict=True)
-    ROOT = evidence_directory(args.evidence_dir)
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=False)
+    ROOT = create_evidence_directory(args.evidence_dir)
     STATE = ROOT / "watcher-state"
     STATE.mkdir(mode=0o700)
     CONFIG = STATE / "config.toml"
@@ -238,37 +292,8 @@ def main() -> None:
     runtime = load_runtime(CONFIG)
     runtime.config.gmail_token_file.write_text("isolated-fixture-only", encoding="utf-8")
     runtime.config.gmail_token_file.chmod(0o600)
-    runtime.store.reconcile_mailbox_identity(
-        DEFAULT_MAIL_PROVIDER, DEFAULT_MAIL_ACCOUNT_ID, IDENTITY, legacy_status="replacement"
-    )
-    now = datetime.now(UTC).isoformat()
-    runtime.store.add_message(
-        message_id=MESSAGE_ID,
-        thread_id=None,
-        sender="fixture@example.invalid",
-        sender_name="Isolated fixture",
-        subject="Approved COI proof",
-        received_at=now,
-        provider=DEFAULT_MAIL_PROVIDER,
-        account_id=DEFAULT_MAIL_ACCOUNT_ID,
-        provider_message_id=MESSAGE_ID,
-        mailbox_identity_key=IDENTITY,
-        admission=AdmissionProvenance(
-            kind="exact_sender",
-            selector_id="sender:fixture@example.invalid",
-            display_name="Isolated fixture",
-            mailbox_identity_key=IDENTITY,
-            admitted_at=now,
-        ),
-    )
-    runtime.store.replace_attachments(
-        MESSAGE_ID,
-        (
-            AttachmentDescriptor(
-                PART_ID, ATTACHMENT_ID, "certificate.pdf", "application/pdf", len(content), 0
-            ),
-        ),
-    )
+    staged = StagedMailbox(content)
+    staged.seed_message(runtime)
     expected_provider = {
         "app_id": "invoice-processor",
         "capability_id": "certificate.extract",
@@ -299,27 +324,14 @@ def main() -> None:
     put = engine_api._response(request("automation.rules.put", {"definition": rule}))
     if not put.get("ok"):
         raise RuntimeError(f"rule put failed: {put.get('error', {}).get('code')}")
-    runtime.store.mark_analyzed(
-        MESSAGE_ID,
-        {
-            "category": "informational",
-            "priority": "normal",
-            "summary": "Certificate arrived.",
-            "action_required": True,
-            "suggested_action": "Review certificate expiry.",
-            "deadline_text": None,
-            "deadline_iso": None,
-            "confidence": 0.9,
-        },
-        mailbox_identity_key=IDENTITY,
-    )
+    staged.seed_analysis(runtime)
     fires = runtime.store.automation_fires_for_message(MESSAGE_ID)
     if len(fires) != 1:
         raise RuntimeError(f"expected one fire, found {len(fires)}")
     fire_id = fires[0].fire_id
     progress: list[dict[str, object]] = []
     deadline = time.monotonic() + 300
-    with patch.object(engine_api.GmailGateway, "from_token", return_value=StagedMailbox(content)):
+    with patch.object(engine_api.GmailGateway, "from_token", return_value=staged):
         while time.monotonic() < deadline:
             pumped = engine_api._response(request("connect.queue.pump", {"limit": 25}))
             if not pumped.get("ok"):
@@ -343,7 +355,7 @@ def main() -> None:
         request("certificate.expiry_ledger.list", {"today": args.today, "limit": 100})
     )
     before = ledger
-    with patch.object(engine_api.GmailGateway, "from_token", return_value=StagedMailbox(content)):
+    with patch.object(engine_api.GmailGateway, "from_token", return_value=staged):
         for _ in range(3):
             replay = engine_api._response(request("connect.queue.pump", {"limit": 25}))
             if not replay.get("ok"):
@@ -372,7 +384,7 @@ def main() -> None:
     job = runtime.store.connect_job(fire.job_id) if fire.job_id else None
     result = {
         "input_sha256": hashlib.sha256(content).hexdigest(),
-        "mailbox_source": "isolated staged adapter, not live Gmail",
+        "substituted_boundaries": staged.substitutions,
         "provider_identity": {
             field: getattr(selected, field) for field in expected_provider
         },

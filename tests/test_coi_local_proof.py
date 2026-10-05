@@ -17,6 +17,7 @@ proof = importlib.util.module_from_spec(spec)
 sys.path.insert(0, str(Path(spec.origin).parent))
 try:
     spec.loader.exec_module(proof)
+    import coi_evidence
 finally:
     sys.path.pop(0)
 
@@ -184,13 +185,13 @@ def test_git_evidence_destination_is_rejected(tmp_path, marker, symlink):
         link.symlink_to(repo, target_is_directory=True)
         output = link / "nested" / "evidence"
     with pytest.raises(RuntimeError, match="Git"):
-        proof.evidence_directory(output)
+        coi_evidence.evidence_directory(output)
     assert not output.exists()
 
 
 def test_external_evidence_destination_is_accepted(tmp_path):
     output = tmp_path / "new" / "evidence"
-    assert proof.evidence_directory(output) == output
+    assert coi_evidence.evidence_directory(output) == output
     assert not output.exists()
 
 
@@ -291,3 +292,39 @@ def test_projection_known_date_sorts_before_unknown():
     assert proof.projection_matches(ledger, parents, children, 2, None)
     ledger["data"]["items"].reverse()
     assert not proof.projection_matches(ledger, parents, children, 2, None)
+
+
+def test_receipt_names_every_seeded_boundary():
+    from unittest.mock import Mock
+    runtime = SimpleNamespace(store=Mock())
+    staged = proof.StagedMailbox(b"public fixture")
+    assert set(staged.substitutions) == {"attachment_retrieval"}
+    staged.seed_message(runtime)
+    runtime.store.add_message.assert_called_once()
+    runtime.store.replace_attachments.assert_called_once()
+    assert "message_analysis" not in staged.substitutions
+    staged.seed_analysis(runtime)
+    runtime.store.mark_analyzed.assert_called_once()
+    assert set(staged.substitutions) == {
+        "message_ingestion", "attachment_discovery", "message_analysis", "attachment_retrieval",
+    }
+
+
+def test_proof_tools_use_one_evidence_directory_owner():
+    import ast
+    root = Path(proof.__file__).parent
+    tree = ast.parse((root / "coi_local_proof.py").read_text())
+    assignments = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "ROOT"
+                           for target in node.targets)]
+    assert len(assignments) == 1
+    assert isinstance(assignments[0].value, ast.Call)
+    assert isinstance(assignments[0].value.func, ast.Name)
+    assert assignments[0].value.func.id == "create_evidence_directory"
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and isinstance(node.func.value, ast.Name) and node.func.value.id == "ROOT"
+                   and node.func.attr == "mkdir" for node in ast.walk(tree))
+    assert not any(isinstance(node, ast.FunctionDef) and node.name == "evidence_directory"
+                   for node in ast.walk(tree))
+    assert proof.create_evidence_directory is coi_evidence.create_evidence_directory

@@ -1,16 +1,19 @@
 /** Build a source-rendering fixture from production markup/functions and an engine response.
  * This is explicitly not an installed Tauri proof. No renderer implementation is copied here.
  * Usage: node scripts/coi_rendering_fixture.mjs ENGINE_RESPONSE_JSON NEW_OUTPUT_DIRECTORY
+ * Requires Python 3 (COI_PROOF_PYTHON overrides the interpreter).
  * Open NEW_OUTPUT_DIRECTORY/index.html directly. All data, code and styles are embedded.
  */
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { renderSavedHtml } from './coi_render_probe.mjs';
 import { createHash } from 'node:crypto';
 import { stripTypeScriptTypes } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 
-const [responsePath, outputPath] = process.argv.slice(2);
-if (!responsePath || !outputPath) throw new Error('Engine response and new output directory required');
+const [responsePath, requestedOutputPath] = process.argv.slice(2);
+if (!responsePath || !requestedOutputPath) throw new Error('Engine response and new output directory required');
 const root = fileURLToPath(new URL('../', import.meta.url));
 const source = await readFile(resolve(root, 'desktop/src/main.ts'), 'utf8');
 const responseText = await readFile(responsePath, 'utf8');
@@ -66,11 +69,19 @@ const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>COI so
 <p>Source rendering proof using a saved engine response. Installed desktop integration is not exercised.</p>
 <button id="reload">Reload saved engine response</button>${markup}
 </main><script>${adapter}</script></body></html>`;
-await mkdir(outputPath, { mode: 0o700 });
+const rendered = renderSavedHtml(html);
+// The Python owner admits and creates the destination for both proof tools.
+const outputPath = JSON.parse(execFileSync(
+  process.env.COI_PROOF_PYTHON ?? (process.platform === 'win32' ? 'python' : 'python3'),
+  [resolve(root, 'scripts/coi_evidence.py'), requestedOutputPath],
+  { encoding: 'utf8' },
+));
 const hash = value => createHash('sha256').update(value).digest('hex');
 for (const [name, content] of Object.entries({
   'index.html': html, 'engine-response.json': responseText,
-  'source-receipt.json': JSON.stringify({source_sha256: hash(source), response_sha256: hash(responseText),
+  'rendered-rows.json': JSON.stringify(rendered, null, 2),
+  'source-receipt.json': JSON.stringify({source_sha256: hash(source), styles_sha256: hash(styles), response_sha256: hash(responseText),
+    artifact_sha256: hash(html),
     expiry_states: [...expiryStates].sort(), review_states: [...reviewStates].sort(),
     scope: 'production renderer and markup; saved engine response; no Tauri IPC or installed shell'}, null, 2),
 })) await writeFile(resolve(outputPath, name), content, { mode: 0o600, flag: 'wx' });

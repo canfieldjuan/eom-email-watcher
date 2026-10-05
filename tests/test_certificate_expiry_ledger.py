@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -1813,6 +1816,28 @@ def test_concurrent_certificate_settlement_and_restart_preserve_complete_project
     response_path = tmp_path / "rendering-engine-response.json"
     response_path.write_text(json.dumps(before), encoding="utf-8")
     response_path.chmod(0o600)
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "rendering"
+    subprocess.run(
+        ["node", str(root / "scripts/coi_rendering_fixture.mjs"),
+         str(response_path), str(output)],
+        env={**os.environ, "COI_PROOF_PYTHON": sys.executable},
+        check=True, capture_output=True, text=True,
+    )
+    observed = json.loads((output / "rendered-rows.json").read_text())
+    assert observed["after_reload"] == observed["initial"]
+    assert [row[8] for row in observed["initial"]] == [
+        "Expired", "Expires today", "Upcoming", "Needs review",
+    ]
+    assert [row[9] for row in observed["initial"]] == [
+        "Extracted", "Extracted", "Extracted", "Needs review",
+    ]
+    assert len(observed["initial"]) == len(before["data"]["items"])
+    for cells, item in zip(observed["initial"], before["data"]["items"], strict=True):
+        assert cells[:6] == [item[field] if item[field] is not None else "Not available"
+                             for field in ("certificate_holder", "insured", "producer",
+                                           "coverage", "insurer", "policy_number")]
+    assert json.loads((output / "engine-response.json").read_text()) == before
 
 
 @pytest.mark.parametrize(
