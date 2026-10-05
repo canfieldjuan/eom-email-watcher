@@ -193,7 +193,9 @@ input. The adapter never issues IMAP write commands such as
 `connect.entitlement.status` and `connect.entitlement.install` are app-local operations rather than
 Connect wire routes. They do not load watcher configuration or private mailbox state. Status
 returns only `active`, `authority_unavailable`, `missing`, `invalid`, `not_yet_valid`, `expired`, or
-`feature_missing` plus an active boolean; it never returns IDs, subjects, timestamps, claims, or key
+`feature_missing` plus `active` and `automations_active` booleans in both responses.
+`automations_active` requires both Connect and Automations and is advisory for display;
+rule writes recheck it authoritatively. Neither response returns IDs, subjects, timestamps, claims, or key
 material. Install accepts no destination. It reads bounded bytes from an absolute regular source
 without following a final symlink, applies the same compiled-authority signature, claim, feature,
 and time checks as live discovery, and admits only a currently active license. Under the shared
@@ -203,6 +205,12 @@ and re-evaluates before returning success. Expected validation, lock, write, and
 failures preserve the existing entitlement and selected source. Stable failure codes follow the
 accepted Connect activation v1 contract. Successful replacement is visible to both apps on their
 next gated operation without restart.
+
+`automation.rules.put` (create/edit), `put_watched`, and `set_enabled(true)` require
+an active Automations entitlement after payload/version/definition validation and before
+locking or runtime access; refusal is `automation_entitlement_required` with message
+"Automation rules require an active Automations entitlement" and writes nothing.
+List, get, prepare, delete, and `set_enabled(false)` remain available without it.
 
 `config.initialize` is the only watcher-configuration operation that may run before the
 configuration file exists. It

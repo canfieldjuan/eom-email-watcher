@@ -12,6 +12,16 @@ export interface RuleSummary {
 export interface RuleDetail { summary: RuleSummary; definition: unknown }
 export interface RuleResult { rule: RuleDetail }
 export interface RuleList { revision: number; rules: RuleSummary[] }
+export function coiControlState(automationsActive: boolean, selectedRule: RuleSummary | null): {
+  saveEnabled: boolean; toggleEnabled: boolean; locked: boolean;
+} {
+  return {
+    saveEnabled: automationsActive,
+    toggleEnabled: selectedRule !== null && (automationsActive || selectedRule.enabled),
+    locked: !automationsActive,
+  };
+}
+
 export interface CoiFields {
   name: string;
   mailbox: { provider: string; account_id: string };

@@ -927,6 +927,8 @@ pub enum ConnectEntitlementState {
 pub struct ConnectEntitlementStatus {
     pub state: ConnectEntitlementState,
     pub active: bool,
+    #[serde(default)]
+    pub automations_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3966,6 +3968,25 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.connect","data
     }
 
     #[test]
+    fn automation_entitlement_status_preserves_true_false_and_defaults_absent() {
+        for flag in [Some(true), Some(false), None] {
+            let mut value = json!({"state": "active", "active": true});
+            if let Some(active) = flag {
+                value["automations_active"] = json!(active);
+            }
+            let status: ConnectEntitlementStatus =
+                serde_json::from_value(value).expect("typed entitlement status");
+            assert_eq!(status.state, ConnectEntitlementState::Active);
+            assert!(status.active);
+            let encoded = serde_json::to_value(status).expect("serialize typed status");
+            assert_eq!(
+                encoded.get("automations_active"),
+                Some(&json!(flag.unwrap_or(false)))
+            );
+        }
+    }
+
+    #[test]
     fn protocol_v1_entitlement_status_is_typed_and_claim_free() {
         let status: ConnectEntitlementStatus = serde_json::from_value(json!({
             "state": "expired",
@@ -3978,6 +3999,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.connect","data
             ConnectEntitlementStatus {
                 state: ConnectEntitlementState::Expired,
                 active: false,
+                automations_active: false,
             }
         );
     }
@@ -5215,6 +5237,7 @@ timezone = "UTC"
             ConnectEntitlementStatus {
                 state: ConnectEntitlementState::AuthorityUnavailable,
                 active: false,
+                automations_active: false,
             }
         );
         assert_eq!(

@@ -287,6 +287,13 @@ live `certificate.extract` v1.0 provider for PDF inputs. Saving creates an enabl
 rule. Confirmation defaults on; automatic extraction requires an explicit user
 choice. Provider-mandated confirmation cannot be disabled by that choice.
 
+Save (create/edit) and resume require an active Automations entitlement; pause does not.
+Each refresh reads `automations_active` from `connect.entitlement.status`. When false,
+disable Save and Resume, retain Pause, and show "Automations locked" with "View Connect".
+View Connect opens and refreshes Health, whose active Connect card states whether
+Automations is included. The engine remains authoritative: an
+`automation_entitlement_required` refusal shows its message and refreshes the locked state.
+
 Use typed admitted Tauri bridges to `automation.rules.list/get/set_enabled` and
 `automation.rules.put_watched` for desktop creates and definition edits.
 These preserve engine-owned identities, immutable versions, compare-and-set edits,

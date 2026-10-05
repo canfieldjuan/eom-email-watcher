@@ -446,7 +446,7 @@ of `RuleDetail` describes the same immutable version.
 
 Public callers cannot set `system`, revision values, timestamps, digests, or
 version numbers. Domain errors are `invalid_rule`, `stale_rule`, `rule_limit`,
-`system_rule_protected`, or `not_found`; mutation lock errors are the
+`system_rule_protected`, `not_found`, or `automation_entitlement_required`; mutation lock errors are the
 `unsupported_platform` and retryable `mailbox_busy` responses above. Scoped
 create/edit may also return retryable `mailbox_identity_unavailable` when the
 provider identity cannot currently be obtained. List is summary-only so the
@@ -863,7 +863,12 @@ Rule deletion does not rewrite already committed fires.
 ## 10. Deferred and explicit non-scope
 
 - Dispatching pending fires into the existing consumer-side Connect queue.
-- Entitlement timing and whether an unlicensed match may later dispatch.
+- Decided: create/edit (`put`, including `put_watched`) and enable require active
+  Connect and Automations entitlements after request validation, before locking/runtime
+  access; otherwise return `automation_entitlement_required` without writing.
+  List/get/prepare, disable and delete remain available under existing CAS/lock rules.
+  Lapse leaves existing rules unchanged; dispatch gating and `entitlement_paused` remain.
+  A lapse between the pre-lock check and commit may admit that call; dispatch stays gated.
 - Provider discovery, effects comparison, source-byte hashing, confirmation,
   retries, settlement, notification delivery, and timer wakeups.
 - Rules/history/approval user interface.
