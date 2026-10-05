@@ -59,6 +59,15 @@ if OCR or another admission step is missing, identify that boundary and keep
 the real-world scanned case open. No result establishes active coverage or
 policy validity without separate verification outside this contract.
 
+### Accepted input baseline (operator decision, 2026-10-04)
+
+The operator approved the recovered encrypted and scanned candidate PDFs as the M3 test
+baseline. Their current private hashes and retained supported-entrypoint outcomes identify
+that baseline. Historical byte-for-byte continuity is not established and is not claimed.
+This decision replaces the requirement to recover authoritative identities for the original
+historical pair; it does not waive the expected-error checks, approved ordinary real-model
+comparison, repeatable acceptance items, or separate M4 installed proof.
+
 ## Milestones and evidence
 
 | Milestone | Finish condition | Current state and evidence |
@@ -66,7 +75,7 @@ policy validity without separate verification outside this contract.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | OPEN: the recovered encrypted/scanned candidates passed admission, but authoritative continuity with the original inputs is unverified. Historical filenames and metadata do not close that gate. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) retains the approved ordinary real-model comparison and repeatable admission, replay/restart, concurrency and rendering evidence; its proof-tool review corrections are pending. The original-input gate needs authoritative identity evidence or an explicit operator decision changing the finish condition. |
+| M3: integrated local proof | Begin with both private real COIs from the accepted input baseline above through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | The recovered pair is accepted as the M3 baseline by the operator decision above; both recorded expected errors with no ledger rows. The approved ordinary real-model comparison and repeatable evidence remain retained. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) has further rendering/evidence review findings to reconcile before M3 completion. Historical byte continuity remains unproven. |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
@@ -101,7 +110,14 @@ contract and update these finish conditions.
 
 ## Current state log
 
-- 2026-10-04, identity-gate correction: my recovery entry below promoted matching historical
+- 2026-10-04, operator baseline decision: following the explicit recommendation to accept
+  the recovered PDFs while preserving the missing historical-hash limitation, the operator
+  replied "lets do it". The Accepted input baseline section above is now the authoritative
+  finish-condition adjustment; issue #188 records the decision. No runtime evidence is
+  relabeled or rerun by this approval. PR187 has new proof-tool findings; M3 review remains
+  pending while the installed Linux M4 preparation begins.
+
+- 2026-10-04, identity-gate correction (before operator baseline decision): my recovery entry below promoted matching historical
   paths and metadata into proof of original-file continuity. It cannot establish that
   continuity without authoritative historical identity evidence. The recovered candidate
   runs and their current hashes remain valid supplemental evidence; M3 stays **OPEN**.
