@@ -74,6 +74,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - The mailbox owner is therefore never suggested as a vendor address.
    - Accepting runs item 1.
    - Dismissing records the dismissal so the same suggestion does not return.
+   - Removing an address from a vendor also records a dismissal for that `(vendor, address)` pair. The product therefore never prompts the user to undo their own removal.
    - Suggestions never admit mail on their own.
 
 ### Admission (adds to today's rules, never replaces them)
@@ -112,7 +113,7 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - **The reconcile pass has three stages, run in order:**
      - **(a) Discovery.** Find messages within retention in INBOX that come from a current vendor address or domain, and messages in Sent addressed (`To`/`Cc`) to one, that are not yet in a followed thread. Their threads become followed.
        - This is how pre-arc retained mail, conversations started while Connect was lapsed, and mail newly in scope after a vendor or retention change all enter threads.
-     - **(b) Thread sync.** For every followed thread, fetch its messages in INBOX and Sent within retention, from its watermark. When the cutoff moved earlier, the sync is full again, from the new cutoff. Each message is admitted as `thread_follow`.
+     - **(b) Thread sync.** For every followed thread, fetch its messages in INBOX and Sent within retention, from its watermark. When the cutoff moved earlier, the sync is full again, from the new cutoff. Each message is admitted under the admission rule (item 5a), which is the only owner of admission kind and direction. A message that also matches `exact_sender` or `vendor_domain` records that stronger kind, whichever path finds it.
      - **(c) Derived work.** Fetch bodies for stored messages that lack one, if the source still exists. Extract claims for inbound vendor messages that lack the current extractor version (M4).
    - Normal polling keeps coverage current between scope changes. The reconcile pass runs only when coverage is stale or a thread's sync is incomplete.
    - **Every stage is bounded per check and resumable from its durable progress,** and never fetches outside retention or outside INBOX and Sent.
@@ -121,7 +122,10 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - **Provider rules the M2 plan must satisfy (its plan specifies and tests the exact calls):**
      - **Content is fetched only after the folder or label check and the retention check pass, on per-message metadata.**
        - Gmail: discovery by `threads.get` with `format=minimal` yields only ids and `labelIds`. It is followed by a bounded per-message `format=metadata` fetch for `internalDate` and headers, before any body fetch.
-       - Microsoft 365: folder-scoped queries on `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, filtered by `conversationId` (sync) or by sender and recipients (discovery), and by `receivedDateTime` at or after the cutoff. Only metadata is selected, and paging uses bounded `@odata.nextLink`.
+       - Microsoft 365: folder-scoped queries on `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, filtered by `conversationId` for sync and by `receivedDateTime` at or after the cutoff.
+         - Discovery pages each folder by the `receivedDateTime` filter alone, selects sender and recipient metadata, and matches normalized addresses locally.
+         - It never relies on `$search`, which is capped and not complete.
+         - Only metadata is selected, and paging uses bounded `@odata.nextLink` with durable resume.
      - **Other folders are never fetched,** including Deleted Items, Drafts, Archive, and Clutter.
      - **IMAP thread sync searches `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References`** for every known id of the component, in INBOX and the resolved Sent folder, with `SINCE` the cutoff.
        - It repeats with newly found ids until the component stops growing or the per-check budget runs out.
@@ -134,7 +138,10 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - **IMAP uses an order-independent component model.**
      - Each message contributes its id set: its own `Message-ID`, `In-Reply-To`, and the bounded `References` list.
      - A thread is a connected component of messages whose id sets overlap, identified by a surrogate thread key (UUIDv4) that is created with the component.
-     - When a new message's ids touch several existing components, they are merged into the earliest-created one in a single transaction. That transaction re-keys every row that names a merged key: messages, follow state, backfill progress, claims, and suggestions. The merged keys are recorded as aliases, so any stale reference resolves to the survivor.
+     - When a new message's ids touch several existing components, they are merged into the earliest-created one in a single transaction. That transaction re-keys every row that names a merged key: messages, claims, and suggestions. The merged keys are recorded as aliases, so any stale reference resolves to the survivor.
+       - **Per-thread state is combined, never overwritten.** If any merged component was followed, the survivor is followed, and its owner is the survivor's owner under item 2a; it is the merged component's owner if the survivor was not followed.
+       - The survivor's sync progress is reset to "full sync from the retention cutoff", which marks coverage stale (item 7), so neither component's unsynced messages can be skipped.
+       - Duplicate follow and progress rows from the merged keys are deleted in the same transaction.
      - The result is the same thread regardless of arrival order. Reply C, then B, then A, ends as one thread.
      - It remains best-effort only where clients break chains entirely. A message whose ids touch no component forms its own.
    - Today's per-message IMAP `thread_id` value is not reused as a thread key.
@@ -183,7 +190,8 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - `term`: short text. Terms are displayed only and never compared.
     - `reference`: kind (`invoice`, `quote`, `po`) and number. References are never compared with each other; they serve only as **transaction anchors** under item 17.
 16. **Evidence is validated in code, as scheduling already does.**
-    - Every quote must be a whitespace-normalized substring of that message's authored text (item 15) or subject.
+    - Every quote must be a whitespace-normalized substring of that message's authored text, as defined by item 15, which is the only owner of the evidence scope.
+    - Subjects are never evidence, because replies inherit them unchanged.
     - **Every structured field is re-derived from its quote in code, or the claim is rejected:**
       - amounts and currencies by a deterministic money parser;
       - dates by the scheduling date rules;
@@ -192,12 +200,14 @@ Today the product cannot do this, by construction. A read-only investigation of 
     - **Comparison keys are also checked in code.**
       - An `amount_role` other than `other`, and a `date_commitment` `what` other than `other`, must have one of that role's fixed keywords in the quote.
       - A quantity's or unit price's item text must be a substring of the quote.
-    - Claims that fail validation are discarded and logged as rejected. They are never shown.
+    - **Validation has two levels, and both are deterministic for the same input:**
+      - **The response:** a response that is not valid JSON for the claims schema is rejected whole. The message shows "Claims unavailable" and no claims are stored.
+      - **Each claim, in a schema-valid response:** each claim is validated independently. Claims that fail are discarded and counted, and are never shown. Claims that pass are stored. If any were discarded, the message shows a "Some claims could not be verified" note.
 17. **Discrepancies are computed in code, never by the model. Comparability has one owner: the comparability rule.** Two validated claims are comparable only if every one of these holds:
     1. They are in the same thread.
     2. They belong to the same vendor (item 2a).
     3. They have the same type and the same validated comparison key.
-    4. They share a **transaction anchor**: a `reference` number, of any kind, present in the authored text of both messages. This applies to `amount` roles other than `unit_price`, to `date_commitment`, and to `quantity`.
+    4. They share a **transaction anchor**: a validated `reference` pair `(kind, number)` extracted from the authored text of both messages. An invoice that cites "Quote #123" carries the anchor `(quote, 123)`, so it matches the quote. An unrelated "Invoice #123" does not. This applies to `amount` roles other than `unit_price`, to `date_commitment`, and to `quantity`.
        - Without a shared anchor, two totals in one thread may belong to different orders, so they are shown side by side as "No shared quote, PO, or invoice number; compare manually" and never flagged.
        - `unit_price` needs no anchor. A changed price for the same normalized item from the same vendor is shown as "price changed since <date>".
     - **`reference`, `term`, `role = other`, and `what = other` are never compared.**
@@ -211,7 +221,8 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 ### Gating
 
-19. **Every operation that captures, syncs, reconciles, extracts, or changes vendor data requires the paid Connect entitlement**, `connect.capability_exchange`, the same feature that gates Connect today (`engine_api.py` `require_connect_entitlement`).
+19. **Every operation that captures, syncs, reconciles, extracts, or adds vendor data requires the paid Connect entitlement**, `connect.capability_exchange`, the same feature that gates Connect today (`engine_api.py` `require_connect_entitlement`).
+    - **Removing data is never gated:** removing an address from a vendor, and deleting a vendor. A user whose Connect has lapsed can therefore still clear an address and then remove it from the watchlist (item 1).
     - **Reading stored data is read-only and is not gated:** listing vendors, threads, messages, bodies, claims, and discrepancies.
     - The read operations never call a provider or model.
     - When the entitlement is inactive, capture stops. Today's inbox behavior continues, and provider cursors keep advancing.
@@ -244,12 +255,14 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 - **A provider thread API error:** that thread's backfill retries with backoff. Polling and inbox behavior are unaffected.
 - **No IMAP Sent folder:** the account shows "Sent mail unavailable". Following still works for inbound mail.
-- **The claims model is unavailable or returns invalid output:** the message shows "Claims unavailable", with no partial claims.
+- **The claims model is unavailable, or returns a response that fails the schema:** the message shows "Claims unavailable", and no claims are stored. Per-claim failures inside a valid response follow item 16 instead.
 - **The entitlement lapses mid-backfill:** backfill stops at the next budget check, and existing rows stay.
 
 ## Milestones
 
 Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No milestone ships UI that depends on a later one.
+
+This contract owns the arc's rules and invariants. Each milestone plan owns its exact provider calls, schema, and tests, and must satisfy every rule here. Review findings about one milestone's mechanics are raised on that milestone's plan PR, where they can be checked against code. A finding is fixed here only if it contradicts a rule.
 
 - **M1, vendor records and thread identity.**
   - Vendor tables and the engine API, with addresses unique across vendors and `watchlist.remove` guarded.
@@ -262,6 +275,8 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
   - Bounded, folder-scoped backfill.
   - `To`/`Cc` are fetched for Sent matching.
   - Local body storage with `secure_delete` for every message M2 captures. Nothing renders bodies yet.
+  - **D1 thread retention.** Purge removes a followed thread as a unit once its newest message is older than `retention_days`. Messages outside followed threads keep today's per-message purge.
+  - The settings copy for retention is updated to say so, and ships in M2 with the purge change.
 - **M3, the thread view.** The CSP, the Vendors → threads → thread UI, and the updated inbox copy.
 - **M4, vendor claims and discrepancies.**
   - The extraction task and code validation, then deterministic discrepancy rules and their UI.
@@ -346,3 +361,15 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
   - Exact provider calls move to the M2 plan, under stated rules: Gmail metadata before the retention check, and IMAP reply-header search.
   - Ambiguity is counted only among comparable claims.
   - Reading stored data is ungated.
+- 2026-10-05: fourth Codex round on #200 (nine findings). Most were contradictions created by restating a rule in a second place. Each section now defers to the rule's single owner:
+  - admission kind (5a) during sync;
+  - evidence scope (15), with subjects excluded;
+  - gating (19), with data removal ungated;
+  - merge (8), which combines per-thread state.
+- Also in the fourth round:
+  - anchors are `(kind, number)` pairs;
+  - claim validation has two deterministic levels (response, then claim);
+  - removing an address suppresses re-suggestion;
+  - Microsoft discovery pages by date and matches locally, never with `$search`;
+  - D1 thread retention is assigned to M2.
+- A governance note now sends milestone-mechanics findings to their milestone plan PR.
