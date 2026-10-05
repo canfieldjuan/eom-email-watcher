@@ -1776,3 +1776,41 @@ def test_starttls_failures_distinguish_transport_from_tls(
     assert raised.value.code == code
     assert "private" not in str(raised.value)
     assert client.logged_out is True
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_body"), [(5, "abc\nd"), (6, "abc\nde"), (7, "abc\nde")]
+)
+def test_live_content_reports_pre_cut_length(limit: int, expected_body: str) -> None:
+    class TwoTextSections(FakeImap):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bodystructure = (
+                b'(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 3 1 NIL NIL NIL NIL) '
+                b'("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 2 1 NIL NIL NIL NIL) '
+                b'"MIXED" ("BOUNDARY" "boundary") NIL NIL NIL)'
+            )
+            self.sections = {"1": b"abc", "2": b"de"}
+
+    client = TwoTextSections()
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    content = gateway.content(message_id(), limit)
+
+    assert content.body == expected_body
+    assert content.body_source_chars == 6
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_body"), [(8, "abcd\nefg"), (9, "abcd\nefgh"), (10, "abcd\nefgh")]
+)
+def test_parsed_message_content_reports_pre_cut_length(
+    limit: int, expected_body: str
+) -> None:
+    message = EmailMessage()
+    message.set_content("  abcd \n\n efgh ")
+
+    content = _content(message, limit)
+
+    assert content.body == expected_body
+    assert content.body_source_chars == 9

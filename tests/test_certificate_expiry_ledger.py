@@ -208,6 +208,8 @@ def _certificate_pending_fires(store: Store, *, count: int = 1) -> list[object]:
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fires = store.automation_fires_for_message("message-1")
     assert len(fires) == count

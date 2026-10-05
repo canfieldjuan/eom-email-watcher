@@ -150,6 +150,8 @@ from .microsoft_calendar import (
     microsoft_cached_mailbox_principal,
     microsoft_mailbox_principal,
 )
+from .mime import body_was_truncated
+from .notifications import PARTIAL_SUMMARY_NOTE
 from .runtime import (
     MAIL_PROVIDER_NAMES,
     Runtime,
@@ -5726,6 +5728,8 @@ def _notification_payload(
             lines.append(f"Next: {intent.suggested_action}")
         if intent.deadline_iso:
             lines.append(f"Deadline: {intent.deadline_iso}")
+        if body_was_truncated(intent.analysis_body_chars, intent.analysis_body_source_chars):
+            lines.append(PARTIAL_SUMMARY_NOTE)
         body = "\n".join(line for line in lines if line)
         priority = intent.priority or "normal"
     elif intent.kind == "automation_review":

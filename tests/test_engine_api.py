@@ -61,6 +61,7 @@ from eom_email_watcher.microsoft_calendar import (
 )
 from eom_email_watcher.mime import AttachmentDescriptor, extract_body
 from eom_email_watcher.model import Analysis, LocalModel
+from eom_email_watcher.notifications import PARTIAL_SUMMARY_NOTE
 from eom_email_watcher.runtime import (
     Runtime,
     load_runtime,
@@ -134,6 +135,8 @@ def _mark_test_analyzed(
     source = store.message_source(message_id)
     assert source.mailbox_identity_key is not None
     values.setdefault("mailbox_identity_key", source.mailbox_identity_key)
+    values.setdefault("body_chars", None)
+    values.setdefault("body_source_chars", None)
     store.mark_analyzed(message_id, result, **values)  # type: ignore[arg-type]
 
 
@@ -6606,10 +6609,10 @@ class FakeGmail:
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        body, attachment_names, attachments = extract_body(
+        body, attachment_names, attachments, body_source_chars = extract_body(
             self.full_payload(message_id), body_char_limit
         )
-        return MessageContent(body, attachment_names, attachments)
+        return MessageContent(body, attachment_names, attachments, body_source_chars)
 
 
 class FakeModel:
@@ -6847,7 +6850,7 @@ def test_catalog_failure_remains_primary_while_processing_persisted_pending_work
             self.content_calls += 1
             if pending_error is not None:
                 raise pending_error
-            return MessageContent("body", (), ())
+            return MessageContent("body", (), (), 4)
 
     gateway = CatalogFailureGateway()
     runtime = Runtime(config=loaded.config, store=loaded.store, model=FakeModel())
@@ -8267,3 +8270,66 @@ def test_watched_save_membership_and_commit_share_watchlist_mutation_lock(
     assert result["ok"], result
     assert observations == ["membership", "commit"]
     assert held is False
+
+
+@pytest.mark.parametrize(
+    ("chars", "source", "truncated"),
+    [(20_000, 20_001, True), (20_000, 20_000, False), (None, None, None)],
+)
+def test_inbox_and_host_notifications_report_body_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    chars: int | None,
+    source: int | None,
+    truncated: bool | None,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    patch_runtime(monkeypatch, runtime)
+    _add_test_message(
+        runtime.store, message_id="long-1", thread_id=None, sender="sender@example.com",
+        sender_name=None, subject="Invoice", received_at="2026-09-30T12:00:00+00:00",
+    )
+    _add_test_message(
+        runtime.store, message_id="pending-1", thread_id=None, sender="sender@example.com",
+        sender_name=None, subject="Later", received_at="2026-09-30T11:00:00+00:00",
+    )
+    _mark_test_analyzed(
+        runtime.store,
+        "long-1",
+        {
+            "category": "invoice",
+            "priority": "normal",
+            "summary": "An invoice arrived.",
+            "action_required": False,
+            "suggested_action": None,
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+        body_chars=chars,
+        body_source_chars=source,
+    )
+
+    response = engine_api._response(request(config_path, "inbox.query", {}))
+    recent = engine_api._response(request(config_path, "inbox.recent", {"limit": 10}))
+
+    assert response["ok"] is True, response
+    assert recent["ok"] is True, recent
+    items = {item["message_id"]: item for item in response["data"]["items"]}
+    recent_items = {item["message_id"]: item for item in recent["data"]["items"]}
+    for field in ("body_analyzed_chars", "body_source_chars", "body_truncated"):
+        assert recent_items["long-1"][field] == items["long-1"][field]
+        assert recent_items["pending-1"][field] is None
+    analyzed, pending = items["long-1"], items["pending-1"]
+    assert (analyzed["body_analyzed_chars"], analyzed["body_source_chars"]) == (chars, source)
+    assert analyzed["body_truncated"] is truncated
+    assert (pending["body_analyzed_chars"], pending["body_source_chars"]) == (None, None)
+    assert pending["body_truncated"] is None
+    [payload] = [
+        item
+        for item in engine_api._pending_notification_payloads(runtime, 10)
+        if item["message_id"] == "long-1"
+    ]
+    assert payload["body"].endswith(PARTIAL_SUMMARY_NOTE) is (truncated is True)

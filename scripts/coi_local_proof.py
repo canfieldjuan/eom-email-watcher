@@ -253,6 +253,8 @@ class StagedMailbox:
                 "confidence": 0.9,
             },
             mailbox_identity_key=IDENTITY,
+            body_chars=None,
+            body_source_chars=None,
         )
         self.substitutions["message_analysis"] = (
             "Store.mark_analyzed seeds a completed analysis; no analyzer call"

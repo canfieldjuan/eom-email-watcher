@@ -726,6 +726,21 @@ select:focus {
   line-height: 1.55;
 }
 
+.message-truncation-note {
+  margin: 0;
+  color: #7a4b12;
+  font-size: 0.86rem;
+}
+
+.inbox-partial-summary {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #7a4b12;
+  background: #f6ead8;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .message-details {
   display: grid;
   gap: 7px;

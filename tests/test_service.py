@@ -43,7 +43,7 @@ from eom_email_watcher.microsoft_calendar import (
     CalendarWriteResult,
     MicrosoftCalendarProposalRejected,
 )
-from eom_email_watcher.mime import AttachmentDescriptor, extract_body
+from eom_email_watcher.mime import AttachmentDescriptor, bounded_body_text, extract_body
 from eom_email_watcher.model import (
     MAX_GATEWAY_ATTACHMENT_COUNT,
     MAX_GATEWAY_ATTACHMENT_NAME_CHARS,
@@ -141,10 +141,10 @@ class FakeGmail:
         return {"mimeType": "text/plain", "body": {"data": "SGVsbG8="}}
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        body, attachment_names, attachments = extract_body(
+        body, attachment_names, attachments, body_source_chars = extract_body(
             self.full_payload(message_id), body_char_limit
         )
-        return MessageContent(body, attachment_names, attachments)
+        return MessageContent(body, attachment_names, attachments, body_source_chars)
 
 
 class FreshGmail(FakeGmail):
@@ -241,12 +241,12 @@ class AutomationGateway:
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         assert message_id == "schedule-1"
-        return MessageContent(self.body[:body_char_limit], (), ())
+        return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class AnyAutomationGateway(AutomationGateway):
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        return MessageContent(self.body[:body_char_limit], (), ())
+        return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class MissingAutomationSource(AutomationGateway):
@@ -271,7 +271,7 @@ class FailingOlderAutomationProvider(AutomationGateway):
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
         if message_id == "older-failure":
             raise Microsoft365Error("temporarily unavailable")
-        return MessageContent(self.body[:body_char_limit], (), ())
+        return MessageContent(self.body[:body_char_limit], (), (), len(self.body))
 
 
 class MetadataHeavyAutomationProvider(AutomationGateway):
@@ -280,12 +280,13 @@ class MetadataHeavyAutomationProvider(AutomationGateway):
             f"attachment-{index}-{'x' * MAX_GATEWAY_ATTACHMENT_NAME_CHARS}.pdf"
             for index in range(MAX_GATEWAY_ATTACHMENT_COUNT + 1)
         )
-        return MessageContent(self.body[:body_char_limit], names, ())
+        return MessageContent(self.body[:body_char_limit], names, (), len(self.body))
 
 
 class MalformedUnicodeAutomationProvider(AutomationGateway):
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        return MessageContent(f"{self.body}\ud800"[:body_char_limit], (), ())
+        body = f"{self.body}\ud800"
+        return MessageContent(body[:body_char_limit], (), (), len(body))
 
 
 class ExtractionModel(FakeModel):
@@ -517,6 +518,8 @@ def admit_scheduling_run(
         SchedulingModel().analyze().model_dump(),
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
         scheduling_automation_principal_key=principal_key,
+        body_chars=None,
+        body_source_chars=None,
     )
     run = store.automation_run_for_message(message_id)
     assert run is not None
@@ -869,7 +872,7 @@ def test_current_identity_pending_work_survives_last_selector_removal_without_po
 
         def content(self, message_id: str, body_char_limit: int) -> MessageContent:
             assert message_id == "current-pending"
-            return MessageContent("current mailbox body", (), ())
+            return MessageContent("current mailbox body", (), (), 20)
 
     result = Watcher(cfg, store, PendingOnlyGmail(), FakeModel()).check()
 
@@ -930,7 +933,7 @@ def test_public_check_processes_current_pending_work_without_watch_selectors(
 
         def content(self, message_id: str, body_char_limit: int) -> MessageContent:
             assert message_id == "current-pending-public"
-            return MessageContent("current mailbox body", (), ())
+            return MessageContent("current mailbox body", (), (), 20)
 
     monkeypatch.setattr(
         service_module,
@@ -3991,6 +3994,8 @@ def test_zero_sender_watchlist_is_inactive_without_gmail_or_state(
         "queued",
         FakeModel().analyze().model_dump(),
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     with store.connection() as db:
         db.execute(
@@ -4661,6 +4666,8 @@ def test_expired_notification_intent_is_removed_before_cli_delivery(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     gmail = FakeGmail()
     gmail.history_message_ids = lambda cursor: ([], "200")
@@ -5002,6 +5009,7 @@ def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped
                         0,
                     ),
                 ),
+                7,
             )
 
     gateway = ChangedEpochGateway()
@@ -5024,3 +5032,48 @@ def test_imap_uidvalidity_change_recovers_before_advancing_and_inerts_old_scoped
     )
     assert store.message_source(message_id).mailbox_identity_key == new_identity
     assert store.automation_fires_for_message(message_id) == []
+
+
+class LongBodyGmail(FakeGmail):
+    def __init__(self, body: str):
+        super().__init__()
+        self.body = body
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        self.full_payload_calls += 1
+        body, body_source_chars = bounded_body_text(self.body, body_char_limit)
+        return MessageContent(body, (), (), body_source_chars)
+
+
+@pytest.mark.parametrize(("source_chars", "truncated"), [(20_001, True), (20_000, False)])
+def test_analysis_stores_body_counts_and_marks_partial_notifications(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_chars: int, truncated: bool
+) -> None:
+    cfg = replace(config(tmp_path), notifications_enabled=True)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    partial: list[bool] = []
+
+    def flaky_analysis_notification(*args, **kwargs) -> None:
+        partial.append(kwargs["partial_summary"])
+        if len(partial) == 1:
+            raise NotificationError("all channels unavailable")
+
+    def unavailable_fallback(*args, **kwargs) -> None:
+        raise NotificationError("all channels unavailable")
+
+    monkeypatch.setattr(service_module, "send_analysis", flaky_analysis_notification)
+    monkeypatch.setattr(service_module, "send_fallback", unavailable_fallback)
+    watcher = Watcher(cfg, store, LongBodyGmail("x" * source_chars), FakeModel())
+
+    assert watcher.check()["summarized"] == 1
+    item = store.recent(1)[0]
+    assert (item["body_analyzed_chars"], item["body_source_chars"]) == (20_000, source_chars)
+    assert item["body_truncated"] is truncated
+
+    _make_retries_due(store)
+    watcher.check()
+
+    assert partial == [truncated, truncated]
+    assert store.recent(1)[0]["status"] == "summarized"

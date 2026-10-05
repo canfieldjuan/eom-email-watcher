@@ -32,7 +32,7 @@ from .mailbox import (
     StaleMailboxCursor,
     validate_operation_timeout,
 )
-from .mime import AttachmentDescriptor, html_to_text
+from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
 
 IMAP_PROVIDER = "imap"
 IMAP_CONNECTION_METHOD = "server_credentials"
@@ -1187,10 +1187,10 @@ def _content_and_attachment_payloads(
             "imap_mime_too_complex", "Message MIME structure exceeds the safe limit"
         ) from exc
     selected = "\n\n".join(plain if plain else html)
-    body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
+    body, body_source_chars = bounded_body_text(selected, body_char_limit)
     names = tuple(dict.fromkeys(item.filename for item in attachments))
     return (
-        MessageContent(body[:body_char_limit], names, tuple(attachments)),
+        MessageContent(body, names, tuple(attachments), body_source_chars),
         tuple(attachment_payloads),
     )
 
@@ -1742,10 +1742,10 @@ class ImapGateway:
                     text = decoded.decode("utf-8", errors="replace")
                 rendered.append(html_to_text(text) if part.media_type == "text/html" else text)
         selected = "\n\n".join(rendered)
-        body = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
+        body, body_source_chars = bounded_body_text(selected, body_char_limit)
         descriptors = tuple(attachment.descriptor for attachment in catalog.attachments)
         names = tuple(dict.fromkeys(item.filename for item in descriptors))
-        return MessageContent(body[:body_char_limit], names, descriptors)
+        return MessageContent(body, names, descriptors, body_source_chars)
 
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if attachment_id is not None or not part_id.startswith("mime-"):

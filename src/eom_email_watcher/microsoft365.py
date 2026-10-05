@@ -30,7 +30,7 @@ from .mailbox import (
     StaleMailboxCursor,
     validate_operation_timeout,
 )
-from .mime import AttachmentDescriptor, html_to_text
+from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
 
 MICROSOFT365_PROVIDER = "microsoft365"
 SCOPES = ("Mail.Read",)
@@ -325,16 +325,15 @@ def _response_document(response: httpx.Response, context: str) -> dict[str, Any]
     return document
 
 
-def _message_body_text(body: object, limit: int) -> str:
+def _message_body_text(body: object, limit: int) -> tuple[str, int]:
     if not isinstance(body, dict):
-        return ""
+        return "", 0
     content = body.get("content")
     if not isinstance(content, str):
-        return ""
+        return "", 0
     if str(body.get("contentType", "")).casefold() == "html":
         content = html_to_text(content)
-    normalized = "\n".join(line.strip() for line in content.splitlines() if line.strip())
-    return normalized[:limit]
+    return bounded_body_text(content, limit)
 
 
 class Microsoft365Gateway:
@@ -700,10 +699,12 @@ class Microsoft365Gateway:
             self._attachments(message_id) if document.get("hasAttachments") is True else ()
         )
         names = tuple(dict.fromkeys(item.filename for item in attachments))
+        body, body_source_chars = _message_body_text(document.get("body"), body_char_limit)
         return MessageContent(
-            body=_message_body_text(document.get("body"), body_char_limit),
+            body=body,
             attachment_names=names,
             attachments=attachments,
+            body_source_chars=body_source_chars,
         )
 
     def attachment_bytes(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from eom_email_watcher.mime import html_to_text
+from eom_email_watcher.mime import bounded_body_text, html_to_text
 from eom_email_watcher.model import (
     SYSTEM_PROMPT,
     LocalModel,
@@ -356,3 +356,18 @@ def test_local_model_uses_strict_scheduling_schema_and_feedback(
     messages = requests[0]["messages"]
     assert "UNTRUSTED DATA" in messages[0]["content"]
     assert "time_naive" in messages[1]["content"]
+
+
+def test_head_cut_trims_quoted_history_before_top_posted_reply_text() -> None:
+    reply = "Please pay the revised total of $480 by Friday."
+    quote = "On Mon, Oct 5, 2026 at 9:00 AM Vendor <billing@example.com> wrote:\n" + (
+        "> The quoted total was $400.\n" * 400
+    )
+
+    body, source_chars = bounded_body_text(f"{reply}\n{quote}", 1_000)
+    current, quoted = _split_quoted_history(body)
+
+    assert source_chars > 1_000
+    assert current.strip() == reply
+    assert quoted is not None
+    assert quoted.startswith("On Mon, Oct 5, 2026")

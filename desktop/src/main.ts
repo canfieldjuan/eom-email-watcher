@@ -18,6 +18,7 @@ import {
 } from "./automationDecision";
 import { automationOutcomeIdentity, automationOutcomeStatus } from "./automationOutcome";
 import { inboxActionState } from "./inboxActionState";
+import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import {
   CALENDAR_CONSENT_PROFILES,
@@ -151,6 +152,9 @@ interface InboxItem {
   analysis_retryable: boolean | null;
   analysis_error_code: string | null;
   analysis_retry_after_seconds: number | null;
+  body_truncated?: boolean | null;
+  body_analyzed_chars?: number | null;
+  body_source_chars?: number | null;
   attachments: InboxAttachment[];
   calendar_proposal: CalendarProposalPreview | null;
   admission: InboxAdmission | null;
@@ -724,7 +728,7 @@ app.innerHTML = `
       <p class="view-lede">Change the everyday controls that are safe to manage from this app.</p>
       <section id="ntfy-disclosure-panel" class="ntfy-disclosure-panel" hidden>
         <h3>Phone notification privacy</h3>
-        <p>Email Watcher sends the configured ntfy service the notification topic; the watched sender's configured label, or the message-supplied display name or email address; the email subject; and either the local-model summary with any suggested action and deadline, fixed fallback text, or scheduling review text that may contain an email-derived summary.</p>
+        <p>Email Watcher sends the configured ntfy service the notification topic; the watched sender's configured label, or the message-supplied display name or email address; the email subject; and either the local-model summary with any suggested action and deadline and, when the summary covers only part of a long email, a fixed note saying so; fixed fallback text; or scheduling review text that may contain an email-derived summary.</p>
         <p>Email Watcher does not redact or encrypt these fields at the application layer. HTTPS protects them while they travel to the service, but the configured ntfy service can read and may retain or log them.</p>
         <p>A long random topic limits who can subscribe or publish; it does not hide the content from that service.</p>
         <p>For confidentiality-sensitive mail, close Email Watcher and remove the topic from the private configuration before continuing.</p>
@@ -1720,6 +1724,12 @@ function renderInbox(items: InboxItem[]): void {
     const summary = document.createElement("p");
     summary.className = "message-summary";
     summary.textContent = item.summary || "Local analysis has not completed yet.";
+    const truncation = inboxBodyTruncation(item);
+    const truncationNote = truncation ? document.createElement("p") : null;
+    if (truncation && truncationNote) {
+      truncationNote.className = "message-truncation-note";
+      truncationNote.textContent = truncation.note;
+    }
 
     const details = document.createElement("div");
     details.className = "message-details";
@@ -2319,6 +2329,7 @@ function renderInbox(items: InboxItem[]): void {
     footerActions.append(deleteButton);
 
     card.append(meta, summary);
+    if (truncationNote) card.append(truncationNote);
     if (details.childElementCount) card.append(details);
     if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
@@ -2353,6 +2364,12 @@ function renderInbox(items: InboxItem[]): void {
       const attachmentCount = document.createElement("span");
       attachmentCount.textContent = `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
       rowBadges.append(attachmentCount);
+    }
+    if (truncation) {
+      const partial = document.createElement("span");
+      partial.className = "inbox-partial-summary";
+      partial.textContent = truncation.badge;
+      rowBadges.append(partial);
     }
     const actionState = inboxActionState(
       item.attachments.flatMap((attachment) => (attachment.automation_fires ?? []).map((fire) => fire?.state)),

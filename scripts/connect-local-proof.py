@@ -804,6 +804,8 @@ def main() -> None:
                     "confidence": 0.9,
                 },
                 mailbox_identity_key=FIXTURE_MAILBOX_IDENTITY_KEY,
+                body_chars=None,
+                body_source_chars=None,
             )
             automation_fires = runtime.store.automation_fires_for_message("fixture-message")
             if len(automation_fires) != 1:
