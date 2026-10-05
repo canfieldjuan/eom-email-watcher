@@ -96,10 +96,12 @@ test("decision refresh requires its own committed inbox projection", async () =>
     ui.indexOf("const decide = async (decision: \"confirmed\""),
   );
   const loadInbox = ui.slice(ui.indexOf("async function loadInbox("), ui.indexOf("async function refreshLoadedInboxSpan("));
-  const renderPoint = loadInbox.indexOf("renderInbox(inboxItems);");
+  const commitPoint = loadInbox.indexOf("inboxItems = page.items");
+  assert.notEqual(commitPoint, -1);
+  const renderPoint = loadInbox.indexOf("renderInbox(inboxItems);", commitPoint);
   assert.notEqual(renderPoint, -1);
   assert.match(loadInbox, /\): Promise<boolean> \{/);
-  assert.match(loadInbox, /if \(!mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) return false;/);
+  assert.match(loadInbox, /if \(!mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) \{(?:[^{}]|\{[^{}]*\})*?\breturn false;\s*\}/);
   assert.match(loadInbox, /renderInbox\(inboxItems\);[\s\S]*return true;/);
   assert.doesNotMatch(loadInbox.slice(0, renderPoint), /\breturn(?:;| true;)/);
   assert.doesNotMatch(loadInbox.slice(renderPoint), /\breturn(?:;| false;)/);
