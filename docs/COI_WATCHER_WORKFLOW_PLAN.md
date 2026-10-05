@@ -75,8 +75,8 @@ comparison, repeatable acceptance items, or separate M4 installed proof.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs from the accepted input baseline above through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | The recovered pair is accepted as the M3 baseline by the operator decision above; both recorded expected errors with no ledger rows. The approved ordinary real-model comparison and repeatable evidence remain retained. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) has further rendering/evidence review findings to reconcile before M3 completion. Historical byte continuity remains unproven. |
-| M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
+| M3: integrated local proof | Begin with both private real COIs from the accepted input baseline above through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Complete under the accepted baseline. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) merged at `8d832259583b5e59f507fe5cc706e9f8d86f0a59` after exact-head review, four green checks and thread reconciliation. The approved ordinary real-model comparison and repeatable evidence remain retained; corrected terminal replay and rendering receipts are identified in the 2026-10-05 entry below. Historical byte continuity remains unproven. |
+| M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Linux proof passed on 2026-10-05: actual installed apps processed the approved COI from a real Gmail message, persisted one policy row matching the approved reference, and displayed Expired / Extracted / Available before and after desktop restart. Isolated application state; no Windows/macOS, reboot or unattended-operation claim. Receipt and exact package sources are in the dated entry below. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
 ## Definition of finished
@@ -109,6 +109,42 @@ If the operator wants any of them in v1, first accept a separate product
 contract and update these finish conditions.
 
 ## Current state log
+
+- 2026-10-05, M3 review closure and installed Linux M4 proof:
+  - PR187's reviewed head was `e482914f421ea7cb663a309e7b95fdeee194adf3`;
+    all four CI checks passed and no unresolved threads or change requests remained
+    before merge. A claimed failed-replay provider-identity bypass was contradicted
+    through the real HTTP decoder; alternate Git-environment invocation hardening
+    is explicitly deferred to [issue190](https://github.com/canfieldjuan/eom-email-watcher/issues/190).
+    Final M3 evidence alias `acceptance-evidence-v8.json`, SHA-256
+    `1f93ddea01735b06601bfe2effeedf5e7801acf0ade268fa306f37d0165e126f`,
+    retains actual terminal replay and complete rendering receipts. Older queue-only
+    replay claims are superseded, not relabeled as executed terminal replays.
+  - The operator explicitly approved one prepared self-addressed test email carrying
+    the unchanged approved real COI. Installed Watcher operations configured the
+    mailbox baseline, watchlist and certificate rule, then retrieved and analyzed that
+    actual Gmail message. The installed provider completed one certificate job and fire;
+    the ledger persisted one policy row. No mailbox state, analysis, extraction or
+    rendering result was substituted for this run.
+  - Installed package versions were Email Watcher `0.1.0` and Invoice Processor `0.1.0`.
+    Package source heads were respectively `4a4642408024539690e8821ac1c890f5deee3562`
+    and `85ae9de619d545fbf5f09fb82188666c7cbc8273`. Watcher production/build inputs
+    were unchanged between its package head and PR187's reviewed head; the intervening
+    corrections affected proof tools/tests. The frozen `qwen35-9b` runtime used its
+    approved launch profile with context 32768 and one slot.
+  - All twelve reference/input/completion checks passed. Comparison included page,
+    bounding box, exact text and token extents; only unstable provenance span IDs were
+    excluded. The actual installed Tauri window showed one row with Expired, Extracted
+    and Available states before and after a real desktop process restart, and the
+    installed ledger API response was identical. Screenshots and raw outputs remain
+    private. Owned desktop, provider and model processes were stopped afterward.
+  - Durable evidence alias `installed-workflow-receipt.json`, SHA-256
+    `2b996b1c4ba7ff365c9ae491f31da75a834880eb9d0f3e0a83a45e91bbb3f77f`,
+    binds package receipts, private output/screenshot hashes, reference comparison,
+    observed states and limits. Alias `package-source-equivalence.json`, SHA-256
+    `af536b2bf24c829b3a2d96c3b3042998f413e69954692f517de8165f091dd4f9`,
+    records the production/build-input comparison. M5 product/release decisions remain
+    open; this proof does not enable reminders, renewal actions or compliance claims.
 
 - 2026-10-04, operator baseline decision: following the explicit recommendation to accept
   the recovered PDFs while preserving the missing historical-hash limitation, the operator
