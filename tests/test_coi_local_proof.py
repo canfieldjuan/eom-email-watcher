@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -353,6 +354,56 @@ def test_summary_records_input_oracles(completed_main_run):
     summary = json.loads((output / "watcher-result-summary.json").read_text())
     assert summary["expected_policy_count"] == 4
     assert summary["today"] == "2026-09-20"
+
+
+@pytest.fixture
+def failed_terminal_replay(tmp_path, monkeypatch):
+    from test_certificate_expiry_ledger import _certificate_fire_job
+    from test_connect_v2_engine_api import capability, seeded_runtime
+
+    _, runtime = seeded_runtime(tmp_path)
+    _, job_id = _certificate_fire_job(runtime.store)
+    selected = capability(app_id="invoice-processor", app_version="0.1.0",
+                          capability_id="certificate.extract",
+                          produces=("application/vnd.local-connect.certificate+json",),
+                          parameters=())
+    update = proof.connect.CapabilityJobUpdate(
+        job_id=job_id, status="failed", provider_app_id=selected.app_id,
+        provider_instance_id=selected.instance_id, result=None,
+        error=proof.connect.ConnectError("DOCUMENT_UNREADABLE", "Cannot read PDF"),
+    )
+    job = proof.engine_api._apply_connect_update(runtime.store, update)
+    get = Mock(return_value=update)
+    monkeypatch.setattr(proof.connect, "ConnectV2Client", lambda *_: SimpleNamespace(get=get))
+    monkeypatch.setattr(proof, "ROOT", tmp_path, raising=False)
+    return runtime, selected, job, get, update
+
+
+@pytest.mark.parametrize("change", [
+    {"code": "INTERNAL_ERROR"}, {"message": "Different failure"}, {"retryable": True}, None,
+])
+def test_failed_replay_rejects_changed_error(failed_terminal_replay, change):
+    runtime, selected, job, get, update = failed_terminal_replay
+    error = None if change is None else proof.connect.ConnectError(**{
+        "code": "DOCUMENT_UNREADABLE", "message": "Cannot read PDF", "retryable": False,
+        **change,
+    })
+    get.return_value = replace(update, error=error)
+    with pytest.raises(RuntimeError, match="recorded terminal error"):
+        proof.replay_terminal_update(runtime, selected, job)
+    assert runtime.store.connect_job(job.job_id) == job
+    assert not (proof.ROOT / "replayed-terminal-update.json").exists()
+
+
+def test_failed_replay_retains_matching_error(failed_terminal_replay):
+    runtime, selected, job, get, _ = failed_terminal_replay
+    proof.replay_terminal_update(runtime, selected, job)
+    get.assert_called_once()
+    assert runtime.store.connect_job(job.job_id) == job
+    receipt = json.loads((proof.ROOT / "replayed-terminal-update.json").read_text())
+    assert receipt["error"] == receipt["recorded_error"] == {
+        "code": "DOCUMENT_UNREADABLE", "message": "Cannot read PDF", "retryable": False,
+    }
 
 
 def test_foreign_loaded_package_is_rejected_before_io(cli, monkeypatch, tmp_path):

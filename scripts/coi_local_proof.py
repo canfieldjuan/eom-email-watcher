@@ -157,6 +157,16 @@ def replay_terminal_update(runtime, selected, job) -> dict[str, object]:
     update = connect.ConnectV2Client(selected).get(tracked)
     if update.status != job.status:
         raise RuntimeError("Provider did not return the recorded terminal status")
+    recorded_error = {
+        "code": job.error_code, "message": job.error_message,
+        "retryable": bool(job.error_retryable),
+    } if job.status == "failed" else None
+    error = {
+        "code": update.error.code, "message": str(update.error),
+        "retryable": update.error.retryable,
+    } if update.error is not None else None
+    if error != recorded_error:
+        raise RuntimeError("Provider did not return the recorded terminal error")
     engine_api._apply_connect_update(runtime.store, update)
     receipt = {
         "job_id": update.job_id,
@@ -164,7 +174,8 @@ def replay_terminal_update(runtime, selected, job) -> dict[str, object]:
         "provider_app_id": update.provider_app_id,
         "provider_instance_id": update.provider_instance_id,
         "result": update.result.store_dict() if update.result else None,
-        "error_code": update.error.code if update.error else None,
+        "error": error,
+        "recorded_error": recorded_error,
     }
     write_private_json("replayed-terminal-update.json", receipt)
     return {"artifact": "replayed-terminal-update.json", "job_id": update.job_id,

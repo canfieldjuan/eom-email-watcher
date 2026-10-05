@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderSavedHtml } from "../../scripts/coi_render_probe.mjs";
 import test from "node:test";
@@ -92,7 +92,38 @@ test("receipt binds embedded production stylesheet bytes", () => {
   assert.equal(result.status, 0, result.stderr);
   const receipt = JSON.parse(readFileSync(join(output, "source-receipt.json"), "utf8"));
   const stylesheet = readFileSync(new URL("../src/styles.css", import.meta.url));
-  assert.equal(receipt.styles_sha256, createHash("sha256").update(stylesheet).digest("hex"));
+  assert.equal(receipt.sources["desktop/src/styles.css"], createHash("sha256").update(stylesheet).digest("hex"));
+});
+
+test("receipt binds executable harness sources and checkout HEAD", () => {
+  const { result, output } = generate(rows());
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(readFileSync(join(output, "source-receipt.json"), "utf8"));
+  const root = dirname(dirname(script));
+  const head = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" });
+  assert.equal(head.status, 0, head.stderr);
+  assert.equal(receipt.watcher_head, head.stdout.trim());
+  for (const name of ["scripts/coi_rendering_fixture.mjs", "scripts/coi_render_probe.mjs", "scripts/coi_evidence.py"]) {
+    const bytes = readFileSync(join(root, name));
+    assert.equal(receipt.sources[name], createHash("sha256").update(bytes).digest("hex"));
+  }
+});
+
+test("receipt binds every emitted artifact and detects changed rendered observations", () => {
+  const { result, output } = generate(rows());
+  assert.equal(result.status, 0, result.stderr);
+  const receipt = JSON.parse(readFileSync(join(output, "source-receipt.json"), "utf8"));
+  const names = ["engine-response.json", "index.html", "rendered-rows.json"];
+  assert.deepEqual(Object.keys(receipt.artifacts).sort(), names);
+  assert.deepEqual(Object.keys(receipt.artifacts).sort(), readdirSync(output).filter(name => name !== "source-receipt.json").sort());
+  for (const name of names) {
+    assert.equal(receipt.artifacts[name], createHash("sha256").update(readFileSync(join(output, name))).digest("hex"));
+  }
+  const path = join(output, "rendered-rows.json");
+  for (const changed of ["", "{", JSON.stringify({ initial: [], after_reload: [] })]) {
+    writeFileSync(path, changed);
+    assert.notEqual(receipt.artifacts["rendered-rows.json"], createHash("sha256").update(readFileSync(path)).digest("hex"));
+  }
 });
 
 

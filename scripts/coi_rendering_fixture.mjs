@@ -15,7 +15,15 @@ import { resolve } from 'node:path';
 const [responsePath, requestedOutputPath] = process.argv.slice(2);
 if (!responsePath || !requestedOutputPath) throw new Error('Engine response and new output directory required');
 const root = fileURLToPath(new URL('../', import.meta.url));
-const source = await readFile(resolve(root, 'desktop/src/main.ts'), 'utf8');
+const hash = value => createHash('sha256').update(value).digest('hex');
+const sources = Object.fromEntries(await Promise.all([
+  'desktop/src/main.ts', 'desktop/src/styles.css',
+  'scripts/coi_rendering_fixture.mjs', 'scripts/coi_render_probe.mjs', 'scripts/coi_evidence.py',
+].map(async name => [name, await readFile(resolve(root, name))])));
+const watcherHead = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const checkoutDirty = execFileSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=all'],
+  { encoding: 'utf8' }).length > 0;
+const source = sources['desktop/src/main.ts'].toString('utf8');
 const responseText = await readFile(responsePath, 'utf8');
 const response = JSON.parse(responseText);
 if (response.ok !== true || !Array.isArray(response.data?.items)) {
@@ -63,7 +71,7 @@ function loadSavedResponse() {
 document.getElementById('reload').addEventListener('click', loadSavedResponse);
 loadSavedResponse();
 `;
-const styles = await readFile(resolve(root, 'desktop/src/styles.css'), 'utf8');
+const styles = sources['desktop/src/styles.css'].toString('utf8');
 const html = `<!doctype html><html lang="en"><meta charset="utf-8"><title>COI source rendering proof</title>
 <style>${styles}</style><body><main style="padding:24px">
 <p>Source rendering proof using a saved engine response. Installed desktop integration is not exercised.</p>
@@ -76,12 +84,15 @@ const outputPath = JSON.parse(execFileSync(
   [resolve(root, 'scripts/coi_evidence.py'), requestedOutputPath],
   { encoding: 'utf8' },
 ));
-const hash = value => createHash('sha256').update(value).digest('hex');
-for (const [name, content] of Object.entries({
+const artifacts = {
   'index.html': html, 'engine-response.json': responseText,
   'rendered-rows.json': JSON.stringify(rendered, null, 2),
-  'source-receipt.json': JSON.stringify({source_sha256: hash(source), styles_sha256: hash(styles), response_sha256: hash(responseText),
-    artifact_sha256: hash(html),
+};
+const digests = values => Object.fromEntries(Object.entries(values).map(([name, content]) => [name, hash(content)]));
+for (const [name, content] of Object.entries({
+  ...artifacts,
+  'source-receipt.json': JSON.stringify({watcher_head: watcherHead, checkout_dirty: checkoutDirty,
+    sources: digests(sources), artifacts: digests(artifacts),
     expiry_states: [...expiryStates].sort(), review_states: [...reviewStates].sort(),
     scope: 'production renderer and markup; saved engine response; no Tauri IPC or installed shell'}, null, 2),
 })) await writeFile(resolve(outputPath, name), content, { mode: 0o600, flag: 'wx' });
