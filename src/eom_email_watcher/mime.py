@@ -82,9 +82,22 @@ def _decode(data: str) -> str:
         return ""
 
 
+def bounded_body_text(selected: str, limit: int) -> tuple[str, int]:
+    """Return the normalized body cut to ``limit`` characters and its pre-cut length."""
+    normalized = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
+    return normalized[:limit], len(normalized)
+
+
+def body_was_truncated(analyzed_chars: int | None, source_chars: int | None) -> bool | None:
+    """Return whether an analysis read a strict prefix of the body; ``None`` when unknown."""
+    if analyzed_chars is None or source_chars is None:
+        return None
+    return source_chars > analyzed_chars
+
+
 def extract_body(
     payload: dict[str, Any], limit: int
-) -> tuple[str, tuple[str, ...], tuple[AttachmentDescriptor, ...]]:
+) -> tuple[str, tuple[str, ...], tuple[AttachmentDescriptor, ...], int]:
     plain: list[str] = []
     rich: list[str] = []
     attachment_names: list[str] = []
@@ -133,7 +146,7 @@ def extract_body(
 
     walk(payload)
     selected = "\n\n".join(plain) if plain else "\n\n".join(rich)
-    normalized = "\n".join(line.strip() for line in selected.splitlines() if line.strip())
+    body, source_chars = bounded_body_text(selected, limit)
     names = tuple(dict.fromkeys(attachment_names))
     descriptors = tuple(attachments_by_part_id.values())
-    return normalized[:limit], names, descriptors
+    return body, names, descriptors, source_chars

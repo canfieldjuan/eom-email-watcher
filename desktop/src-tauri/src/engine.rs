@@ -1158,6 +1158,12 @@ pub struct InboxItem {
     pub notified_at: Option<String>,
     pub last_error: Option<String>,
     #[serde(default)]
+    pub body_truncated: Option<bool>,
+    #[serde(default)]
+    pub body_analyzed_chars: Option<u64>,
+    #[serde(default)]
+    pub body_source_chars: Option<u64>,
+    #[serde(default)]
     pub attachments: Vec<InboxAttachment>,
     #[serde(default)]
     pub calendar_proposal: Option<CalendarProposalPreview>,
@@ -3252,8 +3258,51 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"watcher.check","data":{"acti
         assert!(item.attachments.is_empty());
         assert_eq!(item.calendar_proposal, None);
         assert_eq!(item.category, None);
+        assert_eq!(item.body_truncated, None);
+        assert_eq!(item.body_analyzed_chars, None);
+        assert_eq!(item.body_source_chars, None);
         assert_eq!(item.provider, "gmail");
         assert_eq!(item.account_id, "gmail-default");
+    }
+
+    #[test]
+    fn inbox_body_truncation_contract_is_typed() {
+        let item: InboxItem = serde_json::from_value(json!({
+            "message_id": "message-1",
+            "received_at": "2026-08-29T12:00:00+00:00",
+            "sender": "sender@example.com",
+            "sender_name": null,
+            "subject": "Subject",
+            "status": "analyzed",
+            "analysis_at": "2026-08-29T12:01:00+00:00",
+            "priority": "normal",
+            "summary": "Summary",
+            "action_required": 0,
+            "suggested_action": null,
+            "deadline_text": null,
+            "deadline_iso": null,
+            "confidence": 0.9,
+            "attempts": 0,
+            "next_retry_at": null,
+            "analysis_retryable": null,
+            "analysis_error_code": null,
+            "analysis_retry_after_seconds": null,
+            "fallback_notified_at": null,
+            "notified_at": null,
+            "last_error": null,
+            "body_truncated": true,
+            "body_analyzed_chars": 20000,
+            "body_source_chars": 54321
+        }))
+        .expect("inbox row with body truncation fields");
+
+        assert_eq!(item.body_truncated, Some(true));
+        assert_eq!(item.body_analyzed_chars, Some(20_000));
+        assert_eq!(item.body_source_chars, Some(54_321));
+        let forwarded = serde_json::to_value(&item).expect("serialize inbox row for the desktop");
+        assert_eq!(forwarded["body_truncated"], json!(true));
+        assert_eq!(forwarded["body_analyzed_chars"], json!(20000));
+        assert_eq!(forwarded["body_source_chars"], json!(54321));
     }
 
     #[test]

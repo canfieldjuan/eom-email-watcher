@@ -966,10 +966,10 @@ class GmailGateway:
         return message.get("payload") or {}
 
     def content(self, message_id: str, body_char_limit: int) -> MessageContent:
-        body, attachment_names, attachments = extract_body(
+        body, attachment_names, attachments, body_source_chars = extract_body(
             self.full_payload(message_id), body_char_limit
         )
-        return MessageContent(body, attachment_names, attachments)
+        return MessageContent(body, attachment_names, attachments, body_source_chars)
 
     def attachment_bytes(self, message_id: str, part_id: str, attachment_id: str | None) -> bytes:
         if attachment_id:

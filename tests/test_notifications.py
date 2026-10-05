@@ -2,6 +2,7 @@ import pytest
 
 from eom_email_watcher.model import Analysis
 from eom_email_watcher.notifications import (
+    PARTIAL_SUMMARY_NOTE,
     ChannelResult,
     NotificationError,
     send_analysis,
@@ -345,3 +346,49 @@ def test_dry_run_prints_instead_of_sending(
     out = capsys.readouterr().out
     assert "notification" in out
     assert "ntfy" in out
+
+
+def _capture_channels(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    bodies: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "eom_email_watcher.notifications._send_desktop",
+        lambda title, body, urgency, dry_run: bodies.append(("desktop", body)),
+    )
+    monkeypatch.setattr(
+        "eom_email_watcher.notifications._send_ntfy",
+        lambda topic, url, title, body, priority, dry_run: bodies.append(("ntfy", body)),
+    )
+    return bodies
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_partial_summary_note_reaches_both_channels_only_when_partial(
+    monkeypatch: pytest.MonkeyPatch, partial: bool
+) -> None:
+    bodies = _capture_channels(monkeypatch)
+
+    send_analysis(
+        "Vendor",
+        "Invoice",
+        analysis(),
+        ntfy_topic="eom-email-watch-0123456789ab",
+        ntfy_content_disclosure_acknowledged=True,
+        partial_summary=partial,
+    )
+
+    expected = "An invoice is due.\nNext: Pay it"
+    if partial:
+        expected += "\nSummary covers only the beginning of a long email."
+    assert bodies == [("desktop", expected), ("ntfy", expected)]
+
+
+def test_fallback_and_review_notifications_never_carry_the_partial_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bodies = _capture_channels(monkeypatch)
+
+    send_fallback("Vendor", "Invoice")
+    send_review("Vendor", "Invoice", "A scheduling mention needs manual review.")
+
+    assert len(bodies) == 2
+    assert all(PARTIAL_SUMMARY_NOTE not in body for _channel, body in bodies)

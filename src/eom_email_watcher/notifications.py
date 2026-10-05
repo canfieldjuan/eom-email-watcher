@@ -8,6 +8,8 @@ import httpx
 
 from .model import Analysis
 
+PARTIAL_SUMMARY_NOTE = "Summary covers only the beginning of a long email."
+
 NTFY_TIMEOUT_SECONDS = 5.0
 
 # ntfy's publish API requires a numeric priority (1=min .. 5=urgent) -- a
@@ -134,6 +136,7 @@ def send_analysis(
     ntfy_topic: str | None = None,
     ntfy_url: str = "https://ntfy.sh",
     ntfy_content_disclosure_acknowledged: bool = False,
+    partial_summary: bool = False,
     dry_run: bool = False,
 ) -> DeliveryResult:
     urgency = "critical" if analysis.priority == "urgent" else "normal"
@@ -142,6 +145,8 @@ def send_analysis(
         lines.append(f"Next: {analysis.suggested_action}")
     if analysis.deadline_iso:
         lines.append(f"Deadline: {analysis.deadline_iso}")
+    if partial_summary:
+        lines.append(PARTIAL_SUMMARY_NOTE)
     return _deliver(
         f"{sender_label}: {subject}",
         "\n".join(lines),

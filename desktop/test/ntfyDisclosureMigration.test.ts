@@ -27,7 +27,7 @@ const uiSource = await readFile(new URL("../src/main.ts", import.meta.url), "utf
 
 const disclosureCopy =
   "Phone notification privacy " +
-  "Email Watcher sends the configured ntfy service the notification topic; the watched sender's configured label, or the message-supplied display name or email address; the email subject; and either the local-model summary with any suggested action and deadline, fixed fallback text, or scheduling review text that may contain an email-derived summary. " +
+  "Email Watcher sends the configured ntfy service the notification topic; the watched sender's configured label, or the message-supplied display name or email address; the email subject; and either the local-model summary with any suggested action and deadline and, when the summary covers only part of a long email, a fixed note saying so; fixed fallback text; or scheduling review text that may contain an email-derived summary. " +
   "Email Watcher does not redact or encrypt these fields at the application layer. HTTPS protects them while they travel to the service, but the configured ntfy service can read and may retain or log them. " +
   "A long random topic limits who can subscribe or publish; it does not hide the content from that service. " +
   "For confidentiality-sensitive mail, close Email Watcher and remove the topic from the private configuration before continuing. " +

@@ -479,6 +479,8 @@ def test_rule_cas_noop_and_atomic_analysis_create_one_durable_fire(tmp_path: Pat
         analysis(),
         mailbox_identity_key=MAILBOX_IDENTITY_KEY,
         now=datetime(2026, 9, 12, 12, 1, tzinfo=UTC),
+        body_chars=None,
+        body_source_chars=None,
     )
 
     fires = store.automation_fires_for_message("message-1")
@@ -523,6 +525,8 @@ def test_empty_root_part_id_creates_a_source_verified_fire_and_attempt(tmp_path:
         "message-1",
         analysis(),
         mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
 
     fires = store.automation_fires_for_message("message-1")
@@ -644,6 +648,8 @@ def test_store_reparses_definitions_and_skips_corrupted_current_versions(
         "message-1",
         analysis(),
         mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     assert store.automation_fires_for_message("message-1") == []
 
@@ -819,6 +825,8 @@ def test_store_fanout_bound_is_all_or_zero(
         "message-1",
         analysis(),
         mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
 
     with store.connection() as db:
@@ -853,6 +861,8 @@ def test_fire_insert_failure_rolls_back_analysis_revision_and_attempt(tmp_path: 
             "message-1",
             analysis(),
             mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+            body_chars=None,
+            body_source_chars=None,
         )
 
     with store.connection() as db:
@@ -892,6 +902,8 @@ def test_rule_mutation_and_analysis_serialize_to_one_coherent_revision(tmp_path:
             "message-1",
             analysis(),
             mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+            body_chars=None,
+            body_source_chars=None,
         )
         assert edit.result().summary.version == 2
         analyze.result()
@@ -943,6 +955,8 @@ def test_old_mailbox_session_cannot_mutate_after_identity_replacement(tmp_path: 
             "message-1",
             analysis(),
             mailbox_identity_key=MAILBOX_IDENTITY_KEY,
+            body_chars=None,
+            body_source_chars=None,
         )
     assert store.state() is None
     assert store.message_source("message-1").mailbox_identity_key == MAILBOX_IDENTITY_KEY

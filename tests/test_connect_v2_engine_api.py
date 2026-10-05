@@ -298,6 +298,8 @@ def test_connect_queue_pump_materializes_matching_automation_fire_once(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fire = runtime.store.automation_fires_for_message("message-1")[0]
     attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]
@@ -1506,6 +1508,8 @@ def test_shared_job_deadline_is_extended_once_for_one_entitlement_pause(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fires = runtime.store.automation_fires_for_message("message-1")
     install_automation_dispatch_fakes(
@@ -1591,6 +1595,8 @@ def test_unchanged_fire_prefix_rotates_so_later_work_is_selected(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     all_fire_ids = {
         fire.fire_id for fire in runtime.store.automation_fires_for_message("message-1")
@@ -1635,6 +1641,8 @@ def test_active_entitlement_wakes_paused_fire_beyond_pump_batch(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fires = runtime.store.automation_fires_for_message("message-1")
     for fire in fires:
@@ -1732,6 +1740,8 @@ def test_maximum_valid_rule_parameters_fit_prepared_confirmation_identity(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fire = runtime.store.automation_fires_for_message("message-1")[0]
     install_automation_dispatch_fakes(
@@ -3318,6 +3328,8 @@ def test_queue_pump_continues_terminal_fire_settlement_past_batch(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fires = runtime.store.automation_fires_for_message("message-1")
     first_attempt = runtime.store.automation_fire_attempts(fires[0].fire_id)[0]
@@ -3728,6 +3740,8 @@ def seed_contract_fire(
             "confidence": 0.9,
         },
         mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+        body_chars=None,
+        body_source_chars=None,
     )
     fire = runtime.store.automation_fires_for_message("message-1")[0]
     attempt = runtime.store.automation_fire_attempts(fire.fire_id)[0]

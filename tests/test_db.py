@@ -90,6 +90,8 @@ class Store(ProductionStore):
         source = self.message_source(message_id)
         if source.mailbox_identity_key is not None:
             values.setdefault("mailbox_identity_key", source.mailbox_identity_key)
+        values.setdefault("body_chars", None)
+        values.setdefault("body_source_chars", None)
         super().mark_analyzed(message_id, result, **values)  # type: ignore[arg-type]
 
     def has_seen_message(
@@ -2258,7 +2260,7 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
 
     monkeypatch.setattr(db_module, "SCHEMA_VERSION", 26)
     with pytest.raises(RuntimeError, match="newer than supported version 26"):
@@ -2281,7 +2283,7 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
         tables = {
             str(row["name"])
             for row in db.execute(
@@ -2337,7 +2339,7 @@ def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
         assert db.execute(
             "SELECT catalog_state FROM gmail_label_validation_sets"
         ).fetchone()[0] == "current"
@@ -6155,3 +6157,151 @@ def test_connect_v2_resubmission_reset_updates_dispatch_and_preserves_acceptance
         )
     assert store.connect_job(job_id).status == "accepted"  # type: ignore[union-attr]
     assert store.connect_dispatch(job_id).state == "provider_owned"  # type: ignore[union-attr]
+
+
+def _truncation_analysis() -> dict[str, object]:
+    return {
+        "category": "informational",
+        "priority": "low",
+        "summary": "Long update.",
+        "action_required": False,
+        "suggested_action": None,
+        "deadline_text": None,
+        "deadline_iso": None,
+        "confidence": 0.9,
+    }
+
+
+def _truncation_store(tmp_path: Path, *message_ids: str) -> Store:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for message_id in message_ids:
+        store.add_message(
+            message_id=message_id,
+            thread_id=None,
+            sender="a@b.com",
+            sender_name=None,
+            subject="S",
+            received_at="2026-08-29T12:00:00+00:00",
+        )
+    return store
+
+
+@pytest.mark.parametrize(
+    ("chars", "source", "truncated"),
+    [(20_000, 20_001, True), (20_000, 20_000, False), (0, 0, False)],
+)
+def test_body_counts_persist_with_the_analysis(
+    tmp_path: Path, chars: int, source: int, truncated: bool
+) -> None:
+    store = _truncation_store(tmp_path, "m1")
+
+    store.mark_analyzed("m1", _truncation_analysis(), body_chars=chars, body_source_chars=source)
+
+    item = store.recent(1)[0]
+    assert item["summary"] == "Long update."
+    assert (item["body_analyzed_chars"], item["body_source_chars"]) == (chars, source)
+    assert item["body_truncated"] is truncated
+    [delivery] = store.pending_delivery()
+    assert (delivery.analysis_body_chars, delivery.analysis_body_source_chars) == (chars, source)
+    [intent] = store.notification_intents(kind="analysis")
+    assert (intent.analysis_body_chars, intent.analysis_body_source_chars) == (chars, source)
+
+
+@pytest.mark.parametrize(
+    ("chars", "source"), [(None, 10), (10, None), (11, 10), (-1, 10), (0, -1)]
+)
+def test_inconsistent_body_counts_roll_back_the_analysis(
+    tmp_path: Path, chars: int | None, source: int | None
+) -> None:
+    store = _truncation_store(tmp_path, "m1")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.mark_analyzed(
+            "m1", _truncation_analysis(), body_chars=chars, body_source_chars=source
+        )
+
+    item = store.recent(1)[0]
+    assert item["status"] == "pending"
+    assert item["summary"] is None
+    assert item["body_truncated"] is None
+
+
+def test_unanalyzed_and_uncounted_rows_report_unknown_truncation(tmp_path: Path) -> None:
+    store = _truncation_store(tmp_path, "m1", "m2")
+    store.mark_analyzed("m2", _truncation_analysis())
+
+    items = {str(item["message_id"]): item for item in store.recent(10)}
+
+    for message_id in ("m1", "m2"):
+        item = items[message_id]
+        assert item["body_analyzed_chars"] is None
+        assert item["body_source_chars"] is None
+        assert item["body_truncated"] is None
+
+
+def test_deleting_a_message_removes_its_body_counts(tmp_path: Path) -> None:
+    store = _truncation_store(tmp_path, "m1")
+    store.mark_analyzed("m1", _truncation_analysis(), body_chars=5, body_source_chars=9)
+
+    assert store.delete_message("m1") is True
+
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+
+
+def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
+    store = _truncation_store(tmp_path, "m1")
+    store.mark_analyzed("m1", _truncation_analysis())
+    with store.connection() as db:
+        db.execute("DROP TRIGGER messages_body_counts_consistent_insert")
+        db.execute("DROP TRIGGER messages_body_counts_consistent_update")
+        db.execute("ALTER TABLE messages DROP COLUMN analysis_body_chars")
+        db.execute("ALTER TABLE messages DROP COLUMN analysis_body_source_chars")
+        db.execute("PRAGMA user_version = 27")
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    with migrated.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+        triggers = {
+            str(row["name"])
+            for row in db.execute(
+                """SELECT name FROM sqlite_schema
+                WHERE type = 'trigger' AND name LIKE 'messages_body_counts_%'"""
+            ).fetchall()
+        }
+    assert triggers == {
+        "messages_body_counts_consistent_insert",
+        "messages_body_counts_consistent_update",
+    }
+    item = migrated.recent(1)[0]
+    assert item["summary"] == "Long update."
+    assert item["body_truncated"] is None
+    with pytest.raises(sqlite3.IntegrityError), migrated.connection() as db:
+        db.execute("UPDATE messages SET analysis_body_chars = 3 WHERE message_id = 'm1'")
+
+
+def test_body_count_schema_bump_rejects_previous_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    Store(database).initialize()
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 27)
+    with pytest.raises(RuntimeError, match="newer than supported version 27"):
+        Store(database).initialize()
+
+
+def test_production_store_requires_explicit_body_counts(tmp_path: Path) -> None:
+    store = _truncation_store(tmp_path, "m1")
+    identity = store.message_source("m1").mailbox_identity_key
+    assert identity is not None
+
+    with pytest.raises(TypeError, match="body_chars"):
+        ProductionStore(store.path).mark_analyzed(  # type: ignore[call-arg]
+            "m1", _truncation_analysis(), mailbox_identity_key=identity
+        )
+
+    assert store.recent(1)[0]["status"] == "pending"

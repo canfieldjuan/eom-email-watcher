@@ -71,7 +71,7 @@ def graph_client(handler) -> httpx.Client:
 
 
 def test_html_message_body_preserves_reply_header_boundaries() -> None:
-    body = microsoft365._message_body_text(
+    body, _source_chars = microsoft365._message_body_text(
         {
             "contentType": "html",
             "content": (
@@ -576,6 +576,7 @@ def test_message_content_and_file_attachments_map_to_shared_contract() -> None:
     assert metadata.subject == "Invoice"
     assert metadata.labels == frozenset({"INBOX"})
     assert content.body == "First line\nSecond line"
+    assert content.body_source_chars == len("First line\nSecond line")
     assert content.attachment_names == ("invoice.pdf", "unknown.pdf")
     assert attachment.media_type == "application/pdf"
     assert attachment.byte_size == 1234
@@ -662,3 +663,29 @@ def test_runtime_dispatches_microsoft_account_to_microsoft_gateway(
 
     assert session.gateway is sentinel
     assert observed == [(runtime.config.microsoft_credentials_file, token_file)]
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_body"), [(8, "abcd\nefg"), (9, "abcd\nefgh"), (10, "abcd\nefgh")]
+)
+def test_message_content_reports_pre_cut_length(limit: int, expected_body: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "body": {"contentType": "text", "content": "  abcd \n\n efgh "},
+                "hasAttachments": False,
+            },
+        )
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    content = gateway.content("message-1", limit)
+
+    assert content.body == expected_body
+    assert content.body_source_chars == 9
+
+
+@pytest.mark.parametrize("body", [None, {}, {"content": 7}, "text"])
+def test_unusable_message_body_counts_zero(body: object) -> None:
+    assert microsoft365._message_body_text(body, 100) == ("", 0)

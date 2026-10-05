@@ -79,6 +79,7 @@ from .microsoft_calendar import (
     find_calendar_event_by_transaction,
     find_meeting_time,
 )
+from .mime import body_was_truncated
 from .model import (
     MAX_GATEWAY_BODY_CHARS,
     MAX_GATEWAY_SENDER_CHARS,
@@ -2220,6 +2221,8 @@ class Watcher:
         analysis: Analysis,
         dry_run: bool,
         attempts: int | None = None,
+        *,
+        partial_summary: bool,
     ) -> int:
         if not self.config.notifications_enabled:
             if not dry_run:
@@ -2235,6 +2238,7 @@ class Watcher:
                 ntfy_content_disclosure_acknowledged=(
                     self.config.ntfy_content_disclosure_acknowledged
                 ),
+                partial_summary=partial_summary,
                 dry_run=dry_run,
             )
         except NotificationError as exc:
@@ -2275,7 +2279,15 @@ class Watcher:
             if received_at is None or received_at < retention_cutoff:
                 continue
             if deliver_notifications:
-                fallback += self._deliver_analysis(message, self._stored_analysis(message), dry_run)
+                fallback += self._deliver_analysis(
+                    message,
+                    self._stored_analysis(message),
+                    dry_run,
+                    partial_summary=body_was_truncated(
+                        message.analysis_body_chars, message.analysis_body_source_chars
+                    )
+                    is True,
+                )
             elif not self.config.notifications_enabled and not dry_run:
                 self.store.mark_delivery_complete(message.message_id, notified=False)
         for message in [
@@ -2341,12 +2353,23 @@ class Watcher:
                         analysis.model_dump(),
                         mailbox_identity_key=mailbox_identity_key,
                         scheduling_automation_principal_key=scheduling_principal_key,
+                        body_chars=len(content.body),
+                        body_source_chars=content.body_source_chars,
                     )
                     assert request_id is not None
                     _acknowledge_gateway_result(self.model, request_id, "persisted")
                 summarized += 1
                 if deliver_notifications:
-                    fallback += self._deliver_analysis(message, analysis, dry_run, attempts=0)
+                    fallback += self._deliver_analysis(
+                        message,
+                        analysis,
+                        dry_run,
+                        attempts=0,
+                        partial_summary=body_was_truncated(
+                            len(content.body), content.body_source_chars
+                        )
+                        is True,
+                    )
                 elif not self.config.notifications_enabled and not dry_run:
                     self.store.mark_delivery_complete(message.message_id, notified=False)
             except MailboxMessageUnavailable as exc:

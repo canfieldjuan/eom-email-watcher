@@ -36,9 +36,9 @@ from .config import (
     normalize_validated_address,
 )
 from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
-from .mime import AttachmentDescriptor
+from .mime import AttachmentDescriptor, body_was_truncated
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -1901,6 +1901,8 @@ class AnalyzedMessage:
     deadline_text: str | None
     deadline_iso: str | None
     confidence: float
+    analysis_body_chars: int | None
+    analysis_body_source_chars: int | None
 
 
 @dataclass(frozen=True)
@@ -1919,6 +1921,8 @@ class NotificationIntent:
     suggested_action: str | None
     deadline_iso: str | None
     last_error: str | None
+    analysis_body_chars: int | None
+    analysis_body_source_chars: int | None
 
 
 @dataclass(frozen=True)
@@ -4818,10 +4822,36 @@ class Store:
                 "analysis_retryable": "INTEGER",
                 "analysis_error_code": "TEXT",
                 "analysis_retry_after_seconds": "INTEGER",
+                "analysis_body_chars": (
+                    "INTEGER CHECK (analysis_body_chars IS NULL OR analysis_body_chars >= 0)"
+                ),
+                "analysis_body_source_chars": (
+                    "INTEGER CHECK (analysis_body_source_chars IS NULL "
+                    "OR analysis_body_source_chars >= 0)"
+                ),
             }
             for column, definition in migrations.items():
                 if column not in columns:
                     db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+            _execute_transactional_script(
+                db,
+                """
+                CREATE TRIGGER IF NOT EXISTS messages_body_counts_consistent_insert
+                BEFORE INSERT ON messages
+                WHEN (NEW.analysis_body_chars IS NULL) <> (NEW.analysis_body_source_chars IS NULL)
+                  OR NEW.analysis_body_chars > NEW.analysis_body_source_chars
+                BEGIN
+                    SELECT RAISE(ABORT, 'message body counts are inconsistent');
+                END;
+                CREATE TRIGGER IF NOT EXISTS messages_body_counts_consistent_update
+                BEFORE UPDATE OF analysis_body_chars, analysis_body_source_chars ON messages
+                WHEN (NEW.analysis_body_chars IS NULL) <> (NEW.analysis_body_source_chars IS NULL)
+                  OR NEW.analysis_body_chars > NEW.analysis_body_source_chars
+                BEGIN
+                    SELECT RAISE(ABORT, 'message body counts are inconsistent');
+                END;
+                """,
+            )
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -10975,7 +11005,8 @@ class Store:
             rows = db.execute(
                 """SELECT message_id, sender, sender_name, subject, received_at, attempts,
                 fallback_notified_at, category, priority, summary, action_required,
-                suggested_action, deadline_text, deadline_iso, confidence FROM messages
+                suggested_action, deadline_text, deadline_iso, confidence,
+                analysis_body_chars, analysis_body_source_chars FROM messages
                 WHERE status = 'analyzed' AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY received_at LIMIT ?""",
                 (stamp, limit),
@@ -11079,6 +11110,8 @@ class Store:
         result: dict[str, object],
         *,
         mailbox_identity_key: str,
+        body_chars: int | None,
+        body_source_chars: int | None,
         scheduling_automation_principal_key: str | None = None,
         now: datetime | None = None,
     ) -> None:
@@ -11182,6 +11215,7 @@ class Store:
                 analysis_retry_after_seconds=NULL,
                 category=?, priority=?, summary=?, action_required=?, suggested_action=?,
                 deadline_text=?, deadline_iso=?, confidence=?,
+                analysis_body_chars=?, analysis_body_source_chars=?,
                 rules_revision_at_analysis=?, rules_evaluation_error=?
                 WHERE message_id=? AND status='pending'""",
                 (
@@ -11194,6 +11228,8 @@ class Store:
                     result.get("deadline_text"),
                     result.get("deadline_iso"),
                     result["confidence"],
+                    body_chars,
+                    body_source_chars,
                     rules_revision,
                     evaluation_error,
                     message_id,
@@ -11282,13 +11318,15 @@ class Store:
             rows = db.execute(
                 """SELECT subject_type, subject_id, revision, message_id, kind,
                     sender, sender_name, subject, analysis_at, priority, summary,
-                    suggested_action, deadline_iso, last_error
+                    suggested_action, deadline_iso, last_error,
+                    analysis_body_chars, analysis_body_source_chars
                 FROM (
                 SELECT 'message' AS subject_type, message_id AS subject_id,
                 COALESCE(analysis_at, 'fallback') AS revision, message_id,
                 CASE WHEN status = 'analyzed' THEN 'analysis' ELSE 'fallback' END AS kind,
                 sender, sender_name, subject, analysis_at, priority, summary,
-                suggested_action, deadline_iso, last_error, received_at AS sort_at
+                suggested_action, deadline_iso, last_error,
+                analysis_body_chars, analysis_body_source_chars, received_at AS sort_at
                 FROM messages
                 WHERE (status = 'analyzed' AND notified_at IS NULL)
                    OR (status = 'pending' AND last_error IS NOT NULL
@@ -11317,7 +11355,8 @@ class Store:
                         ELSE 'A scheduling mention needs manual review.'
                     END AS summary,
                     NULL AS suggested_action, NULL AS deadline_iso,
-                    r.failure_code AS last_error, r.updated_at AS sort_at
+                    r.failure_code AS last_error, NULL AS analysis_body_chars,
+                    NULL AS analysis_body_source_chars, r.updated_at AS sort_at
                 FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
                 LEFT JOIN messages AS m
@@ -11519,6 +11558,7 @@ class Store:
                 deadline_text, deadline_iso, confidence, attempts, next_retry_at,
                 fallback_notified_at, notified_at, last_error, analysis_retryable,
                 analysis_error_code, analysis_retry_after_seconds,
+                analysis_body_chars, analysis_body_source_chars,
                 admission_kind, admission_selector_id, admission_display_name, admitted_at
                 FROM messages{where}
                 ORDER BY received_at DESC, message_id DESC LIMIT ?""",
@@ -11540,6 +11580,11 @@ class Store:
         for item in items:
             if item["analysis_retryable"] is not None:
                 item["analysis_retryable"] = bool(item["analysis_retryable"])
+            body_chars = item.pop("analysis_body_chars")
+            body_source_chars = item.pop("analysis_body_source_chars")
+            item["body_analyzed_chars"] = body_chars
+            item["body_source_chars"] = body_source_chars
+            item["body_truncated"] = body_was_truncated(body_chars, body_source_chars)
             admission_kind = item.pop("admission_kind")
             admission_selector_id = item.pop("admission_selector_id")
             admission_display_name = item.pop("admission_display_name")

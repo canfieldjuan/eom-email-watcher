@@ -1,6 +1,14 @@
 import base64
 
-from eom_email_watcher.mime import AttachmentDescriptor, extract_body, html_to_text
+import pytest
+
+from eom_email_watcher.mime import (
+    AttachmentDescriptor,
+    body_was_truncated,
+    bounded_body_text,
+    extract_body,
+    html_to_text,
+)
 
 
 def encoded(value: str) -> str:
@@ -21,7 +29,7 @@ def test_prefers_plain_text_and_lists_attachment_names() -> None:
             },
         ],
     }
-    body, attachment_names, attachments = extract_body(payload, 20_000)
+    body, attachment_names, attachments, _source_chars = extract_body(payload, 20_000)
     assert body == "Hello plain"
     assert attachment_names == ("invoice.pdf",)
     assert attachments == (
@@ -37,7 +45,7 @@ def test_prefers_plain_text_and_lists_attachment_names() -> None:
 
 
 def test_html_fallback_is_text_only_and_truncated() -> None:
-    body, attachment_names, attachments = extract_body(
+    body, attachment_names, attachments, _source_chars = extract_body(
         {"mimeType": "text/html", "body": {"data": encoded("<p>Hello &amp; goodbye</p>")}},
         8,
     )
@@ -72,7 +80,7 @@ def test_html_text_keeps_inline_text_readable_without_inventing_a_line_break() -
 
 
 def test_explicit_empty_root_part_id_is_a_valid_attachment_identity() -> None:
-    body, attachment_names, attachments = extract_body(
+    body, attachment_names, attachments, _source_chars = extract_body(
         {
             "mimeType": "application/pdf",
             "partId": "",
@@ -97,7 +105,7 @@ def test_explicit_empty_root_part_id_is_a_valid_attachment_identity() -> None:
 
 
 def test_nested_attachment_names_survive_when_descriptor_identity_is_missing() -> None:
-    body, attachment_names, attachments = extract_body(
+    body, attachment_names, attachments, _source_chars = extract_body(
         {
             "mimeType": "multipart/mixed",
             "parts": [
@@ -139,7 +147,7 @@ def test_nested_attachment_names_survive_when_descriptor_identity_is_missing() -
 
 
 def test_zero_attachment_size_remains_known() -> None:
-    _body, _attachment_names, attachments = extract_body(
+    _body, _attachment_names, attachments, _source_chars = extract_body(
         {
             "mimeType": "application/pdf",
             "partId": "zero",
@@ -154,7 +162,7 @@ def test_zero_attachment_size_remains_known() -> None:
 
 
 def test_omitted_attachment_size_remains_unknown() -> None:
-    _body, _attachment_names, attachments = extract_body(
+    _body, _attachment_names, attachments, _source_chars = extract_body(
         {
             "mimeType": "application/pdf",
             "partId": "unknown",
@@ -169,7 +177,7 @@ def test_omitted_attachment_size_remains_unknown() -> None:
 
 
 def test_duplicate_part_ids_keep_first_descriptor_and_stable_positions() -> None:
-    _, attachment_names, attachments = extract_body(
+    _, attachment_names, attachments, _ = extract_body(
         {
             "mimeType": "multipart/mixed",
             "parts": [
@@ -201,3 +209,39 @@ def test_duplicate_part_ids_keep_first_descriptor_and_stable_positions() -> None
         ("10", "first.pdf", 0),
         ("2", "notes.txt", 1),
     ]
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_body"), [(8, "abcd\nefg"), (9, "abcd\nefgh"), (10, "abcd\nefgh")]
+)
+def test_extract_body_reports_pre_cut_length_at_the_boundary(
+    limit: int, expected_body: str
+) -> None:
+    body, _names, _attachments, source_chars = extract_body(
+        {"mimeType": "text/plain", "body": {"data": encoded("  abcd  \n\n efgh ")}}, limit
+    )
+
+    assert body == expected_body
+    assert source_chars == 9
+
+
+def test_html_only_body_is_counted_after_normalization() -> None:
+    body, _names, _attachments, source_chars = extract_body(
+        {"mimeType": "text/html", "body": {"data": encoded("<p>Hello &amp; goodbye</p>")}}, 8
+    )
+
+    assert body == "Hello & "
+    assert source_chars == len("Hello & goodbye")
+
+
+def test_empty_and_missing_bodies_count_zero() -> None:
+    assert extract_body({"mimeType": "text/plain", "body": {"data": ""}}, 10)[3] == 0
+    assert extract_body({"mimeType": "multipart/mixed", "parts": []}, 10)[3] == 0
+    assert bounded_body_text("", 10) == ("", 0)
+
+
+def test_body_was_truncated_is_unknown_unless_both_counts_exist() -> None:
+    assert body_was_truncated(None, 10) is None
+    assert body_was_truncated(10, None) is None
+    assert body_was_truncated(10, 10) is False
+    assert body_was_truncated(9, 10) is True

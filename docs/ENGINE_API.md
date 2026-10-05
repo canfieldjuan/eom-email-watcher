@@ -263,6 +263,16 @@ a Connect provider. Rows include their mail source, existing category, and order
 attachment and durable capability-result metadata. `inbox.recent` remains available for existing
 CLI and host compatibility.
 
+Each row, from `inbox.query` and from `inbox.recent` (which returns the same projection), also
+reports whether its stored analysis read the whole body. Schema v28 stores the
+normalized body length the model received and the normalized length before the `body_char_limit`
+cut, written in the same transaction as the analysis. Rows expose them as `body_analyzed_chars` and
+`body_source_chars`, plus `body_truncated`, which is `true` exactly when the source length exceeds
+the analyzed length. All three are `null` for messages not yet analyzed and for messages analyzed
+before schema v28; `null` means unknown, never "not truncated". When `body_truncated` is true,
+analysis notifications on both delivery paths end with the fixed line "Summary covers only the
+beginning of a long email." See `plans/PR-Body-Truncation-Signal.md`.
+
 `inbox.delete` and `inbox.clear` are local-only privacy operations. They take the same production
 operation lock as watcher checks, delete message rows transactionally, and rely on the existing
 message-delete triggers to remove attachment inventory and Connect jobs/results. Notification

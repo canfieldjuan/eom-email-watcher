@@ -68,6 +68,7 @@ class MessageContent:
     body: str
     attachment_names: tuple[str, ...]
     attachments: tuple[AttachmentDescriptor, ...]
+    body_source_chars: int
 
 
 class MailboxGateway(Protocol):
