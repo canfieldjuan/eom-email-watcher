@@ -54,6 +54,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 - `desktop/src/main.ts`
 - `desktop/test/inboxFilters.test.ts`
+- `desktop/test/automationDecision.test.ts`: its source-wiring test at `:92` must find the commit render explicitly; see the implementation finding below
 
 ## Mechanism
 
@@ -97,7 +98,7 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the points above; th
 ```json
 {
   "roots": ["<worktree>"],
-  "allow": ["desktop/src/main.ts", "desktop/test/inboxFilters.test.ts"],
+  "allow": ["desktop/src/main.ts", "desktop/test/inboxFilters.test.ts", "desktop/test/automationDecision.test.ts"],
   "goal": "Truthful Inbox empty state (plans/PR-Inbox-Empty-State.md)",
   "plan": "plans/PR-Inbox-Empty-State.md",
   "verify": {
@@ -124,3 +125,7 @@ Round 2's second fix made `loadInbox` queue deferred reloads. That stretched thi
 ## Review amendments, round 4 (Codex review of `33b4e7b`)
 
 1. A background refresh superseded by a delete's generation bump returned stale and left `"loading"`. If the delete emptied the list, it showed "Loading…" with nothing in flight. The request that sets `"loading"` now owns it by generation, and its stale return releases it to `"pending"` unless a newer request has taken ownership. This stays inside `loadInbox`, the single owner of request-derived state.
+
+## Implementation finding (Codex session `01a10e6a`)
+
+`desktop/test/automationDecision.test.ts:92` ("decision refresh requires its own committed inbox projection") guards that `loadInbox` returns `false` only before it commits a page and `true` only after; decision refresh relies on `const committed = await loadInbox()`. The test finds the commit as the *first* `renderInbox(inboxItems);` and expects the stale guard as a single line. This plan adds an earlier non-commit render (the `"loading"` re-render of the existing empty list) and turns the stale guard into a block. The invariant still holds; the test's text anchors do not. The test is added to Files touched. It must locate the commit render by the committed-page assignment (`inboxItems = page.items`), accept the block-form stale guard, and keep every existing assertion's intent: no `return true` before the commit render, no `return false` after it, and decision refresh still awaiting `loadInbox()`.
