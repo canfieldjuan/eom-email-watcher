@@ -26,7 +26,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 ### Observable behavior
 
-1. While the current first page is loading and no rows are shown, the empty list reads "Loading messages…".
+1. While a first-page request is pending and no rows are shown, the empty list reads "Loading messages…". This covers every first-page load: a sender or account change, Apply or Reset of the secondary filters, a scheduled check, and the initial load.
 2. When the current first-page load fails and no rows are shown, the empty list reads "Messages could not be loaded." The status line keeps showing the error, as today.
 3. After a successful first-page load, or a successful "Clear local history", an empty list shows exactly today's texts: the sender texts from `inboxSenderEmptyText`, "No watched messages match these filters.", or "No watched messages yet. …".
 4. A failed "Load more" or background refresh while rows are shown changes nothing in the list.
@@ -35,15 +35,18 @@ Slice phase: correctness fix on an existing operator-visible state
 
 - One module-level page state, `"loading" | "loaded" | "failed"`, starts as `"loading"`. Only these change it:
   - `clearInboxPageForAccountChange`: `"loading"`, before it renders;
+  - `loadInbox` with `append === false`, once its early-return guards have passed and a request will be sent: `"loading"` plus a re-render, but only when `inboxItems` is empty. Rows already shown stay as they are;
   - `loadInbox` with `append === false` and a current generation: `"loaded"` on success, before it renders; on failure, `"failed"` plus a re-render, but only when `inboxItems` is empty;
   - a successful `inbox_clear`: `"loaded"`.
+- `loadInbox` is the single owner of deferral. When it skips a first-page load because a mutation is in flight (`inboxMutationInFlight()`), it sets `inboxReloadAfterMutation = true`, so the existing `resumeInboxReloadAfterMutation` (run when the last delete or clear finishes) re-issues it. This covers account-scope reconciliation and filter commits, not only sender selection, so the list never stays on "Loading messages…" with no request in flight.
 - A response for a superseded generation never changes the state. The existing generation check returns before any state write.
 - The empty-state branch is the only reader.
 
 ### Failure cases
 
 - A first-page failure while rows are shown (background refresh): the state is unchanged and rows stay, as today.
-- `loadInbox` returning early (mutation in flight, stale effect scope): the state is unchanged. A later load or deferred reload sets it.
+- `loadInbox` skipped while a mutation is in flight: the reload is queued and runs when the mutation finishes (above).
+- `loadInbox` returning early for a stale effect scope: the newer scope's own load sets the state.
 
 ### Files touched
 
@@ -52,7 +55,7 @@ Slice phase: correctness fix on an existing operator-visible state
 
 ## Mechanism
 
-Add the state variable next to `inboxQueryEpoch`. Set it at the four points above. In `renderInbox`'s empty branch, return "Loading messages…" or "Messages could not be loaded." first, and otherwise fall through to today's chain unchanged.
+Add the state variable next to `inboxQueryEpoch`. Set it at the points above. In `loadInbox`, the mutation early return queues the deferred reload when `append` is false. The "loading" set and its re-render go after the guards, before the `await`. In `renderInbox`'s empty branch, return "Loading messages…" or "Messages could not be loaded." first, and otherwise fall through to today's chain unchanged.
 
 ## Intentional
 
@@ -66,6 +69,8 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the four points abov
 
 - Fail-first source-wiring tests in `desktop/test/inboxFilters.test.ts`:
   - `clearInboxPageForAccountChange` sets the state to `"loading"` before `renderInbox`;
+  - `loadInbox` with `append === false` and no rows sets `"loading"` and re-renders after its guards and before its request (covers an empty-list Apply or Reset);
+  - `loadInbox` with `append === false`, skipped for an in-flight mutation, sets `inboxReloadAfterMutation`;
   - a non-append failure with no rows sets `"failed"` and re-renders;
   - success sets `"loaded"` before rendering;
   - `inbox_clear` success sets `"loaded"`;
@@ -80,9 +85,9 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the four points abov
 
 | File | LOC |
 |---|---:|
-| `desktop/src/main.ts` | 15 |
-| `desktop/test/inboxFilters.test.ts` | 30 |
-| **Total** | **45** |
+| `desktop/src/main.ts` | 22 |
+| `desktop/test/inboxFilters.test.ts` | 40 |
+| **Total** | **62** |
 
 ## Codex scope file
 
@@ -96,6 +101,11 @@ Add the state variable next to `inboxQueryEpoch`. Set it at the four points abov
     "commands": ["node --test --experimental-strip-types --test-isolation=none", "pnpm --dir desktop build"],
     "max_runs": 4
   },
-  "churn": { "max_lines": 70, "max_new_tests": 6 }
+  "churn": { "max_lines": 90, "max_new_tests": 8 }
 }
 ```
+
+## Review amendments (Codex review of `f46014a`)
+
+1. An Apply or Reset of only secondary filters with an empty list never entered `"loading"`, so it showed a false "no messages" during the request. `loadInbox` now sets `"loading"` for any first-page request while no rows are shown.
+2. A scope clear during an in-flight delete or clear left `"loading"` with no request, because only sender selection queued a reload. `loadInbox` now owns that deferral for every first-page load.
