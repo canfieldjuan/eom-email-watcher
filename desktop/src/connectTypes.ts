@@ -47,4 +47,3 @@ export interface ConnectCapabilities {
   items: ConnectCapability[];
   diagnostic: { code: string } | null;
 }
-
