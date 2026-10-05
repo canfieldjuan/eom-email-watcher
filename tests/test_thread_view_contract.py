@@ -45,11 +45,12 @@ OWNED_PHRASES = {
         r"Sent mail unavailable",
     ],
     "D-capture": [
-        r"`exact_sender`, `vendor_domain`, `sent_to_vendor`, `thread_follow`, `gmail_user_label`",
+        r"`exact_sender`, `vendor_address`, `vendor_domain`, `sent_to_vendor`, `thread_follow`,"
+        r" `gmail_user_label`",
         r"leaves no trace",
     ],
-    "D-follow": [r"becomes followed"],
-    "D-identity": [r"UIDVALIDITY:UID", r"logical identity", r"earliest-created"],
+    "D-follow": [r"is followed exactly while", r"earliest-received such message"],
+    "D-identity": [r"UIDVALIDITY:UID", r"logical identity", r"smallest member `Message-ID`"],
     "D-reconcile": [r"coverage record", r"synced_through", r"retries that unit with backoff"],
     "D-body": [r"Body not stored", r"Partial body", r"summary-only storage"],
     "D-ops": [
@@ -132,9 +133,7 @@ def test_owned_phrase_appears_only_in_its_definition(owner: str, pattern: str) -
 
 def test_no_definition_line_is_copied_into_another_section() -> None:
     normative = _normative()
-    others = {
-        heading: _plain(body) for heading, body in normative if _definition_of(heading) is None
-    }
+    plain = {heading: _plain(body) for heading, body in normative}
     copies = []
     for heading, body in normative:
         owner = _definition_of(heading)
@@ -144,10 +143,11 @@ def test_no_definition_line_is_copied_into_another_section() -> None:
             rule = _plain(line)
             if len(rule.split()) < MIN_COPY_WORDS:
                 continue
+            # Every other normative section, including the other definitions.
             copies.extend(
                 f"{owner} line copied into {other}: {rule[:80]}"
-                for other, text in others.items()
-                if rule in text
+                for other, text in plain.items()
+                if other != heading and rule in text
             )
     assert not copies, "\n".join(copies)
 
