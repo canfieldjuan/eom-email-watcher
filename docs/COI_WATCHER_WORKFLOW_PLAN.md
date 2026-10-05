@@ -66,7 +66,7 @@ policy validity without separate verification outside this contract.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Local proof evidence passed; PR review and merge pending. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) records the eight repeatable acceptance items, the approved ordinary real COI completed with the frozen local model, and a passing human-checked field/provenance comparison. Generated ordinary, encrypted and scanned cases cover the repeatable admission controls; replay/restart, concurrent settlement and source rendering also pass. See the final 2026-10-04 evidence entry below. |
+| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Open: the two original private inputs have no retained end-to-end outcomes and cannot currently be located. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) records the eight repeatable acceptance items, the approved ordinary real COI completed with the frozen local model, and a passing human-checked field/provenance comparison. Generated ordinary, encrypted and scanned cases cover the repeatable admission controls; replay/restart, concurrent settlement and source rendering also pass. See the final 2026-10-04 evidence entry below. |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
@@ -101,6 +101,21 @@ contract and update these finish conditions.
 
 ## Current state log
 
+- 2026-10-04, review correction: my preceding completion statement accounted for the
+  approved ordinary COI and generated fault fixtures but omitted the two original private
+  inputs required above. The operator cannot currently locate them, and no retained
+  supported-entrypoint outcomes identify those exact files. Their checks remain **unverified**;
+  M3 is **open**. The generated cases supplement them and do not waive or replace this gate.
+  Recover the exact original identities before running them; do not substitute another COI.
+  The approved ordinary comparison and existing repeatable evidence remain retained at their
+  recorded revisions.
+  The scan-error wording is also corrected at its source: the
+  [provider input contract](https://github.com/canfieldjuan/invoice-processor/blob/85ae9de619d545fbf5f09fb82188666c7cbc8273/docs/contracts/CERTIFICATE-EXTRACT.md#L49-L53)
+  defines public `DOCUMENT_UNREADABLE`, and the
+  [certificate Connect error boundary](https://github.com/canfieldjuan/invoice-processor/blob/85ae9de619d545fbf5f09fb82188666c7cbc8273/src/invoice_processor/connect/service.py#L477-L496)
+  maps internal `NO_NATIVE_TEXT` to it. The generated scan result matches that contract;
+  this correction does not change provider behavior or add certificate OCR.
+
 - 2026-10-04, final reference approval: the approved ordinary real COI completed the real
   provider/consumer path on consumer `144cadaf8c0e7aed10fbb4af6604d4211e510104` and
   provider `85ae9de619d545fbf5f09fb82188666c7cbc8273`, using frozen local model
@@ -114,8 +129,8 @@ contract and update these finish conditions.
   `coi-m3/acceptance-evidence-v2.json`, SHA256
   `e6b3b5c5d16198af90a8e4cbdd354fc5b165f2241d1f3e0dc308ec6728ab149f`.
   Proof PR187 is ready for review. Application code and the frozen model profile are
-  unchanged by this reference approval. Local evidence is complete; review and merge remain
-  pending. Installed Tauri/platform proof remains M4, and product/release decisions remain M5.
+  unchanged by this reference approval. The ordinary-input and repeatable evidence passed; the original encrypted/scanned
+  input checks remain unverified, so M3 is open. Review and merge also remain pending. Installed Tauri/platform proof remains M4, and product/release decisions remain M5.
 
 - 2026-10-04: M3 proof in [PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187),
   consumer head `144cadaf8c0e7aed10fbb4af6604d4211e510104`, provider merged head
@@ -161,8 +176,9 @@ contract and update these finish conditions.
     fix with a regression test.
   - Scanned input: Invoice Processor now accepts OCR input for invoices
     (`application/vnd.local-connect.ocr-pdf`), but `certificate.extract` still
-    builds its catalog from native text only, so the scan still ends
-    `NO_NATIVE_TEXT`. OCR admission for certificates would be a provider
+    builds its catalog from native text only. Its parser raises internal
+    `NO_NATIVE_TEXT`, which the certificate Connect boundary maps to public
+    `DOCUMENT_UNREADABLE`. OCR admission for certificates would be a provider
     contract change; it stays an open coverage gap here.
   - Model runtime: the CPU-placement failure predates the shared per-user model
     runtime in connect-contracts ADR-0011 (Linux, on `main`). Its Windows
@@ -170,7 +186,9 @@ contract and update these finish conditions.
     built yet. Until Invoice Processor attaches to it, an M3 run must record
     the runtime it actually used and its device placement.
   - Inputs: under the accepted contract the encrypted COI should fail
-    `DOCUMENT_UNREADABLE` and the scan `NO_NATIVE_TEXT`. Neither can show a
+    `DOCUMENT_UNREADABLE`; an unreadable image-only scan has the same public
+    error. The earlier `NO_NATIVE_TEXT` wording confused an internal parser code
+    with the capability error. Neither can show a
     completed ledger record, so M3 also needs one ordinary, unencrypted,
     text-bearing real COI, chosen by the operator and kept outside Git.
   - Finish conditions tightened: M3 and M4 now require at least one real,
