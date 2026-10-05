@@ -4438,6 +4438,50 @@ def test_gateway_retry_reuses_durable_request_identity(tmp_path: Path) -> None:
     assert store.recent(1)[0]["status"] == "summarized"
 
 
+class LocalTimeCaptureModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.local_times: list[datetime] = []
+
+    def analyze(self, **kwargs) -> Analysis:
+        self.local_times.append(kwargs["current_local_time"])
+        return super().analyze(**kwargs)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_analysis_prompt_time_uses_configured_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    # 01:00 UTC is still the previous evening in America/Chicago (CDT, UTC-5).
+    checked_at = datetime(2026, 10, 6, 1, tzinfo=UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return checked_at if tz is None else checked_at.astimezone(tz)
+
+    monkeypatch.setattr(service_module, "datetime", FixedDatetime)
+    monkeypatch.setattr(db_module, "datetime", FixedDatetime)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=True,
+    )
+    model = LocalTimeCaptureModel()
+
+    Watcher(cfg, store, FakeGmail(), model).check(dry_run=dry_run)
+
+    assert len(model.local_times) == 1
+    assert model.local_times[0] == checked_at
+    assert model.local_times[0].isoformat() == "2026-10-05T20:00:00-05:00"
+
+
 def test_gateway_result_is_persisted_before_acknowledgement(tmp_path: Path) -> None:
     cfg = config(tmp_path)
     store = Store(cfg.database_file)
