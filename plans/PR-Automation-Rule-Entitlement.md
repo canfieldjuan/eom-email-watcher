@@ -34,10 +34,10 @@ Slice phase: paid-boundary enforcement (operator decision, 2026-10-05)
 
 Engine:
 
-1. `automation.rules.put`, for create and edit, and `automation.rules.put_watched` return `automation_entitlement_required` ("Automation rules require an active Automations entitlement") unless `_automation_entitlement_active()` is true. The check runs before the mutation lock is taken and before runtime access, so a refused call writes nothing.
-2. `automation.rules.set_enabled` with `enabled: true` has the same requirement. `enabled: false` is always allowed.
+1. `automation.rules.put`, for create and edit, and `automation.rules.put_watched` return `automation_entitlement_required` ("Automation rules require an active Automations entitlement") unless `_automation_entitlement_active()` is true. The check runs after the request's existing payload, shape, version, and definition validation (`engine_api.py:2377-2388`), so malformed requests keep returning `invalid_request` or `invalid_rule` as today. It runs before the mutation lock is taken and before runtime access, so a refused call writes nothing.
+2. `automation.rules.set_enabled` with `enabled: true` has the same requirement, checked after its payload validation. `enabled: false` is always allowed.
 3. `automation.rules.delete`, `list`, `get`, and `prepare` require no entitlement. Disabling and deleting stay possible after a license lapses, matching calendar revocation (`engine_api.py:1583`).
-4. `connect.entitlement.status` adds `automations_active: bool`, the current value of `_automation_entitlement_active()`. `_connect_entitlement_status` (`engine_api.py:1440-1442`) adds it to the package's `public_dict()`; the `connect-automate` package is unchanged. It is advisory for display; the engine check in items 1-2 is authoritative. This is the only place the desktop learns the Automations state.
+4. Both `connect.entitlement.status` and `connect.entitlement.install` add `automations_active: bool`, the current value of `_automation_entitlement_active()`. One helper builds that response from the package's `public_dict()` for both handlers (`engine_api.py:1440-1457`); the `connect-automate` package is unchanged. So a license installed with Automations shows "included" immediately. It is advisory for display; the engine check in items 1-2 is authoritative. This is the only place the desktop learns the Automations state.
 
 Desktop:
 
@@ -47,7 +47,8 @@ Desktop:
    - disables "Save enabled rule" (`data-action="save"`);
    - disables the toggle when it would enable a paused rule;
    - keeps the toggle enabled when it would pause an enabled rule;
-   - shows "Automations locked" with a "View Connect" button that opens the Health view, the same pattern as the Inbox's "Connect actions locked" (`desktop/src/main.ts:1979-1993`).
+   - shows "Automations locked" with a "View Connect" button, the same pattern as the Inbox's "Connect actions locked" (`desktop/src/main.ts:1979-1993`).
+6b. Opening Health always refreshes it. One `openConnectHealth()` in `main.ts` shows the Health view, runs `loadHealth()` and `refreshConnectStatus()` as the Health tab already does (`desktop/src/main.ts:4653-4656`), and scrolls to the Connect card. The Health tab, the Inbox's "View Connect", and the COI setup's "View Connect" all use it. Today the Inbox button only calls `showView` (`desktop/src/main.ts:1990-1993`) and can show a cached state for up to the 30-second poll.
 
    When the flag is `true`, the setup behaves exactly as today.
 7. If a save or enable fails with `automation_entitlement_required` (the license lapsed after the last refresh), the setup shows the engine's message and refreshes, which shows the locked state.
@@ -85,8 +86,8 @@ Desktop:
 
 ## Mechanism
 
-- Engine: add `_require_automation_entitlement()`, modelled on `_require_calendar_entitlement` (`engine_api.py:1491`). Call it at the top of `_automation_rules_put` and in `_automation_rules_set_enabled` when `enabled` is true, before `_with_automation_rule_mutation`. `_connect_entitlement_status` returns the package's `public_dict()` plus `automations_active`.
-- Desktop: a pure function in `coiRules.ts`, `coiControlState(automationsActive, selectedRule)`, returns whether Save and the toggle are enabled and whether the locked line shows. `coiSetup.ts` fetches `connect_entitlement_status` on refresh and applies it. `mountCoiSetup` takes an optional `onViewConnect` callback, which `main.ts` supplies as `() => showView("health")`. `renderConnectStatus` adds the Automations sentence when `status.active`.
+- Engine: add `_require_automation_entitlement()`, modelled on `_require_calendar_entitlement` (`engine_api.py:1491`). In `_automation_rules_put`, call it after definition validation and before `_with_automation_rule_mutation`. In `_automation_rules_set_enabled`, call it after the `enabled` type check when `enabled` is true. A helper `_connect_entitlement_response(status)` returns `status.public_dict()` plus `automations_active`, and both `_connect_entitlement_status` and `_connect_entitlement_install` return through it.
+- Desktop: a pure function in `coiRules.ts`, `coiControlState(automationsActive, selectedRule)`, returns whether Save and the toggle are enabled and whether the locked line shows. `coiSetup.ts` fetches `connect_entitlement_status` on refresh and applies it. `mountCoiSetup` takes an optional `onViewConnect` callback, which `main.ts` supplies as `openConnectHealth`. The Health tab handler and the Inbox's "View Connect" switch to `openConnectHealth` too. `renderConnectStatus` adds the Automations sentence when `status.active`.
 
 ## Intentional
 
@@ -101,14 +102,16 @@ Desktop:
 
 - Fail-first engine tests in `tests/test_engine_api.py`, with the entitlement monkeypatched as existing tests do (`tests/test_connect_v2_engine_api.py:766`):
   - with it inactive, `put` (create), `put` (edit), `put_watched`, and `set_enabled(true)` are each refused with `automation_entitlement_required`, and the rules snapshot revision is unchanged;
+  - with it inactive, a malformed `put` (bad shape, bad version, invalid definition) still returns `invalid_request` or `invalid_rule`, so validation precedes the entitlement check;
   - with it inactive, `set_enabled(false)` and `delete` succeed;
   - with it active, all succeed;
-  - `connect.entitlement.status` reports `automations_active` both ways and keeps the package's `state` and `active`;
+  - `connect.entitlement.status` and `connect.entitlement.install` both report `automations_active` both ways and keep the package's `state` and `active`;
   - `_automation_entitlement_active` itself still requires both features (one test on `feature_entitlements_active`'s arguments).
 - Existing rule-mutation tests (the 17 engine calls in `tests/test_engine_api.py`) enable the entitlement explicitly. None is weakened or deleted.
 - Rust: a typed test for `ConnectEntitlementStatus` deserializes with `automations_active` true, false, and absent (absent reads as false).
 - Desktop: `coiControlState` unit tests (locked plus new rule, locked plus enabled rule, locked plus paused rule, entitled), and source wiring for:
   - the locked line and the "View Connect" callback;
+  - `openConnectHealth` running `loadHealth` and `refreshConnectStatus`, and used by the Health tab and both "View Connect" buttons;
   - refresh on `automation_entitlement_required`;
   - the COI refresh fetching `connect_entitlement_status`;
   - `renderConnectStatus` adding the Automations sentence only when Connect is active.
@@ -124,18 +127,18 @@ Desktop:
 
 | File | LOC |
 |---|---:|
-| `src/eom_email_watcher/engine_api.py` | 20 |
+| `src/eom_email_watcher/engine_api.py` | 26 |
 | `docs/ENGINE_API.md` | 8 |
 | `docs/AUTOMATE_RULE_ENGINE_CONTRACT.md` | 6 |
 | `docs/CERTIFICATE_EXPIRY_LEDGER_AUTOMATION_CONTRACT.md` | 8 |
 | `desktop/src-tauri/src/engine.rs` | 20 |
 | `desktop/src/coiRules.ts` | 20 |
 | `desktop/src/coiSetup.ts` | 35 |
-| `desktop/src/main.ts` | 12 |
+| `desktop/src/main.ts` | 20 |
 | `desktop/test/coiRules.test.ts` | 45 |
-| `tests/test_engine_api.py` | 100 |
+| `tests/test_engine_api.py` | 115 |
 | `tests/test_coi_local_proof.py` | 4 |
-| **Total** | **283** |
+| **Total** | **312** |
 
 ## Codex scope file
 
@@ -159,7 +162,7 @@ Desktop:
     ],
     "max_runs": 12
   },
-  "churn": { "max_lines": 360, "max_new_tests": 18 }
+  "churn": { "max_lines": 390, "max_new_tests": 20 }
 }
 ```
 
@@ -167,3 +170,9 @@ Desktop:
 
 1. "View Connect" led to a Health card that reports the Connect license as "Active" without mentioning Automations, which is misleading for exactly the Connect-only user. Health now states whether Automations is included. The Automations state moved from a rule-list flag to `connect.entitlement.status`, so Health and the COI setup read it from one place.
 2. The COI-specific contract (`CERTIFICATE_EXPIRY_LEDGER_AUTOMATION_CONTRACT.md`, M5) now gets the save/resume restriction too, not only the general rule-engine contract.
+
+## Review amendments, round 2 (Codex review of `d45537e`)
+
+1. `connect.entitlement.install` also returns the status, unaugmented, so a freshly installed Automations license would read "not included". One response helper now serves both status and install.
+2. "View Connect" called only `showView`, skipping the Health tab's refresh. One `openConnectHealth()` now owns opening Health, for the tab and both "View Connect" buttons, including the existing Inbox one, which had the same gap.
+3. The entitlement check now follows request validation, so malformed requests keep their `invalid_request` or `invalid_rule` errors.
