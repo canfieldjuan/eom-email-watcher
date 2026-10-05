@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import os
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -77,7 +78,101 @@ class ReachedRuntime(Exception):
 
 
 @pytest.fixture
-def cli(tmp_path, monkeypatch):
+def identity_checkout(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    files = {
+        "src/eom_email_watcher/__init__.py": "",
+        "src/eom_email_watcher/engine_api.py": "# engine\n",
+        "scripts/coi_local_proof.py": "# proof\n",
+        "scripts/build_desktop_sidecar.py": "# approved validator\n",
+        "scripts/coi_evidence.py": "# evidence owner\n",
+        "uv.lock": "# dependency lock\n",
+        ".gitignore": "ignored-output/\n",
+    }
+    for name, content in files.items():
+        path = checkout / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    for args in (
+        ["init", "--quiet"], ["add", "."],
+        ["-c", "user.name=Proof Test", "-c", "user.email=fixture@example.invalid",
+         "commit", "--quiet", "-m", "clean fixture"],
+    ):
+        subprocess.run(["git", "-C", str(checkout), *args], check=True, capture_output=True)
+    monkeypatch.setattr(proof, "CHECKOUT", checkout)
+    monkeypatch.setattr(proof, "__file__", str(checkout / "scripts/coi_local_proof.py"))
+    monkeypatch.setattr(proof.engine_api, "__file__",
+                        str(checkout / "src/eom_email_watcher/engine_api.py"))
+    monkeypatch.setattr(proof, "sys", SimpleNamespace(modules={
+        "eom_email_watcher": SimpleNamespace(
+            __file__=str(checkout / "src/eom_email_watcher/__init__.py")
+        ),
+        "eom_email_watcher.engine_api": proof.engine_api,
+    }))
+    return checkout
+
+
+@pytest.mark.parametrize("name,change", [
+    ("scripts/build_desktop_sidecar.py", "modified"),
+    ("scripts/build_desktop_sidecar.py", "staged"),
+    ("scripts/build_desktop_sidecar.py", "deleted"),
+    ("scripts/coi_evidence.py", "modified"),
+    ("scripts/coi_local_proof.py", "modified"),
+    ("src/eom_email_watcher/engine_api.py", "modified"),
+    ("uv.lock", "modified"),
+    ("scripts/future_proof_helper.py", "untracked"),
+])
+def test_identity_rejects_checkout_changes(identity_checkout, name, change):
+    path = identity_checkout / name
+    if change == "deleted":
+        path.unlink()
+    else:
+        path.write_text("# changed admission behavior\n")
+    if change == "staged":
+        subprocess.run(["git", "-C", str(identity_checkout), "add", name], check=True)
+    if change == "untracked":
+        subprocess.run(
+            ["git", "-C", str(identity_checkout), "config", "status.showUntrackedFiles", "no"],
+            check=True,
+        )
+    with pytest.raises(RuntimeError, match="uncommitted"):
+        proof.watcher_identity()
+
+
+def test_identity_accepts_clean_checkout_with_ignored_output(identity_checkout):
+    expected = subprocess.check_output(
+        ["git", "-C", str(identity_checkout), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert proof.watcher_identity()["watcher_head"] == expected
+    output = identity_checkout / "ignored-output"
+    output.mkdir()
+    (output / "scratch.txt").write_text("build artifact")
+    assert proof.watcher_identity()["watcher_head"] == expected
+
+
+def test_checkout_status_has_one_owner_and_no_path_filter():
+    import ast
+
+    tree = ast.parse(Path(spec.origin).read_text())
+    owners = []
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        for call in ast.walk(function):
+            if not isinstance(call, ast.Call) or not call.args:
+                continue
+            command = call.args[0]
+            if not isinstance(command, ast.List):
+                continue
+            literals = [node.value for node in command.elts if isinstance(node, ast.Constant)]
+            if "git" in literals and "status" in literals:
+                owners.append(function.name)
+                assert "--" not in literals, "Source admission must cover the whole checkout"
+    assert owners == ["watcher_identity"]
+
+
+@pytest.fixture
+def cli(tmp_path, monkeypatch, identity_checkout):
     pdf = tmp_path / "input.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
     old_umask = os.umask(0o077)

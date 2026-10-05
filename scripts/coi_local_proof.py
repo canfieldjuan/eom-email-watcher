@@ -52,7 +52,7 @@ CHECKOUT = Path(__file__).resolve().parents[1]
 
 
 def watcher_identity() -> dict[str, str]:
-    """Only attribute loaded, unchanged checkout code to its Git revision."""
+    """Attribute code to HEAD only when the whole proof checkout is unchanged."""
     package = CHECKOUT / "src" / "eom_email_watcher"
     for name, module in tuple(sys.modules.items()):
         if name != "eom_email_watcher" and not name.startswith("eom_email_watcher."):
@@ -61,11 +61,11 @@ def watcher_identity() -> dict[str, str]:
         if loaded is None or not Path(loaded).resolve().is_relative_to(package):
             raise RuntimeError(f"Loaded {name} is not from the proof checkout")
     changes = subprocess.check_output(
-        ["git", "-C", str(CHECKOUT), "status", "--porcelain", "--", "src/eom_email_watcher"],
+        ["git", "-C", str(CHECKOUT), "status", "--porcelain", "--untracked-files=all"],
         text=True,
     )
     if changes:
-        raise RuntimeError("Proof checkout has uncommitted watcher source changes")
+        raise RuntimeError("Proof checkout has uncommitted changes")
     return {
         "watcher_head": subprocess.check_output(
             ["git", "-C", str(CHECKOUT), "rev-parse", "HEAD"], text=True
