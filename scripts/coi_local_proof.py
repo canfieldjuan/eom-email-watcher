@@ -3,7 +3,9 @@
 Run with an isolated XDG_RUNTIME_DIR containing a running invoice-connect provider.
 Uses the installed entitlement through the published keyring; never reads it directly.
 Only mailbox retrieval is staged from --pdf. Provider results are never mocked.
-Declare any fixture model with --model-kind fixture.
+--model-kind is required: it records the caller's declaration, not runtime attestation.
+Real-model evidence also requires a separately retained runtime/profile receipt.
+Run with this checkout's installed package (for example, uv run python scripts/coi_local_proof.py).
 The evidence directory contains document text and must remain private.
 """
 
@@ -22,6 +24,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from connect_automate import connect, entitlement
+from tomlkit import dumps as toml_dumps
 
 from eom_email_watcher import engine_api
 from eom_email_watcher.config import config_admission_snapshot
@@ -40,6 +43,31 @@ IDENTITY = hashlib.sha256(b"coi-m3-isolated-mailbox").hexdigest()
 MESSAGE_ID = "coi-m3-proof"
 PART_ID = "part-1"
 ATTACHMENT_ID = "attachment-1"
+CHECKOUT = Path(__file__).resolve().parents[1]
+
+
+def watcher_identity() -> dict[str, str]:
+    """Only attribute loaded, unchanged checkout code to its Git revision."""
+    package = CHECKOUT / "src" / "eom_email_watcher"
+    for name, module in tuple(sys.modules.items()):
+        if name != "eom_email_watcher" and not name.startswith("eom_email_watcher."):
+            continue
+        loaded = getattr(module, "__file__", None)
+        if loaded is None or not Path(loaded).resolve().is_relative_to(package):
+            raise RuntimeError(f"Loaded {name} is not from the proof checkout")
+    changes = subprocess.check_output(
+        ["git", "-C", str(CHECKOUT), "status", "--porcelain", "--", "src/eom_email_watcher"],
+        text=True,
+    )
+    if changes:
+        raise RuntimeError("Proof checkout has uncommitted watcher source changes")
+    return {
+        "watcher_head": subprocess.check_output(
+            ["git", "-C", str(CHECKOUT), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "engine_sha256": hashlib.sha256(Path(engine_api.__file__).read_bytes()).hexdigest(),
+        "proof_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
 
 
 def require_checks(checks: dict[str, bool]) -> None:
@@ -110,10 +138,11 @@ def main() -> None:
     parser.add_argument("--expect-policy-count", type=int, required=True)
     parser.add_argument("--expect-error", choices=["DOCUMENT_UNREADABLE"])
     parser.add_argument("--today", required=True)
-    parser.add_argument("--model-kind", choices=["real", "fixture"], default="real")
+    parser.add_argument("--model-kind", choices=["real", "fixture"], required=True)
     args = parser.parse_args()
     if args.expect_policy_count < 0 or (args.expect_error and args.expect_policy_count != 0):
         parser.error("Expected errors require zero policy rows; counts must be nonnegative")
+    identity = watcher_identity()
     os.umask(0o077)
     INPUT = args.pdf.resolve(strict=True)
     ROOT = args.evidence_dir.resolve()
@@ -125,16 +154,17 @@ def main() -> None:
     stage_authority(bundle, args.keyring)
     content = INPUT.read_bytes()
     CONFIG.write_text(
-        f'''timezone = "America/Chicago"
-gmail_credentials_file = "{STATE / "credentials.json"}"
-gmail_token_file = "{STATE / "token.json"}"
-gmail_send_token_file = "{STATE / "send-token.json"}"
-database_file = "{STATE / "watcher.sqlite3"}"
-model_base_url = "http://127.0.0.1:18081/v1"
-model_name = "qwen35-9b"
-model_require_auth = false
-notifications_enabled = false
-''',
+        toml_dumps({
+            "timezone": "America/Chicago",
+            "gmail_credentials_file": str(STATE / "credentials.json"),
+            "gmail_token_file": str(STATE / "token.json"),
+            "gmail_send_token_file": str(STATE / "send-token.json"),
+            "database_file": str(STATE / "watcher.sqlite3"),
+            "model_base_url": "http://127.0.0.1:18081/v1",
+            "model_name": "qwen35-9b",
+            "model_require_auth": False,
+            "notifications_enabled": False,
+        }),
         encoding="utf-8",
     )
     CONFIG.chmod(0o600)
@@ -256,6 +286,8 @@ notifications_enabled = false
     )
     restarted = subprocess.run(
         [sys.executable, "-m", "eom_email_watcher.engine_api"],
+        cwd=CHECKOUT,
+        env={**os.environ, "PYTHONPATH": str(CHECKOUT / "src")},
         input=json.dumps(
             request("certificate.expiry_ledger.list", {"today": args.today, "limit": 100})
         ),
@@ -309,10 +341,13 @@ notifications_enabled = false
     }
     result["checks"] = checks
     result["model_kind"] = args.model_kind
+    result["model_kind_source"] = (
+        "explicit caller declaration; runtime receipt required for real proof"
+    )
     result["expected_error"] = args.expect_error
-    result["watcher_head"] = subprocess.check_output(
-        ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True
-    ).strip()
+    if watcher_identity() != identity:
+        raise RuntimeError("Proof checkout changed during the run")
+    result.update(identity)
     write_private_json("watcher-result-summary.json", result)
     print(
         json.dumps({"checks": checks, "job_error_code": result["job_error_code"]}, sort_keys=True)
