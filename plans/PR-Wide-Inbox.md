@@ -33,7 +33,7 @@ Slice phase: layout correction on an operator-reported defect
 
 ### Observable behavior
 
-1. **Width.** While the Inbox or Expiry Ledger tab is shown, at viewport widths of 681px or more, the shell is `max(80%, min(760px, calc(100% - 40px)))` wide: 80% of the window, never narrower than today. That is 1207px at the operator's size, and about 1640px on a 2560-CSS-pixel window. Watchlist, Health, and Settings keep today's width. Below 681px, the existing phone rule applies unchanged.
+1. **Width.** While the Inbox or Expiry Ledger tab is shown, at viewport widths of 681px or more, the shell is `max(80%, min(760px, calc(100% - 40px)))` wide: 80% of the window, never narrower than today. That is 1207px at the operator's size. On a 2560-pixel monitor at the same 1.25× scale (2048 CSS pixels) it is about 1640px; on a 2560-CSS-pixel window it is about 2048px. At 681px and up, Watchlist, Health, and Settings keep today's `min(760px, calc(100% - 40px))`. At 680px and below, every view, the Inbox and Expiry Ledger included, uses the existing phone rule `min(100% - 28px, 760px)` (`desktop/src/styles.css:1356`), unchanged.
 2. **Sender column.** It becomes `minmax(220px, 300px)`; the message column takes the rest. Below 760px the columns still stack.
 3. **Intro.** While the Inbox is shown, the intro block is visually hidden. It stays in the DOM and in the accessibility tree, using the standard visually-hidden clip pattern, not `display: none`, so the page keeps its `h1`. On every other tab it shows as today.
 4. **Filters.** The filter panel starts collapsed: `<details>` without `open`. One click on its summary opens it. Its controls, Apply, Reset, and values behave as today.
