@@ -66,7 +66,7 @@ policy validity without separate verification outside this contract.
 | M0: contract | Provider and consumer agree on result schema, boundaries, and vertical acceptance proof. | Accepted consumer contract revision 2 dated 2026-09-20; provider contract is its named dependency. This establishes intent, not runtime proof. |
 | M1: provider and consumer code | Provider exposes `certificate.extract`; Email Watcher dispatches, validates, stores, and lists the result with a desktop ledger. | Code merged: [Invoice Processor #63](https://github.com/canfieldjuan/invoice-processor/pull/63) at `7b52f566520df108be916a22c18433e5b9d62f24` and [Email Watcher #177](https://github.com/canfieldjuan/eom-email-watcher/pull/177) at `e336e0ebf38f413be4437ef5d6f3f2661dacfaaf`. Installed cross-app proof is not recorded here. |
 | M2: operator inbox visibility | A person can see confirmation decisions and resulting automation outcomes on the attachment path. | Code merged: [Email Watcher #179](https://github.com/canfieldjuan/eom-email-watcher/pull/179) at `45853036d62c218651905510fc0b77e4e42fb585`; [#181](https://github.com/canfieldjuan/eom-email-watcher/pull/181) at `ac4829fd9b0ba9eb20cdb081af436618ed6795ee`. This is adjacent operator visibility, not proof that the COI flow ran end to end. |
-| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | Local acceptance evidence passed; PR review and merge pending. The historical encrypted/scanned pair was recovered from earlier explicit paths and both now have supported-entrypoint outcomes: `DOCUMENT_UNREADABLE`, zero ledger rows, stable replay/restart. Identity recovery and its historical-digest limitation are recorded below. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) records the eight repeatable acceptance items, the approved ordinary real COI completed with the frozen local model, and a passing human-checked field/provenance comparison. Generated ordinary, encrypted and scanned cases cover the repeatable admission controls; replay/restart, concurrent settlement and source rendering also pass. See the final 2026-10-04 evidence entry below. |
+| M3: integrated local proof | Begin with both private real COIs through the supported Email Watcher and Connect v2 entrypoint, then use deterministic fixtures for the accepted contract's eight repeatable acceptance items. Record exact heads, commands, outcomes, and failures without publishing document content. | OPEN: the recovered encrypted/scanned candidates passed admission, but authoritative continuity with the original inputs is unverified. Historical filenames and metadata do not close that gate. [Proof PR187](https://github.com/canfieldjuan/eom-email-watcher/pull/187) retains the approved ordinary real-model comparison and repeatable admission, replay/restart, concurrency and rendering evidence; its proof-tool review corrections are pending. The original-input gate needs authoritative identity evidence or an explicit operator decision changing the finish condition. |
 | M4: installed/operator proof | On each platform claimed, install the actual builds, configure a selected rule/provider through the supported path, process a retained COI PDF, and observe the persisted ledger and desktop review state. Record versions, setup, logs, and artifacts. | Pending. Do not claim an installed workflow or cross-platform readiness from local source tests. |
 | M5: product/release decision | Operator accepts the target customer-facing workflow, setup and review responsibilities, and any reminder/renewal behavior; release evidence supports the exact claims made. | Not decided. This plan does not silently add reminders or set a release date. |
 
@@ -101,8 +101,24 @@ contract and update these finish conditions.
 
 ## Current state log
 
-- 2026-10-04, original-input recovery and proof: earlier session records named the native
-  and scanned COI paths. Both files were still present; filenames, byte sizes, timestamps
+- 2026-10-04, identity-gate correction: my recovery entry below promoted matching historical
+  paths and metadata into proof of original-file continuity. It cannot establish that
+  continuity without authoritative historical identity evidence. The recovered candidate
+  runs and their current hashes remain valid supplemental evidence; M3 stays **OPEN**.
+  No finish condition is relaxed. The separate encryption finding is contradicted by the
+  merged provider source and its readable-encrypted-PDF regression, linked in the corrected
+  audit below. Proof-tool identity, authority, evidence-location and projection corrections
+  are committed in PR187 at `c3296c75a62f3d7d6b8bcbb35cbea73e8a26f9ab`: focused proof
+  and authority tests passed, and fresh generated ordinary/encrypted/scanned integration
+  runs passed with pinned provider instance/versions, approved release authority and full
+  projection identity checks. Current correction manifest: alias
+  `coi-m3/acceptance-evidence-v5.json`, SHA256
+  `414c2bfefabb887cfc410cf2e7a7e4ab980835369d93fc78221b006ef4989f45`.
+  The remaining identity decision is tracked in
+  [issue #188](https://github.com/canfieldjuan/eom-email-watcher/issues/188).
+
+- 2026-10-04, candidate-input recovery and proof (completion claim corrected above): earlier
+  session records named the native and scanned COI paths. Both files were still present; filenames, byte sizes, timestamps
   and native-text profiles matched the historical records. Private copies and current
   SHA256 identities are retained with the recovery trace. No historical digest was retained,
   so byte-for-byte continuity with the earlier profiling cannot be independently established.
@@ -114,10 +130,11 @@ contract and update these finish conditions.
   was staged and the deterministic fixture model boundary declared; these are unreadable-input
   admission proofs, not extraction successes. The approved ordinary real-model/reference
   proof remains at its recorded revision, with unchanged application/extraction source.
-  Current evidence chain: alias `coi-m3/acceptance-evidence-v4.json`, SHA256
+  Historical evidence chain (completion status superseded above): alias
+  `coi-m3/acceptance-evidence-v4.json`, SHA256
   `b3f7eb3b169ab5440cbdc92c7e22fee641d50b7e7479e5c8c5ad13c705f7db83`.
-  Local acceptance evidence now covers the recovered originals plus the approved ordinary
-  COI and repeatable cases. PR review and merge remain pending. Scanned extraction, installed
+  Evidence covers the recovered candidates, approved ordinary COI and repeatable cases.
+  The original-file identity gate, PR review and merge remain open. Scanned extraction, installed
   proof and product/release decisions remain separate gaps. Owned proof processes are stopped.
 
 - 2026-10-04, review correction (before original-input recovery): my preceding completion
@@ -125,9 +142,10 @@ contract and update these finish conditions.
   approved ordinary COI and generated fault fixtures but omitted the two original private
   inputs required above. At this checkpoint the operator could not locate them, and no retained
   supported-entrypoint outcomes identified those exact files. Their checks were **unverified**;
-  M3 was **open** until the recovery and proof recorded above. The generated cases supplement
-  them and do not waive or replace this gate.
-  Recover the exact original identities before running them; do not substitute another COI.
+  M3 remains **open**; the recovery above does not establish historical content continuity.
+  The generated cases supplement them and do not waive or replace this gate.
+  Recover authoritative original identities before closing this gate; candidate runs alone
+  do not authorize substituting another COI.
   The approved ordinary comparison and existing repeatable evidence remain retained at their
   recorded revisions.
   The scan-error wording is also corrected at its source: the
@@ -194,10 +212,19 @@ contract and update these finish conditions.
 - 2026-10-02: Re-checked the M3 blockers against Invoice Processor `main`.
   Certificate code changed only in Invoice Processor #85 (2026-09-27, value
   parsing).
-  - Encrypted input: `extract/pdf.py::build_catalog` still has no encryption
-    check, so the provider still admits the encrypted COI that its contract
-    rejects as `DOCUMENT_UNREADABLE`. No issue tracks this; it needs a provider
-    fix with a regression test.
+  - Encrypted input (historical finding, resolved by
+    [Invoice Processor #110](https://github.com/canfieldjuan/invoice-processor/pull/110)):
+    the earlier audit found that the shared reader lacked an encryption check. At tested
+    provider `85ae9de619d545fbf5f09fb82188666c7cbc8273`, the
+    [certificate entrypoint](https://github.com/canfieldjuan/invoice-processor/blob/85ae9de619d545fbf5f09fb82188666c7cbc8273/src/invoice_processor/connect/service.py#L510)
+    requests `reject_encrypted=True`; the
+    [PDF reader](https://github.com/canfieldjuan/invoice-processor/blob/85ae9de619d545fbf5f09fb82188666c7cbc8273/src/invoice_processor/extract/pdf.py#L433)
+    checks encryption before reading pages or creating a model. The
+    [readable encrypted PDF regression](https://github.com/canfieldjuan/invoice-processor/blob/85ae9de619d545fbf5f09fb82188666c7cbc8273/tests/test_certificate_connect.py#L167)
+    proves the library can read the generated empty-password PDF while the real certificate
+    job returns the error required by the canonical provider input contract linked above.
+    This regression passed again during the 2026-10-04 reconciliation. Invoice behavior is
+    unchanged. The original audit is not current provider behavior.
   - Scanned input: Invoice Processor now accepts OCR input for invoices
     (`application/vnd.local-connect.ocr-pdf`), but `certificate.extract` still
     builds its catalog from native text only. Its parser raises internal
