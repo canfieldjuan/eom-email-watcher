@@ -37,8 +37,6 @@ Slice phase: layout correction on an operator-reported defect
 2. **Sender column.** It becomes `minmax(220px, 300px)`; the message column takes the rest. Below 760px the columns still stack.
 3. **Intro.** While the Inbox is shown, the intro block is visually hidden. It stays in the DOM and in the accessibility tree, using the standard visually-hidden clip pattern, not `display: none`, so the page keeps its `h1`. On every other tab it shows as today.
 4. **Filters.** The filter panel starts collapsed: `<details>` without `open`. One click on its summary opens it. Its controls, Apply, Reset, and values behave as today.
-
-   The collapsed summary shows the committed scope instead of today's static "Sender, priority, topic and more" (`desktop/src/main.ts:542`). The Inbox starts scoped to the active account (`activeInboxAccountSelection = "active"`, `desktop/src/main.ts:1003`), so a collapsed panel must not hide it. The text is the label of the account option matching `activeInboxAccountSelection`, exactly as the selector writes it (`desktop/src/main.ts:3345-3367`: "Active — <address>", "All retained accounts", or "<address> · <name>"). When N of keyword, free-text sender, priority, topic, and status are set, it is followed by " · N filter" or " · N filters". It updates after the account options render and after every query commit (Apply, Reset, account change).
 5. **No repeated header.** An expanded row's content no longer repeats:
    - the sender name and address;
    - the received time;
@@ -55,18 +53,17 @@ Slice phase: layout correction on an operator-reported defect
 ### Invariants
 
 - Only `showView` changes the marker. It uses the same argument that toggles `hidden` (`desktop/src/main.ts:1190-1200`), so the marker and the visible view cannot disagree.
-- Nothing is removed from the DOM except the repeated row items in item 5. The intro stays in the accessibility tree. The collapsed filter controls leave the accessibility tree until the panel is opened. That is native `<details>` behavior, intended here, and the summary states the active scope while they are hidden.
+- Nothing is removed from the DOM except the repeated row items in item 5. The intro stays in the accessibility tree. The collapsed filter controls leave the accessibility tree until the panel is opened. That is native `<details>` behavior, and it is intended here.
 - Every rule for the wide shell and the hidden intro is keyed to `data-view`. Without a marker, the layout falls back to today's.
 
 ### Failure cases
 
 - An unknown view cannot occur: `showView` takes a closed union. A missing marker falls back to today's layout, never a broken one.
-- A collapsed panel cannot hide the scope. The account scope is active from launch, and secondary filters can be applied mid-session, so the summary always shows both (item 4).
-- No option matches `activeInboxAccountSelection` (accounts still loading): the summary keeps today's static text until the options render.
+- A collapsed panel does not show the active scope. The Inbox starts scoped to the active account (`activeInboxAccountSelection = "active"`, `desktop/src/main.ts:1003`), and secondary filters can be applied mid-session. The summary keeps its static text "Sender, priority, topic and more" (`desktop/src/main.ts:542`); opening the panel shows the scope. This is an operator decision (see Intentional).
 
 ### Files touched
 
-- `desktop/src/main.ts`: the shell marker in the markup and in `showView`; `open` removed from the filter panel; the scope summary; the repeated header items left out of the expanded content.
+- `desktop/src/main.ts`: the shell marker in the markup and in `showView`; `open` removed from the filter panel; the repeated header items left out of the expanded content.
 - `desktop/src/styles.css`: the 80% rule, the Inbox intro rule, the sender column.
 - `desktop/test/inboxFilters.test.ts`: new source-wiring tests. The existing "initially open native disclosure" test is changed to "initially collapsed", because the operator reversed that decision.
 
@@ -80,6 +77,7 @@ Slice phase: layout correction on an operator-reported defect
 
 - 80% with a 760px floor scales with the window rather than stopping at a fixed cap.
 - The intro is hidden only on the Inbox. Other tabs keep it.
+- The collapsed filter summary keeps its static text and does not show the account scope or a filter count. The operator declined that on 2026-10-05: "no, dont want that in the summaries".
 
 ## Deferred
 
@@ -93,7 +91,6 @@ Slice phase: layout correction on an operator-reported defect
   - the 80% rule's selector covers exactly `inbox` and `expiry-ledger`, inside `@media (min-width: 681px)`;
   - the Inbox intro rule uses the clip pattern, not `display: none`;
   - the filter `<details>` has no `open`;
-  - the summary is set from the account option label matching `activeInboxAccountSelection`, plus the secondary-filter count, and is updated by `renderInboxAccountOptions` and `commitInboxQueryFromControls`;
   - the expanded content does not append the sender, address, received time, subject, category, or state, and still appends the provenance, priority, and footer actions;
   - the sender column is `minmax(220px, 300px)`.
 - Commands, each a narrowing of a prefix declared in the Codex scope file:
@@ -103,7 +100,7 @@ Slice phase: layout correction on an operator-reported defect
   - the Inbox shell at 80% of the viewport;
   - Watchlist at today's width;
   - the intro hidden on Inbox and visible on Settings;
-  - the filters collapsed, with the summary reading the active account label;
+  - the filters collapsed, with the summary text unchanged;
   - at least one message row above the fold;
   - an expanded row with no repeated sender, subject, or time.
 
@@ -113,10 +110,10 @@ Slice phase: layout correction on an operator-reported defect
 
 | File | LOC |
 |---|---:|
-| `desktop/src/main.ts` | 40 |
+| `desktop/src/main.ts` | 25 |
 | `desktop/src/styles.css` | 20 |
-| `desktop/test/inboxFilters.test.ts` | 60 |
-| **Total** | **120** |
+| `desktop/test/inboxFilters.test.ts` | 45 |
+| **Total** | **90** |
 
 ## Codex scope file
 
@@ -130,11 +127,11 @@ Slice phase: layout correction on an operator-reported defect
     "commands": ["node --test --experimental-strip-types --test-isolation=none", "pnpm --dir desktop build"],
     "max_runs": 5
   },
-  "churn": { "max_lines": 180, "max_new_tests": 9 }
+  "churn": { "max_lines": 140, "max_new_tests": 8 }
 }
 ```
 
 ## Review amendments (Codex review of `f678e62`)
 
 1. The invariant said only the repeated row items leave the accessibility tree, but a collapsed `<details>` hides its controls until opened. The invariant now names that as intended native behavior.
-2. "No filter is active at launch" was false: the Inbox starts scoped to the active account. The collapsed summary now shows the committed account scope and the secondary-filter count. This also replaces the deferred active-filter indicator.
+2. "No filter is active at launch" was false: the Inbox starts scoped to the active account. That statement is corrected. A scope-showing summary was proposed in `62d3643`, and the operator declined it, so the summary keeps its static text (see Intentional).
