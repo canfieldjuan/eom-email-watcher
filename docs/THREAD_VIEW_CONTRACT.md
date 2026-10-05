@@ -1,6 +1,6 @@
 # Thread View and Vendor Claims Contract
 
-Status: proposed, awaiting operator acceptance. No implementation may start before acceptance (contract-first rule).
+Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended. It was revised the same day for the Codex review on #200; see the revision log. Each milestone still needs its own accepted plan before code.
 
 ## Why this arc exists
 
@@ -51,11 +51,17 @@ Today the product cannot do this, by construction. A read-only investigation of 
    - Every vendor address is also a watched sender.
    - Adding an address to a vendor adds it to the watchlist through the existing atomic watchlist mutation (`engine_api.py:5506`).
    - Removing it from the vendor does not remove it from the watchlist unless the user asks.
+   - A normalized address belongs to at most one vendor; adding it to a second vendor returns `conflict`. Each followed thread, claim, and suggestion therefore has exactly one owning vendor.
+   - `watchlist.remove` of an address that belongs to a vendor is rejected with `conflict`, naming the vendor. The user must remove it from the vendor first. This keeps "every vendor address is watched" true through the API.
+   - A hand edit of the private config can still drop a vendor address from the watchlist. `vendors.list` then reports that address as `watched: false`, as a repair state with a "Watch again" action. Until it is repaired, that address does not trigger following, because following requires an `exact_sender` admission.
 2. **A vendor may opt in one or more business domains.**
    - Any admitted-folder message whose `From` domain equals an opted-in domain is admitted for that vendor.
    - Domains on the public-provider list (gmail.com, googlemail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, me.com, aol.com, proton.me, protonmail.com, gmx.com, and similar) are refused with a stated reason.
    - The list is a closed constant owned in one module and tested.
-3. **New addresses are suggested, never auto-added.** When a followed thread contains a sender that matches no vendor address, the vendor shows a suggestion: "Add <address> to <vendor>?"
+3. **New addresses are suggested, never auto-added.** When a followed thread contains an **inbound** message whose sender matches no vendor address, the owning vendor shows a suggestion: "Add <address> to <vendor>?"
+   - Outbound messages never produce suggestions.
+   - Every verified identity of the active mailbox is excluded: `mail_accounts.address`, plus the authenticated address the provider reports for the session.
+   - The mailbox owner is therefore never suggested as a vendor address.
    - Accepting runs item 1.
    - Dismissing records the dismissal so the same suggestion does not return.
    - Suggestions never admit mail on their own.
@@ -71,16 +77,27 @@ Today the product cannot do this, by construction. A read-only investigation of 
 5. **A thread becomes followed** when any message in it is admitted by `exact_sender` for a vendor address, by `vendor_domain`, or by `sent_to_vendor`.
    - Gmail-label-only admission does not follow threads.
    - Following is recorded durably with the triggering message.
+5a. **Admission kind and direction come from message metadata, never from the discovery path.** A message can be reachable by several paths (Inbox poll, Sent poll, backfill) and match several rules, so the result is computed only from its labels or folder and its headers.
+    - The admission kind is chosen in a fixed precedence: `exact_sender` > `vendor_domain` > `sent_to_vendor` > `thread_follow` > `gmail_user_label`.
+    - Whichever path discovers the message first records the same kind and selector. Provenance stays immutable.
 6. **Sent mail is read** with the same read-only grants:
    - Gmail: the `SENT` label in history;
    - Microsoft 365: `mailFolders/sentitems` delta;
    - IMAP: the folder with the RFC 6154 `\Sent` attribute, falling back to a configured folder name.
    - A Sent message is admitted only by `sent_to_vendor` or `thread_follow`. Other Sent mail leaves no trace, matching today's rule for non-matching mail.
    - If no IMAP Sent folder can be resolved, the account shows "Sent mail unavailable" and inbound behavior is unchanged.
+   - **Cursors are kept per folder.**
+     - Microsoft 365 delta links belong to the collection that produced them, so the Sent Items delta link is stored in its own row, keyed by `(provider, account_id, folder)`. It never shares the existing Inbox cursor in `mailbox_state`.
+     - IMAP Sent keeps its own `UIDVALIDITY` and UID cursor.
+     - Gmail's history id is mailbox-wide, so one cursor covers both.
+     - Expiry and recovery of one folder's cursor never move or reset the other's.
 7. **Thread history backfill.** When a thread becomes followed, earlier messages in that thread that are within retention are fetched and admitted as `thread_follow`, from INBOX and Sent:
-   - Gmail: `threads.get`.
-   - Microsoft 365: `/me/messages` filtered by `conversationId`.
-   - IMAP: searching INBOX and Sent by the thread's `Message-ID` set.
+   - **Gmail:** discovery calls `threads.get` with `format=minimal`, which returns ids, `labelIds`, and `internalDate` only, never bodies.
+     - Each message id is fetched individually, only if it carries `INBOX` or `SENT` and its `internalDate` is within retention.
+     - The discovery response is byte-bounded. If a thread exceeds the bound, only the newest in-retention ids are kept, and the thread is marked "history partial".
+     - The per-message fetches are what get split across checks.
+   - **Microsoft 365:** two folder-scoped queries, `/me/mailFolders/inbox/messages` and `/me/mailFolders/sentitems/messages`, each filtered by `conversationId` and `receivedDateTime` at or after the retention cutoff. They select metadata only and are paged with bounded `@odata.nextLink`. Messages in any other folder, such as Deleted Items, Drafts, Archive, or Clutter, are never fetched.
+   - **IMAP:** searching INBOX and the resolved Sent folder by the thread's `Message-ID` set, with `SINCE` the retention cutoff.
    - Backfill is bounded per thread and per check, and resumes on the next check when a budget is exhausted.
    - It never fetches messages outside retention.
 
@@ -88,14 +105,21 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 8. **Each admitted message gets a thread key scoped like message identity:** `(provider, account_id, mailbox_identity_key, provider_thread_key)`.
    - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
-   - IMAP uses the first `References` entry, else `In-Reply-To`, else the message's own `Message-ID`. Members are joined when any of their `Message-ID`, `In-Reply-To`, or `References` values match.
-   - The IMAP rule is stated as best-effort, because clients can break chains. A message with no usable headers forms its own thread.
+   - **IMAP uses an order-independent component model.**
+     - Each message contributes its id set: its own `Message-ID`, `In-Reply-To`, and the bounded `References` list.
+     - A thread is a connected component of messages whose id sets overlap, identified by a surrogate thread key (UUIDv4) that is created with the component.
+     - When a new message's ids touch several existing components, they are merged into the earliest-created one in a single transaction. That transaction re-keys every row that names a merged key: messages, follow state, backfill progress, claims, and suggestions. The merged keys are recorded as aliases, so any stale reference resolves to the survivor.
+     - The result is the same thread regardless of arrival order. Reply C, then B, then A, ends as one thread.
+     - It remains best-effort only where clients break chains entirely. A message whose ids touch no component forms its own.
    - Today's per-message IMAP `thread_id` value is not reused as a thread key.
-9. **Each message carries a closed `direction`:** `inbound` (admitted from INBOX) or `outbound` (admitted from Sent).
+9. **Each message carries a closed `direction`:** `inbound` or `outbound`.
+   - Direction is derived from the message, not from the path that found it.
+   - Gmail: `outbound` if `labelIds` contains `SENT`, else `inbound`. A message labeled both `INBOX` and `SENT` (for example, mail to oneself) is `outbound`.
+   - Microsoft 365 and IMAP: `outbound` if the message is in the Sent folder, else `inbound`. A message is in exactly one folder there, and immutable ids keep it deduplicated across a move.
 
 ### Bodies
 
-10. **Admitted messages store their normalized body text locally.**
+10. **Every message admitted by this arc's capture paths stores its normalized body text locally, from M2 onward.** That covers `thread_follow`, `sent_to_vendor`, `vendor_domain`, backfill, and new `exact_sender` vendor messages. M2 messages therefore have bodies when the M3 view ships.
     - The text comes from the same `bounded_body_text` owner, with a separate storage cap. The cap is larger than `body_char_limit` and is a named constant.
     - Raw HTML is never stored, so nothing renders as markup.
     - The pre-cut length is stored as well, so a stored body that was cut is labeled as cut.
@@ -114,18 +138,30 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 ### Vendor claims ("keep vendors honest")
 
-15. **Each vendor message in a followed thread is offered to a new extraction task.** The task returns typed claims, each with evidence quotes. The claim types are a closed set:
-    - `amount` (value and currency);
-    - `date_commitment` (what, by when);
-    - `quantity` (item and count);
-    - `term` (short text);
-    - `reference` (invoice, quote, or PO number).
+15. **Each inbound vendor message in a followed thread is offered to a new extraction task.** The task returns typed claims. Each claim has evidence quotes and a **comparison key**. The claim types are a closed set:
+    - `amount`: value, currency, and an `amount_role` from a closed set: `total`, `subtotal`, `tax`, `shipping`, `deposit`, `unit_price`, `other`. For `unit_price`, the key adds the item text.
+    - `date_commitment`: the `what`, from a closed set (`delivery`, `completion`, `payment_due`, `service_start`, `other`), and the date.
+    - `quantity`: the item text and the count.
+    - `term`: short text. Terms are displayed only and never compared.
+    - `reference`: kind (`invoice`, `quote`, `po`) and number.
 16. **Evidence is validated in code, as scheduling already does.**
     - Every quote must be a whitespace-normalized substring of that message's stored body or subject.
-    - Values are re-derived from the quote: amounts by a deterministic parser, dates by the scheduling date rules.
+    - **Every structured field is re-derived from its quote in code, or the claim is rejected:**
+      - amounts and currencies by a deterministic money parser;
+      - dates by the scheduling date rules;
+      - quantity counts by a deterministic number parser, with the number required to sit next to the item text inside the quote;
+      - reference numbers as exact substrings matching the kind's pattern.
+    - **Comparison keys are also checked in code.**
+      - An `amount_role` other than `other`, and a `date_commitment` `what` other than `other`, must have one of that role's fixed keywords in the quote.
+      - A quantity's or unit price's item text must be a substring of the quote.
     - Claims that fail validation are discarded and logged as rejected. They are never shown.
 17. **Discrepancies are computed in code, never by the model.**
-    - A later vendor claim of the same type and subject that differs from an earlier one is shown on the thread, with both quotes and dates. Examples: an invoice amount differing from a quoted amount, a delivery date later than a promised date, a quantity changed.
+    - **A discrepancy is flagged only between two validated claims in the same thread, with the same type and the same comparison key, whose re-derived values differ.** It is shown with both quotes and dates.
+      - Amounts compare only within the same `amount_role` and currency, so a quoted `total` is compared only with an invoiced `total`. Unit prices also need the same normalized item text.
+      - `date_commitment` compares the same `what`. The flag is "later than promised" when the later claim's date is after the earlier one.
+      - `quantity` compares the same normalized item text.
+      - `role = other`, `what = other`, and `term` are never compared.
+    - **Matching fails closed.** If more than one earlier claim has the same key, for example two different totals, no discrepancy is flagged, and the thread shows "Several values for <key>; compare manually". Ambiguity never produces a flag.
     - The model only extracts; it never decides whether something is a discrepancy.
 18. **The model input is bounded.** Claims are extracted per message, not per thread, so input stays within `body_char_limit`. Truncation is recorded as in #146.
     - Thread-level summarization is out of scope for this arc.
@@ -139,7 +175,11 @@ Today the product cannot do this, by construction. A read-only investigation of 
 
 ## Invariants
 
-- No new data leaves the machine. The claims task uses the configured loopback model, or a gateway task only if that gateway has the task registered (see Dependencies).
+- **Claims extraction adds no new destination and no new kind of data.**
+  - It sends a message's subject and body to the configured model backend, exactly as today's per-message analysis does.
+  - In loopback mode that stays on the machine.
+  - In gateway mode it goes to the operator's configured on-prem inference gateway (`docs/INFERENCE_GATEWAY_V0.md`), the same place analysis already sends that body.
+  - Stored bodies, threads, and claims never leave the machine otherwise.
 - **Mailbox access stays read-only.** No message is moved, labeled, marked read, or sent. IMAP keeps `readonly=True` and `BODY.PEEK`.
 - **Admission is still explainable per message.** Every admitted message has exactly one admission kind and selector, and its provenance stays immutable (`db.py:3645-3671`).
 - **Non-matching mail still leaves no trace.** A message that matches no rule, including a followed thread, writes nothing.
@@ -166,16 +206,21 @@ Today the product cannot do this, by construction. A read-only investigation of 
 Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No milestone ships UI that depends on a later one.
 
 - **M1, vendor records and thread identity.**
-  - Vendor tables and the engine API.
-  - A thread key on every newly admitted message, from all providers, including IMAP `In-Reply-To`/`References` fetch.
+  - Vendor tables and the engine API, with addresses unique across vendors and `watchlist.remove` guarded.
+  - A thread key on every newly admitted message, from all providers. That includes the IMAP `In-Reply-To`/`References` fetch and the component model with atomic merges.
   - A Vendors list in the desktop, with no thread view yet.
   - No change to what is admitted.
-- **M2, follow the thread and Sent mail.** The three new admission kinds, Sent capture on all providers, IMAP Sent discovery, and bounded backfill. `To`/`Cc` are fetched for Sent matching.
-- **M3, local bodies and the thread view.** Body storage with `secure_delete`, the CSP, the Vendors → threads → thread UI, and the updated inbox copy.
+- **M2, follow the thread, Sent mail, and body capture.**
+  - The three new admission kinds and the metadata-derived precedence.
+  - Sent capture on all providers, with per-folder cursors, and IMAP Sent discovery.
+  - Bounded, folder-scoped backfill.
+  - `To`/`Cc` are fetched for Sent matching.
+  - Local body storage with `secure_delete` for every message M2 captures. Nothing renders bodies yet.
+- **M3, the thread view.** The CSP, the Vendors → threads → thread UI, and the updated inbox copy.
 - **M4, vendor claims and discrepancies.** The extraction task and code validation, then deterministic discrepancy rules and their UI.
 - **M5, domain opt-in and address suggestions.** The public-provider refusal list and suggestion accept/dismiss.
 
-## Decisions for the operator
+## Operator decisions (accepted 2026-10-05, as recommended)
 
 - **D1, retention for followed threads.**
   - Recommended: a followed thread is kept whole until it has had no new message for `retention_days`. Without this, the earliest quote, which is the thing being compared, is deleted first.
@@ -208,9 +253,27 @@ Each milestone plan names its fail-first tests. The arc-level evidence includes:
 - a fixture thread on each provider with an inbound quote, an outbound reply, and an inbound invoice that differs, showing exactly one discrepancy with both quotes;
 - a non-vendor message in the same mailbox leaving no row;
 - backfill stopping at retention and resuming after a budget stop;
-- an IMAP thread joined across `In-Reply-To` and `References`;
+- an IMAP thread joined across `In-Reply-To` and `References`, and the same single thread when the messages arrive in reverse order (C, B, A), with follow state carried across the merge;
+- a Gmail message labeled both `INBOX` and `SENT` recording the same direction and admission kind whichever path finds it first;
+- the Microsoft Inbox and Sent Items delta cursors advancing and expiring independently;
+- a Deleted Items or Archive message in a followed Microsoft conversation never fetched;
+- a quote with two `total` amounts producing "compare manually" and no discrepancy, and a quantity claim whose count does not match its quote being rejected;
+- the mailbox owner's address never suggested;
+- `watchlist.remove` of a vendor address returning `conflict`;
 - `Mail.Read` / `gmail.readonly` remaining the only scopes.
 
 ## Revision log
 
 - 2026-10-05: proposed.
+- 2026-10-05: accepted by the operator with D1-D3 as recommended. Revised in the same PR for twelve Codex findings on #200:
+  - the gateway privacy statement is corrected to match existing analysis behavior;
+  - validated comparison keys and fail-closed discrepancy matching;
+  - order-independent IMAP thread components with atomic merges;
+  - `watchlist.remove` guarded for vendor addresses;
+  - the mailbox owner excluded from suggestions;
+  - every claim field re-derived in code;
+  - per-folder Microsoft and IMAP Sent cursors;
+  - vendor addresses unique across vendors;
+  - body capture moved into M2;
+  - Gmail minimal discovery and Microsoft folder-scoped backfill;
+  - metadata-derived direction and admission precedence.
