@@ -56,7 +56,7 @@ Engine and store:
    - The field is required, with no default. An adapter or fake that omits it fails construction rather than silently reporting "not truncated".
 2. The four sites call one helper in `mime.py`. It takes the selected text and the limit, and returns the cut text and the pre-cut length. It performs today's exact line-strip, blank-line drop, and head cut. The four inline copies of that rule are removed.
 3. `mark_analyzed` stores `analysis_body_chars = len(body)` and `analysis_body_source_chars = body_source_chars`, in the same transaction as the summary.
-4. `inbox.query` items gain three fields:
+4. `inbox.query` items, and the same rows returned by `inbox.recent` (`Store.recent` delegates to `query_inbox`), gain three fields:
    - `body_analyzed_chars`: integer or `null`;
    - `body_source_chars`: integer or `null`;
    - `body_truncated`: `true`, `false`, or `null`, derived by the engine as `source > analyzed`.
@@ -122,7 +122,7 @@ Desktop:
   - empty body: `0/0`, not truncated;
   - the 1,000 minimum and the 100,000 maximum limit;
   - legacy rows: `NULL/NULL`, rendering nothing.
-- **New API output:** three nullable fields on each `inbox.query` item. There is no new input.
+- **New API output:** three nullable fields on each `inbox.query` item and each `inbox.recent` row, which share one store projection. There is no new input.
 
 ### Files touched
 
@@ -134,6 +134,7 @@ Desktop:
 - `README.md`, `docs/ENGINE_API.md` (the `inbox.query` contract section), `docs/NTFY_DISCLOSURE_MIGRATION_CONTRACT.md` (the canonical disclosure copy)
 - `desktop/test/ntfyDisclosureMigration.test.ts` (the exact-copy assertion)
 - `tests/test_mime.py`, `test_imap.py`, `test_microsoft365.py`, `test_service.py`, `test_db.py`, `test_engine_api.py`, `test_notifications.py`, and every test fake that constructs `MessageContent`
+- Every direct `mark_analyzed` caller: the test helpers in `tests/test_db.py` and `tests/test_engine_api.py`, plus `tests/test_automation_rules.py`, `tests/test_certificate_expiry_ledger.py`, `tests/test_connect_v2_engine_api.py`, `tests/test_service.py`, `scripts/coi_local_proof.py`, and `scripts/connect-local-proof.py`
 
 ## Mechanism
 
@@ -141,7 +142,8 @@ Desktop:
 - **`db.py`:**
   - `SCHEMA_VERSION = 28` and the two `ADD COLUMN`s on the existing idempotent path.
   - The guard follows the repo's trigger style.
-  - `mark_analyzed` gains keyword-only `body_chars` and `body_source_chars`, kept separate from the model result dict so rule matching (`automation/rules.py`) sees nothing new.
+  - `mark_analyzed` gains **required** keyword-only `body_chars` and `body_source_chars` (`int | None`, no default), kept separate from the model result dict so rule matching (`automation/rules.py`) sees nothing new.
+  - Every caller must state the counts. An explicit `None` pair means "not recorded" and is only for tests and proof tooling that do not analyze a real body. The service always passes real counts, so no production path can store an analysis with unknown truncation by omission.
   - `query_inbox`, `pending_delivery`/`AnalyzedMessage`, and `NotificationIntent` select the counts.
 - **`service.py`:** passes the counts from `content` to `mark_analyzed` and to `_deliver_analysis`. Stored-row delivery reads them from `AnalyzedMessage`.
 - **`notifications.py` / `engine_api.py`:** a shared predicate and the fixed line appended when it is true.
@@ -182,7 +184,8 @@ Fail-first: each behavior test must fail on `b65d34a`.
   - delete and purge remove the counts with their row;
   - a v27 database migrates to 28 with `NULL` counts;
   - a v28 database is refused by version-27 code, matching the existing newer-version test pattern.
-- **Engine:** `inbox.query` returns the three fields for truncated, untruncated, unanalyzed, and legacy rows.
+- **Engine:** `inbox.query` and `inbox.recent` return the three fields for truncated, untruncated, unanalyzed, and legacy rows.
+- **Required counts:** calling `mark_analyzed` without `body_chars` and `body_source_chars` raises `TypeError`.
 - **Notifications:** both paths append the fixed line exactly when truncated, and never on fallback or review notifications.
 - **Disclosure copy:** `ntfyDisclosureMigration.test.ts` asserts the new panel text exactly. The panel, the canonical contract block, and the README field list all name the partial-summary note.
 - **Rust:** the typed contract test round-trips the three fields.
