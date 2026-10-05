@@ -1070,6 +1070,42 @@ pub struct CalendarDecisionResult {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomationRuleSummary {
+    pub rule_id: String,
+    pub version: i64,
+    pub enabled: bool,
+    pub system: bool,
+    pub valid: bool,
+    pub name: Option<String>,
+    pub invalid_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct AutomationRuleDetail {
+    pub summary: AutomationRuleSummary,
+    // Python's strict rule schema owns definition admission and canonicalization.
+    pub definition: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct AutomationRuleResult {
+    pub rule: AutomationRuleDetail,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutomationRules {
+    pub revision: i64,
+    pub rules: Vec<AutomationRuleSummary>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct PreparedAutomationRule {
+    pub definition: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AutomationDecisionResult {
     pub fire_id: String,
     pub state: String,
@@ -1723,6 +1759,72 @@ impl Engine {
                 "status": query.status,
                 "keyword": query.keyword,
             }),
+        )
+    }
+
+    pub fn connect_catalog(&self) -> Result<ConnectCapabilities, EngineError> {
+        self.request("connect.catalog", json!({}))
+    }
+
+    pub fn list_automation_rules(&self) -> Result<AutomationRules, EngineError> {
+        self.request("automation.rules.list", json!({}))
+    }
+
+    pub fn get_automation_rule(
+        &self,
+        rule_id: String,
+    ) -> Result<AutomationRuleResult, EngineError> {
+        self.request("automation.rules.get", json!({"rule_id": rule_id}))
+    }
+
+    pub fn prepare_automation_rule(
+        &self,
+        definition: Value,
+    ) -> Result<PreparedAutomationRule, EngineError> {
+        self.request(
+            "automation.rules.prepare",
+            json!({"definition": definition}),
+        )
+    }
+
+    pub fn put_automation_rule(
+        &self,
+        definition: Value,
+        rule_id: Option<String>,
+        expected_version: Option<i64>,
+    ) -> Result<AutomationRuleResult, EngineError> {
+        let payload = match (rule_id, expected_version) {
+            (None, None) => json!({"definition": definition}),
+            (Some(rule_id), Some(expected_version)) => {
+                json!({"definition": definition, "rule_id": rule_id, "expected_version": expected_version})
+            }
+            _ => {
+                return Err(EngineError::host(
+                    "invalid_request",
+                    "Rule identity and version must be supplied together",
+                ));
+            }
+        };
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request("automation.rules.put_watched", payload)
+    }
+
+    pub fn set_automation_rule_enabled(
+        &self,
+        rule_id: String,
+        expected_version: i64,
+        enabled: bool,
+    ) -> Result<AutomationRuleResult, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        self.request(
+            "automation.rules.set_enabled",
+            json!({"rule_id": rule_id, "expected_version": expected_version, "enabled": enabled}),
         )
     }
 
@@ -3937,6 +4039,133 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"calendar.automation.decide",
                 "state_version": 7
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coi_rule_bridges_forward_exact_versions_and_definitions() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request_path = directory.path().join("request.json");
+        let response_path = directory.path().join("response.json");
+        let definition = json!({"subject": "opaque canonical definition"});
+        let summary = json!({"rule_id":"rule-a", "version":7, "enabled":false,
+            "system":false, "valid":true, "name":"COI", "invalid_reason":null,
+            "created_at":"now", "updated_at":"now"});
+        let rule = json!({"summary":summary,"definition":definition});
+        for operation in [
+            "connect.catalog",
+            "automation.rules.list",
+            "automation.rules.get",
+            "automation.rules.prepare",
+            "automation.rules.put_watched",
+            "automation.rules.set_enabled",
+        ] {
+            let data = match operation {
+                "connect.catalog" => json!({"items":[],"diagnostic":null}),
+                "automation.rules.list" => json!({"revision":8,"rules":[summary]}),
+                "automation.rules.prepare" => json!({"definition":definition}),
+                _ => json!({"rule":rule}),
+            };
+            fs::write(
+                &response_path,
+                serde_json::to_vec(
+                    &json!({"protocol":1,"ok":true,"operation":operation,"data":data}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let engine = Engine::with_command(
+                "sh",
+                vec![
+                    OsString::from("-c"),
+                    OsString::from("cat > \"$1\"; cat \"$2\""),
+                    OsString::from("coi-bridge-test"),
+                    request_path.as_os_str().into(),
+                    response_path.as_os_str().into(),
+                ],
+                PathBuf::from("unused.toml"),
+            );
+            let expected = match operation {
+                "connect.catalog" => {
+                    assert!(engine.connect_catalog().unwrap().items.is_empty());
+                    json!({})
+                }
+                "automation.rules.list" => {
+                    assert_eq!(engine.list_automation_rules().unwrap().revision, 8);
+                    json!({})
+                }
+                "automation.rules.get" => {
+                    assert_eq!(
+                        engine
+                            .get_automation_rule("rule-a".into())
+                            .unwrap()
+                            .rule
+                            .summary
+                            .version,
+                        7
+                    );
+                    json!({"rule_id":"rule-a"})
+                }
+                "automation.rules.prepare" => {
+                    assert_eq!(
+                        engine
+                            .prepare_automation_rule(definition.clone())
+                            .unwrap()
+                            .definition,
+                        definition
+                    );
+                    json!({"definition":definition})
+                }
+                "automation.rules.put_watched" => {
+                    assert_eq!(
+                        engine
+                            .put_automation_rule(definition.clone(), Some("rule-a".into()), Some(7))
+                            .unwrap()
+                            .rule
+                            .summary
+                            .version,
+                        7
+                    );
+                    json!({"definition":definition,"rule_id":"rule-a","expected_version":7})
+                }
+                _ => {
+                    assert!(
+                        !engine
+                            .set_automation_rule_enabled("rule-a".into(), 7, false)
+                            .unwrap()
+                            .rule
+                            .summary
+                            .enabled
+                    );
+                    json!({"rule_id":"rule-a","expected_version":7,"enabled":false})
+                }
+            };
+            let request: Value = serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+            assert_eq!(request["operation"], operation);
+            assert_eq!(request["payload"], expected);
+            if operation == "automation.rules.put_watched" {
+                engine
+                    .put_automation_rule(definition.clone(), None, None)
+                    .unwrap();
+                let request: Value =
+                    serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+                assert_eq!(request["payload"], json!({"definition":definition}));
+            }
+        }
+    }
+
+    #[test]
+    fn coi_rule_bridge_rejects_partial_edit_identity_before_dispatch() {
+        let engine = Engine::with_command("must-not-execute", vec![], PathBuf::from("unused.toml"));
+        for (rule_id, version) in [(Some("rule-a".into()), None), (None, Some(7))] {
+            assert_eq!(
+                engine
+                    .put_automation_rule(json!({}), rule_id, version)
+                    .unwrap_err()
+                    .code,
+                "invalid_request"
+            );
+        }
     }
 
     #[cfg(unix)]

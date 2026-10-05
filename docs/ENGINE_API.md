@@ -85,6 +85,9 @@ envelope without changing its protocol number.
 | `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
 | `connect.output.export` | attachment, `job_id`, `artifact_id`, `destination_dir` | Export one validated completed output to a private random `.bin` file for the trusted host |
 | `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
+| `connect.catalog` | `{}` | Shared Connect v2 public catalog for rule setup; retains entitlement/discovery diagnostics |
+| `automation.rules.prepare` | `definition` | Case-fold human subject text at the Python rule owner, validate and return the canonical definition without writing |
+| `automation.rules.put_watched` | `definition`, optional paired `rule_id` / `expected_version` | Desktop save with current exact-sender admission under the shared mutation lock; see [M5 desktop setup](CERTIFICATE_EXPIRY_LEDGER_AUTOMATION_CONTRACT.md#m5-desktop-setup-accepted-2026-10-05) |
 | `connect.attachment.summarize` | `message_id`, `part_id` | Legacy v1 document-summary invocation |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |

@@ -274,6 +274,71 @@ entrypoint, tested heads, result and any remaining gap. The proof must fail on a
 false check. It does not repair the deferred attribution harness or change extraction,
 prompts, model choice, schema, generic dispatcher policy or product behavior.
 
+## M5 desktop setup (accepted 2026-10-05)
+
+Operator approval of issue #192 extends the desktop setup surface only. The
+canonical workflow plan records the product decision; this section defines its
+implementation boundary. Generic rule validation and Connect dispatch remain
+owned by their existing contracts.
+
+A compact form in Expiry Ledger selects one connected mailbox, one already
+watched exact sender, an optional subject-contains filter, and one compatible
+live `certificate.extract` v1.0 provider for PDF inputs. Saving creates an enabled
+rule. Confirmation defaults on; automatic extraction requires an explicit user
+choice. Provider-mandated confirmation cannot be disabled by that choice.
+
+Use typed admitted Tauri bridges to `automation.rules.list/get/set_enabled` and
+`automation.rules.put_watched` for desktop creates and definition edits.
+These preserve engine-owned identities, immutable versions, compare-and-set edits,
+mailbox operation locking and domain errors. The watched-save entrypoint has the
+same payload/result and shared write implementation as generic `automation.rules.put`,
+but requires one exact sender condition admitted by the current config allowlist.
+Read that config and check membership under the existing production operation lock,
+which also covers watchlist mutations, and hold it through the rule commit. Reject
+a missing/inactive sender as `invalid_rule` without creating a rule or successor;
+return an actionable refresh message. Cached desktop membership is only a form
+preview, never save admission. Generic `put` retains its existing semantics.
+Do not add a second rule schema,
+queue, provider client, policy parser or database write path. A read-only
+`connect.catalog` operation exposes the existing Connect v2 discovery owner's
+public catalog for setup without requiring a pre-existing attachment; it accepts
+an empty payload and returns the same `items`/`diagnostic` shape as attachment
+capability discovery. Existing attachment-specific admission is unchanged.
+
+A read-only `automation.rules.prepare` operation accepts `{definition}` and
+normalizes subject condition text with the rule owner's Python Unicode case-folding,
+then parses and returns the canonical definition through the existing strict schema.
+Other fields retain strict validation. The desktop uses this preparation before
+`put`; direct `put` semantics remain unchanged. This avoids a second text-normalization
+implementation in the desktop.
+
+Only representable COI rules may be edited by this bounded form. Existing rules
+with additional predicates, parameters or unsupported scope remain unchanged;
+show that they cannot be edited here rather than dropping hidden conditions.
+Round-trip all represented fields and the exact selected provider identity.
+Pause/resume use the current saved version and preserve the canonical definition.
+Edits and toggles require a fresh read after a stale-version response. A failed
+or uncertain mutation never presents an optimistic saved state or retries creation
+automatically. Reserve each mutation before awaiting it to prevent double submits;
+refresh and mutation responses must not overwrite newer form state.
+
+The form previews mailbox/sender/filter/provider scope and activation behavior.
+A missing sender, disconnected mailbox, unavailable provider or incompatible
+capability prevents a new selection from being saved, with an actionable visible
+message. An existing unavailable provider remains pinned and visible; the user
+must explicitly select a replacement when editing. Rule activation does not
+retroactively reprocess old messages. Pause stops new matches; already-created
+fires keep their existing immutable-version behavior.
+
+Acceptance requires public boundary/concurrency regressions, typed bridge tests,
+and a real installed Linux desktop setup that creates a rule without scripts or
+database edits. Save and pause/resume survive restart. An approved incoming real
+COI must pass through the UI-created rule and installed provider, show confirmation
+when enabled, and produce the expected ledger/reference result. Keep the frozen
+model profile and retain native evidence privately with public receipt hashes.
+Another outbound proof email needs separate explicit approval. No release or
+cross-platform claim follows from this acceptance.
+
 ## Explicit non-scope
 
 - No changes to generic rule definition, evaluator, Connect v2 dispatcher,
@@ -284,8 +349,9 @@ prompts, model choice, schema, generic dispatcher policy or product behavior.
 - No automatic reminders, email/calendar writes, renewal workflow, broker
   contact, coverage advice, claims, compliance assessment, premium handling,
   certificate generation, policy verification, or cross-source record merge.
-- No rule builder, new sender allowlist, new mailbox permissions, general
-  automation UI, ledger edit/review action, or customer-facing product claims.
+- No general rule builder beyond the accepted M5 COI form, new sender allowlist,
+  new mailbox permissions, general automation UI, ledger edit/review action, or
+  customer-facing product claims beyond the approved pilot scope.
 - No source-byte or full-document-text duplication into Email Watcher's ledger.
 - No release, installation, or cross-platform readiness claim without separate
   installed runtime evidence for each claimed platform.
@@ -310,3 +376,5 @@ prompts, model choice, schema, generic dispatcher policy or product behavior.
   settlement, zero-policy visibility, and the 100-policy cap.
 
 - 2026-10-04: M3 executable-proof boundary accepted under the operator's instruction to start the next slice. Evidence-only amendment; existing behavior and eight acceptance items unchanged.
+
+- 2026-10-05: M5 desktop COI setup accepted by the operator in issue #192; generic rule, Connect and extraction behavior unchanged.

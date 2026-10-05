@@ -35,6 +35,7 @@ from .automation.rules import (
     RuleValidationError,
     canonical_rule_definition,
     parse_rule_definition,
+    prepare_rule_definition,
 )
 from .config import (
     MUTABLE_DESKTOP_SETTINGS,
@@ -2355,7 +2356,22 @@ def _automation_rules_get(request: dict[str, object]) -> dict[str, object]:
     return {"rule": _automation_rule_detail_data(rule)}
 
 
-def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
+def _automation_rules_prepare(request: dict[str, object]) -> dict[str, object]:
+    payload = _payload(request, {"definition"})
+    try:
+        definition = prepare_rule_definition(payload.get("definition"))
+        return {"definition": json.loads(canonical_rule_definition(definition))}
+    except RuleValidationError as exc:
+        raise ApiError("invalid_rule", exc.reason) from exc
+
+
+def _automation_rules_put_watched(request: dict[str, object]) -> dict[str, object]:
+    return _automation_rules_put(request, require_watched_sender=True)
+
+
+def _automation_rules_put(
+    request: dict[str, object], *, require_watched_sender: bool = False
+) -> dict[str, object]:
     payload = _payload(request, {"rule_id", "expected_version", "definition"})
     fields = set(payload)
     create = fields == {"definition"}
@@ -2371,6 +2387,17 @@ def _automation_rules_put(request: dict[str, object]) -> dict[str, object]:
 
     def put(runtime: Runtime) -> dict[str, object]:
         try:
+            if require_watched_sender:
+                senders = [item for item in definition.conditions if item.field == "sender"]
+                if (
+                    len(senders) != 1
+                    or senders[0].op != "equals"
+                    or senders[0].value not in runtime.config.allowlist
+                ):
+                    raise RuleValidationError(
+                        "Select one currently watched exact sender; "
+                        "refresh saved rules before saving"
+                    )
             if rule_id is None:
                 runtime.store.require_automation_rule_create_capacity()
             else:
@@ -2867,6 +2894,11 @@ def _attachment_export(request: dict[str, object]) -> dict[str, object]:
         "media_type": attachment.media_type,
         "path": str(path),
     }
+
+
+def _connect_catalog(request: dict[str, object]) -> dict[str, object]:
+    _payload(request)
+    return connect.discover_capabilities().public_result()
 
 
 def _connect_capabilities(request: dict[str, object]) -> dict[str, object]:
@@ -5840,7 +5872,9 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "automation.rules.delete": _automation_rules_delete,
     "automation.rules.get": _automation_rules_get,
     "automation.rules.list": _automation_rules_list,
+    "automation.rules.prepare": _automation_rules_prepare,
     "automation.rules.put": _automation_rules_put,
+    "automation.rules.put_watched": _automation_rules_put_watched,
     "automation.rules.set_enabled": _automation_rules_set_enabled,
     "attachment.export": _attachment_export,
     "calendar.read.connect": _calendar_read_connect,
@@ -5865,6 +5899,7 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "connect.attachment.invoke": _connect_attachment_invoke,
     "connect.attachment.summarize": _connect_attachment_summarize,
     "connect.capabilities": _connect_capabilities,
+    "connect.catalog": _connect_catalog,
     "connect.entitlement.install": _connect_entitlement_install,
     "connect.entitlement.status": _connect_entitlement_status,
     "connect.output.export": _connect_output_export,
