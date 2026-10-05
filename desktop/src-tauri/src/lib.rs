@@ -5,13 +5,14 @@ mod scheduler;
 use delivery::NotificationDelivery;
 use engine::{
     AdmissionErrorObserver, AdmissionLease, AdmissionToken, AutomationDecisionResult,
-    CalendarConsentProfile, CalendarConsentStatus, CalendarDecisionResult, CancellationToken,
-    CertificateExpiryLedger, CheckResult, ConfigInitialization, ConfigInitializationFailureClass,
-    ConnectCapabilities, ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult,
-    ConnectOutputView, ConnectProviderIdentity, Engine, EngineError, EngineSettings,
-    GmailAuthorization, GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved,
-    GmailLabelSelectors, HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts,
-    MailServerConnection, NtfyDisclosureStatus, WatchedSender,
+    AutomationRuleResult, AutomationRules, CalendarConsentProfile, CalendarConsentStatus,
+    CalendarDecisionResult, CancellationToken, CertificateExpiryLedger, CheckResult,
+    ConfigInitialization, ConfigInitializationFailureClass, ConnectCapabilities,
+    ConnectCapabilityRef, ConnectEntitlementStatus, ConnectInvocationResult, ConnectOutputView,
+    ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
+    GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
+    HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
+    NtfyDisclosureStatus, PreparedAutomationRule, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -1579,6 +1580,90 @@ async fn inbox_query(
 }
 
 #[tauri::command]
+async fn connect_catalog(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<ConnectCapabilities, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.connect_catalog())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn automation_rules_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<AutomationRules, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_automation_rules())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn automation_rules_get(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    rule_id: String,
+) -> Result<AutomationRuleResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.get_automation_rule(rule_id))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn automation_rules_prepare(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    definition: Value,
+) -> Result<PreparedAutomationRule, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.prepare_automation_rule(definition))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn automation_rules_put(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    definition: Value,
+    rule_id: Option<String>,
+    expected_version: Option<i64>,
+) -> Result<AutomationRuleResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.put_automation_rule(definition, rule_id, expected_version)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn automation_rules_set_enabled(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    rule_id: String,
+    expected_version: i64,
+    enabled: bool,
+) -> Result<AutomationRuleResult, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.set_automation_rule_enabled(rule_id, expected_version, enabled)
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
 async fn certificate_expiry_ledger_list(
     engine: State<'_, Engine>,
     admission: State<'_, AdmissionCoordinator>,
@@ -2321,6 +2406,12 @@ pub fn run() {
             attachment_capability_invoke,
             attachment_open,
             automation_fire_decide,
+            connect_catalog,
+            automation_rules_list,
+            automation_rules_get,
+            automation_rules_prepare,
+            automation_rules_put,
+            automation_rules_set_enabled,
             autostart_get,
             autostart_set,
             calendar_consent_connect,

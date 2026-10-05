@@ -1,3 +1,12 @@
+import { mountCoiSetup } from "./coiSetup";
+import type {
+  ConnectProviderIdentity,
+  ConnectCapabilityRef,
+  ConnectCapabilityDeclaration,
+  ConnectCapability,
+  ConnectOutputMetadata,
+  ConnectCapabilities,
+} from "./connectTypes";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -89,56 +98,6 @@ interface AttachmentCapabilityResult {
   summary: ConnectSummary | null;
   outputs?: ConnectOutputMetadata[];
   error: { code: string; message: string } | null;
-}
-
-interface ConnectProviderIdentity {
-  app_id: string;
-  version: string;
-  instance_id: string;
-}
-
-interface ConnectProvider extends ConnectProviderIdentity {
-  name: string;
-}
-
-interface ConnectCapabilityRef {
-  id: string;
-  version: string;
-}
-
-interface ConnectParameter {
-  name: string;
-  value_type: "string" | "integer" | "boolean";
-  required: boolean;
-  label: string;
-  description: string;
-}
-
-interface ConnectCapabilityDeclaration extends ConnectCapabilityRef {
-  action: { label: string; description: string };
-  accepts: { media_type: string; max_bytes: number }[];
-  produces: string[];
-  parameters: ConnectParameter[];
-  effects: { external: boolean; confirmation_required: boolean };
-}
-
-interface ConnectCapability {
-  protocol_version: 2;
-  provider: ConnectProvider;
-  capability: ConnectCapabilityDeclaration;
-}
-
-interface ConnectOutputMetadata {
-  artifact_id: string;
-  media_type: string;
-  display_name: string;
-  byte_size: number;
-  sha256: string;
-}
-
-interface ConnectCapabilities {
-  items: ConnectCapability[];
-  diagnostic: { code: string } | null;
 }
 
 interface ConnectInvocationResult {
@@ -638,6 +597,7 @@ app.innerHTML = `
     <section id="expiry-ledger-view" class="view" aria-labelledby="expiry-ledger-tab" hidden>
       <h2>Expiry Ledger</h2>
       <p class="view-lede">Policy dates extracted from retained certificates, with uncertain details marked for review.</p>
+      <div id="coi-setup"></div>
       <p id="expiry-ledger-status" class="status" role="status" aria-live="polite">Open this view to load policy expirations.</p>
       <div id="expiry-ledger-table-wrap" class="expiry-ledger-table-wrap" hidden>
         <table class="expiry-ledger-table" aria-label="Certificate expiry ledger">
@@ -857,6 +817,7 @@ const settingsView = requiredElement<HTMLElement>("#settings-view");
 const expiryLedgerStatus = requiredElement<HTMLParagraphElement>("#expiry-ledger-status");
 const expiryLedgerTableWrap = requiredElement<HTMLDivElement>("#expiry-ledger-table-wrap");
 const expiryLedgerRows = requiredElement<HTMLTableSectionElement>("#expiry-ledger-rows");
+const coiSetup = mountCoiSetup(requiredElement<HTMLElement>("#coi-setup"), invoke, errorMessage);
 const inboxList = requiredElement<HTMLUListElement>("#inbox-list");
 const inboxStatus = requiredElement<HTMLParagraphElement>("#inbox-status");
 const inboxSenderNavigation = requiredElement<HTMLElement>("#inbox-sender-nav");
@@ -4670,6 +4631,7 @@ watchlistTab.addEventListener("click", () => showView("watchlist"));
 expiryLedgerTab.addEventListener("click", () => {
   showView("expiry-ledger");
   void loadExpiryLedger();
+  void coiSetup.refresh();
 });
 healthTab.addEventListener("click", () => {
   showView("health");

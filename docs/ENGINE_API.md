@@ -85,6 +85,8 @@ envelope without changing its protocol number.
 | `connect.output.present` | attachment, `job_id`, `artifact_id` | Return a validated native presentation for a completed output, or classify it as opaque |
 | `connect.output.export` | attachment, `job_id`, `artifact_id`, `destination_dir` | Export one validated completed output to a private random `.bin` file for the trusted host |
 | `connect.capabilities` | `{}` | Legacy v1 document-summary discovery |
+| `connect.catalog` | `{}` | Shared Connect v2 public catalog for rule setup; retains entitlement/discovery diagnostics |
+| `automation.rules.prepare` | `definition` | Case-fold human subject text at the Python rule owner, validate and return the canonical definition without writing |
 | `connect.attachment.summarize` | `message_id`, `part_id` | Legacy v1 document-summary invocation |
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |

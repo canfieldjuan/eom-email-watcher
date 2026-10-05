@@ -268,6 +268,23 @@ def parse_rule_definition(value: object) -> RuleDefinition:
         raise RuleValidationError(_bounded_reason(exc)) from None
 
 
+def prepare_rule_definition(value: object) -> RuleDefinition:
+    """Prepare human subject input; strict parsing remains the admission owner."""
+    if isinstance(value, dict) and isinstance(value.get("conditions"), list):
+        value = {
+            **value,
+            "conditions": [
+                {**condition, "value": condition["value"].casefold()}
+                if isinstance(condition, dict)
+                and condition.get("field") == "subject"
+                and isinstance(condition.get("value"), str)
+                else condition
+                for condition in value["conditions"]
+            ],
+        }
+    return parse_rule_definition(value)
+
+
 def canonical_rule_definition(definition: RuleDefinition) -> bytes:
     """Materialize defaults and encode the contracted canonical JSON bytes."""
     raw = json.dumps(
