@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -151,7 +154,7 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
                 "byte_size": len(PDF),
                 "sha256": hashlib.sha256(PDF).hexdigest(),
                 "display_name": "invoice.pdf",
-                "source_app_id": "eom-email-watcher",
+                "source_app_id": connect.SOURCE_APP_ID,
             }
         ],
         "parameters": {},
@@ -171,7 +174,7 @@ def _certificate_job(store: Store, job_id: str = JOB_ID) -> None:
         input_byte_size=len(PDF),
         input_sha256=hashlib.sha256(PDF).hexdigest(),
         input_display_name="invoice.pdf",
-        source_app_id="eom-email-watcher",
+        source_app_id=connect.SOURCE_APP_ID,
         request_json=json.dumps(request, separators=(",", ":")).encode(),
         capability_produces=(CERTIFICATE_MEDIA_TYPE,),
     )
@@ -1756,3 +1759,156 @@ def test_certificate_validator_retains_reversed_range_only_with_review_reason() 
         validate_certificate_result_json(
             json.dumps(contradicted, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+def test_concurrent_certificate_settlement_and_restart_preserve_complete_projection(
+    tmp_path: Path,
+) -> None:
+    """Separate connections racing the real commit path settle one complete record."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from test_connect_v2_engine_api import api_request
+
+    config_path, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    ready = Barrier(4)
+
+    def settle() -> str:
+        store = Store(runtime.store.path)
+        ready.wait(timeout=10)
+        job = engine_api._apply_connect_update(
+            store,
+            connect.CapabilityJobUpdate(
+                job_id=job_id,
+                status="completed",
+                provider_app_id="invoice-processor",
+                provider_instance_id=INSTANCE_A,
+                result=_capability_result(_record()),
+                error=None,
+            ),
+        )
+        return job.status
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        outcomes = list(workers.map(lambda _: settle(), range(4)))
+    assert outcomes == ["completed"] * 4
+    assert runtime.store.automation_fire(fire.fire_id).state == "completed"
+    before = engine_api._response(
+        api_request(config_path, "certificate.expiry_ledger.list", {"today": "2026-09-20"})
+    )
+    assert before["ok"] is True
+    assert [row["expiry_status"] for row in before["data"]["items"]] == [
+        "expired",
+        "expires_today",
+        "upcoming",
+        "review",
+    ]
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 4
+    restarted = Store(runtime.store.path)
+    restarted.initialize()
+    assert (
+        restarted.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+        == before["data"]["items"]
+    )
+    response_path = tmp_path / "rendering-engine-response.json"
+    response_path.write_text(json.dumps(before), encoding="utf-8")
+    response_path.chmod(0o600)
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "rendering"
+    subprocess.run(
+        ["node", str(root / "scripts/coi_rendering_fixture.mjs"),
+         str(response_path), str(output)],
+        env={**os.environ, "COI_PROOF_PYTHON": sys.executable},
+        check=True, capture_output=True, text=True,
+    )
+    observed = json.loads((output / "rendered-rows.json").read_text())
+    assert observed["after_reload"] == observed["initial"]
+    assert [row[8] for row in observed["initial"]] == [
+        "Expired", "Expires today", "Upcoming", "Needs review",
+    ]
+    assert [row[9] for row in observed["initial"]] == [
+        "Extracted", "Extracted", "Extracted", "Needs review",
+    ]
+    assert len(observed["initial"]) == len(before["data"]["items"])
+    for cells, item in zip(observed["initial"], before["data"]["items"], strict=True):
+        assert cells[:6] == [item[field] if item[field] is not None else "Not available"
+                             for field in ("certificate_holder", "insured", "producer",
+                                           "coverage", "insurer", "policy_number")]
+    assert json.loads((output / "engine-response.json").read_text()) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["malformed", "duplicate_keys", "extra_field", "wrong_type", "invalid_iso",
+     "date_relationship", "duplicate_policy", "policy_overflow"],
+)
+def test_m3_invalid_result_classes_leave_no_partial_ledger(tmp_path: Path, case: str) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    record = _record(policies=[_policy(0, _date("2027-01-01", "expiration"))])
+    if case == "extra_field":
+        record["unexpected"] = True
+    elif case == "wrong_type":
+        record["policies"][0]["expiration_date"]["ambiguous"] = "false"
+    elif case == "invalid_iso":
+        record["policies"][0]["expiration_date"].update(
+            iso="2026-02-30", candidates=["2026-02-30"]
+        )
+    elif case == "date_relationship":
+        record["policies"][0]["expiration_date"]["candidates"] = ["2027-01-02"]
+    elif case == "duplicate_policy":
+        record["policies"].append(record["policies"][0])
+    elif case == "policy_overflow":
+        record["policies"] = [_policy(i, _date("2027-01-01", f"e-{i}")) for i in range(101)]
+    payload = json.dumps(record).encode()
+    if case == "malformed":
+        payload = payload[:-1]
+    elif case == "duplicate_keys":
+        payload = b'{"record_version":"1.0",' + payload[1:]
+    output = connect.CapabilityOutput(
+        artifact_id=OUTPUT_ID,
+        media_type=CERTIFICATE_MEDIA_TYPE,
+        display_name="certificate.json",
+        byte_size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        payload=payload,
+    )
+    runtime.store.transition_connect_job(
+        job_id=job_id, expected_state="requested", next_state="completed",
+        provider_app_id="invoice-processor", provider_instance_id=INSTANCE_A,
+        result=connect.CapabilityResult((output,)).store_dict(),
+    )
+    settled = runtime.store.automation_fire(fire.fire_id)
+    assert settled.state == "failed" and settled.reason == "CERTIFICATE_RESULT_INVALID"
+    with runtime.store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM certificate_records").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("field", ["effective_date", "expiration_date"])
+@pytest.mark.parametrize("uncertainty", ["missing", "ambiguous"])
+def test_m3_date_uncertainty_preserves_certain_expiration_status(
+    tmp_path: Path, field: str, uncertainty: str,
+) -> None:
+    _, runtime = seeded_runtime(tmp_path)
+    fire, job_id = _certificate_fire_job(runtime.store)
+    policy = _policy(0, _date("2027-01-01", "expiration"))
+    policy[field] = None if uncertainty == "missing" else {
+        "iso": None, "ambiguous": True, "candidates": ["2026-01-02", "2026-02-01"],
+        "provenance": _provenance("01/02/2026", "uncertain"),
+    }
+    policy["review_reasons"] = [f"{field.upper()}_{uncertainty.upper()}"]
+    runtime.store.transition_connect_job(
+        job_id=job_id, expected_state="requested", next_state="completed",
+        provider_app_id="invoice-processor", provider_instance_id=INSTANCE_A,
+        result=_result(_record(policies=[policy])),
+    )
+    assert runtime.store.automation_fire(fire.fire_id).state == "completed"
+    rows = runtime.store.list_certificate_expiry_ledger(today="2026-09-20", limit=100)
+    assert len(rows) == 1
+    assert rows[0]["review_state"] == "needs_review"
+    assert rows[0]["expiry_status"] == ("upcoming" if field == "effective_date" else "review")
+    assert rows[0][f"{field}_iso"] is None

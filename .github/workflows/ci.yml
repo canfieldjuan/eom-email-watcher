@@ -19,6 +19,9 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --all-groups
       - run: uv run ruff check .
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "26"
       - run: uv run pytest --cov=eom_email_watcher --cov-report=term-missing
 
   windows-operation-lock:
