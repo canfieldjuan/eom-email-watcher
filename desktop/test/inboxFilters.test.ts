@@ -3,16 +3,51 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("../src/main.ts", import.meta.url), "utf8");
+const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
 
-test("inbox filters use an initially open native disclosure", () => {
+test("inbox filters use an initially collapsed native disclosure", () => {
   const panel = source.match(
-    /<details class="inbox-filter-panel" open>([\s\S]*?)<\/details>/,
+    /<details class="inbox-filter-panel">([\s\S]*?)<\/details>/,
   );
 
-  assert.ok(panel, "expected the inbox filter disclosure");
+  assert.ok(panel, "expected the inbox filter disclosure without open");
   assert.match(panel[1], /<summary>[\s\S]*Inbox filters[\s\S]*<\/summary>/);
+  assert.match(panel[1], /<span class="inbox-filter-summary">Sender, priority, topic and more<\/span>/);
   assert.match(panel[1], /<form id="inbox-filter-form" class="inbox-filter-form">/);
   assert.ok(panel[1].indexOf("<summary>") < panel[1].indexOf("<form"));
+});
+
+test("shell view marker starts at inbox and follows only showView", () => {
+  assert.ok(source.includes('<div class="shell" data-view="inbox">'), "shell must start with the inbox view marker");
+  const show = source.match(/function showView\([\s\S]*?\n\}/)![0];
+  assert.match(show, /requiredElement<HTMLElement>\("\.shell"\)\.dataset.view = view;/);
+  assert.equal(source.match(/\.dataset\.view\s*=/g)?.length, 1);
+});
+
+test("wide shell applies only to inbox and expiry ledger above the phone breakpoint", () => {
+  const wide = styles.match(/@media \(min-width: 681px\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(wide, "wide shell must be inside the desktop media query");
+  assert.match(wide, /^\s*\.shell\[data-view="inbox"\],\s*\.shell\[data-view="expiry-ledger"\]\s*\{\s*width: max\(80%, min\(760px, calc\(100% - 40px\)\)\);\s*\}\s*$/);
+  assert.match(styles, /\.shell \{\s*width: min\(760px, calc\(100% - 40px\)\);/);
+  assert.match(styles, /@media \(max-width: 680px\) \{\s*\.shell \{\s*width: min\(100% - 28px, 760px\);/);
+});
+
+test("inbox intro is clipped while retaining its accessible heading", () => {
+  const intro = styles.match(/\.shell\[data-view="inbox"\] \.intro \{([^}]+)\}/)?.[1];
+  assert.ok(intro, "inbox intro must have a view-keyed visually-hidden rule");
+  for (const declaration of ["position: absolute;", "width: 1px;", "height: 1px;", "overflow: hidden;", "clip: rect(0 0 0 0);", "white-space: nowrap;"]) assert.ok(intro.includes(declaration), declaration);
+  assert.doesNotMatch(intro, /display:\s*none|visibility:\s*hidden/);
+  assert.match(source, /<header class="intro">[\s\S]*?<h1>Your signal inbox<\/h1>/);
+});
+
+test("expanded content keeps provenance, priority and actions without repeated row items", () => {
+  const render = source.match(/function renderInbox\([\s\S]*?\n\}/)![0];
+  const expanded = render.slice(0, render.indexOf("const summary =")) + render.slice(render.indexOf("const footer ="), render.indexOf("const toggle ="));
+  assert.ok(!/\.append\([^;]*\b(?:sender|senderAddress|received|subject|category|state)\b/.test(expanded), "expanded content must not append sender, address, time, subject, category or state");
+  for (const wiring of ["senderIdentity.append(sourceAccount)", "senderIdentity.append(admission)", "meta.append(senderIdentity)", "card.append(meta, summary)", "badges.append(badge)", "footer.append(badges, footerActions)", "footerActions.append(retryButton)", "footerActions.append(deleteButton)", "card.append(footer)"]) assert.ok(render.includes(wiring), wiring);
+  for (const node of ["details", "calendarProposal", "attachments"]) assert.ok(render.includes(`card.append(${node})`), node);
+  assert.match(render, /rowBadges.append\(category, state\)/);
+  assert.match(render, /toggle.append\(identity, received, rowSubject, rowBadges\)/);
 });
 
 test("sender selection clears the scope before requesting its first page", () => {
@@ -111,7 +146,6 @@ test("watchlist updates and failures render navigation with a responsive layout"
   assert.match(source, /function loadSenders[^]*?catch \(error\) \{\s+renderInboxSenderNavigation\(errorMessage\(error\)\)/);
   assert.match(source, /setAttribute\("aria-pressed", String\(item.selected\)\)/);
   assert.match(source, /if \(model.sender !== activeInboxQuery.sender\) selectInboxSender\(model.sender\)/);
-  const styles = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.match(styles, /\.inbox-columns\s*\{[^}]*grid-template-columns:/);
-  assert.match(styles, /@media \(max-width: 760px\)/);
+  assert.ok(/\.inbox-columns\s*\{[^}]*grid-template-columns: minmax\(220px, 300px\) minmax\(0, 1fr\);/.test(styles), "sender column must use minmax(220px, 300px)");
+  assert.match(styles, /@media \(max-width: 760px\)\s*\{\s*\.inbox-columns\s*\{\s*grid-template-columns: minmax\(0, 1fr\);/);
 });

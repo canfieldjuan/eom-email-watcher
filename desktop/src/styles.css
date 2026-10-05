@@ -42,6 +42,22 @@ select:disabled {
   padding: 64px 0;
 }
 
+@media (min-width: 681px) {
+  .shell[data-view="inbox"],
+  .shell[data-view="expiry-ledger"] {
+    width: max(80%, min(760px, calc(100% - 40px)));
+  }
+}
+
+.shell[data-view="inbox"] .intro {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .intro {
   margin-bottom: 32px;
 }
@@ -199,7 +215,7 @@ select:focus {
 
 .inbox-columns {
   display: grid;
-  grid-template-columns: minmax(140px, 190px) minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
   align-items: start;
   gap: 20px;
 }

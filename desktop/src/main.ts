@@ -513,7 +513,7 @@ function requiredElement<T extends Element>(selector: string): T {
 const app = requiredElement<HTMLElement>("#app");
 
 app.innerHTML = `
-  <div class="shell">
+  <div class="shell" data-view="inbox">
     <header class="intro">
       <p class="eyebrow">Local email watcher</p>
       <h1>Your signal inbox</h1>
@@ -536,7 +536,7 @@ app.innerHTML = `
       </aside>
       <div class="inbox-messages">
       <h2 id="inbox-heading">All messages</h2>
-      <details class="inbox-filter-panel" open>
+      <details class="inbox-filter-panel">
         <summary>
           <span>Inbox filters</span>
           <span class="inbox-filter-summary">Sender, priority, topic and more</span>
@@ -1188,6 +1188,7 @@ function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
 }
 
 function showView(view: "inbox" | "watchlist" | "expiry-ledger" | "health" | "settings"): void {
+  requiredElement<HTMLElement>(".shell").dataset.view = view;
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
   const expiryLedgerSelected = view === "expiry-ledger";
@@ -1728,14 +1729,6 @@ function renderInbox(items: InboxItem[]): void {
     meta.className = "message-meta";
     const senderIdentity = document.createElement("div");
     senderIdentity.className = "message-sender";
-    const sender = document.createElement("strong");
-    sender.textContent = item.sender_name || item.sender;
-    senderIdentity.append(sender);
-    if (item.sender_name) {
-      const senderAddress = document.createElement("span");
-      senderAddress.textContent = item.sender;
-      senderIdentity.append(senderAddress);
-    }
     if (activeInboxQuery.provider === null && activeInboxQuery.account_id === null) {
       const account = mailAccounts.find(
         (candidate) =>
@@ -1761,10 +1754,8 @@ function renderInbox(items: InboxItem[]): void {
     const received = document.createElement("time");
     received.dateTime = item.received_at;
     received.textContent = receivedLabel(item.received_at);
-    meta.append(senderIdentity, received);
+    meta.append(senderIdentity);
 
-    const subject = document.createElement("h3");
-    subject.textContent = item.subject;
     const summary = document.createElement("p");
     summary.className = "message-summary";
     summary.textContent = item.summary || "Local analysis has not completed yet.";
@@ -2327,12 +2318,11 @@ function renderInbox(items: InboxItem[]): void {
     const category = document.createElement("span");
     category.className = "category-badge";
     category.textContent = (item.category || "Unclassified").replace(/_/g, " ");
-    badges.append(badge, category);
+    badges.append(badge);
     const state = document.createElement("span");
     state.textContent = stateLabel(item);
     const footerActions = document.createElement("div");
     footerActions.className = "message-footer-actions";
-    footerActions.append(state);
     footer.append(badges, footerActions);
     if (item.status === "pending" && item.analysis_retryable === false) {
       const retryButton = document.createElement("button");
@@ -2367,7 +2357,7 @@ function renderInbox(items: InboxItem[]): void {
     deleteButton.addEventListener("click", () => void deleteInboxItem(item));
     footerActions.append(deleteButton);
 
-    card.append(meta, subject, summary);
+    card.append(meta, summary);
     if (details.childElementCount) card.append(details);
     if (calendarProposal) card.append(calendarProposal);
     if (attachments.childElementCount) card.append(attachments);
@@ -2397,7 +2387,7 @@ function renderInbox(items: InboxItem[]): void {
     rowSubject.textContent = item.subject;
     const rowBadges = document.createElement("span");
     rowBadges.className = "message-badges";
-    rowBadges.append(category.cloneNode(true), state.cloneNode(true));
+    rowBadges.append(category, state);
     if (item.attachments.length) {
       const attachmentCount = document.createElement("span");
       attachmentCount.textContent = `${item.attachments.length} attachment${item.attachments.length === 1 ? "" : "s"}`;
@@ -2419,7 +2409,7 @@ function renderInbox(items: InboxItem[]): void {
       chip.textContent = actionState;
       rowBadges.append(chip);
     }
-    toggle.append(identity, received.cloneNode(true), rowSubject, rowBadges);
+    toggle.append(identity, received, rowSubject, rowBadges);
     toggle.addEventListener("click", () => {
       content.hidden = !content.hidden;
       if (content.hidden) expandedInboxMessages.delete(item.message_id);
