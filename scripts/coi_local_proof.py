@@ -3,6 +3,9 @@
 Run with an isolated XDG_RUNTIME_DIR containing a running invoice-connect provider.
 Uses the installed entitlement through the published keyring; never reads it directly.
 Only mailbox retrieval is staged from --pdf. Provider results are never mocked.
+Supply the expected provider instance and versions from its retained launch receipt;
+that receipt must record the tested source revision. Manifest versions alone are not
+source revision attestation. The selected identity is retained with the result.
 --model-kind is required: it records the caller's declaration, not runtime attestation.
 Real-model evidence also requires a separately retained runtime/profile receipt.
 Run with this checkout's installed package (for example, uv run python scripts/coi_local_proof.py).
@@ -15,7 +18,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -23,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from build_desktop_sidecar import validate_entitlement_keyring
 from connect_automate import connect, entitlement
 from tomlkit import dumps as toml_dumps
 
@@ -121,12 +124,73 @@ class StagedMailbox:
         return self.content
 
 
-def stage_authority(bundle: Path, public_keyring: Path) -> None:
+def select_provider(items, expected):
+    """Bind discovery to the instance and versions from the retained launch receipt."""
+    candidates = [
+        item for item in items
+        if all(getattr(item, field) == value for field, value in expected.items())
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(f"expected one pinned certificate provider, found {len(candidates)}")
+    return candidates[0]
+
+
+def evidence_directory(path: Path) -> Path:
+    resolved = path.resolve()
+    if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
+        raise RuntimeError("Private evidence must be outside every Git worktree")
+    return resolved
+
+
+def projection_matches(ledger, parents, children, count, expect_error):
+    """Compare independent DB identities in the order defined by the consumer contract."""
+    if (
+        ledger.get("ok") is not True
+        or len(parents) != (0 if expect_error else 1)
+        or len(children) != count
+    ):
+        return False
+    expected = []
+    for parent in parents:
+        policies = [child for child in children
+                    if child["certificate_id"] == parent["certificate_id"]]
+        for policy in policies or [None]:
+            expiration = policy["expiration_date_iso"] if policy is not None else None
+            ordinal = policy["ordinal"] if policy is not None else None
+            identity = {
+                "certificate_id": parent["certificate_id"],
+                "policy_id": policy["policy_id"] if policy is not None else None,
+                "policy_ordinal": ordinal,
+                "source_message_id": parent["source_message_id"],
+                "source_part_id": parent["source_part_id"],
+                "connect_job_id": parent["connect_job_id"],
+            }
+            expected.append(((expiration is None, expiration or "",
+                              parent["certificate_id"], ordinal), identity))
+    if sum(child["certificate_id"] == parent["certificate_id"]
+           for child in children for parent in parents) != len(children):
+        return False
+    ordered = [identity for _, identity in sorted(expected, key=lambda item: item[0])]
+    items = ledger.get("data", {}).get("items")
+    if not isinstance(items, list) or len(items) != len(ordered):
+        return False
+    return all(
+        isinstance(row, dict)
+        and all(field in row and type(row[field]) is type(value) and row[field] == value
+                for field, value in identity.items())
+        for row, identity in zip(items, ordered, strict=True)
+    )
+
+
+def stage_authority(bundle: Path, public_keyring: Path) -> str:
+    # Packaging and local proof use the same approved authority, owned by connect-automate.
+    content = validate_entitlement_keyring(public_keyring)
     keyring = bundle / entitlement.BUNDLED_KEYRING
     keyring.parent.mkdir(parents=True, mode=0o700)
-    shutil.copyfile(public_keyring, keyring)
+    keyring.write_bytes(content)
     keyring.chmod(0o600)
     sys._MEIPASS = str(bundle)
+    return hashlib.sha256(content).hexdigest()
 
 
 def main() -> None:
@@ -139,19 +203,22 @@ def main() -> None:
     parser.add_argument("--expect-error", choices=["DOCUMENT_UNREADABLE"])
     parser.add_argument("--today", required=True)
     parser.add_argument("--model-kind", choices=["real", "fixture"], required=True)
+    parser.add_argument("--expect-provider-instance-id", required=True)
+    parser.add_argument("--expect-provider-app-version", required=True)
+    parser.add_argument("--expect-capability-version", required=True)
     args = parser.parse_args()
     if args.expect_policy_count < 0 or (args.expect_error and args.expect_policy_count != 0):
         parser.error("Expected errors require zero policy rows; counts must be nonnegative")
     identity = watcher_identity()
     os.umask(0o077)
     INPUT = args.pdf.resolve(strict=True)
-    ROOT = args.evidence_dir.resolve()
+    ROOT = evidence_directory(args.evidence_dir)
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=False)
     STATE = ROOT / "watcher-state"
     STATE.mkdir(mode=0o700)
     CONFIG = STATE / "config.toml"
     bundle = ROOT / "bundle"
-    stage_authority(bundle, args.keyring)
+    keyring_sha256 = stage_authority(bundle, args.keyring)
     content = INPUT.read_bytes()
     CONFIG.write_text(
         toml_dumps({
@@ -202,14 +269,14 @@ def main() -> None:
             ),
         ),
     )
-    candidates = [
-        item
-        for item in connect.discover_capabilities().items
-        if item.app_id == "invoice-processor" and item.capability_id == "certificate.extract"
-    ]
-    if len(candidates) != 1:
-        raise RuntimeError(f"expected one certificate provider, found {len(candidates)}")
-    selected = candidates[0]
+    expected_provider = {
+        "app_id": "invoice-processor",
+        "capability_id": "certificate.extract",
+        "instance_id": args.expect_provider_instance_id,
+        "app_version": args.expect_provider_app_version,
+        "capability_version": args.expect_capability_version,
+    }
+    selected = select_provider(connect.discover_capabilities().items, expected_provider)
     rule = {
         "name": "COI M3 isolated proof",
         "scope": {},
@@ -306,7 +373,11 @@ def main() -> None:
     result = {
         "input_sha256": hashlib.sha256(content).hexdigest(),
         "mailbox_source": "isolated staged adapter, not live Gmail",
-        "provider_capability": selected.capability_id,
+        "provider_identity": {
+            field: getattr(selected, field) for field in expected_provider
+        },
+        "provider_identity_source": "expected instance/versions from separate launch receipt",
+        "release_keyring_sha256": keyring_sha256,
         "fire_state": fire.state,
         "fire_reason": fire.reason,
         "job_status": job.status if job else None,
@@ -315,11 +386,11 @@ def main() -> None:
         "ledger_items": len(ledger.get("data", {}).get("items", [])) if ledger.get("ok") else None,
     }
     with runtime.store.connection() as db:
-        parents = db.execute("SELECT canonical_result_json FROM certificate_records").fetchall()
-        children = db.execute("SELECT COUNT(*) FROM certificate_policy_rows").fetchone()[0]
+        parents = db.execute("SELECT * FROM certificate_records").fetchall()
+        children = db.execute("SELECT * FROM certificate_policy_rows").fetchall()
         jobs = db.execute("SELECT COUNT(*) FROM connect_attachment_jobs").fetchone()[0]
     if parents:
-        write_private_json("persisted-record.json", json.loads(parents[0][0]))
+        write_private_json("persisted-record.json", json.loads(parents[0]["canonical_result_json"]))
     checks = {
         "one_fire": len(runtime.store.automation_fires_for_message(MESSAGE_ID)) == 1,
         "one_attempt": len(runtime.store.automation_fire_attempts(fire_id)) == 1,
@@ -329,12 +400,8 @@ def main() -> None:
             if args.expect_error
             else fire.state == "completed" and job is not None and job.status == "completed"
         ),
-        "expected_projection": (
-            ledger.get("ok") is True
-            and len(parents) == (0 if args.expect_error else 1)
-            and children == args.expect_policy_count
-            and len(ledger.get("data", {}).get("items", []))
-            == (0 if args.expect_error else max(1, args.expect_policy_count))
+        "expected_projection": projection_matches(
+            ledger, parents, children, args.expect_policy_count, args.expect_error
         ),
         "replay_unchanged": before == ledger,
         "restart_unchanged": after_restart == ledger,
