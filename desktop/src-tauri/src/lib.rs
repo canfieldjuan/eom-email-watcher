@@ -12,7 +12,7 @@ use engine::{
     ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
     GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
     HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, PreparedAutomationRule, WatchedSender,
+    NtfyDisclosureStatus, PreparedAutomationRule, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -249,6 +249,17 @@ struct OpenedAttachment {
 struct RevealedCapabilityOutput {
     display_name: String,
     filename: String,
+}
+
+/// What a failed configuration mutation may have left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationFailure {
+    /// The mutation is one atomic config write, so a failure left the config
+    /// unchanged; a changed admission identity means something else wrote it.
+    ConfigUnchanged,
+    /// The mutation writes the watchlist before a database step, so a failure
+    /// can follow its own committed config write; restage what is now admitted.
+    ConfigMayHaveChanged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1027,6 +1038,15 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
         mutate: impl FnOnce() -> Result<T, EngineError>,
         restage: impl FnOnce() -> Result<W, EngineError>,
     ) -> Result<T, EngineError> {
+        self.mutate_with_failure(MutationFailure::ConfigUnchanged, mutate, restage)
+    }
+
+    fn mutate_with_failure<T>(
+        &self,
+        failure: MutationFailure,
+        mutate: impl FnOnce() -> Result<T, EngineError>,
+        restage: impl FnOnce() -> Result<W, EngineError>,
+    ) -> Result<T, EngineError> {
         let generation = {
             let mut inner = self.inner.lock().map_err(|_| {
                 EngineError::host("host_error", "Configuration admission coordinator stopped")
@@ -1070,7 +1090,9 @@ impl<W: AdmissionWorkerSet> AdmissionCoordinator<W> {
             Ok(value) => value,
             Err(error) => {
                 let recovery = restage().and_then(|staged| {
-                    if prior_token.as_ref() != staged.admission_token() {
+                    if failure == MutationFailure::ConfigUnchanged
+                        && prior_token.as_ref() != staged.admission_token()
+                    {
                         return Err(EngineError::host(
                             "conflict",
                             "Watcher configuration changed during config mutation",
@@ -1471,6 +1493,23 @@ impl AdmissionCoordinator<AdmissionWorkers> {
     ) -> Result<T, EngineError> {
         let observer = self.engine_error_observer();
         self.mutate_with(
+            || mutate(engine),
+            || stage_admitted_workers(app, engine, delivery, observer, None),
+        )
+    }
+
+    // Vendor operations write the watchlist before their database step (contract
+    // D-ops, two stores), so a failure can follow their own committed config write.
+    fn mutate_config_two_stores<T>(
+        &self,
+        app: &AppHandle,
+        engine: &Engine,
+        delivery: &NotificationDelivery,
+        mutate: impl FnOnce(&Engine) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let observer = self.engine_error_observer();
+        self.mutate_with_failure(
+            MutationFailure::ConfigMayHaveChanged,
             || mutate(engine),
             || stage_admitted_workers(app, engine, delivery, observer, None),
         )
@@ -2318,6 +2357,122 @@ async fn watchlist_remove(
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+// Vendor records (contract D-ops). Operations that can change the watchlist
+// go through the configuration mutation, like watchlist_add and
+// watchlist_remove; the rest only change the database.
+#[tauri::command]
+async fn vendors_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<Vec<Vendor>, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_vendors())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_create(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    display_name: String,
+) -> Result<Vendor, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.create_vendor(display_name))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_rename(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    display_name: String,
+) -> Result<Vendor, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.rename_vendor(vendor_id, display_name))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_address_add(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    address: String,
+) -> Result<Vendor, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        admission.mutate_config_two_stores(&app, &engine, &delivery, |engine| {
+            engine.add_vendor_address(vendor_id, address)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_address_remove(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    address: String,
+    unwatch: bool,
+) -> Result<Vendor, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if unwatch {
+            admission.mutate_config_two_stores(&app, &engine, &delivery, |engine| {
+                engine.remove_vendor_address(vendor_id, address, true)
+            })
+        } else {
+            let _admission_permit = admission.require_admitted()?;
+            engine.remove_vendor_address(vendor_id, address, false)
+        }
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_delete(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    unwatch_addresses: bool,
+) -> Result<VendorDeleted, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if unwatch_addresses {
+            admission.mutate_config_two_stores(&app, &engine, &delivery, |engine| {
+                engine.delete_vendor(vendor_id, true)
+            })
+        } else {
+            let _admission_permit = admission.require_admitted()?;
+            engine.delete_vendor(vendor_id, false)
+        }
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(desktop)]
@@ -2442,6 +2597,12 @@ pub fn run() {
             mail_accounts_list,
             settings_get,
             settings_update,
+            vendors_address_add,
+            vendors_address_remove,
+            vendors_create,
+            vendors_delete,
+            vendors_list,
+            vendors_rename,
             watcher_check,
             watchlist_list,
             watchlist_add,
@@ -4172,6 +4333,73 @@ printf '%s\n' '{"protocol":1,"ok":false,"operation":"connect.queue.pump","error"
                 .expect("repair event")
                 .status,
             ConfigAdmissionStatus::ManualRepairRequired
+        );
+    }
+
+    #[test]
+    fn two_store_mutation_failure_restages_its_committed_config() {
+        let old_token = probe_admission_token('b', 'c');
+        let changed_token = probe_admission_token('d', 'e');
+        let held = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (event_sender, event_receiver) = mpsc::channel();
+        let admission =
+            AdmissionCoordinator::<TokenProbeWorkers>::with_event_sink(Arc::new(move |event| {
+                event_sender.send(event).expect("admission event")
+            }))
+            .expect("start revocation supervisor");
+        let admitted_old_token = old_token;
+        admission
+            .refresh_with(
+                || Ok(NtfyDisclosureStatus::NormalAdmission),
+                || {
+                    Ok(TokenProbeWorkers {
+                        token: admitted_old_token,
+                        held: Arc::clone(&held),
+                        drops: Arc::clone(&drops),
+                    })
+                },
+            )
+            .expect("admit old workers");
+        event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial admitted event");
+
+        // The watchlist write committed, then the database step failed.
+        let restaged_token = changed_token.clone();
+        let result: Result<(), EngineError> = admission.mutate_with_failure(
+            MutationFailure::ConfigMayHaveChanged,
+            || Err(EngineError::host("engine_timeout", "Database step failed")),
+            || {
+                Ok(TokenProbeWorkers {
+                    token: restaged_token,
+                    held: Arc::clone(&held),
+                    drops: Arc::clone(&drops),
+                })
+            },
+        );
+
+        assert_eq!(
+            result.expect_err("the engine's own error is reported").code,
+            "engine_timeout"
+        );
+        admission
+            .require_admitted()
+            .expect("the committed config is admitted, so a retry can complete");
+        assert_eq!(
+            event_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recovered admission event")
+                .status,
+            ConfigAdmissionStatus::Admitted
+        );
+        let inner = admission.inner.lock().expect("admission state");
+        assert_eq!(
+            inner
+                .workers
+                .as_ref()
+                .and_then(AdmissionWorkerSet::admission_token),
+            Some(&changed_token)
         );
     }
 

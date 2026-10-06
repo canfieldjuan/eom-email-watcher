@@ -22,6 +22,7 @@ from eom_email_watcher.config import (
     load_config,
     normalize_address,
     remove_sender,
+    remove_senders,
     update_settings,
 )
 
@@ -1811,3 +1812,29 @@ def test_initialization_locks_before_creating_config_parent(
     assert observed == ["after_acquire"]
     assert path.is_file()
     assert normalize_address("Person <TRUSTED@example.com>") == "trusted@example.com"
+
+
+def test_remove_senders_unwatches_several_in_one_write_and_skips_unwatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    write_config(path)
+    add_sender(path, "billing@acme.com", None)
+    add_sender(path, "sales@acme.com", None)
+    publish = config_module._publish_config_mutation
+    writes: list[bytes] = []
+
+    def counted(source: object, content: bytes) -> None:
+        writes.append(content)
+        publish(source, content)
+
+    monkeypatch.setattr(config_module, "_publish_config_mutation", counted)
+    removed = remove_senders(path, ["Sales@Acme.com", "billing@acme.com", "missing@acme.com"])
+
+    assert [sender.email for sender in removed] == ["billing@acme.com", "sales@acme.com"]
+    assert len(writes) == 1
+    assert load_config(path).allowlist == frozenset({"trusted@example.com"})
+    original = path.read_bytes()
+    assert remove_senders(path, ["missing@acme.com"]) == []
+    assert len(writes) == 1
+    assert path.read_bytes() == original

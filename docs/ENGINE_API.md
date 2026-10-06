@@ -92,6 +92,12 @@ envelope without changing its protocol number.
 | `watchlist.list` | `{}` | Normalized configured senders |
 | `watchlist.add` | `email`, optional `name` | Add and return one normalized sender |
 | `watchlist.remove` | `email` | Remove and return one normalized sender |
+| `vendors.list` | `{}` | Every vendor with its exact addresses and whether each is watched |
+| `vendors.create` | `display_name` | Create and return one vendor (Connect required) |
+| `vendors.rename` | `vendor_id`, `display_name` | Rename and return one vendor (Connect required) |
+| `vendors.addresses.add` | `vendor_id`, `address` | Link one exact address, watching it if needed, and return the vendor (Connect required) |
+| `vendors.addresses.remove` | `vendor_id`, `address`, optional `unwatch` | Unlink one address, record its dismissal, and return the vendor |
+| `vendors.delete` | `vendor_id`, optional `unwatch_addresses` | Delete one vendor with its addresses and dismissals |
 | `settings.get` | `{}` | Safe public settings, polling interval/support, and token-presence boolean |
 | `settings.update` | one or more safe setting fields | Persist and return safe desktop settings |
 | `host.operation_lock` | `{}` | Trusted-host-only canonical native operation-lock path |
@@ -229,6 +235,25 @@ address that is not watched returns `not_found`, and malformed payload values re
 `watcher.check` returns `active: false` without accessing Gmail; local retention cleanup and exact
 pending-notification counting continue so removing the final sender cannot strand prior state.
 Adding the first sender activates later Gmail checks.
+
+Vendor operations implement [D-vendor](THREAD_VIEW_CONTRACT.md#d-vendor-vendors-and-vendor_ofaddress)
+and [D-ops](THREAD_VIEW_CONTRACT.md#d-ops-operation-classes-and-gating) of the thread-view
+contract, which owns their rules: operation classes, the watchlist link, removal effects, and the
+order of the two stores. Mechanically, `vendor_id` is a canonical UUIDv4 string, `display_name` is
+trimmed, non-empty, at most 200 UTF-8 bytes, and free of line breaks and invisible characters (the
+watchlist's sender-name rule, since it becomes its addresses' watched-sender name), and addresses
+get the same validation and selector bound as `watchlist.add`. A vendor item is `{vendor_id, display_name, addresses}`, with each address
+as `{address, watched}`; vendors are ordered by display name, and addresses by when they were
+added. `vendors.delete` returns `{deleted, vendor_id, addresses}`. While the entitlement is
+inactive, `vendors.create`, `vendors.rename`, and `vendors.addresses.add` return
+`connect_entitlement_required` and write nothing. `conflict` means the address belongs to another
+vendor, whom the message names, or is a mail account's own address. `not_found` means an unknown
+vendor, or an address the vendor does not have. `watchlist.remove` of a vendor address also returns
+`conflict`, naming the vendor. Vendor mutations share the watchlist mutation lock.
+
+Schema v29 also gives every stored message a thread key under
+[D-identity](THREAD_VIEW_CONTRACT.md#d-identity-message-identity-direction-and-thread-keys). No
+operation returns it before the thread view.
 
 `settings.get` reports the configured inference endpoint and model under `local_model` without
 exposing token values or paths. Its `editable` flag is true only for the exact-loopback backend.

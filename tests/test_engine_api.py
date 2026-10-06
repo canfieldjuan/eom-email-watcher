@@ -8455,3 +8455,334 @@ def test_inbox_and_host_notifications_report_body_truncation(
         if item["message_id"] == "long-1"
     ]
     assert payload["body"].endswith(PARTIAL_SUMMARY_NOTE) is (truncated is True)
+
+
+# Thread view M1: vendor operations (plans/PR-Thread-M1-Vendors-Thread-Keys.md).
+
+
+def _entitlement(monkeypatch: pytest.MonkeyPatch, *, active: bool) -> None:
+    decision = (
+        connect.entitlement.EntitlementDecision.ACTIVE
+        if active
+        else connect.entitlement.EntitlementDecision.MISSING
+    )
+    monkeypatch.setattr(connect.entitlement, "connect_entitlement_decision", lambda: decision)
+
+
+def _vendor_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    patch_runtime(monkeypatch, load_runtime(config_path))
+    _entitlement(monkeypatch, active=True)
+    return config_path
+
+
+def _call(config_path: Path, operation: str, payload: dict[str, object]) -> dict[str, object]:
+    return engine_api._response(request(config_path, operation, payload))
+
+
+def test_vendor_addresses_link_the_watchlist_and_guard_its_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": " Acme Supply "})["data"]["item"]
+    other = _call(config_path, "vendors.create", {"display_name": "Other Co"})["data"]["item"]
+    assert acme["display_name"] == "Acme Supply"
+
+    added = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "Billing@Acme.com"},
+    )
+    assert added["data"]["item"]["addresses"] == [
+        {"address": "billing@acme.com", "watched": True}
+    ]
+    assert "billing@acme.com" in load_config(config_path).allowlist
+    again = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    assert again["ok"] is True
+
+    conflict = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": other["vendor_id"], "address": "billing@acme.com"},
+    )
+    assert conflict["error"]["code"] == "conflict"
+    assert "Acme Supply" in conflict["error"]["message"]
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert [item["addresses"] for item in listed if item["display_name"] == "Other Co"] == [[]]
+
+    guarded = _call(config_path, "watchlist.remove", {"email": "billing@acme.com"})
+    assert guarded["error"]["code"] == "conflict"
+    assert "billing@acme.com" in load_config(config_path).allowlist
+
+    kept = _call(
+        config_path, "vendors.addresses.remove",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    assert kept["data"]["item"]["addresses"] == []
+    assert "billing@acme.com" in load_config(config_path).allowlist
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    _call(
+        config_path, "vendors.addresses.remove",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com", "unwatch": True},
+    )
+    assert "billing@acme.com" not in load_config(config_path).allowlist
+
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": other["vendor_id"], "address": "sales@other.com"},
+    )
+    deleted = _call(
+        config_path, "vendors.delete",
+        {"vendor_id": other["vendor_id"], "unwatch_addresses": True},
+    )
+    assert deleted["data"]["addresses"] == ["sales@other.com"]
+    assert "sales@other.com" not in load_config(config_path).allowlist
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload", "code"),
+    [
+        ("vendors.create", {"display_name": ""}, "invalid_request"),
+        ("vendors.create", {"display_name": "x" * 201}, "invalid_request"),
+        ("vendors.rename", {"vendor_id": "not-a-uuid", "display_name": "A"}, "invalid_request"),
+        (
+            "vendors.rename",
+            {"vendor_id": "00000000-0000-4000-8000-000000000000", "display_name": "A"},
+            "not_found",
+        ),
+        (
+            "vendors.addresses.add",
+            {"vendor_id": "00000000-0000-4000-8000-000000000000", "address": "not an address"},
+            "invalid_request",
+        ),
+    ],
+)
+def test_vendor_operations_reject_bad_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    payload: dict[str, object],
+    code: str,
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    assert _call(config_path, operation, payload)["error"]["code"] == code
+
+
+def test_vendor_display_name_accepts_exactly_200_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    created = _call(config_path, "vendors.create", {"display_name": "x" * 200})
+    assert created["ok"] is True
+
+
+def test_gated_vendor_operations_write_nothing_while_connect_is_inactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    _entitlement(monkeypatch, active=False)
+
+    for operation, payload in (
+        ("vendors.create", {"display_name": "Second"}),
+        ("vendors.rename", {"vendor_id": acme["vendor_id"], "display_name": "Renamed"}),
+        (
+            "vendors.addresses.add",
+            {"vendor_id": acme["vendor_id"], "address": "new@acme.com"},
+        ),
+    ):
+        response = _call(config_path, operation, payload)
+        assert response["error"]["code"] == "connect_entitlement_required", operation
+
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert [(item["display_name"], item["addresses"]) for item in listed] == [
+        ("Acme", [{"address": "billing@acme.com", "watched": True}])
+    ]
+    assert "new@acme.com" not in load_config(config_path).allowlist
+    removed = _call(
+        config_path, "vendors.addresses.remove",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    assert removed["ok"] is True
+    assert _call(config_path, "vendors.delete", {"vendor_id": acme["vendor_id"]})["ok"] is True
+
+
+def test_hand_edited_config_reports_unwatched_vendor_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    config_module.remove_sender(config_path, "billing@acme.com")
+
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert listed[0]["addresses"] == [{"address": "billing@acme.com", "watched": False}]
+
+
+def test_vendor_addresses_refuse_the_mailbox_own_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    runtime.store.register_mail_account(
+        "gmail", "gmail-owner", display_name="Gmail", address="Owner@Example.com", active=False
+    )
+    patch_runtime(monkeypatch, runtime)
+    _entitlement(monkeypatch, active=True)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    original = config_path.read_bytes()
+
+    refused = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "owner@example.com"},
+    )
+
+    assert refused["error"]["code"] == "conflict"
+    assert config_path.read_bytes() == original
+    assert runtime.store.vendor_for_address("owner@example.com") is None
+
+
+def test_vendor_delete_writes_the_watchlist_first_so_a_retry_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    for address in ("billing@acme.com", "sales@acme.com"):
+        _call(
+            config_path, "vendors.addresses.add",
+            {"vendor_id": acme["vendor_id"], "address": address},
+        )
+    delete_vendor = Store.delete_vendor
+
+    def interrupted(_store: object, _vendor_id: str) -> list[str]:
+        raise RuntimeError("interrupted after the watchlist write")
+
+    monkeypatch.setattr(Store, "delete_vendor", interrupted)
+    payload = {"vendor_id": acme["vendor_id"], "unwatch_addresses": True}
+    assert _call(config_path, "vendors.delete", payload)["ok"] is False
+
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert listed[0]["addresses"] == [
+        {"address": "billing@acme.com", "watched": False},
+        {"address": "sales@acme.com", "watched": False},
+    ]
+    monkeypatch.setattr(Store, "delete_vendor", delete_vendor)
+    retried = _call(config_path, "vendors.delete", payload)
+    assert retried["data"]["addresses"] == ["billing@acme.com", "sales@acme.com"]
+    assert _call(config_path, "vendors.list", {})["data"]["items"] == []
+
+
+def test_vendor_address_remove_checks_membership_before_unwatching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    original = config_path.read_bytes()
+
+    response = _call(
+        config_path, "vendors.addresses.remove",
+        {"vendor_id": acme["vendor_id"], "address": "a@example.com", "unwatch": True},
+    )
+
+    assert response["error"]["code"] == "not_found"
+    assert config_path.read_bytes() == original
+
+
+def test_vendor_address_remove_with_unwatch_retries_after_an_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    remove_vendor_address = Store.remove_vendor_address
+
+    def interrupted(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("interrupted after the watchlist write")
+
+    monkeypatch.setattr(Store, "remove_vendor_address", interrupted)
+    payload = {"vendor_id": acme["vendor_id"], "address": "billing@acme.com", "unwatch": True}
+    assert _call(config_path, "vendors.addresses.remove", payload)["ok"] is False
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert listed[0]["addresses"] == [{"address": "billing@acme.com", "watched": False}]
+
+    # The address is already unwatched, and the retry still completes.
+    monkeypatch.setattr(Store, "remove_vendor_address", remove_vendor_address)
+    retried = _call(config_path, "vendors.addresses.remove", payload)
+    assert retried["data"]["item"]["addresses"] == []
+    assert "billing@acme.com" not in load_config(config_path).allowlist
+
+
+def test_vendor_address_add_to_a_missing_vendor_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    original = config_path.read_bytes()
+
+    response = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": "00000000-0000-4000-8000-000000000000", "address": "new@acme.com"},
+    )
+
+    assert response["error"]["code"] == "not_found"
+    assert config_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("name", ["Acme Corp", "Acme\tCorp", "Soft­Hyphen", "Line\nBreak"])
+def test_vendor_names_follow_the_watchlist_name_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    # The vendor name becomes the watched sender's name, so it shares that rule.
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    created = _call(config_path, "vendors.create", {"display_name": name})
+    assert created["error"]["code"] == "invalid_request"
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    renamed = _call(
+        config_path, "vendors.rename", {"vendor_id": acme["vendor_id"], "display_name": name}
+    )
+    assert renamed["error"]["code"] == "invalid_request"
+
+
+def test_a_printable_unicode_vendor_name_can_watch_its_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    vendor = _call(config_path, "vendors.create", {"display_name": "Café Ñandú 株式会社"})
+    added = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": vendor["data"]["item"]["vendor_id"], "address": "billing@cafe.example"},
+    )
+    assert added["data"]["item"]["addresses"] == [
+        {"address": "billing@cafe.example", "watched": True}
+    ]
+
+
+def test_a_missing_vendor_is_reported_before_address_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    missing = "00000000-0000-4000-8000-000000000000"
+    response = _call(
+        config_path, "vendors.addresses.add", {"vendor_id": missing, "address": "billing@acme.com"}
+    )
+    assert response["error"]["code"] == "not_found"

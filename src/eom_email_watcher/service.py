@@ -2141,7 +2141,12 @@ class Watcher:
                     )
                 )
                 added += 1
-            elif self.store.add_message(**values, admission=admission.provenance()):
+            elif self.store.add_message(
+                **values,
+                admission=admission.provenance(),
+                rfc_message_id=metadata.rfc_message_id,
+                reply_ids=metadata.reply_ids,
+            ):
                 added += 1
 
         if not dry_run:

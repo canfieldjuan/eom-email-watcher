@@ -23,6 +23,7 @@ from urllib.parse import unquote_to_bytes
 
 from .config import normalize_address
 from .mailbox import (
+    MAX_IDS_PER_REPLY_HEADER,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -30,6 +31,8 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    message_id_list,
+    normalize_message_id,
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
@@ -41,6 +44,9 @@ MAX_CA_FILE_BYTES = 256 * 1024
 MAX_CREDENTIAL_FILE_BYTES = MAX_CA_FILE_BYTES + 16 * 1024
 MAX_MESSAGE_BYTES = 50 * 1024 * 1024
 MAX_HEADER_BYTES = 64 * 1024
+# Reply headers are a separately bounded fetch item: an oversized chain is
+# ignored for threading and never rejects a message the main item accepts.
+MAX_REPLY_HEADER_BYTES = 16 * 1024
 MAX_BODYSTRUCTURE_BYTES = 1024 * 1024
 MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
@@ -506,6 +512,50 @@ def _literal(response: list[Any] | None) -> tuple[bytes, bytes]:
             if isinstance(metadata, bytes) and isinstance(payload, bytes):
                 return metadata, payload
     raise MailboxMessageUnavailable("The mail server message is no longer available")
+
+
+def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | None]:
+    """Split a metadata FETCH into (metadata, main headers, reply headers or None).
+
+    UID and INTERNALDATE precede the first literal, whichever header item the
+    server returns first, so the metadata is always that first prefix.
+    """
+    metadata: bytes | None = None
+    main: bytes | None = None
+    reply: bytes | None = None
+    for item in response or []:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            continue
+        prefix, payload = item
+        if not (isinstance(prefix, bytes) and isinstance(payload, bytes)):
+            continue
+        if metadata is None:
+            metadata = prefix
+        if b"IN-REPLY-TO" in prefix.upper():
+            reply = payload
+        elif main is None:
+            main = payload
+    if metadata is None or main is None:
+        raise MailboxMessageUnavailable("The mail server message is no longer available")
+    return metadata, main, reply
+
+
+def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
+    """Return In-Reply-To then oldest-first References ids; empty if unusable.
+
+    In-Reply-To may name several parents, so each field keeps up to the same bound.
+    """
+    if payload is None or len(payload) >= MAX_REPLY_HEADER_BYTES:
+        return ()
+    try:
+        parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
+        in_reply_to = message_id_list(
+            str(parsed.get("In-Reply-To", "")), MAX_IDS_PER_REPLY_HEADER
+        )
+        references = message_id_list(str(parsed.get("References", "")), MAX_IDS_PER_REPLY_HEADER)
+    except (RecursionError, ValueError, TypeError, IndexError):
+        return ()
+    return tuple(dict.fromkeys((*in_reply_to, *references)))
 
 
 def _response_metadata(response: list[Any] | None) -> bytes:
@@ -1596,11 +1646,12 @@ class ImapGateway:
                 "FETCH",
                 uid,
                 "(UID INTERNALDATE "
-                f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>)",
+                f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}> "
+                f"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>)",
             )
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server header fetch failed; retry")
-            metadata, payload = _literal(response)
+            metadata, payload, reply_payload = _header_literals(response)
             if len(payload) >= MAX_HEADER_BYTES:
                 raise MailboxMessageInvalid(
                     "imap_headers_too_large", "Message headers exceed the safe size limit"
@@ -1611,6 +1662,7 @@ class ImapGateway:
             sender_name, _address = parseaddr(raw_from)
             subject = str(parsed.get("Subject", "")).strip() or "(no subject)"
             thread_id = str(parsed.get("Message-ID", "")).strip() or None
+            reply_ids = _reply_ids(reply_payload)
         except RecursionError as exc:
             raise MailboxMessageInvalid(
                 "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
@@ -1623,6 +1675,8 @@ class ImapGateway:
             subject=subject,
             received_at=_message_date(metadata, parsed),
             labels=frozenset({"INBOX"}),
+            rfc_message_id=normalize_message_id(thread_id),
+            reply_ids=reply_ids,
         )
 
     @staticmethod

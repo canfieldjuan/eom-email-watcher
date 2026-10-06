@@ -220,7 +220,9 @@ Desktop hosts use the versioned one-shot JSON contract documented in
 point.
 
 The Linux Tauri application provides a local Inbox with confirmed local-only delete/clear controls,
-GUI watchlist management, safe polling, source-time retention and notification settings, live
+GUI watchlist management, a Vendors list that groups the exact addresses each vendor writes from
+(adding vendors and addresses needs an active Connect entitlement; viewing and removing never do),
+safe polling, source-time retention and notification settings, live
 health status, a safe one-shot `Check now` action, and
 contextual local capabilities for attachments. Its Debian package includes the Python engine as a
 Tauri sidecar, so the installed application does not depend on a source checkout or `uv`. It still

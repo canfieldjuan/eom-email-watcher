@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -12,6 +13,10 @@ from .mime import AttachmentDescriptor
 
 DEFAULT_MAIL_PROVIDER = "gmail"
 DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
+# RFC 5322 line limit; longer message ids are malformed and dropped.
+MAX_MESSAGE_ID_CHARS = 998
+MAX_IDS_PER_REPLY_HEADER = 64
+_BRACKETED_ID_RE = re.compile(r"<([^<>\s]+)>")
 
 
 class MailboxError(RuntimeError):
@@ -61,6 +66,43 @@ class MessageMetadata:
     subject: str
     received_at: str
     labels: frozenset[str]
+    # RFC 5322 identity for thread keys (contract D-identity); providers that
+    # supply their own thread id leave these empty.
+    rfc_message_id: str | None = None
+    reply_ids: tuple[str, ...] = ()
+
+
+def normalize_message_id(value: object) -> str | None:
+    """Return one RFC 5322 message id without angle brackets, or None if malformed."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    # left@right with exactly one "@", both sides non-empty, and only printable,
+    # non-space characters other than angle brackets. Rare RFC forms with an "@"
+    # inside a quoted local part or a domain literal are dropped, which is safe:
+    # an id that is dropped just joins no component.
+    left, at, right = text.partition("@")
+    if (
+        len(text) > MAX_MESSAGE_ID_CHARS
+        or not at
+        or not left
+        or not right
+        or "@" in right
+        or any(not c.isprintable() or c.isspace() or c in "<>" for c in text)
+    ):
+        return None
+    return text
+
+
+def message_id_list(value: object, limit: int | None = None) -> tuple[str, ...]:
+    """Return the distinct message ids of an In-Reply-To or References value, in order."""
+    if not isinstance(value, str):
+        return ()
+    found = _BRACKETED_ID_RE.findall(value) or value.split()
+    ids = tuple(dict.fromkeys(i for i in map(normalize_message_id, found) if i is not None))
+    return ids if limit is None else ids[:limit]
 
 
 @dataclass(frozen=True)

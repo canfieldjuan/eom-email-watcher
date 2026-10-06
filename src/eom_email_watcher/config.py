@@ -12,7 +12,7 @@ import stat
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from email.utils import parseaddr
@@ -303,6 +303,15 @@ def admission_sender_display_name(value: str | None) -> str | None:
     return encoded[:MAX_SENDER_NAME_BYTES].decode("utf-8", errors="ignore")
 
 
+def printable_display_name(value: str) -> bool:
+    """The watchlist's sender-name rule: no line breaks or non-printable characters.
+
+    Vendor names use it too, because a vendor's name becomes its addresses'
+    watched-sender name.
+    """
+    return not any(character in "\r\n" or not character.isprintable() for character in value)
+
+
 def _sender(
     email_value: str,
     name_value: str | None,
@@ -320,9 +329,7 @@ def _sender(
             exact_sender_selector_id(email)
         except ValueError as exc:
             raise InvalidSenderError(str(exc)) from exc
-    if name_value is not None and any(
-        character in "\r\n" or not character.isprintable() for character in name_value
-    ):
+    if name_value is not None and not printable_display_name(name_value):
         raise InvalidSenderError("sender name must not contain control characters")
     name = name_value.strip() if name_value and name_value.strip() else None
     if (
@@ -4046,28 +4053,42 @@ def add_sender(path: Path, email: str, name: str | None = None) -> Sender:
 
 
 def remove_sender(path: Path, email: str) -> Sender:
-    requested = _sender(
-        email,
-        None,
-        invalid_message="email must be a valid email address",
-        enforce_selector_limit=False,
-    )
+    return _remove_senders(path, (email,), missing_ok=False)[0]
+
+
+def remove_senders(path: Path, emails: Iterable[str]) -> list[Sender]:
+    """Stop watching every listed address in one config write; unwatched ones are skipped."""
+    return _remove_senders(path, emails, missing_ok=True)
+
+
+def _remove_senders(path: Path, emails: Iterable[str], *, missing_ok: bool) -> list[Sender]:
+    requested = {
+        _sender(
+            email,
+            None,
+            invalid_message="email must be a valid email address",
+            enforce_selector_limit=False,
+        ).email
+        for email in emails
+    }
     with _config_serialization_lock(), _config_mutation_source(path) as source:
         config = _load_config_bytes(source.content, source.path)
-        try:
-            index = next(
-                index
-                for index, sender in enumerate(config.senders)
-                if sender.email == requested.email
-            )
-        except StopIteration as exc:
-            raise SenderNotFoundError(f"Sender is not watched: {requested.email}") from exc
-        removed = config.senders[index]
+        indexes = [
+            index for index, sender in enumerate(config.senders) if sender.email in requested
+        ]
+        if not missing_ok and len(indexes) < len(requested):
+            watched = {config.senders[index].email for index in indexes}
+            missing = ", ".join(sorted(requested - watched))
+            raise SenderNotFoundError(f"Sender is not watched: {missing}")
+        if not indexes:
+            return []
+        removed = [config.senders[index] for index in indexes]
         document = parse(source.content.decode("utf-8"))
         sender_items = document.get("senders")
         if not isinstance(sender_items, (AoT, Array)):
             raise ConfigError("senders must be a list of tables")
-        del sender_items[index]
+        for index in reversed(indexes):
+            del sender_items[index]
         _publish_config_mutation(source, dumps(document).encode("utf-8"))
     return removed
 

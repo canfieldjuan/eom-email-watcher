@@ -2260,7 +2260,7 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
 
     monkeypatch.setattr(db_module, "SCHEMA_VERSION", 26)
     with pytest.raises(RuntimeError, match="newer than supported version 26"):
@@ -2283,7 +2283,7 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
         tables = {
             str(row["name"])
             for row in db.execute(
@@ -2339,7 +2339,7 @@ def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
         assert db.execute(
             "SELECT catalog_state FROM gmail_label_validation_sets"
         ).fetchone()[0] == "current"
@@ -6264,7 +6264,7 @@ def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
         triggers = {
             str(row["name"])
             for row in db.execute(
@@ -6305,3 +6305,472 @@ def test_production_store_requires_explicit_body_counts(tmp_path: Path) -> None:
         )
 
     assert store.recent(1)[0]["status"] == "pending"
+
+
+# Thread view M1: vendor records and thread keys (plans/PR-Thread-M1-Vendors-Thread-Keys.md).
+
+
+def test_vendor_records_enforce_one_vendor_per_address(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    acme = store.create_vendor("Acme Supply")
+    other = store.create_vendor("Other Co")
+
+    assert store.add_vendor_address(acme, "billing@acme.com") is True
+    assert store.add_vendor_address(acme, "billing@acme.com") is False
+    with pytest.raises(db_module.VendorAddressConflict, match="Acme Supply"):
+        store.add_vendor_address(other, "billing@acme.com")
+    with pytest.raises(KeyError):
+        store.add_vendor_address("00000000-0000-4000-8000-000000000000", "x@acme.com")
+
+    store.rename_vendor(acme, "Acme Supplies")
+    assert [(v["display_name"], v["addresses"]) for v in store.list_vendors()] == [
+        ("Acme Supplies", ["billing@acme.com"]),
+        ("Other Co", []),
+    ]
+    assert store.vendor_for_address("billing@acme.com")["vendor_id"] == acme
+    assert store.remove_vendor_address(acme, "billing@acme.com") is True
+    assert store.remove_vendor_address(acme, "billing@acme.com") is False
+    assert store.add_vendor_address(other, "billing@acme.com") is True
+    assert store.delete_vendor(other) == ["billing@acme.com"]
+    assert store.vendor_for_address("billing@acme.com") is None
+    with pytest.raises(KeyError):
+        store.delete_vendor(other)
+
+
+@pytest.mark.parametrize("name", ["", "x" * 201])
+def test_vendor_display_name_is_bounded_in_storage(tmp_path: Path, name: str) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    with pytest.raises(sqlite3.IntegrityError):
+        store.create_vendor(name)
+
+
+def _imap_message(
+    store: Store, uid: str, own: str | None, replies: tuple[str, ...] = ()
+) -> str:
+    message_id = f"imap-message-{uid}"
+    store.add_message(
+        message_id=message_id,
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id=f"imap:mailbox:44:{uid}",
+        thread_id=f"<{own}>" if own else None,
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id=own,
+        reply_ids=replies,
+    )
+    return message_id
+
+
+def _thread_keys(store: Store) -> dict[str, str | None]:
+    with store.connection() as db:
+        rows = db.execute("SELECT message_id, thread_key FROM messages").fetchall()
+    return {str(row["message_id"]): row["thread_key"] for row in rows}
+
+
+@pytest.mark.parametrize("order", [("a", "b", "c"), ("c", "b", "a"), ("b", "c", "a")])
+def test_imap_thread_key_is_one_component_in_any_arrival_order(
+    tmp_path: Path, order: tuple[str, ...]
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    chain = {"a": ("1", "a@x", ()), "b": ("2", "b@x", ("a@x",)), "c": ("3", "c@x", ("b@x", "a@x"))}
+    for name in order:
+        uid, own, replies = chain[name]
+        _imap_message(store, uid, own, replies)
+
+    keys = set(_thread_keys(store).values())
+    assert len(keys) == 1 and None not in keys
+
+
+def test_imap_merge_keeps_the_component_of_the_smallest_member(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "root-one@x")
+    second = _imap_message(store, "2", "root-two@x")
+    before = _thread_keys(store)
+    assert before[first] != before[second]
+
+    bridge = _imap_message(store, "3", "bridge@x", ("root-two@x", "root-one@x"))
+    after = _thread_keys(store)
+
+    # Canonical order is the source identity: imap:mailbox:44:1 sorts first.
+    assert after[first] == after[second] == after[bridge] == before[first]
+    with store.connection() as db:
+        aliases = db.execute("SELECT old_key, survivor_key FROM thread_key_aliases").fetchall()
+    assert [(row["old_key"], row["survivor_key"]) for row in aliases] == [
+        (before[second], before[first])
+    ]
+
+
+def test_imap_components_without_message_id_merge_deterministically(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    left = _imap_message(store, "5", None, ("thread-left@x",))
+    right = _imap_message(store, "4", None, ("thread-right@x",))
+    before = _thread_keys(store)
+    bridge = _imap_message(store, "6", None, ("thread-left@x", "thread-right@x"))
+    after = _thread_keys(store)
+
+    assert after[left] == after[right] == after[bridge] == before[right]
+
+
+def test_imap_message_without_ids_forms_its_own_component(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", None)
+    two = _imap_message(store, "2", None)
+    keys = _thread_keys(store)
+    assert keys[one] and keys[two] and keys[one] != keys[two]
+
+
+def test_deleting_a_components_last_message_releases_its_ids(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    only = _imap_message(store, "1", "solo@x")
+    assert store.delete_message(only) is True
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0] == 0
+    fresh = _imap_message(store, "2", "reply@x", ("solo@x",))
+    assert _thread_keys(store)[fresh]
+
+
+def test_gmail_and_microsoft_thread_keys_are_the_provider_thread_ids(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for provider, thread in (("gmail", "gmail-thread"), ("microsoft365", "conversation-1")):
+        store.add_message(
+            message_id=f"{provider}-1",
+            provider=provider,
+            account_id=f"{provider}-account",
+            provider_message_id=f"{provider}-id",
+            thread_id=thread,
+            sender="a@b.com",
+            sender_name=None,
+            subject="S",
+            received_at="2026-08-29T12:00:00+00:00",
+        )
+    keys = _thread_keys(store)
+    assert keys["gmail-1"] == "gmail-thread"
+    assert keys["microsoft365-1"] == "conversation-1"
+
+
+def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-old", thread_id="gmail-thread", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00",
+    )
+    old = _imap_message(store, "1", "old-root@x")
+    first_copy = _imap_message(store, "3", "dup@x")
+    second_copy = _imap_message(store, "4", "dup@x")
+    idless = _imap_message(store, "5", None)
+    malformed = _imap_message(store, "6", None)
+    store.add_message(
+        message_id="microsoft-old", provider="microsoft365", account_id="m-account",
+        provider_message_id="m-id", thread_id=None, sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00",
+    )
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET thread_id = '<not-an-id>' WHERE message_id = ?", (malformed,)
+        )
+        db.execute("UPDATE messages SET thread_key = NULL, rfc_message_id = NULL")
+        db.execute("DELETE FROM imap_thread_ids")
+        db.execute("DROP TRIGGER messages_release_imap_component")
+        db.execute("DROP INDEX idx_messages_thread_key")
+        db.execute("DROP INDEX idx_messages_rfc_message_id")
+        db.execute("ALTER TABLE messages DROP COLUMN thread_key")
+        db.execute("ALTER TABLE messages DROP COLUMN rfc_message_id")
+        db.execute("PRAGMA user_version = 28")
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    keys = _thread_keys(migrated)
+    assert keys["gmail-old"] == "gmail-thread"
+    assert None not in keys.values()
+    assert keys[first_copy] == keys[second_copy]
+    assert len({keys[old], keys[first_copy], keys[idless], keys[malformed]}) == 4
+    assert keys["microsoft-old"] not in {keys[old], keys[idless], keys[malformed]}
+    with migrated.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute(
+            "SELECT rfc_message_id FROM messages WHERE message_id = ?", (old,)
+        ).fetchone()[0] == "old-root@x"
+        assert db.execute(
+            "SELECT rfc_message_id FROM messages WHERE message_id = ?", (malformed,)
+        ).fetchone()[0] is None
+        stored = db.execute(
+            "SELECT rfc_message_id FROM messages WHERE message_id IN (?, ?)",
+            (first_copy, second_copy),
+        ).fetchall()
+        assert [row[0] for row in stored] == ["dup@x", "dup@x"]
+    with migrated.connection() as db:
+        gaps = {row[0] for row in db.execute("SELECT message_id FROM imap_reply_header_gaps")}
+    assert gaps == {old, first_copy, second_copy, idless, malformed}
+    # The retained row stored the raw header <old-root@x>; a reply names it bare.
+    reply = _imap_message(migrated, "2", "reply@x", ("old-root@x",))
+    assert _thread_keys(migrated)[reply] == keys[old]
+    assert migrated.delete_message(old) is True
+    with migrated.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM imap_reply_header_gaps WHERE message_id = ?", (old,)
+        ).fetchone() is None
+
+
+def test_thread_identity_schema_bump_rejects_previous_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    Store(database).initialize()
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 28)
+    with pytest.raises(RuntimeError, match="newer than supported version 28"):
+        Store(database).initialize()
+
+
+def test_vendor_address_removal_records_a_dismissal_that_leaves_with_its_vendor(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    acme = store.create_vendor("Acme")
+    store.add_vendor_address(acme, "billing@acme.com")
+
+    def dismissals() -> list[tuple[str, str]]:
+        with store.connection() as db:
+            rows = db.execute("SELECT vendor_id, address FROM vendor_address_dismissals")
+            return [(row["vendor_id"], row["address"]) for row in rows.fetchall()]
+
+    assert store.remove_vendor_address(acme, "other@acme.com") is False
+    assert dismissals() == []
+    assert store.remove_vendor_address(acme, "billing@acme.com") is True
+    assert dismissals() == [(acme, "billing@acme.com")]
+    store.delete_vendor(acme)
+    assert dismissals() == []
+
+
+def test_imap_merges_repoint_earlier_aliases(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    a = _imap_message(store, "3", "a@x")
+    b = _imap_message(store, "2", "b@x")
+    first = _thread_keys(store)
+    _imap_message(store, "4", "ab@x", ("a@x", "b@x"))
+    c = _imap_message(store, "1", "c@x")
+    second = _thread_keys(store)
+    _imap_message(store, "5", None, ("b@x", "c@x"))
+
+    # Canonical order: imap:mailbox:44:1 < :2 < :3, so c's component survives both.
+    assert set(_thread_keys(store).values()) == {second[c]}
+    with store.connection() as db:
+        rows = db.execute("SELECT old_key, survivor_key FROM thread_key_aliases").fetchall()
+    aliases = {row["old_key"]: row["survivor_key"] for row in rows}
+    assert aliases == {first[a]: second[c], first[b]: second[c]}
+
+
+def test_malformed_ids_never_join_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", None, ("not-an-id", "@host"))
+    two = _imap_message(store, "2", None, ("not-an-id", "left@"))
+    keys = _thread_keys(store)
+    assert keys[one] != keys[two]
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0] == 0
+
+
+def test_messages_without_a_provider_thread_id_get_their_own_key(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for index in (1, 2):
+        store.add_message(
+            message_id=f"microsoft-{index}", provider="microsoft365", account_id="m-account",
+            provider_message_id=f"m-{index}", thread_id=None, sender="a@b.com",
+            sender_name=None, subject="S", received_at="2026-08-29T12:00:00+00:00",
+        )
+    keys = _thread_keys(store)
+    assert keys["microsoft-1"] and keys["microsoft-2"]
+    assert keys["microsoft-1"] != keys["microsoft-2"]
+
+
+def _reset_to_schema_28(store: Store) -> None:
+    with store.connection() as db:
+        db.execute("UPDATE messages SET thread_key = NULL, rfc_message_id = NULL")
+        db.execute("DELETE FROM imap_thread_ids")
+        db.execute("DROP TRIGGER messages_release_imap_component")
+        db.execute("DROP INDEX idx_messages_thread_key")
+        db.execute("DROP INDEX idx_messages_rfc_message_id")
+        db.execute("ALTER TABLE messages DROP COLUMN thread_key")
+        db.execute("ALTER TABLE messages DROP COLUMN rfc_message_id")
+        db.execute("PRAGMA user_version = 28")
+
+
+@pytest.mark.parametrize("status", ["continuity_proven", "unresolved"])
+def test_schema_28_legacy_rows_without_a_mailbox_identity_upgrade(
+    tmp_path: Path, status: str
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    legacy_root = _imap_message(store, "1", "legacy-root@x")
+    legacy_copy = _imap_message(store, "2", "legacy-root@x")
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (legacy_root,)
+        ).fetchone()[0]
+        # Rows from before mailbox identities and admission provenance existed.
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
+        db.execute(
+            """UPDATE messages SET mailbox_identity_key = NULL, admission_kind = NULL,
+                admission_selector_id = NULL, admission_display_name = NULL,
+                admission_mailbox_identity_key = NULL, admitted_at = NULL"""
+        )
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = ?, legacy_identity_key = ?
+            WHERE account_id = 'imap-account'""",
+            (status, identity if status == "continuity_proven" else None),
+        )
+    _reset_to_schema_28(store)
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    keys = _thread_keys(migrated)
+    assert None not in keys.values()
+    reply = _imap_message(migrated, "3", "reply@x", ("legacy-root@x",))
+    keys = _thread_keys(migrated)
+    if status == "continuity_proven":
+        # Proven continuous with today's mailbox: the legacy rows thread with new mail.
+        assert keys[legacy_root] == keys[legacy_copy] == keys[reply]
+    else:
+        # Unknown mailbox: legacy rows never join current mail.
+        assert keys[reply] not in {keys[legacy_root], keys[legacy_copy]}
+        assert keys[legacy_root] != keys[legacy_copy]
+
+
+def test_a_reply_to_two_parents_merges_their_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "parent-one@x")
+    two = _imap_message(store, "2", "parent-two@x")
+    reply = _imap_message(store, "3", "reply@x", ("parent-one@x", "parent-two@x"))
+    keys = _thread_keys(store)
+    assert keys[one] == keys[two] == keys[reply]
+
+
+def test_a_suppressed_bridging_message_changes_no_component(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "root-one@x")
+    two = _imap_message(store, "2", "root-two@x")
+    bridge = _imap_message(store, "3", "bridge@x", ("root-one@x", "root-two@x"))
+    assert store.delete_message(bridge) is True
+    before = _thread_keys(store)
+    with store.connection() as db:
+        registered = db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0]
+        aliases = db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0]
+
+    # Recapturing the deleted bridge is suppressed: no row, no ids, no merge.
+    assert _imap_message(store, "3", "bridge-again@x", ("root-one@x", "root-two@x")) == bridge
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM messages WHERE message_id = ?", (bridge,)
+        ).fetchone() is None
+        assert db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0] == registered
+        assert db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0] == aliases
+        assert db.execute(
+            "SELECT 1 FROM imap_thread_ids WHERE rfc_id = 'bridge-again@x'"
+        ).fetchone() is None
+    assert _thread_keys(store) == before
+    assert before[one] == before[two]
+
+
+def test_a_suppressed_message_cannot_bridge_separate_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "root-one@x")
+    two = _imap_message(store, "2", "root-two@x")
+    lone = _imap_message(store, "3", "lone@x")
+    assert store.delete_message(lone) is True
+    before = _thread_keys(store)
+    assert before[one] != before[two]
+
+    # The deleted source identity is suppressed, so its new ids merge nothing.
+    _imap_message(store, "3", "lone@x", ("root-one@x", "root-two@x"))
+
+    after = _thread_keys(store)
+    assert lone not in after
+    assert after == before
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("statement", "index"),
+    [
+        (
+            "UPDATE messages SET thread_key = 'k' WHERE provider = 'imap'"
+            " AND account_id = 'a' AND thread_key = 'old'",
+            "idx_messages_thread_key",
+        ),
+        (
+            "UPDATE imap_thread_ids SET thread_key = 'k' WHERE provider = 'imap'"
+            " AND account_id = 'a' AND thread_key = 'old'",
+            "idx_imap_thread_ids_key",
+        ),
+        (
+            "UPDATE thread_key_aliases SET survivor_key = 'k' WHERE survivor_key = 'old'",
+            "idx_thread_key_aliases_survivor",
+        ),
+    ],
+)
+def test_component_queries_use_key_led_indexes(
+    tmp_path: Path, statement: str, index: str
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    with store.connection() as db:
+        plan = " ".join(str(row[-1]) for row in db.execute(f"EXPLAIN QUERY PLAN {statement}"))
+    assert index in plan, plan
+
+
+def test_an_oversized_provider_thread_id_still_keys_its_thread(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    long_thread = "t" * 600
+    for index in (1, 2):
+        store.add_message(
+            message_id=f"gmail-long-{index}", provider="gmail", account_id="g-account",
+            provider_message_id=f"g-{index}", thread_id=long_thread, sender="a@b.com",
+            sender_name=None, subject="S", received_at="2026-08-29T12:00:00+00:00",
+        )
+    keys = _thread_keys(store)
+    assert keys["gmail-long-1"] == keys["gmail-long-2"]
+    assert len(keys["gmail-long-1"].encode()) <= 512
+
+
+def test_schema_28_upgrade_keys_an_oversized_provider_thread_id(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    for index in (1, 2):
+        store.add_message(
+            message_id=f"gmail-old-{index}", provider="gmail", account_id="g-account",
+            provider_message_id=f"g-{index}", thread_id="short", sender="a@b.com",
+            sender_name=None, subject="S", received_at="2026-08-29T12:00:00+00:00",
+        )
+    _reset_to_schema_28(store)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET thread_id = ?", ("t" * 600,))
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    keys = _thread_keys(migrated)
+    assert keys["gmail-old-1"] == keys["gmail-old-2"]
+    assert len(keys["gmail-old-1"].encode()) <= 512

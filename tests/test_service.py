@@ -5077,3 +5077,86 @@ def test_analysis_stores_body_counts_and_marks_partial_notifications(
 
     assert partial == [truncated, truncated]
     assert store.recent(1)[0]["status"] == "summarized"
+
+
+def test_imap_capture_threads_a_reply_with_its_root(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = "imap-" + "d" * 32
+    store.register_mail_account(
+        "imap", account_id, display_name="IMAP", address="owner@example.com", active=True
+    )
+    credential_identity = "d" * 64
+    identity = hashlib.sha256(
+        f"imap-mailbox-v2\0{credential_identity}\0{44}".encode()
+    ).hexdigest()
+    store.reconcile_mailbox_identity(
+        "imap", account_id, identity, legacy_status="replacement", preserve_cursor=True
+    )
+    cursor = f"eom-imap-v2:{credential_identity}:44:7"
+    store.set_state(
+        cursor,
+        datetime.now(UTC) - timedelta(minutes=10),
+        provider="imap",
+        account_id=account_id,
+        mailbox_identity_key=identity,
+    )
+    headers = {
+        "root": ("<root@vendor.example>", ()),
+        "reply": ("<reply@vendor.example>", ("root@vendor.example",)),
+    }
+
+    class ThreadedGateway(ImapGateway):
+        def __init__(self) -> None:
+            pass
+
+        @contextmanager
+        def polling_session(self):
+            yield
+
+        def mailbox_epoch(self) -> tuple[str, int]:
+            return credential_identity, 44
+
+        def mailbox_identity_key(self) -> str:
+            return identity
+
+        def mailbox_address(self) -> str:
+            return "owner@example.com"
+
+        def initial_cursor(self) -> str:
+            return cursor
+
+        def changes_since(self, current: str) -> MailboxChanges:
+            return MailboxChanges(("reply", "root"), f"eom-imap-v2:{credential_identity}:44:9")
+
+        def metadata(self, message_id: str) -> MessageMetadata:
+            own, replies = headers[message_id]
+            return MessageMetadata(
+                message_id,
+                own,
+                "trusted@example.com",
+                "Trusted",
+                "Quote",
+                datetime.now(UTC).isoformat(),
+                frozenset({"INBOX"}),
+                rfc_message_id=own.strip("<>"),
+                reply_ids=replies,
+            )
+
+        def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+            return MessageContent("body", (), (), 4)
+
+    Watcher(cfg, store, MailboxSession("imap", account_id, ThreadedGateway()), FakeModel()).check()
+
+    ids = {
+        name: scoped_message_id("imap", account_id, name, identity) for name in ("root", "reply")
+    }
+    with store.connection() as db:
+        rows = {
+            row["message_id"]: (row["thread_key"], row["rfc_message_id"])
+            for row in db.execute("SELECT message_id, thread_key, rfc_message_id FROM messages")
+        }
+    assert rows[ids["root"]][1] == "root@vendor.example"
+    assert rows[ids["reply"]][1] == "reply@vendor.example"
+    assert rows[ids["root"]][0] == rows[ids["reply"]][0] is not None

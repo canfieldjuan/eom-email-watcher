@@ -619,6 +619,96 @@ select:focus {
   list-style: none;
 }
 
+.vendor-list {
+  display: grid;
+  gap: 12px;
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vendor-form {
+  grid-template-columns: 1fr auto;
+  margin-bottom: 14px;
+}
+
+.vendors-locked {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+  margin-bottom: 14px;
+  padding: 14px 18px;
+  border: 1px solid #e3d2a8;
+  border-radius: 14px;
+  color: #7a5a13;
+  background: #fffaf0;
+}
+
+.vendor-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px;
+  border: 1px solid #d7ded8;
+  border-radius: 14px;
+  background: rgb(255 255 255 / 72%);
+}
+
+.vendor-card-header,
+.vendor-card-footer,
+.vendor-addresses li,
+.vendor-address-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.vendor-card-header strong {
+  margin-right: auto;
+  overflow-wrap: anywhere;
+}
+
+.vendor-addresses {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vendor-addresses li span:first-child {
+  margin-right: auto;
+  overflow-wrap: anywhere;
+}
+
+.vendor-address-status {
+  color: #7a5a13;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.vendor-empty {
+  margin: 0;
+  color: #657068;
+}
+
+.vendor-address-form input {
+  flex: 1 1 220px;
+}
+
+.vendor-card-footer {
+  justify-content: space-between;
+  padding-top: 10px;
+  border-top: 1px solid #dce3dd;
+}
+
+.vendor-card-footer label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .inbox-list {
   display: grid;
   gap: 14px;
