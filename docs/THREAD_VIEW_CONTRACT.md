@@ -171,11 +171,12 @@ Each definition is the only place its rule is stated.
   - a `retention_days` change;
   - a change in the entitlement state;
   - a new claims extractor version;
-  - a provider cursor that expires or recovers.
+  - a provider cursor that expires or recovers;
+  - the Sent folder the account resolves ([D-scope](#d-scope-in-scope-messages-and-retention)): a different folder, or Sent becoming available or unavailable.
 
-  Every check records the `retention_days` and entitlement state it observes and counts a difference as a change, so an edit to the configuration file and a lapse that ends both count. A change and its reversal are two increases, so a removed address that returns, or an entitlement that lapses and returns, is reconciled again.
+  Every check records the `retention_days`, entitlement state, and Sent folder it observes and counts a difference as a change, so an edit to the configuration file and a lapse that ends both count. A change and its reversal are two increases, so a removed address that returns, or an entitlement that lapses and returns, is reconciled again.
 - **Coverage is stale exactly when** the current generation differs from the reconciled one, a followed thread has no watermark, or derived work is pending: a message in a followed thread lacks the body or claim attempt its definition requires, or has a retryable attempt whose backoff deadline has passed ([D-claims](#d-claims-claims-and-comparability)), which [D-derived](#d-derived-derived-state-and-invalidation) leaves to this pass. This is a comparison made at every check, so no change has to remember to trigger it. The cutoff moving forward with the clock never makes coverage stale.
-- **Watermarks.** A watermark exists only while its thread is followed ([D-derived](#d-derived-derived-state-and-invalidation) drops it otherwise), so a newly followed thread has none. A followed thread is synced from its watermark, or from the cutoff when it has none. An IMAP merge clears the survivor's watermark, and a `retention_days` increase clears every watermark.
+- **Watermarks.** A watermark exists only while its thread is followed ([D-derived](#d-derived-derived-state-and-invalidation) drops it otherwise), so a newly followed thread has none. A followed thread is synced from its watermark, or from the cutoff when it has none. An IMAP merge clears the survivor's watermark; a `retention_days` increase, or a change of the account's Sent folder, clears every watermark.
 - **Stale coverage triggers a reconcile pass.** It is bounded per check, resumable from durable progress, and the only writer of coverage and watermarks. It runs three stages, in order:
   - **(a) Discovery:** in-scope messages that are not captured yet, and that have a vendor ([D-attribution](#d-attribution-a-messages-vendor)), are captured under [D-capture](#d-capture-what-is-stored-and-its-provenance). Their threads' follow state then follows from [D-follow](#d-follow-followed-threads).
   - **(b) Thread sync:** for each followed thread, its in-scope messages are fetched from its watermark and captured under [D-capture](#d-capture-what-is-stored-and-its-provenance).
