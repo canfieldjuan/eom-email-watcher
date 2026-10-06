@@ -1,6 +1,6 @@
 # Thread View M1: Vendor Records and Thread Keys
 
-Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05). It includes amendment B of #207, committed separately ahead of this plan.
+Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05). It includes amendment B of #207 and the review amendment to D-identity and D-ops, each committed separately ahead of this plan.
 
 This plan specifies M1's mechanics only. Every rule it implements is stated in the contract's definitions, and this plan cites them rather than restating them. Where this plan and a definition seem to differ, the definition wins, and this plan is wrong.
 
@@ -24,8 +24,7 @@ Ownership lane: thread-view-m1
 **In scope:**
 - Vendor records with exact addresses.
 - The address operations of D-ops (domains arrive in M5).
-- D-identity thread keys for every message captured from now on.
-- A migration for retained rows.
+- D-identity thread keys for every message: those captured from now on, and retained rows by migration.
 - A desktop Vendors list.
 
 **Out of scope:**
@@ -37,40 +36,45 @@ Ownership lane: thread-view-m1
 ### Mechanics
 
 **Storage (schema 29, `SCHEMA_VERSION` 28 to 29):**
-1. Two vendor tables:
+1. Vendor tables:
    - `vendors(vendor_id UUIDv4 PRIMARY KEY, display_name, created_at, updated_at)`, with the display name trimmed, non-empty, and at most 200 UTF-8 bytes;
-   - `vendor_addresses(address PRIMARY KEY, vendor_id, created_at)`. The primary key enforces D-vendor's uniqueness, and a trigger deletes a vendor's addresses with it.
+   - `vendor_addresses(address PRIMARY KEY, vendor_id, created_at)`. The primary key enforces D-vendor's uniqueness;
+   - `vendor_address_dismissals(vendor_id, address, created_at)`, primary key on both columns, holding D-ops's dismissals from the first removal on, so M5's suggestions inherit them.
+   - A trigger deletes a vendor's addresses and dismissals with it.
 2. New `messages` columns:
    - `thread_key TEXT`;
    - `rfc_message_id TEXT`.
 3. IMAP component tables:
    - `imap_thread_ids(provider, account_id, mailbox_identity_key, rfc_id, thread_key)`, primary key on the first four columns;
-   - `thread_key_aliases(old_key PRIMARY KEY, survivor_key)`.
+   - `thread_key_aliases(old_key PRIMARY KEY, survivor_key)`;
+   - a trigger that, when a component's last message is deleted, deletes its `imap_thread_ids` rows and the aliases naming it, so purged threads leave nothing behind.
 4. Indexes:
    - `messages(provider, account_id, mailbox_identity_key, thread_key, received_at)`;
    - `messages(provider, account_id, mailbox_identity_key, rfc_message_id)`.
-5. Migration of retained rows:
-   - Gmail and Microsoft rows get `thread_key = thread_id`. For those providers, `thread_id` already holds `threadId` or `conversationId`.
-   - IMAP rows get `rfc_message_id = thread_id`, because for IMAP that column already holds `Message-ID`.
-   - Each IMAP row that has an id becomes a one-member component with a fresh UUIDv4 key, and its own id is registered.
+5. Migration of retained rows. Every row gets a key:
+   - Gmail and Microsoft rows get `thread_key = thread_id`, which already holds `threadId` or `conversationId`; a row without one gets a fresh UUIDv4.
+   - For IMAP, `thread_id` holds the raw `Message-ID` header. Each row, in `message_id` order, goes through the step-7 parser that new metadata uses:
+     - a valid id that is already registered joins that component, so retained rows sharing an id share one component;
+     - a valid new id gets a fresh UUIDv4 component, and the id is registered and stored as `rfc_message_id`;
+     - a missing or malformed id gets a fresh component of its own, with nothing registered.
 
 **IMAP reply headers.**
 6. The metadata `FETCH` adds a second header item, `BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]`, with its own byte bound.
    - The existing `FROM SUBJECT DATE MESSAGE-ID` item and its `imap_headers_too_large` rejection (`imap.py:43`, `imap.py:1599`) are unchanged.
    - If the reply-header item reaches its bound or fails to parse, it is ignored: the message keeps only its own `Message-ID` in its id set, and admission is unchanged.
-7. Ids are parsed as follows:
-   - angle brackets and whitespace are trimmed, and case is kept;
-   - at most 64 `References` ids are kept, oldest first;
-   - an id over 998 characters is dropped.
-8. `MessageMetadata` (`mailbox.py`) gains `rfc_message_id`, `in_reply_to`, and `references`. Gmail and Microsoft fill them with `None` and empty values in M1.
+7. One parser owns ids (`mailbox.normalize_message_id`), used at capture and by the migration:
+   - surrounding whitespace and one pair of angle brackets are trimmed, and case is kept;
+   - the result must be `left@right`, both sides non-empty, at most 998 characters, with no whitespace, control characters, or angle brackets. Anything else, such as `not-an-id`, is dropped and never registered;
+   - `In-Reply-To` keeps its first id, and `References` keeps at most 64 ids, oldest first.
+8. `MessageMetadata` (`mailbox.py`) gains `rfc_message_id` and `reply_ids` (the `In-Reply-To` id, then the `References` ids, deduplicated). Gmail and Microsoft leave them empty in M1.
 
 **Thread keys at capture.** Inside the capture transaction (`BEGIN IMMEDIATE`):
-9. Gmail stores `threadId`, and Microsoft stores `conversationId`.
+9. Gmail stores `threadId`, and Microsoft stores `conversationId`. A message without one gets a fresh UUIDv4 key.
 10. IMAP looks up the message's id set in `imap_thread_ids`:
     - no match: a new component, with a UUIDv4 key;
-    - one component: the message joins it;
+    - one component: the message joins it, and the key is unchanged;
     - several components: they merge.
-11. A merge picks the survivor under D-identity. In the same transaction, it re-keys `messages.thread_key` and `imap_thread_ids` and records aliases.
+11. A merge keeps the survivor's key under D-identity. In the same transaction it re-keys every row naming a merged key, which in M1 means `messages.thread_key`, `imap_thread_ids.thread_key`, and `thread_key_aliases.survivor_key`, then records an alias from each merged key.
     - This merge function is the single re-key owner. Later milestones add their thread-keyed tables to it, and nowhere else.
 12. The capture sites pass the new metadata to the insert (`service.py:1640`, `1832`, `2125`).
 
@@ -84,10 +88,17 @@ Ownership lane: thread-view-m1
     - the watchlist link of D-ops (`add_sender` for an address not yet watched);
     - the new `conflict` guard in `_watchlist_remove`, which applies when the address belongs to a vendor.
 16. `vendors.list` reports `watched` per address, read from the config watchlist.
+17. `vendors.addresses.add` returns `conflict`, before any write, for an address equal to any `mail_accounts.address`.
+    - That covers both of D-vendor's verified identities, because `reconcile_mailbox_session_identity` (`service.py:1208-1210`) refuses a session whose authenticated address differs from the stored one.
+    - An account connected after its address became a vendor address is handled where `vendor_of` is evaluated, by amendment C of #207, before M2 uses it.
+18. `vendors.addresses.remove` records the `(vendor, address)` dismissal in the same transaction as the removal.
+19. The order of D-ops's two stores:
+    - `vendors.addresses.add`: `add_sender` when not watched, then the vendor insert;
+    - `vendors.addresses.remove` with `unwatch`, and `vendors.delete` with `unwatch_addresses`: membership is checked, then a new `config.remove_senders` removes every requested address in one config write, then the database transaction. `remove_sender` becomes its single-address case.
 
 **Desktop.**
-17. A Vendors tab next to Watchlist. It shows controls by D-ops class, through the existing locked-Connect presentation (`desktop/src/connectAvailability.ts`). Text renders with `textContent`.
-18. Typed requests in `desktop/src-tauri/src/engine.rs`, with commands in `lib.rs`.
+20. A Vendors tab next to Watchlist. It shows controls by D-ops class, through the existing locked-Connect presentation (`desktop/src/connectAvailability.ts`). Text renders with `textContent`.
+21. Typed requests in `desktop/src-tauri/src/engine.rs`, with commands in `lib.rs`.
 
 ### Concurrency
 
@@ -96,17 +107,17 @@ Ownership lane: thread-view-m1
 
 ### Failure cases
 
-- **The watchlist add succeeds, then the vendor insert fails.** The address stays watched, which is harmless, and a retry is idempotent.
-- **Malformed message ids** are dropped from the id set and never stored.
+- **An interruption between the two stores** leaves one of D-ops's valid states, and a retry completes the operation (step 19).
+- **Malformed message ids** are dropped from the id set and never stored (step 7).
 
 ### Files touched
 
-- `src/eom_email_watcher/db.py`, `mailbox.py`, `imap.py`, `gmail.py`, `microsoft365.py`, `service.py`, `engine_api.py`.
+- `src/eom_email_watcher/db.py`, `mailbox.py`, `imap.py`, `config.py`, `service.py`, `engine_api.py`.
 - `desktop/src-tauri/src/engine.rs`, `lib.rs`.
 - `desktop/src/main.ts`, `desktop/src/vendors.ts` (new, the view model), `desktop/src/styles.css`.
 - `docs/ENGINE_API.md`, `README.md`.
 - Tests:
-  - `tests/test_db.py`, `test_imap.py`, `test_service.py`, `test_engine_api.py`, and the test fakes that build `MessageMetadata`;
+  - `tests/test_db.py`, `test_imap.py`, `test_config.py`, `test_service.py`, `test_engine_api.py`;
   - `desktop/test/vendors.test.ts` (new);
   - the Rust typed contract tests.
 
@@ -114,9 +125,10 @@ Ownership lane: thread-view-m1
 
 **Vendors:**
 - create, rename, and delete;
-- `vendors.addresses.add` in four cases: new (it becomes watched), already watched (unchanged), on another vendor (`conflict`, nothing written), and invalid;
-- remove, with and without `unwatch`;
-- `vendors.delete` with and without `unwatch_addresses`;
+- `vendors.addresses.add` in five cases: new (it becomes watched), already watched (unchanged), on another vendor (`conflict`, nothing written), a mailbox account's address (`conflict`, nothing written), and invalid;
+- remove, with and without `unwatch`, records a dismissal;
+- `vendors.delete` with and without `unwatch_addresses`, and its dismissals go with it;
+- a delete with `unwatch_addresses` interrupted after the watchlist write leaves the vendor showing `watched: false`, and a retry completes it;
 - every gated operation refused with nothing written while inactive, while `vendors.list` and the removal operations work;
 - display-name bounds: empty, 200 bytes, 201 bytes;
 - `watchlist.remove` of a vendor address returns `conflict` and leaves the config unchanged;
@@ -125,18 +137,20 @@ Ownership lane: thread-view-m1
 **IMAP:**
 - a full `References` chain joins its root;
 - a missing root joins through a shared id;
-- arrival orders A,B,C, C,B,A, and B,C,A give one component with the same survivor;
-- components whose members have no `Message-ID` (ids only from `In-Reply-To` and `References`) merge to the same survivor in every order;
-- a bridging message merges atomically and records an alias;
-- 65 `References` ids keep 64, and a 999-character id is dropped;
+- arrival orders A,B,C, C,B,A, and B,C,A give the same components;
+- a merge keeps the key of the component holding the smallest member, including when no member has a `Message-ID`;
+- a bridging message merges atomically and records an alias, and a second merge re-points the first alias;
+- 65 `References` ids keep 64; a 999-character id, `not-an-id`, `@host`, and `left@` are dropped;
 - an oversized reply-header item is ignored, and the message is still admitted;
 - today's `imap_headers_too_large` rejection is unchanged.
 
-**Gmail and Microsoft:** `thread_key` equals `threadId` or `conversationId`.
+**Gmail and Microsoft:** `thread_key` equals `threadId` or `conversationId`, and a message without one gets a key of its own.
 
 **Migration:**
-- a v28 database gains the keys as specified;
-- a reply to a retained IMAP row joins its component;
+- a v28 database gains the keys as specified, with every row keyed;
+- a reply whose `In-Reply-To` is `<root@example.com>` joins the retained row stored with that raw header;
+- two retained rows with one id share a component, and the upgrade completes;
+- retained rows with no id, or a malformed one, each get their own key;
 - v28 code refuses v29.
 
 **Admission is unchanged:** the existing admission and service suites pass unmodified.
