@@ -65,10 +65,49 @@ test("sender selection clears the scope before requesting its first page", () =>
   assert.match(clear, /renderInbox\(inboxItems\)/);
   const load = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
   assert.match(load, /query: \{ \.\.\.activeInboxQuery, cursor \}/);
-  assert.match(load, /if \(!mailboxEffectRequestIsCurrent[^\n]+return false/);
+  assert.match(load, /if \(!mailboxEffectRequestIsCurrent[^\n]+[\s\S]*?return false/);
   const failure = load.slice(load.indexOf("} catch (error)"), load.indexOf("if (!append) {\n    attachmentCapabilities"));
   assert.match(failure, /inboxStatus.dataset.kind = "error"/);
   assert.doesNotMatch(failure, /inboxItems =/);
+});
+
+const inboxLoad = source.match(/async function loadInbox\([\s\S]*?\n\}/)![0];
+
+test("inbox page state starts loading and scope clearing records pending before rendering", () => {
+  assert.ok(source.includes('let inboxPageState: "pending" | "loading" | "loaded" | "failed" = "loading";'), "page state must start loading");
+  const clear = source.match(/function clearInboxPageForAccountChange[\s\S]*?\n\}/)![0];
+  assert.match(clear, /inboxPageState = "pending";[\s\S]*renderInbox\(inboxItems\)/, "scope clear must record pending before rendering");
+});
+
+test("inbox first-page loading follows unchanged guards and owns its generation before requesting", () => {
+  assert.match(inboxLoad, /if \(!mailboxEffectScopeIsCurrent\(effectScope\)\) return false;\s+if \(inboxMutationInFlight\(\)\) return false;\s+if \(append && !inboxNextCursor\) return false;\s+const generation = \+\+inboxRequestGeneration;/);
+  assert.doesNotMatch(inboxLoad, /inboxReloadAfterMutation/);
+  const beforeRequest = inboxLoad.slice(inboxLoad.indexOf("const generation"), inboxLoad.indexOf("page = await"));
+  assert.match(beforeRequest, /if \(!append\) \{\s+inboxPageState = "loading";\s+inboxPageStateGeneration = generation;\s+if \(inboxItems.length === 0\) renderInbox\(inboxItems\);\s+\}/, "first-page request must own loading and render an empty list");
+});
+
+test("inbox current first-page failure records failed even with retained rows", () => {
+  const failure = inboxLoad.slice(inboxLoad.indexOf("} catch (error)"), inboxLoad.indexOf('inboxStatus.dataset.kind = "error"'));
+  assert.match(failure, /return false;[\s\S]*?if \(!append\) \{\s+inboxPageState = "failed";\s+if \(inboxItems.length === 0\) renderInbox\(inboxItems\);/, "current first-page failure must record failed outside the empty-row condition");
+  assert.doesNotMatch(failure, /inboxItems =/);
+});
+
+test("inbox stale success and failure release only their own first-page loading state", () => {
+  const releases = inboxLoad.match(/if \(!mailboxEffectRequestIsCurrent\(generation, inboxRequestGeneration, effectScope\)\) \{\s+if \(!append && inboxPageState === "loading" && inboxPageStateGeneration === generation\) \{\s+inboxPageState = "pending";\s+if \(inboxItems.length === 0\) renderInbox\(inboxItems\);\s+\}\s+return false;\s+\}/g);
+  assert.equal(releases?.length, 2, "both stale returns must release only their own loading state");
+});
+
+test("inbox first-page and clear-history success record loaded before rendering", () => {
+  const success = inboxLoad.slice(inboxLoad.indexOf("if (!append) {\n    attachmentCapabilities"));
+  assert.match(success, /if \(!append\) \{[^}]*inboxPageState = "loaded";[^}]*\} else \{[^}]*\}[\s\S]*renderInbox\(inboxItems\)/, "first-page success must record loaded before rendering");
+  const clear = source.match(/async function clearInboxHistory\([\s\S]*?\n\}/)![0];
+  assert.match(clear, /await invoke<number>\("inbox_clear"\);[^}]*inboxPageState = "loaded";[^}]*renderInbox\(inboxItems\)/, "successful history clear must record loaded before rendering");
+});
+
+test("inbox empty text checks pending loading and failed before existing query texts", () => {
+  const empty = source.match(/function renderInbox\([\s\S]*?inboxList.append\(empty\)/)![0];
+  assert.match(empty, /empty.textContent = inboxPageState === "pending"\s+\? "Messages not loaded yet\."\s+: inboxPageState === "loading"\s+\? "Loading messages\u2026"\s+: inboxPageState === "failed"\s+\? "Messages could not be loaded\."\s+: activeInboxQuery.sender !== null/, "empty text must prioritize request state over query-derived absence");
+  assert.match(empty, /\? inboxSenderEmptyText\(activeInboxQuery, activeInboxAccountSelection\)\s+: filtered\s+\? "No watched messages match these filters\."\s+: "No watched messages yet\. Add a sender or Gmail label, then run the watcher\.";/);
 });
 
 test("sender selection defers reload until the final inbox mutation finishes", () => {

@@ -953,6 +953,8 @@ const capabilityOutputPreviews = new Map<string, HTMLDivElement>();
 const capabilityOutputViewButtons = new Map<string, HTMLButtonElement>();
 let inboxRequestGeneration = 0;
 let inboxQueryEpoch = 0;
+let inboxPageState: "pending" | "loading" | "loaded" | "failed" = "loading";
+let inboxPageStateGeneration = 0;
 let inboxSenderNavigationError: string | null = null;
 const expandedInboxMessages = new Set<string>();
 let inboxItems: InboxItem[] = [];
@@ -1672,7 +1674,13 @@ function renderInbox(items: InboxItem[]): void {
     const filtered = Object.entries(activeInboxQuery).some(
       ([key, value]) => key !== "limit" && value !== null,
     );
-    empty.textContent = activeInboxQuery.sender !== null
+    empty.textContent = inboxPageState === "pending"
+      ? "Messages not loaded yet."
+      : inboxPageState === "loading"
+      ? "Loading messages…"
+      : inboxPageState === "failed"
+      ? "Messages could not be loaded."
+      : activeInboxQuery.sender !== null
       ? inboxSenderEmptyText(activeInboxQuery, activeInboxAccountSelection)
       : filtered
       ? "No watched messages match these filters."
@@ -2550,6 +2558,7 @@ function queryFromInboxControls(): Omit<InboxQuery, "cursor"> {
 function clearInboxPageForAccountChange(message: string): void {
   inboxRequestGeneration += 1;
   inboxQueryEpoch += 1;
+  inboxPageState = "pending";
   expandedInboxMessages.clear();
   inboxItems = [];
   inboxNextCursor = null;
@@ -2650,6 +2659,7 @@ async function clearInboxHistory(): Promise<void> {
   try {
     const deleted = await invoke<number>("inbox_clear");
     expandedInboxMessages.clear();
+    inboxPageState = "loaded";
     inboxItems = [];
     inboxNextCursor = null;
     inboxCapabilityUnavailableCount = 0;
@@ -2688,14 +2698,27 @@ async function loadInbox(
   const generation = ++inboxRequestGeneration;
   const cursor = append ? inboxNextCursor : null;
   setInboxControlsBusy(true);
+  if (!append) {
+    inboxPageState = "loading";
+    inboxPageStateGeneration = generation;
+    if (inboxItems.length === 0) renderInbox(inboxItems);
+  }
   let page: InboxPage;
   try {
     page = await invoke<InboxPage>("inbox_query", {
       query: { ...activeInboxQuery, cursor },
     });
   } catch (error) {
-    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
+    if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
+      if (!append && inboxPageState === "loading" && inboxPageStateGeneration === generation) {
+        inboxPageState = "pending";
+        if (inboxItems.length === 0) renderInbox(inboxItems);
+      }
+      return false;
+    }
     if (!append) {
+      inboxPageState = "failed";
+      if (inboxItems.length === 0) renderInbox(inboxItems);
       inboxNextCursor = null;
       inboxLoadMore.hidden = true;
     }
@@ -2704,13 +2727,20 @@ async function loadInbox(
     setInboxControlsBusy(false);
     return false;
   }
-  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) return false;
+  if (!mailboxEffectRequestIsCurrent(generation, inboxRequestGeneration, effectScope)) {
+    if (!append && inboxPageState === "loading" && inboxPageStateGeneration === generation) {
+      inboxPageState = "pending";
+      if (inboxItems.length === 0) renderInbox(inboxItems);
+    }
+    return false;
+  }
 
   if (!append) {
     attachmentCapabilities.clear();
     attachmentCapabilityDiagnostics.clear();
     inboxCapabilityUnavailableCount = 0;
     inboxItems = page.items;
+    inboxPageState = "loaded";
   } else {
     const known = new Set(inboxItems.map((item) => item.message_id));
     inboxItems = [...inboxItems, ...page.items.filter((item) => !known.has(item.message_id))];

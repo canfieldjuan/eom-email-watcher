@@ -1,0 +1,401 @@
+# Thread View and Vendor Claims Contract
+
+Status: accepted by the operator on 2026-10-05, with D1-D3 as recommended, and restructured the same day into a definitions-first form (see the revision log). Each milestone still needs its own accepted plan before code.
+
+**How to read and change this contract.**
+
+- Every rule is stated once, in [Definitions](#definitions). Every other section links to the definition it uses.
+- `tests/test_thread_view_contract.py` enforces this, and fails in three cases:
+  - a definition's own text (any rule line of eight or more words) appears verbatim in another normative section;
+  - a listed key phrase of a rule appears outside its definition;
+  - a definition link no longer resolves.
+
+  It cannot detect a paraphrase. A fix therefore changes the one definition, never a copy.
+- Milestone plans own the exact provider calls, schema, and tests, under these definitions. A finding about one milestone's mechanics belongs on that milestone's plan PR. This contract changes only when a definition is wrong.
+
+## Why this arc exists
+
+The operator wants Email Watcher users to "keep vendors honest". A user should see a whole conversation with a vendor, including what was quoted, promised, or agreed earlier and their own replies. They should be told when a later message or invoice departs from an earlier claim.
+
+Today the product cannot do this, by construction. The findings below come from `origin/main` at `8c1e076`, re-checked at `6a068bf`.
+
+- **Admission is per message, from the inbox only.** A message is admitted only if it carries `INBOX` and its `From` matches a watched address, or carries a selected Gmail user label (`service.py:153-199`, `service.py:166`).
+  - Microsoft 365 reads only `mailFolders/inbox` (`microsoft365.py:275`, `microsoft365.py:615`).
+  - IMAP selects only `INBOX` (`imap.py:1366`).
+  - Sent mail is never read, and non-matching messages leave no trace (`service.py:2105-2106`).
+- **Thread identity is stored but never used, and is wrong for IMAP.** `messages.thread_id` (`db.py:4602`) holds Gmail `threadId` (`gmail.py:490`) and Microsoft `conversationId` (`microsoft365.py:611-633`).
+  - For IMAP it holds the message's own `Message-ID` (`imap.py:1613`).
+  - `In-Reply-To`, `References`, `To`, and `Cc` are never fetched (`gmail.py:937-938`, `imap.py:1599`).
+- **Bodies are never stored or displayed.** There is no body column (`db.py:4597-4629`), and bodies are discarded after analysis (`service.py:2319`).
+- **There is no backfill.** Every provider starts at "now" (`gmail.py:768-769`, `microsoft365.py:278-280`, `imap.py:1434-1448`).
+- **Retention purges per message by `received_at`** (`db.py:11834`, `service.py:2107-2113`).
+- **Analysis sees one message at a time, with no evidence spans** (`model.py:80-92`). Scheduling is the only evidence-bound extractor (`scheduling.py:387-429`).
+- **The existing read-only scopes permit this arc.** They are `gmail.readonly` (`gmail.py:42`) and `Mail.Read` (`microsoft365.py:36`).
+- **The webview has no Content Security Policy** (`desktop/src-tauri/tauri.conf.json`, `"csp": null`).
+
+## Operator decisions already made (2026-10-05)
+
+1. Store email bodies locally; they never go to a cloud service.
+2. Read Sent mail.
+3. Vendor matching follows the thread, plus vendor records:
+   - several exact addresses per vendor;
+   - domains are opt-in, and refused for public providers;
+   - new addresses are suggested, never auto-added;
+   - Sent mail matches on recipients.
+4. The feature is paid Connect.
+5. Prerequisites are done: #194 (PR #195) and #146 (PR #199).
+
+## Definitions
+
+Each definition is the only place its rule is stated.
+
+### D-vendor: vendors and `vendor_of(address)`
+
+- **A vendor** is a named record that owns:
+  - exact addresses, normalized with `normalize_validated_address` (`config.py:245`);
+  - opted-in business domains.
+- **Uniqueness.** Each address, and each domain, belongs to at most one vendor. Assigning it to a second vendor returns `conflict`.
+- **Public domains are refused.** The public-provider list is one constant in code, and nothing else classifies domains. It starts as exactly gmail.com, googlemail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, me.com, aol.com, proton.me, protonmail.com, and gmx.com. Adding a domain is a code change with a test.
+- **`vendor_of(address)`** returns:
+  - the vendor that owns the exact address;
+  - else the vendor that owns the address's domain;
+  - else none.
+- **The mailbox's verified identities** are `mail_accounts.address` and the session's authenticated address. They never have a vendor, and are never suggestion candidates.
+- **Suggestion candidates** are senders of inbound messages in a followed thread ([D-follow](#d-follow-followed-threads)) that meet all of these:
+  - `vendor_of` returns none;
+  - the sender is not one of the mailbox's verified identities;
+  - the `(owner, address)` pair has not been dismissed ([D-ops](#d-ops-operation-classes-and-gating)).
+
+  Each candidate is offered to the thread's owner as "Add <address> to <vendor>?". Suggestions never capture mail.
+
+### D-attribution: a message's vendor
+
+- **Inbound:** `vendor_of(From)`.
+- **Outbound:**
+  - the vendor of the first `To`, then `Cc`, recipient, in stored header order, whose exact address has a vendor;
+  - else the first such recipient whose domain has a vendor;
+  - else none.
+- **Each message has at most one attributed vendor.** It shows that vendor alone, and its claims belong to that vendor.
+- **A vendor's threads** are:
+  - the threads it owns ([D-follow](#d-follow-followed-threads));
+  - plus, listed as linked, the threads that contain a message attributed to it.
+
+### D-scope: in-scope messages and retention
+
+- **Folders.** A message is in scope only while it is in an admitted folder:
+  - Gmail: the `INBOX` or `SENT` label;
+  - Microsoft 365: the Inbox or Sent Items folder;
+  - IMAP: `INBOX`, or the folder with the RFC 6154 `\Sent` attribute (falling back to a configured name).
+  - No other folder is ever fetched, including archive, deleted items, drafts, and clutter.
+  - An IMAP account with no resolvable Sent folder has only `INBOX` in scope, and shows "Sent mail unavailable".
+- **The retention cutoff** is `now - retention_days`.
+  - Only messages received at or after the cutoff are fetched or captured.
+  - Mail that aged past the cutoff before it was captured is never recovered, and its thread shows "history partial".
+- **Purge.**
+  - A message outside a followed thread is purged once it is older than the cutoff, as today.
+  - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1).
+  - Purge takes bodies, claims, discrepancies, and claim attempts with their message. Deletes run with `PRAGMA secure_delete = ON`.
+
+### D-capture: what is stored, and its provenance
+
+- **Today's admission is unchanged:**
+  - `exact_sender`: `From` is a watched address;
+  - `gmail_user_label`: a selected Gmail label.
+- **While the gated class is allowed ([D-ops](#d-ops-operation-classes-and-gating)), an in-scope message ([D-scope](#d-scope-in-scope-messages-and-retention)) is also captured when:**
+  - it is inbound and its vendor ([D-attribution](#d-attribution-a-messages-vendor)) comes from an exact address (`vendor_address`) or a domain (`vendor_domain`);
+  - it is outbound with a vendor (`sent_to_vendor`);
+  - or it belongs to a followed thread (`thread_follow`, [D-follow](#d-follow-followed-threads)).
+- **Anything else leaves no trace.**
+- **Admission kind.** When a message matches several rules, its kind is the first match in `exact_sender`, `vendor_address`, `vendor_domain`, `sent_to_vendor`, `thread_follow`, `gmail_user_label`. `exact_sender` therefore always means the sender was watched, and `vendor_address` means only the vendor record matched.
+  - The kind is computed from message metadata and the current configuration, never from the discovery path.
+  - It is stored once, as immutable provenance (`db.py:3645-3671`), and never rewritten.
+  - `messages.admission_kind` stays a closed set (`db.py:3606`), widened by migration.
+
+### D-follow: followed threads
+
+- **A thread is followed exactly while** it contains a stored message that has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
+  - Following is a classification of stored data, not an operation.
+- **Its owner** is the vendor of the earliest-received such message. Ties are broken by source identity, in byte order.
+- **Follow state and owner are derived, never recorded history.**
+  - They are a function of the stored messages and the current configuration, cached in one row per thread key.
+  - The cache is recomputed, under the operation lock (`engine_api.py:2192-2199`), whenever:
+    - a message is captured;
+    - a vendor record changes;
+    - a merge happens ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
+  - The result therefore never depends on arrival or discovery order. Stored provenance is never consulted.
+
+### D-identity: message identity, direction, and thread keys
+
+- **Source identity.**
+  - Gmail message ids are mailbox-wide.
+  - Microsoft ids are immutable ids (`Prefer: IdType="ImmutableId"`) and survive moves.
+  - IMAP ids are `mailbox:UIDVALIDITY:UID` (`imap.py:310-315`), with a folder token added for the Sent folder, so the unique source key (`db.py:3335-3336`) separates folders.
+- **Logical identity.** A message with a `Message-ID` also has the logical identity `(provider, account, mailbox identity, Message-ID)`.
+  - A second location of an already-captured logical identity is recorded, not captured again.
+  - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
+- **Direction** is `outbound` when the message carries Gmail's `SENT` label (even with `INBOX`), or when it was first found in the Sent folder; otherwise `inbound`. It is decided once, at capture.
+- **Thread key:**
+  - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
+  - IMAP uses components: messages whose id sets overlap form one component, identified by a UUIDv4 key. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list.
+  - The result does not depend on arrival order. A message that touches no component forms its own.
+- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member `Message-ID` sorts first in byte order, so it never depends on arrival order. In that transaction:
+  - every row naming a merged key is re-keyed, and aliases are recorded.
+
+### D-reconcile: coverage and the reconcile pass
+
+- **The coverage record.** Each account keeps a durable coverage record of the configuration it has reconciled: the vendor set, the `retention_days` setting, the entitlement state, and the claims extractor version. It also keeps a `synced_through` watermark per followed thread.
+- **Coverage goes stale only when a change can require data not yet covered:**
+  - a vendor address or domain is added;
+  - `retention_days` is increased;
+  - the entitlement is reactivated;
+  - a new extractor version is deployed;
+  - a provider cursor expires or recovers;
+  - an IMAP merge happens;
+  - a thread becomes followed, by any path.
+
+  The cutoff moving forward with the clock never makes coverage stale.
+- **Watermark resets.** A thread's watermark resets to the cutoff in three cases: when the thread becomes followed, when `retention_days` increases, and when it is the survivor of an IMAP merge.
+- **Stale coverage triggers a reconcile pass.** It is bounded per check, resumable from durable progress, and the only writer of coverage and watermarks. It runs three stages, in order:
+  - **(a) Discovery:** in-scope messages that are not captured yet, and that have a vendor ([D-attribution](#d-attribution-a-messages-vendor)), are captured under [D-capture](#d-capture-what-is-stored-and-its-provenance). Their threads' follow state then follows from [D-follow](#d-follow-followed-threads).
+  - **(b) Thread sync:** for each followed thread, its in-scope messages are fetched from its watermark and captured under [D-capture](#d-capture-what-is-stored-and-its-provenance).
+  - **(c) Derived work:**
+    - bodies ([D-body](#d-body-stored-bodies)) for messages that lack one;
+    - claim attempts that are missing for their current [D-claims](#d-claims-claims-and-comparability) key, or are due for retry.
+- **Failures.**
+  - A provider error retries that unit with backoff, and polling is unaffected.
+  - If the gated class stops being allowed mid-pass, the pass stops at its next budget check and keeps its progress.
+- **Normal polling keeps coverage current between changes.**
+  - Gmail has one mailbox-wide history id. A checkpoint advances only after every event in its range has been handled for both the `INBOX` and `SENT` labels.
+  - Microsoft Inbox and Sent Items have separate delta links, and IMAP `INBOX` and Sent have separate `UIDVALIDITY` and UID cursors. One of these folder cursors never moves another.
+
+### D-body: stored bodies
+
+- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage.
+- **What is stored:**
+  - the normalized text, from `bounded_body_text` with a named storage cap larger than `body_char_limit`;
+  - the pre-cut length;
+  - the date context: received time and the configured time zone, recorded at capture.
+- **Raw HTML is never stored**, and bodies never render as markup.
+- **Quote boundaries survive normalization.** When the source is HTML, the stored text keeps quote containers as `>`-prefixed lines; the M2 plan names the recognized containers. Today's analysis normalization is unchanged.
+- **Each message shows exactly one body state:**
+  - the stored text;
+  - the stored text, marked "Partial body: first N of M characters" when it is shorter than its pre-cut length;
+  - "Body not stored (source no longer available)";
+  - "Body not stored (outside the admitted folders)";
+  - "Body not stored yet", pending [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass) stage (c).
+
+### D-ops: operation classes and gating
+
+- **Every operation belongs to exactly one class.**
+  - **read:** `vendors.list`, and listing threads, messages, bodies, claims, and discrepancies.
+    - Never gated, and never calls a provider or model.
+  - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
+    - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
+  - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, and dismissing a suggestion.
+    - Never gated.
+- **The desktop shows controls by class.**
+  - Gated controls are hidden while the entitlement is inactive, under a "Connect required to update" notice.
+  - Read and removal controls always show.
+- **While the entitlement is inactive,** today's admission and inbox continue, and cursors advance.
+- **Watchlist link.** `vendors.addresses.add` also adds the address to the watchlist, in the existing mutation (`engine_api.py:5506`), so the inbox's sender navigation shows vendor mail.
+  - `watchlist.remove` of an address that belongs to a vendor returns `conflict`, naming the vendor.
+  - A hand-edited config can still drop one. `vendors.list` then shows `watched: false` with a "Watch again" action.
+  - Capture and following never depend on the watchlist.
+- **Removal effects:**
+  - Removing an address records a dismissal of its `(vendor, address)` pair.
+  - Removing a domain stops its matches.
+  - Deleting a vendor runs in one transaction:
+    - it removes the vendor's addresses, domains, and dismissals;
+    - it optionally stops watching its addresses ("Also stop watching these addresses", off by default);
+    - addresses left watched keep today's `exact_sender` admission.
+
+### D-claims: claims and comparability
+
+- **Source.** Each inbound message with a vendor, in a followed thread, is offered to the extraction task. The source text is computed as follows:
+  1. Cut the stored body at `body_char_limit` with `bounded_body_text`, the model-input bound, recording truncation as #146 does.
+  2. Remove the quoted segments:
+     - every line that starts with `>`, wherever it appears;
+     - the reply header that introduces a quote: an `On ... wrote:` line, or an Outlook `From:/Sent:/To:/Subject:` block. An unprefixed Outlook header quotes everything after it.
+
+  Everything else is the *authored text*, including text written below a `>`-quoted block. Subjects and quoted history are never evidence. The segmentation algorithm belongs to the M4 plan.
+- **Types (closed):**
+  - `amount`: value, currency, and a role in `total`, `subtotal`, `tax`, `shipping`, `deposit`, `unit_price`, `other`;
+  - `date_commitment`: a `what` in `delivery`, `completion`, `payment_due`, `service_start`, `other`, and a date;
+  - `quantity`: an item and a count;
+  - `term`: text, displayed only;
+  - `reference`: a `(kind, number)` pair, with kind in `invoice`, `quote`, `po`. References are used only as anchors.
+- **Keying.** Claims and attempts are keyed by `(message, attributed vendor, extractor version)`. When a message's attributed vendor changes ([D-attribution](#d-attribution-a-messages-vendor)), its claims, discrepancies, and attempts under the old vendor are deleted. That covers a vendor's deletion or re-creation.
+- **Attempts.** Each key has one durable attempt record, with one of three outcomes:
+  - `succeeded`;
+  - `retryable`: the model or its transport was unavailable. Another attempt is made after a backoff deadline, and the message shows "Claims unavailable, will retry";
+  - `rejected`: the response failed the schema. It is permanent for that version, and the message shows "Claims unavailable".
+- **Validation, deterministic for the same input.** In a schema-valid response, each claim is checked on its own:
+  - every quote is a whitespace-normalized substring of the authored text;
+  - every structured field is re-derived from its quote in code: money by a parser, dates by the scheduling rules, counts by a number parser next to the item, references by exact substring and kind pattern;
+  - each role or `what` other than `other` needs one of its fixed keywords in the quote.
+
+  Failing claims are discarded and counted ("Some claims could not be verified"). Passing claims are stored. Every shown claim therefore has validated evidence.
+- **Binding (algorithm in the M4 plan).**
+  - A claim's anchor and its canonical item key must be bound to that claim uniquely, from its own evidence. Item keys are canonicalized in code, never taken from the model's choice of substring.
+  - Relative and yearless dates resolve against the message's stored date context ([D-body](#d-body-stored-bodies)). Without that context they are rejected.
+  - Only claims of the current extractor version exist for comparison. A new version supersedes a message's older claims atomically.
+- **`comparable(a, b)`** holds only if all of these do:
+  - same thread, and same vendor;
+  - same type, and same validated key;
+  - for `amount` roles other than `unit_price`, and for `date_commitment` and `quantity`: a shared bound anchor `(kind, number)`;
+  - neither claim is a `reference`, a `term`, or `other`;
+  - they come from different messages.
+- **Outcome:**
+  - **Ambiguous:** either side has more than one comparable value. The thread shows "Several values for <key>; compare manually" and flags nothing.
+  - **No shared anchor**, where one is needed: the claims are shown side by side, unflagged.
+  - **Otherwise** a discrepancy, citing both claims' quotes and dates, is flagged when:
+    - an amount or quantity differs ("price changed since <date>" for `unit_price`);
+    - a later `date_commitment` is after the earlier one ("later than promised").
+
+    A later date that is earlier is shown as "date moved earlier", unflagged.
+  - The model only extracts; code decides.
+
+## Thread view (desktop)
+
+- **Vendors view.** It lists vendors, then each vendor's threads ([D-attribution](#d-attribution-a-messages-vendor)), newest activity first, then a thread.
+  - The thread shows its messages oldest first, each with its direction, sender, attributed vendor, time, and body state ([D-body](#d-body-stored-bodies)).
+  - Bodies render with `textContent` only.
+- **A Content Security Policy is required first.** Before any body renders, the webview gets a CSP that forbids inline script and remote loads.
+- **Inbox and watchlist copy** says that followed threads and Sent replies to vendors also appear.
+
+## Invariants
+
+- **Claims extraction adds no new destination or data kind.** It sends only the [D-claims](#d-claims-claims-and-comparability) source text to the configured model backend, as per-message analysis already sends the body.
+  - Loopback stays on the machine.
+  - Gateway mode reaches the operator's configured on-prem gateway (`docs/INFERENCE_GATEWAY_V0.md`).
+  - Stored data never leaves the machine otherwise.
+- **Mailbox access stays read-only.** IMAP keeps `readonly=True` and `BODY.PEEK`.
+
+## Milestones
+
+Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No milestone ships UI that depends on a later one.
+
+- **M1, vendors and thread identity.**
+  - [D-vendor](#d-vendor-vendors-and-vendor_ofaddress) records with exact addresses.
+  - The address operations and the watchlist link of [D-ops](#d-ops-operation-classes-and-gating).
+  - [D-identity](#d-identity-message-identity-direction-and-thread-keys) thread keys on newly captured messages, including the IMAP reply-header fetch, components, and merges.
+  - A Vendors list in the desktop.
+  - Admission is unchanged.
+- **M2, capture:** [D-capture](#d-capture-what-is-stored-and-its-provenance), [D-follow](#d-follow-followed-threads), [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass), [D-body](#d-body-stored-bodies), and [D-scope](#d-scope-in-scope-messages-and-retention). That includes Sent capture and the purge, with the retention settings copy.
+- **M3, the thread view**, with its CSP and the inbox copy.
+- **M4, [D-claims](#d-claims-claims-and-comparability).** Deploying the extractor makes coverage stale, so retained messages get claim attempts.
+- **M5, domains and suggestions:** the domain operations of [D-ops](#d-ops-operation-classes-and-gating), and suggestion candidates under [D-vendor](#d-vendor-vendors-and-vendor_ofaddress).
+
+### Required items carried to milestone plans
+
+Each named plan must include these, with fail-first tests.
+
+- **M2:**
+  - Gmail discovery pages `messages.list` with durable page tokens. `threads.get` only syncs known threads.
+  - Every Gmail message gets a bounded `format=metadata` fetch before its scope check, and the body is fetched only after that check.
+  - Microsoft discovery pages each folder by `receivedDateTime` and matches recipients locally, never using `$search`.
+  - IMAP sync searches `HEADER Message-ID`, `In-Reply-To`, and `References` until the component stops growing.
+  - The date context is stored at capture, with a test that changes the zone after storage.
+  - The Gmail checkpoint covers both labels, with a test of a poll that stops mid-range and resumes without missing `SENT` events.
+  - The recognized HTML quote containers (at least `<blockquote>`, Gmail's quote block, and Outlook's reply header block), each tested.
+- **M4:**
+  - Per-claim anchor binding, tested on "PO-1 total $100; PO-2 total $200".
+  - Canonical item keys, tested on "premium red widget".
+  - Atomic supersession by extractor version.
+  - Re-extraction months later yields the same dates.
+  - Quote segmentation, tested on top-posted, bottom-posted (`>`), inline, and Outlook-header replies.
+  - The attempt record's backoff.
+
+## Operator decisions (accepted 2026-10-05, as recommended)
+
+- **D1:** a followed thread is purged as a unit, by its newest message ([D-scope](#d-scope-in-scope-messages-and-retention)).
+- **D2:** no encryption at rest in this arc. Bodies get today's `0600` database in a `0700` directory (`db.py:4502`, `db.py:4826`), plus the secure deletes of D-scope. SQLCipher would be its own arc.
+- **D3:** gate on the existing `connect.capability_exchange` ([D-ops](#d-ops-operation-classes-and-gating)).
+
+## Dependencies
+
+- **Gateway mode needs a registered claims task** (for example `email.vendor_claims.extract` v1) before M4 works there. Today's tasks are `email.analyze` and `email.schedule.extract` (`model.py:433-435`).
+- **Gmail restricted-scope distribution (#74).** Storing bodies locally should be reviewed against it before a public release.
+
+## Explicit non-scope
+
+- Sending, replying, moving, or labeling mail.
+- Any cloud model or cloud storage.
+- More than one active mailbox at a time (#149).
+- Thread-level AI summaries.
+- Attachment content in claims.
+- Changing today's per-message analysis, notifications, scheduling, or Connect behavior.
+
+## Acceptance evidence
+
+Each milestone plan names its fail-first tests. The arc-level scenarios are:
+
+- **The core scenario**, on each provider: a fixture thread with an inbound quote, an outbound reply, and an inbound invoice that differs, giving one discrepancy with both quotes.
+- **No trace:** a non-vendor message leaves no row.
+- **No new bodies:** a watched non-vendor message, or a label-only message, outside any followed thread stores no body.
+- **Attribution:** an outbound message to vendor A (`To`) and vendor B (`Cc`) is A's, and the thread is listed under B as linked.
+- **Provenance:**
+  - a message captured by `gmail_user_label`, whose sender later becomes a vendor address, makes its thread followed and keeps its provenance;
+  - an unwatched vendor address is captured as `vendor_address`, never as `exact_sender`.
+- **Gmail direction:** a Gmail message with both `INBOX` and `SENT` gets the same direction and kind on every path.
+- **IMAP identity:**
+  - colliding Inbox and Sent UIDs give two messages;
+  - a moved message with a `Message-ID` is captured once;
+  - reverse-order arrival (C, B, A) gives one thread;
+  - a bridging message merges two followed components, owned by different vendors, without skipping either one's messages. The owner is the same for every arrival order.
+- **Reconcile:**
+  - many polls with no configuration change never make coverage stale;
+  - a vendor message captured by polling, in a conversation that was not followed, syncs that conversation's earlier messages;
+  - a Connect lapse, then reactivation, recovers in-cutoff mail from the lapse and conversations started during it;
+  - raising `retention_days` from 30 to 180 fetches the 31-180-day messages of followed threads;
+  - adding a vendor pulls in retained mail, including a standalone message that was never captured;
+  - a thread stays followed while it is active, after its first vendor message passes the cutoff;
+  - an ungated `exact_sender` capture while Connect is inactive makes its thread followed, with no gated capture and no body;
+  - deploying M4 extracts claims for M2 and M3 messages.
+- **Scope:**
+  - a Microsoft deleted-items message in a followed conversation is never fetched;
+  - an archived, label-captured Gmail message shows "outside the admitted folders".
+- **Bodies:** a body longer than the storage cap shows its partial marker.
+- **Claims:**
+  - a reply quoting an earlier total yields no claim from the quote, for both `>` quoting and an HTML blockquote;
+  - a bottom-posted reply's new total, below the quote, is extracted;
+  - deleting a vendor and re-creating it with the same addresses re-extracts its claims;
+  - two totals for one PO in one message are ambiguous;
+  - after PO-1 and PO-2 totals, a PO-2 invoice compares only with PO-2;
+  - two orders without a shared anchor stay unflagged;
+  - a delivery date moved earlier is not flagged;
+  - an unavailable model leaves a retryable attempt that succeeds later;
+  - a message longer than `body_char_limit` is extracted from its bounded slice.
+- **Gating:**
+  - with an expired entitlement, reading and removal work while adds and sync are refused;
+  - removal controls stay visible.
+- **Vendor operations:**
+  - `watchlist.remove` of a vendor address returns `conflict`;
+  - removing a domain stops new domain matches;
+  - deleting a vendor ends following, and offers to stop watching its addresses;
+  - the mailbox owner is never suggested, including on a self-sent inbound copy.
+- **Scopes:** `Mail.Read` and `gmail.readonly` remain the only scopes.
+
+## Revision log
+
+- 2026-10-05: proposed, then accepted by the operator with D1-D3 as recommended.
+- 2026-10-05: five Codex review rounds (12, 7, 7, 9, and 7 findings) were each answered with local edits.
+  - Later rounds were mostly contradictions those edits created, because each rule was restated in up to 14 places.
+- 2026-10-05: restructured into definitions-first form, at the operator's direction ("share seams, stop symptom patching"), with `tests/test_thread_view_contract.py` enforcing it.
+  - **One deliberate simplification:** capture and following come from vendor records, not the watchlist.
+- 2026-10-05: the review of the restructure found twelve definition gaps. Each was fixed inside its owner:
+  - D-body: bodies only for followed threads; a partial-body state;
+  - D-reconcile: the configuration, not the moving cutoff, is compared; watermarks reset when retention grows;
+  - D-claims: model input bounded by `body_char_limit`; only later dates are flagged; durable claim attempts;
+  - D-vendor: an exact public-provider list; mailbox identities excluded from suggestions;
+  - D-ops: domain removal;
+  - D-attribution: one vendor per message, with linked thread listing.
+- The same review showed that rules still sat outside their definitions: the operation list, the suggestion rule, the failure cases, and an invariant. Those were moved into their owners. The seam check now also catches verbatim copies of any definition line.
+- 2026-10-05: the next review found six gaps. Two of them, a follow created by polling never syncing and a merge owner depending on arrival order, came from one root: recorded follow history. D-follow now derives follow state and owner from stored messages and configuration, which also removed the owner special cases from merges and deletion. The others:
+  - D-capture: `vendor_address`, so `exact_sender` stays truthful;
+  - D-reconcile: a Gmail checkpoint covers both labels;
+  - D-body: HTML quote boundaries survive;
+  - the seam check compares definitions against each other too.
+- 2026-10-05: the next review found five gaps.
+  - Three came from last round's D-follow predicate, which mixed fetch eligibility with classification. D-follow now classifies stored messages, D-ops no longer lists following as an operation, and discovery is defined directly.
+  - D-claims keys claims and attempts by attributed vendor, and keeps authored text below quotes.
