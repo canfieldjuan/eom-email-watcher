@@ -3349,6 +3349,21 @@ END;
 """
 
 
+def _requeue_if_skipped(db: sqlite3.Connection, message_id: str) -> None:
+    """A message skipped because its only copy was gone is analyzed once a copy exists.
+
+    Called wherever a source identity is recorded for a logical message (the
+    capture of a second copy, and a polled location), so the one path that can
+    make the message readable again is the one that queues it.
+    """
+    db.execute(
+        """UPDATE messages SET status = 'pending', attempts = 0, next_retry_at = NULL,
+            last_error = NULL
+        WHERE message_id = ? AND status = 'skipped'""",
+        (message_id,),
+    )
+
+
 def _record_recipients(
     db: sqlite3.Connection, *, message_id: str, to: tuple[str, ...], cc: tuple[str, ...]
 ) -> int:
@@ -3574,8 +3589,11 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
             recorded_at=None,
         )
     # Rows sharing a logical identity are one message (contract D-identity): the
-    # canonical-smallest row keeps the identity, the others point to it and their
-    # locations move. No row is deleted, so per-row history survives.
+    # row in the most advanced processing state keeps the identity (notified, then
+    # analyzed, then pending; ties to the smallest source identity), so the message
+    # is neither analyzed nor notified twice and no completed result hides behind a
+    # pending copy. The others point to it and their locations move. No row is
+    # deleted, so per-row history survives.
     groups = db.execute(
         """SELECT provider, account_id, mailbox_identity_key, rfc_message_id
         FROM messages
@@ -3589,7 +3607,12 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
             """SELECT message_id FROM messages
             WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
               AND rfc_message_id = ? AND logical_of IS NULL
-            ORDER BY provider_message_id""",
+            ORDER BY CASE
+                    WHEN notified_at IS NOT NULL THEN 0
+                    WHEN status = 'analyzed' THEN 1
+                    ELSE 2
+                END,
+                provider_message_id""",
             tuple(group),
         ).fetchall()
         canonical = str(members[0]["message_id"])
@@ -8540,6 +8563,7 @@ class Store:
                     recorded_at=discovered_at if scope_complete else None,
                 )
                 _record_recipients(db, message_id=str(logical["message_id"]), to=to, cc=cc)
+                _requeue_if_skipped(db, str(logical["message_id"]))
                 if provider == "imap":
                     # The copy's reply headers may bridge components (contract
                     # D-identity): the one re-key owner applies them as for a new row.
@@ -8804,6 +8828,8 @@ class Store:
                 recorded_at=stamp if complete else None,
             )
             _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
+            if recorded:
+                _requeue_if_skipped(db, str(row["logical_id"]))
             return recorded
 
     # Vendor records (contract D-vendor). Addresses arrive normalized.

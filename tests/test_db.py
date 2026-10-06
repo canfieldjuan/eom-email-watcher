@@ -7651,3 +7651,62 @@ def test_sent_scope_reads_not_polled_for_an_inactive_account(tmp_path: Path) -> 
     # Only the active account is polled, so A's last record no longer applies.
     assert store.sent_scope("imap", "imap-a") == "not_polled"
     assert store.sent_scope("imap", "imap-b") == "not_polled"
+
+
+def test_coalescing_keeps_the_most_advanced_copy_as_the_canonical(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    pending = _imap_message(store, "1", "same@x")
+    analyzed = _retained_duplicate(store, "2", "same@x")
+    store.mark_analyzed(
+        analyzed,
+        {
+            "category": "invoice",
+            "priority": "normal",
+            "summary": "Invoice received.",
+            "action_required": True,
+            "suggested_action": "Review it.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+    _reset_to_schema_29(store)
+    store.initialize()
+
+    with store.connection() as db:
+        logical_of = {
+            str(r["message_id"]): r["logical_of"]
+            for r in db.execute("SELECT message_id, logical_of FROM messages").fetchall()
+        }
+    # The analyzed copy is the logical message; the pending one points at it, so
+    # the message is not analyzed again and its summary is the one listed.
+    assert logical_of == {analyzed: None, pending: analyzed}
+    assert [m.message_id for m in store.pending()] == []
+    assert store.recent(1)[0]["summary"] == "Invoice received."
+
+
+def test_a_skipped_message_is_queued_again_when_another_copy_is_recorded(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+    store.mark_skipped(first)
+    assert store.pending() == []
+
+    assert store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    ) is False
+
+    assert [m.message_id for m in store.pending()] == [first]
