@@ -29,6 +29,13 @@ None of it exists today:
 - **Purge ignores threads, and nothing uses `secure_delete`.** Purge is `purge_with_outcome` (`db.py:12273`).
 - **The admission kind is a closed CHECK of two values** (`db.py:3855-3882`).
 
+## Operator decisions (2026-10-06)
+
+1. **Unfollow deletes bodies right away.** A thread that stops being followed loses its stored bodies in the same transaction (C/D-body, C/D-derived).
+2. **Sent is polled only while Connect is active** (step 2).
+3. **The `messages` rebuild gets a backup, besides its in-transaction checks** (step 11).
+4. **The stored-body cap is 200,000 characters** (step 21).
+
 ## Scope
 
 Ownership lane: thread-view-m2
@@ -107,6 +114,9 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - `admission_kind` gains `vendor_address`, `vendor_domain`, `sent_to_vendor`, and `thread_follow`.
     - SQLite cannot change a CHECK in place, so `messages` is rebuilt by SQLite's documented procedure (create, copy, drop, rename, then recreate its indexes and triggers). Earlier migrations rebuilt `automation_fires` this way (`db.py:3484-3506`).
     - `PRAGMA foreign_key_check` and `integrity_check` run inside the migration transaction, which rolls back on any finding.
+    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database: `<database>.pre-v31.bak`, mode 0600.
+      - If the backup cannot be written (for example, the disk is full), the migration does not start, and the engine reports the error with the database unchanged.
+      - The backup is deleted once the migrated database has opened and its checks have passed. It is left in place if the migration fails, so the database can be restored by hand.
     - The set's other owners widen together:
       - `_validate_admission_provenance` (`db.py:4164-4195`);
       - `AdmissionDecision.kind` (`service.py:127-141`);
@@ -175,7 +185,8 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 - **A provider error in the pass** backs off that unit, and polling is unaffected (C/D-reconcile).
 - **An IMAP server with neither SPECIAL-USE nor a configured Sent name** has no Sent scope, and health shows it.
 - **A body fetch whose source is gone** records `source_gone` and is never retried.
-- **A failed `messages` rebuild** rolls back the whole migration, so the previous binary still opens the database.
+- **A failed `messages` rebuild** rolls back the whole migration, so the previous binary still opens the database. Its pre-migration backup stays in place (step 11).
+- **No room for the backup:** the migration does not start, the engine reports the error, and the database stays at v30.
 
 ## Files touched
 
@@ -216,7 +227,10 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 - **The `messages` rebuild:**
   - a v30 database keeps every row, index, trigger, and provenance value;
   - `foreign_key_check` and `integrity_check` are clean;
-  - v30 code refuses v31.
+  - v30 code refuses v31;
+  - the backup is written at mode 0600 before the rebuild, and deleted after a successful open;
+  - a rebuild failure injected after the backup keeps both the v30 database and its backup;
+  - a backup that cannot be written leaves the database at v30, unchanged.
 
 **M2.3**
 - **Staleness, one case each:** a new vendor address, raised retention, entitlement reactivation, an extractor change, a recovered cursor, and a followed thread without a watermark. Many polls with no change never make coverage stale.
