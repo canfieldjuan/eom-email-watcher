@@ -113,7 +113,8 @@ Each definition is the only place its rule is stated.
 
 ### D-follow: followed threads
 
-- **A thread is followed exactly while** it contains a captured, in-scope message that has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
+- **A thread is followed exactly while** it contains a stored message that has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
+  - Following is a classification of stored data, not an operation.
 - **Its owner** is the vendor of the earliest-received such message. Ties are broken by source identity, in byte order.
 - **Follow state and owner are derived, never recorded history.**
   - They are a function of the stored messages and the current configuration, cached in one row per thread key.
@@ -155,11 +156,11 @@ Each definition is the only place its rule is stated.
   The cutoff moving forward with the clock never makes coverage stale.
 - **Watermark resets.** A thread's watermark resets to the cutoff in three cases: when the thread becomes followed, when `retention_days` increases, and when it is the survivor of an IMAP merge.
 - **Stale coverage triggers a reconcile pass.** It is bounded per check, resumable from durable progress, and the only writer of coverage and watermarks. It runs three stages, in order:
-  - **(a) Discovery:** in-scope messages that [D-follow](#d-follow-followed-threads) says should start a follow, and that are not in a followed thread yet, are captured and their threads followed.
+  - **(a) Discovery:** in-scope messages that are not captured yet, and that have a vendor ([D-attribution](#d-attribution-a-messages-vendor)), are captured under [D-capture](#d-capture-what-is-stored-and-its-provenance). Their threads' follow state then follows from [D-follow](#d-follow-followed-threads).
   - **(b) Thread sync:** for each followed thread, its in-scope messages are fetched from its watermark and captured under [D-capture](#d-capture-what-is-stored-and-its-provenance).
   - **(c) Derived work:**
     - bodies ([D-body](#d-body-stored-bodies)) for messages that lack one;
-    - claim attempts ([D-claims](#d-claims-claims-and-comparability)) that are missing for the current extractor version, or due for retry.
+    - claim attempts that are missing for their current [D-claims](#d-claims-claims-and-comparability) key, or are due for retry.
 - **Failures.**
   - A provider error retries that unit with backoff, and polling is unaffected.
   - If the gated class stops being allowed mid-pass, the pass stops at its next budget check and keeps its progress.
@@ -188,7 +189,7 @@ Each definition is the only place its rule is stated.
 - **Every operation belongs to exactly one class.**
   - **read:** `vendors.list`, and listing threads, messages, bodies, claims, and discrepancies.
     - Never gated, and never calls a provider or model.
-  - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, following, body storage, reconcile, and claim extraction.
+  - **gated:** `vendors.create`, `vendors.rename`, `vendors.addresses.add`, `vendors.domains.add`, and accepting a suggestion. Also capture beyond today's admission, body storage, reconcile, and claim extraction.
     - All need the paid entitlement `connect.capability_exchange` (decision D3, `require_connect_entitlement`).
   - **removal:** `vendors.addresses.remove`, `vendors.domains.remove`, `vendors.delete`, and dismissing a suggestion.
     - Never gated.
@@ -204,7 +205,7 @@ Each definition is the only place its rule is stated.
   - Removing an address records a dismissal of its `(vendor, address)` pair.
   - Removing a domain stops its matches.
   - Deleting a vendor runs in one transaction:
-    - it removes the vendor's addresses, domains, dismissals, claims, and discrepancies;
+    - it removes the vendor's addresses, domains, and dismissals;
     - it optionally stops watching its addresses ("Also stop watching these addresses", off by default);
     - addresses left watched keep today's `exact_sender` admission.
 
@@ -212,17 +213,19 @@ Each definition is the only place its rule is stated.
 
 - **Source.** Each inbound message with a vendor, in a followed thread, is offered to the extraction task. The source text is computed as follows:
   1. Cut the stored body at `body_char_limit` with `bounded_body_text`, the model-input bound, recording truncation as #146 does.
-  2. Take `current_message_text` from `_split_quoted_history` (`model.py:288`).
-  3. Drop every line that starts with `>`.
+  2. Remove the quoted segments:
+     - every line that starts with `>`, wherever it appears;
+     - the reply header that introduces a quote: an `On ... wrote:` line, or an Outlook `From:/Sent:/To:/Subject:` block. An unprefixed Outlook header quotes everything after it.
 
-  The result is the *authored text*. Subjects and quoted history are never evidence.
+  Everything else is the *authored text*, including text written below a `>`-quoted block. Subjects and quoted history are never evidence. The segmentation algorithm belongs to the M4 plan.
 - **Types (closed):**
   - `amount`: value, currency, and a role in `total`, `subtotal`, `tax`, `shipping`, `deposit`, `unit_price`, `other`;
   - `date_commitment`: a `what` in `delivery`, `completion`, `payment_due`, `service_start`, `other`, and a date;
   - `quantity`: an item and a count;
   - `term`: text, displayed only;
   - `reference`: a `(kind, number)` pair, with kind in `invoice`, `quote`, `po`. References are used only as anchors.
-- **Attempts.** Each `(message, extractor version)` pair has one durable attempt record, with one of three outcomes:
+- **Keying.** Claims and attempts are keyed by `(message, attributed vendor, extractor version)`. When a message's attributed vendor changes ([D-attribution](#d-attribution-a-messages-vendor)), its claims, discrepancies, and attempts under the old vendor are deleted. That covers a vendor's deletion or re-creation.
+- **Attempts.** Each key has one durable attempt record, with one of three outcomes:
   - `succeeded`;
   - `retryable`: the model or its transport was unavailable. Another attempt is made after a backoff deadline, and the message shows "Claims unavailable, will retry";
   - `rejected`: the response failed the schema. It is permanent for that version, and the message shows "Claims unavailable".
@@ -300,6 +303,7 @@ Each named plan must include these, with fail-first tests.
   - Canonical item keys, tested on "premium red widget".
   - Atomic supersession by extractor version.
   - Re-extraction months later yields the same dates.
+  - Quote segmentation, tested on top-posted, bottom-posted (`>`), inline, and Outlook-header replies.
   - The attempt record's backoff.
 
 ## Operator decisions (accepted 2026-10-05, as recommended)
@@ -344,7 +348,9 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - a vendor message captured by polling, in a conversation that was not followed, syncs that conversation's earlier messages;
   - a Connect lapse, then reactivation, recovers in-cutoff mail from the lapse and conversations started during it;
   - raising `retention_days` from 30 to 180 fetches the 31-180-day messages of followed threads;
-  - adding a vendor pulls in retained mail;
+  - adding a vendor pulls in retained mail, including a standalone message that was never captured;
+  - a thread stays followed while it is active, after its first vendor message passes the cutoff;
+  - an ungated `exact_sender` capture while Connect is inactive makes its thread followed, with no gated capture and no body;
   - deploying M4 extracts claims for M2 and M3 messages.
 - **Scope:**
   - a Microsoft deleted-items message in a followed conversation is never fetched;
@@ -352,6 +358,8 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - **Bodies:** a body longer than the storage cap shows its partial marker.
 - **Claims:**
   - a reply quoting an earlier total yields no claim from the quote, for both `>` quoting and an HTML blockquote;
+  - a bottom-posted reply's new total, below the quote, is extracted;
+  - deleting a vendor and re-creating it with the same addresses re-extracts its claims;
   - two totals for one PO in one message are ambiguous;
   - after PO-1 and PO-2 totals, a PO-2 invoice compares only with PO-2;
   - two orders without a shared anchor stay unflagged;
@@ -388,3 +396,6 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - D-reconcile: a Gmail checkpoint covers both labels;
   - D-body: HTML quote boundaries survive;
   - the seam check compares definitions against each other too.
+- 2026-10-05: the next review found five gaps.
+  - Three came from last round's D-follow predicate, which mixed fetch eligibility with classification. D-follow now classifies stored messages, D-ops no longer lists following as an operation, and discovery is defined directly.
+  - D-claims keys claims and attempts by attributed vendor, and keeps authored text below quotes.
