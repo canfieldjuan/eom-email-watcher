@@ -313,7 +313,7 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
 Each named plan must include these, with fail-first tests.
 
 - **M2:**
-  - Gmail discovery pages `messages.list` with durable page tokens. `threads.get` only syncs known threads.
+  - Gmail discovery and thread sync page `messages.list` with durable page tokens, bounded to the admitted labels and dates; `threads.get` is never called, since it returns a thread's every message.
   - Every Gmail message gets a bounded `format=metadata` fetch before its scope check, and the body is fetched only after that check.
   - Microsoft discovery pages each folder by `receivedDateTime` and matches recipients locally, never using `$search`.
   - IMAP sync searches `HEADER Message-ID`, `In-Reply-To`, and `References` until the component stops growing.
