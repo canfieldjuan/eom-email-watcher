@@ -91,7 +91,7 @@ Each definition is the only place its rule is stated.
   - Gmail: the `INBOX` or `SENT` label;
   - Microsoft 365: the Inbox or Sent Items folder;
   - IMAP: `INBOX`, or the folder with the RFC 6154 `\Sent` attribute (falling back to a configured name).
-  - No other folder is ever fetched, including archive, deleted items, drafts, and clutter.
+  - No other folder is ever fetched on purpose: no request targets archive, deleted items, drafts, or clutter. Gmail and Microsoft ids are mailbox-wide, so a message that leaves an admitted folder between a listing and its fetch can still answer; every fetch response carries the message's folders (`labelIds`, `parentFolderId`, or the IMAP folder selected for it), and a response outside the admitted folders is discarded with nothing stored.
   - An IMAP account with no resolvable Sent folder has only `INBOX` in scope, and shows "Sent mail unavailable".
 - **The retention cutoff** is `now - retention_days`.
   - Only messages received at or after the cutoff are fetched or captured.
