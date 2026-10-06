@@ -115,7 +115,7 @@ Each definition is the only place its rule is stated.
 
 - **A thread is followed exactly while** it contains a stored message that has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
   - Following is a classification of stored data, not an operation.
-- **Its owner** is the vendor of the earliest-received such message. Ties are broken by source identity, in byte order.
+- **Its owner** is the vendor of the earliest-received such message. Ties are broken by the canonical order ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
 - **Follow state and owner are derived, never recorded history.**
   - They are a function of the stored messages and the current configuration, cached in one row per thread key.
   - The cache is recomputed, under the operation lock (`engine_api.py:2192-2199`), whenever:
@@ -133,12 +133,13 @@ Each definition is the only place its rule is stated.
 - **Logical identity.** A message with a `Message-ID` also has the logical identity `(provider, account, mailbox identity, Message-ID)`.
   - A second location of an already-captured logical identity is recorded, not captured again.
   - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
-- **Direction** is `outbound` when the message carries Gmail's `SENT` label (even with `INBOX`), or when it was first found in the Sent folder; otherwise `inbound`. It is decided once, at capture.
+- **Canonical order.** The canonical order of messages is their source identity in byte order. Every tie-break in this contract uses it.
+- **Direction** is derived from the logical message's recorded locations. It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. It is recomputed when a location is added, so discovery order never decides it.
 - **Thread key:**
   - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
   - IMAP uses components: messages whose id sets overlap form one component, identified by a UUIDv4 key. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list.
   - The result does not depend on arrival order. A message that touches no component forms its own.
-- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member `Message-ID` sorts first in byte order, so it never depends on arrival order. In that transaction:
+- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first. That holds whether or not its members have a `Message-ID`, so the survivor never depends on arrival order. In that transaction:
   - every row naming a merged key is re-keyed, and aliases are recorded.
 
 ### D-reconcile: coverage and the reconcile pass
@@ -399,3 +400,5 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-05: the next review found five gaps.
   - Three came from last round's D-follow predicate, which mixed fetch eligibility with classification. D-follow now classifies stored messages, D-ops no longer lists following as an operation, and discovery is defined directly.
   - D-claims keys claims and attempts by attributed vendor, and keeps authored text below quotes.
+- 2026-10-05: merged on green at the operator's direction. The final review's six findings are tracked as amendments A-D in #207.
+- 2026-10-05: amendment B (#207), in the M1 plan PR. D-identity defines one canonical order that every tie-break uses, including the merge survivor without a `Message-ID`, and direction is derived from the recorded locations.

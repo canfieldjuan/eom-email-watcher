@@ -50,7 +50,12 @@ OWNED_PHRASES = {
         r"leaves no trace",
     ],
     "D-follow": [r"is followed exactly while", r"earliest-received such message"],
-    "D-identity": [r"UIDVALIDITY:UID", r"logical identity", r"smallest member `Message-ID`"],
+    "D-identity": [
+        r"UIDVALIDITY:UID",
+        r"logical identity",
+        r"is their source identity in byte order",
+        r"smallest member under the canonical order",
+    ],
     "D-reconcile": [r"coverage record", r"synced_through", r"retries that unit with backoff"],
     "D-body": [r"Body not stored", r"Partial body", r"summary-only storage"],
     "D-ops": [
