@@ -74,7 +74,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
    - `message_recipients(message_id, field, position, address)`, written at capture for every captured message. Outbound attribution reads it (C/D-attribution).
    - `message_locations(message_id, location, provider_message_id, recorded_at)`, primary key `(provider, account_id, mailbox_identity_key, provider_message_id, location)`. One source identity is recorded once per location, so a Gmail message with both labels has two rows under one id.
    - `messages.logical_of`, NULL for a logical message. It holds the canonical row's id for a row that duplicates one.
-   - `messages.capture_timezone`, the configured zone at capture. With `received_at`, it is C/D-body's date context, recorded here because a body can arrive in a later check (step 22).
+   - `messages.capture_timezone`, the configured zone at capture. With `received_at`, it is C/D-body's date context, recorded here because a body can arrive in a later check (step 22). Retained rows keep it NULL: their context is unavailable, which C/D-claims already defines (dates without context are rejected).
    - Migration:
      - every retained row gets an `inbox` location;
      - retained rows sharing a logical identity (C/D-identity) are coalesced: the canonical-smallest row is the logical message, the others point to it through `logical_of`, and their locations move to it;
@@ -92,7 +92,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
    Provider thread ids mean something only within one mailbox, and an account's mailbox can change, so both caches are keyed by the mailbox identity. A legacy row without one contributes under the account's proven legacy identity, else to no cache, as M1 keyed it.
 9. **One recompute function, `_recompute_derived(db, changed)`, owns C/D-derived.**
    - It takes the changed inputs: message ids, thread keys, vendor addresses, or identities. From them it finds the affected logical messages, then their threads.
-   - It recomputes attribution, then the follow cache. It deletes the cache row and watermark of an empty thread (C/D-follow), and deletes the bodies a newly unfollowed thread may not keep (M2.4, C/D-body).
+   - It recomputes attribution, then the follow cache. It deletes the cache row of an empty thread (C/D-follow), the watermark of any thread that is not followed (C/D-reconcile), and the bodies a newly unfollowed thread may not keep (M2.4, C/D-body). A message that regains an admitted location loses its `outside_folders` reason (M2.4), so stage (c) fetches it again.
    - The schema-31 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
    - Every writer of an input calls it in its own transaction:
      - capture and location recording;
@@ -118,9 +118,9 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - `admission_kind` gains `vendor_address`, `vendor_domain`, `sent_to_vendor`, and `thread_follow`.
     - SQLite cannot change a CHECK in place, so `messages` is rebuilt by SQLite's documented procedure (create, copy, drop, rename, then recreate its indexes and triggers). Earlier migrations rebuilt `automation_fires` this way (`db.py:3484-3506`).
     - `PRAGMA foreign_key_check` and `integrity_check` run inside the migration transaction, which rolls back on any finding.
-    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database: `<database>.pre-v31.bak`, mode 0600.
+    - **Backup (decision 3).** Before that transaction, the migration writes `VACUUM INTO` a private backup next to the database, mode 0600, at a fresh path per attempt: `<database>.pre-v31.<UTC timestamp>.bak`. `VACUUM INTO` refuses an existing file, so a fixed path would block every retry after a failure.
       - If the backup cannot be written (for example, the disk is full), the migration does not start, and the engine reports the error with the database unchanged.
-      - The backup is deleted once the migrated database has opened and its checks have passed. It is left in place if the migration fails, so the database can be restored by hand.
+      - Once the migrated database has opened and its checks have passed, every `pre-v31` backup is deleted. If the migration fails, the newest backup is kept and older ones are removed, so the database can be restored by hand and the next start retries.
     - The set's other owners widen together:
       - `_validate_admission_provenance` (`db.py:4164-4195`);
       - `AdmissionDecision.kind` (`service.py:127-141`);
@@ -131,20 +131,22 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 ### M2.3 — The reconcile pass
 
 13. **Storage (schema 32):**
-    - `reconcile_coverage(provider, account_id, mailbox_identity_key, vendor_set_digest, retention_days, entitlement_active, extractor_version, cursor_epoch, recorded_at)`;
-    - `reconcile_progress(...)`, which holds the staleness inputs frozen when the pass started, the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields.
+    - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active)`, C/D-reconcile's counter and the last observed entitlement state. One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation, `settings.update` of `retention_days`, the check when the observed entitlement differs from `entitlement_active`, a cursor expiry or recovery, and (M4) an extractor version change;
+    - `reconcile_coverage(provider, account_id, mailbox_identity_key, generation, recorded_at)`, the reconciled generation;
+    - `reconcile_progress(...)`, which holds the generation and the upper bound frozen when the pass started (step 16), the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields.
 
     Both follow `gmail_recovery_state`'s pattern (`db.py:3756-3833`): frozen inputs, monotonic counters, and a guard trigger.
-14. **Staleness** is C/D-reconcile's comparison of the current state with `reconcile_coverage`, made at every check. An account with no record is stale. A stale record starts a pass, or resumes it if a pass is already underway.
-    - When the comparison finds `retention_days` above the record, it clears every watermark first (C/D-reconcile), so stage (b) syncs from the new cutoff.
+14. **Staleness** is C/D-reconcile's comparison, made at every check: the current generation differs from `reconcile_coverage`, or a followed thread has no watermark. An account with no record is stale. A stale record starts a pass, or resumes it if a pass is already underway.
+    - `settings.update` clears every watermark when it raises `retention_days` (C/D-reconcile), in the transaction that bumps the generation, so stage (b) syncs from the new cutoff.
 15. **Budget.** The pass runs after polling, in `_check_active`, under the production check lock (`engine_api.py:390-391`).
     - Each check gets 30 seconds and at most 200 provider calls, the bounds `_run_gmail_recovery` uses (`service.py:1669-1846`).
     - A unit that errors backs off `min(15, 2**n)` minutes (`service.py:1505-1506`) while polling continues.
     - The pass stops at its next budget check when the gated class is no longer allowed, keeping its progress.
 16. **Stage (a), discovery.** Each candidate gets a bounded metadata fetch, then the scope check, then C/D-capture. Bodies are never fetched in this stage.
-    - **Gmail:** `messages.list` with `q = (in:inbox OR in:sent) after:<cutoff> (from:a OR to:a OR cc:a ...)` over vendor addresses in batches, with durable page tokens.
-    - **Microsoft:** pages each of `inbox` and `sentitems` with `$filter=receivedDateTime ge <cutoff>` and `$select` of the step-1 fields, and matches recipients locally. It never uses `$search`.
-    - **IMAP:** `UID SEARCH SINCE <date> OR FROM a OR TO a CC a`, per folder, in bounded batches. IMAP's `OR` takes exactly two keys, so the keys nest; a test checks the exact command.
+    - The pass freezes an upper bound at its start, held in `reconcile_progress`: the start time, and for IMAP each folder's highest UID. Every page, including a resumed one, applies it, so the result set cannot move while the pass spans checks. Mail after the bound reaches polling, or the next pass.
+    - **Gmail:** `messages.list` with `q = (in:inbox OR in:sent) after:<cutoff> before:<start> (from:a OR to:a OR cc:a ...)` over vendor addresses in batches, with durable page tokens.
+    - **Microsoft:** pages each of `inbox` and `sentitems` with `$filter=receivedDateTime ge <cutoff> and receivedDateTime lt <start>` and `$select` of the step-1 fields, and matches recipients locally. It never uses `$search`.
+    - **IMAP:** `UID SEARCH UID 1:<highest> SINCE <date> OR FROM a OR TO a CC a`, per folder, in bounded batches. IMAP's `OR` takes exactly two keys, so the keys nest; a test checks the exact command.
 17. **Stage (b), thread sync.** Each followed thread syncs from its watermark, or from the cutoff when it has none.
     - **Gmail:** `threads.get(format=metadata)`. It is used only for threads already stored.
     - **Microsoft:** `/me/messages?$filter=conversationId eq '<id>' and receivedDateTime ge <since>`, then the step-1 location check.
@@ -153,7 +155,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
       - a row whose source is gone, or whose identity is unknown, leaves the list.
     - A thread's watermark advances to the start time of the check that finished its sync.
 18. **Stage (c), derived work.** Bodies (M2.4). Claims arrive in M4.
-19. **Completion.** When every stage has no work left, `reconcile_coverage` records the snapshot the pass froze at its start (step 13), in one transaction with clearing the progress row. A vendor or setting changed mid-pass therefore still differs from the record, and the next check starts another pass.
+19. **Completion.** When every stage has no work left, `reconcile_coverage` records the generation the pass froze at its start (step 13), in one transaction with clearing the progress row. A change mid-pass bumped the generation past it, so the next check starts another pass.
 
 ### M2.4 — Bodies and the followed-thread purge
 
@@ -172,11 +174,11 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - Microsoft: HTML, without `prefer_text`, so quote containers survive;
     - IMAP: the existing BODYSTRUCTURE path.
 
-    Right before each body request, a bounded metadata fetch rechecks the message's folder, because a pass can span checks and a message can leave scope in between. Out of scope records `outside_folders` (C/D-body); a source that is gone records `source_gone`; other errors back off (step 15).
+    A logical message may have several recorded locations (step 5). Stage (c) tries each in-scope location in canonical order: right before each body request, a bounded metadata fetch rechecks that copy's folder, because a pass can span checks and a copy can leave scope in between. A copy outside the admitted folders is skipped; one that is gone is skipped. Only when every location is skipped does the message record `outside_folders` if any copy still exists, else `source_gone` (C/D-body). Other errors back off (step 15).
 23. **Purge.**
-    - `purge_with_outcome` (`db.py:12273`) keeps its predicate for messages outside followed threads. A followed thread purges as one unit when its newest logical message is older than the cutoff (C/D-scope, decision D1). Duplicate rows (`logical_of`) go with their logical message.
+    - `purge_with_outcome` (`db.py:12273`) keeps its predicate for messages outside followed threads. A followed thread purges as one unit when its newest logical message is older than the cutoff and the account's coverage is current (C/D-scope, decision D1), so a thread whose newer replies are still unfetched survives a lapse. Duplicate rows (`logical_of`) go with their logical message.
     - `Store.connection` sets `PRAGMA secure_delete = ON`.
-    - A purge that deleted rows ends with `PRAGMA wal_checkpoint(TRUNCATE)`, so deleted pages leave the WAL too.
+    - A purge that deleted rows ends with `PRAGMA wal_checkpoint(TRUNCATE)` and checks its result. A busy checkpoint, which a concurrent reader's snapshot can cause, leaves a durable `checkpoint_pending` flag that every later check retries until a checkpoint succeeds; the purge's outcome reports secure deletion complete only then.
     - `_recompute_derived` drops the emptied threads' cache rows and watermarks.
 24. **Retention copy.** The settings copy (`main.ts:812`) and README gain: "Followed vendor threads are kept until their newest message is older than this."
 
@@ -238,13 +240,15 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
   - a v30 database keeps every row, index, trigger, and provenance value;
   - `foreign_key_check` and `integrity_check` are clean;
   - v30 code refuses v31;
-  - the backup is written at mode 0600 before the rebuild, and deleted after a successful open;
-  - a rebuild failure injected after the backup keeps both the v30 database and its backup;
+  - the backup is written at mode 0600 and a fresh path before the rebuild, and every backup is deleted after a successful open;
+  - a rebuild failure injected after the backup keeps both the v30 database and its backup, and the next start retries with a new backup, keeping only the newest;
   - a backup that cannot be written leaves the database at v30, unchanged.
 
 **M2.3**
-- **Staleness, one case each:** no record, a new vendor address, raised retention, entitlement reactivation, an extractor change, a recovered cursor, and a followed thread without a watermark. Many polls with no change never make coverage stale.
-- **Mid-pass change.** A vendor added after discovery finished is not covered by the pass's completion record, and the next check starts another pass.
+- **Staleness, one case each:** no record, a vendor address added, an address removed and re-added, raised retention, an entitlement lapse observed and then reactivation, an extractor change, a recovered cursor, and a followed thread without a watermark. Many polls with no change never make coverage stale.
+- **Mid-pass change.** A vendor added after discovery finished bumps the generation past the pass's record, and the next check starts another pass.
+- **Frozen bound.** Mail arriving while a pass spans two checks is not paged twice and not skipped; it reaches polling.
+- **Unfollow drops the watermark**, so a refollowed thread is stale and resyncs.
 - **Raised retention clears every watermark,** and the IMAP search command nests its `OR` keys exactly.
 - **Discovery.**
   - Gmail pages with durable tokens across checks (M2 required item).
@@ -259,12 +263,14 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 
 **M2.4**
 - **Quote containers (M2 required item).** `<blockquote>`, Gmail's quote block, and Outlook's reply header each become `>` lines. `stored_body_text` leaves today's analysis normalization unchanged.
-- **Body states.** A stored body, a partial body (with its marker counts), `source_gone`, `outside_folders` for a message archived between stages (b) and (c), and not stored yet.
+- **Body states.** A stored body, a partial body (with its marker counts), `source_gone` only after every recorded location is gone, `outside_folders` for a message archived between stages (b) and (c) while another copy is fetched when one exists, and not stored yet. A message moved back into scope loses `outside_folders` and gets its body on the next pass.
+- **Date context after upgrade.** A retained row has no context, and a relative date in its later-extracted claims is rejected rather than resolved.
 - **Upgrade.** Installing M2.4 on an account with current coverage makes it stale, and stage (c) fetches its followed messages' bodies.
 - **Purge.**
   - A followed thread stays until its newest message is past the cutoff, then purges whole.
   - Bodies go with it.
-  - `secure_delete` is on for the connection, and the WAL is truncated after a purge.
+  - `secure_delete` is on for the connection, and the WAL is truncated after a purge; a busy checkpoint sets the pending flag and a later check completes it.
+  - A followed thread whose newest stored message is past the cutoff is kept while coverage is stale, and purged once a pass completes.
 - **No new bodies.** A watched non-vendor message, or a label-only message, outside any followed thread stores no body.
 
 **Gates, every slice:** `uv run ruff check .`, the full `uv run pytest` including the contract seam check, desktop `node --test` and `tsc`, and the Rust suite (`cargo fmt`, `clippy -D warnings`, `cargo test`).

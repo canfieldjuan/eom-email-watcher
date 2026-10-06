@@ -67,6 +67,8 @@ OWNED_PHRASES = {
         r"synced_through",
         r"retries that unit with backoff",
         r"no change has to remember to trigger it",
+        r"coverage generation\*\* is a counter",
+        r"exists only while its thread is followed",
     ],
     "D-body": [r"Body not stored", r"Partial body", r"summary-only storage"],
     "D-ops": [

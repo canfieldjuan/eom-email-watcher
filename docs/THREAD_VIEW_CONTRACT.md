@@ -98,7 +98,7 @@ Each definition is the only place its rule is stated.
   - Mail that aged past the cutoff before it was captured is never recovered, and its thread shows "history partial".
 - **Purge.**
   - A message outside a followed thread is purged once it is older than the cutoff, as today.
-  - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1).
+  - A followed thread is purged as one unit once its newest message is older than the cutoff (decision D1) and the account's coverage is current ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)), so a thread whose newer replies are still unfetched is kept.
   - Purge takes bodies, claims, discrepancies, and claim attempts with their message. Deletes run with `PRAGMA secure_delete = ON`.
 
 ### D-capture: what is stored, and its provenance
@@ -150,7 +150,7 @@ Each definition is the only place its rule is stated.
 - **Derived state** is what this contract computes and keeps, rather than records:
   - each message's direction ([D-identity](#d-identity-message-identity-direction-and-thread-keys)) and attributed vendor ([D-attribution](#d-attribution-a-messages-vendor));
   - each thread's follow state and owner ([D-follow](#d-follow-followed-threads));
-  - which messages keep a body ([D-body](#d-body-stored-bodies));
+  - which messages keep a body, and which reasons for a missing body still hold ([D-body](#d-body-stored-bodies));
   - which messages have claims, discrepancies, and attempts, and under which key ([D-claims](#d-claims-claims-and-comparability)).
 - **Its inputs** are exactly:
   - the stored messages, with their headers, received times, and recorded locations;
@@ -164,17 +164,17 @@ Each definition is the only place its rule is stated.
 
 ### D-reconcile: coverage and the reconcile pass
 
-- **The coverage record.** Each account keeps a durable coverage record of the configuration it has reconciled: the vendor set, the `retention_days` setting, the entitlement state, and the claims extractor version. It also keeps a `synced_through` watermark per followed thread.
-- **Coverage is stale exactly when the current state needs data the record does not cover:**
-  - a vendor address or domain outside the reconciled vendor set;
-  - a `retention_days` above the reconciled value;
-  - an active entitlement where the record has it inactive;
-  - an extractor version the record has not reconciled;
-  - a provider cursor that expired or recovered after the record;
-  - a followed thread without a watermark.
+- **The coverage record.** Each account keeps a durable coverage record: the coverage generation it has reconciled, and a `synced_through` watermark per followed thread.
+- **The coverage generation** is a counter per account. It increases by one on every change to a reconcile input, whichever operation makes it:
+  - a vendor record change: an address or domain added or removed, or a vendor deleted;
+  - a `retention_days` change;
+  - a change in the observed entitlement state, which every check records, so a lapse and its end each count;
+  - a new claims extractor version;
+  - a provider cursor that expires or recovers.
 
-  This is a comparison made at every check, so no change has to remember to trigger it. The cutoff moving forward with the clock never makes coverage stale.
-- **Watermarks.** A followed thread is synced from its watermark, or from the cutoff when it has none. A thread has none when it becomes followed; an IMAP merge clears the survivor's watermark, and a `retention_days` increase clears every watermark.
+  A change and its reversal are two increases, so a removed address that returns, or an entitlement that lapses and returns, is reconciled again.
+- **Coverage is stale exactly when** the current generation differs from the reconciled one, or a followed thread has no watermark. This is a comparison made at every check, so no change has to remember to trigger it. The cutoff moving forward with the clock never makes coverage stale.
+- **Watermarks.** A watermark exists only while its thread is followed ([D-derived](#d-derived-derived-state-and-invalidation) drops it otherwise), so a newly followed thread has none. A followed thread is synced from its watermark, or from the cutoff when it has none. An IMAP merge clears the survivor's watermark, and a `retention_days` increase clears every watermark.
 - **Stale coverage triggers a reconcile pass.** It is bounded per check, resumable from durable progress, and the only writer of coverage and watermarks. It runs three stages, in order:
   - **(a) Discovery:** in-scope messages that are not captured yet, and that have a vendor ([D-attribution](#d-attribution-a-messages-vendor)), are captured under [D-capture](#d-capture-what-is-stored-and-its-provenance). Their threads' follow state then follows from [D-follow](#d-follow-followed-threads).
   - **(b) Thread sync:** for each followed thread, its in-scope messages are fetched from its watermark and captured under [D-capture](#d-capture-what-is-stored-and-its-provenance).
@@ -438,3 +438,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-05: the fourth M1 plan review found that outbound attribution looked up recipients' addresses and domains directly instead of through `vendor_of`, so amendment C's exclusion did not reach outbound mail. D-attribution now judges recipients only through `vendor_of`.
 - 2026-10-05: the fifth M1 plan review found that D-attribution asked how `vendor_of` matched, which `vendor_of` did not say. `vendor_of` now returns its match, exact or domain, and outbound attribution and D-capture's kinds both read it. A finding that a newly verified identity leaves follow state and claims stale is an input to amendment A (#207), with the direction finding above.
 - 2026-10-06: amendment A (#207). Derived state was invalidated by event lists in two places, D-follow's recompute triggers and D-reconcile's stale triggers, and every new input added an event they missed: a removal, a purge, a direction change, and an identity becoming verified. A new definition, D-derived, owns one rule over the inputs instead: any change to the stored messages, their locations, the vendor records, or the verified identities recomputes what depends on them, in the same transaction. Each definition keeps its own invariant (D-follow's empty threads, D-body's bodies, D-claims' keys), and coverage staleness became a comparison with the coverage record, so it needs no triggers.
+- 2026-10-06: the second M2 plan review found three findings of one class: comparing the current state with the coverage record cannot see a change that reverts (an entitlement lapse that ends, an address removed and re-added, a thread unfollowed and refollowed). D-reconcile now keeps a coverage generation that every input change bumps, so a change and its reversal both count, and a watermark exists only while its thread is followed. D-scope keeps a followed thread until the account's coverage is current, so a lapse cannot purge a thread whose newer replies are unfetched. D-derived names a missing-body reason as derived state.
