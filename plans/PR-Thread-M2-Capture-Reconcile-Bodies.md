@@ -72,8 +72,9 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 4. **IMAP Sent identity.** Sent ids are `eom-imap-sent-v1:<mailbox_id>:<folder_sha256>:<UIDVALIDITY>:<UID>`, the folder token of C/D-identity. Inbox ids are unchanged. `_checked_uid` validates against the folder the id names (`imap.py:1500-1507`).
 5. **Storage (schema 30):**
    - `message_recipients(message_id, field, position, address)`, written at capture for every captured message. Outbound attribution reads it (C/D-attribution).
-   - `message_locations(message_id, location, provider_message_id, recorded_at)`. Its primary key is `(provider_message_id)` per account and identity, so one source identity is recorded once.
+   - `message_locations(message_id, location, provider_message_id, recorded_at)`, primary key `(provider, account_id, mailbox_identity_key, provider_message_id, location)`. One source identity is recorded once per location, so a Gmail message with both labels has two rows under one id.
    - `messages.logical_of`, NULL for a logical message. It holds the canonical row's id for a row that duplicates one.
+   - `messages.capture_timezone`, the configured zone at capture. With `received_at`, it is C/D-body's date context, recorded here because a body can arrive in a later check (step 22).
    - Migration:
      - every retained row gets an `inbox` location;
      - retained rows sharing a logical identity (C/D-identity) are coalesced: the canonical-smallest row is the logical message, the others point to it through `logical_of`, and their locations move to it;
@@ -85,16 +86,19 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 
 8. **Derived storage (schema 31):**
    - `message_derived(message_id, direction, vendor_id, match)`, the stored attribution of C/D-attribution, through `vendor_of` with its match (C/D-vendor);
-   - `thread_follow(provider, account_id, thread_key, followed, owner_vendor_id)`, the C/D-follow cache;
-   - `thread_watermarks(provider, account_id, thread_key, synced_through)`, for C/D-reconcile.
+   - `thread_follow(provider, account_id, mailbox_identity_key, thread_key, followed, owner_vendor_id)`, the C/D-follow cache;
+   - `thread_watermarks(provider, account_id, mailbox_identity_key, thread_key, synced_through)`, for C/D-reconcile.
+
+   Provider thread ids mean something only within one mailbox, and an account's mailbox can change, so both caches are keyed by the mailbox identity. A legacy row without one contributes under the account's proven legacy identity, else to no cache, as M1 keyed it.
 9. **One recompute function, `_recompute_derived(db, changed)`, owns C/D-derived.**
    - It takes the changed inputs: message ids, thread keys, vendor addresses, or identities. From them it finds the affected logical messages, then their threads.
    - It recomputes attribution, then the follow cache. It deletes the cache row and watermark of an empty thread (C/D-follow), and deletes the bodies a newly unfollowed thread may not keep (M2.4, C/D-body).
+   - The schema-31 migration calls it over every retained message, so an upgraded database has its attribution and follow rows before anything changes.
    - Every writer of an input calls it in its own transaction:
      - capture and location recording;
      - `delete_message` and `clear_messages`;
      - the purge;
-     - `_apply_imap_component`;
+     - `_apply_imap_component`, which also clears the survivor's watermark (C/D-reconcile);
      - every vendor mutation;
      - `register_mail_account` and `update_mail_account_identity`.
    - A test enumerates the input tables, and fails if a writer of one does not reach `_recompute_derived`. That makes C/D-derived's "by any path" checkable.
@@ -104,10 +108,10 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - That last input is decided once per check from `connect_entitlement_decision`, which reads and verifies the license on every call. It is then passed down.
     - It returns the first match in C/D-capture's order, or nothing.
     - `thread_follow` resolves the thread key read-only before insert. For IMAP that is the component lookup of `_imap_thread_key` (`db.py:3360-3395`).
-    - Provenance selector ids:
+    - Provenance selector ids are built by the owner of `exact_sender_selector_id` (`config.py`), which enforces the 512-byte bound of `admission_selector_id` (`db.py:3863`):
       - `vendor_address`: `vendor-address:<address>`;
       - `sent_to_vendor`: `vendor-recipient:<address>`;
-      - `thread_follow`: `thread:<thread_key>`.
+      - `thread_follow`: `thread:<sha256 of the thread key>`, since a thread key can itself be 512 bytes.
 
       The display name is the vendor's. Provenance stays immutable.
 11. **Widening the closed set.**
@@ -121,17 +125,18 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
       - `_validate_admission_provenance` (`db.py:4164-4195`);
       - `AdmissionDecision.kind` (`service.py:127-141`);
       - the Rust `InboxAdmissionKind` (`engine.rs:1139-1142`);
-      - the desktop type (`main.ts:175`).
+      - the desktop type (`main.ts:175`) and the inbox's admission label (`main.ts:1771-1773`), which today shows every kind but the Gmail label as "watched sender". Each kind gets its own label, from one lookup table.
 12. **Gmail recovery** still admits today's kinds only, because its query is `in:inbox` (`gmail.py:1053`). Vendor mail in a recovered gap is captured by the reconcile pass. A cursor that expired or recovered makes coverage stale (C/D-reconcile).
 
 ### M2.3 — The reconcile pass
 
 13. **Storage (schema 32):**
     - `reconcile_coverage(provider, account_id, mailbox_identity_key, vendor_set_digest, retention_days, entitlement_active, extractor_version, cursor_epoch, recorded_at)`;
-    - `reconcile_progress(...)`, which holds the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields.
+    - `reconcile_progress(...)`, which holds the staleness inputs frozen when the pass started, the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields.
 
     Both follow `gmail_recovery_state`'s pattern (`db.py:3756-3833`): frozen inputs, monotonic counters, and a guard trigger.
-14. **Staleness** is C/D-reconcile's comparison of the current state with `reconcile_coverage`, made at every check. A stale record starts a pass, or resumes it if a pass is already underway.
+14. **Staleness** is C/D-reconcile's comparison of the current state with `reconcile_coverage`, made at every check. An account with no record is stale. A stale record starts a pass, or resumes it if a pass is already underway.
+    - When the comparison finds `retention_days` above the record, it clears every watermark first (C/D-reconcile), so stage (b) syncs from the new cutoff.
 15. **Budget.** The pass runs after polling, in `_check_active`, under the production check lock (`engine_api.py:390-391`).
     - Each check gets 30 seconds and at most 200 provider calls, the bounds `_run_gmail_recovery` uses (`service.py:1669-1846`).
     - A unit that errors backs off `min(15, 2**n)` minutes (`service.py:1505-1506`) while polling continues.
@@ -139,7 +144,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 16. **Stage (a), discovery.** Each candidate gets a bounded metadata fetch, then the scope check, then C/D-capture. Bodies are never fetched in this stage.
     - **Gmail:** `messages.list` with `q = (in:inbox OR in:sent) after:<cutoff> (from:a OR to:a OR cc:a ...)` over vendor addresses in batches, with durable page tokens.
     - **Microsoft:** pages each of `inbox` and `sentitems` with `$filter=receivedDateTime ge <cutoff>` and `$select` of the step-1 fields, and matches recipients locally. It never uses `$search`.
-    - **IMAP:** `UID SEARCH SINCE <date> OR FROM a TO a CC a`, per folder, in bounded batches.
+    - **IMAP:** `UID SEARCH SINCE <date> OR FROM a OR TO a CC a`, per folder, in bounded batches. IMAP's `OR` takes exactly two keys, so the keys nest; a test checks the exact command.
 17. **Stage (b), thread sync.** Each followed thread syncs from its watermark, or from the cutoff when it has none.
     - **Gmail:** `threads.get(format=metadata)`. It is used only for threads already stored.
     - **Microsoft:** `/me/messages?$filter=conversationId eq '<id>' and receivedDateTime ge <since>`, then the step-1 location check.
@@ -148,13 +153,14 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
       - a row whose source is gone, or whose identity is unknown, leaves the list.
     - A thread's watermark advances to the start time of the check that finished its sync.
 18. **Stage (c), derived work.** Bodies (M2.4). Claims arrive in M4.
-19. **Completion.** When every stage has no work left, `reconcile_coverage` records the current state, in one transaction with clearing the progress row.
+19. **Completion.** When every stage has no work left, `reconcile_coverage` records the snapshot the pass froze at its start (step 13), in one transaction with clearing the progress row. A vendor or setting changed mid-pass therefore still differs from the record, and the next check starts another pass.
 
 ### M2.4 — Bodies and the followed-thread purge
 
 20. **Storage (schema 33):**
-    - `message_bodies(message_id, text, stored_chars, source_chars, received_at, timezone, captured_at)`. A delete trigger ties it to its message.
+    - `message_bodies(message_id, text, stored_chars, source_chars, fetched_at)`. A delete trigger ties it to its message. The date context lives on the message (step 5).
     - `message_body_unavailable(message_id, reason)`, where `reason` is `source_gone` or `outside_folders`.
+    - The migration deletes every `reconcile_coverage` row, so each account is stale (step 14) and stage (c) fetches bodies for its already-followed messages.
 21. **The storage normalizer** is a new `stored_body_text` in `mime.py`, beside today's normalizer, which stays unchanged for analysis (C/D-body).
     - Quote containers become `>`-prefixed lines:
       - `<blockquote>`;
@@ -166,7 +172,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - Microsoft: HTML, without `prefer_text`, so quote containers survive;
     - IMAP: the existing BODYSTRUCTURE path.
 
-    A source that is gone records `source_gone`; other errors back off (step 15). The date context (C/D-body) is recorded at capture.
+    Right before each body request, a bounded metadata fetch rechecks the message's folder, because a pass can span checks and a message can leave scope in between. Out of scope records `outside_folders` (C/D-body); a source that is gone records `source_gone`; other errors back off (step 15).
 23. **Purge.**
     - `purge_with_outcome` (`db.py:12273`) keeps its predicate for messages outside followed threads. A followed thread purges as one unit when its newest logical message is older than the cutoff (C/D-scope, decision D1). Duplicate rows (`logical_of`) go with their logical message.
     - `Store.connection` sets `PRAGMA secure_delete = ON`.
@@ -198,7 +204,8 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 ## Verification (fail-first on each slice's base commit)
 
 **M2.1**
-- **Locations.** Each provider records `inbox` and `sent` locations, plus the To/Cc order. A Gmail message with both labels records both. A Microsoft message in another folder leaves no trace.
+- **Locations.** Each provider records `inbox` and `sent` locations, plus the To/Cc order. A Gmail message with both labels records both rows under one provider id. A Microsoft message in another folder leaves no trace.
+- **Date context (M2 required item).** `capture_timezone` is recorded at capture, and a body fetched after the configured zone changes still reads the capture-time zone.
 - **IMAP.**
   - `\Sent` is found by SPECIAL-USE and by the configured name. With neither, health shows "Sent mail unavailable".
   - Colliding Inbox and Sent UIDs give two source identities.
@@ -223,6 +230,9 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
   - A later Sent location makes the message outbound and re-attributes it.
   - Connecting a mailbox whose address is a vendor address leaves its messages without a vendor.
 - **The input-writer test** fails when a writer skips `_recompute_derived`.
+- **Migration backfill.** A database upgraded from M1 with vendor mail already stored has its attribution and follow rows right after the upgrade, with no other change.
+- **Thread caches** of two mailbox identities under one account never mix.
+- **Selector bounds.** A `thread_follow` capture on a 512-byte thread key succeeds, and the inbox labels each new kind by name.
 - **Gating.** With the gated class inactive, only today's kinds are captured.
 - **The `messages` rebuild:**
   - a v30 database keeps every row, index, trigger, and provenance value;
@@ -233,7 +243,9 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
   - a backup that cannot be written leaves the database at v30, unchanged.
 
 **M2.3**
-- **Staleness, one case each:** a new vendor address, raised retention, entitlement reactivation, an extractor change, a recovered cursor, and a followed thread without a watermark. Many polls with no change never make coverage stale.
+- **Staleness, one case each:** no record, a new vendor address, raised retention, entitlement reactivation, an extractor change, a recovered cursor, and a followed thread without a watermark. Many polls with no change never make coverage stale.
+- **Mid-pass change.** A vendor added after discovery finished is not covered by the pass's completion record, and the next check starts another pass.
+- **Raised retention clears every watermark,** and the IMAP search command nests its `OR` keys exactly.
 - **Discovery.**
   - Gmail pages with durable tokens across checks (M2 required item).
   - Microsoft pages each folder by `receivedDateTime` with no `$search` (M2 required item).
@@ -247,8 +259,8 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 
 **M2.4**
 - **Quote containers (M2 required item).** `<blockquote>`, Gmail's quote block, and Outlook's reply header each become `>` lines. `stored_body_text` leaves today's analysis normalization unchanged.
-- **Body states.** A stored body, a partial body (with its marker counts), `source_gone`, `outside_folders`, and not stored yet.
-- **Date context (M2 required item).** A body keeps its stored zone after the configured zone changes.
+- **Body states.** A stored body, a partial body (with its marker counts), `source_gone`, `outside_folders` for a message archived between stages (b) and (c), and not stored yet.
+- **Upgrade.** Installing M2.4 on an account with current coverage makes it stale, and stage (c) fetches its followed messages' bodies.
 - **Purge.**
   - A followed thread stays until its newest message is past the cutoff, then purges whole.
   - Bodies go with it.
