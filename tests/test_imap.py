@@ -2105,7 +2105,10 @@ def test_sent_ids_carry_a_folder_token_so_colliding_uids_stay_distinct() -> None
 
 def test_metadata_selects_the_folder_an_id_names_and_restores_inbox_validation() -> None:
     client = SentFolderImap(
-        list_lines=SENT_LIST, raw_message=RECIPIENT_MESSAGE, sequence_uids=[7], sent_sequence_uids=[3]
+        list_lines=SENT_LIST,
+        raw_message=RECIPIENT_MESSAGE,
+        sequence_uids=[7],
+        sent_sequence_uids=[3],
     )
     gateway = _sent_gateway(client)
     mailbox_id = imap_mailbox_identity(credentials())
