@@ -94,7 +94,7 @@ Each definition is the only place its rule is stated.
   - No other folder is ever fetched on purpose: no request targets archive, deleted items, drafts, or clutter. Gmail and Microsoft ids are mailbox-wide, so a message that leaves an admitted folder between a listing and its fetch can still answer; every fetch response carries the message's folders (`labelIds`, `parentFolderId`, or the IMAP folder selected for it), and a response outside the admitted folders is discarded with nothing stored.
   - An IMAP account with no resolvable Sent folder has only `INBOX` in scope, and shows "Sent mail unavailable".
 - **The retention cutoff** is `now - retention_days`.
-  - Only messages received at or after the cutoff are fetched or captured.
+  - Only messages received at or after the cutoff are fetched or captured. Fetching a message reads its headers or body; a listing that returns ids and received times is how a pass finds candidates, and fetches nothing.
   - Mail that aged past the cutoff before it was captured is never recovered, and its thread shows "history partial".
 - **Purge.**
   - A message outside a followed thread is purged once it is older than the cutoff, as today.
