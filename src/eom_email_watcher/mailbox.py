@@ -99,6 +99,11 @@ class MessageMetadata:
 # The admitted folders (contract D-scope), as locations are recorded.
 INBOX_LOCATION = "inbox"
 SENT_LOCATION = "sent"
+def folder_scope_key(folders: frozenset[str]) -> str:
+    """One text key for a set of folders in scope, for queries whose pages belong to it."""
+    return "+".join(sorted(folders))
+
+
 MESSAGE_LOCATIONS = frozenset({INBOX_LOCATION, SENT_LOCATION})
 # An account's Sent scope (contract D-scope), as health reports it.
 SENT_SCOPE_AVAILABLE = "available"

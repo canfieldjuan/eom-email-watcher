@@ -23,6 +23,7 @@ from filelock import Timeout as FileLockTimeout
 from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
+    MESSAGE_LOCATIONS,
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
     SENT_SCOPE_UNAVAILABLE,
@@ -614,6 +615,10 @@ class Microsoft365Gateway:
                 unique = tuple(dict.fromkeys(ids))
                 # A message is in one folder, so the delta's folder is its whole location.
                 observation = FolderObservation(frozenset({FOLDER_LOCATIONS[folder]}), True)
+                origins = getattr(self, "_delta_folders", None)
+                if origins is None:
+                    origins = self._delta_folders = {}
+                origins.update({message_id: folder for message_id in unique})
                 return MailboxChanges(
                     unique, cursor, {message_id: observation for message_id in unique}
                 )
@@ -665,6 +670,12 @@ class Microsoft365Gateway:
             return SENT_SCOPE_AVAILABLE
         return SENT_SCOPE_UNAVAILABLE
 
+    # The folders a check has in scope (contract D-ops) and, per id, the folder whose
+    # delta listed it; both set once per check through scope_folders.
+    def scope_folders(self, folders: frozenset[str]) -> None:
+        self._folders_in_scope = folders
+        self._delta_folders: dict[str, str] = {}
+
     def _folder_id(self, folder: str) -> str | None:
         """One admitted well-known folder's id, resolved once per gateway; None when absent."""
         cached: dict[str, str | None] = getattr(self, "_folder_ids", None) or {}
@@ -695,20 +706,26 @@ class Microsoft365Gateway:
         """
         if not isinstance(parent_folder_id, str):
             return frozenset()
+        in_scope = getattr(self, "_folders_in_scope", MESSAGE_LOCATIONS)
         for folder, location in FOLDER_LOCATIONS.items():
-            if self._folder_id(folder) == parent_folder_id:
+            if location in in_scope and self._folder_id(folder) == parent_folder_id:
                 return frozenset({location})
         return frozenset()
 
     def metadata(self, message_id: str) -> MessageMetadata:
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")
         query = urlencode({"$select": METADATA_SELECT})
-        # Folder-agnostic, so a Sent Items message resolves; its folder decides the
-        # location, and a message outside the admitted folders gets none.
-        response = self._request(
-            f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}",
-            missing_is_message=True,
+        # Through the folder whose delta listed the id, so a message that moved since
+        # answers not found instead of being read from a folder outside scope
+        # (contract D-scope); an id with no delta origin is read mailbox-wide and its
+        # folder decides the location.
+        origin = getattr(self, "_delta_folders", {}).get(message_id)
+        url = (
+            f"{GRAPH_ROOT}/me/mailFolders/{origin}/messages/{encoded_id}?{query}"
+            if origin is not None
+            else f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}"
         )
+        response = self._request(url, missing_is_message=True)
         document = _response_document(response, "message metadata")
         response_id = _graph_id(document.get("id"), "message id")
         if response_id != message_id:

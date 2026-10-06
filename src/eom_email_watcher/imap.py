@@ -512,10 +512,12 @@ def _special_use_sent_folder(client: imaplib.IMAP4) -> str | None:
             _, lines = client.response("LIST")
         else:
             status, lines = client.list('""', "*")
-    except imaplib.IMAP4.error:
-        return None
+    except imaplib.IMAP4.error as exc:
+        raise ImapError("imap_protocol_error", "Mail server folder listing failed; retry") from exc
     if status != "OK":
-        return None
+        # A failed listing says nothing about \Sent: the Sent poll retries it, and
+        # the configured fallback is never read in its place.
+        raise ImapError("imap_protocol_error", "Mail server folder listing failed; retry")
     for item in lines or []:
         if item is None:
             continue

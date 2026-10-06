@@ -6968,6 +6968,9 @@ def test_folder_cursors_are_per_folder_and_identity_checked(tmp_path: Path) -> N
 def test_sent_scope_defaults_to_not_polled(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
+    store.register_mail_account(
+        "imap", "imap-account", display_name="A", address="a@example.com", active=True
+    )
     assert store.sent_scope("imap", "imap-account") == "not_polled"
     store.set_sent_scope("imap", "imap-account", "unavailable")
     assert store.sent_scope("imap", "imap-account") == "unavailable"
@@ -7608,3 +7611,43 @@ def test_a_sent_copy_s_reply_headers_merge_imap_components(tmp_path: Path) -> No
     keys = _thread_keys(store)
     assert keys[root] == keys[other]
     assert store.message_locations(root) == ["inbox", "sent"]
+
+
+def test_message_sources_list_every_copy_canonical_first(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+    store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    )
+
+    sources = store.message_sources(first)
+    assert [s.provider_message_id for s in sources] == ["imap:mailbox:44:1", "imap:sent:77:3"]
+    assert all(s.message_id == first for s in sources)
+
+
+def test_sent_scope_reads_not_polled_for_an_inactive_account(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.register_mail_account(
+        "imap", "imap-a", display_name="A", address="a@example.com", active=True
+    )
+    store.set_sent_scope("imap", "imap-a", "available")
+    assert store.sent_scope("imap", "imap-a") == "available"
+
+    store.register_mail_account(
+        "imap", "imap-b", display_name="B", address="b@example.com", active=True
+    )
+    # Only the active account is polled, so A's last record no longer applies.
+    assert store.sent_scope("imap", "imap-a") == "not_polled"
+    assert store.sent_scope("imap", "imap-b") == "not_polled"

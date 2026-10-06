@@ -743,7 +743,7 @@ def _folders_and_messages(request: httpx.Request) -> httpx.Response | None:
         },
     }
     for message_id, document in documents.items():
-        if path.endswith(f"/me/messages/{message_id}"):
+        if path.endswith(f"/messages/{message_id}"):
             return httpx.Response(200, json=document)
     return None
 
@@ -775,8 +775,10 @@ def test_sent_items_has_its_own_delta_and_metadata_records_locations() -> None:
     assert sent.cc == ("cc@other.com",)
     assert sent.rfc_message_id == "s1@owner.example"
     assert sent.sender == "owner@example.com"
-    metadata_request = next(r for r in requests if r.url.path.endswith("/me/messages/sent-1"))
-    assert "/mailFolders/" not in metadata_request.url.path
+    # Read through the folder whose delta listed it, so a message that moved since
+    # answers not found instead of being read from another folder.
+    metadata_request = next(r for r in requests if r.url.path.endswith("/messages/sent-1"))
+    assert "/mailFolders/sentitems/messages/sent-1" in metadata_request.url.path
 
     archived = gateway.metadata("archived-1")
     assert archived.locations == frozenset()
@@ -820,6 +822,24 @@ def test_inbox_metadata_never_looks_up_sent_items() -> None:
     # The Sent poll sees the failure as the mailbox error it contains.
     with pytest.raises(Microsoft365Error):
         gateway.sent_scope()
+
+
+def test_folder_resolution_never_reads_sent_items_while_it_is_out_of_scope() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+    gateway.scope_folders(frozenset({"inbox"}))
+
+    # A message outside the Inbox is not compared with Sent Items while Sent is gated:
+    # no request reads the paid scope, and the message gets no location.
+    assert gateway.metadata("archived-1").locations == frozenset()
+    assert not any(r.url.path.endswith("/mailFolders/sentitems") for r in requests)
 
 
 def test_sent_scope_is_unavailable_without_a_sent_items_folder() -> None:

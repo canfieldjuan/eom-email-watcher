@@ -122,6 +122,7 @@ from .imap import (
 from .mailbox import (
     DEFAULT_MAIL_ACCOUNT_ID,
     DEFAULT_MAIL_PROVIDER,
+    SENT_SCOPE_NOT_POLLED,
     MailboxAccountUnavailable,
     MailboxError,
     MailboxMessageInvalid,
@@ -431,16 +432,22 @@ def _mail_account_key(payload: dict[str, object]) -> tuple[str, str]:
 
 def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, object]:
     state = runtime.store.state(provider=account.provider, account_id=account.account_id)
+    connected = mail_account_connected(runtime.config, account)
     return {
         "account_id": account.account_id,
         "active": account.active,
         "address": account.address,
-        "connected": mail_account_connected(runtime.config, account),
+        "connected": connected,
         "display_name": account.display_name,
         "last_check": state[1] if state else None,
         "provider": account.provider,
-        # Contract D-scope: whether this account's Sent folder is in scope.
-        "sent_scope": runtime.store.sent_scope(account.provider, account.account_id),
+        # Contract D-scope: whether this account's Sent folder is in scope. An
+        # account this build cannot poll is not polled, whatever it last recorded.
+        "sent_scope": (
+            runtime.store.sent_scope(account.provider, account.account_id)
+            if connected
+            else SENT_SCOPE_NOT_POLLED
+        ),
     }
 
 

@@ -2275,6 +2275,23 @@ def test_a_configured_non_ascii_sent_folder_is_selected_in_wire_form() -> None:
     assert '"Envoy&AOk-s"' in _selects(client)
 
 
+def test_a_failed_folder_listing_retries_instead_of_using_the_fallback() -> None:
+    class ListingFails(SentFolderImap):
+        def list(self, directory: str, pattern: str) -> tuple[str, list[object]]:
+            self.calls.append(("list", directory, pattern))
+            return "NO", [b"LIST failed"]
+
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Custom"})
+    client = ListingFails(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    # A failed listing says nothing about \Sent: the poll sees a mailbox error and
+    # retries later, and the configured fallback is never selected in its place.
+    with pytest.raises(ImapError):
+        gateway.sent_scope()
+    assert '"Custom"' not in _selects(client)
+
+
 def test_a_server_advertising_special_use_is_asked_for_it() -> None:
     client = SentFolderImap(list_lines=SENT_LIST)
     client.capabilities = ("IMAP4REV1", "SPECIAL-USE")

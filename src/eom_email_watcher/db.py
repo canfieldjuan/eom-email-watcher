@@ -2062,6 +2062,9 @@ class GmailRecoveryState:
     next_retry_at: str | None
     created_at: str
     updated_at: str
+    # The folder scope the saved page belongs to (mailbox.folder_scope_key); a page
+    # token is never reused against a query of another scope.
+    query_scope: str = "inbox+sent"
 
 
 def _mail_account(row: sqlite3.Row) -> MailAccount:
@@ -2137,6 +2140,7 @@ def _gmail_recovery_state(row: sqlite3.Row) -> GmailRecoveryState:
         page_count=int(row["page_count"]),
         terminal_candidate_count=int(row["terminal_candidate_count"]),
         invalid_page_token_count=int(row["invalid_page_token_count"]),
+        query_scope=str(row["query_scope"]),
         consecutive_retry_count=int(row["consecutive_retry_count"]),
         state=str(row["state"]),
         failure_code=(str(row["failure_code"]) if row["failure_code"] is not None else None),
@@ -3422,6 +3426,15 @@ def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
     }.items():
         if column not in columns:
             db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+    recovery_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(gmail_recovery_state)").fetchall()
+    }
+    if "query_scope" not in recovery_columns:
+        # Pages saved before schema 30 were read under both folders.
+        db.execute(
+            "ALTER TABLE gmail_recovery_state ADD COLUMN query_scope TEXT NOT NULL"
+            " DEFAULT 'inbox+sent'"
+        )
     _execute_transactional_script(db, SENT_CAPTURE_SCHEMA)
 
 
@@ -6458,6 +6471,7 @@ class Store:
         replacement_history_cursor: str,
         *,
         retention_cutoff: datetime | None = None,
+        query_scope: str = "inbox+sent",
         now: datetime | None = None,
     ) -> GmailRecoveryState:
         _require_mailbox_identity_key(mailbox_identity_key)
@@ -6533,10 +6547,11 @@ class Store:
                         page_token, current_page_ids_json,
                         page_loaded, next_index, page_count, terminal_candidate_count,
                         invalid_page_token_count, consecutive_retry_count,
-                        state, failure_code, next_retry_at, created_at, updated_at
+                        state, failure_code, next_retry_at, created_at, updated_at,
+                        query_scope
                     ) VALUES (
                         'gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, X'5B5D',
-                        0, 0, 0, 0, 0, 0, 'collecting', NULL, NULL, ?, ?
+                        0, 0, 0, 0, 0, 0, 'collecting', NULL, NULL, ?, ?, ?
                     )""",
                     (
                         account_id,
@@ -6550,6 +6565,7 @@ class Store:
                         cursor,
                         stamp,
                         stamp,
+                        query_scope,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -6796,6 +6812,41 @@ class Store:
             ).fetchone()
         assert updated is not None
         return _gmail_recovery_state(updated)
+
+    def restart_gmail_recovery_page(
+        self,
+        account_id: str,
+        mailbox_identity_key: str,
+        query_scope: str,
+        *,
+        now: datetime | None = None,
+    ) -> GmailRecoveryState:
+        """Drop the saved page so the next page is read under query_scope.
+
+        A page token belongs to the query that produced it; when the folders in
+        scope change mid-recovery (contract D-ops), the recovery restarts its paging
+        under the new scope, keeping its window, and ids already captured are
+        skipped as seen.
+        """
+        _require_mailbox_identity_key(mailbox_identity_key)
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._require_current_gmail_recovery(
+                db, account_id=account_id, mailbox_identity_key=mailbox_identity_key
+            )
+            db.execute(
+                """UPDATE gmail_recovery_state
+                SET page_token = NULL, current_page_ids_json = X'5B5D',
+                    page_loaded = 0, next_index = 0, query_scope = ?, updated_at = ?
+                WHERE provider = 'gmail' AND account_id = ?""",
+                (query_scope, stamp, account_id),
+            )
+            row = db.execute(
+                "SELECT * FROM gmail_recovery_state WHERE provider='gmail' AND account_id=?",
+                (account_id,),
+            ).fetchone()
+        return _gmail_recovery_state(row)
 
     def finish_gmail_recovery_candidate(
         self,
@@ -8278,6 +8329,35 @@ class Store:
                 is not None
             )
 
+    def message_sources(self, message_id: str) -> tuple[MessageSource, ...]:
+        """Every source identity a logical message can be read from (contract D-identity).
+
+        The canonical row's own source comes first, then each recorded location's,
+        so a reader can try another copy when one is gone.
+        """
+        canonical = self.message_source(message_id)
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT DISTINCT mailbox_identity_key, provider_message_id
+                FROM message_locations WHERE message_id = ?
+                ORDER BY provider_message_id""",
+                (message_id,),
+            ).fetchall()
+        others = tuple(
+            MessageSource(
+                message_id=canonical.message_id,
+                provider=canonical.provider,
+                account_id=canonical.account_id,
+                provider_message_id=str(row["provider_message_id"]),
+                received_at=canonical.received_at,
+                discovered_at=canonical.discovered_at,
+                mailbox_identity_key=str(row["mailbox_identity_key"]),
+            )
+            for row in rows
+            if str(row["provider_message_id"]) != canonical.provider_message_id
+        )
+        return (canonical, *others)
+
     def message_source(self, message_id: str) -> MessageSource:
         with self.connection() as db:
             row = db.execute(
@@ -8615,10 +8695,16 @@ class Store:
             )
 
     def sent_scope(self, provider: str, account_id: str) -> str:
-        """'available', 'unavailable', or 'not_polled' (contract D-scope)."""
+        """'available', 'unavailable', or 'not_polled' (contract D-scope).
+
+        Only an active account is polled, so an inactive one reports not polled
+        whatever its last check recorded.
+        """
         with self.connection() as db:
             row = db.execute(
-                "SELECT scope FROM mailbox_sent_scope WHERE provider = ? AND account_id = ?",
+                """SELECT s.scope FROM mailbox_sent_scope AS s
+                JOIN mail_accounts AS a ON a.provider = s.provider AND a.account_id = s.account_id
+                WHERE s.provider = ? AND s.account_id = ? AND a.active = 1""",
                 (provider, account_id),
             ).fetchone()
         return str(row["scope"]) if row else SENT_SCOPE_NOT_POLLED

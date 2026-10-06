@@ -29,6 +29,7 @@ from googleapiclient.errors import HttpError
 from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
+    MESSAGE_LOCATIONS,
     SENT_LOCATION,
     FolderObservation,
     MailboxChanges,
@@ -471,6 +472,11 @@ def _merge_history_hint(
             earlier.locations | observation.locations, earlier.complete or observation.complete
         )
     hints[message_id] = observation
+
+
+def recovery_folder_query(folders: frozenset[str]) -> str:
+    """The Gmail search clause for the admitted folders in scope (contract D-ops)."""
+    return "(in:inbox OR in:sent)" if SENT_LOCATION in folders else "in:inbox"
 
 
 def locations_from_labels(label_ids: object) -> frozenset[str]:
@@ -1096,6 +1102,13 @@ class GmailGateway:
             if not page_token:
                 return list(dict.fromkeys(ids))
 
+    # The folders a check has in scope (contract D-ops); set once per check by the
+    # watcher, so no query reads the Sent scope while it is gated off.
+    query_folders: frozenset[str] = MESSAGE_LOCATIONS
+
+    def scope_folders(self, folders: frozenset[str]) -> None:
+        self.query_folders = folders
+
     def recovery_page(
         self,
         page_token: str | None,
@@ -1124,7 +1137,7 @@ class GmailGateway:
                 error_type=GmailRecoveryPageInvalid,
             )
         query = (
-            f"(in:inbox OR in:sent) after:{after_exclusive_epoch} "
+            f"{recovery_folder_query(self.query_folders)} after:{after_exclusive_epoch} "
             f"before:{before_exclusive_epoch}"
         )
         try:

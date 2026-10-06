@@ -481,6 +481,19 @@ class FakeRecoveryService:
         return self._users
 
 
+def test_gmail_recovery_query_follows_the_folders_in_scope() -> None:
+    service = FakeRecoveryService({"messages": [{"id": "only"}]})
+    gateway = GmailGateway(service)
+    gateway.scope_folders(frozenset({"inbox"}))
+
+    gateway.recovery_page(None, 100, 200)
+
+    assert service.messages.calls[0]["q"] == "in:inbox after:100 before:200"
+    assert gmail_module.recovery_folder_query(frozenset({"inbox", "sent"})) == (
+        "(in:inbox OR in:sent)"
+    )
+
+
 def test_gmail_recovery_page_is_one_broad_inbox_window_query_without_rule_filters() -> None:
     service = FakeRecoveryService(
         {"messages": [{"id": "second"}, {"id": "first"}], "nextPageToken": "next"}

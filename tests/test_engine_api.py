@@ -8796,9 +8796,15 @@ def test_mail_account_list_reports_the_sent_scope(
     config_path = tmp_path / "config.toml"
     write_config(config_path)
     runtime = load_runtime(config_path)
+    runtime.config.gmail_token_file.write_text("connected token", encoding="utf-8")
     patch_runtime(monkeypatch, runtime)
     runtime.store.set_sent_scope("gmail", "gmail-default", "unavailable")
 
     response = engine_api._response(request(config_path, "mail.accounts.list"))
 
     assert [a["sent_scope"] for a in response["data"]["accounts"]] == ["unavailable"]
+
+    # An account this build cannot poll is not polled, whatever it last recorded.
+    runtime.config.gmail_token_file.unlink()
+    response = engine_api._response(request(config_path, "mail.accounts.list"))
+    assert [a["sent_scope"] for a in response["data"]["accounts"]] == ["not_polled"]

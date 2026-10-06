@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol
@@ -65,8 +65,10 @@ from .mailbox import (
     MailboxMessageInvalid,
     MailboxMessageUnavailable,
     MailboxSession,
+    MessageContent,
     StaleMailboxCursor,
     default_mailbox_session,
+    folder_scope_key,
     mailbox_polling_session,
     mailbox_session_address,
     mailbox_session_identity_key,
@@ -169,6 +171,31 @@ def _recovery_since(last_success: str, retention_cutoff: datetime) -> datetime:
 def _folders_in_scope(gated_allowed: bool) -> frozenset[str]:
     """Contract D-ops: Sent is in scope only while the gated class is allowed."""
     return MESSAGE_LOCATIONS if gated_allowed else frozenset({INBOX_LOCATION})
+
+
+def _scope_gateway(gateway: object, folders: frozenset[str]) -> None:
+    """Tell a gateway the folders in scope, so its own queries never read a gated one."""
+    scoper = getattr(gateway, "scope_folders", None)
+    if callable(scoper):
+        scoper(folders)
+
+
+def _content_from_sources(
+    gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int
+) -> MessageContent:
+    """Read a logical message through any of its source identities (contract D-identity).
+
+    A copy that is gone is not the message being gone: the next recorded source is
+    tried, and only when every copy is unavailable does the message count as such.
+    """
+    last: MailboxMessageUnavailable | None = None
+    for provider_message_id in provider_message_ids:
+        try:
+            return gateway.content(provider_message_id, body_char_limit)
+        except MailboxMessageUnavailable as exc:
+            last = exc
+    assert last is not None
+    raise last
 
 
 def _scope_complete(folders: frozenset[str]) -> bool:
@@ -1401,6 +1428,13 @@ class Watcher:
             result["recovery_next_retry_at"] = state.next_retry_at
         return result
 
+    def _note_not_polled(self, dry_run: bool) -> None:
+        """An inactive account polls nothing, Sent included (contract D-scope, D-ops)."""
+        if not dry_run:
+            self.store.set_sent_scope(
+                self.mailbox.provider, self.mailbox.account_id, SENT_SCOPE_NOT_POLLED
+            )
+
     def check(
         self, *, dry_run: bool = False, deliver_notifications: bool = True
     ) -> dict[str, int | bool | str]:
@@ -1431,6 +1465,7 @@ class Watcher:
             and not gmail_watch_configured
             and not pending_current_identity
         ):
+            self._note_not_polled(dry_run)
             return self.inactive_result(self.config, self.store, dry_run=dry_run)
         with mailbox_polling_session(self.gateway):
             mailbox_identity_key = reconcile_mailbox_session_identity(
@@ -1497,6 +1532,7 @@ class Watcher:
                     if self.mailbox.provider == "gmail"
                     else ()
                 )
+                self._note_not_polled(dry_run)
                 return self.inactive_result(
                     self.config,
                     self.store,
@@ -1610,15 +1646,18 @@ class Watcher:
         deadline = time.monotonic() + 30.0
         if not self._retry_due(state.next_retry_at, checked_at):
             return self.recovery_backoff_result(state)
-        if state.page_loaded:
+        same_scope = state.query_scope == folder_scope_key(folders)
+        if state.page_loaded and same_scope:
             message_ids = state.current_page_ids[state.next_index :]
         else:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 message_ids = ()
             else:
+                # A page saved under another folder scope is not previewed; the
+                # window is read afresh under this one, without saving anything.
                 message_ids, _next_page_token = self.gateway.recovery_page(
-                    state.page_token,
+                    state.page_token if same_scope else None,
                     state.recovery_after_exclusive_epoch,
                     state.recovery_before_exclusive_epoch,
                     200,
@@ -1721,6 +1760,15 @@ class Watcher:
         state = self.store.gmail_recovery_state(self.mailbox.account_id)
         if state is None:
             raise RuntimeError("Gmail recovery state was not initialized")
+        if state.query_scope != folder_scope_key(folders):
+            # The saved page belongs to another folder scope: restart paging under
+            # this one (contract D-ops); captured ids are skipped as seen.
+            state = self.store.restart_gmail_recovery_page(
+                self.mailbox.account_id,
+                mailbox_identity_key,
+                folder_scope_key(folders),
+                now=checked_at,
+            )
         retention_cutoff = self._recovery_retention_cutoff(state)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
@@ -1971,6 +2019,7 @@ class Watcher:
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
         gated_allowed = self._gated_class_allowed()
         folders = _folders_in_scope(gated_allowed)
+        _scope_gateway(self.gateway, folders)
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
             provider=self.mailbox.provider,
@@ -2107,6 +2156,7 @@ class Watcher:
                     before_epoch,
                     replacement_cursor,
                     retention_cutoff=retention_cutoff,
+                    query_scope=folder_scope_key(folders),
                     now=sampled_at,
                 )
                 added, completed = self._run_gmail_recovery(
@@ -2218,6 +2268,11 @@ class Watcher:
                         folders=folders,
                         observed=hint,
                     )
+                continue
+            hint = known_locations.get(provider_message_id)
+            if hint is not None and hint.complete and not (hint.locations & folders):
+                # The record says the message is in no folder in scope: nothing is
+                # fetched from the gated scope (contract D-ops); the cursor advances.
                 continue
             try:
                 metadata = self.gateway.metadata(provider_message_id)
@@ -2577,7 +2632,17 @@ class Watcher:
                     request_id = request.request_id
                     body_char_limit = request.body_char_limit
                     current_local_time = datetime.fromisoformat(request.context_at)
-                content = self.gateway.content(message.provider_message_id, body_char_limit)
+                # A stored message is read through any of its copies; a dry-run
+                # message is not stored and has only the id polling saw.
+                source_ids = (
+                    (message.provider_message_id,)
+                    if dry_run
+                    else tuple(
+                        s.provider_message_id
+                        for s in self.store.message_sources(message.message_id)
+                    )
+                )
+                content = _content_from_sources(self.gateway, source_ids, body_char_limit)
                 if not dry_run:
                     self.store.replace_attachments(message.message_id, content.attachments)
                 analysis = self.model.analyze(
