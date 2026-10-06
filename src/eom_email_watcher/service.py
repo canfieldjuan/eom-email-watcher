@@ -1709,13 +1709,12 @@ class Watcher:
         *,
         mailbox_identity_key: str,
         checked_at: datetime,
-        gated_allowed: bool,
+        folders: frozenset[str],
     ) -> tuple[int, bool]:
         state = self.store.gmail_recovery_state(self.mailbox.account_id)
         if state is None:
             raise RuntimeError("Gmail recovery state was not initialized")
         retention_cutoff = self._recovery_retention_cutoff(state)
-        folders = _folders_in_scope(gated_allowed)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
         deadline = time.monotonic() + 30.0
@@ -1950,6 +1949,7 @@ class Watcher:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
         gated_allowed = self._gated_class_allowed()
+        folders = _folders_in_scope(gated_allowed)
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
             provider=self.mailbox.provider,
@@ -1970,7 +1970,7 @@ class Watcher:
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=checked_at,
-                    gated_allowed=gated_allowed,
+                    folders=folders,
                 )
                 pending_recovery = (
                     None
@@ -2090,7 +2090,7 @@ class Watcher:
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=sampled_at,
-                    gated_allowed=gated_allowed,
+                    folders=folders,
                 )
                 pending_recovery = (
                     None
@@ -2122,7 +2122,7 @@ class Watcher:
             label_selectors=label_selectors,
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
-            folders=_folders_in_scope(gated_allowed),
+            folders=folders,
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
@@ -2139,7 +2139,7 @@ class Watcher:
                 label_selectors=label_selectors,
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
-                gated_allowed=gated_allowed,
+                folders=folders,
             )
         return self._finish_active_result(
             added=added,
@@ -2316,7 +2316,7 @@ class Watcher:
         label_selectors: tuple[GmailLabelSelectorLike, ...],
         checked_at: datetime,
         retention_cutoff: datetime,
-        gated_allowed: bool,
+        folders: frozenset[str],
     ) -> int:
         """Poll the Sent folder (contract D-scope) while the gated class is allowed (D-ops).
 
@@ -2328,7 +2328,7 @@ class Watcher:
         if provider == "gmail":
             self.store.set_sent_scope(provider, account_id, SENT_SCOPE_AVAILABLE, now=checked_at)
             return 0
-        if not gated_allowed:
+        if SENT_LOCATION not in folders:
             return 0
         # A Sent folder error never stops the Inbox check; the next check retries.
         try:
@@ -2366,7 +2366,7 @@ class Watcher:
                 label_selectors=label_selectors,
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
-                folders=_folders_in_scope(gated_allowed),
+                folders=folders,
                 dry_run=False,
                 dry_run_messages=[],
             )

@@ -1494,7 +1494,7 @@ def test_due_recovery_retry_crash_preserves_degraded_backoff_state(
         Watcher(cfg, store, gateway, FakeModel())._run_gmail_recovery(
             mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
             checked_at=checked_at,
-            gated_allowed=False,
+            folders=frozenset({"inbox"}),
         )
 
     assert gateway.recovery_calls == 1
