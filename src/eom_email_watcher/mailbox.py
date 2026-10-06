@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -12,6 +13,12 @@ from .mime import AttachmentDescriptor
 
 DEFAULT_MAIL_PROVIDER = "gmail"
 DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
+# RFC 5322 line limit; longer message ids are malformed and dropped.
+MAX_MESSAGE_ID_CHARS = 998
+MAX_REFERENCES_IDS = 64
+_BRACKETED_ID_RE = re.compile(r"<([^<>\s]+)>")
+# RFC 5322 msg-id without its brackets: left@right, no whitespace, controls, or brackets.
+_MESSAGE_ID_RE = re.compile(r"[^\s<>\x00-\x1f\x7f]+@[^\s<>\x00-\x1f\x7f]+")
 
 
 class MailboxError(RuntimeError):
@@ -61,6 +68,31 @@ class MessageMetadata:
     subject: str
     received_at: str
     labels: frozenset[str]
+    # RFC 5322 identity for thread keys (contract D-identity); providers that
+    # supply their own thread id leave these empty.
+    rfc_message_id: str | None = None
+    reply_ids: tuple[str, ...] = ()
+
+
+def normalize_message_id(value: object) -> str | None:
+    """Return one RFC 5322 message id without angle brackets, or None if malformed."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    if len(text) > MAX_MESSAGE_ID_CHARS or _MESSAGE_ID_RE.fullmatch(text) is None:
+        return None
+    return text
+
+
+def message_id_list(value: object, limit: int | None = None) -> tuple[str, ...]:
+    """Return the distinct message ids of an In-Reply-To or References value, in order."""
+    if not isinstance(value, str):
+        return ()
+    found = _BRACKETED_ID_RE.findall(value) or value.split()
+    ids = tuple(dict.fromkeys(i for i in map(normalize_message_id, found) if i is not None))
+    return ids if limit is None else ids[:limit]
 
 
 @dataclass(frozen=True)

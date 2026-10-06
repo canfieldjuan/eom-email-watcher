@@ -64,6 +64,7 @@ from .config import (
     normalize_validated_address,
     ntfy_disclosure_status,
     remove_sender,
+    remove_senders,
     update_settings,
 )
 from .db import (
@@ -91,6 +92,7 @@ from .db import (
     MessageSource,
     NotificationIntent,
     Store,
+    VendorAddressConflict,
 )
 from .gmail import (
     TOKEN_LOCK_TIMEOUT_SECONDS,
@@ -5550,6 +5552,16 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     def remove() -> dict[str, object]:
         config = load_config(_config_path(request))
         try:
+            owner = _runtime(request).store.vendor_for_address(normalize_validated_address(email))
+        except ValueError:
+            owner = None
+        if owner is not None:
+            raise ApiError(
+                "conflict",
+                f"{email.strip()} belongs to vendor {owner['display_name']}; "
+                "remove it from the vendor first",
+            )
+        try:
             sender = remove_sender(_config_path(request), email)
         except ConfigAdmissionStaleError as exc:
             raise ApiError("conflict", "Configuration changed during update") from exc
@@ -5565,6 +5577,210 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
         }
 
     return _with_watchlist_mutation(request, remove)
+
+
+MAX_VENDOR_NAME_BYTES = 200
+
+
+def _vendor_name(payload: dict[str, object]) -> str:
+    value = payload.get("display_name")
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError("invalid_request", "display_name must be a non-empty string")
+    name = value.strip()
+    if len(name.encode("utf-8")) > MAX_VENDOR_NAME_BYTES:
+        raise ApiError("invalid_request", "display_name must be at most 200 UTF-8 bytes")
+    return name
+
+
+def _vendor_id(payload: dict[str, object]) -> str:
+    value = payload.get("vendor_id")
+    try:
+        parsed = uuid.UUID(value) if isinstance(value, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.version != 4 or str(parsed) != value:
+        raise ApiError("invalid_request", "vendor_id must be a canonical UUIDv4 string")
+    return value
+
+
+def _vendor_address(payload: dict[str, object]) -> str:
+    value = payload.get("address")
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError("invalid_request", "address must be a non-empty string")
+    try:
+        exact_sender_selector_id(value)
+        return normalize_validated_address(value)
+    except ValueError as exc:
+        raise ApiError("invalid_request", str(exc)) from exc
+
+
+def _optional_flag(payload: dict[str, object], key: str) -> bool:
+    value = payload.get(key, False)
+    if not isinstance(value, bool):
+        raise ApiError("invalid_request", f"{key} must be true or false")
+    return value
+
+
+def _vendor_or_not_found(store: Store, vendor_id: str) -> dict[str, object]:
+    try:
+        return store.vendor(vendor_id)
+    except KeyError as exc:
+        raise ApiError("not_found", "Vendor was not found") from exc
+
+
+def _vendor_data(store: Store, config: Config, vendor_id: str) -> dict[str, object]:
+    return _vendor_item(_vendor_or_not_found(store, vendor_id), config)
+
+
+def _vendor_item(vendor: dict[str, object], config: Config) -> dict[str, object]:
+    addresses = vendor["addresses"]
+    assert isinstance(addresses, list)
+    return {
+        "vendor_id": vendor["vendor_id"],
+        "display_name": vendor["display_name"],
+        "addresses": [
+            {"address": address, "watched": address in config.allowlist}
+            for address in addresses
+        ],
+    }
+
+
+def _vendors_list(request: dict[str, object]) -> dict[str, object]:
+    """Read class (contract D-ops): never gated."""
+    _payload(request, set())
+    runtime = _runtime(request)
+    config = load_config(_config_path(request))
+    return {"items": [_vendor_item(vendor, config) for vendor in runtime.store.list_vendors()]}
+
+
+def _vendors_create(request: dict[str, object]) -> dict[str, object]:
+    """Gated class (contract D-ops)."""
+    name = _vendor_name(_payload(request, {"display_name"}))
+    connect.require_connect_entitlement()
+
+    def create() -> dict[str, object]:
+        store = _runtime(request).store
+        vendor_id = store.create_vendor(name)
+        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+
+    return _with_watchlist_mutation(request, create)
+
+
+def _vendors_rename(request: dict[str, object]) -> dict[str, object]:
+    """Gated class (contract D-ops)."""
+    payload = _payload(request, {"vendor_id", "display_name"})
+    vendor_id, name = _vendor_id(payload), _vendor_name(payload)
+    connect.require_connect_entitlement()
+
+    def rename() -> dict[str, object]:
+        store = _runtime(request).store
+        try:
+            store.rename_vendor(vendor_id, name)
+        except KeyError as exc:
+            raise ApiError("not_found", "Vendor was not found") from exc
+        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+
+    return _with_watchlist_mutation(request, rename)
+
+
+def _vendors_addresses_add(request: dict[str, object]) -> dict[str, object]:
+    """Gated class; also links the address into the watchlist (contract D-ops)."""
+    payload = _payload(request, {"vendor_id", "address"})
+    vendor_id, address = _vendor_id(payload), _vendor_address(payload)
+    connect.require_connect_entitlement()
+
+    def add() -> dict[str, object]:
+        store = _runtime(request).store
+        if address in _mailbox_addresses(store):
+            raise ApiError("conflict", f"{address} is this mailbox's own address")
+        owner = store.vendor_for_address(address)
+        if owner is not None and owner["vendor_id"] != vendor_id:
+            raise ApiError(
+                "conflict", f"{address} already belongs to vendor {owner['display_name']}"
+            )
+        vendor = _vendor_or_not_found(store, vendor_id)
+        if address not in load_config(_config_path(request)).allowlist:
+            try:
+                add_sender(_config_path(request), address, str(vendor["display_name"]))
+            except ConfigAdmissionStaleError as exc:
+                raise ApiError("conflict", "Configuration changed during update") from exc
+            except DuplicateSenderError:
+                pass
+        try:
+            store.add_vendor_address(vendor_id, address)
+        except VendorAddressConflict as exc:
+            raise ApiError("conflict", str(exc)) from exc
+        except KeyError as exc:
+            raise ApiError("not_found", "Vendor was not found") from exc
+        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+
+    return _with_watchlist_mutation(request, add)
+
+
+def _mailbox_addresses(store: Store) -> set[str]:
+    """The mailbox's verified identities (contract D-vendor).
+
+    Session addresses need no separate read: reconcile_mailbox_session_identity
+    refuses a session whose authenticated address differs from the stored one.
+    """
+    addresses = set()
+    for account in store.mail_accounts():
+        try:
+            if account.address:
+                addresses.add(normalize_validated_address(account.address))
+        except ValueError:
+            continue
+    return addresses
+
+
+def _unwatch_all(request: dict[str, object], addresses: list[str]) -> None:
+    """Stop watching addresses in one config write, before the database (contract D-ops)."""
+    try:
+        remove_senders(_config_path(request), addresses)
+    except ConfigAdmissionStaleError as exc:
+        raise ApiError("conflict", "Configuration changed during update") from exc
+
+
+def _vendors_addresses_remove(request: dict[str, object]) -> dict[str, object]:
+    """Removal class: never gated (contract D-ops)."""
+    payload = _payload(request, {"vendor_id", "address", "unwatch"})
+    vendor_id, address = _vendor_id(payload), _vendor_address(payload)
+    unwatch = _optional_flag(payload, "unwatch")
+
+    def remove() -> dict[str, object]:
+        store = _runtime(request).store
+        if address not in _vendor_or_not_found(store, vendor_id)["addresses"]:
+            raise ApiError("not_found", f"{address} is not an address of this vendor")
+        if unwatch:
+            _unwatch_all(request, [address])
+        try:
+            store.remove_vendor_address(vendor_id, address)
+        except KeyError as exc:
+            raise ApiError("not_found", "Vendor was not found") from exc
+        return {"item": _vendor_data(store, load_config(_config_path(request)), vendor_id)}
+
+    return _with_watchlist_mutation(request, remove)
+
+
+def _vendors_delete(request: dict[str, object]) -> dict[str, object]:
+    """Removal class: never gated (contract D-ops)."""
+    payload = _payload(request, {"vendor_id", "unwatch_addresses"})
+    vendor_id = _vendor_id(payload)
+    unwatch = _optional_flag(payload, "unwatch_addresses")
+
+    def delete() -> dict[str, object]:
+        store = _runtime(request).store
+        listed = _vendor_or_not_found(store, vendor_id)["addresses"]
+        assert isinstance(listed, list)
+        if unwatch:
+            _unwatch_all(request, listed)
+        try:
+            addresses = store.delete_vendor(vendor_id)
+        except KeyError as exc:
+            raise ApiError("not_found", "Vendor was not found") from exc
+        return {"deleted": True, "vendor_id": vendor_id, "addresses": addresses}
+
+    return _with_watchlist_mutation(request, delete)
 
 
 def _settings_data(config: Config) -> dict[str, object]:
@@ -5950,6 +6166,12 @@ OPERATIONS: dict[str, Callable[[dict[str, object]], dict[str, object]]] = {
     "watchlist.add": _watchlist_add,
     "watchlist.list": _watchlist,
     "watchlist.remove": _watchlist_remove,
+    "vendors.list": _vendors_list,
+    "vendors.create": _vendors_create,
+    "vendors.rename": _vendors_rename,
+    "vendors.addresses.add": _vendors_addresses_add,
+    "vendors.addresses.remove": _vendors_addresses_remove,
+    "vendors.delete": _vendors_delete,
 }
 
 

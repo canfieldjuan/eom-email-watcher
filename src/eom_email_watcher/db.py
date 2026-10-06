@@ -35,10 +35,10 @@ from .config import (
     exact_sender_selector_id,
     normalize_validated_address,
 )
-from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER
+from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER, normalize_message_id
 from .mime import AttachmentDescriptor, body_was_truncated
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -1553,6 +1553,14 @@ class AutomationRuleLimitExceeded(RuntimeError):
 
 class AutomationRuleSystemProtected(RuntimeError):
     """A system-owned rule cannot be edited or deleted."""
+
+
+class VendorAddressConflict(RuntimeError):
+    """An address already belongs to another vendor (contract D-vendor uniqueness)."""
+
+    def __init__(self, address: str, vendor_name: str):
+        super().__init__(f"{address} already belongs to vendor {vendor_name}")
+        self.vendor_name = vendor_name
 
 
 class MailboxIdentityChanged(RuntimeError):
@@ -3181,6 +3189,227 @@ def _execute_transactional_script(db: sqlite3.Connection, script: str) -> None:
             pending.clear()
     if "\n".join(pending).strip():
         raise RuntimeError("automation schema script ended with an incomplete statement")
+
+
+# Thread identity and vendor records (schema 29, thread-view contract M1).
+THREAD_IDENTITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS vendors (
+    vendor_id TEXT PRIMARY KEY CHECK (length(vendor_id) = 36),
+    display_name TEXT NOT NULL CHECK (
+        display_name <> '' AND length(CAST(display_name AS BLOB)) <= 200
+    ),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS vendor_addresses (
+    address TEXT PRIMARY KEY CHECK (
+        address <> '' AND length(CAST(address AS BLOB)) <= 512
+    ),
+    vendor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_addresses_vendor
+    ON vendor_addresses(vendor_id, created_at, address);
+CREATE TRIGGER IF NOT EXISTS vendor_addresses_require_vendor
+BEFORE INSERT ON vendor_addresses
+WHEN NOT EXISTS (SELECT 1 FROM vendors WHERE vendor_id = NEW.vendor_id)
+BEGIN
+    SELECT RAISE(ABORT, 'vendor address requires a vendor');
+END;
+CREATE TABLE IF NOT EXISTS vendor_address_dismissals (
+    vendor_id TEXT NOT NULL,
+    address TEXT NOT NULL CHECK (address <> '' AND length(CAST(address AS BLOB)) <= 512),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (vendor_id, address)
+);
+CREATE TRIGGER IF NOT EXISTS vendors_delete_children
+AFTER DELETE ON vendors
+BEGIN
+    DELETE FROM vendor_addresses WHERE vendor_id = OLD.vendor_id;
+    DELETE FROM vendor_address_dismissals WHERE vendor_id = OLD.vendor_id;
+END;
+CREATE TABLE IF NOT EXISTS imap_thread_ids (
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    mailbox_identity_key TEXT NOT NULL,
+    rfc_id TEXT NOT NULL CHECK (rfc_id <> '' AND length(rfc_id) <= 998),
+    thread_key TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id, mailbox_identity_key, rfc_id)
+);
+CREATE INDEX IF NOT EXISTS idx_imap_thread_ids_key
+    ON imap_thread_ids(provider, account_id, mailbox_identity_key, thread_key);
+CREATE TABLE IF NOT EXISTS thread_key_aliases (
+    old_key TEXT PRIMARY KEY,
+    survivor_key TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_thread_key
+    ON messages(provider, account_id, mailbox_identity_key, thread_key, received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_rfc_message_id
+    ON messages(provider, account_id, mailbox_identity_key, rfc_message_id);
+CREATE TRIGGER IF NOT EXISTS messages_release_imap_component
+AFTER DELETE ON messages
+WHEN OLD.provider = 'imap' AND OLD.thread_key IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM messages
+      WHERE provider = OLD.provider AND account_id = OLD.account_id
+        AND thread_key = OLD.thread_key
+  )
+BEGIN
+    DELETE FROM imap_thread_ids
+    WHERE provider = OLD.provider AND account_id = OLD.account_id
+      AND thread_key = OLD.thread_key;
+    DELETE FROM thread_key_aliases WHERE survivor_key = OLD.thread_key;
+END;
+CREATE TABLE IF NOT EXISTS imap_reply_header_gaps (
+    message_id TEXT PRIMARY KEY
+);
+CREATE TRIGGER IF NOT EXISTS messages_release_imap_reply_header_gap
+AFTER DELETE ON messages
+WHEN OLD.provider = 'imap'
+BEGIN
+    DELETE FROM imap_reply_header_gaps WHERE message_id = OLD.message_id;
+END;
+"""
+
+
+def _require_vendor(db: sqlite3.Connection, vendor_id: str) -> None:
+    if db.execute("SELECT 1 FROM vendors WHERE vendor_id = ?", (vendor_id,)).fetchone() is None:
+        raise KeyError(vendor_id)
+
+
+def _migrate_thread_identity(db: sqlite3.Connection) -> None:
+    """Add schema-29 thread keys and vendor records; key retained rows once."""
+    columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
+    for column, definition in {
+        "thread_key": "TEXT CHECK (thread_key IS NULL OR length(CAST(thread_key AS BLOB)) <= 512)",
+        "rfc_message_id": "TEXT CHECK (rfc_message_id IS NULL OR length(rfc_message_id) <= 998)",
+    }.items():
+        if column not in columns:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+    _execute_transactional_script(db, THREAD_IDENTITY_SCHEMA)
+    # Every retained row gets a key (contract D-identity). Gmail threadId and
+    # Microsoft conversationId already are keys.
+    db.execute(
+        """UPDATE messages SET thread_key = thread_id
+        WHERE thread_key IS NULL AND thread_id IS NOT NULL
+          AND provider IN ('gmail', 'microsoft365')"""
+    )
+    # IMAP stored the raw Message-ID header as thread_id. Each row goes through
+    # the same parser and keying functions as capture. A row without a valid id,
+    # or a legacy row stored without an identity whose mailbox was never proven
+    # continuous with the current one, forms its own component. Reply headers
+    # were never fetched, so every row is listed for M2's sync to complete.
+    proven = {
+        (str(row["provider"]), str(row["account_id"])): str(row["legacy_identity_key"])
+        for row in db.execute(
+            """SELECT provider, account_id, legacy_identity_key FROM mail_accounts
+            WHERE legacy_identity_status = 'continuity_proven'
+              AND legacy_identity_key IS NOT NULL"""
+        ).fetchall()
+    }
+    legacy = db.execute(
+        """SELECT message_id, provider, account_id, mailbox_identity_key, thread_id
+        FROM messages WHERE thread_key IS NULL ORDER BY message_id"""
+    ).fetchall()
+    for row in legacy:
+        provider, account_id = str(row["provider"]), str(row["account_id"])
+        if provider != "imap":
+            db.execute(
+                "UPDATE messages SET thread_key = ? WHERE message_id = ?",
+                (str(uuid.uuid4()), row["message_id"]),
+            )
+            continue
+        identity = row["mailbox_identity_key"] or proven.get((provider, account_id))
+        rfc_id = normalize_message_id(row["thread_id"])
+        thread_key = str(uuid.uuid4())
+        if rfc_id is not None and identity is not None:
+            scope = (provider, account_id, str(identity))
+            thread_key, merged = _imap_thread_key(db, scope=scope, ids=(rfc_id,))
+            _apply_imap_component(
+                db, scope=scope, thread_key=thread_key, merged=merged, ids=(rfc_id,)
+            )
+        db.execute(
+            "UPDATE messages SET thread_key = ?, rfc_message_id = ? WHERE message_id = ?",
+            (thread_key, rfc_id, row["message_id"]),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO imap_reply_header_gaps(message_id) VALUES (?)",
+            (row["message_id"],),
+        )
+
+
+def _imap_thread_key(
+    db: sqlite3.Connection,
+    *,
+    scope: tuple[str, str, str],
+    ids: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Return (thread key, components to merge into it) for an IMAP message's ids.
+
+    The survivor is the component whose smallest member, under the canonical
+    order (source identity in byte order), sorts first (contract D-identity).
+    """
+    if not ids:
+        return str(uuid.uuid4()), ()
+    placeholders = ", ".join("?" for _ in ids)
+    keys = [
+        str(row["thread_key"])
+        for row in db.execute(
+            f"""SELECT DISTINCT thread_key FROM imap_thread_ids
+            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+              AND rfc_id IN ({placeholders})""",
+            (*scope, *ids),
+        ).fetchall()
+    ]
+    if not keys:
+        return str(uuid.uuid4()), ()
+
+    def rank(key: str) -> tuple[int, str]:
+        smallest = db.execute(
+            """SELECT MIN(provider_message_id) AS smallest FROM messages
+            WHERE provider = ? AND account_id = ? AND thread_key = ?""",
+            (scope[0], scope[1], key),
+        ).fetchone()["smallest"]
+        return (0, str(smallest)) if smallest is not None else (1, key)
+
+    survivor = min(keys, key=rank)
+    return survivor, tuple(key for key in keys if key != survivor)
+
+
+def _apply_imap_component(
+    db: sqlite3.Connection,
+    *,
+    scope: tuple[str, str, str],
+    thread_key: str,
+    merged: tuple[str, ...],
+    ids: tuple[str, ...],
+) -> None:
+    """Merge components into the survivor and register ids; the single re-key owner."""
+    for old_key in merged:
+        # Keys are UUIDv4s, so provider, account, and key identify a component's
+        # rows, including legacy messages stored without a mailbox identity.
+        for table in ("messages", "imap_thread_ids"):
+            db.execute(
+                f"""UPDATE {table} SET thread_key = ?
+                WHERE provider = ? AND account_id = ? AND thread_key = ?""",
+                (thread_key, scope[0], scope[1], old_key),
+            )
+        db.execute(
+            "UPDATE thread_key_aliases SET survivor_key = ? WHERE survivor_key = ?",
+            (thread_key, old_key),
+        )
+        db.execute(
+            """INSERT INTO thread_key_aliases(old_key, survivor_key) VALUES (?, ?)
+            ON CONFLICT(old_key) DO UPDATE SET survivor_key = excluded.survivor_key""",
+            (old_key, thread_key),
+        )
+    for rfc_id in ids:
+        db.execute(
+            """INSERT OR IGNORE INTO imap_thread_ids(
+                provider, account_id, mailbox_identity_key, rfc_id, thread_key
+            ) VALUES (?, ?, ?, ?, ?)""",
+            (*scope, rfc_id, thread_key),
+        )
 
 
 def _migrate_automation_fires_v21(db: sqlite3.Connection) -> None:
@@ -4852,6 +5081,7 @@ class Store:
                 END;
                 """,
             )
+            _migrate_thread_identity(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -7788,6 +8018,8 @@ class Store:
         mailbox_identity_key: str | None = None,
         admission: AdmissionProvenance,
         discovered_at: str,
+        rfc_message_id: str | None = None,
+        reply_ids: tuple[str, ...] = (),
     ) -> bool:
         if mailbox_identity_key is None:
             raise ValueError("mailbox identity key is required")
@@ -7830,14 +8062,30 @@ class Store:
                     _legacy_message_suppression_key(source_message_id),
                 )
             )
+        # Thread key (contract D-identity): provider thread ids for Gmail and
+        # Microsoft; an IMAP component found or merged from the RFC ids. Every
+        # message gets one, so a message without ids forms its own thread.
+        scope = (provider, account_id, mailbox_identity_key)
+        thread_ids: tuple[str, ...] = ()
+        merged: tuple[str, ...] = ()
+        rfc_message_id = normalize_message_id(rfc_message_id)
+        if provider == "imap":
+            thread_ids = tuple(
+                dict.fromkeys(
+                    i for i in map(normalize_message_id, (rfc_message_id, *reply_ids)) if i
+                )
+            )
+            thread_key, merged = _imap_thread_key(db, scope=scope, ids=thread_ids)
+        else:
+            thread_key = thread_id if thread_id else str(uuid.uuid4())
         placeholders = ", ".join("?" for _ in suppression_keys)
         cursor = db.execute(
             f"""INSERT OR IGNORE INTO messages(
                 message_id, provider, account_id, mailbox_identity_key, provider_message_id,
                 thread_id, sender, sender_name, subject, received_at, discovered_at,
                 admission_kind, admission_selector_id, admission_display_name,
-                admission_mailbox_identity_key, admitted_at
-            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                admission_mailbox_identity_key, admitted_at, thread_key, rfc_message_id
+            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM suppressed_messages
                 WHERE provider = ? AND account_id = ?
@@ -7860,12 +8108,19 @@ class Store:
                 admission.display_name,
                 admission.mailbox_identity_key,
                 admission.admitted_at,
+                thread_key,
+                rfc_message_id,
                 provider,
                 account_id,
                 *suppression_keys,
             ),
         )
-        return cursor.rowcount == 1
+        inserted = cursor.rowcount == 1
+        if inserted and provider == "imap":
+            _apply_imap_component(
+                db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
+            )
+        return inserted
 
     def add_message(
         self,
@@ -7881,6 +8136,8 @@ class Store:
         provider_message_id: str | None = None,
         mailbox_identity_key: str | None = None,
         admission: AdmissionProvenance,
+        rfc_message_id: str | None = None,
+        reply_ids: tuple[str, ...] = (),
     ) -> bool:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -7898,7 +8155,125 @@ class Store:
                 received_at=received_at,
                 admission=admission,
                 discovered_at=datetime.now(UTC).isoformat(),
+                rfc_message_id=rfc_message_id,
+                reply_ids=reply_ids,
             )
+
+    # Vendor records (contract D-vendor). Addresses arrive normalized.
+    def list_vendors(self) -> list[dict[str, object]]:
+        with self.connection() as db:
+            vendors = db.execute(
+                """SELECT vendor_id, display_name, created_at, updated_at FROM vendors
+                ORDER BY display_name, vendor_id"""
+            ).fetchall()
+            addresses = db.execute(
+                "SELECT vendor_id, address FROM vendor_addresses ORDER BY created_at, address"
+            ).fetchall()
+        by_vendor: dict[str, list[str]] = {}
+        for row in addresses:
+            by_vendor.setdefault(str(row["vendor_id"]), []).append(str(row["address"]))
+        return [
+            {**dict(row), "addresses": by_vendor.get(str(row["vendor_id"]), [])}
+            for row in vendors
+        ]
+
+    def vendor(self, vendor_id: str) -> dict[str, object]:
+        for item in self.list_vendors():
+            if item["vendor_id"] == vendor_id:
+                return item
+        raise KeyError(vendor_id)
+
+    def vendor_for_address(self, address: str) -> dict[str, object] | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT v.vendor_id, v.display_name FROM vendor_addresses AS a
+                JOIN vendors AS v ON v.vendor_id = a.vendor_id WHERE a.address = ?""",
+                (address,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_vendor(self, display_name: str, *, now: datetime | None = None) -> str:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        vendor_id = str(uuid.uuid4())
+        with self.connection() as db:
+            db.execute(
+                """INSERT INTO vendors(vendor_id, display_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)""",
+                (vendor_id, display_name, stamp, stamp),
+            )
+        return vendor_id
+
+    def rename_vendor(
+        self, vendor_id: str, display_name: str, *, now: datetime | None = None
+    ) -> None:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            updated = db.execute(
+                "UPDATE vendors SET display_name = ?, updated_at = ? WHERE vendor_id = ?",
+                (display_name, stamp, vendor_id),
+            )
+        if updated.rowcount != 1:
+            raise KeyError(vendor_id)
+
+    def add_vendor_address(
+        self, vendor_id: str, address: str, *, now: datetime | None = None
+    ) -> bool:
+        """Link an address; False if this vendor already has it."""
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _require_vendor(db, vendor_id)
+            owner = db.execute(
+                """SELECT a.vendor_id, v.display_name FROM vendor_addresses AS a
+                JOIN vendors AS v ON v.vendor_id = a.vendor_id WHERE a.address = ?""",
+                (address,),
+            ).fetchone()
+            if owner is not None:
+                if owner["vendor_id"] == vendor_id:
+                    return False
+                raise VendorAddressConflict(address, str(owner["display_name"]))
+            db.execute(
+                "INSERT INTO vendor_addresses(address, vendor_id, created_at) VALUES (?, ?, ?)",
+                (address, vendor_id, stamp),
+            )
+        return True
+
+    def remove_vendor_address(
+        self, vendor_id: str, address: str, *, now: datetime | None = None
+    ) -> bool:
+        """Unlink an address and record its dismissal (contract D-ops); False if not linked."""
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            _require_vendor(db, vendor_id)
+            removed = db.execute(
+                "DELETE FROM vendor_addresses WHERE vendor_id = ? AND address = ?",
+                (vendor_id, address),
+            )
+            if removed.rowcount != 1:
+                return False
+            db.execute(
+                """INSERT OR IGNORE INTO vendor_address_dismissals(vendor_id, address, created_at)
+                VALUES (?, ?, ?)""",
+                (vendor_id, address, stamp),
+            )
+        return True
+
+    def delete_vendor(self, vendor_id: str) -> list[str]:
+        """Delete a vendor with its addresses and dismissals; return the addresses it had."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            addresses = [
+                str(row["address"])
+                for row in db.execute(
+                    "SELECT address FROM vendor_addresses WHERE vendor_id = ? ORDER BY address",
+                    (vendor_id,),
+                ).fetchall()
+            ]
+            deleted = db.execute("DELETE FROM vendors WHERE vendor_id = ?", (vendor_id,))
+            if deleted.rowcount != 1:
+                raise KeyError(vendor_id)
+        return addresses
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)

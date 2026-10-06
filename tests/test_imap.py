@@ -22,6 +22,7 @@ from eom_email_watcher.imap import (
     MAX_MESSAGE_BYTES,
     MAX_MIME_DEPTH,
     MAX_MIME_PARTS,
+    MAX_REPLY_HEADER_BYTES,
     MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
     RECOVERY_CURSOR_PREFIX,
@@ -1814,3 +1815,77 @@ def test_parsed_message_content_reports_pre_cut_length(
 
     assert content.body == expected_body
     assert content.body_source_chars == 9
+
+
+class ReplyHeaderImap(FakeImap):
+    """Answer the metadata FETCH with the main headers and a reply-header literal."""
+
+    def __init__(self, reply_headers: bytes) -> None:
+        super().__init__()
+        self.reply_headers = reply_headers
+
+    def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+        query = str(args[-1]) if args else ""
+        if command == "FETCH" and "IN-REPLY-TO" in query:
+            self.calls.append(("uid", command, *args))
+            uid = str(args[0])
+            headers, _separator, _body = self.raw_message.partition(b"\r\n\r\n")
+            prefix = (
+                f"{uid} (UID {uid} INTERNALDATE \"04-Sep-2026 10:16:00 -0500\" "
+                "BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0> {1}"
+            ).encode()
+            reply_prefix = b" BODY[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]<0> {1}"
+            return "OK", [
+                (prefix, headers + b"\r\n\r\n"),
+                (reply_prefix, self.reply_headers),
+                b")",
+            ]
+        return super().uid(command, *args)
+
+
+def test_metadata_fetch_requests_reply_headers_as_a_separate_bounded_item() -> None:
+    client = ReplyHeaderImap(
+        b"In-Reply-To: <parent@x>\r\nReferences: <root@x> <parent@x>\r\n\r\n"
+    )
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    metadata = gateway.metadata(message_id())
+
+    assert metadata.reply_ids == ("parent@x", "root@x")
+    fetch = next(str(call[-1]) for call in client.calls if call[:2] == ("uid", "FETCH"))
+    assert f"(FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>" in fetch
+    assert f"(IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>" in fetch
+
+
+def test_metadata_keeps_64_references_and_drops_overlong_ids() -> None:
+    references = b" ".join(f"<id-{index}@x>".encode() for index in range(65))
+    overlong = b"<" + b"y" * 999 + b"@x>"
+    client = ReplyHeaderImap(b"References: " + overlong + b" " + references + b"\r\n\r\n")
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    reply_ids = gateway.metadata(message_id()).reply_ids
+
+    assert len(reply_ids) == 64
+    assert reply_ids[0] == "id-0@x"
+    assert all(len(item) <= 998 for item in reply_ids)
+
+
+def test_oversized_reply_headers_are_ignored_and_the_message_is_kept() -> None:
+    client = ReplyHeaderImap(b"References: <" + b"z" * MAX_REPLY_HEADER_BYTES + b"@x>\r\n\r\n")
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    metadata = gateway.metadata(message_id())
+
+    assert metadata.reply_ids == ()
+    assert metadata.sender == "watched@example.com"
+
+
+
+def test_reply_headers_keep_only_well_formed_message_ids() -> None:
+    client = ReplyHeaderImap(
+        b"In-Reply-To: <not-an-id>\r\n"
+        b"References: <@host> <left@> <a b@x> <root@example.com> <root@example.com>\r\n\r\n"
+    )
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    assert gateway.metadata(message_id()).reply_ids == ("root@example.com",)
