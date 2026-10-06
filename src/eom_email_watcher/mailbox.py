@@ -99,10 +99,15 @@ def recipient_addresses(value: object) -> tuple[str, ...]:
     found: list[str] = []
     for _name, address in getaddresses([value]):
         candidate = address.strip().casefold()
+        try:
+            size = len(candidate.encode("utf-8"))
+        except UnicodeEncodeError:
+            # An unpaired surrogate from a provider payload is a malformed entry.
+            continue
         if (
             "@" in candidate
             and not any(c.isspace() for c in candidate)
-            and len(candidate.encode("utf-8")) <= MAX_RECIPIENT_ADDRESS_BYTES
+            and size <= MAX_RECIPIENT_ADDRESS_BYTES
         ):
             found.append(candidate)
     return tuple(dict.fromkeys(found))

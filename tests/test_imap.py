@@ -1980,9 +1980,16 @@ class SentFolderImap(FakeImap):
         self.sent_sequence_uids = sent_sequence_uids or [3]
         self.selected = "INBOX"
 
+    # Like imaplib after login: the server's capabilities, plain by default.
+    capabilities: tuple[str, ...] = ("IMAP4REV1",)
+
     def list(self, directory: str, pattern: str) -> tuple[str, list[object]]:
         self.calls.append(("list", directory, pattern))
         return "OK", list(self.list_lines)
+
+    def xatom(self, name: str, *args: str) -> tuple[str, list[bytes]]:
+        self.calls.append(("xatom", name, *args))
+        return "OK", [b"LIST completed"]
 
     def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
         self.calls.append(("select", mailbox, readonly))
@@ -1998,6 +2005,8 @@ class SentFolderImap(FakeImap):
     def response(self, name: str) -> tuple[str, list[bytes]]:
         if name == "EXPUNGE":
             return name, []
+        if name == "LIST":
+            return name, list(self.list_lines)  # type: ignore[arg-type]
         inbox = self.selected == "INBOX"
         if name == "UIDVALIDITY":
             value = self.uid_validity if inbox else self.sent_uid_validity
@@ -2082,7 +2091,8 @@ def test_configured_sent_folder_is_used_when_the_server_lists_none() -> None:
     assert gateway.sent_scope() == "available"
     gateway.sent_initial_cursor()
     assert '"Enviados"' in _selects(client)
-    assert not any(call[0] == "list" for call in client.calls)
+    # The server is asked first; the configured name is the fallback.
+    assert sum(1 for call in client.calls if call[0] == "list") == 1
 
 
 def test_without_a_sent_folder_the_scope_is_unavailable() -> None:
@@ -2212,6 +2222,28 @@ def test_a_configured_non_ascii_sent_folder_is_selected_in_wire_form() -> None:
 
     assert gateway.sent_scope() == "available"
     assert '"Envoy&AOk-s"' in _selects(client)
+
+
+def test_a_server_advertising_special_use_is_asked_for_it() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    client.capabilities = ("IMAP4REV1", "SPECIAL-USE")
+    gateway = _sent_gateway(client, credentials())
+
+    assert gateway.sent_scope() == "available"
+    assert ("xatom", "LIST", '""', "*", "RETURN", "(SPECIAL-USE)") in client.calls
+    assert not any(call[0] == "list" for call in client.calls)
+    assert '"Sent Messages"' in _selects(client)
+
+
+def test_an_advertised_sent_folder_wins_over_a_configured_fallback() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Custom"})
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "available"
+    selects = _selects(client)
+    assert '"Sent Messages"' in selects
+    assert '"Custom"' not in selects
 
 
 def test_a_configured_sent_folder_that_cannot_be_selected_is_unavailable() -> None:

@@ -1264,6 +1264,82 @@ def test_dry_run_previews_open_recovery_without_mutating_it(tmp_path: Path) -> N
     assert store.state()[0] == "100"
 
 
+def test_dry_run_recovery_preview_keeps_sent_only_candidates_out_of_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = replace(config(tmp_path), senders=())
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 9, 19, 12, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+    selector_set = store.gmail_label_selector_set("gmail-default")
+    assert selector_set is not None
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        "Label_123",
+        "Invoices",
+        selector_set.revision,
+    )
+    frozen_after = 1_779_000_000
+    store.create_gmail_recovery_state(
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        revision,
+        (),
+        (selector,),
+        frozen_after,
+        frozen_after + 3_600,
+        "200",
+    )
+
+    class SentOnlyRecoveryGmail(FreshGmail):
+        labels = frozenset({"SENT", "Label_123"})
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("allowed",), None
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata(message_id),
+                labels=self.labels,
+                locations=frozenset(
+                    location
+                    for label, location in GMAIL_LOCATION_LABELS.items()
+                    if label in self.labels
+                ),
+                received_at=datetime(2026, 10, 1, 12, tzinfo=UTC).isoformat(),
+            )
+
+    # The autouse conftest fixture reports no entitlement: Sent is out of scope.
+    inactive = Watcher(cfg, store, SentOnlyRecoveryGmail(), FakeModel()).check(dry_run=True)
+    assert inactive["recovery_pending"] is True
+    assert inactive["discovered"] == 0
+
+    _active_entitlement(monkeypatch)
+    active = Watcher(cfg, store, SentOnlyRecoveryGmail(), FakeModel()).check(dry_run=True)
+    assert active["recovery_pending"] is True
+    assert active["discovered"] == 1
+
+
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(
     tmp_path: Path,
 ) -> None:

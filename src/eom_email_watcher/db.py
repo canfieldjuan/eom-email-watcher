@@ -3322,7 +3322,9 @@ CREATE TABLE IF NOT EXISTS message_locations (
     mailbox_identity_key TEXT NOT NULL,
     provider_message_id TEXT NOT NULL,
     location TEXT NOT NULL CHECK (location IN ('inbox', 'sent')),
-    recorded_at TEXT NOT NULL,
+    -- NULL for a folder the schema-30 migration assumed (the pre-M2 poller admitted
+    -- from the Inbox only); the first fetch that observes the folder stamps it.
+    recorded_at TEXT,
     PRIMARY KEY (provider, account_id, mailbox_identity_key, provider_message_id, location)
 );
 CREATE INDEX IF NOT EXISTS idx_message_locations_message ON message_locations(message_id);
@@ -3377,30 +3379,34 @@ def _record_locations(
     mailbox_identity_key: str,
     provider_message_id: str,
     locations: Iterable[str],
-    recorded_at: str,
+    recorded_at: str | None,
 ) -> int:
-    """Record a source identity's admitted folders on its logical message (D-identity)."""
+    """Record a source identity's admitted folders on its logical message (D-identity).
+
+    Returns the number of new rows. An observed folder (recorded_at given) also
+    stamps a row the migration assumed, which carries no recorded_at.
+    """
     recorded = 0
     if not locations:
         raise ValueError("a captured message names at least one admitted folder")
     for location in sorted(set(locations)):
         if location not in MESSAGE_LOCATIONS:
             raise ValueError(f"unknown message location {location!r}")
+        key = (provider, account_id, mailbox_identity_key, provider_message_id, location)
         recorded += db.execute(
             """INSERT OR IGNORE INTO message_locations(
                 message_id, provider, account_id, mailbox_identity_key,
                 provider_message_id, location, recorded_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                message_id,
-                provider,
-                account_id,
-                mailbox_identity_key,
-                provider_message_id,
-                location,
-                recorded_at,
-            ),
+            (message_id, *key, recorded_at),
         ).rowcount
+        if recorded_at is not None:
+            db.execute(
+                """UPDATE message_locations SET recorded_at = ?
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND provider_message_id = ? AND location = ? AND recorded_at IS NULL""",
+                (recorded_at, *key),
+            )
     return recorded
 
 
@@ -3532,7 +3538,8 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
             mailbox_identity_key=str(identity),
             provider_message_id=str(row["provider_message_id"]),
             locations=(INBOX_LOCATION,),
-            recorded_at=str(row["discovered_at"]),
+            # Assumed, not observed: the pre-M2 poller admitted from the Inbox only.
+            recorded_at=None,
         )
     # Rows sharing a logical identity are one message (contract D-identity): the
     # canonical-smallest row keeps the identity, the others point to it and their
@@ -8611,21 +8618,28 @@ class Store:
     def message_location_count(
         self, *, provider: str, account_id: str, mailbox_identity_key: str, provider_message_id: str
     ) -> int | None:
-        """Locations recorded for a stored source identity, or None if it is not stored."""
+        """Locations recorded for one stored source identity, or None if it is not stored.
+
+        The count is the source identity's own, not its logical message's: two
+        coalesced copies each have their own folders (contract D-identity).
+        """
+        key = (provider, account_id, mailbox_identity_key, provider_message_id)
         with self.connection() as db:
-            row = db.execute(
-                """SELECT COALESCE(m.logical_of, m.message_id) AS logical_id FROM messages AS m
-                WHERE m.provider = ? AND m.account_id = ? AND m.mailbox_identity_key = ?
-                  AND m.provider_message_id = ?""",
-                (provider, account_id, mailbox_identity_key, provider_message_id),
-            ).fetchone()
-            if row is None:
-                return None
             count = db.execute(
-                "SELECT COUNT(*) FROM message_locations WHERE message_id = ?",
-                (str(row["logical_id"]),),
+                """SELECT COUNT(*) FROM message_locations
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND provider_message_id = ?""",
+                key,
             ).fetchone()[0]
-        return int(count)
+            if count:
+                return int(count)
+            stored = db.execute(
+                """SELECT 1 FROM messages
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND provider_message_id = ?""",
+                key,
+            ).fetchone()
+        return 0 if stored is not None else None
 
     def record_message_location(
         self,
@@ -8830,25 +8844,37 @@ class Store:
         return cursor.rowcount >= 1
 
     def clear_messages(self, *, now: datetime | None = None) -> int:
+        """Delete every message, each logical message as one unit (contract D-identity).
+
+        A unit's rows are locked, suppressed, marked, and counted together; the
+        delete trigger removes the rows pointing at each canonical.
+        """
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
         with self.connection() as db:
-            message_ids = [
+            canonicals = [
                 str(row["message_id"])
                 for row in db.execute(
-                    "SELECT message_id FROM messages ORDER BY message_id"
+                    "SELECT message_id FROM messages WHERE logical_of IS NULL ORDER BY message_id"
                 ).fetchall()
             ]
         deleted = 0
-        for offset in range(0, len(message_ids), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
-            chunk = message_ids[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
-            with self._source_cleanup_locks(chunk), self.connection() as db:
+        for offset in range(0, len(canonicals), SOURCE_CLEANUP_LOCK_BATCH_SIZE):
+            chunk = canonicals[offset : offset + SOURCE_CLEANUP_LOCK_BATCH_SIZE]
+            with self.connection() as db:
+                unit_rows = _unit_rows(db, chunk)
+            if not unit_rows:
+                continue
+            with self._source_cleanup_locks(unit_rows), self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
-                placeholders = ", ".join("?" for _ in chunk)
+                current_rows = _unit_rows(db, chunk)
+                if not current_rows:
+                    continue
+                row_placeholders = ", ".join("?" for _ in current_rows)
                 rows = db.execute(
                     f"""SELECT message_id, provider, account_id, mailbox_identity_key,
                         provider_message_id, received_at FROM messages
-                        WHERE message_id IN ({placeholders})""",
-                    tuple(chunk),
+                        WHERE message_id IN ({row_placeholders})""",
+                    tuple(current_rows),
                 ).fetchall()
                 # Recorded locations are source identities too (contract D-identity).
                 located = db.execute(
@@ -8856,30 +8882,9 @@ class Store:
                         l.provider_message_id, m.received_at
                     FROM message_locations AS l
                     JOIN messages AS m ON m.message_id = l.message_id
-                    WHERE l.message_id IN ({placeholders})""",
-                    tuple(chunk),
+                    WHERE l.message_id IN ({row_placeholders})""",
+                    tuple(current_rows),
                 ).fetchall()
-                db.executemany(
-                    """INSERT INTO suppressed_messages(
-                            provider, account_id, message_key, expires_at
-                        ) VALUES (?, ?, ?, ?)
-                        ON CONFLICT(provider, account_id, message_key)
-                        DO UPDATE SET expires_at = excluded.expires_at""",
-                    [
-                        (
-                            str(row["provider"]),
-                            str(row["account_id"]),
-                            _message_suppression_key(
-                                str(row["provider"]),
-                                str(row["account_id"]),
-                                str(row["provider_message_id"]),
-                                str(row["mailbox_identity_key"]),
-                            ),
-                            _suppression_expiry(str(row["received_at"]), stamp),
-                        )
-                        for row in located
-                    ],
-                )
                 db.executemany(
                     """INSERT INTO suppressed_messages(
                             provider, account_id, message_key, expires_at
@@ -8902,22 +8907,21 @@ class Store:
                             ),
                             _suppression_expiry(str(row["received_at"]), stamp),
                         )
-                        for row in rows
+                        for row in (*rows, *located)
                     ],
                 )
-                current_ids = [str(row["message_id"]) for row in rows]
                 _mark_automation_sources_unavailable(
                     db,
-                    current_ids,
+                    current_rows,
                     updated_at=stamp.isoformat(),
                 )
-                if current_ids:
-                    current_placeholders = ", ".join("?" for _ in current_ids)
-                    cursor = db.execute(
-                        f"DELETE FROM messages WHERE message_id IN ({current_placeholders})",
-                        tuple(current_ids),
-                    )
-                    deleted += cursor.rowcount
+                current_canonicals = [m for m in chunk if m in set(current_rows)]
+                canonical_placeholders = ", ".join("?" for _ in current_canonicals)
+                db.execute(
+                    f"DELETE FROM messages WHERE message_id IN ({canonical_placeholders})",
+                    tuple(current_canonicals),
+                )
+                deleted += len(current_rows)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             _purge_expired_automation_tombstones(db, now=stamp.isoformat())

@@ -492,14 +492,25 @@ def _parse_list_line(item: object) -> tuple[frozenset[str], str] | None:
 
 
 def _special_use_sent_folder(client: imaplib.IMAP4) -> str | None:
-    """The folder flagged \\Sent by RFC 6154 SPECIAL-USE, when the server lists one."""
+    """The folder flagged \\Sent by RFC 6154 SPECIAL-USE, when the server lists one.
+
+    A server that advertises SPECIAL-USE must include the attributes only when
+    asked with RETURN (SPECIAL-USE) (RFC 6154 section 2), so the extended LIST
+    is sent when the capability is there; a plain LIST may still carry them.
+    """
     try:
-        status, lines = client.list('""', "*")
+        if "SPECIAL-USE" in getattr(client, "capabilities", ()):
+            status, _ = client.xatom("LIST", '""', "*", "RETURN", "(SPECIAL-USE)")
+            _, lines = client.response("LIST")
+        else:
+            status, lines = client.list('""', "*")
     except imaplib.IMAP4.error:
         return None
     if status != "OK":
         return None
     for item in lines or []:
+        if item is None:
+            continue
         parsed = _parse_list_line(item)
         if parsed is not None and "\\sent" in parsed[0]:
             return parsed[1]
@@ -1678,14 +1689,20 @@ class ImapGateway:
             self._select_mailbox(client, folder)
 
     def _resolve_sent_folder(self, client: imaplib.IMAP4) -> str | None:
-        """The Sent folder: the configured name, else the server's \\Sent (contract D-scope)."""
+        """The Sent folder: the server's \\Sent, else the configured name (contract D-scope).
+
+        The configured name is the fallback for a server that lists no \\Sent, so an
+        advertised folder is never displaced by a stale configuration.
+        """
         if not self._sent_folder_resolved:
+            advertised = _special_use_sent_folder(client)
             configured = self.credentials.sent_folder
-            self._sent_folder = (
-                _encode_mailbox_name(configured)
-                if configured is not None
-                else _special_use_sent_folder(client)
-            )
+            if advertised is not None:
+                self._sent_folder = advertised
+            elif configured is not None:
+                self._sent_folder = _encode_mailbox_name(configured)
+            else:
+                self._sent_folder = None
             self._sent_folder_resolved = True
         return self._sent_folder
 

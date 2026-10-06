@@ -7281,3 +7281,84 @@ def test_purge_keeps_a_logical_message_until_every_row_has_expired(tmp_path: Pat
     assert outcome.messages == 2
     assert not store.has_message(root) and not store.has_message(duplicate)
     assert store.message_locations(root) == []
+
+
+def _coalesced_pair(tmp_path: Path) -> tuple[Store, str, str]:
+    """A canonical row and a retained duplicate pointing at it, as the upgrade leaves them."""
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    duplicate = _retained_duplicate(store, "2", "root@x")
+    _reset_to_schema_29(store)
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT logical_of FROM messages WHERE message_id = ?", (duplicate,)
+        ).fetchone()[0] == root
+    return store, root, duplicate
+
+
+def _source_scope(store: Store, message_id: str) -> dict[str, str]:
+    with store.connection() as db:
+        row = db.execute(
+            """SELECT provider, account_id, mailbox_identity_key, provider_message_id
+            FROM messages WHERE message_id = ?""",
+            (message_id,),
+        ).fetchone()
+    return {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+
+
+def test_location_count_is_per_source_identity(tmp_path: Path) -> None:
+    store, root, duplicate = _coalesced_pair(tmp_path)
+    root_scope = _source_scope(store, root)
+    duplicate_scope = _source_scope(store, duplicate)
+    # Both copies were assumed in the Inbox; each counts its own folder only.
+    assert store.message_location_count(**root_scope) == 1
+    assert store.message_location_count(**duplicate_scope) == 1
+
+    assert store.record_message_location(**duplicate_scope, locations=frozenset({"sent"})) == 1
+    assert store.message_location_count(**duplicate_scope) == 2
+    assert store.message_location_count(**root_scope) == 1
+    assert store.message_locations(root) == ["inbox", "sent"]
+
+
+def test_upgrade_assumes_inbox_and_the_first_observation_stamps_it(tmp_path: Path) -> None:
+    store, root, _duplicate = _coalesced_pair(tmp_path)
+    scope = _source_scope(store, root)
+
+    def recorded() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                """SELECT recorded_at FROM message_locations
+                WHERE provider_message_id = ? ORDER BY location""",
+                (scope["provider_message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert recorded() == [None]
+    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    assert store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at) == 0
+    assert recorded() == [observed_at.isoformat()]
+
+
+def test_clear_messages_removes_logical_units_whole(tmp_path: Path) -> None:
+    store, root, duplicate = _coalesced_pair(tmp_path)
+    lone = _imap_message(store, "3", None)
+    root_scope = _source_scope(store, root)
+    duplicate_scope = _source_scope(store, duplicate)
+
+    assert store.clear_messages() == 3
+    assert not store.has_message(root)
+    assert not store.has_message(duplicate)
+    assert not store.has_message(lone)
+    # Every source identity of the unit is suppressed, the child's included.
+    for scope in (root_scope, duplicate_scope):
+        assert store.has_seen_message(
+            scope["provider_message_id"],
+            provider=scope["provider"],
+            account_id=scope["account_id"],
+            mailbox_identity_key=scope["mailbox_identity_key"],
+        )

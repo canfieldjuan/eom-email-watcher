@@ -1599,6 +1599,7 @@ class Watcher:
         mailbox_identity_key: str,
         checked_at: datetime,
         deliver_notifications: bool,
+        folders: frozenset[str],
     ) -> dict[str, int | bool | str]:
         """Preview the frozen recovery window without changing durable progress."""
         deadline = time.monotonic() + 30.0
@@ -1657,6 +1658,7 @@ class Watcher:
                 exact_senders=current_senders,
                 label_selectors=current_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
             received_at = _received_at_or_none(
                 metadata.received_at,
@@ -2000,6 +2002,7 @@ class Watcher:
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=checked_at,
                     deliver_notifications=deliver_notifications,
+                    folders=folders,
                 )
         try:
             changes = self.gateway.changes_since(cursor)
