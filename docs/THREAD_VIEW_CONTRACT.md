@@ -131,7 +131,7 @@ Each definition is the only place its rule is stated.
 - **Source identity.**
   - Gmail message ids are mailbox-wide.
   - Microsoft ids are immutable ids (`Prefer: IdType="ImmutableId"`) and survive moves.
-  - IMAP ids are `mailbox:UIDVALIDITY:UID` (`imap.py:310-315`), with a folder token added for the Sent folder, so the unique source key (`db.py:3335-3336`) separates folders.
+  - IMAP ids are `mailbox:UIDVALIDITY:UID` (`imap.py:320-321`), with a folder token added for the Sent folder, so the unique source key (`db.py:3585-3588`) separates folders.
 - **Logical identity.** A message with a `Message-ID` also has the logical identity `(provider, account, mailbox identity, Message-ID)`.
   - A second location of an already-captured logical identity is recorded, not captured again.
   - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
