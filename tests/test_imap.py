@@ -4,7 +4,7 @@ import imaplib
 import re
 import ssl
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -28,7 +28,9 @@ from eom_email_watcher.imap import (
     MAX_UID_SEARCH_SPAN,
     MESSAGE_ID_PREFIX,
     RECOVERY_CURSOR_PREFIX,
+    SENT_CURSOR_PREFIX,
     SENT_MESSAGE_ID_PREFIX,
+    SENT_RECOVERY_CURSOR_PREFIX,
     ImapCredentials,
     ImapError,
     ImapGateway,
@@ -1967,9 +1969,11 @@ class SentFolderImap(FakeImap):
         sent_uid_validity: int = 77,
         sent_uid_next: int = 4,
         sent_sequence_uids: list[int] | None = None,
+        reject: set[str] | None = None,
         **options: object,
     ) -> None:
         super().__init__(**options)
+        self.reject = reject or set()
         self.list_lines = list_lines
         self.sent_uid_validity = sent_uid_validity
         self.sent_uid_next = sent_uid_next
@@ -1983,6 +1987,8 @@ class SentFolderImap(FakeImap):
     def select(self, mailbox: str, readonly: bool = False) -> tuple[str, list[bytes]]:
         self.calls.append(("select", mailbox, readonly))
         self.readonly = readonly
+        if mailbox.strip('"') in self.reject:
+            return "NO", [b"Mailbox does not exist"]
         self.selected = mailbox.strip('"')
         return "OK", [str(len(self._uids())).encode("ascii")]
 
@@ -2062,7 +2068,8 @@ def test_special_use_sent_folder_is_discovered_and_selected() -> None:
     cursor = gateway.sent_initial_cursor()
 
     mailbox_id = imap_mailbox_identity(credentials())
-    assert cursor == f"{CURSOR_PREFIX}{mailbox_id}:77:3"
+    folder_key = imap_module._folder_key("Sent Messages")
+    assert cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
     assert '"Sent Messages"' in _selects(client)
     assert client.readonly is True
 
@@ -2093,14 +2100,14 @@ def test_sent_ids_carry_a_folder_token_so_colliding_uids_stay_distinct() -> None
     gateway = _sent_gateway(client)
     mailbox_id = imap_mailbox_identity(credentials())
 
+    folder_key = imap_module._folder_key("Sent Messages")
     inbox = gateway.changes_since(f"{CURSOR_PREFIX}{mailbox_id}:44:0")
-    sent = gateway.sent_changes_since(f"{CURSOR_PREFIX}{mailbox_id}:77:0")
+    sent = gateway.sent_changes_since(f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:0")
 
     assert inbox.message_ids == (f"{MESSAGE_ID_PREFIX}{mailbox_id}:44:3",)
-    folder_key = imap_module._folder_key("Sent Messages")
     assert sent.message_ids == (f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3",)
     assert inbox.message_ids[0] != sent.message_ids[0]
-    assert sent.cursor == f"{CURSOR_PREFIX}{mailbox_id}:77:3"
+    assert sent.cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
 
 
 def test_metadata_selects_the_folder_an_id_names_and_restores_inbox_validation() -> None:
@@ -2155,3 +2162,64 @@ def test_connection_rejects_invalid_sent_folder_names(sent_folder: object) -> No
     with pytest.raises(ImapError) as excinfo:
         credentials_from_connection(connection(sent_folder=sent_folder))
     assert excinfo.value.code == "imap_configuration_error"
+
+
+def test_a_sent_cursor_for_another_folder_is_stale() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST)
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    other = imap_module._folder_key("Old Sent")
+
+    with pytest.raises(StaleMailboxCursor, match="Sent folder changed"):
+        gateway.sent_changes_since(f"{SENT_CURSOR_PREFIX}{mailbox_id}:{other}:77:0")
+    day = date(2026, 9, 1).toordinal()
+    stale_recovery = f"{SENT_RECOVERY_CURSOR_PREFIX}{mailbox_id}:{other}:77:3:3:{day}"
+    with pytest.raises(StaleMailboxCursor, match="Sent folder changed"):
+        gateway.sent_changes_since(stale_recovery)
+
+
+def test_sent_recovery_pages_the_sent_folder_with_folder_bound_cursors() -> None:
+    client = SentFolderImap(list_lines=SENT_LIST, sent_sequence_uids=[3])
+    gateway = _sent_gateway(client)
+    mailbox_id = imap_mailbox_identity(credentials())
+    folder_key = imap_module._folder_key("Sent Messages")
+
+    changes = gateway.sent_recover_since(datetime(2026, 9, 1, tzinfo=UTC))
+
+    assert changes.message_ids == (f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:77:3",)
+    assert changes.cursor == f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:77:3"
+    assert '"Sent Messages"' in _selects(client)
+    assert any(call[0] == "search" and "SINCE" in call for call in client.calls)
+
+
+@pytest.mark.parametrize(
+    ("name", "encoded"),
+    [
+        ("Sent", "Sent"),
+        ("A&B", "A&-B"),
+        ("Envoy\u00e9s", "Envoy&AOk-s"),
+        ("\u9001\u4fe1", "&kAFP4Q-"),
+    ],
+)
+def test_mailbox_names_are_encoded_as_modified_utf7(name: str, encoded: str) -> None:
+    assert imap_module._encode_mailbox_name(name) == encoded
+
+
+def test_a_configured_non_ascii_sent_folder_is_selected_in_wire_form() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Envoy\u00e9s"})
+    client = SentFolderImap(list_lines=NO_SENT_LIST)
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "available"
+    assert '"Envoy&AOk-s"' in _selects(client)
+
+
+def test_a_configured_sent_folder_that_cannot_be_selected_is_unavailable() -> None:
+    values = ImapCredentials(**{**asdict(credentials()), "sent_folder": "Missing"})
+    client = SentFolderImap(list_lines=NO_SENT_LIST, reject={"Missing"})
+    gateway = _sent_gateway(client, values)
+
+    assert gateway.sent_scope() == "unavailable"
+    with pytest.raises(ImapError) as excinfo:
+        gateway.sent_initial_cursor()
+    assert excinfo.value.code == "imap_sent_unavailable"

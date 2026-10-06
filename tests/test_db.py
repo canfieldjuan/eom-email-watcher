@@ -3128,6 +3128,7 @@ def test_recovery_terminal_insert_revocation_and_cursor_commit_are_atomic(
         sender_name=None,
         subject="Invoice",
         received_at="2026-09-19T11:59:00+00:00",
+        locations=frozenset({"inbox"}),
     )
 
     assert store.finish_gmail_recovery_candidate(
@@ -3167,6 +3168,7 @@ def test_recovery_terminal_insert_revocation_and_cursor_commit_are_atomic(
                 sender_name=None,
                 subject="Revoked",
                 received_at="2026-09-19T11:59:30+00:00",
+                locations=frozenset({"inbox"}),
             ),
             admission=admission,
             metadata_label_ids=frozenset({"INBOX", "Label_1"}),
@@ -3262,6 +3264,7 @@ def test_recovery_terminal_recomputes_smallest_current_frozen_label_winner(
         sender_name=None,
         subject="Overlap",
         received_at="2026-09-19T11:59:00+00:00",
+        locations=frozenset({"inbox"}),
     )
     metadata_labels = frozenset({"INBOX", first.label_id, second.label_id})
 
@@ -7101,3 +7104,180 @@ def test_clearing_messages_suppresses_recorded_locations_too(tmp_path: Path) -> 
         assert store.has_seen_message(
             source, provider="imap", account_id="imap-account", mailbox_identity_key=identity
         ), source
+
+
+def test_purging_a_canonical_row_takes_its_logical_children(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    duplicate = _retained_duplicate(store, "2", "root@x")
+    _reset_to_schema_29(store)
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    # Any deletion path, not only delete_message: a bare DELETE stands in for the purge.
+    with migrated.connection() as db:
+        db.execute("DELETE FROM messages WHERE message_id = ?", (root,))
+        remaining = [row[0] for row in db.execute("SELECT message_id FROM messages")]
+    assert duplicate not in remaining and root not in remaining
+
+
+def test_gmail_recovery_stores_the_metadata_polling_stores(tmp_path: Path) -> None:
+    store, identity = _gmail_selector_store(tmp_path)
+    revision, selector = store.add_gmail_label_selector(
+        "gmail-default", identity, "Label_1", "Invoices", 0
+    )
+    store.set_state(
+        "old-history", provider="gmail", account_id="gmail-default", mailbox_identity_key=identity
+    )
+    store.create_gmail_recovery_state(
+        "gmail-default", identity, revision, [], [selector], 1, 2, "replacement-history"
+    )
+    store.store_gmail_recovery_page("gmail-default", identity, ["m1"], None)
+    admission = db_module.AdmissionProvenance(
+        kind="gmail_user_label",
+        selector_id=selector.selector_id,
+        display_name="Invoices",
+        mailbox_identity_key=identity,
+        admitted_at="2026-09-19T12:00:00+00:00",
+    )
+    message = db_module.GmailRecoveryMessage(
+        message_id="local-m1",
+        thread_id="t1",
+        sender="sender@example.com",
+        sender_name=None,
+        subject="Invoice",
+        received_at="2026-09-19T11:59:00+00:00",
+        rfc_message_id="m1@vendor.example",
+        reply_ids=("p@vendor.example",),
+        to=("billing@vendor.example", "sales@vendor.example"),
+        cc=("cc@other.example",),
+        locations=frozenset({"sent"}),
+        capture_timezone="America/Chicago",
+    )
+
+    assert store.finish_gmail_recovery_candidate(
+        "gmail-default",
+        identity,
+        "m1",
+        message=message,
+        admission=admission,
+        metadata_label_ids=frozenset({"SENT", "Label_1"}),
+    )
+
+    assert store.message_locations("local-m1") == ["sent"]
+    with store.connection() as db:
+        recipients = db.execute(
+            """SELECT field, position, address FROM message_recipients
+            WHERE message_id = 'local-m1' ORDER BY field DESC, position"""
+        ).fetchall()
+        row = db.execute(
+            "SELECT rfc_message_id, capture_timezone FROM messages WHERE message_id = 'local-m1'"
+        ).fetchone()
+    assert [tuple(r) for r in recipients] == [
+        ("to", 0, "billing@vendor.example"),
+        ("to", 1, "sales@vendor.example"),
+        ("cc", 0, "cc@other.example"),
+    ]
+    assert tuple(row) == ("m1@vendor.example", "America/Chicago")
+
+
+def test_record_message_location_fills_missing_recipients_once(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key, provider_message_id FROM messages"
+        ).fetchone()
+    scope = {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+
+    def recipients() -> list[tuple[str, int, str]]:
+        with store.connection() as db:
+            rows = db.execute(
+                """SELECT field, position, address FROM message_recipients
+                WHERE message_id = 'gmail-1' ORDER BY field DESC, position"""
+            ).fetchall()
+        return [tuple(r) for r in rows]
+
+    assert recipients() == []
+    expected = [("to", 0, "a@vendor.com"), ("to", 1, "b@vendor.com"), ("cc", 0, "c@o.com")]
+    assert store.record_message_location(
+        **scope,
+        locations=frozenset({"sent"}),
+        to=("a@vendor.com", "b@vendor.com"),
+        cc=("c@o.com",),
+    ) == 1
+    assert recipients() == expected
+    # A later fetch never replaces what a row already has.
+    store.record_message_location(
+        **scope, locations=frozenset({"sent"}), to=("other@vendor.com",)
+    )
+    assert recipients() == expected
+
+
+def test_a_second_copy_fills_the_recipients_its_logical_message_lacks(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+
+    assert store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        to=("billing@vendor.com",),
+        locations=frozenset({"sent"}),
+    ) is False
+
+    with store.connection() as db:
+        rows = db.execute(
+            "SELECT message_id, field, position, address FROM message_recipients"
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [(first, "to", 0, "billing@vendor.com")]
+
+
+def test_purge_keeps_a_logical_message_until_every_row_has_expired(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    duplicate = _retained_duplicate(store, "2", "root@x")
+    _reset_to_schema_29(store)
+    store.initialize()
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT logical_of FROM messages WHERE message_id = ?", (duplicate,)
+        ).fetchone()[0] == root
+        db.execute(
+            "UPDATE messages SET received_at = '2026-01-01T12:00:00+00:00' WHERE message_id = ?",
+            (root,),
+        )
+        db.execute(
+            "UPDATE messages SET received_at = '2026-09-01T12:00:00+00:00' WHERE message_id = ?",
+            (duplicate,),
+        )
+    now = datetime(2026, 9, 10, tzinfo=UTC)
+
+    # The canonical row has expired, its later-dated copy has not: the unit stays whole.
+    outcome = store.purge_with_outcome(30, now=now)
+    assert outcome.messages == 0
+    assert store.has_message(root) and store.has_message(duplicate)
+    assert store.message_locations(root) == ["inbox"]
+
+    # Once every row has expired the unit goes together, locations included.
+    outcome = store.purge_with_outcome(5, now=now)
+    assert outcome.messages == 2
+    assert not store.has_message(root) and not store.has_message(duplicate)
+    assert store.message_locations(root) == []

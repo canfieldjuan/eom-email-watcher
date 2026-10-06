@@ -12,6 +12,7 @@ test("mail server connection uses the engine contract without changing credentia
       username: " owner ",
       password: " private password ",
       caFile: "/private/root.pem",
+      sentFolder: "  ",
     }),
     {
       email_address: "owner@example.com",
@@ -58,3 +59,22 @@ for (const port of ["", "0", "65536", "1.5", "not-a-port"]) {
     );
   });
 }
+
+test("a configured Sent folder name travels with the connection, trimmed", () => {
+  const base = {
+    emailAddress: "owner@example.com",
+    host: "mail.example.com",
+    port: "993",
+    security: "tls" as const,
+    username: "owner",
+    password: "private",
+    caFile: null,
+  };
+  assert.equal("sent_folder" in buildMailServerConnection({ ...base, sentFolder: "" }), false);
+  assert.equal("sent_folder" in buildMailServerConnection({ ...base, sentFolder: "  " }), false);
+  assert.equal("sent_folder" in buildMailServerConnection(base), false);
+  assert.equal(
+    buildMailServerConnection({ ...base, sentFolder: " Enviados " }).sent_folder,
+    "Enviados",
+  );
+});

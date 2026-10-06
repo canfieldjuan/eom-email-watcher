@@ -1072,7 +1072,7 @@ class GmailGateway:
                 error_type=GmailRecoveryPageInvalid,
             )
         query = (
-            f"in:inbox after:{after_exclusive_epoch} "
+            f"(in:inbox OR in:sent) after:{after_exclusive_epoch} "
             f"before:{before_exclusive_epoch}"
         )
         try:

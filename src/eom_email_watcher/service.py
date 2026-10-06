@@ -42,6 +42,7 @@ from .db import (
     Store,
 )
 from .gmail import (
+    GMAIL_LOCATION_LABELS,
     GmailAuthorizationRejected,
     GmailError,
     GmailLabelCatalogInvalid,
@@ -51,6 +52,7 @@ from .gmail import (
 )
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
+    INBOX_LOCATION,
     MESSAGE_LOCATIONS,
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
@@ -156,12 +158,34 @@ class RecoveryLabelGrant:
     selected_display_name: str
 
 
-def _in_admitted_folder(metadata: object, labels: frozenset[str]) -> bool:
-    """Contract D-scope: Inbox or Sent. Providers that record locations say which."""
+def _recovery_since(last_success: str, retention_cutoff: datetime) -> datetime:
+    """Where a stale cursor's recovery starts: shortly before the last success, within retention."""
+    since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
+    return max(since, retention_cutoff)
+
+
+def _folders_in_scope(gated_allowed: bool) -> frozenset[str]:
+    """Contract D-ops: Sent is in scope only while the gated class is allowed."""
+    return MESSAGE_LOCATIONS if gated_allowed else frozenset({INBOX_LOCATION})
+
+
+def _admitted_locations(
+    metadata: object, labels: frozenset[str], folders: frozenset[str] = MESSAGE_LOCATIONS
+) -> frozenset[str]:
+    """Contract D-scope: the admitted folders a message is in, among those in scope.
+
+    Providers that record locations say which. Gmail metadata without them names
+    its folders through labels, with the mapping gmail.parse_metadata owns. The
+    one answer decides admission and is what every insert stores, so a message
+    is never admitted from a folder other than the one recorded for it, and a
+    Sent-only message is admitted only while Sent is in scope (_folders_in_scope).
+    """
     locations = getattr(metadata, "locations", None)
-    if isinstance(locations, frozenset) and locations:
-        return bool(locations & MESSAGE_LOCATIONS)
-    return "INBOX" in labels
+    if not (isinstance(locations, frozenset) and locations):
+        locations = frozenset(
+            location for label, location in GMAIL_LOCATION_LABELS.items() if label in labels
+        )
+    return locations & folders
 
 
 def match_mailbox_admission(
@@ -173,11 +197,12 @@ def match_mailbox_admission(
     exact_senders: Mapping[str, str | None],
     label_selectors: Iterable[GmailLabelSelectorLike],
     admitted_at: datetime,
+    folders: frozenset[str] = MESSAGE_LOCATIONS,
 ) -> AdmissionDecision | None:
     """Return the one deterministic admission grant for mailbox metadata."""
     labels = getattr(metadata, "labels", None)
     sender = getattr(metadata, "sender", None)
-    if not isinstance(labels, frozenset) or not _in_admitted_folder(metadata, labels):
+    if not isinstance(labels, frozenset) or not _admitted_locations(metadata, labels, folders):
         return None
     admitted_at_text = admitted_at.astimezone(UTC).isoformat()
     if isinstance(sender, str) and sender in exact_senders:
@@ -1684,11 +1709,13 @@ class Watcher:
         *,
         mailbox_identity_key: str,
         checked_at: datetime,
+        gated_allowed: bool,
     ) -> tuple[int, bool]:
         state = self.store.gmail_recovery_state(self.mailbox.account_id)
         if state is None:
             raise RuntimeError("Gmail recovery state was not initialized")
         retention_cutoff = self._recovery_retention_cutoff(state)
+        folders = _folders_in_scope(gated_allowed)
         if not self._retry_due(state.next_retry_at, checked_at):
             return 0, False
         deadline = time.monotonic() + 30.0
@@ -1821,6 +1848,7 @@ class Watcher:
                 exact_senders=current_senders,
                 label_selectors=current_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
             received_at = _received_at_or_none(metadata.received_at, observed_at=checked_at)
             if admission is None or received_at is None or received_at < retention_cutoff:
@@ -1849,6 +1877,12 @@ class Watcher:
                         ),
                         subject=metadata.subject,
                         received_at=received_at.isoformat(),
+                        rfc_message_id=metadata.rfc_message_id,
+                        reply_ids=metadata.reply_ids,
+                        to=metadata.to,
+                        cc=metadata.cc,
+                        locations=_admitted_locations(metadata, metadata.labels, folders),
+                        capture_timezone=self.config.timezone,
                     ),
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
@@ -1936,6 +1970,7 @@ class Watcher:
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=checked_at,
+                    gated_allowed=gated_allowed,
                 )
                 pending_recovery = (
                     None
@@ -1987,8 +2022,7 @@ class Watcher:
                     "Stale recovery is blocked by unresolved legacy mailbox identity markers"
                 ) from exc
             recovered = True
-            since = datetime.fromisoformat(last_success).astimezone(UTC) - timedelta(minutes=5)
-            since = max(since, retention_cutoff)
+            since = _recovery_since(last_success, retention_cutoff)
             if self.mailbox.provider == "gmail" and dry_run:
                 replacement_cursor = self.gateway.initial_cursor()
                 if not replacement_cursor.isdigit():
@@ -2056,6 +2090,7 @@ class Watcher:
                 added, completed = self._run_gmail_recovery(
                     mailbox_identity_key=mailbox_identity_key,
                     checked_at=sampled_at,
+                    gated_allowed=gated_allowed,
                 )
                 pending_recovery = (
                     None
@@ -2087,6 +2122,7 @@ class Watcher:
             label_selectors=label_selectors,
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
+            folders=_folders_in_scope(gated_allowed),
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
@@ -2132,6 +2168,7 @@ class Watcher:
         label_selectors: tuple[GmailLabelSelectorLike, ...],
         checked_at: datetime,
         retention_cutoff: datetime,
+        folders: frozenset[str],
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
     ) -> int:
@@ -2151,6 +2188,7 @@ class Watcher:
                         provider_message_id,
                         mailbox_identity_key=mailbox_identity_key,
                         checked_at=checked_at,
+                        folders=folders,
                     )
                 continue
             try:
@@ -2179,6 +2217,7 @@ class Watcher:
                 exact_senders=self.admission_sender_names,
                 label_selectors=label_selectors,
                 admitted_at=checked_at,
+                folders=folders,
             )
             if admission is None:
                 continue
@@ -2225,7 +2264,7 @@ class Watcher:
                 reply_ids=metadata.reply_ids,
                 to=metadata.to,
                 cc=metadata.cc,
-                locations=metadata.locations,
+                locations=_admitted_locations(metadata, metadata.labels, folders),
                 capture_timezone=self.config.timezone,
             ):
                 added += 1
@@ -2237,26 +2276,36 @@ class Watcher:
         *,
         mailbox_identity_key: str,
         checked_at: datetime,
+        folders: frozenset[str],
     ) -> None:
-        """A known id came back through polling: record its location (contract D-identity)."""
+        """A known id came back through polling: record its location (contract D-identity).
+
+        The fetch also supplies the recipients of a row that has none, since the
+        migration could not reconstruct them.
+        """
         count = self.store.message_location_count(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
             provider_message_id=provider_message_id,
         )
-        if count is None or count >= len(MESSAGE_LOCATIONS):
+        if count is None or count >= len(folders):
             return
         try:
             metadata = self.gateway.metadata(provider_message_id)
         except (MailboxMessageUnavailable, MailboxMessageInvalid):
+            return
+        locations = _admitted_locations(metadata, metadata.labels, folders)
+        if not locations:
             return
         self.store.record_message_location(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
             provider_message_id=provider_message_id,
-            locations=metadata.locations,
+            locations=locations,
+            to=metadata.to,
+            cc=metadata.cc,
             now=checked_at,
         )
 
@@ -2306,17 +2355,18 @@ class Watcher:
             try:
                 changes = self.gateway.sent_changes_since(state[0])
             except StaleMailboxCursor as exc:
-                logger.warning("Sent folder cursor expired (%s); restarting from its position", exc)
-                self.store.set_folder_state(
-                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                # Like the Inbox: recover the interval since the last success first.
+                logger.warning("Sent folder cursor expired (%s); recovering the gap", exc)
+                changes = self.gateway.sent_recover_since(
+                    _recovery_since(state[1], retention_cutoff)
                 )
-                return 0
             added = self._capture_ids(
                 changes.message_ids,
                 mailbox_identity_key=mailbox_identity_key,
                 label_selectors=label_selectors,
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
+                folders=_folders_in_scope(gated_allowed),
                 dry_run=False,
                 dry_run_messages=[],
             )

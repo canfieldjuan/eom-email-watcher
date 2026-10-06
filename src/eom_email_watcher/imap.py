@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import imaplib
@@ -66,6 +67,10 @@ MESSAGE_ID_PREFIX = "eom-imap-message-v2:"
 # Sent copies carry a folder token, so Inbox and Sent UIDs never collide
 # (contract D-identity).
 SENT_MESSAGE_ID_PREFIX = "eom-imap-sent-v1:"
+# Sent cursors name the folder they belong to, so a resolved folder that changes
+# makes them stale instead of skipping the new folder's older mail.
+SENT_CURSOR_PREFIX = "eom-imap-sent-cursor-v1:"
+SENT_RECOVERY_CURSOR_PREFIX = "eom-imap-sent-recovery-v1:"
 INBOX_FOLDER = "INBOX"
 MAX_FOLDER_NAME_BYTES = 255
 _LIST_LINE = re.compile(
@@ -344,6 +349,89 @@ def _recovery_cursor(
         f"{RECOVERY_CURSOR_PREFIX}{mailbox_id}:{uid_validity}:{upper_uid}:"
         f"{snapshot_uid}:{search_day.toordinal()}"
     )
+
+
+def _sent_cursor(mailbox_id: str, folder_key: str, uid_validity: int, last_uid: int) -> str:
+    return f"{SENT_CURSOR_PREFIX}{mailbox_id}:{folder_key}:{uid_validity}:{last_uid}"
+
+
+def _decode_sent_cursor(value: str) -> tuple[str, str, int, int]:
+    fields = value.removeprefix(SENT_CURSOR_PREFIX).split(":") if value.startswith(
+        SENT_CURSOR_PREFIX
+    ) else []
+    if (
+        len(fields) != 4
+        or _MAILBOX_ID.fullmatch(fields[0]) is None
+        or _MAILBOX_ID.fullmatch(fields[1]) is None
+        or not fields[2].isdecimal()
+        or not fields[3].isdecimal()
+        or int(fields[2]) <= 0
+    ):
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
+    return fields[0], fields[1], int(fields[2]), int(fields[3])
+
+
+def _sent_recovery_cursor(
+    mailbox_id: str,
+    folder_key: str,
+    uid_validity: int,
+    upper_uid: int,
+    snapshot_uid: int,
+    search_day: date,
+) -> str:
+    return (
+        f"{SENT_RECOVERY_CURSOR_PREFIX}{mailbox_id}:{folder_key}:{uid_validity}:{upper_uid}:"
+        f"{snapshot_uid}:{search_day.toordinal()}"
+    )
+
+
+def _decode_sent_recovery_cursor(value: str) -> tuple[str, str, int, int, int, date]:
+    fields = value.removeprefix(SENT_RECOVERY_CURSOR_PREFIX).split(":") if value.startswith(
+        SENT_RECOVERY_CURSOR_PREFIX
+    ) else []
+    if (
+        len(fields) != 6
+        or _MAILBOX_ID.fullmatch(fields[0]) is None
+        or _MAILBOX_ID.fullmatch(fields[1]) is None
+        or any(not field.isdecimal() for field in fields[2:])
+    ):
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
+    mailbox_id, folder_key, validity_text, upper_text, snapshot_text, ordinal_text = fields
+    validity, upper_uid, snapshot_uid = int(validity_text), int(upper_text), int(snapshot_text)
+    try:
+        search_day = date.fromordinal(int(ordinal_text))
+    except ValueError as exc:
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid") from exc
+    if validity <= 0 or upper_uid <= 0 or snapshot_uid <= 0 or upper_uid > snapshot_uid:
+        raise ImapError("imap_cursor_invalid", "Saved mail server cursor is invalid")
+    return mailbox_id, folder_key, validity, upper_uid, snapshot_uid, search_day
+
+
+def _encode_mailbox_name(name: str) -> str:
+    """RFC 3501 modified UTF-7, so a non-ASCII folder name survives imaplib's ASCII commands.
+
+    Names the server lists are already in this form; only configured names are encoded.
+    """
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if run:
+            raw = base64.b64encode("".join(run).encode("utf-16-be")).decode("ascii")
+            out.append("&" + raw.rstrip("=").replace("/", ",") + "-")
+            run.clear()
+
+    for character in name:
+        if character == "&":
+            flush()
+            out.append("&-")
+        elif 0x20 <= ord(character) <= 0x7E:
+            flush()
+            out.append(character)
+        else:
+            run.append(character)
+    flush()
+    return "".join(out)
 
 
 def _message_id(
@@ -1592,15 +1680,48 @@ class ImapGateway:
     def _resolve_sent_folder(self, client: imaplib.IMAP4) -> str | None:
         """The Sent folder: the configured name, else the server's \\Sent (contract D-scope)."""
         if not self._sent_folder_resolved:
-            self._sent_folder = self.credentials.sent_folder or _special_use_sent_folder(client)
+            configured = self.credentials.sent_folder
+            self._sent_folder = (
+                _encode_mailbox_name(configured)
+                if configured is not None
+                else _special_use_sent_folder(client)
+            )
             self._sent_folder_resolved = True
         return self._sent_folder
 
     def sent_scope(self) -> str:
+        """'available' only once the resolved folder has been selected (contract D-scope)."""
         with self._mailbox() as client:
-            if self._resolve_sent_folder(client) is not None:
-                return SENT_SCOPE_AVAILABLE
-            return SENT_SCOPE_UNAVAILABLE
+            folder = self._resolve_sent_folder(client)
+            if folder is None:
+                return SENT_SCOPE_UNAVAILABLE
+            try:
+                self._ensure_selected(client, folder)
+            except ImapError:
+                self._sent_folder = None
+                return SENT_SCOPE_UNAVAILABLE
+            return SENT_SCOPE_AVAILABLE
+
+    def _folder_cursor(self, folder_key: str | None, uid_validity: int, last_uid: int) -> str:
+        if folder_key is None:
+            return _cursor(self._mailbox_id, uid_validity, last_uid)
+        return _sent_cursor(self._mailbox_id, folder_key, uid_validity, last_uid)
+
+    def _folder_recovery_cursor(
+        self,
+        folder_key: str | None,
+        uid_validity: int,
+        upper_uid: int,
+        snapshot_uid: int,
+        search_day: date,
+    ) -> str:
+        if folder_key is None:
+            return _recovery_cursor(
+                self._mailbox_id, uid_validity, upper_uid, snapshot_uid, search_day
+            )
+        return _sent_recovery_cursor(
+            self._mailbox_id, folder_key, uid_validity, upper_uid, snapshot_uid, search_day
+        )
 
     def _folder_for_key(self, client: imaplib.IMAP4, folder_key: str | None) -> str | None:
         if folder_key is None:
@@ -1653,27 +1774,66 @@ class ImapGateway:
                 raise StaleMailboxCursor("The configured mail server mailbox changed")
             with self._mailbox() as client:
                 self._ensure_selected(client, INBOX_FOLDER)
-                current_validity = _selected_uid_validity(client)
-                if current_validity != saved_validity:
-                    current_validity, current_snapshot_uid = self._snapshot(client)
-                    _reject_recovery_expunge(client)
-                    if current_snapshot_uid == 0:
-                        return MailboxChanges((), _cursor(self._mailbox_id, current_validity, 0))
-                    return self._recovery_page(
-                        client,
-                        uid_validity=current_validity,
-                        upper_uid=current_snapshot_uid,
-                        snapshot_uid=current_snapshot_uid,
-                        search_day=search_day,
-                    )
-                return self._recovery_page(
+                return self._resume_recovery(
                     client,
-                    uid_validity=saved_validity,
+                    folder_key=None,
+                    saved_validity=saved_validity,
                     upper_uid=upper_uid,
                     snapshot_uid=snapshot_uid,
                     search_day=search_day,
                 )
         return self._incremental_changes(cursor, sent=False)
+
+    def _resume_recovery(
+        self,
+        client: imaplib.IMAP4,
+        *,
+        folder_key: str | None,
+        saved_validity: int,
+        upper_uid: int,
+        snapshot_uid: int,
+        search_day: date,
+    ) -> MailboxChanges:
+        """Continue a recovery page in the selected folder, restarting if its epoch changed."""
+        current_validity = _selected_uid_validity(client)
+        if current_validity != saved_validity:
+            current_validity, current_snapshot_uid = self._snapshot(client)
+            _reject_recovery_expunge(client)
+            if current_snapshot_uid == 0:
+                return MailboxChanges((), self._folder_cursor(folder_key, current_validity, 0))
+            return self._recovery_page(
+                client,
+                folder_key=folder_key,
+                uid_validity=current_validity,
+                upper_uid=current_snapshot_uid,
+                snapshot_uid=current_snapshot_uid,
+                search_day=search_day,
+            )
+        return self._recovery_page(
+            client,
+            folder_key=folder_key,
+            uid_validity=saved_validity,
+            upper_uid=upper_uid,
+            snapshot_uid=snapshot_uid,
+            search_day=search_day,
+        )
+
+    def _recover_folder(
+        self, client: imaplib.IMAP4, folder_key: str | None, since: datetime
+    ) -> MailboxChanges:
+        """Start recovering the selected folder from its current snapshot back to since."""
+        uid_validity, snapshot_uid = self._snapshot(client)
+        _reject_recovery_expunge(client)
+        if snapshot_uid == 0:
+            return MailboxChanges((), self._folder_cursor(folder_key, uid_validity, 0))
+        return self._recovery_page(
+            client,
+            folder_key=folder_key,
+            uid_validity=uid_validity,
+            upper_uid=snapshot_uid,
+            snapshot_uid=snapshot_uid,
+            search_day=_recovery_search_day(since),
+        )
 
     # Sent polling (contract D-scope), with its own cursor (contract D-reconcile).
     def sent_initial_cursor(self) -> str:
@@ -1681,10 +1841,38 @@ class ImapGateway:
             folder = self._require_sent_folder(client)
             self._ensure_selected(client, folder)
             uid_validity, last_uid = self._snapshot(client)
-        return _cursor(self._mailbox_id, uid_validity, last_uid)
+        return _sent_cursor(self._mailbox_id, _folder_key(folder), uid_validity, last_uid)
 
     def sent_changes_since(self, cursor: str) -> MailboxChanges:
+        if cursor.startswith(SENT_RECOVERY_CURSOR_PREFIX):
+            (
+                saved_mailbox,
+                saved_folder_key,
+                saved_validity,
+                upper_uid,
+                snapshot_uid,
+                search_day,
+            ) = _decode_sent_recovery_cursor(cursor)
+            with self._mailbox() as client:
+                folder = self._require_sent_folder(client)
+                if saved_mailbox != self._mailbox_id or saved_folder_key != _folder_key(folder):
+                    raise StaleMailboxCursor("The mail server Sent folder changed")
+                self._ensure_selected(client, folder)
+                return self._resume_recovery(
+                    client,
+                    folder_key=saved_folder_key,
+                    saved_validity=saved_validity,
+                    upper_uid=upper_uid,
+                    snapshot_uid=snapshot_uid,
+                    search_day=search_day,
+                )
         return self._incremental_changes(cursor, sent=True)
+
+    def sent_recover_since(self, since: datetime) -> MailboxChanges:
+        with self._mailbox() as client:
+            folder = self._require_sent_folder(client)
+            self._ensure_selected(client, folder)
+            return self._recover_folder(client, _folder_key(folder), since)
 
     def _require_sent_folder(self, client: imaplib.IMAP4) -> str:
         folder = self._resolve_sent_folder(client)
@@ -1693,12 +1881,18 @@ class ImapGateway:
         return folder
 
     def _incremental_changes(self, cursor: str, *, sent: bool) -> MailboxChanges:
-        saved_mailbox, saved_validity, saved_uid = _decode_cursor(cursor)
+        saved_folder_key: str | None = None
+        if sent:
+            saved_mailbox, saved_folder_key, saved_validity, saved_uid = _decode_sent_cursor(cursor)
+        else:
+            saved_mailbox, saved_validity, saved_uid = _decode_cursor(cursor)
         if saved_mailbox != self._mailbox_id:
             raise StaleMailboxCursor("The configured mail server mailbox changed")
         with self._mailbox() as client:
             folder = self._require_sent_folder(client) if sent else INBOX_FOLDER
             folder_key = _folder_key(folder) if sent else None
+            if sent and saved_folder_key != folder_key:
+                raise StaleMailboxCursor("The mail server Sent folder changed")
             self._ensure_selected(client, folder)
             current_validity, snapshot_uid = self._snapshot(client)
             if current_validity != saved_validity:
@@ -1706,11 +1900,15 @@ class ImapGateway:
                     f"The mail server reset its {folder} message identifiers"
                 )
             if snapshot_uid <= saved_uid:
-                return MailboxChanges((), _cursor(self._mailbox_id, current_validity, snapshot_uid))
+                return MailboxChanges(
+                    (), self._folder_cursor(folder_key, current_validity, snapshot_uid)
+                )
             message_count = _selected_message_count(client)
             first_sequence = _first_sequence_after_uid(client, message_count, saved_uid)
             if first_sequence > message_count:
-                return MailboxChanges((), _cursor(self._mailbox_id, current_validity, snapshot_uid))
+                return MailboxChanges(
+                    (), self._folder_cursor(folder_key, current_validity, snapshot_uid)
+                )
             last_sequence = min(message_count, first_sequence + MAX_INCREMENTAL_MESSAGE_IDS - 1)
             candidates = _fetch_sequence_uids(
                 client, list(range(first_sequence, last_sequence + 1))
@@ -1723,13 +1921,14 @@ class ImapGateway:
                 _message_id(self._mailbox_id, current_validity, uid, folder_key)
                 for uid in candidates
             ),
-            _cursor(self._mailbox_id, current_validity, next_uid),
+            self._folder_cursor(folder_key, current_validity, next_uid),
         )
 
     def _recovery_page(
         self,
         client: imaplib.IMAP4,
         *,
+        folder_key: str | None = None,
         uid_validity: int,
         upper_uid: int,
         snapshot_uid: int,
@@ -1738,11 +1937,11 @@ class ImapGateway:
         _reject_recovery_expunge(client)
         message_count = _selected_message_count(client)
         if message_count == 0:
-            return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
+            return MailboxChanges((), self._folder_cursor(folder_key, uid_validity, snapshot_uid))
         last_sequence = _last_sequence_at_or_before_uid(client, message_count, upper_uid)
         _reject_recovery_expunge(client)
         if last_sequence == 0:
-            return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, snapshot_uid))
+            return MailboxChanges((), self._folder_cursor(folder_key, uid_validity, snapshot_uid))
         first_sequence = max(1, last_sequence - MAX_UID_SEARCH_SPAN + 1)
         status, response = client.search(
             None,
@@ -1768,34 +1967,23 @@ class ImapGateway:
         if any(uid > upper_uid or uid > snapshot_uid for uid in candidates):
             raise ImapError("imap_protocol_error", "Mail server UID page was invalid")
         if next_upper_uid <= 0:
-            next_cursor = _cursor(self._mailbox_id, uid_validity, snapshot_uid)
+            next_cursor = self._folder_cursor(folder_key, uid_validity, snapshot_uid)
         else:
-            next_cursor = _recovery_cursor(
-                self._mailbox_id,
-                uid_validity,
-                next_upper_uid,
-                snapshot_uid,
-                search_day,
+            next_cursor = self._folder_recovery_cursor(
+                folder_key, uid_validity, next_upper_uid, snapshot_uid, search_day
             )
         return MailboxChanges(
-            tuple(_message_id(self._mailbox_id, uid_validity, uid) for uid in candidates),
+            tuple(
+                _message_id(self._mailbox_id, uid_validity, uid, folder_key) for uid in candidates
+            ),
             next_cursor,
         )
 
     def recover_since(self, addresses: frozenset[str], since: datetime) -> MailboxChanges:
         del addresses
         with self._mailbox() as client:
-            uid_validity, snapshot_uid = self._snapshot(client)
-            _reject_recovery_expunge(client)
-            if snapshot_uid == 0:
-                return MailboxChanges((), _cursor(self._mailbox_id, uid_validity, 0))
-            return self._recovery_page(
-                client,
-                uid_validity=uid_validity,
-                upper_uid=snapshot_uid,
-                snapshot_uid=snapshot_uid,
-                search_day=_recovery_search_day(since),
-            )
+            self._ensure_selected(client, INBOX_FOLDER)
+            return self._recover_folder(client, None, since)
 
     def metadata(self, message_id: str) -> MessageMetadata:
         with self._mailbox() as client:

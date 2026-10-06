@@ -783,6 +783,42 @@ def test_sent_items_has_its_own_delta_and_metadata_records_locations() -> None:
     assert sum(1 for r in requests if r.url.path.endswith("/mailFolders/inbox")) == 1
 
 
+def test_inbox_metadata_never_looks_up_sent_items() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path.endswith("/mailFolders/sentitems"):
+            return httpx.Response(503, json={"error": {"code": "ServiceUnavailable"}})
+        if path.endswith("/mailFolders/inbox"):
+            return httpx.Response(200, json={"id": "inbox-folder-id"})
+        if path.endswith("/me/messages/inbox-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "inbox-1",
+                    "parentFolderId": "inbox-folder-id",
+                    "conversationId": "conversation-1",
+                    "from": {"emailAddress": {"address": "trusted@example.com"}},
+                    "subject": "Invoice",
+                    "receivedDateTime": "2026-09-02T12:00:00Z",
+                },
+            )
+        raise AssertionError(request.url)
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    # An Inbox message resolves its location without touching the Sent scope, so a
+    # Sent Items failure cannot abort the Inbox check (contract D-ops).
+    assert gateway.metadata("inbox-1").locations == frozenset({"inbox"})
+    assert not any(r.url.path.endswith("/mailFolders/sentitems") for r in requests)
+
+    # The Sent poll sees the failure as the mailbox error it contains.
+    with pytest.raises(Microsoft365Error):
+        gateway.sent_scope()
+
+
 def test_sent_scope_is_unavailable_without_a_sent_items_folder() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/mailFolders/sentitems"):
@@ -794,3 +830,22 @@ def test_sent_scope_is_unavailable_without_a_sent_items_folder() -> None:
     gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
 
     assert gateway.sent_scope() == "unavailable"
+
+
+def test_sent_recovery_restarts_the_sent_items_delta_from_since() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        response = _folders_and_messages(request)
+        assert response is not None, request.url
+        return response
+
+    gateway = Microsoft365Gateway("private-access", "owner@example.com", graph_client(handler))
+
+    changes = gateway.sent_recover_since(datetime(2026, 9, 1, 12, 0, tzinfo=UTC))
+
+    assert changes.message_ids == ("sent-1",)
+    delta = next(r for r in requests if "/messages/delta" in r.url.path)
+    assert "sentitems" in delta.url.path
+    assert "receivedDateTime ge 2026-09-01T12:00:00Z" in str(delta.url.params.get("$filter"))

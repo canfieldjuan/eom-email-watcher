@@ -714,6 +714,10 @@ app.innerHTML = `
                 <span>Password or app password</span>
                 <input id="mail-server-password" name="password" type="password" maxlength="4096" autocomplete="current-password" required />
               </label>
+              <label>
+                <span>Sent folder <small>optional, for servers that list no Sent folder</small></span>
+                <input id="mail-server-sent-folder" name="sentFolder" maxlength="255" autocomplete="off" placeholder="Found automatically on most servers" />
+              </label>
               <div class="mail-server-ca">
                 <button id="mail-server-ca-choose" class="secondary-action" type="button">Choose private CA</button>
                 <button id="mail-server-ca-clear" class="secondary-action" type="button" hidden>Clear CA</button>
@@ -916,6 +920,7 @@ const mailServerSecurity = requiredElement<HTMLSelectElement>("#mail-server-secu
 const mailServerPort = requiredElement<HTMLInputElement>("#mail-server-port");
 const mailServerUsername = requiredElement<HTMLInputElement>("#mail-server-username");
 const mailServerPassword = requiredElement<HTMLInputElement>("#mail-server-password");
+const mailServerSentFolder = requiredElement<HTMLInputElement>("#mail-server-sent-folder");
 const mailServerCaChoose = requiredElement<HTMLButtonElement>("#mail-server-ca-choose");
 const mailServerCaClear = requiredElement<HTMLButtonElement>("#mail-server-ca-clear");
 const mailServerCaLabel = requiredElement<HTMLElement>("#mail-server-ca-label");
@@ -2922,6 +2927,7 @@ function currentMailServerConnection(): MailServerConnection {
     username: mailServerUsername.value,
     password: mailServerPassword.value,
     caFile: mailServerCaFile,
+    sentFolder: mailServerSentFolder.value,
   });
 }
 

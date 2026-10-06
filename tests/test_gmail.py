@@ -459,7 +459,7 @@ def test_gmail_recovery_page_is_one_broad_inbox_window_query_without_rule_filter
     assert service.messages.calls == [
         {
             "userId": "me",
-            "q": "in:inbox after:100 before:200",
+            "q": "(in:inbox OR in:sent) after:100 before:200",
             "pageToken": "current",
             "maxResults": 200,
         }

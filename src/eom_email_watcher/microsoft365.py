@@ -643,40 +643,50 @@ class Microsoft365Gateway:
             return self._delta_round(_delta_url(initial_since, SENT_FOLDER), continuation=False)
         return self._delta_round(cursor, continuation=True)
 
+    def sent_recover_since(self, since: datetime) -> MailboxChanges:
+        """A fresh Sent Items delta from since, after the saved link expired."""
+        return self._delta_round(_delta_url(since, SENT_FOLDER), continuation=False)
+
     def sent_scope(self) -> str:
         """Whether Sent Items is reachable (contract D-scope)."""
-        if SENT_FOLDER in self._folder_ids_by_location():
+        if self._folder_id(SENT_FOLDER) is not None:
             return SENT_SCOPE_AVAILABLE
         return SENT_SCOPE_UNAVAILABLE
 
-    def _folder_ids_by_location(self) -> dict[str, str]:
-        """Map each admitted well-known folder name to its id, resolved once per gateway."""
-        cached = getattr(self, "_folder_ids", None)
-        if cached is not None:
-            return cached
-        resolved: dict[str, str] = {}
-        for folder in FOLDER_LOCATIONS:
-            query = urlencode({"$select": "id"})
-            try:
-                response = self._request(
-                    f"{GRAPH_ROOT}/me/mailFolders/{folder}?{query}", missing_is_message=True
-                )
-            except MailboxMessageUnavailable:
-                continue
-            folder_id = _response_document(response, "mail folder").get("id")
-            if isinstance(folder_id, str) and folder_id:
-                resolved[folder] = _graph_id(folder_id, "folder id")
-        self._folder_ids = resolved
-        return resolved
+    def _folder_id(self, folder: str) -> str | None:
+        """One admitted well-known folder's id, resolved once per gateway; None when absent."""
+        cached: dict[str, str | None] = getattr(self, "_folder_ids", None) or {}
+        if folder in cached:
+            return cached[folder]
+        query = urlencode({"$select": "id"})
+        folder_id: str | None = None
+        try:
+            response = self._request(
+                f"{GRAPH_ROOT}/me/mailFolders/{folder}?{query}", missing_is_message=True
+            )
+        except MailboxMessageUnavailable:
+            pass
+        else:
+            value = _response_document(response, "mail folder").get("id")
+            if isinstance(value, str) and value:
+                folder_id = _graph_id(value, "folder id")
+        cached[folder] = folder_id
+        self._folder_ids = cached
+        return folder_id
 
     def _locations(self, parent_folder_id: object) -> frozenset[str]:
+        """The admitted folder a message's parent is, checking the Inbox first.
+
+        Sent Items is looked up only for a message outside the Inbox, so an Inbox
+        check never touches the Sent scope (contract D-ops), and a Sent Items error
+        reaches only the Sent poll, which contains it.
+        """
         if not isinstance(parent_folder_id, str):
             return frozenset()
-        return frozenset(
-            FOLDER_LOCATIONS[folder]
-            for folder, folder_id in self._folder_ids_by_location().items()
-            if folder_id == parent_folder_id
-        )
+        for folder, location in FOLDER_LOCATIONS.items():
+            if self._folder_id(folder) == parent_folder_id:
+                return frozenset({location})
+        return frozenset()
 
     def metadata(self, message_id: str) -> MessageMetadata:
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")

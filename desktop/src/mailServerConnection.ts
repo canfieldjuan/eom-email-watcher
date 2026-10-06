@@ -8,6 +8,8 @@ export interface MailServerConnectionInput {
   username: string;
   password: string;
   caFile: string | null;
+  // Absent or blank: the server's \Sent folder is found automatically.
+  sentFolder?: string;
 }
 
 export interface MailServerConnection {
@@ -18,6 +20,7 @@ export interface MailServerConnection {
   username: string;
   password: string;
   ca_file?: string;
+  sent_folder?: string;
 }
 
 export function buildMailServerConnection(
@@ -27,6 +30,7 @@ export function buildMailServerConnection(
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error("Mail server port must be between 1 and 65535.");
   }
+  const sentFolder = (input.sentFolder ?? "").trim();
   return {
     email_address: input.emailAddress.trim(),
     host: input.host.trim(),
@@ -35,5 +39,7 @@ export function buildMailServerConnection(
     username: input.username,
     password: input.password,
     ...(input.caFile === null ? {} : { ca_file: input.caFile }),
+    // Only when the server lists no \Sent folder (thread view contract, D-scope).
+    ...(sentFolder === "" ? {} : { sent_folder: sentFolder }),
   };
 }

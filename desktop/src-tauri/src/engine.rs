@@ -1389,6 +1389,9 @@ pub struct MailServerConnection {
     pub password: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<String>,
+    /// A Sent folder name for IMAP servers that list no `\Sent` folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_folder: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -4060,6 +4063,7 @@ printf '%s\n' '{"protocol":1,"ok":true,"operation":"mail.accounts.connect","data
             username: "owner".into(),
             password: "private password".into(),
             ca_file: Some("/private/root.pem".into()),
+            sent_folder: None,
         };
 
         let result = engine
