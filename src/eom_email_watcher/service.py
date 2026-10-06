@@ -2248,9 +2248,15 @@ class Watcher:
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
     ) -> int:
-        """Admit and capture one folder's changed messages; return how many were added."""
+        """Admit and capture one folder's changed messages; return how many were added.
+
+        An id that arrives with a folder observation but outside the batch (a Gmail
+        continuation replays its prefix) is handled like any other: known or new.
+        """
         added = 0
-        for provider_message_id in message_ids:
+        batch = set(message_ids)
+        candidates = (*message_ids, *(i for i in known_locations if i not in batch))
+        for provider_message_id in candidates:
             if self.store.has_seen_message(
                 provider_message_id,
                 provider=self.mailbox.provider,

@@ -897,8 +897,10 @@ class GmailGateway:
     ) -> tuple[list[str], str, dict[str, frozenset[str]]]:
         """The changed ids, the newest cursor, and each record's admitted folders.
 
-        A history record carries the message's labels, so a known id's current
-        folders travel with the change and need no fetch (plan step 6).
+        A history record says which folders a message was added to, so a known
+        id's change travels with it and needs no fetch (plan step 6). The
+        observations may name ids outside the returned batch: those of the prefix
+        a continuation replays, whose later events would otherwise be lost.
         """
         request_start_history_id, skip_unique_ids, expected_prefix_digest = (
             _decode_history_cursor(start_history_id)
@@ -973,7 +975,7 @@ class GmailGateway:
                                 return (
                                     ids,
                                     _history_continuation_cursor(request_start_history_id, prefix),
-                                    {i: hints[i] for i in ids if i in hints},
+                                    dict(hints),
                                 )
                             ids.append(message_id)
                 page_token = response.get("nextPageToken")
@@ -994,7 +996,10 @@ class GmailGateway:
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
         if not prefix_verified:
             raise StaleHistoryCursor("Saved Gmail history continuation cursor cannot be resumed")
-        return ids, newest, {i: hints[i] for i in ids if i in hints}
+        # Every id whose record this call saw keeps its observation, the replayed
+        # prefix included: a later event for an id returned in an earlier batch
+        # arrives here only, so it travels as an observation outside the batch.
+        return ids, newest, dict(hints)
 
     def changes_since(self, cursor: str) -> MailboxChanges:
         message_ids, newest, locations = self._history_changes(cursor)

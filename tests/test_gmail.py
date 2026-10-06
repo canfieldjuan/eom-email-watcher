@@ -289,6 +289,23 @@ def test_gmail_history_v2_resumes_more_than_200_unique_ids_without_skip_or_dupli
     ]
 
 
+def test_gmail_history_carries_later_hints_for_replayed_prefix_ids() -> None:
+    response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS + 1)
+    history = response["history"]
+    assert isinstance(history, list)
+    # After the batch boundary, the first message of the prefix gains SENT.
+    history.append({"labelsAdded": [{"message": {"id": "message-0"}, "labelIds": ["SENT"]}]})
+    gateway = GmailGateway(FakeHistoryService(response))
+
+    first = gateway.changes_since("12345")
+    second = gateway.changes_since(first.cursor)
+
+    assert "message-0" in first.message_ids
+    assert second.message_ids == (f"message-{gmail_module.MAX_INCREMENTAL_MESSAGE_IDS}",)
+    # The later event travels as an observation outside the second batch.
+    assert second.locations["message-0"] == FolderObservation(frozenset({"sent"}), complete=False)
+
+
 def test_gmail_history_deduplicates_before_enforcing_limit() -> None:
     response = history_response(gmail_module.MAX_INCREMENTAL_MESSAGE_IDS)
     history = response["history"]

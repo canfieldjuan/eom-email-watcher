@@ -5553,6 +5553,34 @@ def test_a_folder_change_during_a_lapse_is_recorded_and_leaves_the_source_unstam
     assert len(store.recent(5)) == 1
 
 
+def test_an_observation_for_an_id_outside_the_batch_is_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    class ReplayedPrefix(LabelledGmail):
+        def changes_since(self, cursor: str) -> MailboxChanges:
+            # A continuation whose batch is empty, carrying a later event for a
+            # replayed id.
+            observed = FolderObservation(frozenset({"sent"}), complete=False)
+            return MailboxChanges((), "300", {"allowed": observed})
+
+    replayed = ReplayedPrefix(frozenset({"INBOX", "SENT"}))
+    calls = replayed.metadata_calls
+    Watcher(cfg, store, replayed, FakeModel()).check()
+    assert replayed.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert store.state(provider="gmail", account_id="gmail-default")[0] == "300"
+
+
 def test_gmail_label_added_to_a_known_message_records_its_second_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
