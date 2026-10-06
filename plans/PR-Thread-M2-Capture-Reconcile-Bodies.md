@@ -63,7 +63,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
    - **IMAP.** The first header item adds `TO CC` under its existing 64 KiB bound. The location is the selected folder.
 2. **Sent folders,** each polled only while the gated class is allowed (C/D-ops).
    - Sent capture is gated, so polling Sent while the class is inactive could capture nothing. The gap is recovered on reactivation, because coverage compares the entitlement with its record (C/D-reconcile).
-   - **Gmail:** the one history cursor already returns `SENT` events (no `labelId` filter, `gmail.py:838-848`). Only the admission gate changes (step 9). C/D-reconcile's checkpoint rule holds as long as the cursor advances only after the whole batch (`service.py:2152-2158`), which is unchanged.
+   - **Gmail:** the one history cursor already returns `SENT` events (no `labelId` filter, `gmail.py:838-848`). Only the admission gate changes (step 10). C/D-reconcile's checkpoint rule holds as long as the cursor advances only after the whole batch (`service.py:2152-2158`), which is unchanged.
    - **Microsoft:** a second delta link on `mailFolders/sentitems`. `_DELTA_PATH` already accepts any folder (`microsoft365.py:46-51`).
    - **IMAP:** `LIST` with RFC 6154 `SPECIAL-USE` finds `\Sent`, falling back to a configured `imap_sent_folder` name.
      - With neither, the account has no Sent scope, and health reports "Sent mail unavailable" (C/D-scope).
