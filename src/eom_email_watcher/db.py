@@ -35,10 +35,17 @@ from .config import (
     exact_sender_selector_id,
     normalize_validated_address,
 )
-from .mailbox import DEFAULT_MAIL_ACCOUNT_ID, DEFAULT_MAIL_PROVIDER, normalize_message_id
+from .mailbox import (
+    DEFAULT_MAIL_ACCOUNT_ID,
+    DEFAULT_MAIL_PROVIDER,
+    INBOX_LOCATION,
+    MESSAGE_LOCATIONS,
+    SENT_SCOPE_NOT_POLLED,
+    normalize_message_id,
+)
 from .mime import AttachmentDescriptor, body_was_truncated
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
 MAX_CONNECT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_CERTIFICATE_LEDGER_RESPONSE_BYTES = MAX_CONNECT_OUTPUT_BYTES - 4096
@@ -3276,6 +3283,171 @@ END;
 """
 
 
+# Schema 30 (thread view M2.1): Sent cursors, recipients, locations.
+SENT_CAPTURE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mailbox_folder_state (
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    mailbox_identity_key TEXT NOT NULL,
+    folder TEXT NOT NULL CHECK (folder IN ('sent')),
+    cursor TEXT NOT NULL,
+    last_success_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id, mailbox_identity_key, folder)
+);
+CREATE TABLE IF NOT EXISTS mailbox_sent_scope (
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('available', 'unavailable')),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id)
+);
+CREATE TABLE IF NOT EXISTS message_recipients (
+    message_id TEXT NOT NULL,
+    field TEXT NOT NULL CHECK (field IN ('to', 'cc')),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    address TEXT NOT NULL CHECK (address <> '' AND length(CAST(address AS BLOB)) <= 512),
+    PRIMARY KEY (message_id, field, position)
+);
+CREATE TABLE IF NOT EXISTS message_locations (
+    message_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    mailbox_identity_key TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL,
+    location TEXT NOT NULL CHECK (location IN ('inbox', 'sent')),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (provider, account_id, mailbox_identity_key, provider_message_id, location)
+);
+CREATE INDEX IF NOT EXISTS idx_message_locations_message ON message_locations(message_id);
+CREATE INDEX IF NOT EXISTS idx_messages_logical_of ON messages(logical_of);
+CREATE TRIGGER IF NOT EXISTS messages_delete_recipients_and_locations
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM message_recipients WHERE message_id = OLD.message_id;
+    DELETE FROM message_locations WHERE message_id = OLD.message_id;
+END;
+"""
+
+
+def _record_locations(
+    db: sqlite3.Connection,
+    *,
+    message_id: str,
+    provider: str,
+    account_id: str,
+    mailbox_identity_key: str,
+    provider_message_id: str,
+    locations: Iterable[str],
+    recorded_at: str,
+) -> int:
+    """Record a source identity's admitted folders on its logical message (D-identity)."""
+    recorded = 0
+    for location in sorted(set(locations) or {INBOX_LOCATION}):
+        if location not in MESSAGE_LOCATIONS:
+            raise ValueError(f"unknown message location {location!r}")
+        recorded += db.execute(
+            """INSERT OR IGNORE INTO message_locations(
+                message_id, provider, account_id, mailbox_identity_key,
+                provider_message_id, location, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                message_id,
+                provider,
+                account_id,
+                mailbox_identity_key,
+                provider_message_id,
+                location,
+                recorded_at,
+            ),
+        ).rowcount
+    return recorded
+
+
+def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
+    """Schema 30 tables and columns. They precede the thread-identity step, whose
+    survivor ranking reads message_locations."""
+    columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
+    for column, definition in {
+        "logical_of": "TEXT",
+        "capture_timezone": "TEXT CHECK (capture_timezone IS NULL OR capture_timezone <> '')",
+    }.items():
+        if column not in columns:
+            db.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
+    _execute_transactional_script(db, SENT_CAPTURE_SCHEMA)
+
+
+def _migrate_sent_capture(db: sqlite3.Connection) -> None:
+    """Schema 30 rows: every message has a location; rows that are one message coalesce."""
+    db.execute(
+        """CREATE INDEX IF NOT EXISTS idx_messages_logical_identity
+        ON messages(provider, account_id, mailbox_identity_key, rfc_message_id)"""
+    )
+    # Every retained row was captured from the Inbox. A legacy row without a
+    # mailbox identity records a location only under a proven legacy identity,
+    # as M1 keyed it.
+    proven = {
+        (str(row["provider"]), str(row["account_id"])): str(row["legacy_identity_key"])
+        for row in db.execute(
+            """SELECT provider, account_id, legacy_identity_key FROM mail_accounts
+            WHERE legacy_identity_status = 'continuity_proven'
+              AND legacy_identity_key IS NOT NULL"""
+        ).fetchall()
+    }
+    unlocated = db.execute(
+        """SELECT m.message_id, m.provider, m.account_id, m.mailbox_identity_key,
+            m.provider_message_id, m.discovered_at
+        FROM messages AS m
+        WHERE m.logical_of IS NULL
+          AND NOT EXISTS (SELECT 1 FROM message_locations AS l WHERE l.message_id = m.message_id)
+        ORDER BY m.message_id"""
+    ).fetchall()
+    for row in unlocated:
+        identity = row["mailbox_identity_key"] or proven.get(
+            (str(row["provider"]), str(row["account_id"]))
+        )
+        if identity is None:
+            continue
+        _record_locations(
+            db,
+            message_id=str(row["message_id"]),
+            provider=str(row["provider"]),
+            account_id=str(row["account_id"]),
+            mailbox_identity_key=str(identity),
+            provider_message_id=str(row["provider_message_id"]),
+            locations=(INBOX_LOCATION,),
+            recorded_at=str(row["discovered_at"]),
+        )
+    # Rows sharing a logical identity are one message (contract D-identity): the
+    # canonical-smallest row keeps the identity, the others point to it and their
+    # locations move. No row is deleted, so per-row history survives.
+    groups = db.execute(
+        """SELECT provider, account_id, mailbox_identity_key, rfc_message_id
+        FROM messages
+        WHERE logical_of IS NULL AND rfc_message_id IS NOT NULL
+          AND mailbox_identity_key IS NOT NULL
+        GROUP BY provider, account_id, mailbox_identity_key, rfc_message_id
+        HAVING COUNT(*) > 1"""
+    ).fetchall()
+    for group in groups:
+        members = db.execute(
+            """SELECT message_id FROM messages
+            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+              AND rfc_message_id = ? AND logical_of IS NULL
+            ORDER BY provider_message_id""",
+            tuple(group),
+        ).fetchall()
+        canonical = str(members[0]["message_id"])
+        for member in members[1:]:
+            duplicate = str(member["message_id"])
+            db.execute(
+                "UPDATE messages SET logical_of = ? WHERE message_id = ?", (canonical, duplicate)
+            )
+            db.execute(
+                "UPDATE message_locations SET message_id = ? WHERE message_id = ?",
+                (canonical, duplicate),
+            )
+
+
 MAX_THREAD_KEY_BYTES = 512
 
 
@@ -3384,9 +3556,17 @@ def _imap_thread_key(
         return str(uuid.uuid4()), ()
 
     def rank(key: str) -> tuple[int, str]:
+        # Canonical order (contract D-identity): a logical message sorts by the
+        # smallest source identity across every recorded location.
         smallest = db.execute(
-            """SELECT MIN(provider_message_id) AS smallest FROM messages
-            WHERE provider = ? AND account_id = ? AND thread_key = ?""",
+            """SELECT MIN(source) AS smallest FROM (
+                SELECT provider_message_id AS source FROM messages
+                WHERE provider = ?1 AND account_id = ?2 AND thread_key = ?3
+                UNION ALL
+                SELECT l.provider_message_id FROM message_locations AS l
+                JOIN messages AS m ON m.message_id = l.message_id
+                WHERE m.provider = ?1 AND m.account_id = ?2 AND m.thread_key = ?3
+            )""",
             (scope[0], scope[1], key),
         ).fetchone()["smallest"]
         return (0, str(smallest)) if smallest is not None else (1, key)
@@ -5100,7 +5280,9 @@ class Store:
                 END;
                 """,
             )
+            _ensure_sent_capture_tables(db)
             _migrate_thread_identity(db)
+            _migrate_sent_capture(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -8039,6 +8221,10 @@ class Store:
         discovered_at: str,
         rfc_message_id: str | None = None,
         reply_ids: tuple[str, ...] = (),
+        to: tuple[str, ...] = (),
+        cc: tuple[str, ...] = (),
+        locations: frozenset[str] = frozenset(),
+        capture_timezone: str | None = None,
     ) -> bool:
         if mailbox_identity_key is None:
             raise ValueError("mailbox identity key is required")
@@ -8097,14 +8283,37 @@ class Store:
             thread_key, merged = _imap_thread_key(db, scope=scope, ids=thread_ids)
         else:
             thread_key = _provider_thread_key(thread_id)
+        # A second location of an already-captured logical identity is recorded,
+        # not captured again (contract D-identity).
+        if rfc_message_id is not None:
+            logical = db.execute(
+                """SELECT message_id FROM messages
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND rfc_message_id = ? AND logical_of IS NULL
+                  AND provider_message_id <> ?""",
+                (provider, account_id, mailbox_identity_key, rfc_message_id, source_message_id),
+            ).fetchone()
+            if logical is not None:
+                _record_locations(
+                    db,
+                    message_id=str(logical["message_id"]),
+                    provider=provider,
+                    account_id=account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    provider_message_id=source_message_id,
+                    locations=locations,
+                    recorded_at=discovered_at,
+                )
+                return False
         placeholders = ", ".join("?" for _ in suppression_keys)
         cursor = db.execute(
             f"""INSERT OR IGNORE INTO messages(
                 message_id, provider, account_id, mailbox_identity_key, provider_message_id,
                 thread_id, sender, sender_name, subject, received_at, discovered_at,
                 admission_kind, admission_selector_id, admission_display_name,
-                admission_mailbox_identity_key, admitted_at, thread_key, rfc_message_id
-            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                admission_mailbox_identity_key, admitted_at, thread_key, rfc_message_id,
+                capture_timezone
+            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM suppressed_messages
                 WHERE provider = ? AND account_id = ?
@@ -8129,6 +8338,7 @@ class Store:
                 admission.admitted_at,
                 thread_key,
                 rfc_message_id,
+                capture_timezone,
                 provider,
                 account_id,
                 *suppression_keys,
@@ -8138,6 +8348,26 @@ class Store:
         if inserted and provider == "imap":
             _apply_imap_component(
                 db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
+            )
+        if inserted:
+            db.executemany(
+                """INSERT OR IGNORE INTO message_recipients(message_id, field, position, address)
+                VALUES (?, ?, ?, ?)""",
+                [
+                    (message_id, field, position, address)
+                    for field, addresses in (("to", to), ("cc", cc))
+                    for position, address in enumerate(addresses)
+                ],
+            )
+            _record_locations(
+                db,
+                message_id=message_id,
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=source_message_id,
+                locations=locations,
+                recorded_at=discovered_at,
             )
         return inserted
 
@@ -8157,6 +8387,10 @@ class Store:
         admission: AdmissionProvenance,
         rfc_message_id: str | None = None,
         reply_ids: tuple[str, ...] = (),
+        to: tuple[str, ...] = (),
+        cc: tuple[str, ...] = (),
+        locations: frozenset[str] = frozenset(),
+        capture_timezone: str | None = None,
     ) -> bool:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -8176,6 +8410,136 @@ class Store:
                 discovered_at=datetime.now(UTC).isoformat(),
                 rfc_message_id=rfc_message_id,
                 reply_ids=reply_ids,
+                to=to,
+                cc=cc,
+                locations=locations,
+                capture_timezone=capture_timezone,
+            )
+
+    # Sent capture (thread view M2.1): folder cursors, locations, Sent scope.
+    def folder_state(
+        self, *, provider: str, account_id: str, mailbox_identity_key: str, folder: str
+    ) -> tuple[str, str] | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT cursor, last_success_at FROM mailbox_folder_state
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND folder = ?""",
+                (provider, account_id, mailbox_identity_key, folder),
+            ).fetchone()
+        return (str(row["cursor"]), str(row["last_success_at"])) if row else None
+
+    def set_folder_state(
+        self,
+        cursor: str,
+        *,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        folder: str,
+        at: datetime | None = None,
+    ) -> None:
+        stamp = (at or datetime.now(UTC)).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                """SELECT mailbox_identity_key FROM mail_accounts
+                WHERE provider = ? AND account_id = ?""",
+                (provider, account_id),
+            ).fetchone()
+            if current is None or current["mailbox_identity_key"] != mailbox_identity_key:
+                raise MailboxIdentityChanged("mailbox identity changed")
+            db.execute(
+                """INSERT INTO mailbox_folder_state(
+                    provider, account_id, mailbox_identity_key, folder, cursor, last_success_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, account_id, mailbox_identity_key, folder)
+                DO UPDATE SET cursor = excluded.cursor,
+                    last_success_at = excluded.last_success_at""",
+                (provider, account_id, mailbox_identity_key, folder, cursor, stamp),
+            )
+
+    def sent_scope(self, provider: str, account_id: str) -> str:
+        """'available', 'unavailable', or 'not_polled' (contract D-scope)."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT scope FROM mailbox_sent_scope WHERE provider = ? AND account_id = ?",
+                (provider, account_id),
+            ).fetchone()
+        return str(row["scope"]) if row else SENT_SCOPE_NOT_POLLED
+
+    def set_sent_scope(
+        self, provider: str, account_id: str, scope: str, *, now: datetime | None = None
+    ) -> None:
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute(
+                """INSERT INTO mailbox_sent_scope(provider, account_id, scope, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, account_id)
+                DO UPDATE SET scope = excluded.scope, updated_at = excluded.updated_at""",
+                (provider, account_id, scope, stamp),
+            )
+
+    def message_locations(self, message_id: str) -> list[str]:
+        with self.connection() as db:
+            rows = db.execute(
+                """SELECT DISTINCT location FROM message_locations WHERE message_id = ?
+                ORDER BY location""",
+                (message_id,),
+            ).fetchall()
+        return [str(row["location"]) for row in rows]
+
+    def message_location_count(
+        self, *, provider: str, account_id: str, mailbox_identity_key: str, provider_message_id: str
+    ) -> int | None:
+        """Locations recorded for a stored source identity, or None if it is not stored."""
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT COALESCE(m.logical_of, m.message_id) AS logical_id FROM messages AS m
+                WHERE m.provider = ? AND m.account_id = ? AND m.mailbox_identity_key = ?
+                  AND m.provider_message_id = ?""",
+                (provider, account_id, mailbox_identity_key, provider_message_id),
+            ).fetchone()
+            if row is None:
+                return None
+            count = db.execute(
+                "SELECT COUNT(*) FROM message_locations WHERE message_id = ?",
+                (str(row["logical_id"]),),
+            ).fetchone()[0]
+        return int(count)
+
+    def record_message_location(
+        self,
+        *,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        provider_message_id: str,
+        locations: frozenset[str],
+        now: datetime | None = None,
+    ) -> int:
+        """Record the admitted folders a stored source identity is seen in; new rows."""
+        stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT COALESCE(logical_of, message_id) AS logical_id FROM messages
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+                  AND provider_message_id = ?""",
+                (provider, account_id, mailbox_identity_key, provider_message_id),
+            ).fetchone()
+            if row is None:
+                return 0
+            return _record_locations(
+                db,
+                message_id=str(row["logical_id"]),
+                provider=provider,
+                account_id=account_id,
+                mailbox_identity_key=mailbox_identity_key,
+                provider_message_id=provider_message_id,
+                locations=locations,
+                recorded_at=stamp,
             )
 
     # Vendor records (contract D-vendor). Addresses arrive normalized.

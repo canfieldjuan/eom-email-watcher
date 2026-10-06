@@ -12,6 +12,7 @@ from urllib3.response import HTTPResponse
 
 from eom_email_watcher import gmail as gmail_module
 from eom_email_watcher.gmail import (
+    GMAIL_METADATA_HEADERS,
     GmailAuthorizationRejected,
     GmailError,
     GmailGateway,
@@ -1730,3 +1731,50 @@ def test_profile_rejects_incomplete_identity(response: dict[str, str]) -> None:
 
     with pytest.raises(GmailError, match="profile response"):
         gateway.profile()
+
+
+# Thread view M2.1: recipients, RFC ids, and locations (contract D-attribution, D-identity).
+
+
+def test_parse_metadata_reads_recipients_rfc_ids_and_locations() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m1",
+            "threadId": "t1",
+            "internalDate": "1784383200000",
+            "labelIds": ["INBOX", "SENT", "UNREAD"],
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Person <TRUSTED@Example.com>"},
+                    {"name": "To", "value": "A <A@Vendor.com>, b@vendor.com"},
+                    {"name": "Cc", "value": "c@other.com"},
+                    {"name": "Subject", "value": "Quote"},
+                    {"name": "Message-ID", "value": "<m1@vendor.com>"},
+                    {"name": "In-Reply-To", "value": "<p@vendor.com>"},
+                    {"name": "References", "value": "<r@vendor.com> <p@vendor.com>"},
+                ]
+            },
+        }
+    )
+    assert parsed.to == ("a@vendor.com", "b@vendor.com")
+    assert parsed.cc == ("c@other.com",)
+    assert parsed.rfc_message_id == "m1@vendor.com"
+    assert parsed.reply_ids == ("p@vendor.com", "r@vendor.com")
+    assert parsed.locations == frozenset({"inbox", "sent"})
+
+
+def test_parse_metadata_without_admitted_labels_has_no_location() -> None:
+    parsed = parse_metadata(
+        {
+            "id": "m2",
+            "threadId": "t2",
+            "labelIds": ["IMPORTANT"],
+            "payload": {"headers": [{"name": "From", "value": "a@b.com"}]},
+        }
+    )
+    assert parsed.locations == frozenset()
+    assert parsed.to == ()
+
+
+def test_metadata_fetch_requests_the_thread_headers() -> None:
+    assert set(GMAIL_METADATA_HEADERS) >= {"To", "Cc", "Message-ID", "In-Reply-To", "References"}

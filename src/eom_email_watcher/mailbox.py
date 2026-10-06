@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import getaddresses
 from typing import Protocol
 
 from .mime import AttachmentDescriptor
@@ -70,6 +71,41 @@ class MessageMetadata:
     # supply their own thread id leave these empty.
     rfc_message_id: str | None = None
     reply_ids: tuple[str, ...] = ()
+    # Recipients in stored header order, and the admitted folders this copy is
+    # in (contract D-scope, D-attribution). Providers fill them from M2 on.
+    to: tuple[str, ...] = ()
+    cc: tuple[str, ...] = ()
+    locations: frozenset[str] = frozenset()
+
+
+# The admitted folders (contract D-scope), as locations are recorded.
+INBOX_LOCATION = "inbox"
+SENT_LOCATION = "sent"
+MESSAGE_LOCATIONS = frozenset({INBOX_LOCATION, SENT_LOCATION})
+# An account's Sent scope (contract D-scope), as health reports it.
+SENT_SCOPE_AVAILABLE = "available"
+SENT_SCOPE_UNAVAILABLE = "unavailable"
+SENT_SCOPE_NOT_POLLED = "not_polled"
+MAX_RECIPIENT_ADDRESS_BYTES = 512
+
+
+def recipient_addresses(value: object) -> tuple[str, ...]:
+    """Return the distinct casefolded addresses of a To or Cc header, in header order.
+
+    Malformed or oversized entries are dropped; the rest match normalize_address.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    found: list[str] = []
+    for _name, address in getaddresses([value]):
+        candidate = address.strip().casefold()
+        if (
+            "@" in candidate
+            and not any(c.isspace() for c in candidate)
+            and len(candidate.encode("utf-8")) <= MAX_RECIPIENT_ADDRESS_BYTES
+        ):
+            found.append(candidate)
+    return tuple(dict.fromkeys(found))
 
 
 def normalize_message_id(value: object) -> str | None:
@@ -103,6 +139,20 @@ def message_id_list(value: object, limit: int | None = None) -> tuple[str, ...]:
     found = _BRACKETED_ID_RE.findall(value) or value.split()
     ids = tuple(dict.fromkeys(i for i in map(normalize_message_id, found) if i is not None))
     return ids if limit is None else ids[:limit]
+
+
+def reply_ids_from_headers(in_reply_to: object, references: object) -> tuple[str, ...]:
+    """Return a message's parent ids: In-Reply-To, then References, each bounded.
+
+    One owner for every provider (contract D-identity's id set).
+    """
+    parents = message_id_list(_header_text(in_reply_to), MAX_IDS_PER_REPLY_HEADER)
+    history = message_id_list(_header_text(references), MAX_IDS_PER_REPLY_HEADER)
+    return tuple(dict.fromkeys((*parents, *history)))
+
+
+def _header_text(value: object) -> str:
+    return "" if value is None else str(value)
 
 
 @dataclass(frozen=True)

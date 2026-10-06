@@ -23,7 +23,10 @@ from urllib.parse import unquote_to_bytes
 
 from .config import normalize_address
 from .mailbox import (
-    MAX_IDS_PER_REPLY_HEADER,
+    INBOX_LOCATION,
+    SENT_LOCATION,
+    SENT_SCOPE_AVAILABLE,
+    SENT_SCOPE_UNAVAILABLE,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -31,8 +34,9 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
-    message_id_list,
     normalize_message_id,
+    recipient_addresses,
+    reply_ids_from_headers,
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
@@ -59,6 +63,14 @@ MAX_UID_SEARCH_SPAN = 10_000
 CURSOR_PREFIX = "eom-imap-v2:"
 RECOVERY_CURSOR_PREFIX = "eom-imap-recovery-v1:"
 MESSAGE_ID_PREFIX = "eom-imap-message-v2:"
+# Sent copies carry a folder token, so Inbox and Sent UIDs never collide
+# (contract D-identity).
+SENT_MESSAGE_ID_PREFIX = "eom-imap-sent-v1:"
+INBOX_FOLDER = "INBOX"
+MAX_FOLDER_NAME_BYTES = 255
+_LIST_LINE = re.compile(
+    rb'^\((?P<attributes>[^)]*)\)\s+(?P<delimiter>"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.+)$'
+)
 _DOMAIN_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _UID = re.compile(r"[1-9][0-9]*\Z")
 _MAILBOX_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -100,6 +112,9 @@ class ImapCredentials:
     username: str
     password: str
     ca_pem: str | None = None
+    # A configured Sent folder name, used when the server lists no \Sent folder
+    # (contract D-scope).
+    sent_folder: str | None = None
 
 
 def _valid_host(host: str) -> bool:
@@ -153,9 +168,21 @@ def credentials_from_connection(value: object) -> ImapCredentials:
         "username",
         "password",
         "ca_file",
+        "sent_folder",
     }
     if set(value) - allowed:
         raise ImapError("imap_configuration_error", "Unsupported mail server setting")
+
+    sent_folder = value.get("sent_folder")
+    if sent_folder is not None:
+        if (
+            not isinstance(sent_folder, str)
+            or not sent_folder.strip()
+            or len(sent_folder.encode("utf-8")) > MAX_FOLDER_NAME_BYTES
+            or any(not character.isprintable() for character in sent_folder)
+        ):
+            raise ImapError("imap_configuration_error", "Enter a valid Sent folder name")
+        sent_folder = sent_folder.strip()
 
     raw_host = value.get("host")
     host = raw_host.strip().rstrip(".") if isinstance(raw_host, str) else ""
@@ -223,6 +250,7 @@ def credentials_from_connection(value: object) -> ImapCredentials:
         username=username,
         password=password,
         ca_pem=ca_pem,
+        sent_folder=sent_folder,
     )
 
 
@@ -250,6 +278,7 @@ def load_credentials(path: Path) -> ImapCredentials:
         "username",
         "password",
         "ca_pem",
+        "sent_folder",
     }:
         raise ImapError("imap_configuration_error", "Saved mail server credentials are invalid")
     connection = dict(value)
@@ -317,8 +346,76 @@ def _recovery_cursor(
     )
 
 
-def _message_id(mailbox_id: str, uid_validity: int, uid: int) -> str:
-    return f"{MESSAGE_ID_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
+def _message_id(
+    mailbox_id: str, uid_validity: int, uid: int, folder_key: str | None = None
+) -> str:
+    if folder_key is None:
+        return f"{MESSAGE_ID_PREFIX}{mailbox_id}:{uid_validity}:{uid}"
+    return f"{SENT_MESSAGE_ID_PREFIX}{mailbox_id}:{folder_key}:{uid_validity}:{uid}"
+
+
+def _folder_key(folder: str) -> str:
+    return hashlib.sha256(folder.encode("utf-8")).hexdigest()
+
+
+def _decode_any_message_id(value: str) -> tuple[str, str | None, int, int]:
+    """Return (mailbox, folder key or None for INBOX, UIDVALIDITY, UID) of either id form."""
+    if not value.startswith(SENT_MESSAGE_ID_PREFIX):
+        mailbox_id, validity, uid = _decode_message_id(value)
+        return mailbox_id, None, validity, uid
+    fields = value.removeprefix(SENT_MESSAGE_ID_PREFIX).split(":")
+    if (
+        len(fields) != 4
+        or _MAILBOX_ID.fullmatch(fields[0]) is None
+        or _MAILBOX_ID.fullmatch(fields[1]) is None
+        or not fields[2].isdecimal()
+        or _UID.fullmatch(fields[3]) is None
+        or int(fields[2]) <= 0
+    ):
+        raise ImapError("imap_protocol_error", "Mail server message identity is invalid")
+    return fields[0], fields[1], int(fields[2]), int(fields[3])
+
+
+def _parse_list_line(item: object) -> tuple[frozenset[str], str] | None:
+    """Return (casefolded attributes, folder name) of one LIST response line."""
+    if isinstance(item, tuple) and len(item) == 2 and all(isinstance(i, bytes) for i in item):
+        prefix, literal = item
+        head = prefix.rsplit(b"{", 1)[0] + b'""'
+        match = _LIST_LINE.match(head.strip())
+        if match is None:
+            return None
+        name = literal.decode("utf-8", "replace")
+    else:
+        if not isinstance(item, bytes):
+            return None
+        match = _LIST_LINE.match(item.strip())
+        if match is None:
+            return None
+        raw = match.group("name").decode("utf-8", "replace").strip()
+        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            name = raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            name = raw
+    attributes = frozenset(
+        part.decode("ascii", "replace").casefold()
+        for part in match.group("attributes").split()
+    )
+    return attributes, name
+
+
+def _special_use_sent_folder(client: imaplib.IMAP4) -> str | None:
+    """The folder flagged \\Sent by RFC 6154 SPECIAL-USE, when the server lists one."""
+    try:
+        status, lines = client.list('""', "*")
+    except imaplib.IMAP4.error:
+        return None
+    if status != "OK":
+        return None
+    for item in lines or []:
+        parsed = _parse_list_line(item)
+        if parsed is not None and "\\sent" in parsed[0]:
+            return parsed[1]
+    return None
 
 
 def _decode_cursor(value: str) -> tuple[str, int, int]:
@@ -549,13 +646,9 @@ def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
         return ()
     try:
         parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
-        in_reply_to = message_id_list(
-            str(parsed.get("In-Reply-To", "")), MAX_IDS_PER_REPLY_HEADER
-        )
-        references = message_id_list(str(parsed.get("References", "")), MAX_IDS_PER_REPLY_HEADER)
+        return reply_ids_from_headers(parsed.get("In-Reply-To"), parsed.get("References"))
     except (RecursionError, ValueError, TypeError, IndexError):
         return ()
-    return tuple(dict.fromkeys((*in_reply_to, *references)))
 
 
 def _response_metadata(response: list[Any] | None) -> bytes:
@@ -1279,6 +1372,8 @@ class ImapGateway:
         self._remaining_timeout = remaining_timeout
         self._client_factory = client_factory or self._default_client
         self._active_client: imaplib.IMAP4 | None = None
+        self._sent_folder: str | None = None
+        self._sent_folder_resolved = False
 
     @classmethod
     def from_credentials_file(
@@ -1413,19 +1508,7 @@ class ImapGateway:
 
         try:
             self._refresh_operation_timeout(client)
-            status, response = client.select("INBOX", readonly=True)
-            if status != "OK":
-                raise ImapError("imap_protocol_error", "Mail server INBOX is unavailable")
-            raw_count = response[0] if response else None
-            try:
-                message_count = int(raw_count) if raw_count is not None else -1
-            except (TypeError, ValueError) as exc:
-                raise ImapError(
-                    "imap_protocol_error", "Mail server omitted required mailbox state"
-                ) from exc
-            if message_count < 0:
-                raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
-            client._eom_message_count = message_count  # type: ignore[attr-defined]
+            self._select_mailbox(client, INBOX_FOLDER)
             yield client
         except ImapError:
             raise
@@ -1462,6 +1545,7 @@ class ImapGateway:
                 "imap_protocol_error",
                 "Mail server identity requires an active polling session",
             )
+        self._ensure_selected(self._active_client, INBOX_FOLDER)
         return self._mailbox_id, _selected_uid_validity(self._active_client)
 
     def mailbox_identity_key(self) -> str:
@@ -1481,6 +1565,50 @@ class ImapGateway:
             yield client
 
     @staticmethod
+    def _select_mailbox(client: imaplib.IMAP4, folder: str) -> None:
+        """EXAMINE one folder and reset the per-folder state cached on the client."""
+        status, response = client.select(
+            folder if folder == INBOX_FOLDER else _quoted_imap_astring(folder), readonly=True
+        )
+        if status != "OK":
+            raise ImapError("imap_protocol_error", f"Mail server {folder} is unavailable")
+        raw_count = response[0] if response else None
+        try:
+            message_count = int(raw_count) if raw_count is not None else -1
+        except (TypeError, ValueError) as exc:
+            raise ImapError(
+                "imap_protocol_error", "Mail server omitted required mailbox state"
+            ) from exc
+        if message_count < 0:
+            raise ImapError("imap_protocol_error", "Mail server omitted required mailbox state")
+        client._eom_uid_validity = None  # type: ignore[attr-defined]
+        client._eom_message_count = message_count  # type: ignore[attr-defined]
+        client._eom_selected = folder  # type: ignore[attr-defined]
+
+    def _ensure_selected(self, client: imaplib.IMAP4, folder: str) -> None:
+        if getattr(client, "_eom_selected", None) != folder:
+            self._select_mailbox(client, folder)
+
+    def _resolve_sent_folder(self, client: imaplib.IMAP4) -> str | None:
+        """The Sent folder: the configured name, else the server's \\Sent (contract D-scope)."""
+        if not self._sent_folder_resolved:
+            self._sent_folder = self.credentials.sent_folder or _special_use_sent_folder(client)
+            self._sent_folder_resolved = True
+        return self._sent_folder
+
+    def sent_scope(self) -> str:
+        with self._mailbox() as client:
+            if self._resolve_sent_folder(client) is not None:
+                return SENT_SCOPE_AVAILABLE
+            return SENT_SCOPE_UNAVAILABLE
+
+    def _folder_for_key(self, client: imaplib.IMAP4, folder_key: str | None) -> str | None:
+        if folder_key is None:
+            return INBOX_FOLDER
+        sent = self._resolve_sent_folder(client)
+        return sent if sent is not None and _folder_key(sent) == folder_key else None
+
+    @staticmethod
     def _snapshot(client: imaplib.IMAP4) -> tuple[int, int]:
         uid_validity = _selected_uid_validity(client)
         uid_next = _optional_response_number(client, "UIDNEXT")
@@ -1498,11 +1626,12 @@ class ImapGateway:
         return uid_validity, int(match.group(1))
 
     def _checked_uid(self, client: imaplib.IMAP4, message_id: str) -> str:
-        expected_mailbox, expected_validity, uid = _decode_message_id(message_id)
-        if (
-            expected_mailbox != self._mailbox_id
-            or _selected_uid_validity(client) != expected_validity
-        ):
+        expected_mailbox, folder_key, expected_validity, uid = _decode_any_message_id(message_id)
+        folder = self._folder_for_key(client, folder_key)
+        if expected_mailbox != self._mailbox_id or folder is None:
+            raise MailboxMessageUnavailable("The mail server message is no longer available")
+        self._ensure_selected(client, folder)
+        if _selected_uid_validity(client) != expected_validity:
             raise MailboxMessageUnavailable("The mail server message is no longer available")
         return str(uid)
 
@@ -1523,6 +1652,7 @@ class ImapGateway:
             if saved_mailbox != self._mailbox_id:
                 raise StaleMailboxCursor("The configured mail server mailbox changed")
             with self._mailbox() as client:
+                self._ensure_selected(client, INBOX_FOLDER)
                 current_validity = _selected_uid_validity(client)
                 if current_validity != saved_validity:
                     current_validity, current_snapshot_uid = self._snapshot(client)
@@ -1543,13 +1673,38 @@ class ImapGateway:
                     snapshot_uid=snapshot_uid,
                     search_day=search_day,
                 )
+        return self._incremental_changes(cursor, sent=False)
+
+    # Sent polling (contract D-scope), with its own cursor (contract D-reconcile).
+    def sent_initial_cursor(self) -> str:
+        with self._mailbox() as client:
+            folder = self._require_sent_folder(client)
+            self._ensure_selected(client, folder)
+            uid_validity, last_uid = self._snapshot(client)
+        return _cursor(self._mailbox_id, uid_validity, last_uid)
+
+    def sent_changes_since(self, cursor: str) -> MailboxChanges:
+        return self._incremental_changes(cursor, sent=True)
+
+    def _require_sent_folder(self, client: imaplib.IMAP4) -> str:
+        folder = self._resolve_sent_folder(client)
+        if folder is None:
+            raise ImapError("imap_sent_unavailable", "Mail server has no Sent folder")
+        return folder
+
+    def _incremental_changes(self, cursor: str, *, sent: bool) -> MailboxChanges:
         saved_mailbox, saved_validity, saved_uid = _decode_cursor(cursor)
         if saved_mailbox != self._mailbox_id:
             raise StaleMailboxCursor("The configured mail server mailbox changed")
         with self._mailbox() as client:
+            folder = self._require_sent_folder(client) if sent else INBOX_FOLDER
+            folder_key = _folder_key(folder) if sent else None
+            self._ensure_selected(client, folder)
             current_validity, snapshot_uid = self._snapshot(client)
             if current_validity != saved_validity:
-                raise StaleMailboxCursor("The mail server reset its INBOX message identifiers")
+                raise StaleMailboxCursor(
+                    f"The mail server reset its {folder} message identifiers"
+                )
             if snapshot_uid <= saved_uid:
                 return MailboxChanges((), _cursor(self._mailbox_id, current_validity, snapshot_uid))
             message_count = _selected_message_count(client)
@@ -1564,7 +1719,10 @@ class ImapGateway:
                 raise ImapError("imap_protocol_error", "Mail server UID page was invalid")
         next_uid = snapshot_uid if last_sequence == message_count else candidates[-1]
         return MailboxChanges(
-            tuple(_message_id(self._mailbox_id, current_validity, uid) for uid in candidates),
+            tuple(
+                _message_id(self._mailbox_id, current_validity, uid, folder_key)
+                for uid in candidates
+            ),
             _cursor(self._mailbox_id, current_validity, next_uid),
         )
 
@@ -1646,7 +1804,8 @@ class ImapGateway:
                 "FETCH",
                 uid,
                 "(UID INTERNALDATE "
-                f"BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}> "
+                "BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)]"
+                f"<0.{MAX_HEADER_BYTES}> "
                 f"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>)",
             )
             if status != "OK":
@@ -1667,6 +1826,7 @@ class ImapGateway:
             raise MailboxMessageInvalid(
                 "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
             ) from exc
+        sent_copy = message_id.startswith(SENT_MESSAGE_ID_PREFIX)
         return MessageMetadata(
             message_id=message_id,
             thread_id=thread_id,
@@ -1674,9 +1834,12 @@ class ImapGateway:
             sender_name=sender_name.strip() or None,
             subject=subject,
             received_at=_message_date(metadata, parsed),
-            labels=frozenset({"INBOX"}),
+            labels=frozenset() if sent_copy else frozenset({"INBOX"}),
             rfc_message_id=normalize_message_id(thread_id),
             reply_ids=reply_ids,
+            to=recipient_addresses(str(parsed.get("To", ""))),
+            cc=recipient_addresses(str(parsed.get("Cc", ""))),
+            locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
         )
 
     @staticmethod

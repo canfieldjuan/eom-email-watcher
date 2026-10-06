@@ -8,12 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from connect_automate.entitlement import EntitlementDecision
 
 from eom_email_watcher import db as db_module
 from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
+    GMAIL_LOCATION_LABELS,
     GmailAuthorizationRejected,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
@@ -22,7 +24,7 @@ from eom_email_watcher.gmail import (
     MessageUnavailable,
     StaleHistoryCursor,
 )
-from eom_email_watcher.imap import ImapGateway
+from eom_email_watcher.imap import ImapError, ImapGateway
 from eom_email_watcher.mailbox import (
     MailboxChanges,
     MailboxError,
@@ -5160,3 +5162,268 @@ def test_imap_capture_threads_a_reply_with_its_root(tmp_path: Path) -> None:
     assert rows[ids["root"]][1] == "root@vendor.example"
     assert rows[ids["reply"]][1] == "reply@vendor.example"
     assert rows[ids["root"]][0] == rows[ids["reply"]][0] is not None
+
+
+# Thread view M2.1: Sent capture and locations (contract D-scope, D-identity, D-ops).
+
+
+class LabelledGmail(FakeGmail):
+    """Gmail history naming one watched message, with the labels the test chooses."""
+
+    def __init__(self, labels: frozenset[str]) -> None:
+        super().__init__()
+        self.labels = labels
+        self.metadata_calls = 0
+
+    def history_message_ids(self, cursor: str):
+        return ["allowed"], "200"
+
+    def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+        self.metadata_calls += 1
+        return replace(
+            super().metadata(message_id),
+            labels=self.labels,
+            locations=frozenset(
+                location
+                for label, location in GMAIL_LOCATION_LABELS.items()
+                if label in self.labels
+            ),
+            to=("billing@vendor.com",),
+        )
+
+
+def test_gmail_sent_only_message_from_a_watched_sender_is_captured_with_its_location(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+
+    result = Watcher(cfg, store, LabelledGmail(frozenset({"SENT"})), FakeModel()).check()
+
+    assert result["summarized"] == 1
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+    assert store.sent_scope("gmail", "gmail-default") == "available"
+    with store.connection() as db:
+        recipients = db.execute(
+            "SELECT field, position, address FROM message_recipients WHERE message_id = ?",
+            (item["message_id"],),
+        ).fetchall()
+        zone = db.execute(
+            "SELECT capture_timezone FROM messages WHERE message_id = ?", (item["message_id"],)
+        ).fetchone()[0]
+    assert [tuple(row) for row in recipients] == [("to", 0, "billing@vendor.com")]
+    assert zone == "America/Chicago"
+
+
+def test_gmail_label_added_to_a_known_message_records_its_second_location(
+    tmp_path: Path,
+) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    watcher = Watcher(cfg, store, gateway, FakeModel())
+    watcher.check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    # Gmail reports the same id again, now also in SENT: one metadata fetch records it.
+    gateway.labels = frozenset({"INBOX", "SENT"})
+    calls = gateway.metadata_calls
+    watcher.check()
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert gateway.metadata_calls == calls + 1
+
+    # With every admitted folder recorded, a repeated event costs no fetch.
+    watcher.check()
+    assert gateway.metadata_calls == calls + 1
+    assert len(store.recent(5)) == 1
+
+
+def _imap_sent_scaffold(tmp_path: Path) -> tuple[Config, Store, str, str, str, str]:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    account_id = "imap-" + "e" * 32
+    store.register_mail_account(
+        "imap", account_id, display_name="IMAP", address="owner@example.com", active=True
+    )
+    credential_identity = "e" * 64
+    identity = hashlib.sha256(
+        f"imap-mailbox-v2\0{credential_identity}\0{44}".encode()
+    ).hexdigest()
+    store.reconcile_mailbox_identity(
+        "imap", account_id, identity, legacy_status="replacement", preserve_cursor=True
+    )
+    inbox_cursor = f"eom-imap-v2:{credential_identity}:44:7"
+    store.set_state(
+        inbox_cursor,
+        datetime.now(UTC) - timedelta(minutes=10),
+        provider="imap",
+        account_id=account_id,
+        mailbox_identity_key=identity,
+    )
+    return cfg, store, account_id, credential_identity, identity, inbox_cursor
+
+
+class SentPollingGateway(ImapGateway):
+    """An IMAP gateway whose Inbox is quiet and whose Sent folder the test controls."""
+
+    def __init__(
+        self,
+        credential_identity: str,
+        identity: str,
+        inbox_cursor: str,
+        *,
+        scope: str = "available",
+        sent_ids: tuple[str, ...] = (),
+        fail_sent: bool = False,
+    ) -> None:
+        self.credential_identity = credential_identity
+        self.identity = identity
+        self.inbox_cursor = inbox_cursor
+        self.scope = scope
+        self.sent_ids = sent_ids
+        self.fail_sent = fail_sent
+        self.sent_cursor = f"eom-imap-v2:{credential_identity}:77:0"
+        self.sent_calls: list[object] = []
+
+    @contextmanager
+    def polling_session(self):
+        yield
+
+    def mailbox_epoch(self) -> tuple[str, int]:
+        return self.credential_identity, 44
+
+    def mailbox_identity_key(self) -> str:
+        return self.identity
+
+    def mailbox_address(self) -> str:
+        return "owner@example.com"
+
+    def initial_cursor(self) -> str:
+        return self.inbox_cursor
+
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        return MailboxChanges((), self.inbox_cursor)
+
+    def sent_scope(self) -> str:
+        self.sent_calls.append("scope")
+        return self.scope
+
+    def sent_initial_cursor(self) -> str:
+        self.sent_calls.append("initial")
+        return self.sent_cursor
+
+    def sent_changes_since(self, cursor: str) -> MailboxChanges:
+        self.sent_calls.append(("changes", cursor))
+        if self.fail_sent:
+            raise ImapError("imap_connection_failed", "Mail server connection failed; retry")
+        return MailboxChanges(self.sent_ids, f"eom-imap-v2:{self.credential_identity}:77:3")
+
+    def metadata(self, message_id: str) -> MessageMetadata:
+        return MessageMetadata(
+            message_id,
+            "<sent@owner.example>",
+            "trusted@example.com",
+            "Trusted",
+            "Re: Quote",
+            datetime.now(UTC).isoformat(),
+            frozenset(),
+            rfc_message_id="sent@owner.example",
+            to=("billing@vendor.com",),
+            locations=frozenset({"sent"}),
+        )
+
+    def content(self, message_id: str, body_char_limit: int) -> MessageContent:
+        return MessageContent("body", (), (), 4)
+
+
+def _active_entitlement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.ACTIVE
+    )
+
+
+def test_imap_sent_folder_is_polled_only_while_connect_is_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, sent_ids=(sent_id,))
+    scope = {
+        "provider": "imap",
+        "account_id": account_id,
+        "mailbox_identity_key": identity,
+        "folder": "sent",
+    }
+
+    def check() -> dict[str, object]:
+        session = MailboxSession("imap", account_id, gateway)
+        return Watcher(cfg, store, session, FakeModel()).check()
+
+    # Inactive (the conftest default): Sent is never consulted.
+    check()
+    assert gateway.sent_calls == []
+    assert store.folder_state(**scope) is None
+    assert store.sent_scope("imap", account_id) == "not_polled"
+
+    # The first active check records the folder's current position, like the Inbox at setup.
+    _active_entitlement(monkeypatch)
+    check()
+    assert store.sent_scope("imap", account_id) == "available"
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+    assert store.recent(1) == []
+
+    # The next active check captures from Sent and advances only the Sent cursor.
+    result = check()
+    assert result["summarized"] == 1
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+    assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor
+
+
+def test_imap_without_a_sent_folder_records_unavailable_and_polls_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, scope="unavailable")
+    _active_entitlement(monkeypatch)
+
+    Watcher(cfg, store, MailboxSession("imap", account_id, gateway), FakeModel()).check()
+
+    assert store.sent_scope("imap", account_id) == "unavailable"
+    assert gateway.sent_calls == ["scope"]
+    assert (
+        store.folder_state(
+            provider="imap", account_id=account_id, mailbox_identity_key=identity, folder="sent"
+        )
+        is None
+    )
+
+
+def test_a_sent_folder_error_does_not_stop_the_inbox_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, fail_sent=True)
+    _active_entitlement(monkeypatch)
+    session = MailboxSession("imap", account_id, gateway)
+    Watcher(cfg, store, session, FakeModel()).check()
+
+    result = Watcher(cfg, store, session, FakeModel()).check()
+
+    assert result["active"] is True
+    assert ("changes", gateway.sent_cursor) in gateway.sent_calls
+    assert (
+        store.folder_state(
+            provider="imap", account_id=account_id, mailbox_identity_key=identity, folder="sent"
+        )[0]
+        == gateway.sent_cursor
+    )
+    assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor

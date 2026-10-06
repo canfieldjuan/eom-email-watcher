@@ -22,12 +22,18 @@ from filelock import Timeout as FileLockTimeout
 
 from .config import normalize_address
 from .mailbox import (
+    INBOX_LOCATION,
+    SENT_LOCATION,
+    SENT_SCOPE_AVAILABLE,
+    SENT_SCOPE_UNAVAILABLE,
     MailboxChanges,
     MailboxError,
     MailboxMessageUnavailable,
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    normalize_message_id,
+    recipient_addresses,
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
@@ -263,7 +269,17 @@ def _safe_graph_url(url: object, *, delta_token: str | None = None) -> str:
     return url
 
 
-def _delta_url(since: datetime) -> str:
+# Well-known folder names of the admitted folders (contract D-scope).
+INBOX_FOLDER = "inbox"
+SENT_FOLDER = "sentitems"
+FOLDER_LOCATIONS = {INBOX_FOLDER: INBOX_LOCATION, SENT_FOLDER: SENT_LOCATION}
+METADATA_SELECT = (
+    "id,conversationId,from,toRecipients,ccRecipients,subject,receivedDateTime,"
+    "internetMessageId,parentFolderId"
+)
+
+
+def _delta_url(since: datetime, folder: str = INBOX_FOLDER) -> str:
     stamp = since.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     query = urlencode(
         {
@@ -272,7 +288,20 @@ def _delta_url(since: datetime) -> str:
             "changeType": "created",
         }
     )
-    return f"{GRAPH_ROOT}/me/mailFolders/inbox/messages/delta?{query}"
+    return f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages/delta?{query}"
+
+
+def _graph_recipients(value: object) -> tuple[str, ...]:
+    """Return the casefolded addresses of a Graph recipient list, in order."""
+    if not isinstance(value, list):
+        return ()
+    found: list[str] = []
+    for item in value:
+        email_object = item.get("emailAddress") if isinstance(item, dict) else None
+        address = email_object.get("address") if isinstance(email_object, dict) else None
+        if isinstance(address, str):
+            found.extend(recipient_addresses(address))
+    return tuple(dict.fromkeys(found))
 
 
 def _initial_cursor(since: datetime) -> str:
@@ -603,15 +632,59 @@ class Microsoft365Gateway:
         del addresses
         return self._delta_round(_delta_url(since), continuation=False)
 
+    # The Sent folder has its own delta link (contract D-reconcile: one folder
+    # cursor never moves another). Its initial cursor is the same time boundary.
+    def sent_initial_cursor(self) -> str:
+        return _initial_cursor(datetime.now(UTC))
+
+    def sent_changes_since(self, cursor: str) -> MailboxChanges:
+        initial_since = _initial_cursor_time(cursor)
+        if initial_since is not None:
+            return self._delta_round(_delta_url(initial_since, SENT_FOLDER), continuation=False)
+        return self._delta_round(cursor, continuation=True)
+
+    def sent_scope(self) -> str:
+        """Whether Sent Items is reachable (contract D-scope)."""
+        if SENT_FOLDER in self._folder_ids_by_location():
+            return SENT_SCOPE_AVAILABLE
+        return SENT_SCOPE_UNAVAILABLE
+
+    def _folder_ids_by_location(self) -> dict[str, str]:
+        """Map each admitted well-known folder name to its id, resolved once per gateway."""
+        cached = getattr(self, "_folder_ids", None)
+        if cached is not None:
+            return cached
+        resolved: dict[str, str] = {}
+        for folder in FOLDER_LOCATIONS:
+            query = urlencode({"$select": "id"})
+            try:
+                response = self._request(
+                    f"{GRAPH_ROOT}/me/mailFolders/{folder}?{query}", missing_is_message=True
+                )
+            except MailboxMessageUnavailable:
+                continue
+            folder_id = _response_document(response, "mail folder").get("id")
+            if isinstance(folder_id, str) and folder_id:
+                resolved[folder] = _graph_id(folder_id, "folder id")
+        self._folder_ids = resolved
+        return resolved
+
+    def _locations(self, parent_folder_id: object) -> frozenset[str]:
+        if not isinstance(parent_folder_id, str):
+            return frozenset()
+        return frozenset(
+            FOLDER_LOCATIONS[folder]
+            for folder, folder_id in self._folder_ids_by_location().items()
+            if folder_id == parent_folder_id
+        )
+
     def metadata(self, message_id: str) -> MessageMetadata:
         encoded_id = quote(_graph_id(message_id, "message id"), safe="")
-        query = urlencode(
-            {
-                "$select": "id,conversationId,from,subject,receivedDateTime",
-            }
-        )
+        query = urlencode({"$select": METADATA_SELECT})
+        # Folder-agnostic, so a Sent Items message resolves; its folder decides the
+        # location, and a message outside the admitted folders gets none.
         response = self._request(
-            f"{GRAPH_ROOT}/me/mailFolders/inbox/messages/{encoded_id}?{query}",
+            f"{GRAPH_ROOT}/me/messages/{encoded_id}?{query}",
             missing_is_message=True,
         )
         document = _response_document(response, "message metadata")
@@ -627,6 +700,7 @@ class Microsoft365Gateway:
         subject = document.get("subject")
         received_at = document.get("receivedDateTime")
         conversation_id = document.get("conversationId")
+        locations = self._locations(document.get("parentFolderId"))
         return MessageMetadata(
             message_id=message_id,
             thread_id=conversation_id if isinstance(conversation_id, str) else None,
@@ -638,7 +712,11 @@ class Microsoft365Gateway:
                 subject.strip() if isinstance(subject, str) and subject.strip() else "(no subject)"
             ),
             received_at=received_at if isinstance(received_at, str) else "",
-            labels=frozenset({"INBOX"}),
+            labels=frozenset({"INBOX"}) if INBOX_LOCATION in locations else frozenset(),
+            rfc_message_id=normalize_message_id(document.get("internetMessageId")),
+            to=_graph_recipients(document.get("toRecipients")),
+            cc=_graph_recipients(document.get("ccRecipients")),
+            locations=locations,
         )
 
     def _attachments(self, message_id: str) -> tuple[AttachmentDescriptor, ...]:

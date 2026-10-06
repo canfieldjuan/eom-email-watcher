@@ -13,6 +13,8 @@ from typing import Literal, Protocol
 from connect_automate.entitlement import (
     AUTOMATIONS_FEATURE_ID,
     CONNECT_FEATURE_ID,
+    EntitlementDecision,
+    connect_entitlement_decision,
     feature_entitlements_active,
 )
 
@@ -49,6 +51,9 @@ from .gmail import (
 )
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
+    MESSAGE_LOCATIONS,
+    SENT_LOCATION,
+    SENT_SCOPE_AVAILABLE,
     MailboxAccountUnavailable,
     MailboxChanges,
     MailboxError,
@@ -151,6 +156,14 @@ class RecoveryLabelGrant:
     selected_display_name: str
 
 
+def _in_admitted_folder(metadata: object, labels: frozenset[str]) -> bool:
+    """Contract D-scope: Inbox or Sent. Providers that record locations say which."""
+    locations = getattr(metadata, "locations", None)
+    if isinstance(locations, frozenset) and locations:
+        return bool(locations & MESSAGE_LOCATIONS)
+    return "INBOX" in labels
+
+
 def match_mailbox_admission(
     *,
     metadata: object,
@@ -164,7 +177,7 @@ def match_mailbox_admission(
     """Return the one deterministic admission grant for mailbox metadata."""
     labels = getattr(metadata, "labels", None)
     sender = getattr(metadata, "sender", None)
-    if not isinstance(labels, frozenset) or "INBOX" not in labels:
+    if not isinstance(labels, frozenset) or not _in_admitted_folder(metadata, labels):
         return None
     admitted_at_text = admitted_at.astimezone(UTC).isoformat()
     if isinstance(sender, str) and sender in exact_senders:
@@ -1902,6 +1915,7 @@ class Watcher:
     ) -> dict[str, int | bool | str]:
         checked_at = datetime.now(UTC)
         retention_cutoff = checked_at - timedelta(days=self.config.retention_days)
+        gated_allowed = self._gated_class_allowed()
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
             provider=self.mailbox.provider,
@@ -2066,15 +2080,78 @@ class Watcher:
             else:
                 changes = self.gateway.recover_since(self.config.allowlist, since)
 
-        added = 0
         dry_run_messages: list[PendingMessage] = []
-        for provider_message_id in changes.message_ids:
+        added = self._capture_ids(
+            changes.message_ids,
+            mailbox_identity_key=mailbox_identity_key,
+            label_selectors=label_selectors,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            dry_run=dry_run,
+            dry_run_messages=dry_run_messages,
+        )
+
+        if not dry_run:
+            self.store.set_state(
+                changes.cursor,
+                provider=self.mailbox.provider,
+                account_id=self.mailbox.account_id,
+                mailbox_identity_key=mailbox_identity_key,
+            )
+            added += self._poll_sent_folder(
+                mailbox_identity_key=mailbox_identity_key,
+                label_selectors=label_selectors,
+                checked_at=checked_at,
+                retention_cutoff=retention_cutoff,
+                gated_allowed=gated_allowed,
+            )
+        return self._finish_active_result(
+            added=added,
+            purged=purged,
+            recovered=recovered,
+            dry_run=dry_run,
+            deliver_notifications=deliver_notifications,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            mailbox_identity_key=mailbox_identity_key,
+            dry_run_messages=dry_run_messages,
+            recovery_incomplete=recovery_incomplete,
+            recovery_reason=recovery_reason,
+        )
+
+    @staticmethod
+    def _gated_class_allowed() -> bool:
+        """Contract D-ops: Sent polling (and later gated capture) need the paid entitlement."""
+        return connect_entitlement_decision() is EntitlementDecision.ACTIVE
+
+    def _capture_ids(
+        self,
+        message_ids: Iterable[str],
+        *,
+        mailbox_identity_key: str,
+        label_selectors: tuple[GmailLabelSelectorLike, ...],
+        checked_at: datetime,
+        retention_cutoff: datetime,
+        dry_run: bool,
+        dry_run_messages: list[PendingMessage],
+    ) -> int:
+        """Admit and capture one folder's changed messages; return how many were added."""
+        added = 0
+        for provider_message_id in message_ids:
             if self.store.has_seen_message(
                 provider_message_id,
                 provider=self.mailbox.provider,
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             ):
+                # Gmail and Microsoft ids span folders, so a known id comes back
+                # when its folder changes; IMAP copies have folder-tokened ids.
+                if self.mailbox.provider != IMAP_PROVIDER and not dry_run:
+                    self._record_known_message_location(
+                        provider_message_id,
+                        mailbox_identity_key=mailbox_identity_key,
+                        checked_at=checked_at,
+                    )
                 continue
             try:
                 metadata = self.gateway.metadata(provider_message_id)
@@ -2146,29 +2223,108 @@ class Watcher:
                 admission=admission.provenance(),
                 rfc_message_id=metadata.rfc_message_id,
                 reply_ids=metadata.reply_ids,
+                to=metadata.to,
+                cc=metadata.cc,
+                locations=metadata.locations,
+                capture_timezone=self.config.timezone,
             ):
                 added += 1
+        return added
 
-        if not dry_run:
-            self.store.set_state(
-                changes.cursor,
-                provider=self.mailbox.provider,
-                account_id=self.mailbox.account_id,
-                mailbox_identity_key=mailbox_identity_key,
-            )
-        return self._finish_active_result(
-            added=added,
-            purged=purged,
-            recovered=recovered,
-            dry_run=dry_run,
-            deliver_notifications=deliver_notifications,
-            checked_at=checked_at,
-            retention_cutoff=retention_cutoff,
+    def _record_known_message_location(
+        self,
+        provider_message_id: str,
+        *,
+        mailbox_identity_key: str,
+        checked_at: datetime,
+    ) -> None:
+        """A known id came back through polling: record its location (contract D-identity)."""
+        count = self.store.message_location_count(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
-            dry_run_messages=dry_run_messages,
-            recovery_incomplete=recovery_incomplete,
-            recovery_reason=recovery_reason,
+            provider_message_id=provider_message_id,
         )
+        if count is None or count >= len(MESSAGE_LOCATIONS):
+            return
+        try:
+            metadata = self.gateway.metadata(provider_message_id)
+        except (MailboxMessageUnavailable, MailboxMessageInvalid):
+            return
+        self.store.record_message_location(
+            provider=self.mailbox.provider,
+            account_id=self.mailbox.account_id,
+            mailbox_identity_key=mailbox_identity_key,
+            provider_message_id=provider_message_id,
+            locations=metadata.locations,
+            now=checked_at,
+        )
+
+    def _poll_sent_folder(
+        self,
+        *,
+        mailbox_identity_key: str,
+        label_selectors: tuple[GmailLabelSelectorLike, ...],
+        checked_at: datetime,
+        retention_cutoff: datetime,
+        gated_allowed: bool,
+    ) -> int:
+        """Poll the Sent folder (contract D-scope) while the gated class is allowed (D-ops).
+
+        Gmail's one mailbox-wide cursor already carries SENT events, so only the other
+        providers keep a Sent cursor of their own.
+        """
+        provider = self.mailbox.provider
+        account_id = self.mailbox.account_id
+        if provider == "gmail":
+            self.store.set_sent_scope(provider, account_id, SENT_SCOPE_AVAILABLE, now=checked_at)
+            return 0
+        if not gated_allowed:
+            return 0
+        # A Sent folder error never stops the Inbox check; the next check retries.
+        try:
+            scope_reader = getattr(self.gateway, "sent_scope", None)
+            if not callable(scope_reader):
+                return 0
+            scope = scope_reader()
+            self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+            if scope != SENT_SCOPE_AVAILABLE:
+                return 0
+            folder_scope = {
+                "provider": provider,
+                "account_id": account_id,
+                "mailbox_identity_key": mailbox_identity_key,
+                "folder": SENT_LOCATION,
+            }
+            state = self.store.folder_state(**folder_scope)
+            if state is None:
+                # Like the Inbox at setup: start at the folder's current position.
+                self.store.set_folder_state(
+                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                )
+                return 0
+            try:
+                changes = self.gateway.sent_changes_since(state[0])
+            except StaleMailboxCursor as exc:
+                logger.warning("Sent folder cursor expired (%s); restarting from its position", exc)
+                self.store.set_folder_state(
+                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                )
+                return 0
+            added = self._capture_ids(
+                changes.message_ids,
+                mailbox_identity_key=mailbox_identity_key,
+                label_selectors=label_selectors,
+                checked_at=checked_at,
+                retention_cutoff=retention_cutoff,
+                dry_run=False,
+                dry_run_messages=[],
+            )
+            self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
+            return added
+        except MailboxError as exc:
+            logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)
+            return 0
 
     def _label(self, message: PendingMessage | AnalyzedMessage | NotificationIntent) -> str:
         return self.sender_names.get(message.sender) or message.sender_name or message.sender

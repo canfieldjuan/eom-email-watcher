@@ -20,6 +20,7 @@ import { automationOutcomeIdentity, automationOutcomeStatus } from "./automation
 import { inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
+import { mailAccountDetail } from "./mailAccountDetail";
 import {
   deleteVendorConfirmText,
   latestRequestFence,
@@ -301,6 +302,7 @@ interface MailAccountStatus {
   connected: boolean;
   active: boolean;
   last_check: string | null;
+  sent_scope?: "available" | "unavailable" | "not_polled" | null;
 }
 
 interface GmailLabelCatalogItem {
@@ -3448,7 +3450,7 @@ function renderMailAccounts(data: MailAccounts): boolean {
     const title = document.createElement("strong");
     title.textContent = account.address || account.display_name;
     const detail = document.createElement("span");
-    detail.textContent = `${account.display_name} · ${account.active ? "Active" : "Retained"} · ${account.connected ? "Connected" : "Disconnected"}`;
+    detail.textContent = mailAccountDetail(account);
     identity.append(title, detail);
 
     const actions = document.createElement("div");

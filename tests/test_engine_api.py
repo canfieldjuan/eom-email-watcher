@@ -2833,6 +2833,7 @@ def test_mail_account_list_adopts_existing_gmail_token_without_exposing_paths(
                 "display_name": "Gmail",
                 "last_check": None,
                 "provider": "gmail",
+                "sent_scope": "not_polled",
             }
         ],
         "providers": [
@@ -2907,6 +2908,7 @@ def test_mail_account_connect_installs_private_token_and_initializes_identity(
         "display_name": "Gmail",
         "last_check": "<checked>",
         "provider": "gmail",
+        "sent_scope": "not_polled",
     }
     runtime = load_runtime(config_path)
     assert runtime.config.gmail_token_file.read_text(encoding="utf-8") == "private readonly token"
@@ -8786,3 +8788,17 @@ def test_a_missing_vendor_is_reported_before_address_conflicts(
         config_path, "vendors.addresses.add", {"vendor_id": missing, "address": "billing@acme.com"}
     )
     assert response["error"]["code"] == "not_found"
+
+
+def test_mail_account_list_reports_the_sent_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    runtime = load_runtime(config_path)
+    patch_runtime(monkeypatch, runtime)
+    runtime.store.set_sent_scope("gmail", "gmail-default", "unavailable")
+
+    response = engine_api._response(request(config_path, "mail.accounts.list"))
+
+    assert [a["sent_scope"] for a in response["data"]["accounts"]] == ["unavailable"]

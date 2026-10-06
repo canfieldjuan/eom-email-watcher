@@ -28,6 +28,8 @@ from googleapiclient.errors import HttpError
 
 from .config import normalize_address
 from .mailbox import (
+    INBOX_LOCATION,
+    SENT_LOCATION,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -35,6 +37,9 @@ from .mailbox import (
     MessageContent,
     MessageMetadata,
     StaleMailboxCursor,
+    normalize_message_id,
+    recipient_addresses,
+    reply_ids_from_headers,
     validate_operation_timeout,
 )
 from .mime import extract_body
@@ -430,6 +435,15 @@ def gmail_credentials_configured(configured_file: Path) -> bool:
     return resolve_gmail_credentials_file(configured_file).is_file()
 
 
+# The headers one metadata fetch needs: sender and subject as before, plus the
+# recipients and RFC ids of contract D-attribution and D-identity.
+GMAIL_METADATA_HEADERS = [
+    "From", "To", "Cc", "Subject", "Date", "Message-ID", "In-Reply-To", "References",
+]
+# Gmail system labels that are admitted folders (contract D-scope).
+GMAIL_LOCATION_LABELS = {"INBOX": INBOX_LOCATION, "SENT": SENT_LOCATION}
+
+
 def _headers(payload: dict[str, Any]) -> dict[str, str]:
     return {
         str(item.get("name", "")).casefold(): str(item.get("value", ""))
@@ -493,6 +507,13 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
         subject=headers.get("subject", "(no subject)").strip() or "(no subject)",
         received_at=_received_at(message, headers),
         labels=labels,
+        rfc_message_id=normalize_message_id(headers.get("message-id")),
+        reply_ids=reply_ids_from_headers(headers.get("in-reply-to"), headers.get("references")),
+        to=recipient_addresses(headers.get("to")),
+        cc=recipient_addresses(headers.get("cc")),
+        locations=frozenset(
+            location for label, location in GMAIL_LOCATION_LABELS.items() if label in labels
+        ),
     )
 
 
@@ -935,7 +956,7 @@ class GmailGateway:
                     userId="me",
                     id=message_id,
                     format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"],
+                    metadataHeaders=GMAIL_METADATA_HEADERS,
                 )
             )
             message = self._execute_request(request, timeout_seconds=timeout_seconds)

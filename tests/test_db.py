@@ -2260,7 +2260,7 @@ def test_gmail_validation_schema_bump_rejects_previous_binary(
     store.initialize()
 
     with store.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
 
     monkeypatch.setattr(db_module, "SCHEMA_VERSION", 26)
     with pytest.raises(RuntimeError, match="newer than supported version 26"):
@@ -2283,7 +2283,7 @@ def test_schema_25_migrates_validation_tables_fail_closed_without_losing_selecto
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
         tables = {
             str(row["name"])
             for row in db.execute(
@@ -2339,7 +2339,7 @@ def test_schema_26_migrates_current_validation_with_explicit_catalog_state(
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
         assert db.execute(
             "SELECT catalog_state FROM gmail_label_validation_sets"
         ).fetchone()[0] == "current"
@@ -6264,7 +6264,7 @@ def test_schema_27_database_gains_unknown_body_counts(tmp_path: Path) -> None:
     migrated.initialize()
 
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
         triggers = {
             str(row["name"])
             for row in db.execute(
@@ -6366,6 +6366,21 @@ def _imap_message(
     return message_id
 
 
+def _retained_duplicate(store: Store, uid: str, own: str) -> str:
+    """Store a second row for a Message-ID the way a pre-M2 database retained it.
+
+    Capture records a known logical identity's second copy as a location, not a
+    row (contract D-identity), so the duplicate is written through SQL.
+    """
+    message_id = _imap_message(store, uid, f"placeholder-{uid}@dup")
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET rfc_message_id = ?, thread_id = ? WHERE message_id = ?",
+            (own, f"<{own}>", message_id),
+        )
+    return message_id
+
+
 def _thread_keys(store: Store) -> dict[str, str | None]:
     with store.connection() as db:
         rows = db.execute("SELECT message_id, thread_key FROM messages").fetchall()
@@ -6459,6 +6474,38 @@ def test_gmail_and_microsoft_thread_keys_are_the_provider_thread_ids(tmp_path: P
     assert keys["microsoft365-1"] == "conversation-1"
 
 
+def _reset_to_schema_29(store: Store) -> None:
+    """Undo schema 30 (Sent capture) so a migration test can start from v29."""
+    with store.connection() as db:
+        for statement in (
+            "DROP TRIGGER messages_delete_recipients_and_locations",
+            "DROP INDEX idx_messages_logical_identity",
+            "DROP INDEX idx_messages_logical_of",
+            "DROP INDEX idx_message_locations_message",
+            "DROP TABLE message_recipients",
+            "DROP TABLE message_locations",
+            "DROP TABLE mailbox_folder_state",
+            "DROP TABLE mailbox_sent_scope",
+            "ALTER TABLE messages DROP COLUMN logical_of",
+            "ALTER TABLE messages DROP COLUMN capture_timezone",
+        ):
+            db.execute(statement)
+        db.execute("PRAGMA user_version = 29")
+
+
+def _reset_to_schema_28(store: Store) -> None:
+    _reset_to_schema_29(store)
+    with store.connection() as db:
+        db.execute("UPDATE messages SET thread_key = NULL, rfc_message_id = NULL")
+        db.execute("DELETE FROM imap_thread_ids")
+        db.execute("DROP TRIGGER messages_release_imap_component")
+        db.execute("DROP INDEX idx_messages_thread_key")
+        db.execute("DROP INDEX idx_messages_rfc_message_id")
+        db.execute("ALTER TABLE messages DROP COLUMN thread_key")
+        db.execute("ALTER TABLE messages DROP COLUMN rfc_message_id")
+        db.execute("PRAGMA user_version = 28")
+
+
 def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
@@ -6468,7 +6515,7 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
     )
     old = _imap_message(store, "1", "old-root@x")
     first_copy = _imap_message(store, "3", "dup@x")
-    second_copy = _imap_message(store, "4", "dup@x")
+    second_copy = _retained_duplicate(store, "4", "dup@x")
     idless = _imap_message(store, "5", None)
     malformed = _imap_message(store, "6", None)
     store.add_message(
@@ -6480,14 +6527,7 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
         db.execute(
             "UPDATE messages SET thread_id = '<not-an-id>' WHERE message_id = ?", (malformed,)
         )
-        db.execute("UPDATE messages SET thread_key = NULL, rfc_message_id = NULL")
-        db.execute("DELETE FROM imap_thread_ids")
-        db.execute("DROP TRIGGER messages_release_imap_component")
-        db.execute("DROP INDEX idx_messages_thread_key")
-        db.execute("DROP INDEX idx_messages_rfc_message_id")
-        db.execute("ALTER TABLE messages DROP COLUMN thread_key")
-        db.execute("ALTER TABLE messages DROP COLUMN rfc_message_id")
-        db.execute("PRAGMA user_version = 28")
+    _reset_to_schema_28(store)
 
     migrated = Store(store.path)
     migrated.initialize()
@@ -6499,7 +6539,7 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
     assert len({keys[old], keys[first_copy], keys[idless], keys[malformed]}) == 4
     assert keys["microsoft-old"] not in {keys[old], keys[idless], keys[malformed]}
     with migrated.connection() as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
         assert db.execute(
             "SELECT rfc_message_id FROM messages WHERE message_id = ?", (old,)
         ).fetchone()[0] == "old-root@x"
@@ -6600,18 +6640,6 @@ def test_messages_without_a_provider_thread_id_get_their_own_key(tmp_path: Path)
     assert keys["microsoft-1"] != keys["microsoft-2"]
 
 
-def _reset_to_schema_28(store: Store) -> None:
-    with store.connection() as db:
-        db.execute("UPDATE messages SET thread_key = NULL, rfc_message_id = NULL")
-        db.execute("DELETE FROM imap_thread_ids")
-        db.execute("DROP TRIGGER messages_release_imap_component")
-        db.execute("DROP INDEX idx_messages_thread_key")
-        db.execute("DROP INDEX idx_messages_rfc_message_id")
-        db.execute("ALTER TABLE messages DROP COLUMN thread_key")
-        db.execute("ALTER TABLE messages DROP COLUMN rfc_message_id")
-        db.execute("PRAGMA user_version = 28")
-
-
 @pytest.mark.parametrize("status", ["continuity_proven", "unresolved"])
 def test_schema_28_legacy_rows_without_a_mailbox_identity_upgrade(
     tmp_path: Path, status: str
@@ -6619,7 +6647,7 @@ def test_schema_28_legacy_rows_without_a_mailbox_identity_upgrade(
     store = Store(tmp_path / "db.sqlite3")
     store.initialize()
     legacy_root = _imap_message(store, "1", "legacy-root@x")
-    legacy_copy = _imap_message(store, "2", "legacy-root@x")
+    legacy_copy = _retained_duplicate(store, "2", "legacy-root@x")
     with store.connection() as db:
         identity = db.execute(
             "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (legacy_root,)
@@ -6774,3 +6802,225 @@ def test_schema_28_upgrade_keys_an_oversized_provider_thread_id(tmp_path: Path) 
     keys = _thread_keys(migrated)
     assert keys["gmail-old-1"] == keys["gmail-old-2"]
     assert len(keys["gmail-old-1"].encode()) <= 512
+
+
+# Thread view M2.1: recipients, locations, folder cursors, Sent scope (schema 30).
+
+
+def _registered_imap_store(tmp_path: Path) -> tuple[Store, str]:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    identity = "a" * 64
+    store.register_mail_account(
+        "imap", "imap-account-2", display_name="IMAP", address="owner@example.com", active=True
+    )
+    store.reconcile_mailbox_identity(
+        "imap", "imap-account-2", identity, legacy_status="replacement", preserve_cursor=True
+    )
+    return store, identity
+
+
+def test_capture_records_recipients_locations_and_date_context(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-both", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00",
+        to=("a@vendor.com", "b@vendor.com"), cc=("c@other.com",),
+        locations=frozenset({"inbox", "sent"}), capture_timezone="America/Chicago",
+    )
+    with store.connection() as db:
+        recipients = db.execute(
+            """SELECT field, position, address FROM message_recipients
+            WHERE message_id = 'gmail-both' ORDER BY field DESC, position"""
+        ).fetchall()
+        zone = db.execute(
+            "SELECT capture_timezone FROM messages WHERE message_id = 'gmail-both'"
+        ).fetchone()[0]
+    assert [tuple(row) for row in recipients] == [
+        ("to", 0, "a@vendor.com"), ("to", 1, "b@vendor.com"), ("cc", 0, "c@other.com"),
+    ]
+    assert store.message_locations("gmail-both") == ["inbox", "sent"]
+    assert zone == "America/Chicago"
+
+
+def test_a_message_without_locations_is_recorded_in_the_inbox(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    only = _imap_message(store, "1", "only@x")
+    assert store.message_locations(only) == ["inbox"]
+
+
+def test_a_second_copy_of_a_logical_message_is_a_location_not_a_row(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+
+    inserted = store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    )
+
+    assert inserted is False
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM messages WHERE message_id = 'imap-message-sent-copy'"
+        ).fetchone() is None
+        copies = db.execute(
+            "SELECT provider_message_id, location FROM message_locations WHERE message_id = ?",
+            (first,),
+        ).fetchall()
+    assert sorted((row[0], row[1]) for row in copies) == [
+        ("imap:mailbox:44:1", "inbox"), ("imap:sent:77:3", "sent"),
+    ]
+    assert store.message_locations(first) == ["inbox", "sent"]
+
+
+def test_record_message_location_adds_only_new_locations(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key, provider_message_id FROM messages"
+        ).fetchone()
+    scope = {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+    assert store.message_location_count(**scope) == 1
+    assert store.record_message_location(**scope, locations=frozenset({"inbox", "sent"})) == 1
+    assert store.record_message_location(**scope, locations=frozenset({"sent"})) == 0
+    assert store.message_location_count(**scope) == 2
+    assert store.message_location_count(**{**scope, "provider_message_id": "unknown"}) is None
+    assert store.record_message_location(
+        **{**scope, "provider_message_id": "unknown"}, locations=frozenset({"sent"})
+    ) == 0
+
+
+def test_schema_29_upgrade_locates_retained_rows_and_coalesces_duplicates(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    duplicate = _retained_duplicate(store, "2", "root@x")
+    lone = _imap_message(store, "3", None)
+    store.add_message(
+        message_id="gmail-old", thread_id="gmail-thread", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00",
+    )
+    _reset_to_schema_29(store)
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    with migrated.connection() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 30
+        logical = {
+            row[0]: row[1]
+            for row in db.execute("SELECT message_id, logical_of FROM messages").fetchall()
+        }
+        zones = {row[0] for row in db.execute("SELECT capture_timezone FROM messages")}
+        duplicate_locations = db.execute(
+            "SELECT COUNT(*) FROM message_locations WHERE message_id = ?", (duplicate,)
+        ).fetchone()[0]
+    assert logical == {root: None, duplicate: root, lone: None, "gmail-old": None}
+    assert zones == {None}
+    assert migrated.message_locations(root) == ["inbox"]
+    assert duplicate_locations == 0
+    assert migrated.message_locations(lone) == ["inbox"]
+    assert migrated.message_locations("gmail-old") == ["inbox"]
+    # Running again changes nothing.
+    Store(store.path).initialize()
+    assert migrated.message_locations(root) == ["inbox"]
+
+
+def test_folder_cursors_are_per_folder_and_identity_checked(tmp_path: Path) -> None:
+    store, identity = _registered_imap_store(tmp_path)
+    scope = {
+        "provider": "imap", "account_id": "imap-account-2",
+        "mailbox_identity_key": identity, "folder": "sent",
+    }
+    assert store.folder_state(**scope) is None
+    store.set_folder_state("cursor-1", **scope)
+    assert store.folder_state(**scope)[0] == "cursor-1"
+    store.set_folder_state("cursor-2", **scope)
+    assert store.folder_state(**scope)[0] == "cursor-2"
+    assert store.state(provider="imap", account_id="imap-account-2") is None
+    with pytest.raises(db_module.MailboxIdentityChanged):
+        store.set_folder_state("cursor-3", **{**scope, "mailbox_identity_key": "b" * 64})
+
+
+def test_sent_scope_defaults_to_not_polled(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    assert store.sent_scope("imap", "imap-account") == "not_polled"
+    store.set_sent_scope("imap", "imap-account", "unavailable")
+    assert store.sent_scope("imap", "imap-account") == "unavailable"
+    store.set_sent_scope("imap", "imap-account", "available")
+    assert store.sent_scope("imap", "imap-account") == "available"
+    with pytest.raises(sqlite3.IntegrityError):
+        store.set_sent_scope("imap", "imap-account", "maybe")
+
+
+def test_sent_capture_schema_bump_rejects_previous_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "db.sqlite3"
+    Store(database).initialize()
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 29)
+    with pytest.raises(RuntimeError, match="newer than supported version 29"):
+        Store(database).initialize()
+
+
+def test_imap_merge_ranks_by_the_smallest_recorded_location(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    a = _imap_message(store, "5", "a@x")
+    b = _imap_message(store, "4", "b@x")
+    before = _thread_keys(store)
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (a,)
+        ).fetchone()[0]
+    # A Sent copy of a, whose source identity sorts before b's (…:1 < …:4).
+    assert store.record_message_location(
+        provider="imap", account_id="imap-account", mailbox_identity_key=identity,
+        provider_message_id="imap:mailbox:44:5", locations=frozenset({"sent"}),
+    ) == 1
+    with store.connection() as db:
+        db.execute(
+            "UPDATE message_locations SET provider_message_id = 'imap:mailbox:44:1' "
+            "WHERE message_id = ? AND location = 'sent'", (a,),
+        )
+
+    bridge = _imap_message(store, "6", "bridge@x", ("a@x", "b@x"))
+
+    after = _thread_keys(store)
+    assert after[a] == after[b] == after[bridge] == before[a]
+
+
+def test_deleting_a_message_removes_its_recipients_and_locations(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-gone", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00",
+        to=("a@vendor.com",), locations=frozenset({"inbox", "sent"}),
+    )
+    assert store.delete_message("gmail-gone") is True
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM message_recipients").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM message_locations").fetchone()[0] == 0

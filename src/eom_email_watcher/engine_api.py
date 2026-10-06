@@ -438,6 +438,8 @@ def _mail_account_public(runtime: Runtime, account: MailAccount) -> dict[str, ob
         "display_name": account.display_name,
         "last_check": state[1] if state else None,
         "provider": account.provider,
+        # Contract D-scope: whether this account's Sent folder is in scope.
+        "sent_scope": runtime.store.sent_scope(account.provider, account.account_id),
     }
 
 

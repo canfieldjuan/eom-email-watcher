@@ -1294,6 +1294,10 @@ pub struct MailAccountStatus {
     pub connected: bool,
     pub active: bool,
     pub last_check: Option<String>,
+    /// Whether the account's Sent folder is in scope: `available`, `unavailable`,
+    /// or `not_polled` (thread view contract, D-scope). Absent from older engines.
+    #[serde(default)]
+    pub sent_scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
