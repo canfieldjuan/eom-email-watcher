@@ -3236,14 +3236,18 @@ CREATE TABLE IF NOT EXISTS imap_thread_ids (
     thread_key TEXT NOT NULL,
     PRIMARY KEY (provider, account_id, mailbox_identity_key, rfc_id)
 );
+-- Component rows are found by provider, account, and UUIDv4 key, never by
+-- mailbox identity, so legacy rows stored without one are included.
 CREATE INDEX IF NOT EXISTS idx_imap_thread_ids_key
-    ON imap_thread_ids(provider, account_id, mailbox_identity_key, thread_key);
+    ON imap_thread_ids(provider, account_id, thread_key);
 CREATE TABLE IF NOT EXISTS thread_key_aliases (
     old_key TEXT PRIMARY KEY,
     survivor_key TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_thread_key_aliases_survivor
+    ON thread_key_aliases(survivor_key);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_key
-    ON messages(provider, account_id, mailbox_identity_key, thread_key, received_at);
+    ON messages(provider, account_id, thread_key, received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_rfc_message_id
     ON messages(provider, account_id, mailbox_identity_key, rfc_message_id);
 CREATE TRIGGER IF NOT EXISTS messages_release_imap_component

@@ -8699,3 +8699,30 @@ def test_vendor_address_remove_checks_membership_before_unwatching(
 
     assert response["error"]["code"] == "not_found"
     assert config_path.read_bytes() == original
+
+
+def test_vendor_address_remove_with_unwatch_retries_after_an_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    acme = _call(config_path, "vendors.create", {"display_name": "Acme"})["data"]["item"]
+    _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": acme["vendor_id"], "address": "billing@acme.com"},
+    )
+    remove_vendor_address = Store.remove_vendor_address
+
+    def interrupted(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("interrupted after the watchlist write")
+
+    monkeypatch.setattr(Store, "remove_vendor_address", interrupted)
+    payload = {"vendor_id": acme["vendor_id"], "address": "billing@acme.com", "unwatch": True}
+    assert _call(config_path, "vendors.addresses.remove", payload)["ok"] is False
+    listed = _call(config_path, "vendors.list", {})["data"]["items"]
+    assert listed[0]["addresses"] == [{"address": "billing@acme.com", "watched": False}]
+
+    # The address is already unwatched, and the retry still completes.
+    monkeypatch.setattr(Store, "remove_vendor_address", remove_vendor_address)
+    retried = _call(config_path, "vendors.addresses.remove", payload)
+    assert retried["data"]["item"]["addresses"] == []
+    assert "billing@acme.com" not in load_config(config_path).allowlist

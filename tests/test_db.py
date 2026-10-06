@@ -6657,3 +6657,79 @@ def test_a_reply_to_two_parents_merges_their_components(tmp_path: Path) -> None:
     reply = _imap_message(store, "3", "reply@x", ("parent-one@x", "parent-two@x"))
     keys = _thread_keys(store)
     assert keys[one] == keys[two] == keys[reply]
+
+
+def test_a_suppressed_bridging_message_changes_no_component(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "root-one@x")
+    two = _imap_message(store, "2", "root-two@x")
+    bridge = _imap_message(store, "3", "bridge@x", ("root-one@x", "root-two@x"))
+    assert store.delete_message(bridge) is True
+    before = _thread_keys(store)
+    with store.connection() as db:
+        registered = db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0]
+        aliases = db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0]
+
+    # Recapturing the deleted bridge is suppressed: no row, no ids, no merge.
+    assert _imap_message(store, "3", "bridge-again@x", ("root-one@x", "root-two@x")) == bridge
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT 1 FROM messages WHERE message_id = ?", (bridge,)
+        ).fetchone() is None
+        assert db.execute("SELECT COUNT(*) FROM imap_thread_ids").fetchone()[0] == registered
+        assert db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0] == aliases
+        assert db.execute(
+            "SELECT 1 FROM imap_thread_ids WHERE rfc_id = 'bridge-again@x'"
+        ).fetchone() is None
+    assert _thread_keys(store) == before
+    assert before[one] == before[two]
+
+
+def test_a_suppressed_message_cannot_bridge_separate_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "root-one@x")
+    two = _imap_message(store, "2", "root-two@x")
+    lone = _imap_message(store, "3", "lone@x")
+    assert store.delete_message(lone) is True
+    before = _thread_keys(store)
+    assert before[one] != before[two]
+
+    # The deleted source identity is suppressed, so its new ids merge nothing.
+    _imap_message(store, "3", "lone@x", ("root-one@x", "root-two@x"))
+
+    after = _thread_keys(store)
+    assert lone not in after
+    assert after == before
+    with store.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM thread_key_aliases").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("statement", "index"),
+    [
+        (
+            "UPDATE messages SET thread_key = 'k' WHERE provider = 'imap'"
+            " AND account_id = 'a' AND thread_key = 'old'",
+            "idx_messages_thread_key",
+        ),
+        (
+            "UPDATE imap_thread_ids SET thread_key = 'k' WHERE provider = 'imap'"
+            " AND account_id = 'a' AND thread_key = 'old'",
+            "idx_imap_thread_ids_key",
+        ),
+        (
+            "UPDATE thread_key_aliases SET survivor_key = 'k' WHERE survivor_key = 'old'",
+            "idx_thread_key_aliases_survivor",
+        ),
+    ],
+)
+def test_component_queries_use_key_led_indexes(
+    tmp_path: Path, statement: str, index: str
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    with store.connection() as db:
+        plan = " ".join(str(row[-1]) for row in db.execute(f"EXPLAIN QUERY PLAN {statement}"))
+    assert index in plan, plan
