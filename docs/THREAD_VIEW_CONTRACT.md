@@ -56,10 +56,10 @@ Each definition is the only place its rule is stated.
   - opted-in business domains.
 - **Uniqueness.** Each address, and each domain, belongs to at most one vendor. Assigning it to a second vendor returns `conflict`.
 - **Public domains are refused.** The public-provider list is one constant in code, and nothing else classifies domains. It starts as exactly gmail.com, googlemail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, me.com, aol.com, proton.me, protonmail.com, and gmx.com. Adding a domain is a code change with a test.
-- **`vendor_of(address)`** returns:
+- **`vendor_of(address)`** returns a vendor and how it matched:
   - none for the mailbox's verified identities, before either lookup;
-  - else the vendor that owns the exact address;
-  - else the vendor that owns the address's domain;
+  - else the vendor that owns the exact address, as an exact match;
+  - else the vendor that owns the address's domain, as a domain match;
   - else none.
 
   A record that covers a verified identity, such as an opted-in domain or an address whose mailbox is connected later, is still allowed; the identity is simply excluded.
@@ -75,8 +75,8 @@ Each definition is the only place its rule is stated.
 
 - **Inbound:** `vendor_of(From)`.
 - **Outbound,** over the `To`, then `Cc`, recipients in stored header order:
-  - the vendor of the first recipient for which `vendor_of` matches the exact address;
-  - else of the first for which `vendor_of` matches the domain;
+  - the vendor of the first recipient whose `vendor_of` is an exact match;
+  - else of the first whose `vendor_of` is a domain match;
   - else none.
 
   Recipients are judged only through `vendor_of`, so its exclusions apply to outbound mail too.
@@ -107,7 +107,7 @@ Each definition is the only place its rule is stated.
   - `exact_sender`: `From` is a watched address;
   - `gmail_user_label`: a selected Gmail label.
 - **While the gated class is allowed ([D-ops](#d-ops-operation-classes-and-gating)), an in-scope message ([D-scope](#d-scope-in-scope-messages-and-retention)) is also captured when:**
-  - it is inbound and its vendor ([D-attribution](#d-attribution-a-messages-vendor)) comes from an exact address (`vendor_address`) or a domain (`vendor_domain`);
+  - it is inbound with a vendor ([D-attribution](#d-attribution-a-messages-vendor)) from an exact match (`vendor_address`) or a domain match (`vendor_domain`);
   - it is outbound with a vendor (`sent_to_vendor`);
   - or it belongs to a followed thread (`thread_follow`, [D-follow](#d-follow-followed-threads)).
 - **Anything else leaves no trace.**
@@ -417,3 +417,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-05: the second M1 plan review found that a logical message with several locations had no single source identity to order by; it sorts by the smallest. It also added two M2 items: fetch the reply headers of IMAP messages retained from before M1, and coalesce rows that are one message.
 - 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
 - 2026-10-05: the fourth M1 plan review found that outbound attribution looked up recipients' addresses and domains directly instead of through `vendor_of`, so amendment C's exclusion did not reach outbound mail. D-attribution now judges recipients only through `vendor_of`.
+- 2026-10-05: the fifth M1 plan review found that D-attribution asked how `vendor_of` matched, which `vendor_of` did not say. `vendor_of` now returns its match, exact or domain, and outbound attribution and D-capture's kinds both read it. A finding that a newly verified identity leaves follow state and claims stale is an input to amendment A (#207), with the direction finding above.
