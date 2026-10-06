@@ -57,10 +57,13 @@ Each definition is the only place its rule is stated.
 - **Uniqueness.** Each address, and each domain, belongs to at most one vendor. Assigning it to a second vendor returns `conflict`.
 - **Public domains are refused.** The public-provider list is one constant in code, and nothing else classifies domains. It starts as exactly gmail.com, googlemail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, me.com, aol.com, proton.me, protonmail.com, and gmx.com. Adding a domain is a code change with a test.
 - **`vendor_of(address)`** returns:
-  - the vendor that owns the exact address;
+  - none for the mailbox's verified identities, before either lookup;
+  - else the vendor that owns the exact address;
   - else the vendor that owns the address's domain;
   - else none.
-- **The mailbox's verified identities** are `mail_accounts.address` and the session's authenticated address. They never have a vendor, and are never suggestion candidates.
+
+  A record that covers a verified identity, such as an opted-in domain or an address whose mailbox is connected later, is still allowed; the identity is simply excluded.
+- **The mailbox's verified identities** are `mail_accounts.address` and the session's authenticated address. Through `vendor_of` they never have a vendor, and they are never suggestion candidates.
 - **Suggestion candidates** are senders of inbound messages in a followed thread ([D-follow](#d-follow-followed-threads)) that meet all of these:
   - `vendor_of` returns none;
   - the sender is not one of the mailbox's verified identities;
@@ -407,3 +410,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - D-identity: amendment B claimed the merge survivor never depends on arrival order, which a UUIDv4 key cannot satisfy. Component membership is order-independent and the key is an opaque handle. Every captured message now has a thread key, and merges re-key earlier aliases.
   - D-ops: deleting a vendor claimed one transaction across the watchlist file and the database. Operations that change both now write the watchlist first, so a retry completes them.
   - A third finding, that a location added later changes direction without recomputing follow state or claims, is an input to amendment A (#207).
+- 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
