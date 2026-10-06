@@ -341,11 +341,30 @@ class FakeImap:
         uid = str(args[0])
         if "HEADER.FIELDS" in query:
             headers, _separator, _body = self.raw_message.partition(b"\r\n\r\n")
-            metadata = (
-                f"{uid} (UID {uid} RFC822.SIZE {len(self.raw_message)} "
-                'INTERNALDATE "04-Sep-2026 10:16:00 -0500")'.encode()
-            )
-            return "OK", [(metadata, headers + b"\r\n\r\n"), b")"]
+            # One literal per requested header item, as a server answers.
+            lines: list[bytes] = []
+            for line in headers.split(b"\r\n"):
+                if line[:1] in (b" ", b"\t") and lines:
+                    lines[-1] += b"\r\n" + line
+                else:
+                    lines.append(line)
+            literals: list[tuple[bytes, bytes]] = []
+            for fields in re.findall(r"HEADER\.FIELDS \(([^)]*)\)", query):
+                wanted = {name.lower() for name in fields.split()}
+                payload = b"".join(
+                    line + b"\r\n"
+                    for line in lines
+                    if line.split(b":", 1)[0].strip().lower().decode("ascii", "replace") in wanted
+                ) + b"\r\n"
+                lead = (
+                    f"{uid} (UID {uid} RFC822.SIZE {len(self.raw_message)} "
+                    'INTERNALDATE "04-Sep-2026 10:16:00 -0500" '
+                    if not literals
+                    else " "
+                )
+                prefix = f"{lead}BODY[HEADER.FIELDS ({fields})]<0> {{{len(payload)}}}"
+                literals.append((prefix.encode(), payload))
+            return "OK", [*literals, b")"]
         if "BODYSTRUCTURE" in query:
             return "OK", [f"{uid} (UID {uid} BODYSTRUCTURE ".encode() + self.bodystructure + b")"]
         if "BODY.PEEK[]" in query:
@@ -1859,8 +1878,40 @@ def test_metadata_fetch_requests_reply_headers_as_a_separate_bounded_item() -> N
 
     assert metadata.reply_ids == ("parent@x", "root@x")
     fetch = next(str(call[-1]) for call in client.calls if call[:2] == ("uid", "FETCH"))
-    assert f"(FROM TO CC SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>" in fetch
+    assert f"(FROM SUBJECT DATE MESSAGE-ID)]<0.{MAX_HEADER_BYTES}>" in fetch
+    assert f"(TO CC)]<0.{MAX_HEADER_BYTES}>" in fetch
     assert f"(IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>" in fetch
+
+
+def test_oversized_recipient_headers_degrade_without_invalidating_the_message() -> None:
+    class HugeRecipients(FakeImap):
+        def uid(self, command: str, *args: object) -> tuple[str, list[Any]]:
+            status, response = super().uid(command, *args)
+            if command == "FETCH" and "HEADER.FIELDS" in str(args[-1]):
+                response = [
+                    (prefix, b"To: " + b"x" * MAX_HEADER_BYTES)
+                    if b"(TO CC)" in prefix
+                    else (prefix, payload)
+                    for prefix, payload in (i for i in response if isinstance(i, tuple))
+                ] + [b")"]
+            return status, response
+
+    gateway = ImapGateway(
+        credentials(), lambda _c, _x: HugeRecipients(raw_message=RECIPIENT_MESSAGE)
+    )
+
+    # The recipient item reached its bound: it degrades to no recipients, and the
+    # core item still yields the message (one rule, shared with the reply item).
+    metadata = gateway.metadata(message_id())
+    assert metadata.sender == "owner@example.com"
+    assert metadata.rfc_message_id == "reply@owner.example"
+    assert metadata.to == () and metadata.cc == ()
+
+
+def test_a_sent_folder_name_that_cannot_be_encoded_is_a_configuration_error() -> None:
+    with pytest.raises(ImapError) as excinfo:
+        credentials_from_connection(connection(sent_folder="Sent\udcff"))
+    assert excinfo.value.code == "imap_configuration_error"
 
 
 def test_metadata_keeps_64_references_and_drops_overlong_ids() -> None:

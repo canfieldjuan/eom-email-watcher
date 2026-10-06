@@ -5347,6 +5347,34 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     assert all(stamp is not None for stamp in stamps())
 
 
+def test_a_known_sent_only_message_gaining_inbox_is_fetched_while_sent_is_out_of_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"SENT"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+    assert store.message_locations(item["message_id"]) == ["sent"]
+
+    # Connect lapses, and the message also appears in the Inbox. One folder in scope
+    # is unrecorded for this source, so it is fetched: the comparison is by folder,
+    # not by how many are recorded.
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    gateway.labels = frozenset({"INBOX", "SENT"})
+    calls = gateway.metadata_calls
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == calls + 1
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert len(store.recent(5)) == 1
+
+
 def test_gmail_label_added_to_a_known_message_records_its_second_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5534,6 +5562,48 @@ def test_imap_sent_folder_is_polled_only_while_connect_is_active(
     assert store.message_locations(item["message_id"]) == ["sent"]
     assert store.folder_state(**scope)[0].endswith(":77:3")
     assert store.state(provider="imap", account_id=account_id)[0] == inbox_cursor
+
+    # The entitlement lapses: Sent is out of scope again and Health says so.
+    monkeypatch.setattr(
+        service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
+    )
+    sent_calls = len(gateway.sent_calls)
+    check()
+    assert len(gateway.sent_calls) == sent_calls
+    assert store.sent_scope("imap", account_id) == "not_polled"
+    assert store.folder_state(**scope)[0].endswith(":77:3")
+
+
+def test_a_dry_run_previews_sent_mail_without_moving_its_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg, store, account_id, credential, identity, inbox_cursor = _imap_sent_scaffold(tmp_path)
+    sent_id = f"eom-imap-sent-v1:{credential}:{'a' * 64}:77:3"
+    gateway = SentPollingGateway(credential, identity, inbox_cursor, sent_ids=(sent_id,))
+    scope = {
+        "provider": "imap",
+        "account_id": account_id,
+        "mailbox_identity_key": identity,
+        "folder": "sent",
+    }
+
+    def check(*, dry_run: bool) -> dict[str, object]:
+        session = MailboxSession("imap", account_id, gateway)
+        return Watcher(cfg, store, session, FakeModel()).check(dry_run=dry_run)
+
+    check(dry_run=False)
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+
+    # A dry run reads Sent like the Inbox: it reports the mail and changes nothing.
+    preview = check(dry_run=True)
+    assert preview["discovered"] == 1
+    assert store.recent(5) == []
+    assert store.folder_state(**scope)[0] == gateway.sent_cursor
+
+    result = check(dry_run=False)
+    assert result["summarized"] == 1
+    assert store.folder_state(**scope)[0].endswith(":77:3")
 
 
 def test_imap_without_a_sent_folder_records_unavailable_and_polls_nothing(

@@ -44,6 +44,7 @@ from .mailbox import (
     normalize_message_id,
 )
 from .mime import AttachmentDescriptor, body_was_truncated
+from .text import within_utf8_bytes
 
 SCHEMA_VERSION = 30
 MAX_CONNECT_REQUEST_BYTES = 128 * 1024
@@ -126,10 +127,6 @@ class GmailLabelStoreError(RuntimeError):
         self.code = code
 
 
-def _utf8_size(value: str) -> int:
-    return len(value.encode("utf-8"))
-
-
 def _has_control_character(value: str) -> bool:
     return any(unicodedata.category(character) == "Cc" for character in value)
 
@@ -143,7 +140,7 @@ def _require_bounded_text(
     if (
         not isinstance(value, str)
         or not value
-        or _utf8_size(value) > maximum_bytes
+        or not within_utf8_bytes(value, maximum_bytes)
         or _has_control_character(value)
     ):
         raise ValueError(f"{field} is invalid")
@@ -167,7 +164,7 @@ def _require_revision(value: object) -> int:
 
 
 def _validate_utc_timestamp(value: object, *, field: str) -> str:
-    if not isinstance(value, str) or not value or _utf8_size(value) > 64:
+    if not isinstance(value, str) or not value or not within_utf8_bytes(value, 64):
         raise ValueError(f"{field} must be a UTC ISO-8601 timestamp")
     try:
         parsed = datetime.fromisoformat(value)
@@ -2116,7 +2113,9 @@ def _gmail_recovery_state(row: sqlite3.Row) -> GmailRecoveryState:
     if (not page_loaded and (page_ids or next_index != 0)) or next_index > len(page_ids):
         raise RuntimeError("gmail recovery page state is invalid")
     page_token = str(row["page_token"]) if row["page_token"] is not None else None
-    if page_token is not None and _utf8_size(page_token) > MAX_GMAIL_RECOVERY_PAGE_TOKEN_BYTES:
+    if page_token is not None and not within_utf8_bytes(
+        page_token, MAX_GMAIL_RECOVERY_PAGE_TOKEN_BYTES
+    ):
         raise RuntimeError("gmail recovery page token is invalid")
     return GmailRecoveryState(
         provider=str(row["provider"]),
@@ -3503,6 +3502,22 @@ def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | Non
     )
 
 
+def _refresh_logical_messages_view(db: sqlite3.Connection) -> None:
+    """The rows that are messages to readers (contract D-identity), defined once.
+
+    A row that duplicates another through logical_of is a stored copy: it keeps its
+    summary, attachments, and automation runs, and is listed, queued, counted, and
+    notified only through its canonical row. Every reader that treats rows as
+    messages selects from this view; readers of storage units (delete, suppress,
+    locations) read the table. Recreated after the migrations, so the columns are
+    always the current ones.
+    """
+    db.execute("DROP VIEW IF EXISTS logical_messages")
+    db.execute(
+        "CREATE VIEW logical_messages AS SELECT * FROM messages WHERE logical_of IS NULL"
+    )
+
+
 def _migrate_sent_capture(db: sqlite3.Connection) -> None:
     """Schema 30 rows: every message has a location; rows that are one message coalesce."""
     db.execute(
@@ -4481,7 +4496,7 @@ def _validate_admission_provenance(
         maximum_bytes=MAX_GMAIL_LABEL_ID_BYTES,
         field="admission selector id",
     )
-    if admission.display_name is not None and _utf8_size(admission.display_name) > 1024:
+    if admission.display_name is not None and not within_utf8_bytes(admission.display_name, 1024):
         raise ValueError("admission display name is invalid")
     if admission.display_name is not None and _has_control_character(admission.display_name):
         raise ValueError("admission display name is invalid")
@@ -5411,6 +5426,7 @@ class Store:
             _ensure_sent_capture_tables(db)
             _migrate_thread_identity(db)
             _migrate_sent_capture(db)
+            _refresh_logical_messages_view(db)
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.path.chmod(0o600)
 
@@ -7437,7 +7453,7 @@ class Store:
             )
         if isinstance(expected_version, bool) or expected_version < 1:
             raise ValueError("Automation fire version is invalid")
-        if reason is not None and (not reason or len(reason.encode("utf-8")) > 128):
+        if reason is not None and (not reason or not within_utf8_bytes(reason, 128)):
             raise ValueError("Automation fire reason is invalid")
         if job_id is not None and not _valid_uuid_v4(job_id):
             raise ValueError("Automation fire job identity is invalid")
@@ -8295,6 +8311,10 @@ class Store:
                         WHERE provider = ?1 AND account_id = ?2
                           AND mailbox_identity_key = ?3 AND provider_message_id = ?4
                         UNION ALL
+                        SELECT 1 FROM message_locations
+                        WHERE provider = ?1 AND account_id = ?2
+                          AND mailbox_identity_key = ?3 AND provider_message_id = ?4
+                        UNION ALL
                         SELECT 1 FROM suppressed_messages
                         WHERE provider = ?1 AND account_id = ?2 AND message_key = ?5
                         UNION ALL
@@ -8322,20 +8342,15 @@ class Store:
             return (
                 db.execute(
                     """SELECT 1 FROM messages
-                    WHERE provider = ? AND account_id = ? AND provider_message_id = ?
+                    WHERE provider = ?1 AND account_id = ?2 AND provider_message_id = ?3
+                    UNION ALL
+                    SELECT 1 FROM message_locations
+                    WHERE provider = ?1 AND account_id = ?2 AND provider_message_id = ?3
                     UNION ALL
                     SELECT 1 FROM suppressed_messages
-                    WHERE provider = ? AND account_id = ? AND message_key IN (?, ?)
+                    WHERE provider = ?1 AND account_id = ?2 AND message_key IN (?4, ?5)
                     LIMIT 1""",
-                    (
-                        provider,
-                        account_id,
-                        provider_message_id,
-                        provider,
-                        account_id,
-                        message_key,
-                        legacy_message_key,
-                    ),
+                    (provider, account_id, provider_message_id, message_key, legacy_message_key),
                 ).fetchone()
                 is not None
             )
@@ -8604,8 +8619,20 @@ class Store:
     def set_sent_scope(
         self, provider: str, account_id: str, scope: str, *, now: datetime | None = None
     ) -> None:
+        """Record what the last check found about Sent (contract D-scope).
+
+        'not_polled' is the absence of a record: an account whose Sent folder the
+        gated class does not cover right now reports it, whatever an earlier
+        active check recorded.
+        """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
+            if scope == SENT_SCOPE_NOT_POLLED:
+                db.execute(
+                    "DELETE FROM mailbox_sent_scope WHERE provider = ? AND account_id = ?",
+                    (provider, account_id),
+                )
+                return
             db.execute(
                 """INSERT INTO mailbox_sent_scope(provider, account_id, scope, updated_at)
                 VALUES (?, ?, ?, ?)
@@ -8623,31 +8650,32 @@ class Store:
             ).fetchall()
         return [str(row["location"]) for row in rows]
 
-    def message_location_count(
+    def source_locations(
         self, *, provider: str, account_id: str, mailbox_identity_key: str, provider_message_id: str
-    ) -> int | None:
-        """Locations recorded for one stored source identity, or None if it is not stored.
+    ) -> frozenset[str] | None:
+        """The folders one stored source identity was recorded in; None if it is unknown.
 
-        The count is the source identity's own, not its logical message's: two
-        coalesced copies each have their own folders (contract D-identity).
+        The folders are the source identity's own, not its logical message's: two
+        coalesced copies each have their own (contract D-identity). A source is
+        known through its row or through a location, as has_seen_message knows it.
         """
         key = (provider, account_id, mailbox_identity_key, provider_message_id)
         with self.connection() as db:
-            count = db.execute(
-                """SELECT COUNT(*) FROM message_locations
+            rows = db.execute(
+                """SELECT location FROM message_locations
                 WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
                   AND provider_message_id = ?""",
                 key,
-            ).fetchone()[0]
-            if count:
-                return int(count)
+            ).fetchall()
+            if rows:
+                return frozenset(str(row["location"]) for row in rows)
             stored = db.execute(
                 """SELECT 1 FROM messages
                 WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
                   AND provider_message_id = ?""",
                 key,
             ).fetchone()
-        return 0 if stored is not None else None
+        return frozenset() if stored is not None else None
 
     def record_message_location(
         self,
@@ -8864,7 +8892,7 @@ class Store:
             canonicals = [
                 str(row["message_id"])
                 for row in db.execute(
-                    "SELECT message_id FROM messages WHERE logical_of IS NULL ORDER BY message_id"
+                    "SELECT message_id FROM logical_messages ORDER BY message_id"
                 ).fetchall()
             ]
         deleted = 0
@@ -10441,7 +10469,7 @@ class Store:
                 f"""SELECT message_id, provider, account_id, provider_message_id,
                 mailbox_identity_key, thread_id, sender, sender_name, subject, received_at,
                 attempts, fallback_notified_at, analysis_request_id, analysis_context_at,
-                analysis_body_char_limit FROM messages
+                analysis_body_char_limit FROM logical_messages
                 WHERE status = 'pending' AND COALESCE(analysis_retryable, 1) = 1
                 AND (next_retry_at IS NULL OR next_retry_at <= ?){scope}
                 ORDER BY received_at LIMIT ?""",
@@ -10458,7 +10486,7 @@ class Store:
         _require_mailbox_identity_key(mailbox_identity_key)
         with self.connection() as db:
             row = db.execute(
-                """SELECT 1 FROM messages AS m
+                """SELECT 1 FROM logical_messages AS m
                 JOIN mail_accounts AS a
                   ON a.provider = m.provider AND a.account_id = m.account_id
                  AND a.mailbox_identity_key = m.mailbox_identity_key
@@ -10757,11 +10785,10 @@ class Store:
             (empty_reason, 512),
         ):
             if value is not None:
-                try:
-                    if len(value.encode("utf-8")) > byte_limit:
-                        raise ValueError("automation proposal content is not bounded")
-                except (AttributeError, UnicodeEncodeError) as exc:
-                    raise ValueError("automation proposal content is invalid") from exc
+                if not isinstance(value, str):
+                    raise ValueError("automation proposal content is invalid")
+                if not within_utf8_bytes(value, byte_limit):
+                    raise ValueError("automation proposal content is not bounded")
         accepted = (
             all(value is not None for value in (start, end, timezone, suggestion_reason))
             and bool(suggestion_reason)
@@ -11291,7 +11318,8 @@ class Store:
             if next_state == "completed":
                 if (
                     not isinstance(graph_event_id, str)
-                    or not 1 <= len(graph_event_id.encode("utf-8")) <= 512
+                    or not graph_event_id
+                    or not within_utf8_bytes(graph_event_id, 512)
                 ):
                     raise ValueError("Graph event identity is invalid")
                 write_status = "completed"
@@ -11936,7 +11964,7 @@ class Store:
                 """SELECT message_id, sender, sender_name, subject, received_at, attempts,
                 fallback_notified_at, category, priority, summary, action_required,
                 suggested_action, deadline_text, deadline_iso, confidence,
-                analysis_body_chars, analysis_body_source_chars FROM messages
+                analysis_body_chars, analysis_body_source_chars FROM logical_messages
                 WHERE status = 'analyzed' AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY received_at LIMIT ?""",
                 (stamp, limit),
@@ -12257,7 +12285,7 @@ class Store:
                 sender, sender_name, subject, analysis_at, priority, summary,
                 suggested_action, deadline_iso, last_error,
                 analysis_body_chars, analysis_body_source_chars, received_at AS sort_at
-                FROM messages
+                FROM logical_messages
                 WHERE (status = 'analyzed' AND notified_at IS NULL)
                    OR (status = 'pending' AND last_error IS NOT NULL
                        AND fallback_notified_at IS NULL)
@@ -12318,7 +12346,7 @@ class Store:
         with self.connection() as db:
             row = db.execute(
                 """SELECT
-                    (SELECT COUNT(*) FROM messages
+                    (SELECT COUNT(*) FROM logical_messages
                      WHERE (status = 'analyzed' AND notified_at IS NULL)
                         OR (status = 'pending' AND last_error IS NOT NULL
                             AND fallback_notified_at IS NULL))
@@ -12437,9 +12465,7 @@ class Store:
         provider: str | None = None,
         account_id: str | None = None,
     ) -> tuple[list[dict[str, object]], tuple[str, str] | None]:
-        # One entry per logical message (contract D-identity): a retained duplicate's
-        # row stays stored, with its summary and attachments, but is not listed.
-        clauses: list[str] = ["logical_of IS NULL"]
+        clauses: list[str] = []
         parameters: list[object] = []
         if cursor is not None:
             clauses.append("(received_at < ? OR (received_at = ? AND message_id < ?))")
@@ -12492,7 +12518,7 @@ class Store:
                 analysis_error_code, analysis_retry_after_seconds,
                 analysis_body_chars, analysis_body_source_chars,
                 admission_kind, admission_selector_id, admission_display_name, admitted_at
-                FROM messages{where}
+                FROM logical_messages{where}
                 ORDER BY received_at DESC, message_id DESC LIMIT ?""",
                 parameters,
             ).fetchall()

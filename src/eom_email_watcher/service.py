@@ -56,6 +56,7 @@ from .mailbox import (
     MESSAGE_LOCATIONS,
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
+    SENT_SCOPE_NOT_POLLED,
     MailboxAccountUnavailable,
     MailboxChanges,
     MailboxError,
@@ -167,6 +168,11 @@ def _recovery_since(last_success: str, retention_cutoff: datetime) -> datetime:
 def _folders_in_scope(gated_allowed: bool) -> frozenset[str]:
     """Contract D-ops: Sent is in scope only while the gated class is allowed."""
     return MESSAGE_LOCATIONS if gated_allowed else frozenset({INBOX_LOCATION})
+
+
+def _scope_complete(folders: frozenset[str]) -> bool:
+    """Whether every admitted folder is in scope, so an observation is complete (plan step 5)."""
+    return folders == MESSAGE_LOCATIONS
 
 
 def _admitted_locations(
@@ -1884,7 +1890,7 @@ class Watcher:
                         cc=metadata.cc,
                         locations=_admitted_locations(metadata, metadata.labels, folders),
                         capture_timezone=self.config.timezone,
-                        scope_complete=SENT_LOCATION in folders,
+                        scope_complete=_scope_complete(folders),
                     ),
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
@@ -2138,13 +2144,15 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             )
-            added += self._poll_sent_folder(
-                mailbox_identity_key=mailbox_identity_key,
-                label_selectors=label_selectors,
-                checked_at=checked_at,
-                retention_cutoff=retention_cutoff,
-                folders=folders,
-            )
+        added += self._poll_sent_folder(
+            mailbox_identity_key=mailbox_identity_key,
+            label_selectors=label_selectors,
+            checked_at=checked_at,
+            retention_cutoff=retention_cutoff,
+            folders=folders,
+            dry_run=dry_run,
+            dry_run_messages=dry_run_messages,
+        )
         return self._finish_active_result(
             added=added,
             purged=purged,
@@ -2270,7 +2278,7 @@ class Watcher:
                 cc=metadata.cc,
                 locations=_admitted_locations(metadata, metadata.labels, folders),
                 capture_timezone=self.config.timezone,
-                scope_complete=SENT_LOCATION in folders,
+                scope_complete=_scope_complete(folders),
             ):
                 added += 1
         return added
@@ -2285,16 +2293,17 @@ class Watcher:
     ) -> None:
         """A known id came back through polling: record its location (contract D-identity).
 
-        The fetch also supplies the recipients of a row that has none, since the
-        migration could not reconstruct them.
+        Metadata is fetched while a folder in scope is not recorded for this source
+        identity; the fetch also supplies the recipients of a row that has none,
+        since the migration could not reconstruct them.
         """
-        count = self.store.message_location_count(
+        recorded = self.store.source_locations(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
             provider_message_id=provider_message_id,
         )
-        if count is None or count >= len(folders):
+        if recorded is None or not (folders - recorded):
             return
         try:
             metadata = self.gateway.metadata(provider_message_id)
@@ -2311,7 +2320,7 @@ class Watcher:
             locations=locations,
             to=metadata.to,
             cc=metadata.cc,
-            scope_complete=SENT_LOCATION in folders,
+            scope_complete=_scope_complete(folders),
             now=checked_at,
         )
 
@@ -2323,18 +2332,28 @@ class Watcher:
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
+        dry_run: bool,
+        dry_run_messages: list[PendingMessage],
     ) -> int:
         """Poll the Sent folder (contract D-scope) while the gated class is allowed (D-ops).
 
         Gmail's one mailbox-wide cursor already carries SENT events, so only the other
-        providers keep a Sent cursor of their own.
+        providers keep a Sent cursor of their own. A dry run previews Sent as it
+        previews the Inbox: it reads, and writes neither scope nor cursor.
         """
         provider = self.mailbox.provider
         account_id = self.mailbox.account_id
-        if provider == "gmail":
-            self.store.set_sent_scope(provider, account_id, SENT_SCOPE_AVAILABLE, now=checked_at)
-            return 0
         if SENT_LOCATION not in folders:
+            if not dry_run:
+                self.store.set_sent_scope(
+                    provider, account_id, SENT_SCOPE_NOT_POLLED, now=checked_at
+                )
+            return 0
+        if provider == "gmail":
+            if not dry_run:
+                self.store.set_sent_scope(
+                    provider, account_id, SENT_SCOPE_AVAILABLE, now=checked_at
+                )
             return 0
         # A Sent folder error never stops the Inbox check; the next check retries.
         try:
@@ -2342,7 +2361,8 @@ class Watcher:
             if not callable(scope_reader):
                 return 0
             scope = scope_reader()
-            self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
+            if not dry_run:
+                self.store.set_sent_scope(provider, account_id, scope, now=checked_at)
             if scope != SENT_SCOPE_AVAILABLE:
                 return 0
             folder_scope = {
@@ -2354,9 +2374,10 @@ class Watcher:
             state = self.store.folder_state(**folder_scope)
             if state is None:
                 # Like the Inbox at setup: start at the folder's current position.
-                self.store.set_folder_state(
-                    self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
-                )
+                if not dry_run:
+                    self.store.set_folder_state(
+                        self.gateway.sent_initial_cursor(), at=checked_at, **folder_scope
+                    )
                 return 0
             try:
                 changes = self.gateway.sent_changes_since(state[0])
@@ -2373,10 +2394,11 @@ class Watcher:
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
                 folders=folders,
-                dry_run=False,
-                dry_run_messages=[],
+                dry_run=dry_run,
+                dry_run_messages=dry_run_messages,
             )
-            self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
+            if not dry_run:
+                self.store.set_folder_state(changes.cursor, at=checked_at, **folder_scope)
             return added
         except MailboxError as exc:
             logger.warning("Sent folder poll failed; the Inbox check is unaffected: %s", exc)

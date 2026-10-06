@@ -6481,6 +6481,7 @@ def _reset_to_schema_29(store: Store) -> None:
     """Undo schema 30 (Sent capture) so a migration test can start from v29."""
     with store.connection() as db:
         for statement in (
+            "DROP VIEW IF EXISTS logical_messages",
             "DROP TRIGGER messages_delete_recipients_and_locations",
             "DROP INDEX idx_messages_logical_identity",
             "DROP INDEX idx_messages_logical_of",
@@ -6903,11 +6904,11 @@ def test_record_message_location_adds_only_new_locations(tmp_path: Path) -> None
         "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
         "provider_message_id": row[3],
     }
-    assert store.message_location_count(**scope) == 1
+    assert store.source_locations(**scope) == frozenset({"inbox"})
     assert store.record_message_location(**scope, locations=frozenset({"inbox", "sent"})) == 1
     assert store.record_message_location(**scope, locations=frozenset({"sent"})) == 0
-    assert store.message_location_count(**scope) == 2
-    assert store.message_location_count(**{**scope, "provider_message_id": "unknown"}) is None
+    assert store.source_locations(**scope) == frozenset({"inbox", "sent"})
+    assert store.source_locations(**{**scope, "provider_message_id": "unknown"}) is None
     assert store.record_message_location(
         **{**scope, "provider_message_id": "unknown"}, locations=frozenset({"sent"})
     ) == 0
@@ -7316,12 +7317,12 @@ def test_location_count_is_per_source_identity(tmp_path: Path) -> None:
     root_scope = _source_scope(store, root)
     duplicate_scope = _source_scope(store, duplicate)
     # Both copies were assumed in the Inbox; each counts its own folder only.
-    assert store.message_location_count(**root_scope) == 1
-    assert store.message_location_count(**duplicate_scope) == 1
+    assert store.source_locations(**root_scope) == frozenset({"inbox"})
+    assert store.source_locations(**duplicate_scope) == frozenset({"inbox"})
 
     assert store.record_message_location(**duplicate_scope, locations=frozenset({"sent"})) == 1
-    assert store.message_location_count(**duplicate_scope) == 2
-    assert store.message_location_count(**root_scope) == 1
+    assert store.source_locations(**duplicate_scope) == frozenset({"inbox", "sent"})
+    assert store.source_locations(**root_scope) == frozenset({"inbox"})
     assert store.message_locations(root) == ["inbox", "sent"]
 
 
@@ -7412,3 +7413,68 @@ def test_locations_observed_with_sent_out_of_scope_are_not_stamped(tmp_path: Pat
         **scope, locations=frozenset({"inbox", "sent"}), now=observed_at
     ) == 1
     assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
+
+
+def test_a_coalesced_copy_recorded_as_a_location_counts_as_seen(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    _imap_message(store, "1", "same@x")
+    assert store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    ) is False
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = 'imap-message-1'"
+        ).fetchone()[0]
+
+    # The copy has no row of its own, yet polling must not fetch and analyze it again.
+    assert store.has_seen_message(
+        "imap:sent:77:3",
+        provider="imap",
+        account_id="imap-account",
+        mailbox_identity_key=identity,
+    )
+    assert store.source_locations(
+        provider="imap",
+        account_id="imap-account",
+        mailbox_identity_key=identity,
+        provider_message_id="imap:sent:77:3",
+    ) == frozenset({"sent"})
+
+
+def test_work_queues_see_one_logical_message(tmp_path: Path) -> None:
+    store, root, duplicate = _coalesced_pair(tmp_path)
+    now = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    # The copy was analyzed before the upgrade and never delivered.
+    store.mark_analyzed(
+        duplicate,
+        {
+            "category": "invoice",
+            "priority": "normal",
+            "summary": "Invoice received.",
+            "action_required": True,
+            "suggested_action": "Review it.",
+            "deadline_text": None,
+            "deadline_iso": None,
+            "confidence": 0.9,
+        },
+    )
+
+    assert [m.message_id for m in store.pending(now)] == [root]
+    assert all(m.message_id != duplicate for m in store.pending_delivery(now))
+    assert all(i.message_id != duplicate for i in store.notification_intents())
+    assert store.notification_intent_count() == 0
+    with store.connection() as db:
+        assert db.execute(
+            "SELECT status FROM messages WHERE message_id = ?", (duplicate,)
+        ).fetchone()[0] == "analyzed"

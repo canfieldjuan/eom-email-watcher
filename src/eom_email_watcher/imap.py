@@ -41,6 +41,7 @@ from .mailbox import (
     validate_operation_timeout,
 )
 from .mime import AttachmentDescriptor, bounded_body_text, html_to_text
+from .text import within_utf8_bytes
 
 IMAP_PROVIDER = "imap"
 IMAP_CONNECTION_METHOD = "server_credentials"
@@ -52,6 +53,13 @@ MAX_HEADER_BYTES = 64 * 1024
 # Reply headers are a separately bounded fetch item: an oversized chain is
 # ignored for threading and never rejects a message the main item accepts.
 MAX_REPLY_HEADER_BYTES = 16 * 1024
+# The metadata FETCH asks for three header items, each with its own bound. The core
+# item is required; the other two degrade to nothing when they reach their bound,
+# so a long recipient list or reference chain never invalidates the message.
+CORE_HEADER_FIELDS = "FROM SUBJECT DATE MESSAGE-ID"
+RECIPIENT_HEADER_FIELDS = "TO CC"
+REPLY_HEADER_FIELDS = "IN-REPLY-TO REFERENCES"
+_HEADER_FIELDS = re.compile(rb"HEADER\.FIELDS \(([^)]*)\)", re.IGNORECASE)
 MAX_BODYSTRUCTURE_BYTES = 1024 * 1024
 MAX_MIME_DEPTH = 100
 MAX_MIME_PARTS = 1000
@@ -183,7 +191,7 @@ def credentials_from_connection(value: object) -> ImapCredentials:
         if (
             not isinstance(sent_folder, str)
             or not sent_folder.strip()
-            or len(sent_folder.encode("utf-8")) > MAX_FOLDER_NAME_BYTES
+            or not within_utf8_bytes(sent_folder, MAX_FOLDER_NAME_BYTES)
             or any(not character.isprintable() for character in sent_folder)
         ):
             raise ImapError("imap_configuration_error", "Enter a valid Sent folder name")
@@ -290,7 +298,7 @@ def load_credentials(path: Path) -> ImapCredentials:
     ca_pem = connection.pop("ca_pem", None)
     credentials = credentials_from_connection(connection)
     if ca_pem is not None:
-        if not isinstance(ca_pem, str) or len(ca_pem.encode("utf-8")) > MAX_CA_FILE_BYTES:
+        if not isinstance(ca_pem, str) or not within_utf8_bytes(ca_pem, MAX_CA_FILE_BYTES):
             raise ImapError("imap_configuration_error", "Saved mail server credentials are invalid")
         try:
             ssl.create_default_context(cadata=ca_pem)
@@ -710,15 +718,15 @@ def _literal(response: list[Any] | None) -> tuple[bytes, bytes]:
     raise MailboxMessageUnavailable("The mail server message is no longer available")
 
 
-def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | None]:
-    """Split a metadata FETCH into (metadata, main headers, reply headers or None).
+def _header_literals(response: list[Any] | None) -> tuple[bytes, dict[str, bytes]]:
+    """Split a metadata FETCH into (metadata prefix, header items by field list).
 
     UID and INTERNALDATE precede the first literal, whichever header item the
-    server returns first, so the metadata is always that first prefix.
+    server returns first, so the metadata is always that first prefix. A literal
+    whose prefix names no field list is the core item.
     """
     metadata: bytes | None = None
-    main: bytes | None = None
-    reply: bytes | None = None
+    items: dict[str, bytes] = {}
     for item in response or []:
         if not (isinstance(item, tuple) and len(item) == 2):
             continue
@@ -727,13 +735,19 @@ def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | 
             continue
         if metadata is None:
             metadata = prefix
-        if b"IN-REPLY-TO" in prefix.upper():
-            reply = payload
-        elif main is None:
-            main = payload
-    if metadata is None or main is None:
+        match = _HEADER_FIELDS.search(prefix)
+        fields = match.group(1).decode("ascii", "replace").upper() if match else CORE_HEADER_FIELDS
+        items.setdefault(" ".join(fields.split()), payload)
+    if metadata is None or CORE_HEADER_FIELDS not in items:
         raise MailboxMessageUnavailable("The mail server message is no longer available")
-    return metadata, main, reply
+    return metadata, items
+
+
+def _optional_headers(payload: bytes | None, bound: int) -> bytes | None:
+    """An optional header item, or None when absent or at its bound (truncated)."""
+    if payload is None or len(payload) >= bound:
+        return None
+    return payload
 
 
 def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
@@ -741,7 +755,7 @@ def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
 
     In-Reply-To may name several parents, so each field keeps up to the same bound.
     """
-    if payload is None or len(payload) >= MAX_REPLY_HEADER_BYTES:
+    if payload is None:
         return ()
     try:
         parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
@@ -2009,17 +2023,24 @@ class ImapGateway:
                 "FETCH",
                 uid,
                 "(UID INTERNALDATE "
-                "BODY.PEEK[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID)]"
-                f"<0.{MAX_HEADER_BYTES}> "
-                f"BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]<0.{MAX_REPLY_HEADER_BYTES}>)",
+                f"BODY.PEEK[HEADER.FIELDS ({CORE_HEADER_FIELDS})]<0.{MAX_HEADER_BYTES}> "
+                f"BODY.PEEK[HEADER.FIELDS ({RECIPIENT_HEADER_FIELDS})]<0.{MAX_HEADER_BYTES}> "
+                f"BODY.PEEK[HEADER.FIELDS ({REPLY_HEADER_FIELDS})]<0.{MAX_REPLY_HEADER_BYTES}>)",
             )
             if status != "OK":
                 raise ImapError("imap_protocol_error", "Mail server header fetch failed; retry")
-            metadata, payload, reply_payload = _header_literals(response)
+            metadata, items = _header_literals(response)
+            payload = items[CORE_HEADER_FIELDS]
             if len(payload) >= MAX_HEADER_BYTES:
                 raise MailboxMessageInvalid(
                     "imap_headers_too_large", "Message headers exceed the safe size limit"
                 )
+            recipient_payload = _optional_headers(
+                items.get(RECIPIENT_HEADER_FIELDS), MAX_HEADER_BYTES
+            )
+            reply_payload = _optional_headers(
+                items.get(REPLY_HEADER_FIELDS), MAX_REPLY_HEADER_BYTES
+            )
         try:
             parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
             raw_from = str(parsed.get("From", ""))
@@ -2027,6 +2048,11 @@ class ImapGateway:
             subject = str(parsed.get("Subject", "")).strip() or "(no subject)"
             thread_id = str(parsed.get("Message-ID", "")).strip() or None
             reply_ids = _reply_ids(reply_payload)
+            recipients = (
+                BytesParser(policy=policy.default).parsebytes(recipient_payload, headersonly=True)
+                if recipient_payload is not None
+                else None
+            )
         except RecursionError as exc:
             raise MailboxMessageInvalid(
                 "imap_headers_too_complex", "Message headers exceed the safe complexity limit"
@@ -2042,8 +2068,8 @@ class ImapGateway:
             labels=frozenset() if sent_copy else frozenset({"INBOX"}),
             rfc_message_id=normalize_message_id(thread_id),
             reply_ids=reply_ids,
-            to=recipient_addresses(str(parsed.get("To", ""))),
-            cc=recipient_addresses(str(parsed.get("Cc", ""))),
+            to=recipient_addresses(str(recipients.get("To", "")) if recipients else ""),
+            cc=recipient_addresses(str(recipients.get("Cc", "")) if recipients else ""),
             locations=frozenset({SENT_LOCATION if sent_copy else INBOX_LOCATION}),
         )
 

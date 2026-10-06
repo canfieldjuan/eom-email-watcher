@@ -173,6 +173,7 @@ from .service import (
     reconcile_mailbox_session_identity,
     run_watcher_check,
 )
+from .text import within_utf8_bytes
 
 PROTOCOL_VERSION = 1
 AUTOMATION_DISPATCH_PHASE_SECONDS = 5.0
@@ -953,7 +954,7 @@ def _gmail_label_account_key(payload: dict[str, object]) -> tuple[str, str]:
     if (
         not isinstance(account_id, str)
         or not account_id
-        or len(account_id.encode("utf-8")) > 128
+        or not within_utf8_bytes(account_id, 128)
     ):
         raise ApiError("invalid_request", "account_id must be a non-empty bounded string")
     return provider, account_id
@@ -1267,7 +1268,7 @@ def _gmail_label_selector_add(request: dict[str, object]) -> dict[str, object]:
     if (
         not isinstance(label_id, str)
         or not label_id
-        or len(label_id.encode("utf-8")) > 512
+        or not within_utf8_bytes(label_id, 512)
         or any(unicodedata.category(character) == "Cc" for character in label_id)
     ):
         raise ApiError("invalid_request", "label_id is invalid")
@@ -5592,7 +5593,7 @@ def _vendor_name(payload: dict[str, object]) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ApiError("invalid_request", "display_name must be a non-empty string")
     name = value.strip()
-    if len(name.encode("utf-8")) > MAX_VENDOR_NAME_BYTES:
+    if not within_utf8_bytes(name, MAX_VENDOR_NAME_BYTES):
         raise ApiError("invalid_request", "display_name must be at most 200 UTF-8 bytes")
     if not printable_display_name(name):
         raise ApiError(

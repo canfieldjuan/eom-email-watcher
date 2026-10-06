@@ -11,6 +11,7 @@ from email.utils import getaddresses
 from typing import Protocol
 
 from .mime import AttachmentDescriptor
+from .text import within_utf8_bytes
 
 DEFAULT_MAIL_PROVIDER = "gmail"
 DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
@@ -99,15 +100,10 @@ def recipient_addresses(value: object) -> tuple[str, ...]:
     found: list[str] = []
     for _name, address in getaddresses([value]):
         candidate = address.strip().casefold()
-        try:
-            size = len(candidate.encode("utf-8"))
-        except UnicodeEncodeError:
-            # An unpaired surrogate from a provider payload is a malformed entry.
-            continue
         if (
             "@" in candidate
             and not any(c.isspace() for c in candidate)
-            and size <= MAX_RECIPIENT_ADDRESS_BYTES
+            and within_utf8_bytes(candidate, MAX_RECIPIENT_ADDRESS_BYTES)
         ):
             found.append(candidate)
     return tuple(dict.fromkeys(found))

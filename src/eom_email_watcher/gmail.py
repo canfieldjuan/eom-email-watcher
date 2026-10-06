@@ -43,6 +43,7 @@ from .mailbox import (
     validate_operation_timeout,
 )
 from .mime import extract_body
+from .text import within_utf8_bytes
 
 SCOPES = ("https://www.googleapis.com/auth/gmail.readonly",)
 TOKEN_LOCK_TIMEOUT_SECONDS = 30
@@ -152,13 +153,12 @@ def _bounded_text(
     field: str,
     error_type: type[GmailError],
 ) -> str:
-    if not isinstance(value, str) or not value or _contains_control(value):
-        raise error_type(f"{field} is invalid")
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise error_type(f"{field} is invalid") from exc
-    if len(encoded) > maximum_bytes:
+    if (
+        not isinstance(value, str)
+        or not value
+        or _contains_control(value)
+        or not within_utf8_bytes(value, maximum_bytes)
+    ):
         raise error_type(f"{field} is invalid")
     return value
 
@@ -173,10 +173,12 @@ def _decode_history_cursor(cursor: str) -> tuple[str, int, str | None]:
     if cursor.startswith(LEGACY_HISTORY_CONTINUATION_PREFIX):
         raise StaleHistoryCursor("Saved Gmail history continuation uses the retired stream")
     if not cursor.startswith(HISTORY_CONTINUATION_PREFIX):
-        if not cursor.isdecimal() or len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+        if not cursor.isdecimal() or not within_utf8_bytes(
+            cursor, MAX_HISTORY_CONTINUATION_BYTES
+        ):
             raise StaleHistoryCursor("Saved Gmail history cursor is invalid")
         return cursor, 0, None
-    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+    if not within_utf8_bytes(cursor, MAX_HISTORY_CONTINUATION_BYTES):
         raise StaleHistoryCursor("Saved Gmail history continuation cursor is invalid")
     encoded = cursor.removeprefix(HISTORY_CONTINUATION_PREFIX)
     try:
@@ -218,7 +220,7 @@ def _history_continuation_cursor(start_history_id: str, message_ids: list[str]) 
         "start_history_id": start_history_id,
     }
     cursor = HISTORY_CONTINUATION_PREFIX + _canonical_json_bytes(payload).decode("utf-8")
-    if len(cursor.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES:
+    if not within_utf8_bytes(cursor, MAX_HISTORY_CONTINUATION_BYTES):
         raise StaleHistoryCursor("Saved Gmail history continuation exceeded transport bounds")
     return cursor
 
@@ -778,7 +780,7 @@ class GmailGateway:
         history_id = str(result.get("historyId", "")).strip()
         if (
             not history_id.isdecimal()
-            or len(history_id.encode("utf-8")) > MAX_HISTORY_CONTINUATION_BYTES
+            or not within_utf8_bytes(history_id, MAX_HISTORY_CONTINUATION_BYTES)
         ):
             raise GmailError("Gmail profile response did not contain a history cursor")
         return GmailProfile(email_address=email_address, history_id=history_id)
