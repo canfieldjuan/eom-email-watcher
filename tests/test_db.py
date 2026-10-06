@@ -7024,3 +7024,80 @@ def test_deleting_a_message_removes_its_recipients_and_locations(tmp_path: Path)
     with store.connection() as db:
         assert db.execute("SELECT COUNT(*) FROM message_recipients").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM message_locations").fetchone()[0] == 0
+
+
+def test_deleting_any_row_of_a_logical_message_removes_the_unit_and_suppresses_every_copy(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    duplicate = _retained_duplicate(store, "2", "root@x")
+    _reset_to_schema_29(store)
+    migrated = Store(store.path)
+    migrated.initialize()
+    with migrated.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (root,)
+        ).fetchone()[0]
+        assert db.execute(
+            "SELECT logical_of FROM messages WHERE message_id = ?", (duplicate,)
+        ).fetchone()[0] == root
+    # A Sent copy captured later is a third source identity of the same message.
+    store_for_copy = migrated
+    assert store_for_copy.add_message(
+        message_id="imap-sent-copy-9",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:9",
+        thread_id="<root@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="root@x",
+        locations=frozenset({"sent"}),
+    ) is False
+
+    # Deleting through the duplicate's id resolves the unit.
+    assert migrated.delete_message(duplicate) is True
+
+    with migrated.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM message_locations").fetchone()[0] == 0
+    for source in ("imap:mailbox:44:1", "imap:mailbox:44:2", "imap:sent:77:9"):
+        assert migrated.has_seen_message(
+            source, provider="imap", account_id="imap-account", mailbox_identity_key=identity
+        ), source
+    assert migrated.delete_message(root) is False
+
+
+def test_clearing_messages_suppresses_recorded_locations_too(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    only = _imap_message(store, "1", "only@x")
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (only,)
+        ).fetchone()[0]
+    store_for_copy = store
+    assert store_for_copy.add_message(
+        message_id="imap-sent-copy-4",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:4",
+        thread_id="<only@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="only@x",
+        locations=frozenset({"sent"}),
+    ) is False
+
+    assert store.clear_messages() == 1
+
+    for source in ("imap:mailbox:44:1", "imap:sent:77:4"):
+        assert store.has_seen_message(
+            source, provider="imap", account_id="imap-account", mailbox_identity_key=identity
+        ), source

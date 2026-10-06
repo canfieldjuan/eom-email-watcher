@@ -3376,6 +3376,66 @@ def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
     _execute_transactional_script(db, SENT_CAPTURE_SCHEMA)
 
 
+@dataclass(frozen=True)
+class _SourceIdentity:
+    provider: str
+    account_id: str
+    mailbox_identity_key: str | None
+    provider_message_id: str
+    received_at: str
+
+
+@dataclass(frozen=True)
+class _LogicalUnit:
+    rows: tuple[str, ...]
+    sources: tuple[_SourceIdentity, ...]
+
+
+def _logical_unit(db: sqlite3.Connection, message_id: str) -> _LogicalUnit | None:
+    """The rows and source identities that are one logical message (D-identity)."""
+    row = db.execute(
+        "SELECT COALESCE(logical_of, message_id) AS canonical FROM messages WHERE message_id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    canonical = str(row["canonical"])
+    members = db.execute(
+        """SELECT message_id, provider, account_id, mailbox_identity_key,
+            provider_message_id, received_at
+        FROM messages WHERE message_id = ? OR logical_of = ? ORDER BY message_id""",
+        (canonical, canonical),
+    ).fetchall()
+    sources = {
+        (
+            str(m["provider"]),
+            str(m["account_id"]),
+            str(m["mailbox_identity_key"]) if m["mailbox_identity_key"] is not None else None,
+            str(m["provider_message_id"]),
+        ): str(m["received_at"])
+        for m in members
+    }
+    located = db.execute(
+        """SELECT m.provider, m.account_id, l.mailbox_identity_key, l.provider_message_id,
+            m.received_at
+        FROM message_locations AS l JOIN messages AS m ON m.message_id = l.message_id
+        WHERE l.message_id = ?""",
+        (canonical,),
+    ).fetchall()
+    for located_row in located:
+        key = (
+            str(located_row["provider"]),
+            str(located_row["account_id"]),
+            str(located_row["mailbox_identity_key"]),
+            str(located_row["provider_message_id"]),
+        )
+        sources.setdefault(key, str(located_row["received_at"]))
+    return _LogicalUnit(
+        rows=tuple(str(m["message_id"]) for m in members),
+        sources=tuple(_SourceIdentity(*key, received_at) for key, received_at in sources.items()),
+    )
+
+
 def _migrate_sent_capture(db: sqlite3.Connection) -> None:
     """Schema 30 rows: every message has a location; rows that are one message coalesce."""
     db.execute(
@@ -8659,47 +8719,50 @@ class Store:
         return addresses
 
     def delete_message(self, message_id: str, *, now: datetime | None = None) -> bool:
+        """Delete a logical message as one unit (contract D-identity).
+
+        The canonical row, every row pointing to it through logical_of, and a
+        suppression for each recorded source identity go together, so no copy is
+        recaptured after a cursor recovery.
+        """
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
-        with self._source_cleanup_locks((message_id,)), self.connection() as db:
+        with self.connection() as db:
+            unit = _logical_unit(db, message_id)
+        if unit is None:
+            return False
+        with self._source_cleanup_locks(unit.rows), self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                """SELECT provider, account_id, mailbox_identity_key,
-                    provider_message_id, received_at
-                    FROM messages WHERE message_id = ?""",
-                (message_id,),
-            ).fetchone()
-            if row is None:
+            unit = _logical_unit(db, message_id)
+            if unit is None:
                 return False
-            db.execute(
+            db.executemany(
                 """INSERT INTO suppressed_messages(
                         provider, account_id, message_key, expires_at
                     ) VALUES (?, ?, ?, ?)
                     ON CONFLICT(provider, account_id, message_key)
                     DO UPDATE SET expires_at = excluded.expires_at""",
-                (
-                    str(row["provider"]),
-                    str(row["account_id"]),
-                    _message_suppression_key(
-                        str(row["provider"]),
-                        str(row["account_id"]),
-                        str(row["provider_message_id"]),
-                        (
-                            str(row["mailbox_identity_key"])
-                            if row["mailbox_identity_key"] is not None
-                            else None
+                [
+                    (
+                        source.provider,
+                        source.account_id,
+                        _message_suppression_key(
+                            source.provider,
+                            source.account_id,
+                            source.provider_message_id,
+                            source.mailbox_identity_key,
                         ),
-                    ),
-                    _suppression_expiry(str(row["received_at"]), stamp),
-                ),
+                        _suppression_expiry(source.received_at, stamp),
+                    )
+                    for source in unit.sources
+                ],
             )
-            _mark_automation_sources_unavailable(
-                db,
-                [message_id],
-                updated_at=stamp.isoformat(),
+            _mark_automation_sources_unavailable(db, unit.rows, updated_at=stamp.isoformat())
+            placeholders = ", ".join("?" for _ in unit.rows)
+            cursor = db.execute(
+                f"DELETE FROM messages WHERE message_id IN ({placeholders})", tuple(unit.rows)
             )
-            cursor = db.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
             _purge_expired_automation_tombstones(db, now=stamp.isoformat())
-        return cursor.rowcount == 1
+        return cursor.rowcount >= 1
 
     def clear_messages(self, *, now: datetime | None = None) -> int:
         stamp = (now or datetime.now(UTC)).astimezone(UTC)
@@ -8722,6 +8785,36 @@ class Store:
                         WHERE message_id IN ({placeholders})""",
                     tuple(chunk),
                 ).fetchall()
+                # Recorded locations are source identities too (contract D-identity).
+                located = db.execute(
+                    f"""SELECT m.provider, m.account_id, l.mailbox_identity_key,
+                        l.provider_message_id, m.received_at
+                    FROM message_locations AS l
+                    JOIN messages AS m ON m.message_id = l.message_id
+                    WHERE l.message_id IN ({placeholders})""",
+                    tuple(chunk),
+                ).fetchall()
+                db.executemany(
+                    """INSERT INTO suppressed_messages(
+                            provider, account_id, message_key, expires_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(provider, account_id, message_key)
+                        DO UPDATE SET expires_at = excluded.expires_at""",
+                    [
+                        (
+                            str(row["provider"]),
+                            str(row["account_id"]),
+                            _message_suppression_key(
+                                str(row["provider"]),
+                                str(row["account_id"]),
+                                str(row["provider_message_id"]),
+                                str(row["mailbox_identity_key"]),
+                            ),
+                            _suppression_expiry(str(row["received_at"]), stamp),
+                        )
+                        for row in located
+                    ],
+                )
                 db.executemany(
                     """INSERT INTO suppressed_messages(
                             provider, account_id, message_key, expires_at
