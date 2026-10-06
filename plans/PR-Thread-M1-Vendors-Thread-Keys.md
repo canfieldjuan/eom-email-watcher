@@ -1,6 +1,6 @@
 # Thread View M1: Vendor Records and Thread Keys
 
-Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05).
+Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05). It includes amendment B of #207, committed separately ahead of this plan.
 
 This plan specifies M1's mechanics only. Every rule it implements is stated in the contract's definitions, and this plan cites them rather than restating them. Where this plan and a definition seem to differ, the definition wins, and this plan is wrong.
 
@@ -31,7 +31,7 @@ Ownership lane: thread-view-m1
 **Out of scope:**
 - Admission and capture do not change. D-capture's new kinds arrive in M2.
 - Follow state ([D-follow](../docs/THREAD_VIEW_CONTRACT.md#d-follow-followed-threads)) arrives in M2.
-- Sent folders, and so the IMAP Sent folder token of D-identity, arrive in M2.
+- Sent folders arrive in M2, and with them the IMAP Sent folder token and the recorded locations that derive direction under D-identity. In M1 every capture is an inbox capture.
 - Bodies, claims, domains, and suggestions belong to later milestones.
 
 ### Mechanics
@@ -126,6 +126,7 @@ Ownership lane: thread-view-m1
 - a full `References` chain joins its root;
 - a missing root joins through a shared id;
 - arrival orders A,B,C, C,B,A, and B,C,A give one component with the same survivor;
+- components whose members have no `Message-ID` (ids only from `In-Reply-To` and `References`) merge to the same survivor in every order;
 - a bridging message merges atomically and records an alias;
 - 65 `References` ids keep 64, and a 999-character id is dropped;
 - an oversized reply-header item is ignored, and the message is still admitted;
