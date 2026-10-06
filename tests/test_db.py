@@ -7340,7 +7340,10 @@ def test_upgrade_assumes_inbox_and_the_first_observation_stamps_it(tmp_path: Pat
 
     assert recorded() == [None]
     observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
-    assert store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at) == 0
+    assert (
+        store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at)
+        == 0
+    )
     assert recorded() == [observed_at.isoformat()]
 
 
