@@ -107,3 +107,12 @@ test("only the latest of overlapping vendor list requests commits", async () => 
   assert.equal(fence.isLatest(afterMutation), true);
   assert.equal(fence.isLatest(tabOpened), false);
 });
+
+test("a failed watchlist-changing operation still reloads, keeping its error", async () => {
+  const { vendorReloadAfter } = await vendors();
+  assert.equal(vendorReloadAfter(true, true), "with_message");
+  assert.equal(vendorReloadAfter(true, false), "with_message");
+  // The watchlist write may have committed before the database step failed.
+  assert.equal(vendorReloadAfter(false, true), "keep_error");
+  assert.equal(vendorReloadAfter(false, false), "none");
+});

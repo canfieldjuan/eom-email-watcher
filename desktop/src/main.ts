@@ -24,6 +24,7 @@ import {
   deleteVendorConfirmText,
   latestRequestFence,
   removeAddressConfirmText,
+  vendorReloadAfter,
   vendorErrorText,
   vendorNameError,
   vendorsView,
@@ -4872,14 +4873,15 @@ function renderVendors(): void {
   if (operationInFlight) setBusy(true);
 }
 
-async function loadVendors(message = "Vendors are up to date."): Promise<void> {
+// A null message reloads without replacing the status, so an error stays visible.
+async function loadVendors(message: string | null = "Vendors are up to date."): Promise<void> {
   const request = vendorListFence.begin();
   try {
     const vendors = await invoke<Vendor[]>("vendors_list");
     if (!vendorListFence.isLatest(request)) return;
     vendorRecords = vendors;
     renderVendors();
-    setVendorsStatus(message, "success");
+    if (message !== null) setVendorsStatus(message, "success");
   } catch (error) {
     if (vendorListFence.isLatest(request)) vendorFailure(error);
   }
@@ -4902,7 +4904,8 @@ async function vendorOperation(
   } finally {
     finishOperation();
   }
-  if (message !== null) await loadVendors(message);
+  const reload = vendorReloadAfter(message !== null, changesWatchlist);
+  if (reload !== "none") await loadVendors(reload === "with_message" ? message : null);
   if (changesWatchlist) void loadSenders();
 }
 

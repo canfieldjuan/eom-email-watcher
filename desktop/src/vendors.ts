@@ -120,3 +120,14 @@ export function latestRequestFence() {
     },
   };
 }
+
+// After a vendor operation, what the view reloads (D-ops, two stores). A
+// success reloads with its message. A failure of an operation that can change
+// the watchlist may follow a committed watchlist write, so it reloads too but
+// keeps the error showing; any other failure changed nothing.
+export type VendorReload = "with_message" | "keep_error" | "none";
+
+export function vendorReloadAfter(succeeded: boolean, changesWatchlist: boolean): VendorReload {
+  if (succeeded) return "with_message";
+  return changesWatchlist ? "keep_error" : "none";
+}
