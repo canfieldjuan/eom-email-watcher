@@ -1,6 +1,6 @@
 # Thread View M1: Vendor Records and Thread Keys
 
-Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05). It includes amendment B of #207 and the review amendment to D-identity and D-ops, each committed separately ahead of this plan.
+Milestone M1 of [`docs/THREAD_VIEW_CONTRACT.md`](../docs/THREAD_VIEW_CONTRACT.md) (accepted 2026-10-05). It includes amendments B and C of #207 and the review amendments to D-identity, D-ops, and the M2 items, each committed separately ahead of this plan.
 
 This plan specifies M1's mechanics only. Every rule it implements is stated in the contract's definitions, and this plan cites them rather than restating them. Where this plan and a definition seem to differ, the definition wins, and this plan is wrong.
 
@@ -47,7 +47,8 @@ Ownership lane: thread-view-m1
 3. IMAP component tables:
    - `imap_thread_ids(provider, account_id, mailbox_identity_key, rfc_id, thread_key)`, primary key on the first four columns;
    - `thread_key_aliases(old_key PRIMARY KEY, survivor_key)`;
-   - a trigger that, when a component's last message is deleted, deletes its `imap_thread_ids` rows and the aliases naming it, so purged threads leave nothing behind.
+   - a trigger that, when a component's last message is deleted, deletes its `imap_thread_ids` rows and the aliases naming it, so purged threads leave nothing behind;
+   - `imap_reply_header_gaps(message_id PRIMARY KEY)`, the contract's M2 list of retained IMAP messages whose reply headers were never fetched, with a trigger that drops a message's row when the message is deleted.
 4. Indexes:
    - `messages(provider, account_id, mailbox_identity_key, thread_key, received_at)`;
    - `messages(provider, account_id, mailbox_identity_key, rfc_message_id)`.
@@ -57,6 +58,8 @@ Ownership lane: thread-view-m1
      - a valid id that is already registered joins that component, so retained rows sharing an id share one component;
      - a valid new id gets a fresh UUIDv4 component, and the id is registered and stored as `rfc_message_id`;
      - a missing or malformed id gets a fresh component of its own, with nothing registered.
+   - A legacy row stored without a mailbox identity registers under the account's `legacy_identity_key` when `legacy_identity_status` is `continuity_proven`, the condition capture already uses to treat legacy rows as the current mailbox (`db.py:7823-7825`). Otherwise its mailbox is unknown, and it forms its own component with nothing registered.
+   - Every retained IMAP row is listed in `imap_reply_header_gaps`.
 
 **IMAP reply headers.**
 6. The metadata `FETCH` adds a second header item, `BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)]`, with its own byte bound.
@@ -75,6 +78,7 @@ Ownership lane: thread-view-m1
     - one component: the message joins it, and the key is unchanged;
     - several components: they merge.
 11. A merge keeps the survivor's key under D-identity. In the same transaction it re-keys every row naming a merged key, which in M1 means `messages.thread_key`, `imap_thread_ids.thread_key`, and `thread_key_aliases.survivor_key`, then records an alias from each merged key.
+    - Keys are UUIDv4s, so a component's rows are found by provider, account, and key, never by mailbox identity. That includes legacy members stored without one.
     - This merge function is the single re-key owner. Later milestones add their thread-keyed tables to it, and nowhere else.
 12. The capture sites pass the new metadata to the insert (`service.py:1640`, `1832`, `2125`).
 
@@ -90,7 +94,7 @@ Ownership lane: thread-view-m1
 16. `vendors.list` reports `watched` per address, read from the config watchlist.
 17. `vendors.addresses.add` returns `conflict`, before any write, for an address equal to any `mail_accounts.address`.
     - That covers both of D-vendor's verified identities, because `reconcile_mailbox_session_identity` (`service.py:1208-1210`) refuses a session whose authenticated address differs from the stored one.
-    - An account connected after its address became a vendor address is handled where `vendor_of` is evaluated, by amendment C of #207, before M2 uses it.
+    - An account connected after its address became a vendor address is excluded by `vendor_of` under D-vendor (amendment C). M1 evaluates no `vendor_of`: attribution, capture, and following start in M2.
 18. `vendors.addresses.remove` records the `(vendor, address)` dismissal in the same transaction as the removal.
 19. The order of D-ops's two stores:
     - `vendors.addresses.add`: `add_sender` when not watched, then the vendor insert;
@@ -151,6 +155,8 @@ Ownership lane: thread-view-m1
 - a reply whose `In-Reply-To` is `<root@example.com>` joins the retained row stored with that raw header;
 - two retained rows with one id share a component, and the upgrade completes;
 - retained rows with no id, or a malformed one, each get their own key;
+- legacy rows without a mailbox identity upgrade: under a proven identity they thread with new mail, and otherwise they stay alone;
+- every retained IMAP row is listed in `imap_reply_header_gaps`, and deleting it removes its row;
 - v28 code refuses v29.
 
 **Admission is unchanged:** the existing admission and service suites pass unmodified.
