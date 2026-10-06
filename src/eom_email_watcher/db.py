@@ -3333,6 +3333,10 @@ CREATE TABLE IF NOT EXISTS message_locations (
     -- only) or observed while Sent was out of scope: neither says whether the message
     -- is also in Sent. The first observation under full scope stamps it.
     recorded_at TEXT,
+    -- The copy's own receive time when this location came from a captured copy that
+    -- got no row of its own (contract D-identity); the purge keeps the logical
+    -- message while any copy is within retention. NULL when the row carries it.
+    received_at TEXT,
     PRIMARY KEY (provider, account_id, mailbox_identity_key, provider_message_id, location)
 );
 CREATE INDEX IF NOT EXISTS idx_message_locations_message ON message_locations(message_id);
@@ -3423,13 +3427,15 @@ def _record_locations(
     provider_message_id: str,
     locations: Iterable[str],
     recorded_at: str | None,
+    received_at: str | None = None,
 ) -> int:
     """Record one observation of a source identity's admitted folders (D-identity).
 
     Returns the number of new rows. recorded_at says whether the observation was
     complete (every admitted folder in scope, plan step 5): a complete one stamps
     the source's rows, an incomplete one (None) clears their stamp, so the stamp
-    always describes the latest observation.
+    always describes the latest observation. received_at is the copy's own
+    receive time when the copy got no row of its own, so the purge can see it.
     """
     recorded = 0
     source = (provider, account_id, mailbox_identity_key, provider_message_id)
@@ -3439,15 +3445,16 @@ def _record_locations(
         recorded += db.execute(
             """INSERT OR IGNORE INTO message_locations(
                 message_id, provider, account_id, mailbox_identity_key,
-                provider_message_id, location, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (message_id, *source, location, recorded_at),
+                provider_message_id, location, recorded_at, received_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (message_id, *source, location, recorded_at, received_at),
         ).rowcount
     db.execute(
-        """UPDATE message_locations SET recorded_at = ?
+        """UPDATE message_locations
+        SET recorded_at = ?, received_at = COALESCE(?, received_at)
         WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
           AND provider_message_id = ?""",
-        (recorded_at, *source),
+        (recorded_at, received_at, *source),
     )
     return recorded
 
@@ -3472,6 +3479,11 @@ def _ensure_sent_capture_tables(db: sqlite3.Connection) -> None:
             f" DEFAULT '{FULL_FOLDER_SCOPE}'"
         )
     _execute_transactional_script(db, SENT_CAPTURE_SCHEMA)
+    location_columns = {
+        str(row["name"]) for row in db.execute("PRAGMA table_info(message_locations)").fetchall()
+    }
+    if "received_at" not in location_columns:
+        db.execute("ALTER TABLE message_locations ADD COLUMN received_at TEXT")
 
 
 @dataclass(frozen=True)
@@ -8400,6 +8412,21 @@ class Store:
                 other_than=other_than,
             )
 
+    def clear_location_stamps(
+        self, provider: str, account_id: str, mailbox_identity_key: str
+    ) -> None:
+        """A gap in polling makes every observation of the account incomplete.
+
+        A cursor that expired or recovered may have missed folder changes, so the
+        stamps are cleared and discovery (plan step 16) observes the messages again.
+        """
+        with self.connection() as db:
+            db.execute(
+                """UPDATE message_locations SET recorded_at = NULL
+                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?""",
+                (provider, account_id, mailbox_identity_key),
+            )
+
     def message_sources(self, message_id: str) -> tuple[MessageSource, ...]:
         """Every source identity a logical message can be read from (contract D-identity).
 
@@ -8609,6 +8636,7 @@ class Store:
                     provider_message_id=source_message_id,
                     locations=locations,
                     recorded_at=discovered_at if scope_complete else None,
+                    received_at=received_at,
                 )
                 _record_recipients(db, message_id=logical_id, to=to, cc=cc)
                 _requeue_if_skipped(db, logical_id)
@@ -8876,7 +8904,8 @@ class Store:
                 recorded_at=stamp if complete else None,
             )
             _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
-            if recorded:
+            if locations:
+                # A folder observed again is a readable source again, new row or not.
                 _requeue_if_skipped(db, str(row["logical_id"]))
             return recorded
 
@@ -13037,16 +13066,23 @@ class Store:
         # A logical message is purged as one unit (contract D-identity): its
         # canonical row and every row pointing to it go together, once every
         # row has expired, so a later-dated copy keeps the shared locations.
+        # A copy captured as a location, not a row, carries its own receive time:
+        # while it is within retention the logical message stays.
         expired_units = f"""SELECT canonical FROM (
                 SELECT COALESCE(logical_of, message_id) AS canonical,
                        MIN(CASE WHEN ({expiry_predicate}) THEN 1 ELSE 0 END) AS all_expired
                 FROM messages GROUP BY canonical
-            ) WHERE all_expired = 1"""
+            ) WHERE all_expired = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM message_locations AS l
+                  WHERE l.message_id = canonical AND l.received_at IS NOT NULL
+                    AND aware_iso_epoch(l.received_at) >= ?
+              )"""
         with self.connection() as db:
             expired_ids = [
                 str(row["canonical"])
                 for row in db.execute(
-                    f"{expired_units} ORDER BY canonical", expiry_parameters
+                    f"{expired_units} ORDER BY canonical", (*expiry_parameters, cutoff_epoch)
                 ).fetchall()
             ]
         deleted = 0
@@ -13065,7 +13101,7 @@ class Store:
                     for row in db.execute(
                         f"""SELECT canonical FROM ({expired_units})
                             WHERE canonical IN ({placeholders})""",
-                        (*expiry_parameters, *chunk),
+                        (*expiry_parameters, cutoff_epoch, *chunk),
                     ).fetchall()
                 ]
                 current_rows = _unit_rows(db, current_expired)

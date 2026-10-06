@@ -7816,3 +7816,76 @@ def test_logical_message_id_finds_the_stored_copy_a_source_duplicates(tmp_path: 
     assert store.logical_message_id(
         "imap", "imap-account", identity, "same@x", other_than="imap:mailbox:44:1"
     ) is None
+
+
+def test_a_copy_captured_as_a_location_keeps_its_logical_message_in_retention(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "same@x")
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET received_at = '2026-01-01T12:00:00+00:00' WHERE message_id = ?",
+            (root,),
+        )
+    # The Sent copy arrives later and in window; it becomes a location, not a row.
+    assert store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-09-01T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    ) is False
+    now = datetime(2026, 9, 10, tzinfo=UTC)
+
+    assert store.purge_with_outcome(30, now=now).messages == 0
+    assert store.has_message(root)
+    assert store.purge_with_outcome(5, now=now).messages == 1
+    assert not store.has_message(root)
+
+
+def test_a_skipped_message_is_queued_again_when_a_known_folder_is_observed_again(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+    store.mark_skipped("gmail-1")
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key, provider_message_id FROM messages"
+        ).fetchone()
+    scope = {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+    # The message left and re-entered the Inbox: no new row, but a readable source.
+    assert store.record_message_location(**scope, locations=frozenset({"inbox"})) == 0
+    assert [m.message_id for m in store.pending()] == ["gmail-1"]
+
+
+def test_a_polling_gap_clears_the_account_s_observation_stamps(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key FROM messages"
+        ).fetchone()
+        assert db.execute("SELECT recorded_at FROM message_locations").fetchone()[0] is not None
+    store.clear_location_stamps(row[0], row[1], row[2])
+    with store.connection() as db:
+        assert db.execute("SELECT recorded_at FROM message_locations").fetchone()[0] is None

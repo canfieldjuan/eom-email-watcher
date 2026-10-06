@@ -1483,6 +1483,48 @@ def test_content_is_read_through_any_source_of_a_logical_message() -> None:
         service_module._content_from_sources(Copies(), ids[:1], 100)
 
 
+def test_a_lost_history_cursor_marks_every_observation_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, LabelledGmail(frozenset({"INBOX"})), FakeModel()).check()
+    item = store.recent(1)[0]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ?",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    class LostCursor(LabelledGmail):
+        def history_message_ids(self, cursor: str):
+            raise StaleHistoryCursor()
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return (), None
+
+    # The gap may have moved messages unobserved: every stamp is cleared, so the
+    # next discovery pass looks at them again; the recovery itself lists nothing.
+    Watcher(cfg, store, LostCursor(frozenset({"INBOX"})), FakeModel()).check()
+    assert stamps() == [None]
+
+
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(
     tmp_path: Path,
 ) -> None:

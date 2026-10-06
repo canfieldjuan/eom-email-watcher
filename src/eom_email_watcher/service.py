@@ -2086,6 +2086,12 @@ class Watcher:
                 ) from exc
             recovered = True
             since = _recovery_since(last_success, retention_cutoff)
+            if not dry_run:
+                # A gap in polling: folder changes may have gone unobserved, so every
+                # observation of the account is incomplete until discovery looks.
+                self.store.clear_location_stamps(
+                    self.mailbox.provider, self.mailbox.account_id, mailbox_identity_key
+                )
             if self.mailbox.provider == "gmail" and dry_run:
                 replacement_cursor = self.gateway.initial_cursor()
                 if not replacement_cursor.isdigit():
@@ -2461,6 +2467,8 @@ class Watcher:
             except StaleMailboxCursor as exc:
                 # Like the Inbox: recover the interval since the last success first.
                 logger.warning("Sent folder cursor expired (%s); recovering the gap", exc)
+                if not dry_run:
+                    self.store.clear_location_stamps(provider, account_id, mailbox_identity_key)
                 changes = self.gateway.sent_recover_since(
                     _recovery_since(state[1], retention_cutoff)
                 )
