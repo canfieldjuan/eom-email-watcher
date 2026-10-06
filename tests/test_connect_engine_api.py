@@ -75,6 +75,7 @@ def test_entitlement_status_is_claim_free_and_does_not_load_watcher_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
     monkeypatch.setattr(
         entitlement,
         "connect_entitlement_status",
@@ -88,7 +89,7 @@ def test_entitlement_status_is_claim_free_and_does_not_load_watcher_config(
     )
 
     assert response == {
-        "data": {"state": "expired", "active": False},
+        "data": {"state": "expired", "active": False, "automations_active": False},
         "ok": True,
         "operation": "connect.entitlement.status",
         "protocol": 1,
@@ -99,6 +100,7 @@ def test_entitlement_install_forwards_only_an_absolute_source_and_preserves_erro
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(engine_api, "_automation_entitlement_active", lambda: False)
     source = tmp_path / "license.json"
     source.write_text("{}", encoding="utf-8")
     captured: list[Path] = []
@@ -115,7 +117,7 @@ def test_entitlement_install_forwards_only_an_absolute_source_and_preserves_erro
             {"source_path": str(source)},
         )
     )
-    assert response["data"] == {"state": "active", "active": True}
+    assert response["data"] == {"state": "active", "active": True, "automations_active": False}
     assert captured == [source]
 
     relative = engine_api._response(

@@ -246,6 +246,7 @@ def smoke_packaged_engine(
         if entitlement["data"] != {
             "state": expected_entitlement_state,
             "active": False,
+            "automations_active": False,
         }:
             raise PackagedEngineSmokeError(
                 "Packaged engine did not report the expected Connect authority state"
