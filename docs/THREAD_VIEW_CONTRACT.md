@@ -136,7 +136,7 @@ Each definition is the only place its rule is stated.
 - **Logical identity.** A message with a `Message-ID` also has the logical identity `(provider, account, mailbox identity, Message-ID)`.
   - A second location of an already-captured logical identity is recorded, not captured again.
   - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
-- **Canonical order.** The canonical order of messages is their source identity in byte order. Every tie-break in this contract uses it.
+- **Canonical order.** The canonical order of messages is their source identity in byte order. A logical message recorded in several locations sorts by the smallest of their source identities. Every tie-break in this contract uses it.
 - **Direction** is derived from the logical message's recorded locations. It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. It is recomputed when a location is added, so discovery order never decides it.
 - **Thread key:**
   - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
@@ -300,6 +300,8 @@ Each named plan must include these, with fail-first tests.
   - Every Gmail message gets a bounded `format=metadata` fetch before its scope check, and the body is fetched only after that check.
   - Microsoft discovery pages each folder by `receivedDateTime` and matches recipients locally, never using `$search`.
   - IMAP sync searches `HEADER Message-ID`, `In-Reply-To`, and `References` until the component stops growing.
+  - IMAP messages retained from before M1 never had their reply headers fetched; M1 lists them. Sync fetches those headers for a listed message whose mailbox identity is known and merges through D-identity. A message whose source is gone, or whose identity is unknown, leaves the list and keeps its own component.
+  - Rows stored before locations exist that are one message under [D-identity](#d-identity-message-identity-direction-and-thread-keys), retained or from M1, are coalesced into one message with all their locations.
   - The date context is stored at capture, with a test that changes the zone after storage.
   - The Gmail checkpoint covers both labels, with a test of a poll that stops mid-range and resumes without missing `SENT` events.
   - The recognized HTML quote containers (at least `<blockquote>`, Gmail's quote block, and Outlook's reply header block), each tested.
@@ -410,4 +412,5 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - D-identity: amendment B claimed the merge survivor never depends on arrival order, which a UUIDv4 key cannot satisfy. Component membership is order-independent and the key is an opaque handle. Every captured message now has a thread key, and merges re-key earlier aliases.
   - D-ops: deleting a vendor claimed one transaction across the watchlist file and the database. Operations that change both now write the watchlist first, so a retry completes them.
   - A third finding, that a location added later changes direction without recomputing follow state or claims, is an input to amendment A (#207).
+- 2026-10-05: the second M1 plan review found that a logical message with several locations had no single source identity to order by; it sorts by the smallest. It also added two M2 items: fetch the reply headers of IMAP messages retained from before M1, and coalesce rows that are one message.
 - 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
