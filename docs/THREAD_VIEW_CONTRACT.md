@@ -155,7 +155,8 @@ Each definition is the only place its rule is stated.
 - **Its inputs** are exactly:
   - the stored messages, with their headers, received times, and recorded locations;
   - the vendor records;
-  - the mailbox's verified identities ([D-vendor](#d-vendor-vendors-and-vendor_ofaddress)).
+  - the mailbox's verified identities ([D-vendor](#d-vendor-vendors-and-vendor_ofaddress));
+  - the active claims extractor version ([D-claims](#d-claims-claims-and-comparability)): recording a new one supersedes the previous key's claims, discrepancies, and attempts in that transaction, and reconciliation creates the replacements.
 
   All of them live in the database. Admission provenance and discovery order are never inputs.
 - **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`).
