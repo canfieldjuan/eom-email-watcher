@@ -6647,3 +6647,13 @@ def test_schema_28_legacy_rows_without_a_mailbox_identity_upgrade(
         # Unknown mailbox: legacy rows never join current mail.
         assert keys[reply] not in {keys[legacy_root], keys[legacy_copy]}
         assert keys[legacy_root] != keys[legacy_copy]
+
+
+def test_a_reply_to_two_parents_merges_their_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    one = _imap_message(store, "1", "parent-one@x")
+    two = _imap_message(store, "2", "parent-two@x")
+    reply = _imap_message(store, "3", "reply@x", ("parent-one@x", "parent-two@x"))
+    keys = _thread_keys(store)
+    assert keys[one] == keys[two] == keys[reply]

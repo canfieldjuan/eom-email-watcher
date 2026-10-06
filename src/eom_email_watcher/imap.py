@@ -23,7 +23,7 @@ from urllib.parse import unquote_to_bytes
 
 from .config import normalize_address
 from .mailbox import (
-    MAX_REFERENCES_IDS,
+    MAX_IDS_PER_REPLY_HEADER,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -534,13 +534,18 @@ def _header_literals(response: list[Any] | None) -> tuple[bytes, bytes, bytes | 
 
 
 def _reply_ids(payload: bytes | None) -> tuple[str, ...]:
-    """Return In-Reply-To then oldest-first References ids; empty if unusable."""
+    """Return In-Reply-To then oldest-first References ids; empty if unusable.
+
+    In-Reply-To may name several parents, so each field keeps up to the same bound.
+    """
     if payload is None or len(payload) >= MAX_REPLY_HEADER_BYTES:
         return ()
     try:
         parsed = BytesParser(policy=policy.default).parsebytes(payload, headersonly=True)
-        in_reply_to = message_id_list(str(parsed.get("In-Reply-To", "")), limit=1)
-        references = message_id_list(str(parsed.get("References", "")), MAX_REFERENCES_IDS)
+        in_reply_to = message_id_list(
+            str(parsed.get("In-Reply-To", "")), MAX_IDS_PER_REPLY_HEADER
+        )
+        references = message_id_list(str(parsed.get("References", "")), MAX_IDS_PER_REPLY_HEADER)
     except (RecursionError, ValueError, TypeError, IndexError):
         return ()
     return tuple(dict.fromkeys((*in_reply_to, *references)))

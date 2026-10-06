@@ -12,7 +12,7 @@ use engine::{
     ConnectProviderIdentity, Engine, EngineError, EngineSettings, GmailAuthorization,
     GmailLabelCatalog, GmailLabelSelectorAdded, GmailLabelSelectorRemoved, GmailLabelSelectors,
     HealthStatus, InboxPage, InboxQuery, MailAccountResult, MailAccounts, MailServerConnection,
-    NtfyDisclosureStatus, PreparedAutomationRule, WatchedSender,
+    NtfyDisclosureStatus, PreparedAutomationRule, Vendor, VendorDeleted, WatchedSender,
 };
 use scheduler::{ConnectQueueScheduler, OwnedWorker, PollScheduler, PollingStatus, WorkerGate};
 use serde::Serialize;
@@ -2318,6 +2318,122 @@ async fn watchlist_remove(
     .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
 }
 
+// Vendor records (contract D-ops). Operations that can change the watchlist
+// go through the configuration mutation, like watchlist_add and
+// watchlist_remove; the rest only change the database.
+#[tauri::command]
+async fn vendors_list(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+) -> Result<Vec<Vendor>, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_vendors())
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_create(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    display_name: String,
+) -> Result<Vendor, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.create_vendor(display_name))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_rename(
+    engine: State<'_, Engine>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    display_name: String,
+) -> Result<Vendor, EngineError> {
+    let _admission_permit = admission.require_admitted()?;
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.rename_vendor(vendor_id, display_name))
+        .await
+        .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_address_add(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    address: String,
+) -> Result<Vendor, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        admission.mutate_config(&app, &engine, &delivery, |engine| {
+            engine.add_vendor_address(vendor_id, address)
+        })
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_address_remove(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    address: String,
+    unwatch: bool,
+) -> Result<Vendor, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if unwatch {
+            admission.mutate_config(&app, &engine, &delivery, |engine| {
+                engine.remove_vendor_address(vendor_id, address, true)
+            })
+        } else {
+            let _admission_permit = admission.require_admitted()?;
+            engine.remove_vendor_address(vendor_id, address, false)
+        }
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
+#[tauri::command]
+async fn vendors_delete(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    delivery: State<'_, NotificationDelivery>,
+    admission: State<'_, AdmissionCoordinator>,
+    vendor_id: String,
+    unwatch_addresses: bool,
+) -> Result<VendorDeleted, EngineError> {
+    let admission = AdmissionCoordinator::clone(&*admission);
+    let engine = engine.inner().clone();
+    let delivery = delivery.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if unwatch_addresses {
+            admission.mutate_config(&app, &engine, &delivery, |engine| {
+                engine.delete_vendor(vendor_id, true)
+            })
+        } else {
+            let _admission_permit = admission.require_admitted()?;
+            engine.delete_vendor(vendor_id, false)
+        }
+    })
+    .await
+    .map_err(|_| EngineError::host("host_error", "Watcher engine worker stopped"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(desktop)]
@@ -2442,6 +2558,12 @@ pub fn run() {
             mail_accounts_list,
             settings_get,
             settings_update,
+            vendors_address_add,
+            vendors_address_remove,
+            vendors_create,
+            vendors_delete,
+            vendors_list,
+            vendors_rename,
             watcher_check,
             watchlist_list,
             watchlist_add,

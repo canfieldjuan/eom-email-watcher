@@ -758,6 +758,26 @@ pub struct WatchedSender {
     pub admission_active: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VendorAddress {
+    pub address: String,
+    pub watched: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Vendor {
+    pub vendor_id: String,
+    pub display_name: String,
+    pub addresses: Vec<VendorAddress>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VendorDeleted {
+    pub deleted: bool,
+    pub vendor_id: String,
+    pub addresses: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct InboxAttachment {
     pub part_id: String,
@@ -1588,6 +1608,16 @@ struct SenderItems {
 #[derive(Deserialize)]
 struct SenderItem {
     item: WatchedSender,
+}
+
+#[derive(Deserialize)]
+struct VendorItems {
+    items: Vec<Vendor>,
+}
+
+#[derive(Deserialize)]
+struct VendorItem {
+    item: Vendor,
 }
 
 #[derive(Deserialize)]
@@ -2666,6 +2696,100 @@ impl Engine {
             .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
         self.request::<SenderItem>("watchlist.remove", json!({"email": email}))
             .map(|data| data.item)
+    }
+
+    pub fn list_vendors(&self) -> Result<Vec<Vendor>, EngineError> {
+        self.request::<VendorItems>("vendors.list", json!({}))
+            .map(|data| data.items)
+    }
+
+    pub fn create_vendor(&self, display_name: String) -> Result<Vendor, EngineError> {
+        self.vendor_mutation(
+            "vendors.create",
+            None,
+            json!({"display_name": display_name}),
+        )
+    }
+
+    pub fn rename_vendor(
+        &self,
+        vendor_id: String,
+        display_name: String,
+    ) -> Result<Vendor, EngineError> {
+        self.vendor_mutation(
+            "vendors.rename",
+            Some(&vendor_id),
+            json!({"vendor_id": vendor_id, "display_name": display_name}),
+        )
+    }
+
+    pub fn add_vendor_address(
+        &self,
+        vendor_id: String,
+        address: String,
+    ) -> Result<Vendor, EngineError> {
+        self.vendor_mutation(
+            "vendors.addresses.add",
+            Some(&vendor_id),
+            json!({"vendor_id": vendor_id, "address": address}),
+        )
+    }
+
+    pub fn remove_vendor_address(
+        &self,
+        vendor_id: String,
+        address: String,
+        unwatch: bool,
+    ) -> Result<Vendor, EngineError> {
+        self.vendor_mutation(
+            "vendors.addresses.remove",
+            Some(&vendor_id),
+            json!({"vendor_id": vendor_id, "address": address, "unwatch": unwatch}),
+        )
+    }
+
+    pub fn delete_vendor(
+        &self,
+        vendor_id: String,
+        unwatch_addresses: bool,
+    ) -> Result<VendorDeleted, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let result: VendorDeleted = self.request(
+            "vendors.delete",
+            json!({"vendor_id": vendor_id, "unwatch_addresses": unwatch_addresses}),
+        )?;
+        if !result.deleted || result.vendor_id != vendor_id {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned an invalid vendor deletion",
+            ));
+        }
+        Ok(result)
+    }
+
+    // Vendor mutations can change the watchlist, so they serialize with
+    // mailbox operations like watchlist.add and watchlist.remove.
+    fn vendor_mutation(
+        &self,
+        operation: &str,
+        vendor_id: Option<&str>,
+        payload: Value,
+    ) -> Result<Vendor, EngineError> {
+        let _guard = self
+            .mailbox_operation_gate
+            .lock()
+            .map_err(|_| EngineError::host("host_error", "Email account coordinator stopped"))?;
+        let item = self.request::<VendorItem>(operation, payload)?.item;
+        if vendor_id.is_some_and(|expected| item.vendor_id != expected) {
+            return Err(EngineError::host(
+                "engine_protocol_error",
+                "Watcher engine returned a different vendor",
+            ));
+        }
+        Ok(item)
     }
 
     fn request<T: DeserializeOwned>(
@@ -5522,5 +5646,33 @@ timezone = "UTC"
             .remove("missing@example.com".into())
             .expect_err("missing sender must fail");
         assert_eq!(missing.code, "not_found");
+
+        // Vendors: reads and removals are never gated; adds need Connect.
+        assert_eq!(engine.list_vendors().expect("list vendors"), vec![]);
+        assert_eq!(
+            engine
+                .create_vendor("Acme Supply".into())
+                .expect_err("vendor creation needs Connect")
+                .code,
+            "connect_entitlement_required"
+        );
+        assert_eq!(
+            engine
+                .delete_vendor("00000000-0000-4000-8000-000000000000".into(), true)
+                .expect_err("missing vendor must fail")
+                .code,
+            "not_found"
+        );
+        assert_eq!(
+            engine
+                .remove_vendor_address(
+                    "not-a-vendor-id".into(),
+                    "billing@acme.example".into(),
+                    false,
+                )
+                .expect_err("invalid vendor id must fail")
+                .code,
+            "invalid_request"
+        );
     }
 }

@@ -21,6 +21,14 @@ import { inboxActionState } from "./inboxActionState";
 import { inboxBodyTruncation } from "./inboxBodyTruncation";
 import { inboxSenderEmptyText, inboxSenderNav } from "./inboxSenderNav";
 import {
+  deleteVendorConfirmText,
+  removeAddressConfirmText,
+  vendorErrorText,
+  vendorNameError,
+  vendorsView,
+  type Vendor,
+} from "./vendors";
+import {
   CALENDAR_CONSENT_PROFILES,
   calendarConsentControls,
   calendarConsentStateLabel,
@@ -487,6 +495,7 @@ app.innerHTML = `
     <nav class="view-tabs" aria-label="Watcher views">
       <button id="inbox-tab" type="button" aria-controls="inbox-view" aria-pressed="true">Inbox</button>
       <button id="watchlist-tab" type="button" aria-controls="watchlist-view" aria-pressed="false">Watchlist</button>
+      <button id="vendors-tab" type="button" aria-controls="vendors-view" aria-pressed="false">Vendors</button>
       <button id="expiry-ledger-tab" type="button" aria-controls="expiry-ledger-view" aria-pressed="false">Expiry Ledger</button>
       <button id="health-tab" type="button" aria-controls="health-view" aria-pressed="false">Health</button>
       <button id="settings-tab" type="button" aria-controls="settings-view" aria-pressed="false">Settings</button>
@@ -597,6 +606,25 @@ app.innerHTML = `
 
       <p id="watchlist-status" class="status" role="status" aria-live="polite">Loading watchlist…</p>
       <ul id="sender-list" class="sender-list" aria-label="Watched senders"></ul>
+    </section>
+
+    <section id="vendors-view" class="view" aria-labelledby="vendors-tab" hidden>
+      <h2>Vendors</h2>
+      <p class="view-lede">Group the exact addresses each vendor writes from. Adding an address also watches it.</p>
+      <div id="vendors-locked" class="vendors-locked" hidden>
+        <strong id="vendors-locked-title"></strong>
+        <span>You can still view vendors and remove their addresses.</span>
+        <button id="vendors-view-connect" type="button">View Connect</button>
+      </div>
+      <form id="vendor-form" class="sender-form vendor-form" hidden>
+        <label>
+          <span>Vendor name</span>
+          <input id="vendor-name" name="displayName" autocomplete="organization" required />
+        </label>
+        <button type="submit">Add vendor</button>
+      </form>
+      <p id="vendors-status" class="status" role="status" aria-live="polite">Open this view to load vendors.</p>
+      <ul id="vendor-list" class="vendor-list" aria-label="Vendors"></ul>
     </section>
 
     <section id="expiry-ledger-view" class="view" aria-labelledby="expiry-ledger-tab" hidden>
@@ -811,11 +839,20 @@ app.innerHTML = `
 
 const inboxTab = requiredElement<HTMLButtonElement>("#inbox-tab");
 const watchlistTab = requiredElement<HTMLButtonElement>("#watchlist-tab");
+const vendorsTab = requiredElement<HTMLButtonElement>("#vendors-tab");
 const expiryLedgerTab = requiredElement<HTMLButtonElement>("#expiry-ledger-tab");
 const healthTab = requiredElement<HTMLButtonElement>("#health-tab");
 const settingsTab = requiredElement<HTMLButtonElement>("#settings-tab");
 const inboxView = requiredElement<HTMLElement>("#inbox-view");
 const watchlistView = requiredElement<HTMLElement>("#watchlist-view");
+const vendorsSection = requiredElement<HTMLElement>("#vendors-view");
+const vendorsLocked = requiredElement<HTMLDivElement>("#vendors-locked");
+const vendorsLockedTitle = requiredElement<HTMLElement>("#vendors-locked-title");
+const vendorsViewConnect = requiredElement<HTMLButtonElement>("#vendors-view-connect");
+const vendorForm = requiredElement<HTMLFormElement>("#vendor-form");
+const vendorNameInput = requiredElement<HTMLInputElement>("#vendor-name");
+const vendorsStatus = requiredElement<HTMLParagraphElement>("#vendors-status");
+const vendorList = requiredElement<HTMLUListElement>("#vendor-list");
 const expiryLedgerView = requiredElement<HTMLElement>("#expiry-ledger-view");
 const healthView = requiredElement<HTMLElement>("#health-view");
 const settingsView = requiredElement<HTMLElement>("#settings-view");
@@ -929,6 +966,7 @@ const calendarConsentSettings = requiredElement<HTMLElement>("#calendar-consent-
 const calendarConsentStatus = requiredElement<HTMLParagraphElement>("#calendar-consent-status");
 const calendarConsentList = requiredElement<HTMLElement>("#calendar-consent-list");
 let watchedSenders: WatchedSender[] = [];
+let vendorRecords: Vendor[] = [];
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
@@ -1155,20 +1193,25 @@ function scheduledCheckFailureMessage(event: ScheduledCheckEvent): string {
   return "Automatic check failed. Open Health for details.";
 }
 
-function showView(view: "inbox" | "watchlist" | "expiry-ledger" | "health" | "settings"): void {
+function showView(
+  view: "inbox" | "watchlist" | "vendors" | "expiry-ledger" | "health" | "settings",
+): void {
   requiredElement<HTMLElement>(".shell").dataset.view = view;
   const inboxSelected = view === "inbox";
   const watchlistSelected = view === "watchlist";
+  const vendorsSelected = view === "vendors";
   const expiryLedgerSelected = view === "expiry-ledger";
   const healthSelected = view === "health";
   const settingsSelected = view === "settings";
   inboxView.hidden = !inboxSelected;
   watchlistView.hidden = !watchlistSelected;
+  vendorsSection.hidden = !vendorsSelected;
   expiryLedgerView.hidden = !expiryLedgerSelected;
   healthView.hidden = !healthSelected;
   settingsView.hidden = !settingsSelected;
   inboxTab.setAttribute("aria-pressed", String(inboxSelected));
   watchlistTab.setAttribute("aria-pressed", String(watchlistSelected));
+  vendorsTab.setAttribute("aria-pressed", String(vendorsSelected));
   expiryLedgerTab.setAttribute("aria-pressed", String(expiryLedgerSelected));
   healthTab.setAttribute("aria-pressed", String(healthSelected));
   settingsTab.setAttribute("aria-pressed", String(settingsSelected));
@@ -3691,6 +3734,7 @@ function applyConnectStatus(status: ConnectEntitlementStatus, forceCapabilityRef
     connectEntitlementActive !== null && connectEntitlementActive !== status.active;
   connectEntitlementActive = status.active;
   renderConnectStatus(status);
+  renderVendors();
   if ((activeChanged || forceCapabilityRefresh) && configurationReady) void loadInbox();
 }
 
@@ -4244,6 +4288,7 @@ function setConfigInitializationBusy(busy: boolean): void {
 function setConfiguredNavigation(enabled: boolean): void {
   inboxTab.disabled = !enabled;
   watchlistTab.disabled = !enabled;
+  vendorsTab.disabled = !enabled;
   expiryLedgerTab.disabled = !enabled;
   healthTab.disabled = !enabled;
 }
@@ -4545,6 +4590,14 @@ function setBusy(busy: boolean): void {
   for (const button of list.querySelectorAll<HTMLButtonElement>("button")) {
     button.disabled = busy;
   }
+  for (const control of [
+    ...vendorForm.elements,
+    ...vendorList.querySelectorAll<HTMLElement>("button, input"),
+  ]) {
+    if (control instanceof HTMLInputElement || control instanceof HTMLButtonElement) {
+      control.disabled = busy;
+    }
+  }
 }
 
 function beginOperation(): boolean {
@@ -4679,10 +4732,252 @@ form.addEventListener("submit", (event) => {
   })();
 });
 
+// Vendor records (docs/THREAD_VIEW_CONTRACT.md, D-ops): gated controls follow
+// the Connect entitlement; reading and removal always work.
+function setVendorsStatus(message: string, kind: "success" | "error"): void {
+  vendorsStatus.textContent = message;
+  vendorsStatus.dataset.kind = kind;
+}
+
+function vendorFailure(error: unknown): void {
+  const code = errorCode(error);
+  // A lapsed entitlement re-renders through the Connect status owner.
+  if (code === "connect_entitlement_required") void refreshConnectStatus();
+  setVendorsStatus(vendorErrorText(code, errorMessage(error)), "error");
+}
+
+function renderVendors(): void {
+  const view = vendorsView(vendorRecords, connectEntitlementActive);
+  vendorsLocked.hidden = view.lockedNotice === null;
+  vendorsLockedTitle.textContent = view.lockedNotice ?? "";
+  vendorForm.hidden = !view.canUpdate;
+  vendorList.replaceChildren();
+  if (view.emptyText !== null) {
+    const empty = document.createElement("li");
+    empty.className = "empty-state";
+    empty.textContent = view.emptyText;
+    vendorList.append(empty);
+  }
+  for (const vendor of view.vendors) {
+    const card = document.createElement("li");
+    card.className = "vendor-card";
+
+    const header = document.createElement("div");
+    header.className = "vendor-card-header";
+    const title = document.createElement("strong");
+    title.textContent = vendor.name;
+    header.append(title);
+    if (view.canUpdate) {
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.textContent = "Rename";
+      rename.setAttribute("aria-label", `Rename ${vendor.name}`);
+      rename.addEventListener("click", () => void renameVendor(vendor.vendorId, vendor.name));
+      header.append(rename);
+    }
+
+    const stopWatching = document.createElement("input");
+    stopWatching.type = "checkbox";
+
+    const addresses = document.createElement("ul");
+    addresses.className = "vendor-addresses";
+    addresses.setAttribute("aria-label", `${vendor.name} addresses`);
+    for (const item of vendor.addresses) {
+      const row = document.createElement("li");
+      const address = document.createElement("span");
+      address.textContent = item.address;
+      row.append(address);
+      if (item.status !== null) {
+        const status = document.createElement("span");
+        status.className = "vendor-address-status";
+        status.textContent = item.status;
+        row.append(status);
+      }
+      if (item.watchAgain) {
+        const watch = document.createElement("button");
+        watch.type = "button";
+        watch.textContent = "Watch again";
+        watch.addEventListener("click", () => void watchVendorAddress(item.address, vendor.name));
+        row.append(watch);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "remove-button";
+      remove.textContent = "Remove";
+      remove.setAttribute("aria-label", `Remove ${item.address} from ${vendor.name}`);
+      remove.addEventListener(
+        "click",
+        () => void removeVendorAddress(vendor.vendorId, vendor.name, item.address, stopWatching.checked),
+      );
+      row.append(remove);
+      addresses.append(row);
+    }
+    card.append(header, addresses);
+    if (vendor.noAddressesText !== null) {
+      const none = document.createElement("p");
+      none.className = "vendor-empty";
+      none.textContent = vendor.noAddressesText;
+      card.append(none);
+    }
+
+    if (view.canUpdate) {
+      const addForm = document.createElement("form");
+      addForm.className = "vendor-address-form";
+      const input = document.createElement("input");
+      input.type = "email";
+      input.required = true;
+      input.placeholder = "billing@vendor.com";
+      input.setAttribute("aria-label", `Add an address to ${vendor.name}`);
+      const add = document.createElement("button");
+      add.type = "submit";
+      add.textContent = "Add address";
+      addForm.append(input, add);
+      addForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        void addVendorAddress(vendor.vendorId, input.value);
+      });
+      card.append(addForm);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "vendor-card-footer";
+    const unwatchLabel = document.createElement("label");
+    const unwatchText = document.createElement("span");
+    unwatchText.textContent = "Also stop watching these addresses";
+    unwatchLabel.append(stopWatching, unwatchText);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "remove-button";
+    remove.textContent = "Delete vendor";
+    remove.setAttribute("aria-label", `Delete ${vendor.name}`);
+    remove.addEventListener(
+      "click",
+      () => void deleteVendor(vendor.vendorId, vendor.name, vendor.addresses.length, stopWatching.checked),
+    );
+    footer.append(unwatchLabel, remove);
+    card.append(footer);
+    vendorList.append(card);
+  }
+}
+
+async function loadVendors(message = "Vendors are up to date."): Promise<void> {
+  try {
+    vendorRecords = await invoke<Vendor[]>("vendors_list");
+    renderVendors();
+    setVendorsStatus(message, "success");
+  } catch (error) {
+    vendorFailure(error);
+  }
+}
+
+// The engine owns vendor order and watch state, so every change reloads the
+// list; operations that can change the watchlist also refresh it.
+async function vendorOperation(
+  pending: string,
+  operation: () => Promise<string>,
+  changesWatchlist: boolean,
+): Promise<void> {
+  if (!beginOperation()) return;
+  vendorsStatus.textContent = pending;
+  let message: string | null = null;
+  try {
+    message = await operation();
+  } catch (error) {
+    vendorFailure(error);
+  } finally {
+    finishOperation();
+  }
+  if (message !== null) await loadVendors(message);
+  if (changesWatchlist) void loadSenders();
+}
+
+async function renameVendor(vendorId: string, current: string): Promise<void> {
+  const raw = window.prompt("Rename vendor", current);
+  if (raw === null) return;
+  const problem = vendorNameError(raw);
+  if (problem !== null) {
+    setVendorsStatus(problem, "error");
+    return;
+  }
+  await vendorOperation("Renaming vendor…", async () => {
+    const vendor = await invoke<Vendor>("vendors_rename", {
+      vendorId,
+      displayName: raw.trim(),
+    });
+    return `Renamed to ${vendor.display_name}.`;
+  }, false);
+}
+
+async function addVendorAddress(vendorId: string, address: string): Promise<void> {
+  await vendorOperation("Adding address…", async () => {
+    const vendor = await invoke<Vendor>("vendors_address_add", { vendorId, address });
+    return `${address.trim()} now belongs to ${vendor.display_name} and is watched.`;
+  }, true);
+}
+
+async function watchVendorAddress(address: string, vendorName: string): Promise<void> {
+  await vendorOperation(`Watching ${address}…`, async () => {
+    await invoke<WatchedSender>("watchlist_add", { email: address, name: vendorName });
+    return `${address} is watched again.`;
+  }, true);
+}
+
+async function removeVendorAddress(
+  vendorId: string,
+  vendorName: string,
+  address: string,
+  unwatch: boolean,
+): Promise<void> {
+  if (!window.confirm(removeAddressConfirmText(vendorName, address, unwatch))) return;
+  await vendorOperation(`Removing ${address}…`, async () => {
+    const vendor = await invoke<Vendor>("vendors_address_remove", { vendorId, address, unwatch });
+    return `${address} was removed from ${vendor.display_name}.`;
+  }, unwatch);
+}
+
+async function deleteVendor(
+  vendorId: string,
+  vendorName: string,
+  addressCount: number,
+  unwatchAddresses: boolean,
+): Promise<void> {
+  if (!window.confirm(deleteVendorConfirmText(vendorName, addressCount, unwatchAddresses))) return;
+  await vendorOperation(`Deleting ${vendorName}…`, async () => {
+    await invoke("vendors_delete", { vendorId, unwatchAddresses });
+    return `${vendorName} was deleted.`;
+  }, unwatchAddresses);
+}
+
+vendorForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const problem = vendorNameError(vendorNameInput.value);
+  if (problem !== null) {
+    setVendorsStatus(problem, "error");
+    return;
+  }
+  void vendorOperation("Adding vendor…", async () => {
+    const vendor = await invoke<Vendor>("vendors_create", {
+      displayName: vendorNameInput.value.trim(),
+    });
+    vendorForm.reset();
+    return `${vendor.display_name} was added.`;
+  }, false);
+});
+
+vendorsViewConnect.addEventListener("click", () => {
+  showView("health");
+  connectHealth.scrollIntoView({ block: "center" });
+  if (!connectActivate.hidden) connectActivate.focus();
+});
+
 renderInboxSenderNavigation();
 setBusy(true);
 inboxTab.addEventListener("click", () => showView("inbox"));
 watchlistTab.addEventListener("click", () => showView("watchlist"));
+vendorsTab.addEventListener("click", () => {
+  showView("vendors");
+  void Promise.all([loadVendors(), refreshConnectStatus()]);
+});
 expiryLedgerTab.addEventListener("click", () => {
   showView("expiry-ledger");
   void loadExpiryLedger();

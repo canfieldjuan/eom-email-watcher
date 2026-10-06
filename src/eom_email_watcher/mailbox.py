@@ -15,7 +15,7 @@ DEFAULT_MAIL_PROVIDER = "gmail"
 DEFAULT_MAIL_ACCOUNT_ID = "gmail-default"
 # RFC 5322 line limit; longer message ids are malformed and dropped.
 MAX_MESSAGE_ID_CHARS = 998
-MAX_REFERENCES_IDS = 64
+MAX_IDS_PER_REPLY_HEADER = 64
 _BRACKETED_ID_RE = re.compile(r"<([^<>\s]+)>")
 # RFC 5322 msg-id without its brackets: left@right, no whitespace, controls, or brackets.
 _MESSAGE_ID_RE = re.compile(r"[^\s<>\x00-\x1f\x7f]+@[^\s<>\x00-\x1f\x7f]+")

@@ -1889,3 +1889,10 @@ def test_reply_headers_keep_only_well_formed_message_ids() -> None:
     gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
 
     assert gateway.metadata(message_id()).reply_ids == ("root@example.com",)
+
+
+def test_in_reply_to_keeps_every_parent_id() -> None:
+    client = ReplyHeaderImap(b"In-Reply-To: <parent-one@x> <parent-two@x>\r\n\r\n")
+    gateway = ImapGateway(credentials(), lambda _credentials, _context: client)
+
+    assert gateway.metadata(message_id()).reply_ids == ("parent-one@x", "parent-two@x")
