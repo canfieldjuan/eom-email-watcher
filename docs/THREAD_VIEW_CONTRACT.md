@@ -74,10 +74,12 @@ Each definition is the only place its rule is stated.
 ### D-attribution: a message's vendor
 
 - **Inbound:** `vendor_of(From)`.
-- **Outbound:**
-  - the vendor of the first `To`, then `Cc`, recipient, in stored header order, whose exact address has a vendor;
-  - else the first such recipient whose domain has a vendor;
+- **Outbound,** over the `To`, then `Cc`, recipients in stored header order:
+  - the vendor of the first recipient for which `vendor_of` matches the exact address;
+  - else of the first for which `vendor_of` matches the domain;
   - else none.
+
+  Recipients are judged only through `vendor_of`, so its exclusions apply to outbound mail too.
 - **Each message has at most one attributed vendor.** It shows that vendor alone, and its claims belong to that vendor.
 - **A vendor's threads** are:
   - the threads it owns ([D-follow](#d-follow-followed-threads));
@@ -414,3 +416,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - A third finding, that a location added later changes direction without recomputing follow state or claims, is an input to amendment A (#207).
 - 2026-10-05: the second M1 plan review found that a logical message with several locations had no single source identity to order by; it sorts by the smallest. It also added two M2 items: fetch the reply headers of IMAP messages retained from before M1, and coalesce rows that are one message.
 - 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
+- 2026-10-05: the fourth M1 plan review found that outbound attribution looked up recipients' addresses and domains directly instead of through `vendor_of`, so amendment C's exclusion did not reach outbound mail. D-attribution now judges recipients only through `vendor_of`.
