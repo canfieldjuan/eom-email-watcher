@@ -1884,6 +1884,7 @@ class Watcher:
                         cc=metadata.cc,
                         locations=_admitted_locations(metadata, metadata.labels, folders),
                         capture_timezone=self.config.timezone,
+                        scope_complete=SENT_LOCATION in folders,
                     ),
                     admission=admission.provenance(),
                     metadata_label_ids=metadata.labels,
@@ -2269,6 +2270,7 @@ class Watcher:
                 cc=metadata.cc,
                 locations=_admitted_locations(metadata, metadata.labels, folders),
                 capture_timezone=self.config.timezone,
+                scope_complete=SENT_LOCATION in folders,
             ):
                 added += 1
         return added
@@ -2309,6 +2311,7 @@ class Watcher:
             locations=locations,
             to=metadata.to,
             cc=metadata.cc,
+            scope_complete=SENT_LOCATION in folders,
             now=checked_at,
         )
 

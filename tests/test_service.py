@@ -5297,7 +5297,7 @@ def test_gmail_sent_only_message_from_a_watched_sender_is_captured_with_its_loca
 
 
 def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The autouse conftest fixture reports no entitlement (contract D-ops).
     cfg = config(tmp_path)
@@ -5326,6 +5326,25 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     Watcher(cfg, store, gateway, FakeModel()).check()
     assert gateway.metadata_calls == calls
     assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    # Observed with Sent out of scope: the row is not stamped (plan step 5).
+    assert stamps() == [None]
+
+    # Connect returns: the next event fetches it once, records Sent, and stamps both.
+    _active_entitlement(monkeypatch)
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    assert gateway.metadata_calls == calls + 1
+    assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert all(stamp is not None for stamp in stamps())
 
 
 def test_gmail_label_added_to_a_known_message_records_its_second_location(

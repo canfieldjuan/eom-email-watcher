@@ -2036,6 +2036,8 @@ class GmailRecoveryMessage:
     cc: tuple[str, ...] = ()
     locations: frozenset[str] = frozenset()
     capture_timezone: str | None = None
+    # Whether every admitted folder was in scope at the fetch (D-ops gates Sent).
+    scope_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -3322,8 +3324,10 @@ CREATE TABLE IF NOT EXISTS message_locations (
     mailbox_identity_key TEXT NOT NULL,
     provider_message_id TEXT NOT NULL,
     location TEXT NOT NULL CHECK (location IN ('inbox', 'sent')),
-    -- NULL for a folder the schema-30 migration assumed (the pre-M2 poller admitted
-    -- from the Inbox only); the first fetch that observes the folder stamps it.
+    -- When the folders were observed with every admitted folder in scope. NULL for a
+    -- row the schema-30 migration assumed (the pre-M2 poller admitted from the Inbox
+    -- only) or observed while Sent was out of scope: neither says whether the message
+    -- is also in Sent. The first observation under full scope stamps it.
     recorded_at TEXT,
     PRIMARY KEY (provider, account_id, mailbox_identity_key, provider_message_id, location)
 );
@@ -3383,8 +3387,8 @@ def _record_locations(
 ) -> int:
     """Record a source identity's admitted folders on its logical message (D-identity).
 
-    Returns the number of new rows. An observed folder (recorded_at given) also
-    stamps a row the migration assumed, which carries no recorded_at.
+    Returns the number of new rows. recorded_at is given only for an observation
+    with every admitted folder in scope; it also stamps an unstamped row.
     """
     recorded = 0
     if not locations:
@@ -6895,6 +6899,7 @@ class Store:
                     to=message.to,
                     cc=message.cc,
                     locations=message.locations,
+                    scope_complete=message.scope_complete,
                     capture_timezone=message.capture_timezone,
                 )
             changed = db.execute(
@@ -8356,6 +8361,7 @@ class Store:
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
         locations: frozenset[str] = frozenset({INBOX_LOCATION}),
+        scope_complete: bool = True,
         capture_timezone: str | None = None,
     ) -> bool:
         if mailbox_identity_key is None:
@@ -8434,7 +8440,7 @@ class Store:
                     mailbox_identity_key=mailbox_identity_key,
                     provider_message_id=source_message_id,
                     locations=locations,
-                    recorded_at=discovered_at,
+                    recorded_at=discovered_at if scope_complete else None,
                 )
                 _record_recipients(db, message_id=str(logical["message_id"]), to=to, cc=cc)
                 return False
@@ -8492,7 +8498,7 @@ class Store:
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=source_message_id,
                 locations=locations,
-                recorded_at=discovered_at,
+                recorded_at=discovered_at if scope_complete else None,
             )
         return inserted
 
@@ -8515,6 +8521,7 @@ class Store:
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
         locations: frozenset[str] = frozenset({INBOX_LOCATION}),
+        scope_complete: bool = True,
         capture_timezone: str | None = None,
     ) -> bool:
         with self.connection() as db:
@@ -8538,6 +8545,7 @@ class Store:
                 to=to,
                 cc=cc,
                 locations=locations,
+                scope_complete=scope_complete,
                 capture_timezone=capture_timezone,
             )
 
@@ -8651,11 +8659,13 @@ class Store:
         locations: frozenset[str],
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
+        scope_complete: bool = True,
         now: datetime | None = None,
     ) -> int:
         """Record the admitted folders a stored source identity is seen in; new rows.
 
-        Recipients that came with the same fetch fill a row that has none.
+        Recipients that came with the same fetch fill a row that has none. The rows
+        are stamped only when every admitted folder was in scope at the fetch.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
@@ -8676,7 +8686,7 @@ class Store:
                 mailbox_identity_key=mailbox_identity_key,
                 provider_message_id=provider_message_id,
                 locations=locations,
-                recorded_at=stamp,
+                recorded_at=stamp if scope_complete else None,
             )
             _record_recipients(db, message_id=str(row["logical_id"]), to=to, cc=cc)
             return recorded
@@ -12427,7 +12437,9 @@ class Store:
         provider: str | None = None,
         account_id: str | None = None,
     ) -> tuple[list[dict[str, object]], tuple[str, str] | None]:
-        clauses: list[str] = []
+        # One entry per logical message (contract D-identity): a retained duplicate's
+        # row stays stored, with its summary and attachments, but is not listed.
+        clauses: list[str] = ["logical_of IS NULL"]
         parameters: list[object] = []
         if cursor is not None:
             clauses.append("(received_at < ? OR (received_at = ? AND message_id < ?))")

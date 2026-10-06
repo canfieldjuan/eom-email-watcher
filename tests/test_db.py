@@ -7365,3 +7365,50 @@ def test_clear_messages_removes_logical_units_whole(tmp_path: Path) -> None:
             account_id=scope["account_id"],
             mailbox_identity_key=scope["mailbox_identity_key"],
         )
+
+
+def test_inbox_lists_a_coalesced_message_once(tmp_path: Path) -> None:
+    store, root, duplicate = _coalesced_pair(tmp_path)
+    lone = _imap_message(store, "3", None)
+
+    listed = [item["message_id"] for item in store.recent(10)]
+    assert sorted(listed) == sorted([root, lone])
+    # The duplicate's own row, and whatever it carries, stays stored.
+    assert store.has_message(duplicate)
+    items, next_cursor = store.query_inbox(limit=1)
+    assert len(items) == 1 and next_cursor is not None
+    items, _ = store.query_inbox(limit=1, cursor=next_cursor)
+    assert [item["message_id"] for item in items] != [duplicate]
+
+
+def test_locations_observed_with_sent_out_of_scope_are_not_stamped(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+        scope_complete=False,
+    )
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key, provider_message_id FROM messages"
+        ).fetchone()
+    scope = {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                """SELECT recorded_at FROM message_locations
+                WHERE message_id = 'gmail-1' ORDER BY location"""
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() == [None]
+    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    assert store.record_message_location(
+        **scope, locations=frozenset({"inbox", "sent"}), now=observed_at
+    ) == 1
+    assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
