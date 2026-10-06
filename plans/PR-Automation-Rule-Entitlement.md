@@ -83,6 +83,9 @@ Desktop:
 - `desktop/test/coiRules.test.ts`
 - `tests/test_engine_api.py`
 - `tests/test_coi_local_proof.py`: only if its in-process run reaches `put`, in which case it enables the entitlement explicitly
+- `scripts/smoke_packaged_engine.py`: its packaged-engine entitlement check (`:246-251`) compares the status exactly and must expect `automations_active: False`
+- `tests/test_connect_engine_api.py`: the exact status and install assertions (`:91`, `:118`) gain `automations_active`
+- `tests/test_desktop_packaging.py`: the engine-response fixtures fed to the smoke script (`:133`, `:291`) gain `automations_active: False`
 
 ## Mechanism
 
@@ -176,3 +179,13 @@ Desktop:
 1. `connect.entitlement.install` also returns the status, unaugmented, so a freshly installed Automations license would read "not included". One response helper now serves both status and install.
 2. "View Connect" called only `showView`, skipping the Health tab's refresh. One `openConnectHealth()` now owns opening Health, for the tab and both "View Connect" buttons, including the existing Inbox one, which had the same gap.
 3. The entitlement check now follows request validation, so malformed requests keep their `invalid_request` or `invalid_rule` errors.
+
+## Implementation finding (CI on `81ee0e0`)
+
+Adding `automations_active` to the entitlement responses changed a response shape that five exact-match consumers outside "Files touched" assert. CI's full suite and both build jobs caught them; the plan's verification ran only four test files:
+
+- `scripts/smoke_packaged_engine.py:246-251`: the sidecar smoke check, run by the `desktop` and `windows-package` jobs ("Packaged engine did not report the expected Connect authority state");
+- `tests/test_connect_engine_api.py:91,118`;
+- `tests/test_desktop_packaging.py:133,291`: fixtures fed to the smoke script.
+
+All three files join the scope. The smoke check stays exact and adds `automations_active: False`, because an unlicensed packaged engine must report it as false. Verification now also runs the full `uv run --locked pytest -q` before the PR.
