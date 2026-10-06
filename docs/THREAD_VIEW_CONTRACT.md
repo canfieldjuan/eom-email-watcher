@@ -137,10 +137,11 @@ Each definition is the only place its rule is stated.
 - **Direction** is derived from the logical message's recorded locations. It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. It is recomputed when a location is added, so discovery order never decides it.
 - **Thread key:**
   - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
-  - IMAP uses components: messages whose id sets overlap form one component, identified by a UUIDv4 key. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list.
-  - The result does not depend on arrival order. A message that touches no component forms its own.
-- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first. That holds whether or not its members have a `Message-ID`, so the survivor never depends on arrival order. In that transaction:
-  - every row naming a merged key is re-keyed, and aliases are recorded.
+  - IMAP uses components: messages whose id sets overlap form one component. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list. A message that touches no component forms its own.
+  - Which messages share a component does not depend on arrival order. The key does: it is an opaque UUIDv4 handle, allocated when its component is created. No rule may depend on a key's value, only on its members.
+  - Every captured message has a thread key, including one whose provider omits a thread id, which forms its own thread.
+- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first, whether or not its members have a `Message-ID`, and it keeps its key. In that transaction:
+  - every row naming a merged key is re-keyed, including earlier aliases, and aliases are recorded.
 
 ### D-reconcile: coverage and the reconcile pass
 
@@ -205,10 +206,10 @@ Each definition is the only place its rule is stated.
 - **Removal effects:**
   - Removing an address records a dismissal of its `(vendor, address)` pair.
   - Removing a domain stops its matches.
-  - Deleting a vendor runs in one transaction:
-    - it removes the vendor's addresses, domains, and dismissals;
-    - it optionally stops watching its addresses ("Also stop watching these addresses", off by default);
-    - addresses left watched keep today's `exact_sender` admission.
+  - Deleting a vendor removes its addresses, domains, and dismissals in one transaction.
+    - It can also stop watching its addresses ("Also stop watching these addresses", off by default).
+    - Addresses left watched keep today's `exact_sender` admission.
+- **Two stores.** The watchlist is a separate file, so no operation changes it and the database in one transaction. An operation that changes both writes the watchlist first, in one write, then the database. An interruption therefore leaves either an extra watched address or a vendor address shown `watched: false`, and a retry completes the operation.
 
 ### D-claims: claims and comparability
 
@@ -402,3 +403,7 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - D-claims keys claims and attempts by attributed vendor, and keeps authored text below quotes.
 - 2026-10-05: merged on green at the operator's direction. The final review's six findings are tracked as amendments A-D in #207.
 - 2026-10-05: amendment B (#207), in the M1 plan PR. D-identity defines one canonical order that every tie-break uses, including the merge survivor without a `Message-ID`, and direction is derived from the recorded locations.
+- 2026-10-05: the M1 plan review found two definition flaws, fixed in their owners:
+  - D-identity: amendment B claimed the merge survivor never depends on arrival order, which a UUIDv4 key cannot satisfy. Component membership is order-independent and the key is an opaque handle. Every captured message now has a thread key, and merges re-key earlier aliases.
+  - D-ops: deleting a vendor claimed one transaction across the watchlist file and the database. Operations that change both now write the watchlist first, so a retry completes them.
+  - A third finding, that a location added later changes direction without recomputing follow state or claims, is an input to amendment A (#207).

@@ -55,6 +55,7 @@ OWNED_PHRASES = {
         r"logical identity",
         r"is their source identity in byte order",
         r"smallest member under the canonical order",
+        r"depend on a key's value",
     ],
     "D-reconcile": [r"coverage record", r"synced_through", r"retries that unit with backoff"],
     "D-body": [r"Body not stored", r"Partial body", r"summary-only storage"],
@@ -64,6 +65,7 @@ OWNED_PHRASES = {
         r"`vendors\.[a-z.]+`",
         r"`watchlist\.remove`",
         r"Also stop watching",
+        r"no operation changes it and the database",
     ],
     "D-claims": [
         r"compare manually",
