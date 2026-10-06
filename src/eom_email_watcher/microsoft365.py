@@ -585,7 +585,9 @@ class Microsoft365Gateway:
             raise Microsoft365Error(f"Microsoft Graph request failed (HTTP {response.status_code})")
         return response
 
-    def _delta_round(self, url: str, *, continuation: bool) -> MailboxChanges:
+    def _delta_round(
+        self, url: str, *, continuation: bool, folder: str = INBOX_FOLDER
+    ) -> MailboxChanges:
         current = _safe_graph_url(url, delta_token="$deltatoken") if continuation else url
         ids: list[str] = []
         while True:
@@ -608,7 +610,12 @@ class Microsoft365Gateway:
                 continue
             if isinstance(delta_link, str) and not isinstance(next_link, str):
                 cursor = _safe_graph_url(delta_link, delta_token="$deltatoken")
-                return MailboxChanges(tuple(dict.fromkeys(ids)), cursor)
+                unique = tuple(dict.fromkeys(ids))
+                # A message is in one folder, so the delta's folder is its whole location.
+                location = frozenset({FOLDER_LOCATIONS[folder]})
+                return MailboxChanges(
+                    unique, cursor, {message_id: location for message_id in unique}
+                )
             raise Microsoft365Error(
                 "Microsoft Graph mail delta omitted a single continuation cursor"
             )
@@ -640,12 +647,16 @@ class Microsoft365Gateway:
     def sent_changes_since(self, cursor: str) -> MailboxChanges:
         initial_since = _initial_cursor_time(cursor)
         if initial_since is not None:
-            return self._delta_round(_delta_url(initial_since, SENT_FOLDER), continuation=False)
-        return self._delta_round(cursor, continuation=True)
+            return self._delta_round(
+                _delta_url(initial_since, SENT_FOLDER), continuation=False, folder=SENT_FOLDER
+            )
+        return self._delta_round(cursor, continuation=True, folder=SENT_FOLDER)
 
     def sent_recover_since(self, since: datetime) -> MailboxChanges:
         """A fresh Sent Items delta from since, after the saved link expired."""
-        return self._delta_round(_delta_url(since, SENT_FOLDER), continuation=False)
+        return self._delta_round(
+            _delta_url(since, SENT_FOLDER), continuation=False, folder=SENT_FOLDER
+        )
 
     def sent_scope(self) -> str:
         """Whether Sent Items is reachable (contract D-scope)."""

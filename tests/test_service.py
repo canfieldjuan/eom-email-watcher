@@ -5255,16 +5255,22 @@ class LabelledGmail(FakeGmail):
     def history_message_ids(self, cursor: str):
         return ["allowed"], "200"
 
+    def changes_since(self, cursor: str) -> MailboxChanges:
+        # Like the real gateway: the history record carries the message's labels.
+        ids, newest = self.history_message_ids(cursor)
+        return MailboxChanges(tuple(ids), newest, {i: self._locations() for i in ids})
+
+    def _locations(self) -> frozenset[str]:
+        return frozenset(
+            location for label, location in GMAIL_LOCATION_LABELS.items() if label in self.labels
+        )
+
     def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
         self.metadata_calls += 1
         return replace(
             super().metadata(message_id),
             labels=self.labels,
-            locations=frozenset(
-                location
-                for label, location in GMAIL_LOCATION_LABELS.items()
-                if label in self.labels
-            ),
+            locations=self._locations(),
             to=("billing@vendor.com",),
         )
 
@@ -5320,7 +5326,8 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     item = store.recent(1)[0]
     assert store.message_locations(item["message_id"]) == ["inbox"]
 
-    # A known id gaining SENT is not fetched while Sent is out of scope.
+    # A known id gaining SENT records nothing new while Sent is out of scope, and
+    # the change record is all polling reads: no metadata fetch.
     calls = gateway.metadata_calls
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
@@ -5338,16 +5345,17 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     # Observed with Sent out of scope: the row is not stamped (plan step 5).
     assert stamps() == [None]
 
-    # Connect returns: the next event fetches it once, records Sent, and stamps both.
+    # Connect returns: the next event's record names both folders, so polling
+    # records Sent and stamps both, still without a fetch.
     _active_entitlement(monkeypatch)
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
-    assert gateway.metadata_calls == calls + 1
+    assert gateway.metadata_calls == calls
     assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
     assert all(stamp is not None for stamp in stamps())
 
 
-def test_a_known_sent_only_message_gaining_inbox_is_fetched_while_sent_is_out_of_scope(
+def test_a_folder_change_during_a_lapse_is_recorded_and_leaves_the_source_unstamped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _active_entitlement(monkeypatch)
@@ -5360,9 +5368,19 @@ def test_a_known_sent_only_message_gaining_inbox_is_fetched_while_sent_is_out_of
     item = store.recent(1)[0]
     assert store.message_locations(item["message_id"]) == ["sent"]
 
-    # Connect lapses, and the message also appears in the Inbox. One folder in scope
-    # is unrecorded for this source, so it is fetched: the comparison is by folder,
-    # not by how many are recorded.
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # Connect lapses, and the message also appears in the Inbox: the record names
+    # both folders, the one in scope is recorded, and the observation was incomplete,
+    # so the source's stamp is cleared for the next pass after reactivation.
     monkeypatch.setattr(
         service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
     )
@@ -5370,8 +5388,9 @@ def test_a_known_sent_only_message_gaining_inbox_is_fetched_while_sent_is_out_of
     calls = gateway.metadata_calls
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
-    assert gateway.metadata_calls == calls + 1
+    assert gateway.metadata_calls == calls
     assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
+    assert stamps() == [None, None]
     assert len(store.recent(5)) == 1
 
 
@@ -5388,26 +5407,22 @@ def test_gmail_label_added_to_a_known_message_records_its_second_location(
     watcher.check()
     item = store.recent(1)[0]
     assert store.message_locations(item["message_id"]) == ["inbox"]
-    # A row the migration retained has no recipients to read.
-    with store.connection() as db:
-        db.execute("DELETE FROM message_recipients WHERE message_id = ?", (item["message_id"],))
-
-    # Gmail reports the same id again, now also in SENT: one metadata fetch records it.
-    gateway.labels = frozenset({"INBOX", "SENT"})
     calls = gateway.metadata_calls
+
+    # A star on the known message: the record names the same folder, nothing happens.
+    watcher.check()
+    assert gateway.metadata_calls == calls
+    assert store.message_locations(item["message_id"]) == ["inbox"]
+
+    # Gmail reports the same id again, now also in SENT: the record names it, no fetch.
+    gateway.labels = frozenset({"INBOX", "SENT"})
     watcher.check()
     assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
-    assert gateway.metadata_calls == calls + 1
-    with store.connection() as db:
-        recipients = db.execute(
-            "SELECT field, position, address FROM message_recipients WHERE message_id = ?",
-            (item["message_id"],),
-        ).fetchall()
-    assert [tuple(row) for row in recipients] == [("to", 0, "billing@vendor.com")]
+    assert gateway.metadata_calls == calls
 
-    # With every admitted folder recorded, a repeated event costs no fetch.
+    # A repeated event costs nothing either.
     watcher.check()
-    assert gateway.metadata_calls == calls + 1
+    assert gateway.metadata_calls == calls
     assert len(store.recent(5)) == 1
 
 

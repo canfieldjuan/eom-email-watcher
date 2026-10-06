@@ -2133,6 +2133,7 @@ class Watcher:
             checked_at=checked_at,
             retention_cutoff=retention_cutoff,
             folders=folders,
+            known_locations=changes.locations,
             dry_run=dry_run,
             dry_run_messages=dry_run_messages,
         )
@@ -2181,6 +2182,7 @@ class Watcher:
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
+        known_locations: Mapping[str, frozenset[str]],
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
     ) -> int:
@@ -2194,13 +2196,15 @@ class Watcher:
                 mailbox_identity_key=mailbox_identity_key,
             ):
                 # Gmail and Microsoft ids span folders, so a known id comes back
-                # when its folder changes; IMAP copies have folder-tokened ids.
-                if self.mailbox.provider != IMAP_PROVIDER and not dry_run:
+                # when its labels or folder change; IMAP copies have folder-tokened ids.
+                hint = known_locations.get(provider_message_id)
+                if self.mailbox.provider != IMAP_PROVIDER and not dry_run and hint is not None:
                     self._record_known_message_location(
                         provider_message_id,
                         mailbox_identity_key=mailbox_identity_key,
                         checked_at=checked_at,
                         folders=folders,
+                        observed=hint,
                     )
                 continue
             try:
@@ -2290,36 +2294,22 @@ class Watcher:
         mailbox_identity_key: str,
         checked_at: datetime,
         folders: frozenset[str],
+        observed: frozenset[str],
     ) -> None:
-        """A known id came back through polling: record its location (contract D-identity).
+        """A known id came back through polling with its folders (contract D-identity).
 
-        Metadata is fetched while a folder in scope is not recorded for this source
-        identity; the fetch also supplies the recipients of a row that has none,
-        since the migration could not reconstruct them.
+        The change record says where the message is now, so nothing is fetched. The
+        folders in scope are recorded, and whether every admitted folder was in scope
+        decides the observation's completeness (plan step 5): a complete one stamps
+        the source's rows, an incomplete one clears their stamp, so a folder change
+        during a lapse is observed again by discovery once Sent returns.
         """
-        recorded = self.store.source_locations(
-            provider=self.mailbox.provider,
-            account_id=self.mailbox.account_id,
-            mailbox_identity_key=mailbox_identity_key,
-            provider_message_id=provider_message_id,
-        )
-        if recorded is None or not (folders - recorded):
-            return
-        try:
-            metadata = self.gateway.metadata(provider_message_id)
-        except (MailboxMessageUnavailable, MailboxMessageInvalid):
-            return
-        locations = _admitted_locations(metadata, metadata.labels, folders)
-        if not locations:
-            return
         self.store.record_message_location(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
             provider_message_id=provider_message_id,
-            locations=locations,
-            to=metadata.to,
-            cc=metadata.cc,
+            locations=observed & folders,
             scope_complete=_scope_complete(folders),
             now=checked_at,
         )
@@ -2394,6 +2384,7 @@ class Watcher:
                 checked_at=checked_at,
                 retention_cutoff=retention_cutoff,
                 folders=folders,
+                known_locations=changes.locations,
                 dry_run=dry_run,
                 dry_run_messages=dry_run_messages,
             )

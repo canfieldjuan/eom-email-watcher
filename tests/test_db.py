@@ -6904,11 +6904,10 @@ def test_record_message_location_adds_only_new_locations(tmp_path: Path) -> None
         "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
         "provider_message_id": row[3],
     }
-    assert store.source_locations(**scope) == frozenset({"inbox"})
+    assert store.message_locations("gmail-1") == ["inbox"]
     assert store.record_message_location(**scope, locations=frozenset({"inbox", "sent"})) == 1
     assert store.record_message_location(**scope, locations=frozenset({"sent"})) == 0
-    assert store.source_locations(**scope) == frozenset({"inbox", "sent"})
-    assert store.source_locations(**{**scope, "provider_message_id": "unknown"}) is None
+    assert store.message_locations("gmail-1") == ["inbox", "sent"]
     assert store.record_message_location(
         **{**scope, "provider_message_id": "unknown"}, locations=frozenset({"sent"})
     ) == 0
@@ -7316,13 +7315,25 @@ def test_location_count_is_per_source_identity(tmp_path: Path) -> None:
     store, root, duplicate = _coalesced_pair(tmp_path)
     root_scope = _source_scope(store, root)
     duplicate_scope = _source_scope(store, duplicate)
-    # Both copies were assumed in the Inbox; each counts its own folder only.
-    assert store.source_locations(**root_scope) == frozenset({"inbox"})
-    assert store.source_locations(**duplicate_scope) == frozenset({"inbox"})
+    def per_source(scope: dict[str, str]) -> list[str]:
+        with store.connection() as db:
+            rows = db.execute(
+                """SELECT location FROM message_locations WHERE provider = ? AND account_id = ?
+                AND mailbox_identity_key = ? AND provider_message_id = ? ORDER BY location""",
+                (
+                    scope["provider"], scope["account_id"], scope["mailbox_identity_key"],
+                    scope["provider_message_id"],
+                ),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    # Both copies were assumed in the Inbox; each has its own folders.
+    assert per_source(root_scope) == ["inbox"]
+    assert per_source(duplicate_scope) == ["inbox"]
 
     assert store.record_message_location(**duplicate_scope, locations=frozenset({"sent"})) == 1
-    assert store.source_locations(**duplicate_scope) == frozenset({"inbox", "sent"})
-    assert store.source_locations(**root_scope) == frozenset({"inbox"})
+    assert per_source(duplicate_scope) == ["inbox", "sent"]
+    assert per_source(root_scope) == ["inbox"]
     assert store.message_locations(root) == ["inbox", "sent"]
 
 
@@ -7444,12 +7455,6 @@ def test_a_coalesced_copy_recorded_as_a_location_counts_as_seen(tmp_path: Path) 
         account_id="imap-account",
         mailbox_identity_key=identity,
     )
-    assert store.source_locations(
-        provider="imap",
-        account_id="imap-account",
-        mailbox_identity_key=identity,
-        provider_message_id="imap:sent:77:3",
-    ) == frozenset({"sent"})
 
 
 def test_work_queues_see_one_logical_message(tmp_path: Path) -> None:
@@ -7478,3 +7483,38 @@ def test_work_queues_see_one_logical_message(tmp_path: Path) -> None:
         assert db.execute(
             "SELECT status FROM messages WHERE message_id = ?", (duplicate,)
         ).fetchone()[0] == "analyzed"
+
+
+def test_an_incomplete_observation_clears_the_stamp_and_may_name_no_folder(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    store.add_message(
+        message_id="gmail-1", thread_id="t", sender="a@b.com", sender_name=None,
+        subject="S", received_at="2026-08-29T12:00:00+00:00", locations=frozenset({"inbox"}),
+    )
+    with store.connection() as db:
+        row = db.execute(
+            "SELECT provider, account_id, mailbox_identity_key, provider_message_id FROM messages"
+        ).fetchone()
+    scope = {
+        "provider": row[0], "account_id": row[1], "mailbox_identity_key": row[2],
+        "provider_message_id": row[3],
+    }
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = 'gmail-1'"
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+    # Observed with Sent out of scope, in no folder in scope: nothing new, stamp cleared.
+    assert store.record_message_location(**scope, locations=frozenset(), scope_complete=False) == 0
+    assert stamps() == [None]
+    # A later complete observation stamps it again.
+    observed_at = datetime(2026, 9, 20, 12, tzinfo=UTC)
+    store.record_message_location(**scope, locations=frozenset({"inbox"}), now=observed_at)
+    assert stamps() == [observed_at.isoformat()]

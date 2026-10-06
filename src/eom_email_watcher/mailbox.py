@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import getaddresses
 from typing import Protocol
@@ -57,6 +57,10 @@ class MailboxSession:
 class MailboxChanges:
     message_ids: tuple[str, ...]
     cursor: str
+    # The admitted folders the change record names for an id (contract D-identity):
+    # Gmail's history record carries the message's labels, and a Microsoft delta is
+    # per folder. An id absent here came with no folder information.
+    locations: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

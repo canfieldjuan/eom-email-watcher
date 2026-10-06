@@ -164,7 +164,7 @@ def test_parse_metadata_rejects_malformed_label_ids(label_ids: object) -> None:
 
 def test_gmail_implements_normalized_mailbox_change_and_content_contract() -> None:
     gateway = GmailGateway(None)
-    gateway.history_message_ids = lambda cursor: (["m1", "m2"], "next-cursor")
+    gateway._history_changes = lambda cursor: (["m1", "m2"], "next-cursor", {})
     gateway.search_since = lambda addresses, since: ["recovered"]
     gateway.profile_history_id = lambda: "recovery-cursor"
     gateway.full_payload = lambda message_id: {
@@ -361,6 +361,33 @@ def test_gmail_history_deduplicates_message_and_label_added_in_canonical_order()
 
     assert message_ids == ["delivered", "overlap", "labeled-later"]
     assert cursor == "99999"
+
+
+def test_gmail_history_changes_carry_each_record_s_admitted_folders() -> None:
+    response = {
+        "historyId": "99999",
+        "history": [
+            {
+                "messagesAdded": [
+                    {"message": {"id": "delivered", "labelIds": ["INBOX", "UNREAD"]}},
+                ],
+                "labelsAdded": [
+                    {"message": {"id": "sent-copy", "labelIds": ["SENT", "INBOX", "STARRED"]}},
+                    {"message": {"id": "archived", "labelIds": ["STARRED"]}},
+                    {"message": {"id": "unknown"}},
+                ],
+            }
+        ],
+    }
+
+    changes = GmailGateway(FakeHistoryService(response)).changes_since("12345")
+
+    assert changes.message_ids == ("delivered", "sent-copy", "archived", "unknown")
+    assert changes.locations == {
+        "delivered": frozenset({"inbox"}),
+        "sent-copy": frozenset({"inbox", "sent"}),
+        "archived": frozenset(),
+    }
 
 
 def test_gmail_history_v2_rejects_changed_prefix_digest_and_legacy_v1_token_as_stale() -> None:

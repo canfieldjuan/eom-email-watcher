@@ -3384,32 +3384,31 @@ def _record_locations(
     locations: Iterable[str],
     recorded_at: str | None,
 ) -> int:
-    """Record a source identity's admitted folders on its logical message (D-identity).
+    """Record one observation of a source identity's admitted folders (D-identity).
 
-    Returns the number of new rows. recorded_at is given only for an observation
-    with every admitted folder in scope; it also stamps an unstamped row.
+    Returns the number of new rows. recorded_at says whether the observation was
+    complete (every admitted folder in scope, plan step 5): a complete one stamps
+    the source's rows, an incomplete one (None) clears their stamp, so the stamp
+    always describes the latest observation.
     """
     recorded = 0
-    if not locations:
-        raise ValueError("a captured message names at least one admitted folder")
+    source = (provider, account_id, mailbox_identity_key, provider_message_id)
     for location in sorted(set(locations)):
         if location not in MESSAGE_LOCATIONS:
             raise ValueError(f"unknown message location {location!r}")
-        key = (provider, account_id, mailbox_identity_key, provider_message_id, location)
         recorded += db.execute(
             """INSERT OR IGNORE INTO message_locations(
                 message_id, provider, account_id, mailbox_identity_key,
                 provider_message_id, location, recorded_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (message_id, *key, recorded_at),
+            (message_id, *source, location, recorded_at),
         ).rowcount
-        if recorded_at is not None:
-            db.execute(
-                """UPDATE message_locations SET recorded_at = ?
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-                  AND provider_message_id = ? AND location = ? AND recorded_at IS NULL""",
-                (recorded_at, *key),
-            )
+    db.execute(
+        """UPDATE message_locations SET recorded_at = ?
+        WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+          AND provider_message_id = ?""",
+        (recorded_at, *source),
+    )
     return recorded
 
 
@@ -8436,6 +8435,8 @@ class Store:
             thread_key, merged = _imap_thread_key(db, scope=scope, ids=thread_ids)
         else:
             thread_key = _provider_thread_key(thread_id)
+        if not locations:
+            raise ValueError("a captured message names at least one admitted folder")
         # A second location of an already-captured logical identity is recorded,
         # not captured again (contract D-identity).
         if rfc_message_id is not None:
@@ -8650,33 +8651,6 @@ class Store:
             ).fetchall()
         return [str(row["location"]) for row in rows]
 
-    def source_locations(
-        self, *, provider: str, account_id: str, mailbox_identity_key: str, provider_message_id: str
-    ) -> frozenset[str] | None:
-        """The folders one stored source identity was recorded in; None if it is unknown.
-
-        The folders are the source identity's own, not its logical message's: two
-        coalesced copies each have their own (contract D-identity). A source is
-        known through its row or through a location, as has_seen_message knows it.
-        """
-        key = (provider, account_id, mailbox_identity_key, provider_message_id)
-        with self.connection() as db:
-            rows = db.execute(
-                """SELECT location FROM message_locations
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-                  AND provider_message_id = ?""",
-                key,
-            ).fetchall()
-            if rows:
-                return frozenset(str(row["location"]) for row in rows)
-            stored = db.execute(
-                """SELECT 1 FROM messages
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-                  AND provider_message_id = ?""",
-                key,
-            ).fetchone()
-        return frozenset() if stored is not None else None
-
     def record_message_location(
         self,
         *,
@@ -8690,10 +8664,11 @@ class Store:
         scope_complete: bool = True,
         now: datetime | None = None,
     ) -> int:
-        """Record the admitted folders a stored source identity is seen in; new rows.
+        """Record an observation of a stored source identity's folders; new rows.
 
-        Recipients that came with the same fetch fill a row that has none. The rows
-        are stamped only when every admitted folder was in scope at the fetch.
+        The folders may be empty (the message is in none of the folders in scope);
+        the observation still stamps or clears the source's rows (_record_locations).
+        Recipients that came with the observation fill a row that has none.
         """
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:

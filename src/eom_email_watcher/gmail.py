@@ -446,6 +446,17 @@ GMAIL_METADATA_HEADERS = [
 GMAIL_LOCATION_LABELS = {"INBOX": INBOX_LOCATION, "SENT": SENT_LOCATION}
 
 
+def locations_from_labels(label_ids: object) -> frozenset[str]:
+    """The admitted folders a Gmail label list names (contract D-scope)."""
+    if not isinstance(label_ids, (list, tuple, frozenset, set)):
+        return frozenset()
+    return frozenset(
+        GMAIL_LOCATION_LABELS[label]
+        for label in label_ids
+        if isinstance(label, str) and label in GMAIL_LOCATION_LABELS
+    )
+
+
 def _headers(payload: dict[str, Any]) -> dict[str, str]:
     return {
         str(item.get("name", "")).casefold(): str(item.get("value", ""))
@@ -513,9 +524,7 @@ def parse_metadata(message: dict[str, Any]) -> MessageMetadata:
         reply_ids=reply_ids_from_headers(headers.get("in-reply-to"), headers.get("references")),
         to=recipient_addresses(headers.get("to")),
         cc=recipient_addresses(headers.get("cc")),
-        locations=frozenset(
-            location for label, location in GMAIL_LOCATION_LABELS.items() if label in labels
-        ),
+        locations=locations_from_labels(labels),
     )
 
 
@@ -847,10 +856,22 @@ class GmailGateway:
             ) from exc
 
     def history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
+        ids, newest, _locations = self._history_changes(start_history_id)
+        return ids, newest
+
+    def _history_changes(
+        self, start_history_id: str
+    ) -> tuple[list[str], str, dict[str, frozenset[str]]]:
+        """The changed ids, the newest cursor, and each record's admitted folders.
+
+        A history record carries the message's labels, so a known id's current
+        folders travel with the change and need no fetch (plan step 6).
+        """
         request_start_history_id, skip_unique_ids, expected_prefix_digest = (
             _decode_history_cursor(start_history_id)
         )
         ids: list[str] = []
+        locations: dict[str, frozenset[str]] = {}
         seen_ids: set[str] = set()
         ordered_unique_ids: list[str] = []
         page_token: str | None = None
@@ -915,11 +936,17 @@ class GmailGateway:
                                 continue
                             if len(ids) == MAX_INCREMENTAL_MESSAGE_IDS:
                                 prefix = ordered_unique_ids[: skip_unique_ids + len(ids)]
-                                return ids, _history_continuation_cursor(
-                                    request_start_history_id,
-                                    prefix,
+                                return (
+                                    ids,
+                                    _history_continuation_cursor(request_start_history_id, prefix),
+                                    locations,
                                 )
                             ids.append(message_id)
+                            label_ids = (
+                                message.get("labelIds") if isinstance(message, dict) else None
+                            )
+                            if isinstance(label_ids, list):
+                                locations[message_id] = locations_from_labels(label_ids)
                 page_token = response.get("nextPageToken")
                 if page_token is not None:
                     page_token = _bounded_text(
@@ -938,11 +965,11 @@ class GmailGateway:
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
         if not prefix_verified:
             raise StaleHistoryCursor("Saved Gmail history continuation cursor cannot be resumed")
-        return ids, newest
+        return ids, newest, locations
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        message_ids, newest = self.history_message_ids(cursor)
-        return MailboxChanges(tuple(message_ids), newest)
+        message_ids, newest, locations = self._history_changes(cursor)
+        return MailboxChanges(tuple(message_ids), newest, locations)
 
     def metadata(
         self,
