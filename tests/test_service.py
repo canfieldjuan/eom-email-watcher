@@ -15,7 +15,6 @@ from eom_email_watcher import service as service_module
 from eom_email_watcher.config import Config, Sender
 from eom_email_watcher.db import AdmissionProvenance, MailboxIdentityChanged, Store
 from eom_email_watcher.gmail import (
-    GMAIL_LOCATION_LABELS,
     GmailAuthorizationRejected,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
@@ -23,6 +22,7 @@ from eom_email_watcher.gmail import (
     MessageMetadata,
     MessageUnavailable,
     StaleHistoryCursor,
+    locations_from_labels,
 )
 from eom_email_watcher.imap import ImapError, ImapGateway
 from eom_email_watcher.mailbox import (
@@ -1321,11 +1321,7 @@ def test_dry_run_recovery_preview_keeps_sent_only_candidates_out_of_scope(
             return replace(
                 super().metadata(message_id),
                 labels=self.labels,
-                locations=frozenset(
-                    location
-                    for label, location in GMAIL_LOCATION_LABELS.items()
-                    if label in self.labels
-                ),
+                locations=locations_from_labels(self.labels),
                 received_at=datetime(2026, 10, 1, 12, tzinfo=UTC).isoformat(),
             )
 
@@ -5261,9 +5257,7 @@ class LabelledGmail(FakeGmail):
         return MailboxChanges(tuple(ids), newest, {i: self._locations() for i in ids})
 
     def _locations(self) -> frozenset[str]:
-        return frozenset(
-            location for label, location in GMAIL_LOCATION_LABELS.items() if label in self.labels
-        )
+        return locations_from_labels(self.labels)
 
     def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
         self.metadata_calls += 1

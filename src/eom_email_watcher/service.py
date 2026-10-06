@@ -42,13 +42,13 @@ from .db import (
     Store,
 )
 from .gmail import (
-    GMAIL_LOCATION_LABELS,
     GmailAuthorizationRejected,
     GmailError,
     GmailLabelCatalogInvalid,
     GmailLabelCatalogUnavailable,
     GmailRecoveryPageInvalid,
     GmailRecoveryPageTokenInvalid,
+    locations_from_labels,
 )
 from .imap import IMAP_PROVIDER, ImapGateway, imap_cursor_epoch
 from .mailbox import (
@@ -188,9 +188,7 @@ def _admitted_locations(
     """
     locations = getattr(metadata, "locations", None)
     if not (isinstance(locations, frozenset) and locations):
-        locations = frozenset(
-            location for label, location in GMAIL_LOCATION_LABELS.items() if label in labels
-        )
+        locations = locations_from_labels(labels)
     return locations & folders
 
 
