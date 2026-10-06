@@ -57,7 +57,17 @@ OWNED_PHRASES = {
         r"smallest member under the canonical order",
         r"depend on a key's value",
     ],
-    "D-reconcile": [r"coverage record", r"synced_through", r"retries that unit with backoff"],
+    "D-derived": [
+        r"\*\*Its inputs\*\* are exactly",
+        r"by any path",
+        r"That list is illustrative",
+    ],
+    "D-reconcile": [
+        r"coverage record",
+        r"synced_through",
+        r"retries that unit with backoff",
+        r"no change has to remember to trigger it",
+    ],
     "D-body": [r"Body not stored", r"Partial body", r"summary-only storage"],
     "D-ops": [
         r"Connect required to update",

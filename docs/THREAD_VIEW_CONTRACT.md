@@ -122,11 +122,8 @@ Each definition is the only place its rule is stated.
   - Following is a classification of stored data, not an operation.
 - **Its owner** is the vendor of the earliest-received such message. Ties are broken by the canonical order ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
 - **Follow state and owner are derived, never recorded history.**
-  - They are a function of the stored messages and the current configuration, cached in one row per thread key.
-  - The cache is recomputed, under the operation lock (`engine_api.py:2192-2199`), whenever:
-    - a message is captured;
-    - a vendor record changes;
-    - a merge happens ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
+  - They are a function of the inputs of [D-derived](#d-derived-derived-state-and-invalidation), cached in one row per thread key and kept current by it.
+  - A thread with no stored messages has no cache row and no watermark.
   - The result therefore never depends on arrival or discovery order. Stored provenance is never consulted.
 
 ### D-identity: message identity, direction, and thread keys
@@ -139,7 +136,7 @@ Each definition is the only place its rule is stated.
   - A second location of an already-captured logical identity is recorded, not captured again.
   - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
 - **Canonical order.** The canonical order of messages is their source identity in byte order. A logical message recorded in several locations sorts by the smallest of their source identities. Every tie-break in this contract uses it.
-- **Direction** is derived from the logical message's recorded locations. It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. It is recomputed when a location is added, so discovery order never decides it.
+- **Direction** is derived from the logical message's recorded locations ([D-derived](#d-derived-derived-state-and-invalidation)). It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. Discovery order therefore never decides it.
 - **Thread key:**
   - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
   - IMAP uses components: messages whose id sets overlap form one component. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list. A message that touches no component forms its own.
@@ -148,20 +145,36 @@ Each definition is the only place its rule is stated.
 - **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first, whether or not its members have a `Message-ID`, and it keeps its key. In that transaction:
   - every row naming a merged key is re-keyed, including earlier aliases, and aliases are recorded.
 
+### D-derived: derived state and invalidation
+
+- **Derived state** is what this contract computes and keeps, rather than records:
+  - each message's direction ([D-identity](#d-identity-message-identity-direction-and-thread-keys)) and attributed vendor ([D-attribution](#d-attribution-a-messages-vendor));
+  - each thread's follow state and owner ([D-follow](#d-follow-followed-threads));
+  - which messages keep a body ([D-body](#d-body-stored-bodies));
+  - which messages have claims, discrepancies, and attempts, and under which key ([D-claims](#d-claims-claims-and-comparability)).
+- **Its inputs** are exactly:
+  - the stored messages, with their headers, received times, and recorded locations;
+  - the vendor records;
+  - the mailbox's verified identities ([D-vendor](#d-vendor-vendors-and-vendor_ofaddress)).
+
+  All of them live in the database. Admission provenance and discovery order are never inputs.
+- **One rule.** Any change to an input, by any path, brings everything derived from it back in line with its definition, in the same transaction as the change and under the operation lock (`engine_api.py:2192-2199`).
+  - The paths include capture, a recorded location, deletion, purge, an IMAP merge, a vendor record change, and a verified identity being added or changed. That list is illustrative; the rule is not.
+- **Only local work happens in that transaction.** It recomputes state and deletes what a definition no longer allows. Anything that needs a provider or the model, such as a body to fetch or claims to extract, is left to the reconcile pass ([D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass)).
+
 ### D-reconcile: coverage and the reconcile pass
 
 - **The coverage record.** Each account keeps a durable coverage record of the configuration it has reconciled: the vendor set, the `retention_days` setting, the entitlement state, and the claims extractor version. It also keeps a `synced_through` watermark per followed thread.
-- **Coverage goes stale only when a change can require data not yet covered:**
-  - a vendor address or domain is added;
-  - `retention_days` is increased;
-  - the entitlement is reactivated;
-  - a new extractor version is deployed;
-  - a provider cursor expires or recovers;
-  - an IMAP merge happens;
-  - a thread becomes followed, by any path.
+- **Coverage is stale exactly when the current state needs data the record does not cover:**
+  - a vendor address or domain outside the reconciled vendor set;
+  - a `retention_days` above the reconciled value;
+  - an active entitlement where the record has it inactive;
+  - an extractor version the record has not reconciled;
+  - a provider cursor that expired or recovered after the record;
+  - a followed thread without a watermark.
 
-  The cutoff moving forward with the clock never makes coverage stale.
-- **Watermark resets.** A thread's watermark resets to the cutoff in three cases: when the thread becomes followed, when `retention_days` increases, and when it is the survivor of an IMAP merge.
+  This is a comparison made at every check, so no change has to remember to trigger it. The cutoff moving forward with the clock never makes coverage stale.
+- **Watermarks.** A followed thread is synced from its watermark, or from the cutoff when it has none. A thread has none when it becomes followed; an IMAP merge clears the survivor's watermark, and a `retention_days` increase clears every watermark.
 - **Stale coverage triggers a reconcile pass.** It is bounded per check, resumable from durable progress, and the only writer of coverage and watermarks. It runs three stages, in order:
   - **(a) Discovery:** in-scope messages that are not captured yet, and that have a vendor ([D-attribution](#d-attribution-a-messages-vendor)), are captured under [D-capture](#d-capture-what-is-stored-and-its-provenance). Their threads' follow state then follows from [D-follow](#d-follow-followed-threads).
   - **(b) Thread sync:** for each followed thread, its in-scope messages are fetched from its watermark and captured under [D-capture](#d-capture-what-is-stored-and-its-provenance).
@@ -177,7 +190,7 @@ Each definition is the only place its rule is stated.
 
 ### D-body: stored bodies
 
-- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage.
+- **Which messages store a body.** From M2 on, every captured message in a followed thread ([D-follow](#d-follow-followed-threads)) stores a body. Messages outside followed threads keep today's summary-only storage, so a thread that stops being followed loses its bodies ([D-derived](#d-derived-derived-state-and-invalidation)).
 - **What is stored:**
   - the normalized text, from `bounded_body_text` with a named storage cap larger than `body_char_limit`;
   - the pre-cut length;
@@ -231,7 +244,7 @@ Each definition is the only place its rule is stated.
   - `quantity`: an item and a count;
   - `term`: text, displayed only;
   - `reference`: a `(kind, number)` pair, with kind in `invoice`, `quote`, `po`. References are used only as anchors.
-- **Keying.** Claims and attempts are keyed by `(message, attributed vendor, extractor version)`. When a message's attributed vendor changes ([D-attribution](#d-attribution-a-messages-vendor)), its claims, discrepancies, and attempts under the old vendor are deleted. That covers a vendor's deletion or re-creation.
+- **Keying.** Claims and attempts are keyed by `(message, attributed vendor, extractor version)`. They, and the discrepancies citing them, exist only while their message is offered under that key (Source above). When the message stops being offered, or its attributed vendor changes, they are deleted ([D-derived](#d-derived-derived-state-and-invalidation)). That covers a vendor's deletion or re-creation, and a message that turns outbound.
 - **Attempts.** Each key has one durable attempt record, with one of three outcomes:
   - `succeeded`;
   - `retryable`: the model or its transport was unavailable. Another attempt is made after a backoff deadline, and the message shows "Claims unavailable, will retry";
@@ -288,7 +301,7 @@ Each milestone gets its own `plans/PR-*.md` plan PR, accepted before code. No mi
   - [D-identity](#d-identity-message-identity-direction-and-thread-keys) thread keys on newly captured messages, including the IMAP reply-header fetch, components, and merges.
   - A Vendors list in the desktop.
   - Admission is unchanged.
-- **M2, capture:** [D-capture](#d-capture-what-is-stored-and-its-provenance), [D-follow](#d-follow-followed-threads), [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass), [D-body](#d-body-stored-bodies), and [D-scope](#d-scope-in-scope-messages-and-retention). That includes Sent capture and the purge, with the retention settings copy.
+- **M2, capture:** [D-capture](#d-capture-what-is-stored-and-its-provenance), [D-follow](#d-follow-followed-threads), [D-derived](#d-derived-derived-state-and-invalidation), [D-reconcile](#d-reconcile-coverage-and-the-reconcile-pass), [D-body](#d-body-stored-bodies), and [D-scope](#d-scope-in-scope-messages-and-retention). That includes Sent capture and the purge, with the retention settings copy.
 - **M3, the thread view**, with its CSP and the inbox copy.
 - **M4, [D-claims](#d-claims-claims-and-comparability).** Deploying the extractor makes coverage stale, so retained messages get claim attempts.
 - **M5, domains and suggestions:** the domain operations of [D-ops](#d-ops-operation-classes-and-gating), and suggestion candidates under [D-vendor](#d-vendor-vendors-and-vendor_ofaddress).
@@ -361,6 +374,12 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
   - a thread stays followed while it is active, after its first vendor message passes the cutoff;
   - an ungated `exact_sender` capture while Connect is inactive makes its thread followed, with no gated capture and no body;
   - deploying M4 extracts claims for M2 and M3 messages.
+- **Derived state:**
+  - removing a vendor's only address unfollows its threads and deletes their bodies, claims, discrepancies, and attempts, while the messages keep their summaries;
+  - purging a followed thread's last message drops its cache row and watermark;
+  - a Sent location recorded after the Inbox copy makes the message outbound, re-attributes it, and deletes its claims;
+  - connecting a mailbox whose address is a vendor address leaves that address's messages without a vendor;
+  - none of these needs a reconcile pass to take effect.
 - **Scope:**
   - a Microsoft deleted-items message in a followed conversation is never fetched;
   - an archived, label-captured Gmail message shows "outside the admitted folders".
@@ -418,3 +437,4 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
 - 2026-10-05: the fourth M1 plan review found that outbound attribution looked up recipients' addresses and domains directly instead of through `vendor_of`, so amendment C's exclusion did not reach outbound mail. D-attribution now judges recipients only through `vendor_of`.
 - 2026-10-05: the fifth M1 plan review found that D-attribution asked how `vendor_of` matched, which `vendor_of` did not say. `vendor_of` now returns its match, exact or domain, and outbound attribution and D-capture's kinds both read it. A finding that a newly verified identity leaves follow state and claims stale is an input to amendment A (#207), with the direction finding above.
+- 2026-10-06: amendment A (#207). Derived state was invalidated by event lists in two places, D-follow's recompute triggers and D-reconcile's stale triggers, and every new input added an event they missed: a removal, a purge, a direction change, and an identity becoming verified. A new definition, D-derived, owns one rule over the inputs instead: any change to the stored messages, their locations, the vendor records, or the verified identities recomputes what depends on them, in the same transaction. Each definition keeps its own invariant (D-follow's empty threads, D-body's bodies, D-claims' keys), and coverage staleness became a comparison with the coverage record, so it needs no triggers.
