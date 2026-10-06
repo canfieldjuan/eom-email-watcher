@@ -1325,7 +1325,9 @@ mod tests {
             "sh",
             vec![
                 OsString::from("-c"),
-                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                // The pid is written before anything else, and the deadline below
+                // leaves the helper ample time to start even on a loaded host.
+                OsString::from("echo $$ > \"$1\"; cat >/dev/null; exec sleep 30"),
                 OsString::from("notification-timeout-probe"),
                 pid_path.as_os_str().to_owned(),
             ],
@@ -1333,13 +1335,27 @@ mod tests {
 
         let delivery = NotificationDelivery::default();
         let bounded_delivery = delivery.clone();
-        let outcome = run_bounded_operation(Duration::from_millis(200), move |deadline| {
+        let started = Instant::now();
+        let outcome = run_bounded_operation(Duration::from_secs(1), move |deadline| {
             bounded_delivery.run_exclusive_until(&deadline, |deadline| {
                 notifier.show(&intent("message-1"), deadline)
             })
         });
+        let elapsed = started.elapsed();
 
-        assert_eq!(outcome, BoundedOperation::TimedOut);
+        // show() enforces the same deadline the harness waits on, so either side
+        // can observe it first: the harness cancels (TimedOut), or show() stops
+        // the helper itself and returns engine_timeout. Both stop it at the deadline.
+        match &outcome {
+            BoundedOperation::TimedOut => {}
+            BoundedOperation::Completed(Err(error)) if error.code == "engine_timeout" => {}
+            other => panic!("the helper was not stopped at its deadline: {other:?}"),
+        }
+        // The helper sleeps 30 s; stopping it must not wait for that.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "stopping took {elapsed:?}"
+        );
         let process_id: i32 = std::fs::read_to_string(pid_path)
             .expect("read notification helper pid")
             .trim()
@@ -1363,7 +1379,7 @@ mod tests {
             "sh",
             vec![
                 OsString::from("-c"),
-                OsString::from("cat >/dev/null; echo $$ > \"$1\"; exec sleep 30"),
+                OsString::from("echo $$ > \"$1\"; cat >/dev/null; exec sleep 30"),
                 OsString::from("registered-notification-probe"),
                 pid_path.as_os_str().to_owned(),
             ],
@@ -1376,8 +1392,10 @@ mod tests {
                 &DeliveryDeadline::with_cancellation(Duration::from_secs(30), worker_cancellation),
             )
         });
+        // Polling ends as soon as the helper records its pid; the bound only
+        // matters on a heavily loaded host.
         let mut process_id = None;
-        for _ in 0..200 {
+        for _ in 0..2000 {
             if let Ok(value) = std::fs::read_to_string(&pid_path)
                 && let Ok(parsed_process_id) = value.trim().parse::<i32>()
             {
