@@ -57,6 +57,7 @@ from .mailbox import (
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
     SENT_SCOPE_NOT_POLLED,
+    FolderObservation,
     MailboxAccountUnavailable,
     MailboxChanges,
     MailboxError,
@@ -1803,6 +1804,19 @@ class Watcher:
                 account_id=self.mailbox.account_id,
                 mailbox_identity_key=mailbox_identity_key,
             ):
+                # The lost interval may have moved it, and the search does not say
+                # where it is now: an incomplete observation clears its stamp, so
+                # discovery observes it again once this recovery makes coverage stale.
+                self.store.record_message_location(
+                    provider=self.mailbox.provider,
+                    account_id=self.mailbox.account_id,
+                    mailbox_identity_key=mailbox_identity_key,
+                    provider_message_id=provider_message_id,
+                    locations=frozenset(),
+                    scope_complete=False,
+                    headers_observed=False,
+                    now=checked_at,
+                )
                 self.store.finish_gmail_recovery_candidate(
                     self.mailbox.account_id,
                     mailbox_identity_key,
@@ -2180,7 +2194,7 @@ class Watcher:
         checked_at: datetime,
         retention_cutoff: datetime,
         folders: frozenset[str],
-        known_locations: Mapping[str, frozenset[str]],
+        known_locations: Mapping[str, FolderObservation],
         dry_run: bool,
         dry_run_messages: list[PendingMessage],
     ) -> int:
@@ -2292,23 +2306,23 @@ class Watcher:
         mailbox_identity_key: str,
         checked_at: datetime,
         folders: frozenset[str],
-        observed: frozenset[str],
+        observed: FolderObservation,
     ) -> None:
         """A known id came back through polling with its folders (contract D-identity).
 
         The change record says where the message is now, so nothing is fetched. The
-        folders in scope are recorded, and whether every admitted folder was in scope
-        decides the observation's completeness (plan step 5): a complete one stamps
-        the source's rows, an incomplete one clears their stamp, so a folder change
-        during a lapse is observed again by discovery once Sent returns.
+        folders in scope are recorded. The observation is complete, and stamps the
+        source's rows, only when the record carried the whole folder set and every
+        admitted folder was in scope (plan step 5); otherwise it clears their stamp,
+        so a change seen partially, or during a lapse, is observed again by discovery.
         """
         self.store.record_message_location(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,
             mailbox_identity_key=mailbox_identity_key,
             provider_message_id=provider_message_id,
-            locations=observed & folders,
-            scope_complete=_scope_complete(folders),
+            locations=observed.locations & folders,
+            scope_complete=_scope_complete(folders) and observed.complete,
             headers_observed=False,
             now=checked_at,
         )

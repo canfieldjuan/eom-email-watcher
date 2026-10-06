@@ -7545,3 +7545,66 @@ def test_a_change_record_never_stamps_a_retained_row(tmp_path: Path) -> None:
         **scope, locations=frozenset({"inbox", "sent"}), to=("a@v.com",), now=observed_at
     )
     assert stamps() == [observed_at.isoformat(), observed_at.isoformat()]
+
+
+def test_a_coalesced_copy_s_later_folder_is_recorded_on_its_logical_message(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+    store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:3",
+        thread_id="<same@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="same@x",
+        locations=frozenset({"sent"}),
+    )
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (first,)
+        ).fetchone()[0]
+
+    # The copy has no row; a later observation of it still reaches the logical message.
+    assert store.record_message_location(
+        provider="imap",
+        account_id="imap-account",
+        mailbox_identity_key=identity,
+        provider_message_id="imap:sent:77:3",
+        locations=frozenset({"inbox", "sent"}),
+    ) == 1
+    assert store.message_locations(first) == ["inbox", "sent"]
+
+
+def test_a_sent_copy_s_reply_headers_merge_imap_components(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    root = _imap_message(store, "1", "root@x")
+    other = _imap_message(store, "2", "other@x")
+    assert _thread_keys(store)[root] != _thread_keys(store)[other]
+
+    # The Sent copy of root carries reply headers naming the other component.
+    assert store.add_message(
+        message_id="imap-message-sent-copy",
+        provider="imap",
+        account_id="imap-account",
+        provider_message_id="imap:sent:77:9",
+        thread_id="<root@x>",
+        sender="a@b.com",
+        sender_name=None,
+        subject="S",
+        received_at="2026-08-29T12:00:00+00:00",
+        rfc_message_id="root@x",
+        reply_ids=("other@x",),
+        locations=frozenset({"sent"}),
+    ) is False
+
+    keys = _thread_keys(store)
+    assert keys[root] == keys[other]
+    assert store.message_locations(root) == ["inbox", "sent"]

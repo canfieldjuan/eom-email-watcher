@@ -54,13 +54,26 @@ class MailboxSession:
 
 
 @dataclass(frozen=True)
+class FolderObservation:
+    """What a change record says about a message's admitted folders (D-identity).
+
+    locations are the folders the record puts the message in. complete says the
+    record carried the message's whole folder set (a Gmail record with the
+    message's labels, a Microsoft delta's one folder), as opposed to the labels
+    an addition added; only a whole set can stamp a source as fully observed.
+    """
+
+    locations: frozenset[str]
+    complete: bool
+
+
+@dataclass(frozen=True)
 class MailboxChanges:
     message_ids: tuple[str, ...]
     cursor: str
-    # The admitted folders the change record names for an id (contract D-identity):
-    # Gmail's history record carries the message's labels, and a Microsoft delta is
-    # per folder. An id absent here came with no folder information.
-    locations: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Per id, what the change record says about its folders. An id absent here
+    # came with no folder information.
+    locations: Mapping[str, FolderObservation] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

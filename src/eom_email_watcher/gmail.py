@@ -30,6 +30,7 @@ from .config import normalize_address
 from .mailbox import (
     INBOX_LOCATION,
     SENT_LOCATION,
+    FolderObservation,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -444,6 +445,32 @@ GMAIL_METADATA_HEADERS = [
 ]
 # Gmail system labels that are admitted folders (contract D-scope).
 GMAIL_LOCATION_LABELS = {"INBOX": INBOX_LOCATION, "SENT": SENT_LOCATION}
+
+
+def _merge_history_hint(
+    hints: dict[str, FolderObservation], message_id: str, added: object, message: object
+) -> None:
+    """Fold one history addition into the message's folder observation.
+
+    The addition's own labelIds say what was added, so they place the message in
+    those folders without saying where else it is. The nested message's labelIds,
+    when the record carries them, are the whole set and make the observation
+    complete. Several additions for one id in a batch merge.
+    """
+    added_labels = added.get("labelIds") if isinstance(added, dict) else None
+    whole = message.get("labelIds") if isinstance(message, dict) else None
+    if isinstance(whole, list):
+        observation = FolderObservation(locations_from_labels(whole), complete=True)
+    elif isinstance(added_labels, list):
+        observation = FolderObservation(locations_from_labels(added_labels), complete=False)
+    else:
+        return
+    earlier = hints.get(message_id)
+    if earlier is not None:
+        observation = FolderObservation(
+            earlier.locations | observation.locations, earlier.complete or observation.complete
+        )
+    hints[message_id] = observation
 
 
 def locations_from_labels(label_ids: object) -> frozenset[str]:
@@ -871,7 +898,7 @@ class GmailGateway:
             _decode_history_cursor(start_history_id)
         )
         ids: list[str] = []
-        locations: dict[str, frozenset[str]] = {}
+        hints: dict[str, FolderObservation] = {}
         seen_ids: set[str] = set()
         ordered_unique_ids: list[str] = []
         page_token: str | None = None
@@ -915,6 +942,7 @@ class GmailGateway:
                                 field="Gmail history message ID",
                                 error_type=GmailError,
                             )
+                            _merge_history_hint(hints, message_id, added, message)
                             if message_id in seen_ids:
                                 continue
                             seen_ids.add(message_id)
@@ -939,14 +967,9 @@ class GmailGateway:
                                 return (
                                     ids,
                                     _history_continuation_cursor(request_start_history_id, prefix),
-                                    locations,
+                                    {i: hints[i] for i in ids if i in hints},
                                 )
                             ids.append(message_id)
-                            label_ids = (
-                                message.get("labelIds") if isinstance(message, dict) else None
-                            )
-                            if isinstance(label_ids, list):
-                                locations[message_id] = locations_from_labels(label_ids)
                 page_token = response.get("nextPageToken")
                 if page_token is not None:
                     page_token = _bounded_text(
@@ -965,7 +988,7 @@ class GmailGateway:
             raise GmailError(f"Gmail history request failed (HTTP {exc.resp.status})") from exc
         if not prefix_verified:
             raise StaleHistoryCursor("Saved Gmail history continuation cursor cannot be resumed")
-        return ids, newest, locations
+        return ids, newest, {i: hints[i] for i in ids if i in hints}
 
     def changes_since(self, cursor: str) -> MailboxChanges:
         message_ids, newest, locations = self._history_changes(cursor)

@@ -8459,6 +8459,12 @@ class Store:
                     recorded_at=discovered_at if scope_complete else None,
                 )
                 _record_recipients(db, message_id=str(logical["message_id"]), to=to, cc=cc)
+                if provider == "imap":
+                    # The copy's reply headers may bridge components (contract
+                    # D-identity): the one re-key owner applies them as for a new row.
+                    _apply_imap_component(
+                        db, scope=scope, thread_key=thread_key, merged=merged, ids=thread_ids
+                    )
                 return False
         placeholders = ", ".join("?" for _ in suppression_keys)
         cursor = db.execute(
@@ -8677,10 +8683,17 @@ class Store:
         stamp = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            # A source identity is known through its row or a recorded location, the
+            # same two places has_seen_message reads (contract D-identity).
             row = db.execute(
                 """SELECT COALESCE(logical_of, message_id) AS logical_id FROM messages
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-                  AND provider_message_id = ?""",
+                WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key = ?3
+                  AND provider_message_id = ?4
+                UNION ALL
+                SELECT message_id AS logical_id FROM message_locations
+                WHERE provider = ?1 AND account_id = ?2 AND mailbox_identity_key = ?3
+                  AND provider_message_id = ?4
+                LIMIT 1""",
                 (provider, account_id, mailbox_identity_key, provider_message_id),
             ).fetchone()
             if row is None:

@@ -26,6 +26,7 @@ from eom_email_watcher.gmail import (
 )
 from eom_email_watcher.imap import ImapError, ImapGateway
 from eom_email_watcher.mailbox import (
+    FolderObservation,
     MailboxChanges,
     MailboxError,
     MailboxMessageInvalid,
@@ -1334,6 +1335,54 @@ def test_dry_run_recovery_preview_keeps_sent_only_candidates_out_of_scope(
     active = Watcher(cfg, store, SentOnlyRecoveryGmail(), FakeModel()).check(dry_run=True)
     assert active["recovery_pending"] is True
     assert active["discovered"] == 1
+
+
+def test_recovery_marks_a_known_candidate_for_a_fresh_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active_entitlement(monkeypatch)
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
+    gateway = LabelledGmail(frozenset({"INBOX"}))
+    Watcher(cfg, store, gateway, FakeModel()).check()
+    item = store.recent(1)[0]
+
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ?",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # The history cursor is lost; the recovery search lists the known message among
+    # its candidates. Recovery fetches nothing for it, but the lost interval may have
+    # moved it, so its observation is no longer complete.
+    class RecoveringGmail(LabelledGmail):
+        def history_message_ids(self, cursor: str):
+            raise StaleHistoryCursor()
+
+        def recovery_page(
+            self,
+            page_token: str | None,
+            after_exclusive_epoch: int,
+            before_exclusive_epoch: int,
+            max_results: int = 200,
+            *,
+            timeout_seconds: float | None = None,
+        ) -> tuple[tuple[str, ...], str | None]:
+            return ("allowed",), None
+
+    recovering = RecoveringGmail(frozenset({"INBOX"}))
+    calls = recovering.metadata_calls
+    Watcher(cfg, store, recovering, FakeModel()).check()
+    assert recovering.metadata_calls == calls
+    assert stamps() == [None]
+    assert len(store.recent(5)) == 1
 
 
 def test_inert_persisted_label_selectors_return_stable_inactive_reason(
@@ -5254,7 +5303,8 @@ class LabelledGmail(FakeGmail):
     def changes_since(self, cursor: str) -> MailboxChanges:
         # Like the real gateway: the history record carries the message's labels.
         ids, newest = self.history_message_ids(cursor)
-        return MailboxChanges(tuple(ids), newest, {i: self._locations() for i in ids})
+        observed = FolderObservation(self._locations(), complete=True)
+        return MailboxChanges(tuple(ids), newest, {i: observed for i in ids})
 
     def _locations(self) -> frozenset[str]:
         return locations_from_labels(self.labels)

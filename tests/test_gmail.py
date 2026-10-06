@@ -19,7 +19,7 @@ from eom_email_watcher.gmail import (
     parse_metadata,
     resolve_gmail_credentials_file,
 )
-from eom_email_watcher.mailbox import MailboxMessageInvalid
+from eom_email_watcher.mailbox import FolderObservation, MailboxMessageInvalid
 
 
 def test_gmail_operation_timeout_reaches_authorized_transport() -> None:
@@ -372,8 +372,14 @@ def test_gmail_history_changes_carry_each_record_s_admitted_folders() -> None:
                     {"message": {"id": "delivered", "labelIds": ["INBOX", "UNREAD"]}},
                 ],
                 "labelsAdded": [
-                    {"message": {"id": "sent-copy", "labelIds": ["SENT", "INBOX", "STARRED"]}},
-                    {"message": {"id": "archived", "labelIds": ["STARRED"]}},
+                    # The addition says what was added; the nested message, when it
+                    # carries labelIds, says the whole set.
+                    {"message": {"id": "starred"}, "labelIds": ["STARRED"]},
+                    {"message": {"id": "sent-copy"}, "labelIds": ["SENT"]},
+                    {
+                        "message": {"id": "whole", "labelIds": ["SENT", "INBOX"]},
+                        "labelIds": ["SENT"],
+                    },
                     {"message": {"id": "unknown"}},
                 ],
             }
@@ -382,11 +388,12 @@ def test_gmail_history_changes_carry_each_record_s_admitted_folders() -> None:
 
     changes = GmailGateway(FakeHistoryService(response)).changes_since("12345")
 
-    assert changes.message_ids == ("delivered", "sent-copy", "archived", "unknown")
+    assert changes.message_ids == ("delivered", "starred", "sent-copy", "whole", "unknown")
     assert changes.locations == {
-        "delivered": frozenset({"inbox"}),
-        "sent-copy": frozenset({"inbox", "sent"}),
-        "archived": frozenset(),
+        "delivered": FolderObservation(frozenset({"inbox"}), complete=True),
+        "starred": FolderObservation(frozenset(), complete=False),
+        "sent-copy": FolderObservation(frozenset({"sent"}), complete=False),
+        "whole": FolderObservation(frozenset({"inbox", "sent"}), complete=True),
     }
 
 

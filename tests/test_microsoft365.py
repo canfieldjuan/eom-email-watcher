@@ -11,6 +11,7 @@ import pytest
 
 from eom_email_watcher import microsoft365
 from eom_email_watcher.mailbox import (
+    FolderObservation,
     MailboxMessageUnavailable,
     StaleMailboxCursor,
 )
@@ -762,7 +763,7 @@ def test_sent_items_has_its_own_delta_and_metadata_records_locations() -> None:
     changes = gateway.sent_changes_since(gateway.sent_initial_cursor())
     assert changes.message_ids == ("sent-1",)
     # The delta is per folder, so the record names the message's folder.
-    assert changes.locations == {"sent-1": frozenset({"sent"})}
+    assert changes.locations == {"sent-1": FolderObservation(frozenset({"sent"}), complete=True)}
     assert "/mailFolders/sentitems/messages/delta" in changes.cursor
     delta_requests = [r for r in requests if "/messages/delta" in r.url.path]
     assert len(delta_requests) == 1 and "sentitems" in delta_requests[0].url.path

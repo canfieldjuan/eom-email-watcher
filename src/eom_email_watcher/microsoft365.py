@@ -26,6 +26,7 @@ from .mailbox import (
     SENT_LOCATION,
     SENT_SCOPE_AVAILABLE,
     SENT_SCOPE_UNAVAILABLE,
+    FolderObservation,
     MailboxChanges,
     MailboxError,
     MailboxMessageUnavailable,
@@ -612,9 +613,9 @@ class Microsoft365Gateway:
                 cursor = _safe_graph_url(delta_link, delta_token="$deltatoken")
                 unique = tuple(dict.fromkeys(ids))
                 # A message is in one folder, so the delta's folder is its whole location.
-                location = frozenset({FOLDER_LOCATIONS[folder]})
+                observation = FolderObservation(frozenset({FOLDER_LOCATIONS[folder]}), True)
                 return MailboxChanges(
-                    unique, cursor, {message_id: location for message_id in unique}
+                    unique, cursor, {message_id: observation for message_id in unique}
                 )
             raise Microsoft365Error(
                 "Microsoft Graph mail delta omitted a single continuation cursor"
