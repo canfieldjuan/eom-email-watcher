@@ -75,6 +75,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
    - `message_locations(message_id, provider, account_id, mailbox_identity_key, provider_message_id, location, recorded_at)`, primary key `(provider, account_id, mailbox_identity_key, provider_message_id, location)`. One source identity is recorded once per location, so a Gmail message with both labels has two rows under one id.
    - `messages.logical_of`, NULL for a logical message. It holds the canonical row's id for a row that duplicates one.
    - A trigger deletes a message's recipients and locations with it, so `delete_message`, `clear_messages`, and the purge leave no orphan rows, and a stale location key never blocks a later recapture.
+   - Deletion works on the logical message as one unit: `delete_message` and `clear_messages` remove the canonical row, every row pointing to it through `logical_of`, and record a suppression for each recorded source identity, so no copy is recaptured after a cursor recovery.
    - `messages.capture_timezone`, the configured zone at capture. With `received_at`, it is C/D-body's date context, recorded here because a body can arrive in a later check (step 22). Retained rows keep it NULL: their context is unavailable, which C/D-claims already defines (dates without context are rejected).
    - Migration:
      - every retained row gets an `inbox` location;
@@ -134,7 +135,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
 ### M2.3 — The reconcile pass
 
 13. **Storage (schema 32):**
-    - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days)`, C/D-reconcile's counter and the last observed entitlement state and retention. One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation; the check, when the entitlement state or `retention_days` it observes differs from the recorded ones (so an edited `config.toml` counts, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
+    - `coverage_generation(provider, account_id, mailbox_identity_key, generation, entitlement_active, retention_days)`, C/D-reconcile's counter and the last observed entitlement state and retention. One function, `_bump_coverage_generation`, increments it, and every input change calls it in its own transaction: each vendor mutation; `register_mail_account` and `update_mail_account_identity`, which change a verified identity; the check, when the entitlement state or `retention_days` it observes differs from the recorded ones (so an edited `config.toml` counts, and `settings.update` needs no bump of its own); a cursor expiry or recovery; and (M4) an extractor version change;
     - `reconcile_coverage(provider, account_id, mailbox_identity_key, generation, recorded_at)`, the reconciled generation;
     - `reconcile_progress(...)`, which holds the generation and the upper bound frozen when the pass started (step 16), the stage, durable per-folder page tokens, the thread queue, and per-unit attempt and backoff fields. Progress belongs to the generation it froze: when the current generation differs, the check discards it and starts a fresh pass, so a page token is never reused against a changed query.
 
@@ -147,17 +148,17 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
     - A unit that errors backs off `min(15, 2**n)` minutes (`service.py:1505-1506`) while polling continues.
     - At each budget check the pass re-evaluates the entitlement; when the gated class is no longer allowed, it stops there, keeping its progress.
 16. **Stage (a), discovery.** Each candidate gets a bounded metadata fetch, then the scope check, then C/D-capture. Bodies are never fetched in this stage.
-    - The pass freezes an upper bound at its start, held in `reconcile_progress`: the start time, and for IMAP each folder's highest UID. Every page, including a resumed one, applies it, so the result set cannot move while the pass spans checks. Mail after the bound reaches polling, or the next pass.
+    - The pass freezes an upper bound at its start, held in `reconcile_progress`: the start time, and for IMAP each folder's highest UID. Every provider query the pass makes, in stage (a) or (b), applies it to every page, including a resumed one, so no result set can move while the pass spans checks. Mail after the bound reaches polling, or the next pass.
     - **Gmail:** `messages.list` with `q = (in:inbox OR in:sent) after:<cutoff> before:<start> (from:a OR to:a OR cc:a ...)` over vendor addresses in batches, with durable page tokens.
     - **Microsoft:** pages each of `inbox` and `sentitems` with `$filter=receivedDateTime ge <cutoff> and receivedDateTime lt <start>` and `$select` of the step-1 fields, and matches recipients locally. It never uses `$search`.
     - **IMAP:** `UID SEARCH UID 1:<highest> SINCE <date> OR FROM a OR TO a CC a`, per folder, in bounded batches. IMAP's `OR` takes exactly two keys, so the keys nest; a test checks the exact command.
 17. **Stage (b), thread sync.** Each followed thread syncs from its watermark, or from the cutoff when it has none.
     - **Gmail:** `threads.get(format=metadata)`. It is used only for threads already stored.
-    - **Microsoft:** `/me/messages?$filter=conversationId eq '<id>' and receivedDateTime ge <since>`, then the step-1 location check.
-    - **IMAP:** `UID SEARCH` in `INBOX` and Sent for `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References` over the component's ids, repeated until the component stops growing. Before that, it drains `imap_reply_header_gaps`:
+    - **Microsoft:** `/me/messages?$filter=conversationId eq '<id>' and receivedDateTime ge <since> and receivedDateTime lt <start>`, then the step-1 location check.
+    - **IMAP:** `UID SEARCH UID 1:<highest>` in `INBOX` and Sent for `HEADER Message-ID`, `HEADER In-Reply-To`, and `HEADER References` over the component's ids, repeated until the component stops growing. Before that, it drains `imap_reply_header_gaps`:
       - a listed row whose mailbox identity is known gets its reply headers fetched and merged through `_apply_imap_component`;
       - a row whose source is gone, or whose identity is unknown, leaves the list.
-    - A thread's watermark advances to the start time of the check that finished its sync.
+    - A thread's watermark advances to the pass's frozen start time, never past the bound its queries applied.
 18. **Stage (c), derived work.** Bodies (M2.4). Claims arrive in M4.
 19. **Completion.** When every stage has no work left, `reconcile_coverage` records the generation the pass froze at its start (step 13), in one transaction with clearing the progress row. A change mid-pass bumped the generation past it, so the next check starts another pass.
 
@@ -219,7 +220,7 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
   - Selecting Sent leaves Inbox validation correct.
 - **Cursors.** Folder cursors advance independently, and a Sent batch failure leaves the Inbox cursor untouched.
 - **Gmail checkpoint (M2 required item).** A poll that stops mid-range and resumes misses no `SENT` events.
-- **Cleanup.** `delete_message`, `clear_messages`, and the purge remove a message's recipients and locations with it.
+- **Cleanup.** `delete_message`, `clear_messages`, and the purge remove a message's recipients and locations with it. Deleting the canonical row of a coalesced pair removes both rows and suppresses both source identities.
 - **Seen ids.** A Gmail `SENT` label added to a captured message, and a Microsoft message moved into Sent Items, each record the second location on the next poll, with one metadata fetch; once every admitted location is recorded, repeats cost none.
 - **Coalescing (M2 required item).**
   - A retained duplicate becomes `logical_of` its canonical row, with nothing deleted.
@@ -254,12 +255,12 @@ M2 ships as four implementation PRs under this one plan, in order. Each is fail-
   - a backup that cannot be written leaves the database at v30, unchanged.
 
 **M2.3**
-- **Staleness, one case each:** no record, a vendor address added, an address removed and re-added, raised retention through `settings.update` and through an edited `config.toml`, an entitlement lapse observed and then reactivation, an extractor change, a recovered cursor, a followed thread without a watermark, and a message polled into a followed thread (pending derived work). Many polls with no change never make coverage stale.
+- **Staleness, one case each:** no record, a vendor address added, an address removed and re-added, a verified identity changed, raised retention through `settings.update` and through an edited `config.toml`, an entitlement lapse observed and then reactivation, an extractor change, a recovered cursor, a followed thread without a watermark, and a message polled into a followed thread (pending derived work). Many polls with no change never make coverage stale.
 - **Mid-pass lapse.** A license removed during a pass stops it at the next budget check, with progress kept.
 - **Generation moves mid-pass.** Progress frozen at an older generation is discarded, and the new pass starts clean.
 - **Dry run.** A stale account previewed with `dry_run=True` writes no progress, coverage, message, or body row.
 - **Mid-pass change.** A vendor added after discovery finished bumps the generation past the pass's record, and the next check starts another pass.
-- **Frozen bound.** Mail arriving while a pass spans two checks is not paged twice and not skipped; it reaches polling.
+- **Frozen bound.** Mail arriving while a pass spans two checks is not paged twice and not skipped, in discovery and in thread sync; it reaches polling. A synced thread's watermark never passes the bound.
 - **Unfollow drops the watermark**, so a refollowed thread is stale and resyncs.
 - **Raised retention clears every watermark,** and the IMAP search command nests its `OR` keys exactly.
 - **Discovery.**
