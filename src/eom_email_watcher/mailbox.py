@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -99,6 +99,25 @@ class MessageMetadata:
 # The admitted folders (contract D-scope), as locations are recorded.
 INBOX_LOCATION = "inbox"
 SENT_LOCATION = "sent"
+def read_through_sources[T](
+    provider_message_ids: Sequence[str], read: Callable[[str], T]
+) -> T:
+    """Read a logical message through any of its source identities (contract D-identity).
+
+    A copy that is gone is not the message being gone: the next recorded source is
+    tried, and only when every copy is unavailable does the message count as such.
+    """
+    last: MailboxMessageUnavailable | None = None
+    for provider_message_id in provider_message_ids:
+        try:
+            return read(provider_message_id)
+        except MailboxMessageUnavailable as exc:
+            last = exc
+    if last is None:
+        raise MailboxMessageUnavailable("The message has no source to read")
+    raise last
+
+
 def folder_scope_key(folders: frozenset[str]) -> str:
     """One text key for a set of folders in scope, for queries whose pages belong to it."""
     return "+".join(sorted(folders))

@@ -72,6 +72,7 @@ from .mailbox import (
     mailbox_polling_session,
     mailbox_session_address,
     mailbox_session_identity_key,
+    read_through_sources,
     scoped_message_id,
 )
 from .microsoft365 import (
@@ -183,19 +184,9 @@ def _scope_gateway(gateway: object, folders: frozenset[str]) -> None:
 def _content_from_sources(
     gateway: MailboxGateway, provider_message_ids: Sequence[str], body_char_limit: int
 ) -> MessageContent:
-    """Read a logical message through any of its source identities (contract D-identity).
-
-    A copy that is gone is not the message being gone: the next recorded source is
-    tried, and only when every copy is unavailable does the message count as such.
-    """
-    last: MailboxMessageUnavailable | None = None
-    for provider_message_id in provider_message_ids:
-        try:
-            return gateway.content(provider_message_id, body_char_limit)
-        except MailboxMessageUnavailable as exc:
-            last = exc
-    assert last is not None
-    raise last
+    return read_through_sources(
+        provider_message_ids, lambda source: gateway.content(source, body_char_limit)
+    )
 
 
 def _scope_complete(folders: frozenset[str]) -> bool:
@@ -2020,6 +2011,7 @@ class Watcher:
         gated_allowed = self._gated_class_allowed()
         folders = _folders_in_scope(gated_allowed)
         _scope_gateway(self.gateway, folders)
+        self._preview_identities: set[tuple[str, str, str, str]] = set()
         purged = 0 if dry_run else self.store.purge(self.config.retention_days, now=checked_at)
         state = self.store.state(
             provider=self.mailbox.provider,
@@ -2335,6 +2327,23 @@ class Watcher:
                 "mailbox_identity_key": mailbox_identity_key,
             }
             if dry_run:
+                # A second copy of a stored or already previewed logical identity is a
+                # location, not a message (contract D-identity), in a preview too.
+                if metadata.rfc_message_id is not None:
+                    identity = (
+                        self.mailbox.provider,
+                        self.mailbox.account_id,
+                        mailbox_identity_key,
+                        metadata.rfc_message_id,
+                    )
+                    if identity in self._preview_identities or (
+                        self.store.logical_message_id(
+                            *identity, other_than=metadata.message_id
+                        )
+                        is not None
+                    ):
+                        continue
+                    self._preview_identities.add(identity)
                 dry_run_messages.append(
                     PendingMessage(
                         **values,

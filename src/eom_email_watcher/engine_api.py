@@ -130,6 +130,7 @@ from .mailbox import (
     MailboxSession,
     mailbox_polling_session,
     mailbox_session_identity_key,
+    read_through_sources,
 )
 from .microsoft365 import (
     MICROSOFT365_PROVIDER,
@@ -2883,10 +2884,15 @@ def _verified_mailbox_attachment_bytes(
             )
         if remaining_timeout is not None:
             gateway.set_operation_timeout(remaining_timeout())
-        return gateway.attachment_bytes(
-            source.provider_message_id,
-            part_id,
-            attachment_id,
+        # Any copy of the logical message can serve the bytes (contract D-identity).
+        source_ids = tuple(
+            s.provider_message_id for s in runtime.store.message_sources(source.message_id)
+        ) or (source.provider_message_id,)
+        return read_through_sources(
+            source_ids,
+            lambda provider_message_id: gateway.attachment_bytes(
+                provider_message_id, part_id, attachment_id
+            ),
         )
 
 

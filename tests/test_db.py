@@ -7710,3 +7710,109 @@ def test_a_skipped_message_is_queued_again_when_another_copy_is_recorded(
     ) is False
 
     assert [m.message_id for m in store.pending()] == [first]
+
+
+def test_coalescing_ranks_a_silently_completed_copy_above_a_pending_one(
+    tmp_path: Path,
+) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    pending = _imap_message(store, "1", "same@x")
+    done = _retained_duplicate(store, "2", "same@x")
+    store.mark_analyzed(
+        done,
+        {
+            "category": "invoice", "priority": "normal", "summary": "Done.",
+            "action_required": False, "suggested_action": None,
+            "deadline_text": None, "deadline_iso": None, "confidence": 0.9,
+        },
+    )
+    # Notifications off: completed without a notified_at.
+    store.mark_delivery_complete(done, notified=False)
+    _reset_to_schema_29(store)
+    store.initialize()
+
+    with store.connection() as db:
+        logical_of = {
+            str(r["message_id"]): r["logical_of"]
+            for r in db.execute("SELECT message_id, logical_of FROM messages").fetchall()
+        }
+    assert logical_of == {done: None, pending: done}
+    assert store.pending() == []
+
+
+def test_coalescing_groups_legacy_rows_under_the_proven_identity(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    legacy_root = _imap_message(store, "1", "legacy-root@x")
+    legacy_copy = _retained_duplicate(store, "2", "legacy-root@x")
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (legacy_root,)
+        ).fetchone()[0]
+        db.execute("DROP TRIGGER messages_admission_provenance_immutable")
+        db.execute(
+            """UPDATE messages SET mailbox_identity_key = NULL, admission_kind = NULL,
+                admission_selector_id = NULL, admission_display_name = NULL,
+                admission_mailbox_identity_key = NULL, admitted_at = NULL"""
+        )
+        db.execute(
+            """UPDATE mail_accounts SET legacy_identity_status = 'continuity_proven',
+                legacy_identity_key = ? WHERE account_id = 'imap-account'""",
+            (identity,),
+        )
+    _reset_to_schema_28(store)
+
+    migrated = Store(store.path)
+    migrated.initialize()
+
+    with migrated.connection() as db:
+        logical_of = {
+            str(r["message_id"]): r["logical_of"]
+            for r in db.execute("SELECT message_id, logical_of FROM messages").fetchall()
+        }
+    # Completed pre-identity rows keep a NULL identity, yet they are one message
+    # under the account's proven identity, as their locations and threads are.
+    assert logical_of == {legacy_root: None, legacy_copy: legacy_root}
+    assert len(migrated.recent(10)) == 1
+
+
+def test_automation_work_is_read_through_the_logical_message(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = admitted_scheduling_run(store, message_id="local-a", provider_message_id="m-a")
+    second = admitted_scheduling_run(store, message_id="local-b", provider_message_id="m-b")
+    assert first.run_id != second.run_id
+    with store.connection() as db:
+        # Two retained copies of one message, each with its own run from before.
+        db.execute(
+            "UPDATE messages SET rfc_message_id = 'same@x', thread_id = '<same@x>'"
+            " WHERE message_id IN ('local-a', 'local-b')"
+        )
+    _reset_to_schema_29(store)
+    store.initialize()
+
+    with store.connection() as db:
+        child = db.execute(
+            "SELECT message_id FROM messages WHERE logical_of IS NOT NULL"
+        ).fetchone()[0]
+    # The child's run is not work: every automation queue reads the logical rows.
+    assert store.automation_run_for_message(child) is None
+    runs = {w.run.run_id for w in store.recoverable_automation_runs()}
+    assert runs <= {first.run_id, second.run_id} and len(runs) <= 1
+
+
+def test_logical_message_id_finds_the_stored_copy_a_source_duplicates(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite3")
+    store.initialize()
+    first = _imap_message(store, "1", "same@x")
+    with store.connection() as db:
+        identity = db.execute(
+            "SELECT mailbox_identity_key FROM messages WHERE message_id = ?", (first,)
+        ).fetchone()[0]
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="imap:sent:77:3"
+    ) == first
+    assert store.logical_message_id(
+        "imap", "imap-account", identity, "same@x", other_than="imap:mailbox:44:1"
+    ) is None

@@ -3349,6 +3349,26 @@ END;
 """
 
 
+def _logical_message_id(
+    db: sqlite3.Connection,
+    provider: str,
+    account_id: str,
+    mailbox_identity_key: str,
+    rfc_message_id: str,
+    *,
+    other_than: str,
+) -> str | None:
+    """The stored logical message a source identity duplicates (contract D-identity)."""
+    row = db.execute(
+        """SELECT message_id FROM messages
+        WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
+          AND rfc_message_id = ? AND logical_of IS NULL
+          AND provider_message_id <> ?""",
+        (provider, account_id, mailbox_identity_key, rfc_message_id, other_than),
+    ).fetchone()
+    return str(row["message_id"]) if row is not None else None
+
+
 def _requeue_if_skipped(db: sqlite3.Connection, message_id: str) -> None:
     """A message skipped because its only copy was gone is analyzed once a copy exists.
 
@@ -3594,30 +3614,41 @@ def _migrate_sent_capture(db: sqlite3.Connection) -> None:
     # is neither analyzed nor notified twice and no completed result hides behind a
     # pending copy. The others point to it and their locations move. No row is
     # deleted, so per-row history survives.
-    groups = db.execute(
-        """SELECT provider, account_id, mailbox_identity_key, rfc_message_id
+    # A legacy row without an identity belongs to the account's proven one, as the
+    # locations and threads above keyed it; the rank orders completed work first.
+    candidates = db.execute(
+        """SELECT message_id, provider, account_id, mailbox_identity_key, rfc_message_id,
+            provider_message_id,
+            CASE
+                WHEN notified_at IS NOT NULL THEN 0
+                WHEN status = 'summarized' THEN 1
+                WHEN status = 'analyzed' THEN 2
+                WHEN status = 'pending' THEN 3
+                ELSE 4
+            END AS rank
         FROM messages
         WHERE logical_of IS NULL AND rfc_message_id IS NOT NULL
-          AND mailbox_identity_key IS NOT NULL
-        GROUP BY provider, account_id, mailbox_identity_key, rfc_message_id
-        HAVING COUNT(*) > 1"""
+        ORDER BY rank, provider_message_id"""
     ).fetchall()
-    for group in groups:
-        members = db.execute(
-            """SELECT message_id FROM messages
-            WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-              AND rfc_message_id = ? AND logical_of IS NULL
-            ORDER BY CASE
-                    WHEN notified_at IS NOT NULL THEN 0
-                    WHEN status = 'analyzed' THEN 1
-                    ELSE 2
-                END,
-                provider_message_id""",
-            tuple(group),
-        ).fetchall()
-        canonical = str(members[0]["message_id"])
-        for member in members[1:]:
-            duplicate = str(member["message_id"])
+    groups: dict[tuple[str, str, str, str], list[str]] = {}
+    for row in candidates:
+        identity = row["mailbox_identity_key"]
+        if identity is None:
+            identity = proven.get((str(row["provider"]), str(row["account_id"])))
+        if identity is None:
+            continue
+        key = (
+            str(row["provider"]),
+            str(row["account_id"]),
+            str(identity),
+            str(row["rfc_message_id"]),
+        )
+        groups.setdefault(key, []).append(str(row["message_id"]))
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        canonical = members[0]
+        for duplicate in members[1:]:
             db.execute(
                 "UPDATE messages SET logical_of = ? WHERE message_id = ?", (canonical, duplicate)
             )
@@ -8353,6 +8384,22 @@ class Store:
                 is not None
             )
 
+    def logical_message_id(
+        self,
+        provider: str,
+        account_id: str,
+        mailbox_identity_key: str,
+        rfc_message_id: str,
+        *,
+        other_than: str,
+    ) -> str | None:
+        """The stored logical message a source identity would duplicate, if any."""
+        with self.connection() as db:
+            return _logical_message_id(
+                db, provider, account_id, mailbox_identity_key, rfc_message_id,
+                other_than=other_than,
+            )
+
     def message_sources(self, message_id: str) -> tuple[MessageSource, ...]:
         """Every source identity a logical message can be read from (contract D-identity).
 
@@ -8544,17 +8591,18 @@ class Store:
         # A second location of an already-captured logical identity is recorded,
         # not captured again (contract D-identity).
         if rfc_message_id is not None:
-            logical = db.execute(
-                """SELECT message_id FROM messages
-                WHERE provider = ? AND account_id = ? AND mailbox_identity_key = ?
-                  AND rfc_message_id = ? AND logical_of IS NULL
-                  AND provider_message_id <> ?""",
-                (provider, account_id, mailbox_identity_key, rfc_message_id, source_message_id),
-            ).fetchone()
-            if logical is not None:
+            logical_id = _logical_message_id(
+                db,
+                provider,
+                account_id,
+                mailbox_identity_key,
+                rfc_message_id,
+                other_than=source_message_id,
+            )
+            if logical_id is not None:
                 _record_locations(
                     db,
-                    message_id=str(logical["message_id"]),
+                    message_id=logical_id,
                     provider=provider,
                     account_id=account_id,
                     mailbox_identity_key=mailbox_identity_key,
@@ -8562,8 +8610,8 @@ class Store:
                     locations=locations,
                     recorded_at=discovered_at if scope_complete else None,
                 )
-                _record_recipients(db, message_id=str(logical["message_id"]), to=to, cc=cc)
-                _requeue_if_skipped(db, str(logical["message_id"]))
+                _record_recipients(db, message_id=logical_id, to=to, cc=cc)
+                _requeue_if_skipped(db, logical_id)
                 if provider == "imap":
                     # The copy's reply headers may bridge components (contract
                     # D-identity): the one re-key owner applies them as for a new row.
@@ -10639,7 +10687,7 @@ class Store:
                     i.mailbox_identity_key AS source_mailbox_identity_key
                 FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN messages AS m
+                JOIN logical_messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
                  AND (
@@ -10734,7 +10782,7 @@ class Store:
                     p.created_at AS extraction_created_at, p.completed_at
                 FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN messages AS m
+                JOIN logical_messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
                  AND (
@@ -10828,7 +10876,7 @@ class Store:
                 JOIN automation_runs AS r
                   ON r.run_id = p.run_id AND r.current_payload_id = p.payload_id
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN messages AS m
+                JOIN logical_messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
                  AND (
@@ -11312,7 +11360,7 @@ class Store:
             ):
                 raise RuntimeError("Automation write lost its expected-state race")
             source_exists = db.execute(
-                """SELECT 1 FROM messages AS m
+                """SELECT 1 FROM logical_messages AS m
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = ?
                 WHERE m.provider = ? AND m.account_id = ? AND (
                     (i.mailbox_identity_key IS NOT NULL
@@ -11993,7 +12041,7 @@ class Store:
             row = db.execute(
                 """SELECT r.* FROM automation_runs AS r
                 LEFT JOIN automation_run_source_identities AS i ON i.run_id = r.run_id
-                JOIN messages AS m
+                JOIN logical_messages AS m
                   ON m.provider = r.provider
                  AND m.account_id = r.account_id
                  AND (

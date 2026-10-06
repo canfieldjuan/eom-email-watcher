@@ -5581,6 +5581,42 @@ def test_an_observation_for_an_id_outside_the_batch_is_applied(
     assert store.state(provider="gmail", account_id="gmail-default")[0] == "300"
 
 
+def test_a_dry_run_previews_a_logical_message_once(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = Store(cfg.database_file)
+    store.initialize()
+    # A dry run records no identity, so the account's is registered up front.
+    store.reconcile_mailbox_identity(
+        "gmail",
+        "gmail-default",
+        TEST_MAILBOX_IDENTITY_KEY,
+        legacy_status="replacement",
+        preserve_cursor=False,
+    )
+    store.set_state(
+        "100",
+        datetime(2026, 7, 18, tzinfo=UTC),
+        mailbox_identity_key=TEST_MAILBOX_IDENTITY_KEY,
+    )
+
+    class TwoCopies(FakeGmail):
+        def history_message_ids(self, cursor: str):
+            return ["copy-a", "copy-b"], "200"
+
+        def metadata(self, message_id: str, *, timeout_seconds: float | None = None):
+            return replace(
+                super().metadata("allowed"),
+                message_id=message_id,
+                rfc_message_id="same@x",
+            )
+
+    result = Watcher(cfg, store, TwoCopies(), FakeModel()).check(dry_run=True)
+
+    # Two copies of one logical identity preview as one message, as capture would
+    # store them (the second is a location, not a row).
+    assert result["discovered"] == 1
+
+
 def test_gmail_label_added_to_a_known_message_records_its_second_location(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
