@@ -116,3 +116,14 @@ test("a failed watchlist-changing operation still reloads, keeping its error", a
   assert.equal(vendorReloadAfter(false, true), "keep_error");
   assert.equal(vendorReloadAfter(false, false), "none");
 });
+
+test("vendor drafts survive re-renders and are dropped with their vendor", async () => {
+  const { vendorDrafts } = await vendors();
+  const drafts = vendorDrafts();
+  const draft = drafts.get("vendor-a");
+  draft.address = "billing@acme.co";
+  draft.stopWatching = true;
+  assert.deepEqual(drafts.get("vendor-a"), { address: "billing@acme.co", stopWatching: true });
+  drafts.keepOnly(["vendor-b"]);
+  assert.deepEqual(drafts.get("vendor-a"), { address: "", stopWatching: false });
+});

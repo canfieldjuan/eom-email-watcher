@@ -24,6 +24,7 @@ import {
   deleteVendorConfirmText,
   latestRequestFence,
   removeAddressConfirmText,
+  vendorDrafts,
   vendorReloadAfter,
   vendorErrorText,
   vendorNameError,
@@ -970,6 +971,7 @@ const calendarConsentList = requiredElement<HTMLElement>("#calendar-consent-list
 let watchedSenders: WatchedSender[] = [];
 let vendorRecords: Vendor[] = [];
 const vendorListFence = latestRequestFence();
+const vendorCardDrafts = vendorDrafts();
 let operationInFlight = true;
 let checkInFlight = false;
 let checkSupported = false;
@@ -3735,9 +3737,11 @@ function renderConnectStatus(status: ConnectEntitlementStatus): void {
 function applyConnectStatus(status: ConnectEntitlementStatus, forceCapabilityRefresh = false): void {
   const activeChanged =
     connectEntitlementActive !== null && connectEntitlementActive !== status.active;
+  // Vendor controls depend only on whether the entitlement is active.
+  const vendorGateChanged = connectEntitlementActive !== status.active;
   connectEntitlementActive = status.active;
   renderConnectStatus(status);
-  renderVendors();
+  if (vendorGateChanged) renderVendors();
   if ((activeChanged || forceCapabilityRefresh) && configurationReady) void loadInbox();
 }
 
@@ -4787,8 +4791,13 @@ function renderVendors(): void {
       header.append(rename);
     }
 
+    const draft = vendorCardDrafts.get(vendor.vendorId);
     const stopWatching = document.createElement("input");
     stopWatching.type = "checkbox";
+    stopWatching.checked = draft.stopWatching;
+    stopWatching.addEventListener("change", () => {
+      draft.stopWatching = stopWatching.checked;
+    });
 
     const addresses = document.createElement("ul");
     addresses.className = "vendor-addresses";
@@ -4839,6 +4848,10 @@ function renderVendors(): void {
       input.required = true;
       input.placeholder = "billing@vendor.com";
       input.setAttribute("aria-label", `Add an address to ${vendor.name}`);
+      input.value = draft.address;
+      input.addEventListener("input", () => {
+        draft.address = input.value;
+      });
       const add = document.createElement("button");
       add.type = "submit";
       add.textContent = "Add address";
@@ -4880,6 +4893,7 @@ async function loadVendors(message: string | null = "Vendors are up to date."): 
     const vendors = await invoke<Vendor[]>("vendors_list");
     if (!vendorListFence.isLatest(request)) return;
     vendorRecords = vendors;
+    vendorCardDrafts.keepOnly(vendors.map((vendor) => vendor.vendor_id));
     renderVendors();
     if (message !== null) setVendorsStatus(message, "success");
   } catch (error) {
@@ -4896,17 +4910,21 @@ async function vendorOperation(
 ): Promise<void> {
   if (vendorsBusy() || !beginOperation()) return;
   vendorsStatus.textContent = pending;
-  let message: string | null = null;
+  // The reloads run inside the operation, so no other update starts while they
+  // are in flight and an older list can never land after a newer one.
   try {
-    message = await operation();
-  } catch (error) {
-    vendorFailure(error);
+    let message: string | null = null;
+    try {
+      message = await operation();
+    } catch (error) {
+      vendorFailure(error);
+    }
+    const reload = vendorReloadAfter(message !== null, changesWatchlist);
+    if (reload !== "none") await loadVendors(reload === "with_message" ? message : null);
+    if (changesWatchlist) await loadSenders();
   } finally {
     finishOperation();
   }
-  const reload = vendorReloadAfter(message !== null, changesWatchlist);
-  if (reload !== "none") await loadVendors(reload === "with_message" ? message : null);
-  if (changesWatchlist) void loadSenders();
 }
 
 async function renameVendor(vendorId: string, current: string): Promise<void> {
@@ -4930,6 +4948,7 @@ async function renameVendor(vendorId: string, current: string): Promise<void> {
 async function addVendorAddress(vendorId: string, address: string): Promise<void> {
   await vendorOperation("Adding address…", async () => {
     const vendor = await invoke<Vendor>("vendors_address_add", { vendorId, address });
+    vendorCardDrafts.get(vendorId).address = "";
     return `${address.trim()} now belongs to ${vendor.display_name} and is watched.`;
   }, true);
 }

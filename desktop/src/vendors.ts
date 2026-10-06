@@ -131,3 +131,31 @@ export function vendorReloadAfter(succeeded: boolean, changesWatchlist: boolean)
   if (succeeded) return "with_message";
   return changesWatchlist ? "keep_error" : "none";
 }
+
+export interface VendorDraft {
+  address: string;
+  stopWatching: boolean;
+}
+
+// In-progress input on each vendor card, kept across re-renders, so a list
+// reload or an entitlement change never wipes a half-typed address.
+export function vendorDrafts() {
+  const drafts = new Map<string, VendorDraft>();
+  return {
+    get(vendorId: string): VendorDraft {
+      let draft = drafts.get(vendorId);
+      if (draft === undefined) {
+        draft = { address: "", stopWatching: false };
+        drafts.set(vendorId, draft);
+      }
+      return draft;
+    },
+    // Drafts of vendors that no longer exist are dropped.
+    keepOnly(vendorIds: Iterable<string>): void {
+      const keep = new Set(vendorIds);
+      for (const vendorId of [...drafts.keys()]) {
+        if (!keep.has(vendorId)) drafts.delete(vendorId);
+      }
+    },
+  };
+}
