@@ -56,11 +56,14 @@ Each definition is the only place its rule is stated.
   - opted-in business domains.
 - **Uniqueness.** Each address, and each domain, belongs to at most one vendor. Assigning it to a second vendor returns `conflict`.
 - **Public domains are refused.** The public-provider list is one constant in code, and nothing else classifies domains. It starts as exactly gmail.com, googlemail.com, yahoo.com, outlook.com, hotmail.com, live.com, icloud.com, me.com, aol.com, proton.me, protonmail.com, and gmx.com. Adding a domain is a code change with a test.
-- **`vendor_of(address)`** returns:
-  - the vendor that owns the exact address;
-  - else the vendor that owns the address's domain;
+- **`vendor_of(address)`** returns a vendor and how it matched:
+  - none for the mailbox's verified identities, before either lookup;
+  - else the vendor that owns the exact address, as an exact match;
+  - else the vendor that owns the address's domain, as a domain match;
   - else none.
-- **The mailbox's verified identities** are `mail_accounts.address` and the session's authenticated address. They never have a vendor, and are never suggestion candidates.
+
+  A record that covers a verified identity, such as an opted-in domain or an address whose mailbox is connected later, is still allowed; the identity is simply excluded.
+- **The mailbox's verified identities** are `mail_accounts.address` and the session's authenticated address. Through `vendor_of` they never have a vendor, and they are never suggestion candidates.
 - **Suggestion candidates** are senders of inbound messages in a followed thread ([D-follow](#d-follow-followed-threads)) that meet all of these:
   - `vendor_of` returns none;
   - the sender is not one of the mailbox's verified identities;
@@ -71,10 +74,12 @@ Each definition is the only place its rule is stated.
 ### D-attribution: a message's vendor
 
 - **Inbound:** `vendor_of(From)`.
-- **Outbound:**
-  - the vendor of the first `To`, then `Cc`, recipient, in stored header order, whose exact address has a vendor;
-  - else the first such recipient whose domain has a vendor;
+- **Outbound,** over the `To`, then `Cc`, recipients in stored header order:
+  - the vendor of the first recipient whose `vendor_of` is an exact match;
+  - else of the first whose `vendor_of` is a domain match;
   - else none.
+
+  Recipients are judged only through `vendor_of`, so its exclusions apply to outbound mail too.
 - **Each message has at most one attributed vendor.** It shows that vendor alone, and its claims belong to that vendor.
 - **A vendor's threads** are:
   - the threads it owns ([D-follow](#d-follow-followed-threads));
@@ -102,7 +107,7 @@ Each definition is the only place its rule is stated.
   - `exact_sender`: `From` is a watched address;
   - `gmail_user_label`: a selected Gmail label.
 - **While the gated class is allowed ([D-ops](#d-ops-operation-classes-and-gating)), an in-scope message ([D-scope](#d-scope-in-scope-messages-and-retention)) is also captured when:**
-  - it is inbound and its vendor ([D-attribution](#d-attribution-a-messages-vendor)) comes from an exact address (`vendor_address`) or a domain (`vendor_domain`);
+  - it is inbound with a vendor ([D-attribution](#d-attribution-a-messages-vendor)) from an exact match (`vendor_address`) or a domain match (`vendor_domain`);
   - it is outbound with a vendor (`sent_to_vendor`);
   - or it belongs to a followed thread (`thread_follow`, [D-follow](#d-follow-followed-threads)).
 - **Anything else leaves no trace.**
@@ -115,7 +120,7 @@ Each definition is the only place its rule is stated.
 
 - **A thread is followed exactly while** it contains a stored message that has a vendor ([D-attribution](#d-attribution-a-messages-vendor)) under the current configuration.
   - Following is a classification of stored data, not an operation.
-- **Its owner** is the vendor of the earliest-received such message. Ties are broken by source identity, in byte order.
+- **Its owner** is the vendor of the earliest-received such message. Ties are broken by the canonical order ([D-identity](#d-identity-message-identity-direction-and-thread-keys)).
 - **Follow state and owner are derived, never recorded history.**
   - They are a function of the stored messages and the current configuration, cached in one row per thread key.
   - The cache is recomputed, under the operation lock (`engine_api.py:2192-2199`), whenever:
@@ -133,13 +138,15 @@ Each definition is the only place its rule is stated.
 - **Logical identity.** A message with a `Message-ID` also has the logical identity `(provider, account, mailbox identity, Message-ID)`.
   - A second location of an already-captured logical identity is recorded, not captured again.
   - Without a `Message-ID`, a moved IMAP message can be captured twice; this is best-effort.
-- **Direction** is `outbound` when the message carries Gmail's `SENT` label (even with `INBOX`), or when it was first found in the Sent folder; otherwise `inbound`. It is decided once, at capture.
+- **Canonical order.** The canonical order of messages is their source identity in byte order. A logical message recorded in several locations sorts by the smallest of their source identities. Every tie-break in this contract uses it.
+- **Direction** is derived from the logical message's recorded locations. It is `outbound` once any location is a Sent folder, or carries Gmail's `SENT` label (even with `INBOX`); otherwise it is `inbound`. It is recomputed when a location is added, so discovery order never decides it.
 - **Thread key:**
   - Gmail uses `threadId`, and Microsoft 365 uses `conversationId`.
-  - IMAP uses components: messages whose id sets overlap form one component, identified by a UUIDv4 key. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list.
-  - The result does not depend on arrival order. A message that touches no component forms its own.
-- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member `Message-ID` sorts first in byte order, so it never depends on arrival order. In that transaction:
-  - every row naming a merged key is re-keyed, and aliases are recorded.
+  - IMAP uses components: messages whose id sets overlap form one component. A message's id set is its own `Message-ID`, `In-Reply-To`, and a bounded `References` list. A message that touches no component forms its own.
+  - Which messages share a component does not depend on arrival order. The key does: it is an opaque UUIDv4 handle, allocated when its component is created. No rule may depend on a key's value, only on its members.
+  - Every captured message has a thread key, including one whose provider omits a thread id, which forms its own thread.
+- **IMAP merges.** A message that bridges several components merges them into one survivor, in one transaction. The survivor is the component whose smallest member under the canonical order sorts first, whether or not its members have a `Message-ID`, and it keeps its key. In that transaction:
+  - every row naming a merged key is re-keyed, including earlier aliases, and aliases are recorded.
 
 ### D-reconcile: coverage and the reconcile pass
 
@@ -204,10 +211,10 @@ Each definition is the only place its rule is stated.
 - **Removal effects:**
   - Removing an address records a dismissal of its `(vendor, address)` pair.
   - Removing a domain stops its matches.
-  - Deleting a vendor runs in one transaction:
-    - it removes the vendor's addresses, domains, and dismissals;
-    - it optionally stops watching its addresses ("Also stop watching these addresses", off by default);
-    - addresses left watched keep today's `exact_sender` admission.
+  - Deleting a vendor removes its addresses, domains, and dismissals in one transaction.
+    - It can also stop watching its addresses ("Also stop watching these addresses", off by default).
+    - Addresses left watched keep today's `exact_sender` admission.
+- **Two stores.** The watchlist is a separate file, so no operation changes it and the database in one transaction. An operation that changes both writes the watchlist first, in one write, then the database. An interruption therefore leaves either an extra watched address or a vendor address shown `watched: false`, and a retry completes the operation.
 
 ### D-claims: claims and comparability
 
@@ -295,6 +302,8 @@ Each named plan must include these, with fail-first tests.
   - Every Gmail message gets a bounded `format=metadata` fetch before its scope check, and the body is fetched only after that check.
   - Microsoft discovery pages each folder by `receivedDateTime` and matches recipients locally, never using `$search`.
   - IMAP sync searches `HEADER Message-ID`, `In-Reply-To`, and `References` until the component stops growing.
+  - IMAP messages retained from before M1 never had their reply headers fetched; M1 lists them. Sync fetches those headers for a listed message whose mailbox identity is known and merges through D-identity. A message whose source is gone, or whose identity is unknown, leaves the list and keeps its own component.
+  - Rows stored before locations exist that are one message under [D-identity](#d-identity-message-identity-direction-and-thread-keys), retained or from M1, are coalesced into one message with all their locations.
   - The date context is stored at capture, with a test that changes the zone after storage.
   - The Gmail checkpoint covers both labels, with a test of a poll that stops mid-range and resumes without missing `SENT` events.
   - The recognized HTML quote containers (at least `<blockquote>`, Gmail's quote block, and Outlook's reply header block), each tested.
@@ -399,3 +408,13 @@ Each milestone plan names its fail-first tests. The arc-level scenarios are:
 - 2026-10-05: the next review found five gaps.
   - Three came from last round's D-follow predicate, which mixed fetch eligibility with classification. D-follow now classifies stored messages, D-ops no longer lists following as an operation, and discovery is defined directly.
   - D-claims keys claims and attempts by attributed vendor, and keeps authored text below quotes.
+- 2026-10-05: merged on green at the operator's direction. The final review's six findings are tracked as amendments A-D in #207.
+- 2026-10-05: amendment B (#207), in the M1 plan PR. D-identity defines one canonical order that every tie-break uses, including the merge survivor without a `Message-ID`, and direction is derived from the recorded locations.
+- 2026-10-05: the M1 plan review found two definition flaws, fixed in their owners:
+  - D-identity: amendment B claimed the merge survivor never depends on arrival order, which a UUIDv4 key cannot satisfy. Component membership is order-independent and the key is an opaque handle. Every captured message now has a thread key, and merges re-key earlier aliases.
+  - D-ops: deleting a vendor claimed one transaction across the watchlist file and the database. Operations that change both now write the watchlist first, so a retry completes them.
+  - A third finding, that a location added later changes direction without recomputing follow state or claims, is an input to amendment A (#207).
+- 2026-10-05: the second M1 plan review found that a logical message with several locations had no single source identity to order by; it sorts by the smallest. It also added two M2 items: fetch the reply headers of IMAP messages retained from before M1, and coalesce rows that are one message.
+- 2026-10-05: amendment C (#207), in the M1 plan PR. `vendor_of` excludes the mailbox's verified identities before either lookup, which also covers an address whose mailbox is connected after it became a vendor address.
+- 2026-10-05: the fourth M1 plan review found that outbound attribution looked up recipients' addresses and domains directly instead of through `vendor_of`, so amendment C's exclusion did not reach outbound mail. D-attribution now judges recipients only through `vendor_of`.
+- 2026-10-05: the fifth M1 plan review found that D-attribution asked how `vendor_of` matched, which `vendor_of` did not say. `vendor_of` now returns its match, exact or domain, and outbound attribution and D-capture's kinds both read it. A finding that a newly verified identity leaves follow state and claims stale is an input to amendment A (#207), with the direction finding above.
