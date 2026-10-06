@@ -8726,3 +8726,18 @@ def test_vendor_address_remove_with_unwatch_retries_after_an_interruption(
     retried = _call(config_path, "vendors.addresses.remove", payload)
     assert retried["data"]["item"]["addresses"] == []
     assert "billing@acme.com" not in load_config(config_path).allowlist
+
+
+def test_vendor_address_add_to_a_missing_vendor_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _vendor_setup(tmp_path, monkeypatch)
+    original = config_path.read_bytes()
+
+    response = _call(
+        config_path, "vendors.addresses.add",
+        {"vendor_id": "00000000-0000-4000-8000-000000000000", "address": "new@acme.com"},
+    )
+
+    assert response["error"]["code"] == "not_found"
+    assert config_path.read_bytes() == original

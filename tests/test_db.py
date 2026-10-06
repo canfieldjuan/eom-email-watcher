@@ -6506,6 +6506,11 @@ def test_schema_28_database_keys_retained_rows(tmp_path: Path) -> None:
         assert db.execute(
             "SELECT rfc_message_id FROM messages WHERE message_id = ?", (malformed,)
         ).fetchone()[0] is None
+        stored = db.execute(
+            "SELECT rfc_message_id FROM messages WHERE message_id IN (?, ?)",
+            (first_copy, second_copy),
+        ).fetchall()
+        assert [row[0] for row in stored] == ["dup@x", "dup@x"]
     with migrated.connection() as db:
         gaps = {row[0] for row in db.execute("SELECT message_id FROM imap_reply_header_gaps")}
     assert gaps == {old, first_copy, second_copy, idless, malformed}

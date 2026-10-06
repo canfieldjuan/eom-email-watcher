@@ -5549,6 +5549,7 @@ def _watchlist_remove(request: dict[str, object]) -> dict[str, object]:
     email = payload.get("email")
     if not isinstance(email, str) or not email.strip():
         raise ApiError("invalid_request", "email must be a non-empty string")
+
     def remove() -> dict[str, object]:
         config = load_config(_config_path(request))
         try:
