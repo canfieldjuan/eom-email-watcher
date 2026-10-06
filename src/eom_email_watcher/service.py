@@ -2310,12 +2310,16 @@ class Watcher:
     ) -> None:
         """A known id came back through polling with its folders (contract D-identity).
 
-        The change record says where the message is now, so nothing is fetched. The
-        folders in scope are recorded. The observation is complete, and stamps the
-        source's rows, only when the record carried the whole folder set and every
-        admitted folder was in scope (plan step 5); otherwise it clears their stamp,
-        so a change seen partially, or during a lapse, is observed again by discovery.
+        The change record says which folders the message is in, so nothing is fetched
+        (plan step 6). A record that is not a whole folder set and names no admitted
+        folder in scope (a star, a read) says nothing about folders and changes
+        nothing. Otherwise the folders in scope are recorded; the observation is
+        complete, and stamps the source's rows, only when the record carried the
+        whole set and every admitted folder was in scope (plan step 5), and clears
+        their stamp otherwise, so the message is observed again by discovery.
         """
+        if not observed.complete and not (observed.locations & folders):
+            return
         self.store.record_message_location(
             provider=self.mailbox.provider,
             account_id=self.mailbox.account_id,

@@ -5292,18 +5292,26 @@ def test_imap_capture_threads_a_reply_with_its_root(tmp_path: Path) -> None:
 class LabelledGmail(FakeGmail):
     """Gmail history naming one watched message, with the labels the test chooses."""
 
-    def __init__(self, labels: frozenset[str]) -> None:
+    def __init__(self, labels: frozenset[str], *, added: frozenset[str] | None = None) -> None:
         super().__init__()
         self.labels = labels
+        # What the history record says: the labels an event added (Gmail history is a
+        # delta); the message's whole label set only when a test says so.
+        self.added = labels if added is None else added
+        self.whole = False
         self.metadata_calls = 0
 
     def history_message_ids(self, cursor: str):
         return ["allowed"], "200"
 
     def changes_since(self, cursor: str) -> MailboxChanges:
-        # Like the real gateway: the history record carries the message's labels.
+        # Like the real gateway: a record carries the labels an event added, and the
+        # whole set only when the nested message carries labelIds.
         ids, newest = self.history_message_ids(cursor)
-        observed = FolderObservation(self._locations(), complete=True)
+        observed = FolderObservation(
+            locations_from_labels(self.labels if self.whole else self.added),
+            complete=self.whole,
+        )
         return MailboxChanges(tuple(ids), newest, {i: observed for i in ids})
 
     def _locations(self) -> frozenset[str]:
@@ -5372,6 +5380,7 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
 
     # A known id gaining SENT records nothing new while Sent is out of scope, and
     # the change record is all polling reads: no metadata fetch.
+    gateway.added = frozenset({"SENT"})
     calls = gateway.metadata_calls
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
@@ -5389,14 +5398,15 @@ def test_gmail_sent_only_mail_is_outside_scope_while_connect_is_inactive(
     # Observed with Sent out of scope: the row is not stamped (plan step 5).
     assert stamps() == [None]
 
-    # Connect returns: the next event's record names both folders, so polling
-    # records Sent and stamps both, still without a fetch.
+    # Connect returns: the SENT addition is in scope now, so polling records it,
+    # still without a fetch. The record does not say where else the message is,
+    # so the observation stays incomplete for discovery.
     _active_entitlement(monkeypatch)
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
     assert gateway.metadata_calls == calls
     assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
-    assert all(stamp is not None for stamp in stamps())
+    assert stamps() == [None, None]
 
 
 def test_a_folder_change_during_a_lapse_is_recorded_and_leaves_the_source_unstamped(
@@ -5429,6 +5439,7 @@ def test_a_folder_change_during_a_lapse_is_recorded_and_leaves_the_source_unstam
         service_module, "connect_entitlement_decision", lambda: EntitlementDecision.MISSING
     )
     gateway.labels = frozenset({"INBOX", "SENT"})
+    gateway.added = frozenset({"INBOX"})
     calls = gateway.metadata_calls
     store.set_state("100", datetime(2026, 7, 18, tzinfo=UTC))
     Watcher(cfg, store, gateway, FakeModel()).check()
@@ -5453,16 +5464,38 @@ def test_gmail_label_added_to_a_known_message_records_its_second_location(
     assert store.message_locations(item["message_id"]) == ["inbox"]
     calls = gateway.metadata_calls
 
-    # A star on the known message: the record names the same folder, nothing happens.
+    def stamps() -> list[str | None]:
+        with store.connection() as db:
+            rows = db.execute(
+                "SELECT recorded_at FROM message_locations WHERE message_id = ? ORDER BY location",
+                (item["message_id"],),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    assert stamps() != [None]
+
+    # A star on the known message: the record adds no admitted folder, so it says
+    # nothing about folders and nothing changes, the stamp included.
+    gateway.added = frozenset({"STARRED"})
     watcher.check()
     assert gateway.metadata_calls == calls
     assert store.message_locations(item["message_id"]) == ["inbox"]
+    assert stamps() != [None]
 
-    # Gmail reports the same id again, now also in SENT: the record names it, no fetch.
+    # Gmail reports the same id again with SENT added: the folder is recorded with
+    # no fetch, and since the record does not say where else the message is, the
+    # observation is incomplete until discovery looks.
     gateway.labels = frozenset({"INBOX", "SENT"})
+    gateway.added = frozenset({"SENT"})
     watcher.check()
     assert store.message_locations(item["message_id"]) == ["inbox", "sent"]
     assert gateway.metadata_calls == calls
+    assert stamps() == [None, None]
+
+    # A record that carries the whole label set is a complete observation.
+    gateway.whole = True
+    watcher.check()
+    assert all(stamp is not None for stamp in stamps())
 
     # A repeated event costs nothing either.
     watcher.check()
