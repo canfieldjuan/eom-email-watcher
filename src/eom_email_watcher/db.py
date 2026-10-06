@@ -3381,7 +3381,9 @@ def _record_locations(
 ) -> int:
     """Record a source identity's admitted folders on its logical message (D-identity)."""
     recorded = 0
-    for location in sorted(set(locations) or {INBOX_LOCATION}):
+    if not locations:
+        raise ValueError("a captured message names at least one admitted folder")
+    for location in sorted(set(locations)):
         if location not in MESSAGE_LOCATIONS:
             raise ValueError(f"unknown message location {location!r}")
         recorded += db.execute(
@@ -8346,7 +8348,7 @@ class Store:
         reply_ids: tuple[str, ...] = (),
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
-        locations: frozenset[str] = frozenset(),
+        locations: frozenset[str] = frozenset({INBOX_LOCATION}),
         capture_timezone: str | None = None,
     ) -> bool:
         if mailbox_identity_key is None:
@@ -8505,7 +8507,7 @@ class Store:
         reply_ids: tuple[str, ...] = (),
         to: tuple[str, ...] = (),
         cc: tuple[str, ...] = (),
-        locations: frozenset[str] = frozenset(),
+        locations: frozenset[str] = frozenset({INBOX_LOCATION}),
         capture_timezone: str | None = None,
     ) -> bool:
         with self.connection() as db:
